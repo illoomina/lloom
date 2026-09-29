@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// One buffer binding recorded against the dispatch that consumed it.
 #[derive(Clone, PartialEq, Eq)]
@@ -235,6 +235,154 @@ impl TraceState {
         self.buffer_ids.insert(addr, id);
         id
     }
+
+    fn note_pipeline(&mut self, name: &str) {
+        self.current_pipeline = Some(name.to_string());
+    }
+
+    fn note_barrier(&mut self, kinds: crate::kernels::metal::encoder::HazardKinds) {
+        self.pending_kinds = kinds;
+        self.pending_barrier = true;
+    }
+
+    fn note_binding(
+        &mut self,
+        index: usize,
+        addr: usize,
+        offset: usize,
+        len: usize,
+        is_output: bool,
+    ) {
+        let buffer_id = self.intern(addr);
+        self.pending.push(Binding {
+            index,
+            buffer_id,
+            buffer_addr: addr,
+            offset,
+            len,
+            is_output,
+        });
+    }
+
+    fn note_dispatch(
+        &mut self,
+        grid: (usize, usize, usize),
+        threadgroup: (usize, usize, usize),
+        by_threadgroups: bool,
+    ) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let bindings = std::mem::take(&mut self.pending);
+        let pipeline = self
+            .current_pipeline
+            .clone()
+            // A dispatch with no pipeline recorded would be a gap in the trace,
+            // so it is named rather than dropped.
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let region = self.region.clone();
+        let barrier = std::mem::take(&mut self.pending_barrier);
+        let kinds = self.pending_kinds.take();
+        let encoder = self.encoder;
+        self.dispatches.push(Dispatch {
+            seq,
+            pipeline,
+            grid,
+            threadgroup,
+            by_threadgroups,
+            bindings,
+            barrier,
+            kinds,
+            encoder,
+            region,
+        });
+    }
+}
+
+/// One device's dispatch trace: every dispatch encoded on that device's queue
+/// while a [`TraceWindow`] is open, with its pipeline, bindings, barrier and
+/// encoder session.
+///
+/// The process-wide trace is one recorder behind one recording switch, so
+/// two devices encoding at once -- two tests on parallel threads -- interleave
+/// their pipelines and bindings in it, and one caller's
+/// [`take_dispatches`] or `set_recording(false)` empties or stops the other's.
+/// This one is owned by the device's `Commands` and fed by the encoders it
+/// opens, whose dispatches the `Commands` lock already serializes, so a
+/// window reads its own device's command stream and nothing else, whichever
+/// thread encodes. Recorded beside the process-wide trace, never instead of
+/// it, independent of [`set_recording`], and only under the trace switch
+/// (`CANDLE_METAL_TRACE`): with it off the encoder holds no device trace. The
+/// window records no region; buffer ids are interned from zero per window.
+/// (`invariants.md` §15.1n)
+#[derive(Default)]
+pub struct DeviceTrace {
+    open: AtomicBool,
+    state: parking_lot::Mutex<Option<TraceState>>,
+}
+
+/// Why [`DeviceTrace::open`] refused a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceRefused {
+    /// The trace switch is off: nothing is recorded, so a window would read
+    /// empty and look like a trace of nothing.
+    TraceOff,
+    /// A window is already open on this device; a second would clear its
+    /// dispatches.
+    WindowOpen,
+}
+
+impl DeviceTrace {
+    /// Open a window: from here until [`TraceWindow::close`], every dispatch
+    /// encoded on this device is recorded.
+    pub fn open(self: &Arc<Self>) -> Result<TraceWindow, TraceRefused> {
+        if !enabled() {
+            return Err(TraceRefused::TraceOff);
+        }
+        let mut state = self.state.lock();
+        if self
+            .open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(TraceRefused::WindowOpen);
+        }
+        *state = Some(TraceState::new());
+        Ok(TraceWindow {
+            trace: Arc::clone(self),
+        })
+    }
+
+    #[inline]
+    fn with(&self, f: impl FnOnce(&mut TraceState)) {
+        if !self.open.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(s) = self.state.lock().as_mut() {
+            f(s);
+        }
+    }
+}
+
+/// An open [`DeviceTrace`] window. Dropping it without [`Self::close`] closes
+/// it and discards the dispatches.
+pub struct TraceWindow {
+    trace: Arc<DeviceTrace>,
+}
+
+impl TraceWindow {
+    /// Close the window and return its dispatches in encode order.
+    pub fn close(self) -> Vec<Dispatch> {
+        let state = self.trace.state.lock().take();
+        drop(self);
+        state.map(|s| s.dispatches).unwrap_or_default()
+    }
+}
+
+impl Drop for TraceWindow {
+    fn drop(&mut self) {
+        self.trace.open.store(false, Ordering::Release);
+        self.trace.state.lock().take();
+    }
 }
 
 fn state() -> &'static Mutex<TraceState> {
@@ -286,47 +434,47 @@ pub fn set_region(region: Option<String>) {
 
 /// Record the pipeline that later dispatches will run.
 #[inline]
-pub fn record_pipeline(name: &str) {
-    if !is_recording() {
+pub fn record_pipeline(device: Option<&DeviceTrace>, name: &str) {
+    if !enabled() {
+        return;
+    }
+    if let Some(d) = device {
+        d.with(|s| s.note_pipeline(name));
+    }
+    if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
     if let Ok(mut s) = state().lock() {
-        s.current_pipeline = Some(name.to_string());
+        s.note_pipeline(name);
     }
 }
 
-/// Record that `auto_barrier` emitted a barrier before the next dispatch.
+/// Record that `auto_barrier` emitted a barrier before the next dispatch, and
+/// which hazard directions it is for.
 ///
 /// Called from the barrier site itself, so this is an observation of what
 /// candle did rather than a reconstruction of what it would do. `DESIGN.md`
 /// §9.2e asks for barriers per token as a standing check on arena work, and a
 /// count derived from bindings alone would have to model encoder boundaries
-/// (§9.2e's simulation does; see `tools/barrier-count/`).
+/// (§9.2e's simulation does; see `tools/barrier-count/`). The kinds exist only
+/// here: `prev_outputs` and `prev_inputs` are replaced right after, so a
+/// downstream reconstruction has no evidence left to attribute from (§9.2f).
 #[inline]
-pub fn record_barrier() {
-    if !is_recording() {
+pub fn record_barrier(
+    device: Option<&DeviceTrace>,
+    kinds: crate::kernels::metal::encoder::HazardKinds,
+) {
+    if !enabled() {
+        return;
+    }
+    if let Some(d) = device {
+        d.with(|s| s.note_barrier(kinds));
+    }
+    if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
     if let Ok(mut s) = state().lock() {
-        s.pending_barrier = true;
-    }
-}
-
-/// Record which hazard directions the barrier about to be emitted is for
-/// (issue #185).
-///
-/// Called from `auto_barrier` immediately before [`record_barrier`], because
-/// this is the only point where the answer exists: `prev_outputs` and
-/// `prev_inputs` are replaced two lines later, so the evidence a downstream
-/// reconstruction would need is gone. §9.2f's rule that the barrier count cannot
-/// be simulated applies with more force to its attribution.
-#[inline]
-pub fn record_barrier_kinds(kinds: crate::kernels::metal::encoder::HazardKinds) {
-    if !is_recording() {
-        return;
-    }
-    if let Ok(mut s) = state().lock() {
-        s.pending_kinds = kinds;
+        s.note_barrier(kinds);
     }
 }
 
@@ -417,8 +565,14 @@ static USE_RESOURCE: AtomicU64 = AtomicU64::new(0);
 /// uninterpretable without knowing where the sessions divide. Candle opens one
 /// every `CANDLE_METAL_COMPUTE_PER_BUFFER` dispatches.
 #[inline]
-pub fn record_encoder_begin() {
-    if !is_recording() {
+pub fn record_encoder_begin(device: Option<&DeviceTrace>) {
+    if !enabled() {
+        return;
+    }
+    if let Some(d) = device {
+        d.with(|s| s.encoder += 1);
+    }
+    if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
     if let Ok(mut s) = state().lock() {
@@ -428,20 +582,25 @@ pub fn record_encoder_begin() {
 
 /// Record a buffer binding against the dispatch that will consume it.
 #[inline]
-pub fn record_binding(index: usize, addr: usize, offset: usize, len: usize, is_output: bool) {
-    if !is_recording() {
+pub fn record_binding(
+    device: Option<&DeviceTrace>,
+    index: usize,
+    addr: usize,
+    offset: usize,
+    len: usize,
+    is_output: bool,
+) {
+    if !enabled() {
+        return;
+    }
+    if let Some(d) = device {
+        d.with(|s| s.note_binding(index, addr, offset, len, is_output));
+    }
+    if !RECORDING.load(Ordering::Relaxed) {
         return;
     }
     if let Ok(mut s) = state().lock() {
-        let buffer_id = s.intern(addr);
-        s.pending.push(Binding {
-            index,
-            buffer_id,
-            buffer_addr: addr,
-            offset,
-            len,
-            is_output,
-        });
+        s.note_binding(index, addr, offset, len, is_output);
     }
 }
 
@@ -452,12 +611,16 @@ pub fn record_binding(index: usize, addr: usize, offset: usize, len: usize, is_o
 /// recorded one.
 #[inline]
 pub fn record_dispatch(
+    device: Option<&DeviceTrace>,
     grid: (usize, usize, usize),
     threadgroup: (usize, usize, usize),
     by_threadgroups: bool,
 ) {
     if !enabled() {
         return;
+    }
+    if let Some(d) = device {
+        d.with(|s| s.note_dispatch(grid, threadgroup, by_threadgroups));
     }
     if !RECORDING.load(Ordering::Relaxed) {
         SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -472,31 +635,7 @@ pub fn record_dispatch(
         return;
     }
     if let Ok(mut s) = state().lock() {
-        let seq = s.next_seq;
-        s.next_seq += 1;
-        let bindings = std::mem::take(&mut s.pending);
-        let pipeline = s
-            .current_pipeline
-            .clone()
-            // A dispatch with no pipeline recorded would be a gap in the trace,
-            // so it is named rather than dropped.
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let region = s.region.clone();
-        let barrier = std::mem::take(&mut s.pending_barrier);
-        let kinds = s.pending_kinds.take();
-        let encoder = s.encoder;
-        s.dispatches.push(Dispatch {
-            seq,
-            pipeline,
-            grid,
-            threadgroup,
-            by_threadgroups,
-            bindings,
-            barrier,
-            kinds,
-            encoder,
-            region,
-        });
+        s.note_dispatch(grid, threadgroup, by_threadgroups);
     }
 }
 

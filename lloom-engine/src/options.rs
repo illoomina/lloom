@@ -8,11 +8,11 @@
 //! `DecodeOptions`), so the option surface adds no work to the token path
 //! (`DESIGN.md` §15.2 #9).
 //!
-//! The groups mirror what `lfm2-chat` reaches by hand (`decode-driver-design.md`
-//! Stage 7): the token mechanisms (`decode.readback.*`), the loop's pacing
-//! (`decode.in_flight`), and the prefill's shape (`decode.prefill.*`). The
-//! spellings are `lfm2-chat`'s, so a measurement written against it runs
-//! unchanged through `lloom chat`.
+//! The groups are the token mechanisms (`decode.readback.*`), the loop's
+//! pacing (`decode.in_flight`), and the prefill's shape (`decode.prefill.*`).
+//! The spellings are the retired `lfm2-chat` harness's, so a measurement
+//! written against it runs through `lloom chat` / `lloom bench`; the
+//! flag-for-flag map is `decode-driver-design.md` Stage 7.
 
 use crate::decode::{DecodeParams, ReadbackArm, RingArm};
 use lloom::generation::poll::PollMechanism;
@@ -63,7 +63,7 @@ lloom_tensor::serde_via_str!(ReadbackKind);
 /// How a ring learns EOS (`lloom::generation::EosRead`, by name).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EosKind {
-    /// One blocking flag read per step (`lfm2-chat --readback ring`).
+    /// One blocking flag read per step (`--readback ring`).
     Blocking,
     /// The kernel-written stamp polled (`ring-nonblocking`, the crown).
     #[default]
@@ -197,7 +197,7 @@ impl Default for ReadbackConfig {
 }
 
 impl ReadbackConfig {
-    /// Every spelling `--readback` takes (`lfm2-chat`'s and `lloom serve`'s).
+    /// Every spelling `--readback` takes.
     pub const SPELLINGS: &'static [&'static str] = &[
         "auto",
         "blocking",
@@ -325,7 +325,7 @@ impl ReadbackConfig {
         }
     }
 
-    /// The refusals `lfm2-chat` makes before a run, made here once so every
+    /// The refusals a run meets before it starts, made here once so every
     /// binary refuses the same combinations with the same reasons. Only a
     /// value no arm can run is refused: a knob that defaults on (the adaptive
     /// commit, the EOS gate that rides it) is clamped where the arm cannot
@@ -339,11 +339,21 @@ impl ReadbackConfig {
     }
 }
 
+/// Whether a ring arm, as it runs ([`RingArm::resolved`]), stamps each token
+/// as it publishes it: the poll and flag reads always, the deferred reads
+/// only under the adaptive commit. A model's host fill needs that stamp
+/// (`CausalLM::host_feed`); on any other arm its forward reads the fed id
+/// back. Restates `ReadbackStrategy::stamps_each_token` for `Ring`, and a
+/// test holds the two equal on every read and cadence.
+pub fn stamps_each_token(ring: RingArm) -> bool {
+    matches!(ring.eos, EosRead::Blocking | EosRead::Poll(_)) || ring.adaptive
+}
+
 // ---- the prefill ----------------------------------------------------------------
 
-/// The aligned GEMM buckets `--spark` schedules through (`lfm2-chat`: `1` is
-/// the `seq_len == 1` path, `16`/`32` the aligned 16-row tile, `64` the
-/// aligned 64-row tile).
+/// The aligned GEMM buckets `--spark` schedules through: `1` is the
+/// `seq_len == 1` path, `16`/`32` the aligned 16-row tile, `64` the aligned
+/// 64-row tile.
 pub const SPARK_BUCKETS: [usize; 4] = [1, 16, 32, 64];
 
 fn spark_bucket(n: usize) -> Result<usize, String> {
@@ -360,8 +370,7 @@ fn spark_bucket(n: usize) -> Result<usize, String> {
 /// Parse a `--spark` spelling into `(ramp, bulk)`: `RAMP[/tile:BULK]`, where
 /// `RAMP` is `N` (one fixed first bucket) or `progressive:START,STOP` (the
 /// buckets from `START` to `STOP`), and `/tile:BULK` chops the remainder into
-/// `BULK`-wide forwards instead of a `seq_len == 1` tail. `lfm2-chat`'s
-/// grammar, verbatim.
+/// `BULK`-wide forwards instead of a `seq_len == 1` tail.
 pub fn parse_spark(s: &str) -> Result<(Vec<usize>, usize), String> {
     let s = s.trim();
     let (ramp_str, bulk) = match s.split_once("/tile:") {
@@ -629,10 +638,18 @@ impl TuningOptions {
 
 // ---- the model axes -----------------------------------------------------------
 
-/// The cache presets `lfm2-chat --cache` names, plus `auto` (the engine's
-/// rule: the pool arms at `--batch N`, the rewindable arms under `--dspark`,
-/// the crown otherwise).
-pub const CACHE_PRESETS: &[&str] = &["auto", "crown", "rewindable", "pool", "pool-spec"];
+/// The cache presets, plus `auto` (the engine's rule: the pool arms at
+/// `--batch N`, the rewindable arms under `--dspark`, the crown otherwise).
+/// `rewindable` without a drafter and `rewindable-notap` run the speculative
+/// body's cache at K = 1, so its cost separates from the verify loop's.
+pub const CACHE_PRESETS: &[&str] = &[
+    "auto",
+    "crown",
+    "rewindable",
+    "rewindable-notap",
+    "pool",
+    "pool-spec",
+];
 
 /// The model's own axes: a cache preset as the base, then per-axis overrides
 /// by flag name (`attn`, `kv-append`, `conv-state`, `qkv-layout`,
@@ -643,7 +660,7 @@ pub const CACHE_PRESETS: &[&str] = &["auto", "crown", "rewindable", "pool", "poo
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// The base preset: `auto | crown | rewindable | pool | pool-spec`.
+    /// The base preset: `auto | crown | rewindable | rewindable-notap | pool | pool-spec`.
     pub cache: String,
     /// Per-axis overrides, flag → value in the flag spelling, applied over
     /// the preset in key order.
@@ -666,8 +683,8 @@ impl ModelConfig {
         key: "cache",
         flag: "cache",
         env: None,
-        doc: "The cache preset the axes are applied over: auto (the engine's rule), crown, rewindable, pool, pool-spec.",
-        variants: &["auto", "crown", "rewindable", "pool", "pool-spec"],
+        doc: "The cache preset the axes are applied over: auto (the engine's rule), crown, rewindable, rewindable-notap, pool, pool-spec.",
+        variants: &["auto", "crown", "rewindable", "rewindable-notap", "pool", "pool-spec"],
         ty: "String",
         nested: None,
         is_bool: false,
@@ -740,7 +757,7 @@ fn json_scalar(key: &str, v: &serde_json::Value) -> Result<String, String> {
 /// `lfm2::Config` (`--attn`, `--kv-append`, …), generated by its derive.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct ModelConfigArgs {
-    /// The cache preset the axes are applied over (`auto | crown | rewindable | pool | pool-spec`).
+    /// The cache preset the axes are applied over (`auto | crown | rewindable | rewindable-notap | pool | pool-spec`).
     #[arg(id = "ModelConfig.cache", long = "cache", value_name = "PRESET")]
     pub cache: Option<String>,
     #[command(flatten)]
@@ -1013,9 +1030,9 @@ fn parse_barrier_scope(v: &str) -> Result<String, String> {
     }
 }
 
-/// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `lfm2-chat`'s
-/// `--arena --arena-layout --packed --replay --replay-barriers
-/// --replay-barrier-scope --pass-plans`): installed on the device at load,
+/// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `--arena
+/// --arena-layout --packed --replay --replay-barriers --replay-barrier-scope
+/// --pass-plans`): installed on the device at load,
 /// before the model. Instruments and A/B arms — none is the shipping path.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
@@ -1280,6 +1297,43 @@ mod tests {
         assert_eq!(cfg.prefill.schedule(), Some((vec![16], 0)));
     }
 
+    /// `stamps_each_token` answers what the ring itself answers, on every
+    /// EOS read at both cadences (the CPU ring: the rule is the strategy's,
+    /// not the device's).
+    #[test]
+    fn stamps_each_token_is_the_rings_own_answer() {
+        use lloom::generation::{ReadbackStrategy, Ring};
+        let reads = [
+            EosRead::Blocking,
+            EosRead::Poll(PollMechanism::default()),
+            EosRead::HostOnDrain,
+            EosRead::GpuBatched,
+            EosRead::GpuBatchedNonblocking,
+        ];
+        let mut per_token = 0;
+        for eos in reads {
+            let ring = Ring::new(&[2], &lloom_tensor::Device::Cpu, 64, eos).unwrap();
+            for adaptive in [false, true] {
+                let arm = RingArm {
+                    adaptive,
+                    eos,
+                    ..RingArm::CROWN
+                };
+                assert_eq!(
+                    stamps_each_token(arm),
+                    ring.stamps_each_token(adaptive),
+                    "{}",
+                    arm.name()
+                );
+                per_token += stamps_each_token(arm) as usize;
+            }
+        }
+        assert_eq!(
+            per_token, 7,
+            "poll and flag twice, the three deferred reads once"
+        );
+    }
+
     /// A ring arm that cannot carry the adaptive commit — the flag EOS read,
     /// or no lookahead — runs the fixed cadence and says why at load, naming
     /// the EOS gate that rides it; neither default-on knob is refused. The
@@ -1370,5 +1424,60 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::parse_spark;
+
+    #[test]
+    fn a_fixed_bucket_takes_the_seq1_tail() {
+        assert_eq!(parse_spark("16").unwrap(), (vec![16], 0));
+        assert_eq!(parse_spark("1").unwrap(), (vec![1], 0));
+        assert_eq!(parse_spark("64").unwrap(), (vec![64], 0));
+    }
+
+    #[test]
+    fn a_width_off_the_buckets_is_refused() {
+        assert!(parse_spark("4").is_err());
+        assert!(parse_spark("8").is_err());
+        assert!(parse_spark("100").is_err());
+    }
+
+    #[test]
+    fn progressive_ramps_through_the_buckets() {
+        assert_eq!(
+            parse_spark("progressive:1,64").unwrap(),
+            (vec![1, 16, 32, 64], 0)
+        );
+        assert_eq!(parse_spark("progressive:1,16").unwrap(), (vec![1, 16], 0));
+        assert_eq!(
+            parse_spark("progressive:16,64").unwrap(),
+            (vec![16, 32, 64], 0)
+        );
+        assert_eq!(
+            parse_spark("progressive:1,32").unwrap(),
+            (vec![1, 16, 32], 0)
+        );
+        assert!(parse_spark("progressive:64,1").is_err());
+        assert!(parse_spark("progressive:4,64").is_err());
+        assert!(parse_spark("progressive:1").is_err());
+    }
+
+    #[test]
+    fn the_bulk_tile_rides_either_ramp() {
+        assert_eq!(parse_spark("16/tile:32").unwrap(), (vec![16], 32));
+        assert_eq!(parse_spark("1/tile:64").unwrap(), (vec![1], 64));
+        assert_eq!(
+            parse_spark("progressive:1,64/tile:64").unwrap(),
+            (vec![1, 16, 32, 64], 64)
+        );
+        assert!(parse_spark("16/tile:4").is_err());
+        assert!(
+            parse_spark("16/tile:1").is_err(),
+            "1 is the tail, not a bulk tile"
+        );
+        assert!(parse_spark("16/tile:x").is_err());
     }
 }

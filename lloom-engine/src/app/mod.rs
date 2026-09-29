@@ -10,9 +10,12 @@ pub mod chat;
 pub mod common;
 pub mod family;
 pub mod lfm2;
+pub mod modes;
 pub mod qwen4exp;
+pub mod report;
 pub mod serve;
 pub mod served;
+pub mod template;
 pub mod vision;
 
 use anyhow::{Context, Result};
@@ -109,7 +112,13 @@ pub struct ModelArgs {
     #[arg(long, default_value_t = 0)]
     pub pin: usize,
 
-
+    /// LFM2, under `--attn flash`: pages per FlashDecoding chunk (`k` of
+    /// `chunk_size = k × page_size`; 1, the shipped value, is a 256-key chunk
+    /// per partial threadgroup). A probe of the partial kernel's geometry at
+    /// long context; `k > 1` needs the pool's pages chunk-contiguous, which a
+    /// fresh single-sequence pool is and a recycled one is not (§10.3d).
+    #[arg(long, value_name = "K")]
+    pub flash_k: Option<usize>,
 }
 
 /// The serving shape the family builds for: `serve`'s width and cells, or
@@ -338,8 +347,7 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
         .options
         .apply(&mut o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // The speculation shorthands (`lfm2-chat` / `qwen4exp-chat` spellings),
-    // over the group.
+    // The speculation shorthands (the harnesses' spellings), over the group.
     if common.dspark && common.mtp.is_some() {
         anyhow::bail!("--dspark is LFM2's drafter and --mtp Qwen4-exp's; one speculative body per run");
     }

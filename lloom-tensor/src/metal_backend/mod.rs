@@ -24,6 +24,8 @@ use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
 pub use device::{wire_weights_on, DeviceId, MetalDevice, PassPlansPaused};
+mod host_fed;
+pub use host_fed::HostFedRing;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
@@ -34,7 +36,8 @@ use device::{
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
     hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    EscapeGuard, FreeSummary, HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
+    EscapeGuard, FreeSummary, HazardKey, PassKey, PassKind, PassOpener, PassPlanCounters, Slot,
+    StepPlan,
 };
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
@@ -2977,6 +2980,7 @@ impl BackendDevice for MetalDevice {
             pass_plans: Arc::new(parking_lot::Mutex::new(None)),
             base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            served_pass_pool_requests: Arc::new(Default::default()),
         })
     }
 

@@ -53,30 +53,65 @@ use lloom_tensor::kernels::Kernels;
 ///
 /// Written out rather than derived, because `Source` has no `EnumIter` and an
 /// incomplete list would silently under-report the instantiated set — which is
-/// the failure this whole instrument exists to correct. The count is asserted
-/// against `Source`'s own arm count below, so adding a variant without adding
-/// it here is a failure rather than a silent omission.
-const ALL_SOURCES: &[(Source, &str)] = &[
-    (Source::Affine, "affine"),
-    (Source::ArenaAlloc, "arena_alloc"),
-    (Source::Binary, "binary"),
-    (Source::Cast, "cast"),
-    (Source::Conv, "conv"),
-    (Source::Fill, "fill"),
-    (Source::FlashDecoding, "flash_decoding"),
-    (Source::Gemm, "mlx_gemm"),
-    (Source::Gemv, "gemv"),
-    (Source::Indexing, "indexing"),
-    (Source::MlxSort, "mlx_sort"),
-    (Source::Quantized, "quantized"),
-    (Source::Random, "random"),
-    (Source::Reduce, "reduce"),
-    (Source::Scratch, "scratch"),
-    (Source::Sort, "sort"),
-    (Source::Ternary, "ternary"),
-    (Source::Unary, "unary"),
-    (Source::Sdpa, "sdpa"),
+/// the failure this whole instrument exists to correct. [`label`] matches
+/// every arm with no catch-all, so a variant added to `Source` fails to
+/// compile here until it is named; `main` checks the list covers the labels.
+const ALL_SOURCES: &[Source] = &[
+    Source::Affine,
+    Source::ArenaAlloc,
+    Source::Binary,
+    Source::Cast,
+    Source::Conv,
+    Source::EosGate,
+    Source::EosIndex,
+    Source::Fill,
+    Source::FlashDecoding,
+    Source::Gemm,
+    Source::Gemv,
+    Source::Gdn,
+    Source::Indexing,
+    Source::MlxSort,
+    Source::Quantized,
+    Source::Qwen4Exp,
+    Source::Random,
+    Source::Reduce,
+    Source::Rope,
+    Source::Scratch,
+    Source::Sort,
+    Source::Ternary,
+    Source::Unary,
+    Source::Sdpa,
 ];
+
+/// The source's name, and the exhaustiveness check the list above leans on.
+fn label(s: Source) -> &'static str {
+    match s {
+        Source::Affine => "affine",
+        Source::ArenaAlloc => "arena_alloc",
+        Source::Binary => "binary",
+        Source::Cast => "cast",
+        Source::Conv => "conv",
+        Source::EosGate => "eos_gate",
+        Source::EosIndex => "eos_index",
+        Source::Fill => "fill",
+        Source::FlashDecoding => "flash_decoding",
+        Source::Gemm => "mlx_gemm",
+        Source::Gemv => "gemv",
+        Source::Gdn => "gdn",
+        Source::Indexing => "indexing",
+        Source::MlxSort => "mlx_sort",
+        Source::Quantized => "quantized",
+        Source::Qwen4Exp => "qwen4exp",
+        Source::Random => "random",
+        Source::Reduce => "reduce",
+        Source::Rope => "rope",
+        Source::Scratch => "scratch",
+        Source::Sort => "sort",
+        Source::Ternary => "ternary",
+        Source::Unary => "unary",
+        Source::Sdpa => "sdpa",
+    }
+}
 
 fn main() {
     let device = Device::system_default().expect("no Metal device");
@@ -85,7 +120,10 @@ fn main() {
     let mut total = 0usize;
     let mut rows: Vec<(&str, Vec<String>)> = Vec::new();
 
-    for (source, label) in ALL_SOURCES {
+    // 24 arms in `label`; a list shorter than that under-reports.
+    assert_eq!(ALL_SOURCES.len(), 24, "ALL_SOURCES does not name every Source");
+    for source in ALL_SOURCES {
+        let label = label(*source);
         let library = match kernels.load_library(&device, *source) {
             Ok(lib) => lib,
             Err(e) => {

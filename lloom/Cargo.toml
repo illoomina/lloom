@@ -119,6 +119,11 @@ harness = false
 [[example]]
 name = "cpu_benchmarks"
 
+# The value-law spikes (P-a, P-b, §21.8): the tiny LFM2 under each law, on the
+# CPU and (with `--device metal`) on Metal.
+[[example]]
+name = "tiny_value_law"
+
 # macOS-only: `mincore`/`MINCORE_INCORE` and the page-cache arms are Darwin
 # semantics, so the probe is gated with the Metal build (never on the CPU CI).
 [[example]]

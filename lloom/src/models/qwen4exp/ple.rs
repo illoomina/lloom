@@ -3,7 +3,8 @@
 //!
 //! Three pieces, in dataflow order:
 //!
-//! 1. [`NgramHash`] — the multi-head hash from the token window to table rows.
+//! 1. [`NgramHash`] — the multi-head hash from the token window to table rows,
+//!    the engine's (`nn::ngram_memory`), with its constants from the GGUF.
 //!    Bit-exact to the reference (vLLM `qwen4_exp/nvidia/ops/ple.py`, llama.cpp
 //!    `qwen4exp.cpp` `llm_graph_input_ple::set_input`): per n-gram order
 //!    `n ∈ 2..=ngram_size`, `mixed_n = tok[t]·m[0] ^ tok[t-1]·m[1] ^ … ^
@@ -14,6 +15,8 @@
 //!    context. A wrong hash changes no shape — it is a text-gate-only trap
 //!    (`design/docs/expert-streaming.md` §20.1a), so the tests here pin it
 //!    against hand-computed rows and the checkpoint's own hash constants.
+//!    On a ring arm a producer thread hashes and gathers (the n-gram memory's
+//!    host fill, §20.13) and the GPU waits for its rows before this block.
 //! 2. [`PleTable`] — the row gather, the engine's `nn::ngram_memory`. The
 //!    table is 320 M rows × 160 (28.8 GB at IQ4_NL, the second GGUF shard), so
 //!    it is never loaded: a token's 16 rows (90 B each) are read from a memory
@@ -29,229 +32,11 @@ use crate::nn::{ops, RecurrentState};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor};
 
-/// The per-layer hash constants, as the checkpoint records them
-/// (`qwen4exp.ple.{layer_multipliers, head_offsets, head_vocab_sizes, eos_token_id}`).
-#[derive(Debug, Clone)]
-pub struct NgramHash {
-    /// `layer_multipliers[i]` multiplies the token `i` positions back.
-    multipliers: Vec<i64>,
-    /// Per-head prime table sizes, `n_heads` of them.
-    sizes: Vec<i64>,
-    /// Per-head row offsets into the flat table.
-    offsets: Vec<i64>,
-    heads_per_ngram: usize,
-    ngram_size: usize,
-    eos: i64,
-}
-
-impl NgramHash {
-    pub fn new(
-        multipliers: Vec<i64>,
-        sizes: Vec<i64>,
-        offsets: Vec<i64>,
-        heads_per_ngram: usize,
-        eos: u32,
-    ) -> Result<Self> {
-        let ngram_size = multipliers.len();
-        let n_heads = (ngram_size.saturating_sub(1)) * heads_per_ngram;
-        if ngram_size < 2 || heads_per_ngram == 0 {
-            lloom_tensor::bail!(
-                "ple hash: ngram_size {ngram_size} / heads_per_ngram {heads_per_ngram}"
-            )
-        }
-        if sizes.len() < n_heads || offsets.len() < n_heads {
-            lloom_tensor::bail!(
-                "ple hash: {n_heads} heads but {} sizes / {} offsets",
-                sizes.len(),
-                offsets.len()
-            )
-        }
-        if sizes.iter().take(n_heads).any(|&s| s <= 0) {
-            lloom_tensor::bail!("ple hash: a head vocab size is not positive")
-        }
-        Ok(Self {
-            multipliers,
-            sizes,
-            offsets,
-            heads_per_ngram,
-            ngram_size,
-            eos: eos as i64,
-        })
-    }
-
-    /// Heads (rows gathered per token): `(ngram_size − 1) · heads_per_ngram`.
-    pub fn n_heads(&self) -> usize {
-        (self.ngram_size - 1) * self.heads_per_ngram
-    }
-
-    /// Predecessors the window needs: `ngram_size − 1`.
-    pub fn context_len(&self) -> usize {
-        self.ngram_size - 1
-    }
-
-    /// One row of the table, past the last real row (the padded tail).
-    pub fn total_rows(&self) -> i64 {
-        let n = self.n_heads();
-        (0..n)
-            .map(|h| self.offsets[h] + self.sizes[h])
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Row ids for one token. `window[0]` is the token itself, `window[s]` the
-    /// token `s` positions back (`None` before the sequence start). `out` is
-    /// `n_heads` long, head-major.
-    pub fn row_ids(&self, window: &[Option<u32>], out: &mut [i64]) {
-        debug_assert_eq!(window.len(), self.ngram_size);
-        debug_assert_eq!(out.len(), self.n_heads());
-        let cur = window[0].map(|t| t as i64).unwrap_or(self.eos);
-        // mixed[n-2] accumulates the n-gram's XOR as the window walks outward.
-        let mut mixed = cur.wrapping_mul(self.multipliers[0]);
-        let mut crossed = false;
-        for (shift, older) in window.iter().enumerate().skip(1) {
-            let mut candidate = older.map(|t| t as i64).unwrap_or(self.eos);
-            if crossed {
-                candidate = self.eos;
-            }
-            crossed |= candidate == self.eos;
-            mixed ^= candidate.wrapping_mul(self.multipliers[shift]);
-            // Every head of order n > shift includes this term; the order
-            // `shift + 1` heads are complete now.
-            let order = shift + 1;
-            let base = (order - 2) * self.heads_per_ngram;
-            for g in 0..self.heads_per_ngram {
-                let h = base + g;
-                let size = self.sizes[h];
-                let mut rem = mixed.wrapping_rem(size);
-                if rem < 0 {
-                    rem += size;
-                }
-                out[h] = rem + self.offsets[h];
-            }
-        }
-    }
-
-    /// The reference derivation of the constants (vLLM
-    /// `Qwen4ExpNGramEmbedding::_make_layer_multipliers` /
-    /// `_make_vocab_layout`), so the checkpoint's recorded values can be
-    /// cross-checked rather than trusted.
-    pub fn derive(
-        seed: u64,
-        unigram_vocab_size: u64,
-        ngram_size: usize,
-        heads_per_ngram: usize,
-        ngram_vocab_size_base: u64,
-        ple_dense_layer_id: u64,
-        eos: u32,
-    ) -> Result<Self> {
-        const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-        const PRIME: u64 = 10007;
-        let max_multiplier = ((1u64 << 63) - 1) / unigram_vocab_size;
-        let half_bound = (max_multiplier / 2).max(1);
-        let base_seed = seed.wrapping_add(PRIME.wrapping_mul(ple_dense_layer_id));
-        let multipliers: Vec<i64> = (0..ngram_size)
-            .map(|i| {
-                let v = base_seed.wrapping_add(GAMMA.wrapping_mul(i as u64 + 1));
-                (2 * (splitmix64(v) % half_bound) + 1) as i64
-            })
-            .collect();
-        let n_heads = (ngram_size - 1) * heads_per_ngram;
-        let mut sizes = Vec::with_capacity(n_heads);
-        let mut offsets = Vec::with_capacity(n_heads);
-        let mut offset = 0i64;
-        for local in 0..n_heads as u64 {
-            let global = ple_dense_layer_id * n_heads as u64 + local;
-            let size = nth_prime_after(ngram_vocab_size_base - 1, global + 1) as i64;
-            sizes.push(size);
-            offsets.push(offset);
-            offset += size;
-        }
-        Self::new(multipliers, sizes, offsets, heads_per_ngram, eos)
-    }
-}
-
-fn splitmix64(mut v: u64) -> u64 {
-    v = v.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    v ^ (v >> 31)
-}
-
-fn is_prime_64(n: u64) -> bool {
-    if n < 2 {
-        return false;
-    }
-    for p in [2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        if n.is_multiple_of(p) {
-            return n == p;
-        }
-    }
-    let mut d = n - 1;
-    let mut s = 0;
-    while d.is_multiple_of(2) {
-        d /= 2;
-        s += 1;
-    }
-    'witness: for a in [2u64, 325, 9375, 28178, 450775, 9780504, 1795265022] {
-        if a % n == 0 {
-            continue;
-        }
-        let mut x = mod_pow(a, d, n);
-        if x == 1 || x == n - 1 {
-            continue;
-        }
-        for _ in 0..s - 1 {
-            x = mod_mul(x, x, n);
-            if x == n - 1 {
-                continue 'witness;
-            }
-        }
-        return false;
-    }
-    true
-}
-
-fn mod_mul(a: u64, b: u64, m: u64) -> u64 {
-    ((a as u128 * b as u128) % m as u128) as u64
-}
-
-fn mod_pow(mut base: u64, mut exp: u64, m: u64) -> u64 {
-    let mut acc = 1u64;
-    base %= m;
-    while exp > 0 {
-        if exp & 1 == 1 {
-            acc = mod_mul(acc, base, m);
-        }
-        base = mod_mul(base, base, m);
-        exp >>= 1;
-    }
-    acc
-}
-
-/// The `count`-th prime strictly greater than `start`.
-fn nth_prime_after(start: u64, count: u64) -> u64 {
-    let mut prime = start;
-    for _ in 0..count {
-        let mut c = prime + 1;
-        if c <= 2 {
-            prime = 2;
-            continue;
-        }
-        if c.is_multiple_of(2) {
-            c += 1;
-        }
-        while !is_prime_64(c) {
-            c += 2;
-        }
-        prime = c;
-    }
-    prime
-}
-
 /// The table's storage is the engine's n-gram memory (`nn::ngram_memory`),
 /// under the names this model's code has always used.
 pub use crate::nn::ngram_memory::{
-    CachedRows as CachedPleTable, MmapRows as MmapPleTable, RowTable as PleTable,
+    CachedRows as CachedPleTable, MmapRows as MmapPleTable, NgramHash, NgramWindow,
+    RowTable as PleTable,
 };
 
 /// The PLE block's weights for its one layer.
@@ -308,6 +93,11 @@ impl PleLayer {
             dilation,
             eps,
         })
+    }
+
+    /// The device the block's weights live on.
+    pub fn device(&self) -> &lloom_tensor::Device {
+        self.norm_key.device()
     }
 
     /// The conv history the state channel carries per position: `(k−1)·dilation`.
@@ -394,46 +184,6 @@ impl PleLayer {
         let new_hist = padded.narrow(1, seq, hist)?.contiguous()?;
         conv_state.write(l, new_hist)?;
         out.t()?.reshape((1, seq, ch))
-    }
-}
-
-/// The per-sequence token window the hash reads: the last `context_len`
-/// tokens, newest last, `None` before the sequence start.
-#[derive(Debug, Clone)]
-pub struct NgramWindow {
-    prev: Vec<Option<u32>>,
-}
-
-impl NgramWindow {
-    pub fn new(context_len: usize) -> Self {
-        Self {
-            prev: vec![None; context_len],
-        }
-    }
-
-    pub fn reset(&mut self) {
-        for p in &mut self.prev {
-            *p = None;
-        }
-    }
-
-    /// The hash window for `token` at the current position: `[token, prev1,
-    /// prev2, …]` (newest first).
-    pub fn window(&self, token: Option<u32>) -> Vec<Option<u32>> {
-        let mut w = Vec::with_capacity(self.prev.len() + 1);
-        w.push(token);
-        w.extend(self.prev.iter().rev().copied());
-        w
-    }
-
-    /// Advance past `token`.
-    pub fn push(&mut self, token: Option<u32>) {
-        if self.prev.is_empty() {
-            return;
-        }
-        self.prev.rotate_left(1);
-        let last = self.prev.len() - 1;
-        self.prev[last] = token;
     }
 }
 

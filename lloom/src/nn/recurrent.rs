@@ -93,7 +93,7 @@ fn state_write_by_copy() -> bool {
 /// `MetalStorage::try_clone` hands back the same buffer — so a snapshot taken
 /// with it aliases what it snapshots; the CPU backend copies. This allocates
 /// and copies on every backend.
-fn own_copy(t: &Tensor) -> Result<Tensor> {
+pub(crate) fn own_copy(t: &Tensor) -> Result<Tensor> {
     let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
     out.slice_set(&t.contiguous()?, 0, 0)?;
     Ok(out)
@@ -197,6 +197,15 @@ impl StatePool {
         self.inner.lock().free.push(slot);
     }
 
+    /// Layer `l` as the rows and multi-position kernels read it.
+    pub fn pool_layer(&self, l: usize) -> Result<PoolLayer> {
+        Ok(PoolLayer {
+            tensor: self.layer(l)?,
+            n_slots: self.slots(),
+            n_phases: self.phases(),
+        })
+    }
+
     /// Layer `l`'s tensor `[phases, slots, ..shape]`, allocated (zero) on
     /// first use.
     pub fn layer(&self, l: usize) -> Result<Tensor> {
@@ -212,6 +221,16 @@ impl StatePool {
         }
         Ok(g.slabs[l].as_ref().expect("allocated above").clone())
     }
+}
+
+/// One layer of a [`StatePool`]: `tensor [phases, slots, ..row]`, row `slot`
+/// at `phase` at `(phase · n_slots + slot) · row_elems`, the next phase
+/// `(phase + 1) % n_phases`.
+#[derive(Debug, Clone)]
+pub struct PoolLayer {
+    pub tensor: Tensor,
+    pub n_slots: usize,
+    pub n_phases: usize,
 }
 
 /// A channel's lease on a [`StatePool`] slot.

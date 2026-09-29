@@ -1,8 +1,9 @@
 //! The pass-keyed plan cache (`DESIGN.md` §9.2aa) on the tiny LFM2 fixture:
 //! with `--pass-plans` on, a prompt's prefill and its decode steps compute
 //! the same logits as the pool path, bit for bit; and once every pass shape
-//! the run takes has been seen twice, a further prompt of the same shape
-//! makes **zero** pool allocations — an absolute reference, not "fewer".
+//! the run takes has been seen twice, the passes of a further prompt of the
+//! same shape take every activation from their plans, asking the pools only
+//! for what no plan serves — an exact count, not "fewer".
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model};
@@ -155,8 +156,9 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     let snapshot = |tag: &str| {
         let (shared, private) = m.pool_counters();
         eprintln!(
-            "[{tag}] allocations={} {:?} keys={:?}",
+            "[{tag}] allocations={} served-pass requests={:?} {:?} keys={:?}",
             shared.allocations + private.allocations,
+            m.served_pass_pool_requests(),
             m.pass_plan_counters().unwrap(),
             m.pass_plan_report().map(|(k, _)| k).unwrap_or_default()
         );
@@ -204,11 +206,36 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     // run 2 is served entirely.
     assert_eq!(c.served, 4 + 9, "{c:?}");
 
-    // Served runs: the pool sees no allocation, and a different prompt of
-    // the same shape reads its own values, not the last run's.
+    // Served runs: every activation of their passes comes from the plans, and
+    // a different prompt of the same shape reads its own values, not the last
+    // run's.
+    //
+    // The pool's own `allocations` is not that claim. A request made between
+    // passes (the staged ids, the next prompt's cache) hits or misses
+    // according to whether the completion handler has drained its same-size
+    // predecessor yet: the GPU's timing, not the plan's coverage (§6.3b). The
+    // trim empties both free lists so those requests allocate on every run;
+    // the served-pass count must not see them.
+    //
+    // What a served pass does ask the pool for is exact, and all of it is
+    // `Tensor::zeros`, which the Shared pool serves and no plan does: the
+    // sequence's session state on the fresh tile (each conv layer's carry,
+    // each attention layer's K and V), and nothing on a later tile, since the
+    // carry's padding is set in place in the state (`pass-plan-design.md`
+    // §18). The private pool, which plans serve, is asked nothing; nor is any
+    // pool by a decode step.
+    let conv = cfg
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, LayerType::Conv))
+        .count() as u64;
+    let attn = cfg.layer_types.len() as u64 - conv;
+    let per_prompt = (conv + 2 * attn, 0);
+    let served_before = m.pass_plan_counters().unwrap().served;
+    let requests_before = m.served_pass_pool_requests();
+    m.trim_unused_buffers();
     let (shared, private) = m.pool_counters();
     let allocs_before = shared.allocations + private.allocations;
-    let served_before = m.pass_plan_counters().unwrap().served;
     let got3 = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
     snapshot("after run 3");
     let got_other = run_prompt(&model, &cfg, &dev, &other, 4, 6)?;
@@ -220,15 +247,131 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     );
     let (shared, private) = m.pool_counters();
     let allocs_after = shared.allocations + private.allocations;
+    let requests = m.served_pass_pool_requests();
+    let requests = (
+        requests.0 - requests_before.0,
+        requests.1 - requests_before.1,
+    );
     let c = m.pass_plan_counters().unwrap();
-    eprintln!("pass plans: {c:?} keys={keys:?} base={base}");
+    eprintln!(
+        "pass plans: {c:?} keys={keys:?} base={base} pool allocations after the trim={} \
+         served-pass pool requests={requests:?}",
+        allocs_after - allocs_before,
+    );
     assert_eq!(c.served - served_before, 2 * (3 + 6), "served {c:?}");
     assert_eq!(c.evicted, 0, "{c:?}");
     assert_eq!(
-        allocs_after - allocs_before,
-        0,
-        "two fully served prompts must allocate nothing from the pool ({c:?})"
+        requests,
+        (2 * per_prompt.0, 2 * per_prompt.1),
+        "(shared, private) pool requests made inside the two prompts' served passes: \
+         beyond the session state, a served pass allocates from its plan alone ({c:?})"
     );
+    assert!(
+        allocs_after > allocs_before,
+        "nothing allocated after the trim: the runs' between-pass requests never reached \
+         the pool, so the count above was not tested against any traffic"
+    );
+    Ok(())
+}
+
+/// The served-pass pool count `plans_serve_every_pass_shape_…` pins counts
+/// exactly the requests a SERVED pass makes: one host upload and one
+/// op past the plan's last ordinal, made inside a served pass, read `(1, 1)`;
+/// the same two made between passes, and every request of the recording
+/// passes, read nothing — though the pool saw them, which the lookups show.
+#[test]
+fn a_served_pass_is_charged_its_own_pool_requests_and_nothing_else() -> Result<()> {
+    use lloom::nn::CausalLM;
+    use lloom_tensor::metal_backend::PassKey;
+    let _serial = SERIAL.lock();
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    cfg.conv_prefill_ctx = true;
+    let model = build(&cfg, &dev)?;
+    m.enable_pass_plans(ArenaLayout::Packed);
+    let lookups = || {
+        let (shared, private) = m.pool_counters();
+        (shared.lookups, private.lookups)
+    };
+    // One of each pool's requests: a host upload (shared) and an op on a
+    // pass's output (private; inside a served pass, past the plan's end).
+    let extras = |out: &Tensor| -> Result<()> {
+        let _ids = Tensor::new(&[1u32, 2, 3], &dev)?;
+        let _scaled = out.affine(2.0, 0.0)?;
+        Ok(())
+    };
+
+    let mut cache = Cache::new(true, DType::F16, &cfg, &dev)?;
+    let prompt = Tensor::new(&[1u32, 2, 3, 4], &dev)?.unsqueeze(0)?;
+    model.prepare_pass(&mut cache, 4)?;
+    m.begin_pass(PassKey::new(PassKind::Prefill { w: 4, fresh: true }))?;
+    model.forward(&prompt, 0, &mut cache)?;
+    m.finish_pass()?;
+    // `(shared, private)`, as `served_pass_pool_requests` and `pool_counters`.
+    type Pools = (u64, u64);
+    let mut pos = 4usize;
+    let mut decode = |extra_inside: bool| -> Result<(bool, Pools, Pools)> {
+        let next = Tensor::new(&[5u32], &dev)?.unsqueeze(0)?;
+        model.prepare_pass(&mut cache, 1)?;
+        let served = m.pass_plan_counters().unwrap().served;
+        let (req, look) = (m.served_pass_pool_requests(), lookups());
+        m.begin_pass(PassKey::new(PassKind::Decode { b: 1 }))?;
+        let out = model.forward(&next, pos, &mut cache)?;
+        if extra_inside {
+            extras(&out)?;
+        }
+        m.finish_pass()?;
+        pos += 1;
+        let was_served = m.pass_plan_counters().unwrap().served > served;
+        let (r, l) = (m.served_pass_pool_requests(), lookups());
+        Ok((
+            was_served,
+            (r.0 - req.0, r.1 - req.1),
+            (l.0 - look.0, l.1 - look.1),
+        ))
+    };
+
+    // Decode{1}'s first sight records and its second closes the plan: both
+    // run on the pool, and neither is counted.
+    for sight in 0..2 {
+        let (served, counted, looked) = decode(false)?;
+        assert!(!served, "sight {sight} was served before its plan existed");
+        assert_eq!(
+            counted,
+            (0, 0),
+            "sight {sight}: a recording pass was counted"
+        );
+        assert!(
+            looked.1 > 0,
+            "sight {sight}: a recording pass asked the private pool nothing"
+        );
+    }
+    let (served, counted, _) = decode(false)?;
+    assert!(served, "the third sight was not served");
+    assert_eq!(counted, (0, 0), "a served pass with nothing extra");
+    let (served, counted, _) = decode(true)?;
+    assert!(served, "the fourth sight was not served");
+    assert_eq!(
+        counted,
+        (1, 1),
+        "one upload and one op past the plan, inside a served pass, are (shared, private)"
+    );
+
+    // The same two requests between passes reach the pools and are not counted.
+    let out = Tensor::zeros((1, 4), DType::F16, &dev)?;
+    let (req, look) = (m.served_pass_pool_requests(), lookups());
+    extras(&out)?;
+    let (r, l) = (m.served_pass_pool_requests(), lookups());
+    assert_eq!(
+        (l.0 - look.0, l.1 - look.1),
+        (1, 1),
+        "the extras' own requests"
+    );
+    assert_eq!(r, req, "a request between passes was counted");
+    assert_eq!(m.pass_plan_counters().unwrap().evicted, 0);
     Ok(())
 }
 
@@ -813,6 +956,12 @@ fn a_ring_conv_arm_has_no_escapes_fused_or_not() -> Result<()> {
 /// The control arm pins the detector itself: a value whose object is still
 /// alive and bound in the next pass IS an escape, so the fixed arm's zero is
 /// not a detector that stopped seeing anything.
+///
+/// Whether a new object lands on a freed address is the allocator's choice:
+/// in a fresh process the first freed object's address rarely comes back,
+/// and once a round of objects has been created and freed it comes back on
+/// the first attempt. So the scenario repeats, each time with a fresh
+/// recorder, until one lands.
 #[test]
 fn a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value() -> Result<()> {
     use lloom_tensor::kernels::metal::arena::{set_bind_observer, ArenaRecorder};
@@ -825,55 +974,65 @@ fn a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value() -> Result<
         raw.new_buffer(4096, MTLResourceOptions::empty())
             .expect("a 4 KiB buffer")
     };
-    let rec = Arc::new(parking_lot::Mutex::new(ArenaRecorder::new()));
-    set_bind_observer(Some(Arc::clone(&rec)));
+    // `Some((attempt, escaped ordinals))` once a new object took the dead
+    // object's address.
+    let scenario = || -> Option<(usize, Vec<usize>)> {
+        let rec = Arc::new(parking_lot::Mutex::new(ArenaRecorder::new()));
+        set_bind_observer(Some(Arc::clone(&rec)));
 
-    // Pass 1: two values, one whose object then dies and one that lives on.
-    let dying = new_buffer();
-    let living = new_buffer();
-    let dead_addr = dying.raw_addr();
-    {
-        let mut r = rec.lock();
-        r.record_alloc(dead_addr, 4096);
-        r.record_alloc(living.raw_addr(), 4096);
-    }
-    drop(dying);
-    rec.lock().next_step();
-
-    // Pass 2: objects are created, none reported as an allocation, until one
-    // lands on the dead object's address. Each is kept alive so no attempt
-    // can hand back an address an earlier attempt freed.
-    let mut attempts = Vec::new();
-    let reused = loop {
-        let b = new_buffer();
-        let hit = b.raw_addr() == dead_addr;
-        attempts.push(b);
-        if hit || attempts.len() == 4096 {
-            break hit;
+        // Pass 1: two values, one whose object then dies and one that lives on.
+        let dying = new_buffer();
+        let living = new_buffer();
+        let dead_addr = dying.raw_addr();
+        {
+            let mut r = rec.lock();
+            r.record_alloc(dead_addr, 4096);
+            r.record_alloc(living.raw_addr(), 4096);
         }
+        drop(dying);
+        rec.lock().next_step();
+
+        // Pass 2: objects are created, none reported as an allocation, until
+        // one lands on the dead object's address. Each is kept alive so no
+        // attempt can hand back an address an earlier attempt freed.
+        let mut attempts = Vec::new();
+        let reused = loop {
+            let b = new_buffer();
+            let hit = b.raw_addr() == dead_addr;
+            attempts.push(b);
+            if hit || attempts.len() == 16 {
+                break hit;
+            }
+        };
+        if reused {
+            let mut r = rec.lock();
+            r.record_bind(dead_addr);
+            r.record_bind(living.raw_addr());
+        }
+        set_bind_observer(None);
+        let escaped: Vec<usize> = rec
+            .lock()
+            .previous_undeclared_ordinals()
+            .iter()
+            .map(|&(ordinal, ..)| ordinal)
+            .collect();
+        reused.then_some((attempts.len(), escaped))
     };
-    {
-        let mut r = rec.lock();
-        r.record_bind(dead_addr);
-        r.record_bind(living.raw_addr());
-    }
-    set_bind_observer(None);
-    assert!(
-        reused,
-        "no new buffer object took the destroyed one's address in {} attempts: \
-         the fixture cannot exercise the path it exists for",
-        attempts.len()
-    );
+    let mut scenarios = 0;
+    let (attempt, escaped) = loop {
+        scenarios += 1;
+        if let Some(found) = scenario() {
+            break found;
+        }
+        assert!(
+            scenarios < 256,
+            "no new buffer object took a destroyed one's address in {scenarios} scenarios: \
+             the fixture cannot exercise the path it exists for"
+        );
+    };
     eprintln!(
-        "the destroyed object's address came back on attempt {}",
-        attempts.len()
+        "the destroyed object's address came back on attempt {attempt} of scenario {scenarios}"
     );
-    let escaped: Vec<usize> = rec
-        .lock()
-        .previous_undeclared_ordinals()
-        .iter()
-        .map(|&(ordinal, ..)| ordinal)
-        .collect();
     assert_eq!(
         escaped,
         vec![1],

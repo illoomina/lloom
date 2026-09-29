@@ -12,13 +12,20 @@
 //! The default (`Manual`, flags off) is asserted untouched: bit-identical to
 //! itself across the arms, which is the half that proves the shipping path
 //! was not disturbed (§7.1a).
+//!
+//! The `silu_impl=relu` refusal is `lfm2_fusion_derived_refusal.rs`, its own
+//! process: building that model sets the process-wide SiLU steer, which would
+//! move the logits every test here compares.
 
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{
     Cache, Composition, Config, ConvState, FusionPolicy, GateFusion, KvAppend, LayerType, Model,
 };
-use lloom::nn::VarBuilder;
+use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::testing::tiny::{TinyCheckpoint, Weights};
+use lloom_tensor::metal_backend::profile::CensusRefused;
+use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// The two-layer fixture `lfm2_gemv_epilogue_wiring.rs` uses: one conv layer,
@@ -56,57 +63,49 @@ fn tiny_config(fusion: FusionPolicy, gemv_silu: bool, gemv_residual: bool) -> Co
     }
 }
 
+/// The tiny LFM2 at `cfg`'s geometry and arms (`lloom::testing::tiny`,
+/// keyed weights), at f16.
 fn build(cfg: &Config, dev: &Device) -> Result<Model> {
-    let mut tensors = std::collections::HashMap::new();
-    let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
-        let n: usize = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
-        tensors.insert(name.to_string(), Tensor::from_vec(v, shape, dev)?);
-        Ok(())
-    };
-    let h = cfg.hidden_size;
-    let i = cfg.intermediate_size;
-    fill("model.embed_tokens.weight", vec![cfg.vocab_size, h])?;
-    fill("model.embedding_norm.weight", vec![h])?;
-    for l in 0..cfg.num_hidden_layers {
-        let p = format!("model.layers.{l}");
-        fill(&format!("{p}.operator_norm.weight"), vec![h])?;
-        fill(&format!("{p}.ffn_norm.weight"), vec![h])?;
-        fill(&format!("{p}.feed_forward.w1.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w3.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w2.weight"), vec![h, i])?;
-        match cfg.layer_types[l] {
-            LayerType::Conv => {
-                fill(&format!("{p}.conv.in_proj.weight"), vec![3 * h, h])?;
-                fill(
-                    &format!("{p}.conv.conv.weight"),
-                    vec![h, 1, cfg.conv_l_cache],
-                )?;
-                fill(&format!("{p}.conv.out_proj.weight"), vec![h, h])?;
-            }
-            LayerType::FullAttention => {
-                let kv = cfg.num_key_value_heads * cfg.head_dim();
-                fill(&format!("{p}.self_attn.q_proj.weight"), vec![h, h])?;
-                fill(&format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.out_proj.weight"), vec![h, h])?;
-                fill(
-                    &format!("{p}.self_attn.q_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-                fill(
-                    &format!("{p}.self_attn.k_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-            }
-        }
-    }
-    let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
-    Model::new(cfg, vb)
+    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+        .with_dtype(DType::F16)
+        .model(dev)
+}
+
+/// The decode step on the CPU backend at f32 over the f16 model's (rounded)
+/// weights, every fusion off: the absolute reference (CONTRIBUTING §3.1b)
+/// the derived arm is held to — `derived == manual(on)` is a comparison of
+/// two arms that share every kernel, and moves with them.
+fn cpu_decode(cfg: &Config) -> Result<Vec<f32>> {
+    let mut cpu = cfg.clone();
+    cpu.fusion = FusionPolicy::Manual;
+    cpu.gemv_silu = false;
+    cpu.gemv_residual = false;
+    cpu.gemv_gate = GateFusion::Off;
+    let dev = Device::Cpu;
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(
+        cpu.clone(),
+        Weights {
+            dense: GgmlDType::F16,
+            ..Weights::default()
+        },
+    )
+    .with_dtype(DType::F32)
+    .model(&dev)?;
+    let mut cache = Cache::new(true, DType::F32, &cpu, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
+    model.forward(&inp, 0, &mut cache)?;
+    let step = Tensor::new(&[7u32], &dev)?.reshape((1, 1))?;
+    model
+        .forward(&step, prompt.len(), &mut cache)?
+        .flatten_all()?
+        .to_vec1::<f32>()
 }
 
 /// A prefill and one decode step; the decode step's logits, and the per-label
-/// dispatch census of that step (recorded only under `CANDLE_METAL_PROFILE=1`).
+/// dispatch census of that step from `dev`'s own census (recorded only under
+/// `CANDLE_METAL_PROFILE=1`, empty otherwise), which no test on another
+/// device lands in.
 fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> {
     let model = build(cfg, dev)?;
     let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
@@ -114,7 +113,11 @@ fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> 
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
     dev.synchronize()?;
-    lloom_tensor::metal_backend::profile::reset();
+    let window = match dev.as_metal_device()?.dispatch_census().open() {
+        Ok(w) => Some(w),
+        Err(CensusRefused::ProfileOff) => None,
+        Err(e) => panic!("the decode step's census window: {e:?}"),
+    };
     let step = Tensor::new(&[7u32], dev)?.reshape((1, 1))?;
     let logits = model.forward(&step, prompt.len(), &mut cache)?;
     let logits = logits
@@ -122,11 +125,25 @@ fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> 
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()?;
     dev.synchronize()?;
-    Ok((
-        logits,
-        lloom_tensor::metal_backend::profile::snapshot().by_label,
-    ))
+    Ok((logits, window.map(|w| w.close()).unwrap_or_default()))
 }
+
+/// Every logit bit, folded: a pinned value is an absolute reference that
+/// moves when any bit does — the one here that a defect in code the CPU and
+/// Metal arms share (an op both devices dispatch) cannot move alike.
+fn fingerprint(v: &[f32]) -> u64 {
+    v.iter().fold(0x761, |h, x| {
+        lloom::testing::tiny::init::splitmix64(h ^ x.to_bits() as u64)
+    })
+}
+
+/// The CPU reference's fingerprint under the default law and seed. It moves
+/// with the law, the fixture's geometry and the CPU backend's arithmetic —
+/// each a reason to re-pin, named in the commit that does.
+const CPU_FINGERPRINT: u64 = 0xe41c_e0b0_36c4_0328;
+
+/// `|arm - CPU|` stays inside the f16 activations' own error.
+const CPU_TOL: f32 = 4e-3;
 
 fn count(census: &[(String, u64)], pred: impl Fn(&str) -> bool) -> u64 {
     census
@@ -173,6 +190,24 @@ fn derived_matches_the_hand_selected_fusions_bit_for_bit() -> Result<()> {
         "max |Δ| {delta} against a logit scale of {scale}"
     );
     eprintln!("derived == manual(on); max |Δ| vs unfused {delta:.3e} (scale {scale:.3e})");
+    let cpu = cpu_decode(&tiny_config(FusionPolicy::Derived, false, false))?;
+    assert_eq!(
+        fingerprint(&cpu),
+        CPU_FINGERPRINT,
+        "the CPU reference moved: {:#x}",
+        fingerprint(&cpu)
+    );
+    let off_cpu = max_abs_delta(&manual_off, &cpu);
+    let derived_cpu = max_abs_delta(&derived, &cpu);
+    eprintln!("|unfused - CPU f32| {off_cpu:.3e}; |derived - CPU f32| {derived_cpu:.3e}");
+    // The derived arm is as near the CPU backend as the unfused arm, within
+    // the f16 activations' own error: a fused kernel that computes something
+    // else by less than the 1e-2 bound above still leaves this.
+    assert!(
+        derived_cpu <= CPU_TOL * scale,
+        "the derived arm is {derived_cpu:e} from the CPU backend at scale {scale:e} \
+         (tolerance {CPU_TOL} x scale; the unfused arm is {off_cpu:e})"
+    );
     Ok(())
 }
 
@@ -261,36 +296,6 @@ fn manual_off_is_the_shipping_path_and_deterministic() -> Result<()> {
     let (a, _) = decode(&cfg, &dev)?;
     let (b, _) = decode(&cfg, &dev)?;
     assert_eq!(a, b);
-    Ok(())
-}
-
-/// P2: the exclusion set is consulted for the arms the config selects, not
-/// only for the fragments the derivation composes. `silu_impl=relu` is the
-/// transform §12.2l measured degenerate (2307 f16 ulp, `ARAARAARA…`); under
-/// `Derived` a model selecting it is refused at construction, by name and
-/// with its numbers. Under `Manual` nothing changes — the arm stays selectable
-/// for the ladder it exists to measure.
-#[test]
-fn derived_refuses_an_excluded_silu_arm_at_construction() -> Result<()> {
-    let Ok(dev) = Device::new_metal(0) else {
-        eprintln!("no Metal device; skipping");
-        return Ok(());
-    };
-    let mut cfg = tiny_config(FusionPolicy::Derived, false, false);
-    cfg.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
-    let err = match build(&cfg, &dev) {
-        Ok(_) => panic!("Fusion=Derived must refuse the excluded `silu_impl=relu` arm"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.contains("silu_impl=relu") && err.contains("excluded"),
-        "{err}"
-    );
-    eprintln!("{err}");
-    // Manual is untouched: the arm builds.
-    let mut manual = tiny_config(FusionPolicy::Manual, false, false);
-    manual.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
-    build(&manual, &dev)?;
     Ok(())
 }
 
@@ -394,11 +399,12 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
 }
 
 /// The closed-form gain §5a names, read from the loaded weights: the fold's
-/// ∞-norm per channel, `Σ_j |w[c, j]|`. The fixture fills
-/// `conv.conv.weight` (`[512, 1, 3]`) with `((i % 17) − 8) / 32` over the
-/// flattened index, so the gain is computable by hand — asserted as the
-/// absolute reference (`CONTRIBUTING.md` §3.1b rule 1), max, min and the
-/// count of expansive channels alike — and the horizon is `taps − 1 = 2`.
+/// ∞-norm per channel, `Σ_j |w[c, j]|`. The fixture's `conv.conv.weight`
+/// (`[512, 1, 3]`) is the tiny checkpoint's, keyed by seed, name and index
+/// under the recorded role, so the gain is computable from the law alone —
+/// asserted as the absolute reference (`CONTRIBUTING.md` §3.1b rule 1), max,
+/// min and the count of expansive channels alike — and the horizon is
+/// `taps − 1 = 2`.
 #[test]
 fn the_conv_fold_gain_is_the_weights_norm_and_the_horizon_is_the_window() -> Result<()> {
     let Ok(dev) = Device::new_metal(0) else {
@@ -413,32 +419,46 @@ fn the_conv_fold_gain_is_the_weights_norm_and_the_horizon_is_the_window() -> Res
         .conv_fold_gain
         .clone()
         .expect("one conv layer");
-    // By hand, at f16 (the fixture's dtype): every value ((i % 17) - 8) / 32
-    // is exact in f16, so the sum of three is exact too.
-    let h = cfg.hidden_size;
-    let k = cfg.conv_l_cache;
+    // From the law, at f16 (the fixture's dtype), summed in the tap order.
+    let ckpt = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default());
+    let spec = ckpt
+        .schema()?
+        .get("model.layers.0.conv.conv.weight")
+        .cloned()
+        .expect("the conv layer's filter");
+    let (h, k) = (cfg.hidden_size, cfg.conv_l_cache);
+    assert_eq!(spec.shape, vec![h, 1, k]);
+    let w = ckpt
+        .weights
+        .law
+        .tensor(
+            ckpt.weights.seed,
+            &spec.name,
+            spec.role,
+            &spec.shape.clone().into(),
+            &Device::Cpu,
+        )?
+        .to_dtype(DType::F16)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let mut max = f32::MIN;
     let mut min = f32::MAX;
     let mut over_one = 0;
     for c in 0..h {
-        let l: f32 = (0..k)
-            .map(|j| ((((c * k + j) % 17) as f32) - 8.0) / 32.0)
-            .map(f32::abs)
-            .sum();
+        let l: f32 = w[c * k..(c + 1) * k].iter().map(|x| x.abs()).sum();
         max = max.max(l);
         min = min.min(l);
         if l > 1.0 {
             over_one += 1;
         }
     }
+    eprintln!("conv fold gain from the law: max {max} min {min} over_one {over_one}");
     assert_eq!((g.layers, g.taps, g.channels), (1, 3, h));
     assert_eq!((g.max, g.min, g.over_one), (max, min, over_one));
-    // The absolute values for this fill: the largest window is where the
-    // 17-cycle wraps, {7, 8, −8}/32 → 23/32; the smallest {−1, 0, 1}/32 →
-    // 2/32; no channel is expansive.
-    assert_eq!(g.max, 23.0 / 32.0);
-    assert_eq!(g.min, 2.0 / 32.0);
-    assert_eq!(g.over_one, 0);
+    // The law's filter is expansive on some channels and not on others, so
+    // both sides of the `> 1` count are exercised.
+    assert!(over_one > 0 && over_one < h, "{over_one} of {h}");
     assert!(model
         .fusion_report()
         .unwrap()

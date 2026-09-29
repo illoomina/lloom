@@ -426,6 +426,12 @@ pub struct Commands {
     /// Shared with the buffer pools, which use it to decide when a released
     /// buffer is safe to hand out again. This is the only place it advances.
     clock: Arc<GpuClock>,
+    /// This queue's own dispatch census (`profile::DeviceCensus`), handed to
+    /// every compute encoder this creates while profiling is on.
+    census: Arc<crate::kernels::metal::profile::DeviceCensus>,
+    /// This queue's own dispatch trace (`trace::DeviceTrace`), handed to
+    /// every compute encoder this creates while the trace switch is on.
+    trace: Arc<crate::kernels::metal::trace::DeviceTrace>,
     /// Run after each command buffer completes, once per command buffer.
     ///
     /// The buffer pools subscribe here to sweep in what that command buffer was
@@ -500,8 +506,10 @@ pub struct Commands {
 ///
 /// A command buffer's completion handler only marks the fences of the sessions
 /// it carried completed ([`Fence::mark_completed`]); the host removes their map
-/// entries at its next encoder close ([`FenceBook::reap`]), under the locks that
-/// close takes anyway. So no Metal completion thread ever takes the map's lock
+/// entries at its next encoder close or queue-wide wait ([`FenceBook::reap`]),
+/// under the locks those take anyway. Nothing removes an entry whose session
+/// may still be running: with several threads on one queue, a wait covers only
+/// what was committed when it began. So no Metal completion thread ever takes the map's lock
 /// or this one, and an encoding thread can never wait on a completion thread
 /// descheduled while holding them (`DESIGN.md` §6.4d). Until the close, a bind
 /// that finds a completed fence treats it as absent, as it was once the
@@ -537,11 +545,6 @@ impl FenceBook {
                 }
             }
         }
-    }
-
-    fn clear(&mut self) {
-        self.live.clear();
-        self.retiring.clear();
     }
 }
 
@@ -676,6 +679,8 @@ impl Commands {
             live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
             residency_set,
             clock: Arc::new(GpuClock::new()),
+            census: Arc::default(),
+            trace: Arc::default(),
             on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
             executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
             completion_wait,
@@ -819,6 +824,18 @@ impl Commands {
         Arc::clone(&self.clock)
     }
 
+    /// The dispatch census of this queue alone, for a window that must not
+    /// count another device's work (`profile::DeviceCensus`).
+    pub fn dispatch_census(&self) -> &Arc<crate::kernels::metal::profile::DeviceCensus> {
+        &self.census
+    }
+
+    /// The dispatch trace of this queue alone, for a window that must not
+    /// record another device's work (`trace::DeviceTrace`).
+    pub fn dispatch_trace(&self) -> &Arc<crate::kernels::metal::trace::DeviceTrace> {
+        &self.trace
+    }
+
     /// Registers `f` to run after every command buffer completes.
     ///
     /// Must be called during device setup, before any work is encoded:
@@ -933,6 +950,14 @@ impl Commands {
             self.commit_swap_locked(&mut state_guard, 1)?;
         }
 
+        // The per-kernel timing arm: a counter-sampled encoder per dispatch,
+        // so each encoder's interval is one kernel's (`profile::encoder_per_dispatch`).
+        if crate::kernels::metal::profile::encoder_per_dispatch() {
+            if let Some(enc) = state_guard.current_encoder.take() {
+                self.end_encoding(enc);
+            }
+        }
+
         if state_guard.current_encoder.is_none() {
             let fence = Arc::new(Fence::new(&self.device));
             // No blanket wait here. HazardTrackingModeUntracked means Metal does
@@ -941,7 +966,7 @@ impl Commands {
             // so it waits per buffer in set_input_buffer / set_output_buffer
             // instead. Waiting on every live fence would order this encoder
             // after work it never touches.
-            let enc = state_guard
+            let mut enc = state_guard
                 .current
                 .compute_command_encoder_with_executor(
                     &fence,
@@ -949,6 +974,12 @@ impl Commands {
                     &self.executor(),
                 )
                 .with_clock(Arc::clone(&self.clock));
+            if crate::kernels::metal::profile::enabled() {
+                enc = enc.with_census(Arc::clone(&self.census));
+            }
+            if crate::kernels::metal::trace::trace_requested() {
+                enc = enc.with_trace(Arc::clone(&self.trace));
+            }
             if let Some(flag) = self.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
@@ -960,7 +991,7 @@ impl Commands {
             }
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
-            crate::kernels::metal::trace::record_encoder_begin();
+            crate::kernels::metal::trace::record_encoder_begin(enc.trace.as_deref());
             crate::kernels::metal::profile::record_encoder();
             // The audit needs the seam as a first-class ordering primitive, not
             // only as context for a count: a cross-session edge is ordered by
@@ -1078,8 +1109,14 @@ impl Commands {
             }
         }
 
-        self.prev_ce_outputs.write(Side::Host).clear();
-        self.live_fences.lock(Side::Host).clear();
+        // Drop only what has completed. The state lock was released before the
+        // wait, so another thread sharing this queue may have ended sessions
+        // since, and those may still be running: their entries are the only
+        // thing ordering a later encoder's reads of what they wrote (§6.4f).
+        {
+            let mut prev_ce_outputs = self.prev_ce_outputs.write(Side::Host);
+            self.live_fences.lock(Side::Host).reap(&mut prev_ce_outputs);
+        }
 
         Ok(())
     }

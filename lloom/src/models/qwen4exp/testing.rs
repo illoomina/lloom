@@ -220,3 +220,249 @@ pub fn mtp_head<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> M
         cfg,
     )
 }
+
+/// Qwen4-exp at tiny geometry (`docs/porting-models.md` §21.8): the
+/// [`TinyFamily`](crate::testing::tiny::TinyFamily) impl. Its schema is
+/// declared (`super::schema::tensor_schema`, which the loader validates
+/// against), its files are one GGUF with the family's header keys, and its
+/// in-memory model is that GGUF's bytes through the real loader — the one
+/// place the names are wired to the blocks.
+pub struct Qwen4ExpTiny;
+
+use crate::testing::tiny::{
+    Schema as TinySchema, TinyCheckpoint, TinyFamily, TinyTokenizer, Workload,
+};
+use lloom_tensor::quantized::gguf_file::Value;
+
+impl TinyFamily for Qwen4ExpTiny {
+    type Config = Config;
+    type Model = Qwen4Exp<Resident>;
+    const NAME: &'static str = "qwen4exp";
+    const DENSE_KINDS: &'static [GgmlDType] = &[
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::IQ4NL,
+    ];
+    const EXPERT_KINDS: &'static [GgmlDType] = &[
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::Q8_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+        GgmlDType::IQ4XS,
+        GgmlDType::IQ3XXS,
+        GgmlDType::IQ2XXS,
+        GgmlDType::Q2_0,
+    ];
+
+    fn template() -> Config {
+        Config::tiny()
+    }
+
+    fn covers(template: &Config, cfg: &Config) -> bool {
+        [LayerKind::Linear, LayerKind::Full]
+            .iter()
+            .all(|k| !template.layer_types.contains(k) || cfg.layer_types.contains(k))
+    }
+
+    fn tokenizer() -> TinyTokenizer {
+        TinyTokenizer::qwen4exp()
+    }
+
+    fn schema(ckpt: &TinyCheckpoint<Self>) -> Result<TinySchema> {
+        Ok(super::schema::tensor_schema(
+            &ckpt.cfg,
+            &super::schema::SchemaOptions::default(),
+            &super::schema::Kinds {
+                dense: ckpt.weights.dense,
+                experts: ckpt.weights.experts,
+            },
+        ))
+    }
+
+    fn workloads(_cfg: &Config) -> Vec<Workload> {
+        vec![
+            // Decode only: the gemv arms, the one-query attention.
+            Workload {
+                prompt: 1,
+                decode: 2,
+            },
+            // A short prefill: the f16-weight GEMM above the gemv's rows.
+            Workload {
+                prompt: 7,
+                decode: 2,
+            },
+            // `LLOOM_MOE_MM_FROM` rows: the routed grouped GEMM.
+            Workload {
+                prompt: 64,
+                decode: 1,
+            },
+        ]
+    }
+
+    fn build(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+        let bytes = gguf_bytes(ckpt, None)?;
+        let mut r = std::io::Cursor::new(bytes);
+        let content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
+        Qwen4Exp::from_gguf(content, &mut r, dev)
+    }
+
+    fn write(ckpt: &TinyCheckpoint<Self>, dir: &std::path::Path) -> Result<std::path::PathBuf> {
+        let tok = Self::tokenizer();
+        if ckpt.cfg.vocab_size < tok.vocab_size() {
+            lloom_tensor::bail!(
+                "a written checkpoint carries the tokenizer: vocab_size {} < its {} ids",
+                ckpt.cfg.vocab_size,
+                tok.vocab_size()
+            )
+        }
+        let path = dir.join("tiny-qwen4exp.gguf");
+        std::fs::write(&path, gguf_bytes(ckpt, Some(&tok))?)?;
+        tok.write(dir)?;
+        Ok(path)
+    }
+
+    fn load(path: &std::path::Path, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+        Qwen4Exp::from_gguf_shards(
+            &[path.to_path_buf()],
+            dev,
+            &super::loader::LoadOptions::default(),
+        )
+    }
+
+    /// The loader's f32 arm over the dequantized checkpoint: f32
+    /// activations over the stems' stored values, where the served load's
+    /// `TensorF16` stems would cast the activations to f16 on the CPU.
+    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+        let bytes = gguf_bytes(&ckpt.dequantized(), None)?;
+        let mut r = std::io::Cursor::new(bytes);
+        let content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
+        Qwen4Exp::from_gguf_reference(content, &mut r, dev)
+    }
+}
+
+/// The `qwen4exp.*` header keys for `cfg`, as `Config::from_gguf_metadata`
+/// reads them; the end-of-text id from `tok` when the file carries one.
+pub fn gguf_metadata(cfg: &Config, tok: Option<&TinyTokenizer>) -> Vec<(String, Value)> {
+    let u = |v: usize| Value::U32(v as u32);
+    let ints = |v: &[usize]| Value::Array(v.iter().map(|x| Value::I32(*x as i32)).collect());
+    let ratios: Vec<usize> = cfg
+        .layer_types
+        .iter()
+        .map(|k| match k {
+            LayerKind::Full => cfg.indexer_compress_ratio,
+            LayerKind::Linear => 0,
+        })
+        .collect();
+    let n_rot = (cfg.head_dim as f64 * cfg.partial_rotary_factor).round() as usize;
+    let eos = tok
+        .and_then(|t| t.id("<|endoftext|>"))
+        .unwrap_or(cfg.eos_token_id);
+    let mut md: Vec<(String, Value)> = vec![
+        (
+            "general.architecture".into(),
+            Value::String("qwen4exp".into()),
+        ),
+        ("general.name".into(), Value::String("tiny qwen4exp".into())),
+        ("qwen4exp.block_count".into(), u(cfg.n_layers)),
+        ("qwen4exp.embedding_length".into(), u(cfg.hidden_size)),
+        (
+            "qwen4exp.full_attention_interval".into(),
+            u(cfg.full_attention_interval),
+        ),
+        ("qwen4exp.attention.compress_ratios".into(), ints(&ratios)),
+        (
+            "qwen4exp.rope.dimension_sections".into(),
+            ints(&cfg.mrope_section),
+        ),
+        ("qwen4exp.rope.dimension_count".into(), u(n_rot)),
+        (
+            "qwen4exp.rope.freq_base".into(),
+            Value::F32(cfg.rope_theta as f32),
+        ),
+        (
+            "qwen4exp.attention.layer_norm_rms_epsilon".into(),
+            Value::F32(cfg.norm_eps as f32),
+        ),
+        ("qwen4exp.attention.head_count".into(), u(cfg.n_heads)),
+        ("qwen4exp.attention.head_count_kv".into(), u(cfg.n_kv_heads)),
+        ("qwen4exp.attention.key_length".into(), u(cfg.head_dim)),
+        ("qwen4exp.attention.value_length".into(), u(cfg.head_dim)),
+        (
+            "qwen4exp.attention.indexer.head_count".into(),
+            u(cfg.indexer_n_heads),
+        ),
+        (
+            "qwen4exp.attention.indexer.key_length".into(),
+            u(cfg.indexer_head_dim),
+        ),
+        (
+            "qwen4exp.attention.indexer.top_k".into(),
+            u(cfg.indexer_budget),
+        ),
+        ("qwen4exp.hyper_connection.count".into(), u(cfg.hc_count)),
+        (
+            "qwen4exp.hyper_connection.low_rank".into(),
+            u(cfg.hc_lowrank),
+        ),
+        ("qwen4exp.ssm.state_size".into(), u(cfg.ssm_state_size)),
+        ("qwen4exp.ssm.group_count".into(), u(cfg.ssm_n_group)),
+        ("qwen4exp.ssm.time_step_rank".into(), u(cfg.ssm_dt_rank)),
+        ("qwen4exp.ssm.conv_kernel".into(), u(cfg.ssm_conv_kernel)),
+        ("qwen4exp.ssm.inner_size".into(), u(cfg.ssm_inner_size)),
+        ("qwen4exp.expert_count".into(), u(cfg.n_experts)),
+        (
+            "qwen4exp.expert_used_count".into(),
+            u(cfg.n_experts_per_tok),
+        ),
+        (
+            "qwen4exp.expert_feed_forward_length".into(),
+            u(cfg.moe_intermediate_size),
+        ),
+        (
+            "qwen4exp.expert_shared_feed_forward_length".into(),
+            u(cfg.shared_expert_intermediate_size),
+        ),
+        ("qwen4exp.ple.ngram_size".into(), u(cfg.ple_ngram_size)),
+        (
+            "qwen4exp.ple.heads_per_ngram".into(),
+            u(cfg.ple_heads_per_ngram),
+        ),
+        ("qwen4exp.ple.conv_kernel".into(), u(cfg.ple_conv_kernel)),
+        (
+            "qwen4exp.embedding_length_per_layer_input".into(),
+            u(cfg.ple_head_dim),
+        ),
+        ("tokenizer.ggml.eos_token_id".into(), Value::U32(eos)),
+    ];
+    if !cfg.ple_layers.is_empty() {
+        md.push(("qwen4exp.ple.layers".into(), ints(&cfg.ple_layers)));
+    }
+    if let Some(id) = cfg.ple_image_token_id {
+        md.push(("qwen4exp.ple.image_token_id".into(), Value::U32(id)));
+    }
+    md
+}
+
+/// The checkpoint as one GGUF file's bytes: the header keys, then every
+/// tensor of the schema.
+pub fn gguf_bytes(
+    ckpt: &TinyCheckpoint<Qwen4ExpTiny>,
+    tok: Option<&TinyTokenizer>,
+) -> Result<Vec<u8>> {
+    let schema = ckpt.schema()?;
+    let tensors: Vec<(String, QTensor)> = schema
+        .tensors
+        .iter()
+        .map(|t| Ok((t.name.clone(), ckpt.qtensor(t, &Device::Cpu)?)))
+        .collect::<Result<_>>()?;
+    let md = gguf_metadata(&ckpt.cfg, tok);
+    let md_refs: Vec<(&str, &Value)> = md.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let t_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+    let mut out = std::io::Cursor::new(Vec::new());
+    lloom_tensor::quantized::gguf_file::write(&mut out, &md_refs, &t_refs)?;
+    Ok(out.into_inner())
+}

@@ -198,6 +198,12 @@ struct Gguf<'a, R: Read + Seek> {
     shards: Vec<Shard<'a, R>>,
     index: HashMap<String, usize>,
     device: Device,
+    /// Keep float matrices f32 (`QMatMul::Tensor`) rather than f16 stems:
+    /// the CPU reference's precision ([`Qwen4Exp::from_gguf_reference`]).
+    dense_f32: bool,
+    /// Every tensor read, for the schema's debug check (`build`).
+    #[cfg(debug_assertions)]
+    read: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl<'a, R: Read + Seek> Gguf<'a, R> {
@@ -214,6 +220,9 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             shards,
             index,
             device: device.clone(),
+            dense_f32: false,
+            #[cfg(debug_assertions)]
+            read: Default::default(),
         })
     }
     fn metadata(&self) -> &HashMap<String, Value> {
@@ -227,9 +236,20 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
         let i = self.shard_of(name)?;
+        #[cfg(debug_assertions)]
+        self.read.borrow_mut().insert(name.to_string());
         let device = self.device.clone();
         let s = &mut self.shards[i];
         s.content.tensor(s.reader, name, &device)
+    }
+    /// Every tensor of every shard, `(name, shape)`.
+    fn table(&self) -> impl Iterator<Item = (&str, &[usize])> {
+        self.shards.iter().flat_map(|s| {
+            s.content
+                .tensor_infos
+                .iter()
+                .map(|(n, ti)| (n.as_str(), ti.shape.dims()))
+        })
     }
     fn shape(&self, name: &str) -> Result<Vec<usize>> {
         let i = self.shard_of(name)?;
@@ -242,6 +262,8 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     /// cannot be streamed from.
     fn locate(&self, name: &str) -> Result<(&Content, &Path)> {
         let i = self.shard_of(name)?;
+        #[cfg(debug_assertions)]
+        self.read.borrow_mut().insert(name.to_string());
         let s = &self.shards[i];
         match &s.path {
             Some(p) => Ok((&s.content, p)),
@@ -256,6 +278,9 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     fn qmat(&mut self, name: &str) -> Result<QMatMul> {
         let qt = self.qtensor(name)?;
         match qt.dtype() {
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 if self.dense_f32 => {
+                Ok(QMatMul::Tensor(qt.dequantize(&self.device)?))
+            }
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
                 Ok(QMatMul::TensorF16(qt.dequantize_f16(&self.device)?))
             }
@@ -783,6 +808,36 @@ impl Qwen4Exp<Resident> {
         })
     }
 
+    /// Load from an open GGUF shard with every float matrix kept f32
+    /// (`QMatMul::Tensor`) instead of an f16 stem: f32 activations over the
+    /// file's values, the precision a CPU reference runs at. Not a serving
+    /// arm — the stems' f16 GEMV and its fused stacks are not taken.
+    pub fn from_gguf_reference<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut gg = Gguf::new(
+            vec![Shard {
+                content,
+                reader,
+                path: None,
+            }],
+            device,
+        )?;
+        gg.dense_f32 = true;
+        let opts = LoadOptions::default();
+        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
+        build(&mut gg, device, &opts, |gg, l| {
+            let p = format!("blk.{l}");
+            Ok(Resident::new(
+                gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
+            ))
+        })
+    }
+
     /// Load from a sharded checkpoint, every expert resident.
     pub fn from_gguf_shards(
         paths: &[PathBuf],
@@ -972,6 +1027,15 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
         )
     }
     cfg.vocab_size = embed_shape[0];
+    let schema = super::schema::tensor_schema(
+        &cfg,
+        &super::schema::SchemaOptions {
+            mtp: opts.mtp,
+            ple: ple_hash.is_some(),
+        },
+        &Default::default(),
+    );
+    schema.validate(gg.table())?;
 
     let d = cfg.hidden_size;
     let n = cfg.hc_count;
@@ -1049,6 +1113,14 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
             None => PleTable::Mmap(table),
         };
         model.set_ple(l, hash, table, block)?;
+    }
+    #[cfg(debug_assertions)]
+    for t in &schema.tensors {
+        debug_assert!(
+            gg.read.borrow().contains(&t.name),
+            "the tensor schema lists `{}`, which the loader never read",
+            t.name
+        );
     }
     Ok(model)
 }

@@ -57,6 +57,8 @@ pub mod lfm2;
 pub mod lfm2_dspark;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod lfm2_ir;
+pub mod lfm2_presets;
+pub mod lfm2_testing;
 pub mod lfm2_vl;
 pub mod llama;
 pub mod llama2_c;

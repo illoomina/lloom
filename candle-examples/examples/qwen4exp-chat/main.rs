@@ -189,6 +189,21 @@ struct Args {
     #[arg(long)]
     driver: bool,
 
+    /// The driver's readback arm: `blocking` (the default, the id read back
+    /// per step), `ring-fixed` (the device-resident token polled, lookahead 1,
+    /// a commit every 8 steps) or `ring` (the same under the adaptive commit,
+    /// the crown's cadence). On a ring arm each decode forward's PLE rows
+    /// come from the host fill (`--host-fill`).
+    #[arg(long, default_value = "blocking")]
+    readback: String,
+
+    /// The PLE's host fill on a ring arm (`expert-streaming.md` §20.13): a
+    /// producer thread fills each decode step's rows from the published
+    /// token and the GPU waits for them. `false` is the A/B arm: the forward
+    /// reads its input id back per step.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    host_fill: bool,
+
     /// The harness's own per-token loop (the full logits read back and
     /// hashed a token: the logits digest, `--state-digest`, `--probe`,
     /// `--margins`, `--prompt-split`, `--rollback-probe`, `--mtp-k`) —
@@ -478,14 +493,19 @@ fn report_pass_plans(device: &Device) {
             let keys: Vec<String> = keys
                 .iter()
                 .map(|(k, covered, total, escapes)| {
+                    // A pass the model bracketed itself is its own key (§9.2aa).
+                    let own = match k.opener {
+                        candle::metal_backend::PassOpener::Model => "/model",
+                        candle::metal_backend::PassOpener::Driver => "",
+                    };
                     if *escapes > 0 {
                         format!(
-                            "{:?}={covered}/{total}(+{escapes} escaped {:?})",
+                            "{:?}{own}={covered}/{total}(+{escapes} escaped {:?})",
                             k.kind,
                             dev.pass_plan_escapes(k)
                         )
                     } else {
-                        format!("{:?}={covered}/{total}", k.kind)
+                        format!("{:?}{own}={covered}/{total}", k.kind)
                     }
                 })
                 .collect();
@@ -752,6 +772,7 @@ fn main() -> Result<()> {
             model.set_prefill_mode(prefill_mode);
             model.set_memory_fraction(args.memory_fraction);
             model.set_mem_check(mem_check);
+            model.set_host_fill(args.host_fill);
             if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
             } else if !args.legacy_loop {
@@ -797,6 +818,7 @@ fn main() -> Result<()> {
             model.set_prefill_mode(prefill_mode);
             model.set_memory_fraction(args.memory_fraction);
             model.set_mem_check(mem_check);
+            model.set_host_fill(args.host_fill);
             if let Some(n) = args.spec_ahead {
                 model.set_spec_ahead(n);
             }
@@ -1041,6 +1063,69 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
     mem_line(0, "loaded", device, None);
 }
 
+/// The prefetcher's counters for the run so far (cumulative over runs).
+fn prefetch_line<R: ExpertResidency + HasStreamStats>(
+    run: usize,
+    model: &Qwen4Exp<R>,
+    args: &Args,
+) {
+    let pf = model.prefetch_stats();
+    println!(
+        "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
+        args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
+        pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
+        pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
+    );
+}
+
+/// The streamed tier's counters (cumulative over the process's runs) and
+/// the cache's (this run's): where a miss's host time went, by path.
+fn stream_line<R: ExpertResidency + HasStreamStats>(
+    run: usize,
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    cache: &Cache,
+) {
+    let s = model.stream_stats();
+    println!(
+        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={}",
+        args.loader,
+        model.slots_per_layer(),
+        s.plans,
+        s.groups,
+        s.hits,
+        s.misses,
+        s.evictions,
+        s.bytes_loaded,
+        s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+        s.device_plans,
+        s.settled_misses,
+        s.prefetch_now,
+        cache.redos,
+        cache.host_plan_passes,
+        s.readback_ns as f64 / 1e6,
+        s.load_now_ns as f64 / 1e6,
+        s.land_ns as f64 / 1e6,
+        s.sync_load_ns as f64 / 1e6,
+        s.io_hints,
+        s.io_inflight_hits,
+        s.io_inflight_wasted,
+        s.io_inflight_landed,
+        s.direct_loads,
+        s.direct_wait_ns as f64 / 1e6,
+        s.settle_loads,
+        s.settle_ns as f64 / 1e6,
+        s.settle_clock_lag,
+        cache.settle_after_first,
+        cache.replay_ns as f64 / 1e6,
+        cache.host_pass_ns as f64 / 1e6,
+        s.free_takes,
+        s.inplace_takes,
+        s.quarantined,
+        s.recycled,
+    );
+}
+
 /// `--driver`: the prompt through `Session::decode` on the blocking arm —
 /// the loop `lloom serve` runs (`decode-driver-design.md` Stage 5/6) —
 /// with the same `RESULT` / `PROFILE` / `MEM` / `STREAM` lines as `gate`,
@@ -1056,11 +1141,18 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
     eos_ids: &[u32],
     t0: std::time::Instant,
 ) -> Result<()> {
-    use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+    use lloom::generation::poll::PollMechanism;
+    use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
     use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on, prefill_tiles};
     use lloom::nn::{DecodeOptions, IdentityProposer, Session};
     let cfg = model.config().clone();
     loaded_line(model, args, shards, device, t0);
+    let (lookahead, adaptive) = match args.readback.as_str() {
+        "blocking" => (0, false),
+        "ring-fixed" => (1, false),
+        "ring" => (1, true),
+        other => anyhow::bail!("--readback {other}: blocking | ring-fixed | ring"),
+    };
     // The tile the harness's own loop feeds (`prefill_tiled`): the paired
     // prefill wants both chunks in one forward.
     let tile =
@@ -1069,18 +1161,30 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         } else {
             args.prefill_tile
         };
-    println!("DRIVER arm=blocking prefill_tile={tile} lookahead=0");
+    println!(
+        "DRIVER arm={} prefill_tile={tile} lookahead={lookahead} adaptive={adaptive} host_fill={}",
+        args.readback,
+        args.readback != "blocking" && model.host_fill()
+    );
     let mut greedy_digest: Option<String> = None;
     for run in 0..args.runs {
         let cache: Cache = model.new_cache(&cfg, device)?;
         let mut session = Session::new(model, cache);
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-        let mut rb = Blocking::new(eos_ids, device)?;
         let mut spec = IdentityProposer;
-        let opts = DecodeOptions {
+        let mut opts = DecodeOptions {
             prefill_tile: tile,
             ..DecodeOptions::new(args.max_tokens)
         };
+        if lookahead > 0 {
+            opts.lookahead = lookahead;
+            opts.budget = CommitBudget::steps(8)?;
+            // Under the adaptive commit the ids are taken off the ring at the
+            // end (no reader streams here), and a run past an EOS stops at the
+            // cap: its ids are cut at the EOS.
+            opts.adaptive_commit = adaptive;
+            opts.stream_via_reader = adaptive;
+        }
         #[cfg(feature = "metal")]
         candle::kernels::metal::profile::reset();
         let gauge = MemGauge::start(device, args.mem_sample);
@@ -1092,30 +1196,50 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let trace_on = trace_requested();
         let mut produced = 0usize;
         let mut traced: Vec<(usize, TraceStep)> = Vec::new();
+        // The tier's counters when the first token is out: what the prompt's
+        // prefill loaded, so the decode's share is the difference.
+        let mut pre: Option<lloom::nn::expert_stream::StreamStats> = None;
         let t1 = std::time::Instant::now();
-        let out = session.decode(
-            &mut spec,
-            &mut rb,
-            &mut sampler,
-            prompt_ids,
-            &opts,
-            &mut |toks| {
-                if trace_on {
-                    let before = produced;
-                    produced += toks.len();
-                    if before >= TRACE_FROM && before < TRACE_FROM + TRACE_STEPS {
-                        traced.push((before + 1, trace_take()));
-                    }
-                    if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
-                        trace_set(true, Some(format!("decode[{}]", produced + 1)));
-                    } else {
-                        trace_set(false, None);
-                        let _ = trace_take();
-                    }
+        let mut on_tokens = |toks: &[u32]| -> candle::Result<()> {
+            if pre.is_none() {
+                pre = Some(model.stream_stats());
+            }
+            if trace_on {
+                let before = produced;
+                produced += toks.len();
+                if before >= TRACE_FROM && before < TRACE_FROM + TRACE_STEPS {
+                    traced.push((before + 1, trace_take()));
                 }
-                Ok(())
-            },
-        )?;
+                if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
+                    trace_set(true, Some(format!("decode[{}]", produced + 1)));
+                } else {
+                    trace_set(false, None);
+                    let _ = trace_take();
+                }
+            }
+            Ok(())
+        };
+        let out = if lookahead == 0 {
+            let mut rb = Blocking::new(eos_ids, device)?;
+            session.decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                prompt_ids,
+                &opts,
+                &mut on_tokens,
+            )?
+        } else {
+            let mut rb = Ring::new(eos_ids, device, 0, EosRead::Poll(PollMechanism::default()))?;
+            session.decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                prompt_ids,
+                &opts,
+                &mut on_tokens,
+            )?
+        };
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
         for (step, dispatches) in &traced {
             trace_census(run, *step, dispatches);
@@ -1140,29 +1264,52 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
                 .join(",")
         );
         println!(
-            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-blocking steps={} commits={} config=[{}]",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-{} steps={} commits={} host_fill_forwards={} host_fill_fills={} overrun={} config=[{}]",
             prompt_ids.len(),
             out.ids.len(),
             out.eos,
             args.max_tokens,
+            args.readback,
             out.stats.steps,
             out.stats.commits,
+            out.stats.host_feed.as_ref().map_or(0, |f| f.forwards),
+            out.stats.host_feed.as_ref().map_or(0, |f| f.fills),
+            out.stats.overrun,
             model.config().axes_line(),
         );
+        if let Some(f) = &out.stats.host_feed {
+            if !f.fill_ns.is_empty() {
+                let mut v = f.fill_ns.clone();
+                v.sort_unstable();
+                let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64 / 1e3;
+                println!(
+                    "HOSTFILL run={run} fills={} p50_us={:.1} p90_us={:.1} p99_us={:.1} max_us={:.1}",
+                    v.len(),
+                    q(0.5),
+                    q(0.9),
+                    q(0.99),
+                    q(1.0)
+                );
+            }
+        }
         let s = model.stream_stats();
         if s.plans + s.device_plans > 0 {
-            println!(
-                "STREAM run={run} loader={} slots={} plans={} hits={} misses={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={}",
-                args.loader,
-                model.slots_per_layer(),
-                s.plans,
-                s.hits,
-                s.misses,
-                s.bytes_loaded,
-                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
-                s.device_plans,
-                s.settled_misses,
-            );
+            prefetch_line(run, model, args);
+            if let Some(p) = pre {
+                println!(
+                    "STREAMPRE run={run} misses={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} settle_loads={} settle_ms={:.0} direct_loads={} direct_wait_ms={:.0}",
+                    p.misses,
+                    p.readback_ns as f64 / 1e6,
+                    p.load_now_ns as f64 / 1e6,
+                    p.land_ns as f64 / 1e6,
+                    p.sync_load_ns as f64 / 1e6,
+                    p.settle_loads,
+                    p.settle_ns as f64 / 1e6,
+                    p.direct_loads,
+                    p.direct_wait_ns as f64 / 1e6,
+                );
+            }
+            stream_line(run, model, args, session.sequence().cache());
         }
         greedy_digest = Some(digest);
     }
@@ -1466,20 +1613,13 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             args.max_tokens,
             cfg.axes_line()
         );
-        let s = model.stream_stats();
         if args.experts == "stream" {
             let st = model.staging_stats();
             println!(
                 "STAGING run={run} buffers={} bytes={} allocations={} reuses={} overflows={}",
                 st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
             );
-            let pf = model.prefetch_stats();
-            println!(
-                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
-                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
-                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
-                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
-            );
+            prefetch_line(run, model, args);
             report_pass_plans(device);
             let dh = lloom::models::qwen4exp::Qwen4Exp::<lloom::models::qwen4exp::Streamed>::decode_hints();
             if dh > 0 {
@@ -1497,33 +1637,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                     hr[0].1
                 );
             }
-            println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0}",
-                args.loader,
-                model.slots_per_layer(),
-                s.plans,
-                s.groups,
-                s.hits,
-                s.misses,
-                s.evictions,
-                s.bytes_loaded,
-                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
-                s.device_plans,
-                s.settled_misses,
-                s.prefetch_now,
-                cache.redos,
-                cache.host_plan_passes,
-                s.readback_ns as f64 / 1e6,
-                s.load_now_ns as f64 / 1e6,
-                s.land_ns as f64 / 1e6,
-                s.sync_load_ns as f64 / 1e6,
-                s.io_hints,
-                s.io_inflight_hits,
-                s.io_inflight_wasted,
-                s.io_inflight_landed,
-                s.direct_loads,
-                s.direct_wait_ns as f64 / 1e6
-            );
+            stream_line(run, model, args, &cache);
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {
             println!(

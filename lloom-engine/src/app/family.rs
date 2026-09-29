@@ -22,8 +22,9 @@ pub struct Capabilities {
     pub family: &'static str,
     /// Forward passes the host may enqueue past an unlearned EOS.
     pub lookahead_max: usize,
-    /// The ring arms: `full`, or `by-name` (honoured, but the fed id is read
-    /// back per step, so no faster than blocking) with the reason.
+    /// The ring arms: `full` (naming any arm on which the input still reaches
+    /// the host), or `by-name` (honoured, but the fed id is read back per
+    /// step) with the reason.
     pub ring: &'static str,
     /// `--batch N` (the continuous scheduler).
     pub batch: bool,
@@ -55,6 +56,12 @@ pub struct Capabilities {
     pub vision: bool,
     /// Why a family without vision refuses an image.
     pub vision_missing: &'static str,
+    /// The EOS gate (`decode.readback.eos_gate`) holds: the family's decode
+    /// kernels carry the gated variant, so a forward queued past an EOS
+    /// writes nothing. Where they do not, the gate is clamped off at load.
+    pub eos_gate: bool,
+    /// Why a family without the gated kernels runs ungated.
+    pub eos_gate_missing: &'static str,
 }
 
 impl Capabilities {
@@ -72,12 +79,13 @@ impl Capabilities {
             "kv_quant": self.kv_quant_names(),
             "kv_dtype": self.kv_dtype,
             "vision": self.vision,
+            "eos_gate": self.eos_gate,
         })
     }
 
     pub fn line(&self) -> String {
         format!(
-            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} rewind={:?}",
+            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
             self.lookahead_max,
             self.ring,
             self.batch,
@@ -87,6 +95,7 @@ impl Capabilities {
             self.kv_quant_names().join(","),
             self.kv_dtype,
             self.vision,
+            self.eos_gate,
             self.rewind,
         )
     }
@@ -152,12 +161,14 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     kv_quant_missing: "",
     vision: true,
     vision_missing: "",
+    eos_gate: true,
+    eos_gate_missing: "",
 };
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen4exp",
-    lookahead_max: 0,
-    ring: "by-name: the fed id is read back per step (the PLE hashes it on the host), no faster than blocking",
+    lookahead_max: 1,
+    ring: "full: the PLE fed by the driver's host fill where the arm stamps each token (Metal); the fed id read back on a deferred read at the fixed cadence",
     batch: true,
     prefix_share: false,
     speculation: &["mtp"],
@@ -170,6 +181,10 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     kv_quant_missing: "",
     vision: false,
     vision_missing: "no vision tower is built for Qwen4-exp (its image input is #765)",
+    eos_gate: false,
+    eos_gate_missing: "its decode kernels (the quantized cores, qwen4exp.metal) carry no gated \
+        variant, so a forward queued past an EOS still runs most of its pass, and a request \
+        served after gated runs came back wrong (expert-streaming.md §20.13c)",
 };
 
 /// Every family, in detection order.
@@ -330,6 +345,7 @@ impl Family for Lfm2Family {
             dspark_k: spec.k,
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
+            flash_k: model.flash_k,
         })?;
         Ok(Box::new(engine))
     }
@@ -380,6 +396,9 @@ impl Family for Qwen4ExpFamily {
                     s.batch
                 );
             }
+        }
+        if req.model.flash_k.is_some() {
+            anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen4exp has no such arm");
         }
         match req.model.experts.as_str() {
             "stream" | "resident" => {}
@@ -444,6 +463,20 @@ impl Family for Qwen4ExpFamily {
     }
 }
 
+/// Turn the EOS gate off on a family whose decode kernels carry no gated
+/// variant (`Capabilities::eos_gate`). The gate defaults on, so this is a
+/// clamp, not a refusal; the note is returned only where the configured arm
+/// would have carried the gate (a ring under the adaptive commit).
+fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<String> {
+    let readback = &mut shape.decode.readback;
+    if cap.eos_gate || !readback.eos_gate {
+        return None;
+    }
+    readback.eos_gate = false;
+    let rides = readback.kind == crate::ReadbackKind::Ring && readback.ring_arm().adaptive;
+    rides.then(|| format!("eos_gate is off on {}: {}", cap.family, cap.eos_gate_missing))
+}
+
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
 pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     let path = match &model.model {
@@ -452,6 +485,10 @@ pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf
             .context("no --model given and the LFM2.5-2.6B snapshot was not in the HF cache")?,
     };
     let (family, checkpoint) = detect(&path)?;
+    let mut shape = shape;
+    if let Some(note) = clamp_ungated_eos_gate(&family.capabilities(), &mut shape) {
+        eprintln!("[readback: {note}]");
+    }
     let req = Requested { model, shape };
     family
         .resolve(&req)
@@ -661,7 +698,67 @@ mod tests {
         assert!(err.contains("no such model"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(LFM2_CAPABILITIES.speculation, &["dspark"]);
-        assert!(QWEN4EXP_CAPABILITIES.line().contains("lookahead_max=0"));
+        // One forward past an unlearned EOS on both: Qwen4-exp's standing
+        // window undoes it (`rewind` above), and its PLE is fed from the host.
+        assert!(QWEN4EXP_CAPABILITIES.line().contains("lookahead_max=1"));
+        assert!(QWEN4EXP_CAPABILITIES.ring.starts_with("full"));
+    }
+
+    /// The gate is clamped off on a family whose kernels carry no gated
+    /// variant, noted where the arm would have carried it, silent where it
+    /// would not (the blocking arm, the fixed cadence); a family with the
+    /// kernels keeps it.
+    #[test]
+    fn the_eos_gate_is_clamped_where_the_kernels_carry_no_gated_variant() {
+        use crate::ReadbackConfig;
+        assert_eq!(
+            (LFM2_CAPABILITIES.eos_gate, QWEN4EXP_CAPABILITIES.eos_gate),
+            (true, false)
+        );
+        assert!(QWEN4EXP_CAPABILITIES.line().contains("eos_gate=false"));
+        let with = |spelling: &str| {
+            let mut s = shape();
+            ReadbackConfig::apply_spelling(&mut s.decode.readback, spelling).unwrap();
+            assert!(s.decode.readback.eos_gate, "the gate defaults on");
+            s
+        };
+
+        let mut s = with("ring-nonblocking");
+        let note = clamp_ungated_eos_gate(&QWEN4EXP_CAPABILITIES, &mut s).expect("noted");
+        assert!(!s.decode.readback.eos_gate);
+        assert!(
+            note.contains("eos_gate is off on qwen4exp") && note.contains("no gated"),
+            "{note}"
+        );
+        for spelling in ["auto", "blocking", "ring-fixed"] {
+            let mut s = with(spelling);
+            assert_eq!(clamp_ungated_eos_gate(&QWEN4EXP_CAPABILITIES, &mut s), None, "{spelling}");
+            assert!(!s.decode.readback.eos_gate, "{spelling}: clamped, silently");
+        }
+        let mut s = with("ring-nonblocking");
+        assert_eq!(clamp_ungated_eos_gate(&LFM2_CAPABILITIES, &mut s), None);
+        assert!(s.decode.readback.eos_gate, "LFM2 keeps its gate");
+    }
+
+    /// `--flash-k` is LFM2's FlashDecoding chunk: Qwen4-exp refuses it by
+    /// name, LFM2 resolves it (the load refuses it off `--attn flash`).
+    #[test]
+    fn flash_k_is_lfm2s() {
+        let m = model_args(&["--flash-k", "2"]);
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: shape(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--flash-k"), "{err}");
+        Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: shape(),
+            })
+            .unwrap();
     }
 
     #[test]

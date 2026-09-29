@@ -4,9 +4,9 @@
 //! LFM2 engine (`lfm2.rs`, the former `lloom-serve/engine.rs`) unchanged so a
 //! second family (`qwen4exp.rs`) reuses them rather than restating them.
 
+use super::template::Template;
 use crate::ReadbackArm;
 use anyhow::Result;
-use hf_chat_template::ChatTemplate;
 use lloom_tensor::Device;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub const NEVER_EOS: [u32; 1] = [u32::MAX];
 /// requests are shaped by.
 pub struct Text {
     pub tokenizer: Tokenizer,
-    pub template: Option<ChatTemplate>,
+    pub template: Option<Template>,
     pub bos_token: String,
     pub bos_id: Option<u32>,
     pub eos_ids: Vec<u32>,
@@ -84,7 +84,7 @@ pub struct ProfileReport {
     /// GPU time by kernel from each command buffer's LAST dispatch label —
     /// `(label, buffers, total_ms, p50_ms)`; exact only at
     /// `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one dispatch per buffer), else a
-    /// buffer is charged to its last kernel (`lfm2-chat`'s reading, #727).
+    /// buffer is charged to its last kernel.
     pub gpu_by_label: Vec<(String, u64, f64, f64)>,
 }
 
@@ -208,21 +208,30 @@ pub fn eos_gate_name(report: Option<lloom_tensor::EosGateReport>) -> &'static st
     }
 }
 
+/// A run's host fill for a report line: `fills/forwards`, or `off` when the
+/// run took none (`DecodeStats::host_feed`).
+pub fn host_fill_name(report: Option<&lloom::nn::HostFeedReport>) -> String {
+    match report {
+        Some(f) => format!("{}/{}", f.fills, f.forwards),
+        None => "off".to_string(),
+    }
+}
+
 pub fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
 /// Install the executor arms on `device` (Metal; nothing elsewhere) before
 /// the model loads: the packed param style and the constants pool, the ICB
-/// replay executor, the arena's recording, the pass-plan cache — as
-/// `lfm2-chat` installs them. `speculative` refuses `replay` (a round's
-/// dispatch structure moves with the accepted length, §11.3x) and skips
-/// the arena (served by ordinal).
+/// replay executor, the arena's recording, the pass-plan cache.
+/// `speculative` refuses `replay` (a round's dispatch structure moves with
+/// the accepted length, §11.3x) and skips the arena (served by ordinal).
+/// Returns what was armed, for the engagement reports (`report.rs`).
 pub fn install_executor(
     device: &Device,
     cfg: &crate::ExecutorConfig,
     speculative: bool,
-) -> Result<()> {
+) -> Result<super::report::Installed> {
     if cfg.replay && speculative {
         anyhow::bail!(
             "executor.replay cannot be combined with a speculative body: the round's dispatch \
@@ -239,11 +248,16 @@ pub fn install_executor(
         };
         use lloom_tensor::metal_backend::ArenaLayout;
         let Device::Metal(dev) = device else {
-            return Ok(());
+            return Ok(super::report::Installed::default());
+        };
+        let mut installed = super::report::Installed {
+            pass_widths: "lru",
+            ..Default::default()
         };
         if cfg.packed || cfg.replay {
             set_default_param_style(ParamStyle::Packed);
             set_constants_pool_enabled(true);
+            installed.packed = true;
         }
         if cfg.replay {
             lloom_tensor::kernels::set_pipelines_support_icb(true)
@@ -260,6 +274,7 @@ pub fn install_executor(
         let arena = (cfg.arena || cfg.replay) && !speculative;
         if arena {
             dev.arm_arena_recording(layout, ARENA_SKIP, ARENA_RECORD_STEPS);
+            installed.arena = true;
         }
         if cfg.replay {
             const ICB_RECORD_STEPS: usize = 3;
@@ -276,13 +291,18 @@ pub fn install_executor(
                 exec.set_warm_in(1 + ARENA_SKIP + ARENA_RECORD_STEPS + 1);
                 exec.set_rerecord_warm_in(ARENA_RECORD_STEPS + 1);
             }
-            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec)));
+            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec.clone())));
+            installed.replay = Some(exec);
         }
         if cfg.pass_plans {
             dev.enable_pass_plans(ArenaLayout::Packed);
+            installed.pass_plans = true;
         }
+        Ok(installed)
     }
     #[cfg(not(feature = "metal"))]
-    let _ = (device, cfg);
-    Ok(())
+    {
+        let _ = (device, cfg);
+        Ok(super::report::Installed::default())
+    }
 }

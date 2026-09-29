@@ -4,10 +4,10 @@
 //! warmup leaves nothing in the cache.
 //!
 //! The warmup calls `forward` with no driver bracket, so this model opens its
-//! own pass after the embedding, where the driver's pass of the same key
-//! opens before it: the warmup's `Decode { b: 1 }` plan is the driver's
-//! sequence shifted by one allocation and one dispatch, which the drift guard
-//! does not see. Served to the second decode step, it aliases live values.
+//! own passes. Those are keyed apart from a driver's (`PassOpener`, tested in
+//! `qwen4exp_pass_plan_openers`), so a warmup plan could not be served to the
+//! driver's decode; the pause is for the warmup's own contract, to leave no
+//! plan behind.
 #![cfg(feature = "metal")]
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};

@@ -30,6 +30,7 @@ pub mod expert_prefetch;
 pub mod expert_stream;
 pub mod func;
 pub mod fusion;
+pub mod gdn;
 pub mod group_norm;
 pub mod init;
 pub mod kv_cache;
@@ -49,9 +50,11 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod short_conv;
 pub mod speculator;
 pub mod var_builder;
 pub mod var_map;
+pub mod zeros;
 /// Re-export of [`attention::varlen`] for backward compatibility.
 pub mod varlen_attention {
     pub use crate::nn::attention::varlen::*;
@@ -67,8 +70,8 @@ pub use conv::{
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
-    PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
+    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, HostFeedReport,
+    IdentityProposer, PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{
@@ -91,7 +94,7 @@ pub use observer::{
 };
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
-pub use recurrent::{RecurrentState, StatePool};
+pub use recurrent::{PoolLayer, RecurrentState, StatePool};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{

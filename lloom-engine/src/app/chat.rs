@@ -9,13 +9,22 @@
 //! expands to the image's tiles (`vision.rs`). A `[vision: …]` line per turn
 //! says what the process holds — the model's tensors, whether the tower is
 //! loaded — and, under `CANDLE_METAL_PROFILE=1`, the image's dispatch census.
+//!
+//! After each turn the run reports (`report.rs`): what the executor arms
+//! engaged, the speculative rounds, the profile and trace a variable asked
+//! for, the memory peaks under `--mem-sample`, and under `--verbose` the
+//! once-per-run diagnostics (the first token's split, the visible cadence,
+//! the hot thread, the churn, the lock contention, the KV slab).
 
-use super::common::{eos_gate_name, ms, NEVER_EOS};
+use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
+use super::report;
+use super::served::Served;
+use super::template::{Rejected, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
@@ -33,8 +42,11 @@ pub struct ChatArgs {
     /// `--readback auto` is `lloom serve`'s on both families: the flow on
     /// LFM2 (the adaptive commit, the reader, the EOS gate — the forwards
     /// past a turn's EOS write nothing, so the next turn extends the cache)
-    /// and the blocking arm on Qwen4-exp. `--readback ring-la0` is the ring
-    /// without the lookahead, whose cache also ends at the EOS.
+    /// and the blocking arm on Qwen4-exp, where `--readback ring-fixed`
+    /// feeds the PLE from the host instead (faster while the streamed expert
+    /// pool holds the working set, slower while it misses).
+    /// `--readback ring-la0` is the ring without the lookahead, whose cache
+    /// also ends at the EOS.
     #[command(flatten)]
     pub common: super::CommonArgs,
 
@@ -47,6 +59,15 @@ pub struct ChatArgs {
     #[arg(long)]
     pub think: bool,
 
+    /// How long the model thinks: the chat template's `reasoning_effort`
+    /// (Qwen4-exp's: `low`, `medium`, `xhigh`, its default `xhigh`). The
+    /// values are the template's own, and so is the refusal of one it does
+    /// not accept. Refused, before the first turn, on a template that does
+    /// not read the variable (LFM2) or renders the same prompt for any value
+    /// of it (Qwen4-exp without `--think`).
+    #[arg(long, value_name = "EFFORT")]
+    pub reasoning_effort: Option<String>,
+
     /// Re-prefill the whole conversation every turn instead of extending
     /// the cache (a measurement arm).
     #[arg(long)]
@@ -57,8 +78,8 @@ pub struct ChatArgs {
     pub prompt: Option<String>,
 
     /// The prompt is already rendered: no chat template, the text encoded as
-    /// given with the checkpoint's BOS — what `lfm2-chat` and a benchmark
-    /// runner feed, so a reply can be compared token for token.
+    /// given with the checkpoint's BOS — what a benchmark runner feeds, so a
+    /// reply can be compared token for token.
     #[arg(long)]
     pub raw: bool,
 
@@ -67,12 +88,29 @@ pub struct ChatArgs {
     /// checkpoint without a vision tower refuses it by name.
     #[arg(long, value_name = "PATH")]
     pub image: Vec<std::path::PathBuf>,
+
+    /// Encode the prompt without the checkpoint's BOS (the template-off A/B:
+    /// LFM2's `generation_config.json` starts a sequence with it).
+    #[arg(long)]
+    pub no_bos: bool,
+
+    /// Sample the memory gauges every 10 ms over each turn and print their
+    /// peaks (`MEMPEAK`): the device allocation, the pool's live / free /
+    /// pending bytes, the footprint. Off the hot thread.
+    #[arg(long)]
+    pub mem_sample: bool,
+
+    /// Print each turn's diagnostics: the first token's split, the visible
+    /// cadence, the hot thread and page faults, the churn, the lock
+    /// contention, the pacer's depth, the KV slab, the speculative rounds.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }
 
 /// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
 /// the generated ids as little-endian `u32`, EOS excluded — so a turn is
 /// comparable to the harness's `tokens_sha256` on the same prompt and arm.
-fn tokens_sha256(ids: &[u32]) -> String {
+pub(super) fn tokens_sha256(ids: &[u32]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for id in ids {
@@ -81,8 +119,59 @@ fn tokens_sha256(ids: &[u32]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Refuses a template variable the flags set that the checkpoint's template
+/// would not act on, and a value it rejects — on a one-message conversation,
+/// before the first turn, so the REPL does not find out at its first line.
+fn check_kwargs(
+    engine: &dyn Served,
+    system: Option<&str>,
+    kwargs: &Map<String, Value>,
+) -> Result<()> {
+    let Some(effort) = kwargs.get(REASONING_EFFORT).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let mut probe = Vec::new();
+    if let Some(s) = system {
+        probe.push(json!({ "role": "system", "content": s }));
+    }
+    probe.push(json!({ "role": "user", "content": "." }));
+    let rendered = engine
+        .render_checked(&json!(probe), kwargs, &[REASONING_EFFORT])
+        .map_err(|e| match e.downcast_ref::<Rejected>() {
+            Some(r) => anyhow::anyhow!("--reasoning-effort {effort}: {r}"),
+            None => e,
+        })?;
+    if let Some(ignored) = rendered.ignored.first() {
+        let family = engine.capabilities().family;
+        if ignored.reason == NOT_READ {
+            anyhow::bail!(
+                "--reasoning-effort: {family}'s chat template does not read {REASONING_EFFORT}"
+            );
+        }
+        anyhow::bail!(
+            "--reasoning-effort {effort}: {family}'s chat template renders the same prompt for any \
+             {REASONING_EFFORT} with {ENABLE_THINKING}={}{}",
+            kwargs.get(ENABLE_THINKING).unwrap_or(&Value::Null),
+            if kwargs.get(ENABLE_THINKING) == Some(&json!(false)) {
+                " (add --think)"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
 pub fn run(args: ChatArgs) -> Result<()> {
+    if args.raw && args.reasoning_effort.is_some() {
+        anyhow::bail!(
+            "--reasoning-effort sets a chat-template variable; --raw renders no template"
+        );
+    }
     let options = super::resolve_options(&args.common)?;
+    // After the tuning install: the trace switch is a tuning knob, and a knob
+    // read before the install cannot be installed.
+    report::arm_trace();
     // The chat's own default is a long turn; the group's 512 is the server's.
     let mut sampling = options.sampling.clone();
     if args.common.options.sampling.max_tokens.is_none()
@@ -123,7 +212,13 @@ pub fn run(args: ChatArgs) -> Result<()> {
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
-    let kwargs = json!({ "enable_thinking": args.think });
+    let mut kwargs = Map::new();
+    kwargs.insert(ENABLE_THINKING.into(), json!(args.think));
+    if let Some(effort) = &args.reasoning_effort {
+        kwargs.insert(REASONING_EFFORT.into(), json!(effort));
+    }
+    check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
+    let effort = args.reasoning_effort.as_deref().unwrap_or("default");
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {
         messages.push(json!({ "role": "system", "content": sys }));
@@ -203,7 +298,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let rendered = if args.raw {
             user.clone()
         } else {
-            engine.render_chat(&json!(messages), Some(&kwargs))?
+            engine.render_chat(&json!(messages), &kwargs)?
         };
         let rendered = if images.is_empty() {
             rendered
@@ -214,16 +309,27 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             expand_image_tokens(&rendered, &expansions)?
         };
-        let ids = engine.encode(&rendered, true)?;
+        let ids = engine.encode(&rendered, !args.no_bos)?;
         let params = sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        let probe = report::RunProbe::start(engine.device(), args.mem_sample);
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
+        let mut first_device_allocated: Option<u64> = None;
+        let mut stamps: Vec<f64> = Vec::new();
+        let verbose = args.verbose;
+        let device = engine.device().clone();
         let mut on_fragment = |frag: &str| {
             if first_at.is_none() {
                 first_at = Some(ms(started.elapsed()));
+                if verbose {
+                    first_device_allocated = Some(MemSnapshot::read(&device).device_allocated);
+                }
             }
             print!("{frag}");
             let _ = std::io::stdout().flush();
+            if verbose {
+                stamps.push(ms(started.elapsed()));
+            }
             true
         };
         let decoded = if images.is_empty() {
@@ -232,13 +338,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
             engine.complete_images_until(&ids, &images, &params, &mut on_fragment)
         }
         .context("decoding the turn")?;
+        let elapsed = started.elapsed();
         println!();
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
-        let wall = ms(started.elapsed());
+        let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -254,6 +361,89 @@ pub fn run(args: ChatArgs) -> Result<()> {
             tokens_sha256(&decoded.tokens),
             tokens_sha256(&ids),
             eos_gate_name(st.eos_gate),
+            host_fill_name(st.host_feed.as_ref()),
+            st.max_in_flight,
+            st.step_markers,
+            st.step_waits,
+            report::cut_policy_arm(engine.device()),
+            report::pipelined_cut_arm(engine.device()),
+            st.readback.ring_publishes,
+            st.readback.poll_fallbacks,
+            st.readback.eos_index_hits,
+            st.readback.eos_index_late,
+            st.prefill_units,
+            report::param_style_arm(),
+        );
+        if st.readback.poll_fallbacks > 0 {
+            eprintln!(
+                "[{}: the ring's words were not CPU-mapped; the EOS read took the blocking \
+                 fallback ({} of {} steps)]",
+                decoded.readback.name(),
+                st.readback.poll_fallbacks,
+                st.steps
+            );
+        }
+        if let Some((ramp, bulk)) = options.decode.prefill.schedule() {
+            let tags: Vec<String> = ramp
+                .iter()
+                .map(|&m| format!("{m}:{}", report::tile_tag(m)))
+                .collect();
+            let bulk = if bulk > 0 {
+                format!("{bulk}:{}", report::tile_tag(bulk))
+            } else {
+                "seq_len=1".to_string()
+            };
+            eprintln!(
+                "[spark: ramp=[{}] bulk={bulk} (remainder), then <bulk seq_len=1 tail; \
+                 prefill_units={}{}]",
+                tags.join(", "),
+                st.prefill_units,
+                if options.decode.prefill.in_flight > 0 {
+                    format!("; prefill_in_flight={}", options.decode.prefill.in_flight)
+                } else {
+                    String::new()
+                },
+            );
+        }
+        if args.verbose {
+            eprintln!(
+                "[first-token: submit {:.2} ms (host encode, no GPU wait) | first fragment {} ms \
+                 (received and detokenized, to stdout); tail after the loop {:.2} ms]",
+                st.ttft_compute_ns as f64 / 1e6,
+                first_at
+                    .map(|t| format!("{t:.2}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                st.tail_ns as f64 / 1e6,
+            );
+            report::print_visible_cadence(&stamps, decoded.tokens.len());
+            if let Some(bytes) = first_device_allocated {
+                eprintln!(
+                    "[prefill: device_allocated {:.3} GB at the first token (after the prefill and the first step)]",
+                    bytes as f64 / 1e9
+                );
+            }
+            for line in engine.diagnostics() {
+                eprintln!("{line}");
+            }
+        }
+        probe.finish(
+            engine.device(),
+            st,
+            report::RunFacts {
+                tokens: decoded.tokens.len(),
+                prompt_tokens: ids.len(),
+                wall: elapsed,
+                k: match decoded.readback {
+                    crate::ReadbackArm::Speculative { k } => Some(k),
+                    _ => None,
+                },
+            },
+            engine.installed(),
+            report::Wanted {
+                verbose: args.verbose,
+                phase_sync: options.decode.phase_sync,
+                run_ahead: options.decode.readback.run_ahead,
+            },
         );
         let report = engine.vision_report();
         if !report.is_null() {

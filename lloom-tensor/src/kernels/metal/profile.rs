@@ -25,7 +25,7 @@
 //! different dispatch pattern than the one that ships.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Whether profiling was requested, read once from the environment.
@@ -251,15 +251,24 @@ fn unnamed() -> &'static Arc<str> {
 /// `None` means no pipeline name was recorded; it is counted under a single
 /// shared `<unnamed>` key rather than dropped, so the per-label totals still
 /// sum to `DISPATCHES`.
+///
+/// `input_bytes` is the largest input buffer the dispatch bound (see
+/// `EncoderState::dispatch_input_max`); it is summed onto the open
+/// counter-sampled encoder, and is 0 when the counters are off.
 #[inline]
-pub fn record_dispatch(label: Option<&Arc<str>>) {
+pub fn record_dispatch(label: Option<&Arc<str>>, input_bytes: usize) {
     if !enabled() {
         return;
     }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
-    let mut rec = recorder().lock().unwrap();
-    bump_label(&mut rec.dispatches, label.unwrap_or_else(|| unnamed()));
-    rec.last_label.0 = label.cloned();
+    {
+        let mut rec = recorder().lock().unwrap();
+        bump_label(&mut rec.dispatches, label.unwrap_or_else(|| unnamed()));
+        rec.last_label.0 = label.cloned();
+    }
+    if counters_enabled() {
+        counters().lock().note_dispatch(label, input_bytes);
+    }
 }
 
 /// Increment `label`'s count, cloning the handle only to create a new entry.
@@ -278,6 +287,99 @@ fn bump_label(map: &mut HashMap<Arc<str>, u64>, label: &Arc<str>) {
     } else {
         map.insert(Arc::clone(label), 1);
     }
+}
+
+/// One device's dispatch census: per-label counts of the dispatches encoded
+/// on that device's queue while a [`CensusWindow`] is open.
+///
+/// The process-wide census ([`snapshot`]) counts every device in the
+/// process, so two windows open at once on different devices -- two tests on
+/// parallel threads -- each count the other's dispatches, and a [`reset`] in
+/// one clears the other's. This one is owned by the device's `Commands` and
+/// fed by the encoders it opens, so a window sees its own device and nothing
+/// else, whichever thread encodes. Recorded beside the process-wide census,
+/// never instead of it, and only under [`enabled`]: a closed window costs a
+/// relaxed load per dispatch, and with profiling off the encoder does not
+/// hold one.
+#[derive(Default)]
+pub struct DeviceCensus {
+    open: AtomicBool,
+    dispatches: parking_lot::Mutex<HashMap<Arc<str>, u64>>,
+}
+
+/// Why [`DeviceCensus::open`] refused a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CensusRefused {
+    /// `CANDLE_METAL_PROFILE` is off: nothing is recorded, so a window would
+    /// read empty and look like a census of nothing.
+    ProfileOff,
+    /// A window is already open on this device; a second would clear its
+    /// counts.
+    WindowOpen,
+}
+
+impl DeviceCensus {
+    /// Open a window: from here until [`CensusWindow::close`], every dispatch
+    /// encoded on this device is counted under its pipeline label.
+    pub fn open(self: &Arc<Self>) -> Result<CensusWindow, CensusRefused> {
+        if !enabled() {
+            return Err(CensusRefused::ProfileOff);
+        }
+        let mut map = self.dispatches.lock();
+        if self
+            .open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(CensusRefused::WindowOpen);
+        }
+        map.clear();
+        Ok(CensusWindow {
+            census: Arc::clone(self),
+        })
+    }
+
+    /// Count one dispatch, if a window is open. Called by the encoder,
+    /// already behind [`enabled`].
+    #[inline]
+    pub(crate) fn record(&self, label: Option<&Arc<str>>) {
+        if !self.open.load(Ordering::Relaxed) {
+            return;
+        }
+        bump_label(
+            &mut self.dispatches.lock(),
+            label.unwrap_or_else(|| unnamed()),
+        );
+    }
+}
+
+/// An open [`DeviceCensus`] window. Dropping it without [`Self::close`]
+/// closes it and discards the counts.
+pub struct CensusWindow {
+    census: Arc<DeviceCensus>,
+}
+
+impl CensusWindow {
+    /// Close the window and return its counts by label, in
+    /// [`Snapshot::by_label`]'s order (descending count, then label).
+    pub fn close(self) -> Vec<(String, u64)> {
+        let map = std::mem::take(&mut *self.census.dispatches.lock());
+        drop(self);
+        sorted_by_count(&map)
+    }
+}
+
+impl Drop for CensusWindow {
+    fn drop(&mut self) {
+        self.census.open.store(false, Ordering::Release);
+    }
+}
+
+/// Per-label counts, descending by count, ties by label.
+fn sorted_by_count(map: &HashMap<Arc<str>, u64>) -> Vec<(String, u64)> {
+    let mut by_label: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by_label
 }
 
 /// Add one encoder session's fence-probe counts. Called at encoder close,
@@ -319,6 +421,492 @@ pub fn record_command_buffer(start: f64, end: f64, committed: f64, step: u64) {
         step,
         label,
     });
+}
+
+/// Whether compute encoders are timed by stage-boundary counter samples
+/// (`CANDLE_METAL_PROFILE_COUNTERS=1`, only under `CANDLE_METAL_PROFILE`).
+///
+/// A command buffer's `GPUStartTime`/`GPUEndTime` bound its residency, so a
+/// kernel inside it cannot be priced from them (`DESIGN.md` §13.5r). The
+/// start and end of every compute encoder's stage are the finest point this
+/// GPU samples (§13.1d: `atDispatchBoundary` is unsupported), so the encoder is
+/// the unit, and [`encoder_per_dispatch`] is the arm that makes an encoder one
+/// kernel.
+pub fn counters_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && crate::tuning::tuning().instrument.profile_counters)
+}
+
+/// Whether every dispatch gets its own compute encoder
+/// (`CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH=1`, only under
+/// `CANDLE_METAL_PROFILE`). It changes the submission — a seam per dispatch
+/// instead of a barrier — so a step timed under it is a different step, and
+/// the price of that is reported beside it rather than assumed away.
+pub fn encoder_per_dispatch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        enabled()
+            && crate::tuning::tuning()
+                .instrument
+                .profile_encoder_per_dispatch
+    })
+}
+
+/// One compute encoder's GPU interval from its stage-boundary counter
+/// samples, with what it held and its command buffer's interval (the
+/// containment check: an encoder cannot run outside its buffer).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncoderRecord {
+    /// Seconds in domain A (§3.4b), the clock of `GpuInterval`.
+    pub start: f64,
+    pub end: f64,
+    /// The decode step current when the encoder was opened.
+    pub step: u64,
+    /// The first dispatch's pipeline label.
+    pub label: Option<Arc<str>>,
+    pub dispatches: u32,
+    /// Sum over its dispatches of the largest input buffer each bound.
+    pub input_bytes: u64,
+    /// Its command buffer's `GPUStartTime`/`GPUEndTime`.
+    pub cb_start: f64,
+    pub cb_end: f64,
+}
+
+type SampleBuffer =
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCounterSampleBuffer>>;
+type CounterSet =
+    objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCounterSet>>;
+
+/// Samples in one counter sample buffer: the largest length this device
+/// creates (32 768 B of 8-byte timestamps, `DESIGN.md` §13.1n).
+const SAMPLES_PER_BUFFER: usize = 4096;
+
+/// A sample buffer shared by the encoders of any number of command buffers.
+///
+/// The device holds at most 32 sample buffers at once, whatever their size
+/// (§13.1n), and more command buffers than that can be in flight, so a buffer
+/// per command buffer is refused under load. Slots are handed out in order and
+/// the buffer restarts from slot 0 once every encoder written into it has been
+/// resolved: buffers are sized to the samples in flight, not to the command
+/// buffers.
+struct Slab {
+    buffer: SampleBuffer,
+    /// The next unused sample index.
+    next: usize,
+    /// Encoders given slots here and not yet resolved.
+    pending: usize,
+}
+
+/// An encoder opened on a command buffer that has not completed.
+struct PendingEncoder {
+    step: u64,
+    label: Option<Arc<str>>,
+    dispatches: u32,
+    input_bytes: u64,
+    /// Its slab, and the first of its two samples there.
+    slab: usize,
+    index: usize,
+}
+
+#[derive(Default)]
+struct Counters {
+    set: Option<CounterSet>,
+    /// Why this device cannot sample at all, once asked.
+    unavailable: Option<String>,
+    /// Every sample buffer created; never more than the device's live limit.
+    slabs: Vec<Slab>,
+    /// The slab new encoders take slots from.
+    current: Option<usize>,
+    /// Set by a refused allocation, cleared when a command buffer completes:
+    /// until then an encoder with no free slot is dropped without asking again.
+    at_limit: bool,
+    /// Each incomplete command buffer's sampled encoders, in order, keyed on
+    /// the `MTLCommandBuffer` object's address.
+    by_cb: HashMap<usize, Vec<PendingEncoder>>,
+    /// Most command buffers holding sampled encoders at once.
+    in_flight_peak: usize,
+    /// The command buffer whose last encoder is the one dispatches go to.
+    /// Process-wide, so attribution assumes one encoding thread at a time: two
+    /// threads encoding concurrently would interleave their dispatch counts
+    /// and bytes (the intervals themselves stay each encoder's own).
+    open: Option<usize>,
+    records: Vec<EncoderRecord>,
+    /// Encoders left unsampled: no slot free and no buffer to be had.
+    dropped: u64,
+    /// Sample buffer allocations the device refused.
+    refused: u64,
+    /// Metal's reason for the last refusal, with the buffers live at the time.
+    refusal: Option<String>,
+    /// The longest sample buffer allocation, created or refused, in seconds.
+    alloc_max_s: f64,
+    /// Samples that resolved to the error marker, or a range that would not resolve.
+    bad: u64,
+    /// Encoders that ran no dispatch, or whose samples resolved to zero: no
+    /// work reached the GPU (§13.1d).
+    empty: u64,
+    /// Seconds per sample unit, fixed by the first resolved buffer (`sample_unit_s`).
+    unit_s: Option<f64>,
+}
+
+// SAFETY: the Metal objects held here (a counter set, counter sample buffers)
+// are reference-counted Objective-C objects that Metal documents as usable
+// from any thread; every access is serialized by the mutex that owns this.
+unsafe impl Send for Counters {}
+
+fn counters() -> &'static parking_lot::Mutex<Counters> {
+    static COUNTERS: OnceLock<parking_lot::Mutex<Counters>> = OnceLock::new();
+    COUNTERS.get_or_init(|| parking_lot::Mutex::new(Counters::default()))
+}
+
+/// Seconds per `mach_absolute_time` tick (125/3 ns on Apple silicon, §3.4b).
+fn tick_s() -> f64 {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    static TICK: OnceLock<f64> = OnceLock::new();
+    *TICK.get_or_init(|| {
+        let mut tb = Timebase { numer: 0, denom: 0 };
+        // SAFETY: `mach_timebase_info` writes one `mach_timebase_info_data_t`
+        // (two u32s, the layout above) through a valid out-pointer.
+        unsafe { mach_timebase_info(&mut tb) };
+        tb.numer as f64 / tb.denom.max(1) as f64 * 1e-9
+    })
+}
+
+/// Seconds per counter-sample unit, from one sample and the `GPUStartTime`
+/// (seconds, domain A) of the command buffer it was taken in.
+///
+/// Metal calls the sample a GPU timestamp and does not fix its unit. It is
+/// measured here rather than assumed: the two candidates are the nanosecond
+/// and the mach tick, 41.67x apart, and a sample taken microseconds into a
+/// buffer on a clock running for days distinguishes them at any precision
+/// that matters. `None` when neither fits, so a device writing a third unit
+/// fails loudly (every sample counted bad) rather than converting wrongly.
+fn sample_unit_s(sample: u64, cb_start: f64) -> Option<f64> {
+    let ratio = cb_start / sample as f64;
+    [1e-9, tick_s()]
+        .into_iter()
+        .find(|unit| (ratio / unit - 1.0).abs() < 1e-3)
+}
+
+impl Counters {
+    fn init(&mut self, device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>) {
+        use objc2_metal::{
+            MTLCommonCounterSetTimestamp, MTLCounterSamplingPoint, MTLCounterSet, MTLDevice as _,
+        };
+        if !device.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
+            self.unavailable = Some("the device does not sample at stage boundaries".into());
+            return;
+        }
+        // SAFETY: a framework-provided static NSString.
+        let ts = unsafe { MTLCommonCounterSetTimestamp };
+        self.set = device
+            .counterSets()
+            .and_then(|sets| sets.iter().find(|s| s.name().isEqualToString(ts)));
+        if self.set.is_none() {
+            self.unavailable = Some("the device exposes no timestamp counter set".into());
+        }
+    }
+
+    /// A new sample buffer, or `None` when the device refuses one. A refusal
+    /// is counted and not retried until a command buffer completes.
+    fn new_buffer(
+        &mut self,
+        device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+    ) -> Option<SampleBuffer> {
+        use objc2_metal::{MTLCounterSampleBufferDescriptor, MTLDevice as _, MTLStorageMode};
+        if self.at_limit {
+            return None;
+        }
+        let set = self.set.as_ref()?;
+        let d = MTLCounterSampleBufferDescriptor::new();
+        d.setCounterSet(Some(set));
+        d.setStorageMode(MTLStorageMode::Shared);
+        // SAFETY: a plain count within the device's range; the device validates
+        // it and fails the creation below rather than overrunning anything.
+        unsafe { d.setSampleCount(SAMPLES_PER_BUFFER) };
+        let t = std::time::Instant::now();
+        let made = device.newCounterSampleBufferWithDescriptor_error(&d);
+        self.alloc_max_s = self.alloc_max_s.max(t.elapsed().as_secs_f64());
+        match made {
+            Ok(b) => Some(b),
+            Err(e) => {
+                self.refused += 1;
+                self.at_limit = true;
+                self.refusal = Some(format!(
+                    "{} buffers live: {}",
+                    self.slabs.len(),
+                    e.localizedDescription()
+                ));
+                None
+            }
+        }
+    }
+
+    /// Two consecutive sample slots `(slab, index)`: in the current slab, else
+    /// in one every encoder of which has resolved, else in a new buffer.
+    /// `None` when every slab is in use and the device will not give another.
+    fn slot(
+        &mut self,
+        cb: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+    ) -> Option<(usize, usize)> {
+        use objc2_metal::MTLCommandBuffer as _;
+        let fits = |s: &Slab| s.next + 2 <= SAMPLES_PER_BUFFER;
+        let id = match self.current.filter(|&i| fits(&self.slabs[i])) {
+            Some(i) => i,
+            None => match self.slabs.iter().position(|s| s.pending == 0) {
+                Some(i) => {
+                    self.slabs[i].next = 0;
+                    i
+                }
+                None => {
+                    let buffer = self.new_buffer(&cb.device())?;
+                    self.slabs.push(Slab {
+                        buffer,
+                        next: 0,
+                        pending: 0,
+                    });
+                    self.slabs.len() - 1
+                }
+            },
+        };
+        self.current = Some(id);
+        let s = &mut self.slabs[id];
+        let index = s.next;
+        s.next += 2;
+        s.pending += 1;
+        Some((id, index))
+    }
+
+    fn note_dispatch(&mut self, label: Option<&Arc<str>>, input_bytes: usize) {
+        let Some(key) = self.open else { return };
+        if let Some(e) = self.by_cb.get_mut(&key).and_then(|s| s.last_mut()) {
+            e.dispatches += 1;
+            if e.label.is_none() {
+                e.label = label.cloned();
+            }
+            e.input_bytes += input_bytes as u64;
+        }
+    }
+}
+
+/// A sample buffer and the index of the first of two samples for a compute
+/// encoder about to be opened on `cb`, or `None` to open it unsampled.
+///
+/// Called once per compute encoder. With the counters off it is one cached
+/// bool; with them on, an encoder that cannot be sampled is counted as dropped
+/// and its dispatches go unattributed rather than onto the previous encoder.
+pub fn sample_encoder(
+    cb: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+) -> Option<(SampleBuffer, usize)> {
+    use objc2_metal::MTLCommandBuffer as _;
+    if !counters_enabled() {
+        return None;
+    }
+    let key = cb as *const _ as *const () as usize;
+    let step = current_step();
+    let mut c = counters().lock();
+    if c.set.is_none() && c.unavailable.is_none() {
+        c.init(&cb.device());
+    }
+    c.open = None;
+    let Some((slab, index)) = c.slot(cb) else {
+        c.dropped += 1;
+        return None;
+    };
+    let buffer = c.slabs[slab].buffer.clone();
+    let encoders = c.by_cb.entry(key).or_default();
+    encoders.push(PendingEncoder {
+        step,
+        label: None,
+        dispatches: 0,
+        input_bytes: 0,
+        slab,
+        index,
+    });
+    c.in_flight_peak = c.in_flight_peak.max(c.by_cb.len());
+    c.open = Some(key);
+    Some((buffer, index))
+}
+
+/// Resolve the samples of the command buffer at `key`, which has completed
+/// with the interval `[cb_start, cb_end]`. Called from its completion handler;
+/// the lock is held only to take the entry and to file the records, not across
+/// the resolve.
+pub fn resolve_encoder_samples(key: usize, cb_start: f64, cb_end: f64) {
+    use objc2_metal::MTLCounterSampleBuffer as _;
+    if !counters_enabled() {
+        return;
+    }
+    // Consecutive slots of one slab resolve as one range: `(slab, first, count)`.
+    let (encoders, runs, mut unit) = {
+        let mut c = counters().lock();
+        c.at_limit = false;
+        let Some(encoders) = c.by_cb.remove(&key) else {
+            return;
+        };
+        let mut runs: Vec<(SampleBuffer, usize, usize)> = Vec::new();
+        let mut last = usize::MAX;
+        for e in &encoders {
+            match runs.last_mut() {
+                Some((_, first, n)) if e.slab == last && *first + 2 * *n == e.index => *n += 1,
+                _ => runs.push((c.slabs[e.slab].buffer.clone(), e.index, 1)),
+            }
+            last = e.slab;
+        }
+        (encoders, runs, c.unit_s)
+    };
+    let n = encoders.len();
+    let mut samples: Vec<Option<(u64, u64)>> = Vec::with_capacity(n);
+    for (buffer, first, count) in &runs {
+        // SAFETY: the range lies inside the buffer (`Counters::slot` bounds
+        // every index by `SAMPLES_PER_BUFFER`), and the command buffer that
+        // wrote it has completed; no other command buffer is given these slots
+        // until this one's encoders are resolved.
+        let data = unsafe {
+            buffer.resolveCounterRange(objc2_foundation::NSRange::new(*first, 2 * count))
+        };
+        match data.map(|d| d.to_vec()) {
+            Some(bytes) if bytes.len() >= 16 * count => {
+                let at = |i: usize| {
+                    u64::from_ne_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap_or([0; 8]))
+                };
+                samples.extend((0..*count).map(|i| Some((at(2 * i), at(2 * i + 1)))));
+            }
+            _ => samples.extend((0..*count).map(|_| None)),
+        }
+    }
+    let (mut out, mut bad, mut empty) = (Vec::with_capacity(n), 0u64, 0u64);
+    let mut drained: Vec<usize> = Vec::with_capacity(n);
+    for (e, sample) in encoders.into_iter().zip(samples) {
+        drained.push(e.slab);
+        let Some((s, t)) = sample else {
+            bad += 1;
+            continue;
+        };
+        if s == u64::MAX || t == u64::MAX {
+            bad += 1;
+            continue;
+        }
+        // A slot is reused, so an encoder that ran nothing may still hold an
+        // earlier encoder's samples; it is judged by its dispatches first.
+        if e.dispatches == 0 || (s == 0 && t == 0) {
+            empty += 1;
+            continue;
+        }
+        if unit.is_none() {
+            unit = sample_unit_s(s, cb_start);
+        }
+        match unit {
+            None => bad += 1,
+            Some(u) => out.push(EncoderRecord {
+                start: s as f64 * u,
+                end: t as f64 * u,
+                step: e.step,
+                label: e.label,
+                dispatches: e.dispatches,
+                input_bytes: e.input_bytes,
+                cb_start,
+                cb_end,
+            }),
+        }
+    }
+    let mut c = counters().lock();
+    if c.unit_s.is_none() {
+        c.unit_s = unit;
+    }
+    if c.open == Some(key) {
+        c.open = None;
+    }
+    for slab in drained {
+        c.slabs[slab].pending -= 1;
+    }
+    c.records.extend(out);
+    c.bad += bad;
+    c.empty += empty;
+}
+
+/// Encoders whose interval falls outside their command buffer's by more than
+/// `slack_s`, or runs backwards: the check that the samples are in the clock
+/// and unit the conversion assumes. Zero is the only readable answer.
+pub fn encoder_containment(records: &[EncoderRecord], slack_s: f64) -> usize {
+    records
+        .iter()
+        .filter(|r| r.end < r.start || r.start < r.cb_start - slack_s || r.end > r.cb_end + slack_s)
+        .count()
+}
+
+/// The union of the encoders' intervals, seconds: what they cover of the GPU
+/// timeline, to set against the command buffers' union (`gpu_busy`).
+pub fn encoder_union_s(records: &[EncoderRecord]) -> f64 {
+    let mut iv: Vec<GpuInterval> = records
+        .iter()
+        .map(|r| GpuInterval {
+            start: r.start,
+            end: r.end,
+        })
+        .collect();
+    union_and_span(&mut iv).0
+}
+
+/// Encoder time by the kernel it held: one row per label over the
+/// single-dispatch encoders, and one row for every encoder holding more than
+/// one dispatch (whose time is not any one kernel's).
+pub fn encoder_time_by_label(records: &[EncoderRecord]) -> Vec<EncoderLabelTiming> {
+    let mut map: HashMap<String, (Vec<f64>, u64, u64)> = HashMap::new();
+    for r in records {
+        let key = if r.dispatches == 1 {
+            r.label.as_deref().unwrap_or("<unlabelled>").to_string()
+        } else {
+            "<encoders of several dispatches>".to_string()
+        };
+        let e = map.entry(key).or_default();
+        e.0.push(r.end - r.start);
+        e.1 += u64::from(r.dispatches);
+        e.2 += r.input_bytes;
+    }
+    let mut v: Vec<EncoderLabelTiming> = map
+        .into_iter()
+        .map(|(label, (mut xs, dispatches, input_bytes))| {
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q = |f: f64| xs[(((xs.len() - 1) as f64) * f) as usize];
+            EncoderLabelTiming {
+                label,
+                encoders: xs.len() as u64,
+                dispatches,
+                total_s: xs.iter().sum(),
+                p50_s: q(0.5),
+                p90_s: q(0.9),
+                max_s: xs[xs.len() - 1],
+                input_bytes,
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| {
+        b.total_s
+            .partial_cmp(&a.total_s)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    v
+}
+
+/// One kernel's counter-sampled encoder time (see [`encoder_time_by_label`]).
+#[derive(Clone, Debug)]
+pub struct EncoderLabelTiming {
+    pub label: String,
+    pub encoders: u64,
+    pub dispatches: u64,
+    pub total_s: f64,
+    pub p50_s: f64,
+    pub p90_s: f64,
+    pub max_s: f64,
+    /// Summed largest-input bytes: the weight bytes, for a GEMV.
+    pub input_bytes: u64,
 }
 
 /// GPU time per pipeline label over the recorded command buffers: `(label,
@@ -545,6 +1133,34 @@ pub struct Snapshot {
     /// buffer cannot start before it is committed, so a negative value says
     /// the two stamps are not in one clock and every `starved` figure is void.
     pub min_start_after_commit_s: f64,
+    /// Every counter-sampled compute encoder that completed, in completion
+    /// order (empty unless `counters_enabled()`).
+    pub encoder_records: Vec<EncoderRecord>,
+    /// Encoders opened unsampled: no free slot and no sample buffer to be had.
+    pub encoder_samples_dropped: u64,
+    /// Sample buffer allocations the device refused (each drops its encoder).
+    pub counter_buffers_refused: u64,
+    /// Metal's reason for the last refusal, with the buffers live at the time.
+    pub counter_refusal: Option<String>,
+    /// Sample buffers created since the process started (the device holds 32).
+    pub counter_buffers_live: u64,
+    /// Most command buffers holding sampled encoders at once, since the process started.
+    pub encoder_buffers_in_flight_peak: u64,
+    /// The longest sample buffer allocation, created or refused, in seconds.
+    pub counter_alloc_max_s: f64,
+    /// Encoders whose samples resolved to the error marker.
+    pub encoder_samples_bad: u64,
+    /// Encoders that ran no dispatch or whose samples resolved to zero (no
+    /// work reached the GPU).
+    pub encoder_samples_empty: u64,
+    /// Command buffers holding sampled encoders that have not been resolved:
+    /// in flight at the snapshot, or never given a completion handler.
+    pub encoder_buffers_unresolved: u64,
+    /// Why this device cannot sample at all, when the counters were asked for.
+    /// A refused allocation is not this: it drops encoders and is counted above.
+    pub counters_unavailable: Option<String>,
+    /// Seconds per counter-sample unit, once one buffer has resolved.
+    pub counter_unit_s: Option<f64>,
 }
 
 /// Take the current totals without clearing them.
@@ -565,12 +1181,27 @@ pub fn snapshot() -> Snapshot {
     // token boundary under `--per-token`), never per dispatch, so the
     // allocation here is off the hot path by construction and callers that
     // format or serialise the result want an owned `String` anyway.
-    let mut by_label: Vec<(String, u64)> = rec
-        .dispatches
-        .iter()
-        .map(|(k, v)| (k.to_string(), *v))
-        .collect();
-    by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_label = sorted_by_count(&rec.dispatches);
+    drop(rec);
+
+    let c = counters().lock();
+    let encoder_records = c.records.clone();
+    let (dropped, bad, empty, unresolved, unavailable, unit) = (
+        c.dropped,
+        c.bad,
+        c.empty,
+        c.by_cb.len() as u64,
+        c.unavailable.clone(),
+        c.unit_s,
+    );
+    let (refused, refusal, live, in_flight_peak, alloc_max_s) = (
+        c.refused,
+        c.refusal.clone(),
+        c.slabs.len() as u64,
+        c.in_flight_peak as u64,
+        c.alloc_max_s,
+    );
+    drop(c);
 
     Snapshot {
         dispatches: DISPATCHES.load(Ordering::Relaxed),
@@ -595,6 +1226,18 @@ pub fn snapshot() -> Snapshot {
         command_buffer_records: records,
         idle_gaps,
         min_start_after_commit_s,
+        encoder_records,
+        encoder_samples_dropped: dropped,
+        counter_buffers_refused: refused,
+        counter_refusal: refusal,
+        counter_buffers_live: live,
+        encoder_buffers_in_flight_peak: in_flight_peak,
+        counter_alloc_max_s: alloc_max_s,
+        encoder_samples_bad: bad,
+        encoder_samples_empty: empty,
+        encoder_buffers_unresolved: unresolved,
+        counters_unavailable: unavailable,
+        counter_unit_s: unit,
     }
 }
 
@@ -618,6 +1261,16 @@ pub fn reset() {
     let mut rec = recorder().lock().unwrap();
     rec.records.clear();
     rec.dispatches.clear();
+    drop(rec);
+    // Pending command buffers are kept: one still in flight resolves into the
+    // next window, as its `GpuInterval` does (see above).
+    let mut c = counters().lock();
+    c.records.clear();
+    c.dropped = 0;
+    c.refused = 0;
+    c.refusal = None;
+    c.bad = 0;
+    c.empty = 0;
 }
 
 #[cfg(test)]
@@ -716,6 +1369,74 @@ mod tests {
         ];
         let (union, _) = union_and_span(&mut ivs);
         assert_eq!(union, 10.0);
+    }
+
+    /// The counter sample's unit is read from the data: a sample equal to the
+    /// buffer's start in nanoseconds is nanoseconds, one equal to it in mach
+    /// ticks is ticks, and a third unit is refused rather than converted.
+    #[test]
+    fn the_sample_unit_is_the_one_that_lands_on_the_buffers_start() {
+        let cb_start = 409_705.901_880_666_7_f64;
+        let ns = (cb_start * 1e9) as u64 + 3_000;
+        assert_eq!(sample_unit_s(ns, cb_start), Some(1e-9));
+        let ticks = (cb_start / tick_s()) as u64 + 72;
+        assert_eq!(sample_unit_s(ticks, cb_start), Some(tick_s()));
+        let micros = (cb_start * 1e6) as u64;
+        assert_eq!(sample_unit_s(micros, cb_start), None);
+    }
+
+    /// Containment counts an interval outside its buffer, one running
+    /// backwards, and nothing else.
+    #[test]
+    fn containment_counts_what_escapes_its_buffer() {
+        let r = |start: f64, end: f64| EncoderRecord {
+            start,
+            end,
+            step: 1,
+            label: None,
+            dispatches: 1,
+            input_bytes: 0,
+            cb_start: 10.0,
+            cb_end: 20.0,
+        };
+        let rs = [
+            r(11.0, 12.0),
+            r(10.0, 20.0),
+            r(9.0, 12.0),
+            r(15.0, 21.0),
+            r(14.0, 13.0),
+        ];
+        assert_eq!(encoder_containment(&rs, 1e-6), 3);
+    }
+
+    /// Per-label rows over single-dispatch encoders, and one row for the rest.
+    #[test]
+    fn encoder_time_is_keyed_on_the_kernel_only_when_the_encoder_is_one_kernel() {
+        let r = |label: &str, dispatches: u32, dt: f64, bytes: u64| EncoderRecord {
+            start: 0.0,
+            end: dt,
+            step: 1,
+            label: Some(Arc::from(label)),
+            dispatches,
+            input_bytes: bytes,
+            cb_start: 0.0,
+            cb_end: 1.0,
+        };
+        let rows = encoder_time_by_label(&[
+            r("gemv_a", 1, 2e-4, 100),
+            r("gemv_a", 1, 4e-4, 100),
+            r("rmsnorm", 1, 1e-5, 4),
+            r("gemv_a", 3, 9e-4, 300),
+        ]);
+        let get = |l: &str| rows.iter().find(|k| k.label == l).unwrap();
+        assert_eq!(get("gemv_a").encoders, 2);
+        assert_eq!(get("gemv_a").input_bytes, 200);
+        assert!((get("gemv_a").total_s - 6e-4).abs() < 1e-12);
+        assert_eq!(get("<encoders of several dispatches>").dispatches, 3);
+        assert_eq!(
+            rows[0].label, "<encoders of several dispatches>",
+            "largest total first"
+        );
     }
 
     #[test]

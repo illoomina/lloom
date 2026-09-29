@@ -422,3 +422,47 @@ fn is_truthy(s: String) -> bool {
 pub(crate) fn get_env_bool<K: AsRef<OsStr>>(key: K, default: bool) -> bool {
     std::env::var(key).map(is_truthy).unwrap_or(default)
 }
+
+/// One threadgroup per `groups` items of `width` threads.
+pub(crate) fn dispatch_groups(encoder: &ComputeCommandEncoder, groups: usize, width: usize) {
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: groups.max(1),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// A `gx × gy` grid of threadgroups of `width` threads.
+pub(crate) fn dispatch_groups_2d(
+    encoder: &ComputeCommandEncoder,
+    gx: usize,
+    gy: usize,
+    width: usize,
+) {
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: gx.max(1),
+            height: gy.max(1),
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// A threadgroup of one head's `d` lanes: at least a simdgroup, a power of two.
+pub(crate) fn head_width(d: usize, pipeline: &crate::kernels::ComputePipeline) -> usize {
+    d.max(32)
+        .next_power_of_two()
+        .min(pipeline.max_total_threads_per_threadgroup())
+}

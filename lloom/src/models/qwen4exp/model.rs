@@ -20,6 +20,8 @@ use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
+#[cfg(feature = "metal")]
+use lloom_tensor::metal_backend::{PassKey, PassKind, PassOpener};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor, D};
 
@@ -96,7 +98,20 @@ impl<R: ExpertResidency> Layer<R> {
         cache: &mut Cache,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows(res_hc, l, &mut [cache], device_plan)
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, &mut ())
+    }
+
+    /// [`Self::decode_parts_planned`] with `hook` at the MoE's join points
+    /// (`moe::PlanHook`) when the routed experts are planned on the device.
+    pub fn decode_parts_planned_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        device_plan: bool,
+        hook: &mut H,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, hook)
     }
 
     /// [`Self::decode_parts_planned`] over `B` rows: `res_hc [B, 1, n·d]`,
@@ -109,6 +124,17 @@ impl<R: ExpertResidency> Layer<R> {
         l: usize,
         caches: &mut [&mut Cache],
         device_plan: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, caches, device_plan, &mut ())
+    }
+
+    fn decode_parts_rows_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        caches: &mut [&mut Cache],
+        device_plan: bool,
+        hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
@@ -136,7 +162,7 @@ impl<R: ExpertResidency> Layer<R> {
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
         trace("ffn.mix", l, &cur);
         let (moe_out, record) = if device_plan {
-            self.moe.decode_planned(&cur)?
+            self.moe.decode_planned_with(&cur, hook)?
         } else {
             (self.moe.decode(&cur)?, None)
         };
@@ -257,6 +283,8 @@ pub struct Cache {
     /// for the NEXT forward, which consumes the note instead of reading its
     /// input ids back from the device. Cleared by that forward.
     pub pending_noted: bool,
+    /// The PLE's host fill (`CausalLM::host_feed`).
+    host: HostFill,
     /// Decode position (number of tokens seen).
     pub pos: usize,
     /// Retain every forward's pre-final-mixer carry `[1, seq, n·d]` (the
@@ -286,10 +314,37 @@ pub struct Cache {
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
+    /// Host nanoseconds in the replays (`redos`) and in the disarmed
+    /// host-plan passes (`host_plan_passes`): the miss regime's two pass
+    /// kinds, timed only when they run.
+    pub replay_ns: u64,
+    pub host_pass_ns: u64,
+    /// Experts a settle loaded for layers past the first layer that missed:
+    /// their ids were routed from a carry already wrong at that layer.
+    pub settle_after_first: u64,
     /// The `(pos, seq)` the last `prepare_pass` sized and admitted, so the
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+}
+
+/// A sequence's PLE host fill: the run in progress, if a decode loop armed
+/// one — a single-position forward with no noted id then waits on the GPU for
+/// rows a producer fills, and `Cache::ngram` stays at the run's first decode
+/// step until `host_feed_end` catches it up — and the staging slots and event
+/// it runs over, kept across runs. A clone of the cache shares neither: two
+/// sequences filling one ring would overwrite each other's rows.
+#[derive(Debug, Default)]
+struct HostFill {
+    run: Option<std::sync::Arc<crate::nn::ngram_memory::FeedLink>>,
+    #[cfg(feature = "metal")]
+    ring: Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>,
+}
+
+impl Clone for HostFill {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// What a speculative window must put back besides the recurrent channels'
@@ -407,6 +462,7 @@ impl Cache {
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
             pending_noted: false,
+            host: HostFill::default(),
             pos: 0,
             want_nextn: false,
             nextn: Vec::new(),
@@ -416,6 +472,9 @@ impl Cache {
             redos: 0,
             device_plan_armed: false,
             host_plan_passes: 0,
+            replay_ns: 0,
+            host_pass_ns: 0,
+            settle_after_first: 0,
             prepared: None,
         }
     }
@@ -431,6 +490,7 @@ impl Cache {
         self.ngram.reset();
         self.pending_tokens.clear();
         self.pending_noted = false;
+        self.host.run = None;
         self.pos = 0;
         self.nextn.clear();
         self.window = None;
@@ -739,7 +799,8 @@ struct PleWindowMarks {
 pub struct Ple {
     pub layer: usize,
     pub hash: NgramHash,
-    pub table: PleTable,
+    /// Shared with a run's host-fill producer (`CausalLM::host_feed`).
+    pub table: std::sync::Arc<PleTable>,
     pub block: PleLayer,
 }
 
@@ -759,6 +820,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     ple: Option<Ple>,
     /// The PLE-window instrument, when armed (`arm_ple_window`).
     ple_window: Option<parking_lot::Mutex<PleWindowMarks>>,
+    /// Whether [`CausalLM::host_feed`] offers the PLE's host fill to a loop
+    /// whose tokens stay on the device (`set_host_fill`).
+    host_fill: bool,
     /// The MTP head, when loaded (`LoadOptions::mtp`); an `MtpDrafter`
     /// borrows it beside `embed_tokens` and `lm_head`.
     mtp: Option<super::mtp::MtpHead<R>>,
@@ -782,6 +846,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// the layer itself measured worse than no hint: the reads were
     /// cancelled by the take, P20). `QWEN4EXP_SPEC_AHEAD` by default.
     spec_ahead: usize,
+    /// Spike 0's event (`JoinHook::Wait`), made at first use.
+    #[cfg(feature = "metal")]
+    spike0: std::sync::OnceLock<Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>>,
     cfg: Config,
 }
 
@@ -878,6 +945,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             lm_head,
             ple: None,
             ple_window: None,
+            host_fill: true,
             mtp: None,
             prefill_mode: PrefillMode::default(),
             device_plan,
@@ -885,6 +953,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
+            #[cfg(feature = "metal")]
+            spike0: std::sync::OnceLock::new(),
             cfg,
         }
     }
@@ -917,18 +987,42 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Open a planned pass for `shape` (`DESIGN.md` §9.2aa: the pass's
     /// activations served by ordinal from one base, no allocation on a
     /// cached key) — when the device has pass plans enabled and no driver
-    /// holds a pass already. Returns whether this call opened it.
+    /// holds a pass already. Returns whether this call opened it. The pass
+    /// is keyed as the model's own: it opens after the embedding a driver's
+    /// pass of the same shape holds, so the two are different sequences.
     fn open_pass(&self, shape: crate::nn::decode::PassShape) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
             if !m.pass_plans_enabled() || m.pass_open() {
                 return Ok(false);
             }
-            crate::nn::decode::begin_pass(&self.device(), shape)?;
+            let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
+                return Ok(false);
+            };
+            m.begin_pass(key)?;
             return Ok(true);
         }
         let _ = shape;
         Ok(false)
+    }
+
+    /// The plan-cache key of a pass shape this model prepares or opens — a
+    /// decode step or a prefill chunk — bracketed by `opener`. `None` for
+    /// the shapes only a driver opens.
+    #[cfg(feature = "metal")]
+    fn pass_key(shape: crate::nn::decode::PassShape, opener: PassOpener) -> Option<PassKey> {
+        use crate::nn::decode::PassShape;
+        let kind = match shape {
+            PassShape::Decode { b } => PassKind::Decode {
+                b: b.min(u16::MAX as usize) as u16,
+            },
+            PassShape::Prefill { w, fresh } => PassKind::Prefill {
+                w: w.min(u32::MAX as usize) as u32,
+                fresh,
+            },
+            PassShape::Verify { .. } | PassShape::Ragged { .. } => return None,
+        };
+        Some(PassKey::new(kind).opened_by(opener))
     }
 
     fn close_pass(&self, opened: bool) -> Result<()> {
@@ -1036,6 +1130,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Idempotent per `(pos, seq)`: a driver prepares, then `forward`'s own
     /// chunk loop prepares the same pass and finds it done.
     pub fn prepare_pass_inner(&self, cache: &mut Cache, seq: usize) -> Result<()> {
+        self.prepare_pass_as(cache, seq, false)
+    }
+
+    /// [`Self::prepare_pass_inner`] for the pass about to run: a driver's,
+    /// or with `own` the one this model opens itself when no driver holds a
+    /// pass — whose plan, if any, is a different key.
+    fn prepare_pass_as(&self, cache: &mut Cache, seq: usize, own: bool) -> Result<()> {
         if seq == 0 || cache.prepared == Some((cache.pos, seq)) {
             return Ok(());
         }
@@ -1047,18 +1148,23 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if seq > 1 {
             if let Ok(m) = self.device().as_metal_device() {
                 if m.pass_plans_enabled() {
-                    let key = lloom_tensor::metal_backend::PassKey::new(
-                        lloom_tensor::metal_backend::PassKind::Prefill {
-                            w: seq.min(u32::MAX as usize) as u32,
-                            fresh: cache.pos == 0,
-                        },
-                    );
-                    if m.pass_plan_cached(&key) {
+                    let opener = if own && !m.pass_open() {
+                        PassOpener::Model
+                    } else {
+                        PassOpener::Driver
+                    };
+                    let shape = crate::nn::decode::PassShape::Prefill {
+                        w: seq,
+                        fresh: cache.pos == 0,
+                    };
+                    if Self::pass_key(shape, opener).is_some_and(|k| m.pass_plan_cached(&k)) {
                         plan.transient = 0;
                     }
                 }
             }
         }
+        #[cfg(not(feature = "metal"))]
+        let _ = own;
         if plan.bytes() == 0 || self.mem_check == MemCheck::Off || self.memory_fraction <= 0.0 {
             return Ok(());
         }
@@ -1203,10 +1309,21 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.ple = Some(Ple {
             layer,
             hash,
-            table,
+            table: std::sync::Arc::new(table),
             block,
         });
         Ok(())
+    }
+
+    /// Offer the PLE's host fill to a decode loop whose tokens stay on the
+    /// device (`CausalLM::host_feed`, on by default). Off, such a loop's
+    /// forwards read their input ids back instead: the A/B arm.
+    pub fn set_host_fill(&mut self, on: bool) {
+        self.host_fill = on;
+    }
+
+    pub fn host_fill(&self) -> bool {
+        self.host_fill
     }
 
     /// Arm the PLE-window instrument (`design/docs/expert-streaming.md`
@@ -1256,7 +1373,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
     /// The N-gram PLE's table, if attached (its read policy and counters).
     pub fn ple_table(&self) -> Option<&PleTable> {
-        self.ple.as_ref().map(|p| &p.table)
+        self.ple.as_ref().map(|p| &*p.table)
     }
 
     /// The N-gram PLE's hash, if attached.
@@ -1272,7 +1389,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// The PLE hot-row cache's `(hits, misses)`, if a cached table is attached.
     pub fn ple_cache_stats(&self) -> Option<(u64, u64)> {
         match &self.ple {
-            Some(p) => match &p.table {
+            Some(p) => match &*p.table {
                 PleTable::Cached(_) => Some(p.table.cache_stats()),
                 _ => None,
             },
@@ -1400,6 +1517,17 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn ple_delta(&self, ple: &Ple, res_hc: &Tensor, cache: &mut Cache) -> Result<Tensor> {
         self.ple_window_cut(res_hc)?;
         let seq = res_hc.dim(1)?;
+        if seq == 1 && cache.pending_tokens.is_empty() {
+            if let Some(link) = &cache.host.run {
+                // The host fill: wait on the GPU for the rows a producer
+                // fills from this position's token (`nn::ngram_memory`).
+                let emb = link.encode_read(cache.pos)?;
+                let emb = emb.reshape((1, emb.elem_count()))?;
+                return ple
+                    .block
+                    .forward(res_hc, &emb, &mut cache.ple_conv, ple.layer);
+            }
+        }
         let n_heads = ple.hash.n_heads();
         let mut ids = vec![0i64; seq * n_heads];
         for t in 0..seq {
@@ -1503,7 +1631,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                             at += l;
                         }
                         let total: usize = lens.iter().sum();
-                        self.prepare_pass_inner(cache, total)?;
+                        self.prepare_pass_as(cache, total, true)?;
                         let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
                             w: total,
                             fresh: cache.pos == 0,
@@ -1516,7 +1644,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     let h = embeds.narrow(1, start, len)?;
                     // Each chunk is a pass of its own: admitted here when the
                     // driver handed the whole prompt over untiled.
-                    self.prepare_pass_inner(cache, len)?;
+                    self.prepare_pass_as(cache, len, true)?;
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {
@@ -1774,7 +1902,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if own {
                 cache.open_window()?;
             }
-            let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+            let logits = self
+                .decode_embed_pass(h, cache, obs, false)
+                .map(|(l, _)| l)?;
             if own {
                 cache.keep_standing();
             }
@@ -1785,12 +1915,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // with every expert resident; then the device plan, until it misses.
         if !cache.device_plan_armed {
             let before = self.stream_misses();
+            let t0 = std::time::Instant::now();
             cache.open_window()?;
             let logits = self
                 .decode_embed_pass(h, cache, obs, false)
                 .map(|(l, _)| l)?;
             cache.keep_standing();
             cache.host_plan_passes += 1;
+            cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
             if self.stream_misses() == before {
                 cache.device_plan_armed = true;
             }
@@ -1803,20 +1935,27 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // per-layer readback loads each layer's true experts as it reaches
         // them: one replay per missed token, and the experts it loaded are
         // resident for the tokens after it.
+        let h = &Self::replay_input(h)?;
         cache.open_window()?;
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
-        let redo = self.settle_records(&records)?;
+        let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             // The step's window stays open as the standing one.
             cache.keep_standing();
             return Ok(logits);
         }
+        cache.settle_after_first += after_first;
+        let t0 = std::time::Instant::now();
+        self.note_replay();
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
         cache.open_window()?;
-        let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+        let logits = self
+            .decode_embed_pass(h, cache, obs, false)
+            .map(|(l, _)| l)?;
         cache.keep_standing();
+        cache.replay_ns += t0.elapsed().as_nanos() as u64;
         Ok(logits)
     }
 
@@ -1824,10 +1963,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// in ONE readback (a `cat` after the pass and one wait on its tail),
     /// then each layer's slice settled in layer order. Reading them one by
     /// one was 48 commits and waits a token on retired work (#749 P29).
-    /// `true` when any layer computed on a missing expert.
-    fn settle_records(&self, records: &[(usize, Tensor)]) -> Result<bool> {
+    /// `true` when any layer computed on a missing expert, and the experts
+    /// loaded for layers past the first one that did.
+    fn settle_records(&self, records: &[(usize, Tensor)]) -> Result<(bool, u64)> {
         if records.is_empty() {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let flat: Vec<Tensor> = records
             .iter()
@@ -1839,7 +1979,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let refs: Vec<&Tensor> = flat.iter().collect();
             Tensor::cat(&refs, 0)?.to_vec1()?
         };
-        let mut redo = false;
+        let mut parts: Vec<(&R, &[u32])> = Vec::with_capacity(records.len());
         let mut at = 0usize;
         for ((l, _), f) in records.iter().zip(&flat) {
             let n = f.elem_count();
@@ -1850,12 +1990,21 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     at + n
                 ))
             })?;
-            if self.layers[*l].moe().experts().settle_host(slice)? {
-                redo = true;
-            }
+            parts.push((self.layers[*l].moe().experts(), slice));
             at += n;
         }
-        Ok(redo)
+        let settled = R::settle_batch(&parts)?;
+        let mut redo = false;
+        let mut after_first = 0u64;
+        for (missed, n) in settled {
+            if missed {
+                if redo {
+                    after_first += n;
+                }
+                redo = true;
+            }
+        }
+        Ok((redo, after_first))
     }
 
     /// The streamed tier's misses so far, summed over the layers (0 for
@@ -1865,6 +2014,57 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .iter()
             .map(|l| l.moe().experts().misses_so_far())
             .sum()
+    }
+
+    /// `h` as the device-planned pass and its replay read it. A miss
+    /// rewinds the window and replays the pass from `h` after the planned
+    /// pass has run, inside the pass a driver holds; a pass plan recorded
+    /// from a pass that did not replay ends `h`'s interval at its first
+    /// reader and serves its slot to the next value, so the replay would
+    /// read that value. While the device may reuse activations, `h` is
+    /// copied into memory no plan serves (`DESIGN.md` §9.2aa, escapes are
+    /// declared); `h` itself otherwise.
+    fn replay_input(h: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = h.device().as_metal_device() {
+            if m.activations_may_be_reused() {
+                let _declared = lloom_tensor::EscapeGuard::new();
+                return crate::nn::recurrent::own_copy(h);
+            }
+        }
+        Ok(h.clone())
+    }
+
+    /// The pass in progress replays: its recording holds the replay, which
+    /// a pass that settles clean never runs, so it must not become its key's
+    /// plan (`MetalDevice::pass_diverged`).
+    fn note_replay(&self) {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = self.device().as_metal_device() {
+            m.pass_diverged();
+        }
+    }
+
+    /// The hook a device-planned decode pass runs at each layer's join
+    /// points: nothing, or spike 0's wait (`QWEN4EXP_SPIKE0=wait`).
+    fn join_hook(&self) -> Result<JoinHook> {
+        #[cfg(feature = "metal")]
+        if spike0_wait() {
+            if let Ok(m) = self.device().as_metal_device() {
+                let ring = self
+                    .spike0
+                    .get_or_init(|| {
+                        lloom_tensor::metal_backend::HostFedRing::new(m, 1, 1)
+                            .map(std::sync::Arc::new)
+                            .ok()
+                    })
+                    .clone()
+                    .ok_or_else(|| lloom_tensor::Error::Msg("spike 0: no event".into()))?;
+                let next = ring.base();
+                return Ok(JoinHook::Wait { ring, next });
+            }
+        }
+        Ok(JoinHook::Off)
     }
 
     fn decode_embed_pass<O: ForwardObserver>(
@@ -1900,6 +2100,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                                                                      // and handed to layer l+2's prefetcher: its misses read during
                                                                      // layers l+1 and l+2's mixer, landed at l+2's resolve.
         let hint = decode_hint_on() && !device_plan;
+        let mut join = self.join_hook()?;
         for (l, layer) in self.layers.iter().enumerate() {
             if probe {
                 for k in 0..4 {
@@ -1942,7 +2143,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
 
             let (next, mixed, moe_out, record) =
-                layer.decode_parts_planned(&res_hc, l, cache, device_plan)?;
+                layer.decode_parts_planned_with(&res_hc, l, cache, device_plan, &mut join)?;
             if let Some(r) = record {
                 records.push((l, r));
             }
@@ -2075,6 +2276,9 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
         self.ple_window_entry(seq);
         if cache.pending_noted && cache.pending_tokens.len() == seq {
             cache.pending_noted = false;
+        } else if seq == 1 && cache.host.run.is_some() {
+            // The host fill supplies this position's rows (`host_feed`).
+            cache.set_pending_tokens(&[]);
         } else {
             let ids: Vec<u32> = tokens.flatten_all()?.to_vec1::<u32>()?;
             cache.set_pending_tokens(&ids);
@@ -2086,6 +2290,83 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> Result<()> {
         cache.set_pending_tokens(ids);
         cache.pending_noted = true;
+        Ok(())
+    }
+
+    /// The PLE's host fill (`expert-streaming.md` §20.13): the rows of each
+    /// decode position are filled by the loop's producer from the token
+    /// before it and waited for on the GPU at the PLE layer. Metal only, and
+    /// only with the PLE attached and `set_host_fill` on.
+    fn host_feed(
+        &self,
+        cache: &mut Self::Cache,
+    ) -> Result<Option<crate::nn::ngram_memory::HostFeed>> {
+        #[cfg(feature = "metal")]
+        {
+            use crate::nn::ngram_memory::{FeedLink, HostFeed, HOST_FILL_SLOTS};
+            use lloom_tensor::metal_backend::HostFedRing;
+            use std::sync::Arc;
+            let Some(ple) = self.ple.as_ref().filter(|_| self.host_fill) else {
+                return Ok(None);
+            };
+            let lloom_tensor::Device::Metal(m) = ple.block.device() else {
+                return Ok(None);
+            };
+            let len = ple.hash.n_heads() * ple.table.head_dim()?;
+            let ring = match &cache.host.ring {
+                Some(r) if r.len() == len => Arc::clone(r),
+                _ => {
+                    let r = Arc::new(HostFedRing::new(m, HOST_FILL_SLOTS, len)?);
+                    cache.host.ring = Some(Arc::clone(&r));
+                    r
+                }
+            };
+            let link = Arc::new(FeedLink::new(ring, cache.pos));
+            cache.host.run = Some(Arc::clone(&link));
+            Ok(Some(HostFeed::new(
+                link,
+                Arc::clone(&ple.table),
+                ple.hash.clone(),
+                cache.ngram.clone(),
+            )))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = cache;
+            Ok(None)
+        }
+    }
+
+    /// Disarm the host fill and catch the n-gram window up: every fed
+    /// forward consumed its token without pushing it, so the window (and a
+    /// standing window's snapshot of it) still reads the run's first decode
+    /// step.
+    fn host_feed_end(&self, cache: &mut Self::Cache, published: &[u32]) -> Result<()> {
+        let Some(link) = cache.host.run.take() else {
+            return Ok(());
+        };
+        let fed = cache.pos.saturating_sub(link.pos0());
+        if published.len() < fed && !link.released() {
+            lloom_tensor::bail!(
+                "qwen4exp host feed: {} tokens filled for {fed} fed forwards",
+                published.len()
+            )
+        }
+        let consumed = &published[..fed.min(published.len())];
+        let start = cache.ngram.clone();
+        let after = |n: usize| {
+            let mut w = start.clone();
+            for &t in &consumed[..n.min(consumed.len())] {
+                w.push(Some(t));
+            }
+            w
+        };
+        // A window a fed forward opened snapshots the window it started from;
+        // one opened before the run already holds the right one.
+        if let Some(w) = cache.window.as_mut().filter(|w| w.pos >= link.pos0()) {
+            w.ngram = after(w.pos - link.pos0());
+        }
+        cache.ngram = after(fed);
         Ok(())
     }
 
@@ -2155,33 +2436,46 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             self.device_plan && plan_on_device() && caches.iter().all(|c| c.device_plan_armed);
         if !planned {
             let before = self.stream_misses();
+            // Timed only where a tier streams (the miss regime's pass).
+            let t0 = self.device_plan.then(std::time::Instant::now);
             let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
             let clean = self.stream_misses() == before;
+            let ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
             for c in caches.iter_mut() {
                 c.host_plan_passes += 1;
+                c.host_pass_ns += ns;
                 if clean {
                     c.device_plan_armed = true;
                 }
             }
             return Ok(logits);
         }
+        let h = Self::replay_input(&h)?;
         for c in caches.iter_mut() {
             c.open_window()?;
         }
         let (logits, records) = self.decode_rows_pass(&h, &mut caches, true)?;
-        let redo = self.settle_records(&records)?;
+        let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             for c in caches.iter_mut() {
                 c.resolve_window()?;
             }
             return Ok(logits);
         }
+        let t0 = std::time::Instant::now();
+        self.note_replay();
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
             c.device_plan_armed = false;
         }
-        Ok(self.decode_rows_pass(&h, &mut caches, false)?.0)
+        let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
+        let ns = t0.elapsed().as_nanos() as u64;
+        for c in caches.iter_mut() {
+            c.replay_ns += ns;
+            c.settle_after_first += after_first;
+        }
+        Ok(logits)
     }
 
     /// The layer stack over `B` rows from their embeddings `h [B, 1,
@@ -2363,23 +2657,33 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
         let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let h = if planned { Self::replay_input(&h)? } else { h };
         // The cold phase, as `decode_embed`'s: a host-planned window that
         // completed with every expert resident arms the device plan for the
         // rounds after it. Without this the speculative body — a prefill,
         // then verify windows, never a decode step — planned every round on
         // the host (P29 (9): 137 ms a round against the 40 ms step).
-        let misses_before = (!planned).then(|| self.stream_misses());
+        let misses_before = (!planned).then(|| {
+            (
+                self.stream_misses(),
+                self.device_plan.then(std::time::Instant::now),
+            )
+        });
         let (logits, records) = self.verify_pass(&h, cache, planned)?;
         let mut logits = logits;
-        if let Some(before) = misses_before {
+        if let Some((before, t0)) = misses_before {
             cache.host_plan_passes += 1;
+            cache.host_pass_ns += t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
             if self.device_plan && plan_on_device() && self.stream_misses() == before {
                 cache.device_plan_armed = true;
             }
         }
         if planned {
-            let redo = self.settle_records(&records)?;
+            let (redo, after_first) = self.settle_records(&records)?;
             if redo {
+                cache.settle_after_first += after_first;
+                let t0 = std::time::Instant::now();
+                self.note_replay();
                 // The host plan over the same window from the base.
                 let tokens_v = cache
                     .window
@@ -2395,6 +2699,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     w.tokens = tokens_v;
                 }
                 logits = self.verify_pass(&h, cache, false)?.0;
+                cache.replay_ns += t0.elapsed().as_nanos() as u64;
             }
         }
         let argmax = logits.argmax(D::Minus1)?.to_vec1::<u32>()?; // [T]
@@ -2488,6 +2793,42 @@ impl crate::nn::model::CacheShare for Cache {
     fn share_granularity(&self) -> usize {
         0
     }
+}
+
+/// Spike 0 of fetch-and-wait (`expert-streaming.md` §20.14): at every
+/// device-planned layer's join point — after the routed and the shared
+/// experts, before the combine, where the pass would wait for its misses —
+/// a GPU wait on an event the host has already raised. What the hit path
+/// pays for the wait alone, before any host round trip. An instrument
+/// (`QWEN4EXP_SPIKE0=wait`); `Off` compiles to nothing.
+enum JoinHook {
+    Off,
+    #[cfg(feature = "metal")]
+    Wait {
+        ring: std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>,
+        next: u64,
+    },
+}
+
+impl super::moe::PlanHook for JoinHook {
+    fn at_join(&mut self) -> Result<()> {
+        match self {
+            JoinHook::Off => Ok(()),
+            #[cfg(feature = "metal")]
+            JoinHook::Wait { ring, next } => {
+                *next += 1;
+                ring.signal(*next);
+                ring.encode_wait(*next)
+            }
+        }
+    }
+}
+
+/// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.
+#[cfg(feature = "metal")]
+fn spike0_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.spike0 == "wait")
 }
 
 /// Whether the streamed tier's routed experts are planned on the device

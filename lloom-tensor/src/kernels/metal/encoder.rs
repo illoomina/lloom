@@ -529,6 +529,10 @@ pub struct EncoderState {
     /// is on -- Metal has no way to read the bound pipeline back, and doing so
     /// per dispatch on the classical path would be cost for nobody.
     pub current_pipeline: Option<Arc<str>>,
+    /// The largest input buffer bound since the last dispatch, in bytes. For a
+    /// GEMV that is its weight matrix, which is how the counter profile prices a
+    /// kernel in GB/s. Only maintained under `profile::counters_enabled()`.
+    pub dispatch_input_max: usize,
 }
 
 impl Default for EncoderState {
@@ -558,6 +562,7 @@ impl EncoderState {
             fence_hits: 0,
             fence_waits: 0,
             current_pipeline: None,
+            dispatch_input_max: 0,
         }
     }
 }
@@ -599,6 +604,12 @@ pub struct ComputeCommandEncoder {
     /// (`ConstantsPool`). `None` on encoders built outside `Commands`, which
     /// have no in-flight work to order a CPU write behind.
     pub(crate) clock: Option<Arc<crate::kernels::metal::GpuClock>>,
+    /// The device's own dispatch census, when profiling is on
+    /// (`profile::DeviceCensus`). `None` on encoders built outside `Commands`.
+    pub(crate) census: Option<Arc<crate::kernels::metal::profile::DeviceCensus>>,
+    /// The device's own dispatch trace, when the trace switch is on
+    /// (`trace::DeviceTrace`). `None` on encoders built outside `Commands`.
+    pub(crate) trace: Option<Arc<trace::DeviceTrace>>,
 }
 
 /// Scalars accumulated for a packed params block, and the buffer renumbering
@@ -667,12 +678,31 @@ impl ComputeCommandEncoder {
             capturing: Arc::new(AtomicBool::new(false)),
             param_capture: Arc::new(parking_lot::Mutex::new(ParamCapture::default())),
             clock: None,
+            census: None,
+            trace: None,
         }
     }
 
     /// The GPU clock of the queue this encoder's command buffer is committed on.
     pub fn with_clock(mut self, clock: Arc<crate::kernels::metal::GpuClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Count this encoder's dispatches into `census` as well as the
+    /// process-wide census.
+    pub fn with_census(
+        mut self,
+        census: Arc<crate::kernels::metal::profile::DeviceCensus>,
+    ) -> Self {
+        self.census = Some(census);
+        self
+    }
+
+    /// Record this encoder's dispatches into `trace` as well as the
+    /// process-wide trace.
+    pub fn with_trace(mut self, trace: Arc<trace::DeviceTrace>) -> Self {
+        self.trace = Some(trace);
         self
     }
 
@@ -734,6 +764,7 @@ impl ComputeCommandEncoder {
     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
         self.auto_barrier();
         trace::record_dispatch(
+            self.trace.as_deref(),
             size_tuple(threads_per_grid),
             size_tuple(threads_per_threadgroup),
             false,
@@ -757,6 +788,7 @@ impl ComputeCommandEncoder {
     ) {
         self.auto_barrier();
         trace::record_dispatch(
+            self.trace.as_deref(),
             size_tuple(threadgroups_per_grid),
             size_tuple(threads_per_threadgroup),
             true,
@@ -825,8 +857,7 @@ impl ComputeCommandEncoder {
         let mut s = self.state.lock();
         self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         let kinds = s.pending_kinds.take();
-        trace::record_barrier_kinds(kinds);
-        trace::record_barrier();
+        trace::record_barrier(self.trace.as_deref(), kinds);
         crate::kernels::metal::hazard_audit::record_barrier(kinds);
         s.needs_barrier = false;
     }
@@ -919,12 +950,18 @@ impl ComputeCommandEncoder {
         if !profiling && !cfg!(feature = "hazard-audit") {
             return;
         }
-        let name = {
-            let s = self.state.lock();
-            s.current_pipeline.clone()
+        let (name, input_bytes) = {
+            let mut s = self.state.lock();
+            (
+                s.current_pipeline.clone(),
+                std::mem::take(&mut s.dispatch_input_max),
+            )
         };
         if profiling {
-            crate::kernels::metal::profile::record_dispatch(name.as_ref());
+            crate::kernels::metal::profile::record_dispatch(name.as_ref(), input_bytes);
+            if let Some(census) = &self.census {
+                census.record(name.as_ref());
+            }
         }
         crate::kernels::metal::hazard_audit::record_dispatch(
             name.as_deref().unwrap_or("<unnamed>"),
@@ -1005,8 +1042,7 @@ impl ComputeCommandEncoder {
             // and nowhere downstream, because `prev_*` is replaced two lines
             // below and the evidence is gone.
             let kinds = s.pending_kinds.take();
-            trace::record_barrier_kinds(kinds);
-            trace::record_barrier();
+            trace::record_barrier(self.trace.as_deref(), kinds);
             crate::kernels::metal::hazard_audit::record_barrier(kinds);
             s.needs_barrier = false;
             // Replaced, not extended: everything bound before the barrier is
@@ -1054,13 +1090,23 @@ impl ComputeCommandEncoder {
         let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            trace::record_binding(index, ptr, offset, buf.length(), false);
+            trace::record_binding(
+                self.trace.as_deref(),
+                index,
+                ptr,
+                offset,
+                buf.length(),
+                false,
+            );
             // The clock a liveness recording must use: a value is live until the
             // last dispatch that binds it (`DESIGN.md` §6.7 L4).
             arena::note_bind(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
             late_bind::on_bind(ptr, false, s.current_pipeline.as_deref().unwrap_or("?"));
+            if crate::kernels::metal::profile::counters_enabled() {
+                s.dispatch_input_max = s.dispatch_input_max.max(buf.length());
+            }
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only, under the lock this bind holds anyway.
             self.wait_for_buffer(&mut s, ptr);
@@ -1092,7 +1138,14 @@ impl ComputeCommandEncoder {
         let offset = offset + buffer.map_or(0, Buffer::base_offset);
         if let Some(buf) = buffer {
             let ptr = buf.raw_ptr() as usize;
-            trace::record_binding(index, ptr, offset, buf.length(), true);
+            trace::record_binding(
+                self.trace.as_deref(),
+                index,
+                ptr,
+                offset,
+                buf.length(),
+                true,
+            );
             arena::note_bind(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
@@ -1267,7 +1320,10 @@ impl ComputeCommandEncoder {
     }
 
     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
-        trace::record_pipeline(pipeline.name().unwrap_or("<unnamed>"));
+        trace::record_pipeline(
+            self.trace.as_deref(),
+            pipeline.name().unwrap_or("<unnamed>"),
+        );
         self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
     }
@@ -1321,7 +1377,10 @@ impl ComputeCommandEncoder {
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
         use MTLComputeCommandEncoder as _;
-        trace::record_pipeline(pipeline.name().unwrap_or("<unnamed>"));
+        trace::record_pipeline(
+            self.trace.as_deref(),
+            pipeline.name().unwrap_or("<unnamed>"),
+        );
         self.note_pipeline(pipeline);
         self.raw.setComputePipelineState(pipeline.as_ref());
     }

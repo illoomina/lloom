@@ -7,6 +7,7 @@
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
+use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
     Row, Speculative, VarBuilder,
@@ -458,6 +459,163 @@ impl AttnImpl {
                 "--attn must be `generic`, `sdpa` or `flash`, got `{other}`"
             )),
         }
+    }
+}
+
+/// The kernel an attention layer's `seq_len == 1` step takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeAttn {
+    /// The composed attention: `repeat_kv`, f32 `matmul`, softmax.
+    Generic,
+    /// `sdpa_vector` (and its two-pass sibling past 1024 keys).
+    SdpaVector,
+    /// FlashDecoding, over the contiguous cache or the page pool.
+    FlashDecoding,
+}
+
+/// The kernel an attention layer's `seq_len > 1` pass (prefill, a verify
+/// window) takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillAttn {
+    /// The composed attention, with the causal mask.
+    Generic,
+    /// The tiled `steel_attention`, causal in-kernel.
+    Steel,
+}
+
+impl DecodeAttn {
+    fn name(self) -> &'static str {
+        match self {
+            DecodeAttn::Generic => "generic",
+            DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::FlashDecoding => "flash_decoding",
+        }
+    }
+}
+
+impl PrefillAttn {
+    fn name(self) -> &'static str {
+        match self {
+            PrefillAttn::Generic => "generic",
+            PrefillAttn::Steel => "steel_attention",
+        }
+    }
+}
+
+/// The attention kernels a model's layers take, decided once at load from
+/// the requested arm, the device, the compute dtype and the head dim.
+///
+/// Each fused kernel is instantiated at a fixed set of head dims. A phase
+/// whose kernel has no instantiation at this head dim takes the composed
+/// attention instead of failing inside a forward, and [`Self::warning`] names
+/// what was requested and what is taken. Off Metal, or on
+/// [`AttnImpl::Generic`], every phase is `Generic` and nothing was refused.
+/// The head-dim checks are shape probes (`docs/porting-models.md` §21.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnRoute {
+    pub requested: AttnImpl,
+    pub head_dim: usize,
+    pub dtype: DType,
+    pub decode: DecodeAttn,
+    pub prefill: PrefillAttn,
+    /// The decode kernel the head dim refused, when it refused one.
+    pub decode_refused: Option<DecodeAttn>,
+    /// The prefill kernel the head dim refused, when it refused one.
+    pub prefill_refused: Option<PrefillAttn>,
+}
+
+impl AttnRoute {
+    pub fn resolve(requested: AttnImpl, head_dim: usize, dtype: DType, device: &Device) -> Self {
+        let route = Self {
+            requested,
+            head_dim,
+            dtype,
+            decode: DecodeAttn::Generic,
+            prefill: PrefillAttn::Generic,
+            decode_refused: None,
+            prefill_refused: None,
+        };
+        if requested == AttnImpl::Generic || !device.is_metal() {
+            return route;
+        }
+        #[cfg(feature = "metal")]
+        return route.against_kernel_sets();
+        #[cfg(not(feature = "metal"))]
+        route
+    }
+
+    /// Each phase's fused kernel if it is instantiated at this head dim and
+    /// dtype, else `Generic` with the refused kernel recorded.
+    #[cfg(feature = "metal")]
+    fn against_kernel_sets(mut self) -> Self {
+        use lloom_tensor::kernels::{FLASH_HEAD_DIMS, SDPA_FULL_HEAD_DIMS, SDPA_VECTOR_HEAD_DIMS};
+        let head_dim = self.head_dim;
+        let is_f32 = self.dtype == DType::F32;
+        let (wanted, fits) = match self.requested {
+            AttnImpl::Sdpa => (
+                DecodeAttn::SdpaVector,
+                lloom_tensor::shape_req!(
+                    sdpa_vector_head_dim,
+                    SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
+                    head_dim,
+                    is_f32
+                ),
+            ),
+            _ => (
+                DecodeAttn::FlashDecoding,
+                lloom_tensor::shape_req!(
+                    flash_decoding_head_dim,
+                    FLASH_HEAD_DIMS.contains(&head_dim);
+                    head_dim
+                ),
+            ),
+        };
+        if fits {
+            self.decode = wanted;
+        } else {
+            self.decode_refused = Some(wanted);
+        }
+        if lloom_tensor::shape_req!(
+            sdpa_head_dim,
+            SDPA_FULL_HEAD_DIMS.contains(&head_dim) && !(head_dim == 512 && is_f32);
+            head_dim,
+            is_f32
+        ) {
+            self.prefill = PrefillAttn::Steel;
+        } else {
+            self.prefill_refused = Some(PrefillAttn::Steel);
+        }
+        self
+    }
+
+    /// The one line a load prints when the head dim sent a phase to the
+    /// composed attention; `None` when every phase takes what was requested.
+    pub fn warning(&self) -> Option<String> {
+        let mut phases = Vec::new();
+        if let Some(k) = self.decode_refused {
+            phases.push(format!(
+                "decode requested {} and takes {}",
+                k.name(),
+                self.decode.name()
+            ));
+        }
+        if let Some(k) = self.prefill_refused {
+            phases.push(format!(
+                "prefill requested {} and takes {}",
+                k.name(),
+                self.prefill.name()
+            ));
+        }
+        (!phases.is_empty()).then(|| {
+            format!(
+                "lfm2: attention head_dim {} at {:?} has no {:?} kernel: {} (the composed \
+                 attention, slower)",
+                self.head_dim,
+                self.dtype,
+                self.requested,
+                phases.join("; ")
+            )
+        })
     }
 }
 
@@ -944,22 +1102,40 @@ impl std::fmt::Display for FusionReport {
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
 /// (`hidden_size`, `layer_types`, …) come from the checkpoint and are not axes.
+///
+/// `#[tiny]` marks what the shape campaign may search from the tiny
+/// template (`models::lfm2_testing`, `docs/porting-models.md` §21.8).
 #[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
+    #[tiny(axis)]
     pub vocab_size: usize,
+    #[tiny(axis)]
     pub hidden_size: usize,
+    #[tiny(axis)]
     pub intermediate_size: usize,
+    #[tiny(axis, max = 8)]
     pub num_hidden_layers: usize,
+    #[tiny(axis)]
     pub num_attention_heads: usize,
+    #[tiny(axis)]
     pub num_key_value_heads: usize,
+    #[tiny(fixed)]
     pub norm_eps: f64,
+    #[tiny(fixed)]
     pub rope_theta: f32,
+    #[tiny(fixed)]
     pub max_position_embeddings: usize,
+    #[tiny(axis, max = 8)]
     pub conv_l_cache: usize,
+    #[tiny(fixed)]
     pub conv_bias: bool,
+    #[tiny(derived = "Self::tiny_layer_types(num_hidden_layers)", cover)]
     pub layer_types: Vec<LayerType>,
+    #[tiny(fixed)]
     pub tie_embedding: bool,
+    #[tiny(fixed)]
     pub bos_token_id: Option<u32>,
+    #[tiny(fixed)]
     pub eos_token_id: Option<u32>,
     pub use_flash_attn: bool,
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
@@ -1255,6 +1431,20 @@ impl Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
+
+    /// The tiny models' layer pattern: attention at every third layer, the
+    /// rest conv — both kinds from three layers up.
+    pub fn tiny_layer_types(n_layers: usize) -> Vec<LayerType> {
+        (0..n_layers)
+            .map(|l| {
+                if l % 3 == 2 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::Conv
+                }
+            })
+            .collect()
+    }
 }
 
 /// A `Config` a test or a `..` update can build from, so a new field is not a
@@ -1415,7 +1605,7 @@ impl KvSlot {
         if let Some(old) = self.all_data.as_ref() {
             let mut shape = old.dims().to_vec();
             shape[2] = capacity;
-            let grown = Tensor::zeros(shape, old.dtype(), old.device())?;
+            let grown = zs::zeros(zs::LFM2_KV_SLAB, shape, old.dtype(), old.device())?;
             grown.slice_set(old, 2, 0)?;
             self.all_data = Some(grown);
         }
@@ -1433,7 +1623,12 @@ impl KvSlot {
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
             shape[2] = self.capacity;
-            self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
+            self.all_data = Some(zs::zeros(
+                zs::LFM2_KV_SLAB,
+                shape,
+                src.dtype(),
+                src.device(),
+            )?);
         }
         let all_data = self.all_data.as_ref().unwrap();
         if self.len + seq_len > self.capacity {
@@ -1556,13 +1751,19 @@ impl QuantKvSlot {
             };
             let (old_row, new_row) = (row(self.capacity)?, row(capacity)?);
             let old = codes.reshape((rows, old_row))?;
-            let grown = Tensor::zeros((rows, new_row), DType::U8, codes.device())?;
+            let grown = zs::zeros(
+                zs::LFM2_KV_QUANT,
+                (rows, new_row),
+                DType::U8,
+                codes.device(),
+            )?;
             grown.slice_set(&old, 1, 0)?;
             self.codes = Some(grown.reshape(rows * new_row)?);
             for plane in [&mut self.scales, &mut self.biases] {
                 if let Some(p) = plane.as_ref() {
                     let old = p.reshape((rows, self.capacity))?;
-                    let grown = Tensor::zeros((rows, capacity), p.dtype(), p.device())?;
+                    let grown =
+                        zs::zeros(zs::LFM2_KV_QUANT, (rows, capacity), p.dtype(), p.device())?;
                     grown.slice_set(&old, 1, 0)?;
                     *plane = Some(grown.reshape(rows * capacity)?);
                 }
@@ -1613,10 +1814,10 @@ impl QuantKvSlot {
             .ok_or_else(|| lloom_tensor::Error::msg("QuantKvSlot::ensure on the Off arm"))?;
         // A u8 plane rather than a typed one: the packing is the kernel's, and
         // a `Tensor` of the code width does not exist at int4 anyway.
-        self.codes = Some(Tensor::zeros(code_bytes, DType::U8, device)?);
+        self.codes = Some(zs::zeros(zs::LFM2_KV_QUANT, code_bytes, DType::U8, device)?);
         let scale_els = b_sz * n_heads * self.capacity;
-        self.scales = Some(Tensor::zeros(scale_els, DType::F16, device)?);
-        self.biases = Some(Tensor::zeros(scale_els, DType::F16, device)?);
+        self.scales = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
+        self.biases = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
         self.b_sz = b_sz;
         self.n_heads = n_heads;
         self.head_dim = head_dim;
@@ -1865,9 +2066,9 @@ impl PagedKv {
             if let Some((pk, pv)) = layer.as_ref() {
                 let mut shape = pk.dims().to_vec();
                 shape[2] = tokens;
-                let nk = Tensor::zeros(shape.clone(), pk.dtype(), pk.device())?;
+                let nk = zs::zeros(zs::LFM2_KV_PAGES, shape.clone(), pk.dtype(), pk.device())?;
                 nk.slice_set(pk, 2, 0)?;
-                let nv = Tensor::zeros(shape, pv.dtype(), pv.device())?;
+                let nv = zs::zeros(zs::LFM2_KV_PAGES, shape, pv.dtype(), pv.device())?;
                 nv.slice_set(pv, 2, 0)?;
                 *layer = Some((nk, nv));
             }
@@ -2024,8 +2225,8 @@ impl PagedKv {
         if self.pools[block_idx].is_none() {
             let shape = (1, n_kv_heads, tokens, head_dim);
             self.pools[block_idx] = Some((
-                Tensor::zeros(shape, k.dtype(), k.device())?,
-                Tensor::zeros(shape, v.dtype(), v.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, k.dtype(), k.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, v.dtype(), v.device())?,
             ));
         }
         let slots = self
@@ -2286,8 +2487,8 @@ impl PagedKv {
         if self.pools[block_idx].is_none() {
             let shape = (1, n_kv_heads, tokens, head_dim);
             self.pools[block_idx] = Some((
-                Tensor::zeros(shape, k.dtype(), k.device())?,
-                Tensor::zeros(shape, v.dtype(), v.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, k.dtype(), k.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, v.dtype(), v.device())?,
             ));
         }
         let (pk, pv) = self.pools[block_idx].as_ref().expect("allocated above");
@@ -5070,7 +5271,8 @@ struct Attention {
     num_key_value_heads: usize,
     head_dim: usize,
     use_flash_attn: bool,
-    attn_impl: AttnImpl,
+    /// The kernels this layer takes, decided at load (`AttnRoute::resolve`).
+    route: AttnRoute,
     flash_page_size: usize,
     flash_pages_per_chunk: usize,
     /// §9.1a's sizing policy, wired to FlashDecoding's allocation by #234.
@@ -5086,7 +5288,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let num_attention_heads = cfg.num_attention_heads;
         let num_key_value_heads = cfg.num_key_value_heads;
@@ -5115,7 +5317,7 @@ impl Attention {
             num_key_value_heads,
             head_dim,
             use_flash_attn: cfg.use_flash_attn,
-            attn_impl: cfg.attn_impl,
+            route,
             flash_page_size: cfg.flash_page_size,
             flash_pages_per_chunk: cfg.flash_pages_per_chunk,
             flash_scratch_sizing: cfg.flash_scratch_sizing,
@@ -5126,87 +5328,42 @@ impl Attention {
         })
     }
 
-    /// Whether this call can take the fused `sdpa_vector` kernel.
-    ///
-    /// Every condition is one `crate::nn::ops::sdpa` would otherwise `bail!` on
-    /// (`candle-nn/src/ops.rs`, `Sdpa::metal_fwd`), so a false here is a
-    /// fallback and never a failure. They are checked rather than assumed:
-    ///
-    /// * **Metal.** `Sdpa::cpu_fwd` bails outright; there is no CPU arm.
-    /// * **`seq_len == 1`.** `supports_sdpa_vector` requires it. `seq_len > 1`
-    ///   is `sdpa_full_applies`'s.
-    /// * **dtype.** The kernel is instantiated for f16/bf16/f32 only.
-    ///
-    /// `head_dim == 64` and `32 % 8 == 0` also hold for LFM2 (§5.2) and are
-    /// checked by `ops::sdpa` itself; they are not re-asserted here, because a
-    /// second copy of a condition is a second thing to keep in sync (§8.1b).
+    /// Whether this call takes the fused `sdpa_vector` kernel: the route chose
+    /// it at load (Metal, `--attn sdpa`, an instantiated head dim), the call is
+    /// one token, and the dtype is one the kernel is built for. A false is the
+    /// composed attention, never a failure.
     fn sdpa_applies(&self, q: &Tensor, seq_len: usize) -> bool {
-        self.attn_impl == AttnImpl::Sdpa
-            && q.device().is_metal()
+        self.route.decode == DecodeAttn::SdpaVector
             && seq_len == 1
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
-    /// Whether this call can take the tiled `steel_attention` kernel — the
-    /// `seq_len > 1` sibling of `sdpa_vector` (`DESIGN.md` §10.2v). One
+    /// Whether this call takes the tiled `steel_attention` kernel, the
+    /// `seq_len > 1` sibling of `sdpa_vector` (`DESIGN.md` §10.2v): one
     /// threadgroup per (query block, head), online softmax over K/V blocks,
-    /// GQA-native, K/V at their own dtype, the causal mask applied in-kernel
-    /// from the cache offset `kv_len - seq_len`. Verify, prefill and B>1 are
-    /// all this shape.
-    ///
-    /// Every fused arm takes it: the arm names the DECODE kernel, and there is
-    /// one multi-query kernel for both to share. A false is a fallback to the
-    /// generic path and never a failure — each condition is one `ops::sdpa`
-    /// would otherwise `bail!` on:
-    ///
-    /// * **Metal**, **`seq_len > 1`**, and every query has a key
-    ///   (`seq_len <= kv_len`, the shape `Sdpa::metal_fwd` admits).
-    /// * **dtype** f16/bf16/f32 and **`head_dim`** in the instantiated set;
-    ///   f32 has no `head_dim == 512` instantiation.
+    /// GQA-native, the causal mask in-kernel from the cache offset
+    /// `kv_len - seq_len`. Prefill, verify and B>1 are this shape, and every
+    /// fused arm shares it. The route chose it at load (Metal, a fused arm, an
+    /// instantiated head dim); per call, every query needs a key and the dtype
+    /// must be one the kernel is built for. A false is the composed attention.
     fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
-        const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
-        self.attn_impl != AttnImpl::Generic
-            && q.device().is_metal()
+        self.route.prefill == PrefillAttn::Steel
             && seq_len > 1
             && seq_len <= kv_len
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-            && HEAD_DIMS.contains(&self.head_dim)
-            && !(self.head_dim == 512 && q.dtype() == DType::F32)
     }
 
-    /// Whether this call can take the FlashDecoding kernels (issue #116).
+    /// Whether this call takes the FlashDecoding kernels (`DESIGN.md` §10.4):
+    /// the route chose them at load, the call is one token, and the dtype is
+    /// f16 or f32.
     ///
-    /// The same shape as `sdpa_applies`, and every condition is one
-    /// `ops::flash_decoding` would otherwise `bail!` on — so a false here is a
-    /// fallback and never a failure.
-    ///
-    /// **`BF16` is absent where `sdpa_applies` allows it, and the stated reason
-    /// is false — measured 2026-08-30 (#307, `DESIGN.md` §3.9).** This comment
-    /// used to say `flash_decoding.metal` does not instantiate `bfloat` because
-    /// reaching it needs the ~500-line `_MLX_BFloat16` shim, *"and LFM2 ships
-    /// BF16 on disk and decode runs F16 (§9.1b)"*. Both premises fail:
-    /// `__HAVE_BFLOAT__` **is defined** on this machine, so that shim is the
-    /// `#else` branch and is inert; and bf16 decode is **reachable** — 12 of 12
-    /// decode families dispatch a native bf16 sibling, and `lfm2-smoke` PASSes
-    /// at `--dtype bf16`.
-    ///
-    /// **The condition is kept anyway**, and it is a real fallback rather than
-    /// an oversight: `flash_decoding.metal` genuinely has no `bfloat`
-    /// instantiation, so admitting `BF16` here would `LoadFunctionError` inside
-    /// a forward pass. Instantiating it is **not recommended** — §10.4b measures
-    /// this arm **+6.3 % slower** at `kv_len` 16 034, so a bf16 variant would be
-    /// built-and-unused (§15.2 #11).
-    ///
-    /// **What a caller must know**: at `--attn flash --dtype bf16` this returns
-    /// false and the layer takes the *generic* path — 674 dispatches/token
-    /// against the flash arm's 562 — while `config_line()` still renders
-    /// `AttnImpl=FlashDecoding`. That is a fourth species of §7.1a-i's
-    /// axis-reporting defect: the axis is selected and the mechanism did not
-    /// run, for a **dtype** reason. Attribute a flash run from the kernel
-    /// census, never from the config line (§2.4).
+    /// `flash_decoding.metal` has no `bfloat` instantiation, so at
+    /// `--attn flash --dtype bf16` this is false and the layer takes the
+    /// composed attention while `config_line()` still renders
+    /// `AttnImpl=FlashDecoding` (§3.9, §7.1a). Attribute a flash run from the
+    /// kernel census, never from the config line (§2.4).
     fn flash_decoding_applies(&self, q: &Tensor, seq_len: usize) -> bool {
-        self.attn_impl == AttnImpl::FlashDecoding
-            && q.device().is_metal()
+        self.route.decode == DecodeAttn::FlashDecoding
             && seq_len == 1
             && matches!(q.dtype(), DType::F16 | DType::F32)
     }
@@ -5402,10 +5559,13 @@ impl Attention {
 
     /// Whether every row is a slot of ONE [`BatchPool`] the batched arms can
     /// address in one dispatch (`batched-decode-design.md` §12.2): all on the
-    /// pool, keeping their KV, unquantized, untapped, and the dtype the flash
-    /// kernels instantiate.
+    /// pool, keeping their KV, unquantized, untapped, and the dtype and head
+    /// dim the flash kernels instantiate.
     #[cfg(feature = "metal")]
     fn rows_share_a_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>, dtype: DType) -> bool {
+        if self.route.decode != DecodeAttn::FlashDecoding {
+            return false;
+        }
         let mut first: Option<&Cache> = None;
         for c in caches {
             if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() {
@@ -5972,6 +6132,10 @@ impl Attention {
                         let v = v.contiguous()?;
                         let device = cache.device.clone();
                         let pending = std::mem::take(&mut cache.paged_pass_pending);
+                        // The FlashDecoding read walks the pool in place; any
+                        // other read attends over a gathered copy (below).
+                        let reads_pool =
+                            seq_len == 1 && self.route.decode == DecodeAttn::FlashDecoding;
                         if cache.batch.is_some() {
                             // A row of a shared pool, attending alone: its own
                             // pass over its slot — the per-row path the
@@ -6009,7 +6173,7 @@ impl Attention {
                             let mut g = pool.inner.lock();
                             g.kv.write_rows(block_idx, &k, &v, &pass)?;
                             let n_prev = pass.prev[0];
-                            if seq_len == 1 {
+                            if reads_pool {
                                 let (pk, pv) = g.kv.pools[block_idx]
                                     .as_ref()
                                     .expect("write_rows allocates the layer's pool");
@@ -6035,7 +6199,7 @@ impl Attention {
                         // The write: this pass's tokens to the slots the table
                         // names, one dispatch for K and one for V.
                         paged.write_layer(block_idx, &k, &v)?;
-                        if seq_len == 1 {
+                        if reads_pool {
                             // Decode reads the pool through the table below;
                             // the tensors handed on are the pool itself.
                             let (pk, pv) = paged.pools[block_idx]
@@ -6043,13 +6207,15 @@ impl Attention {
                                 .expect("write_layer allocates the layer's pool");
                             (pk.clone(), pv.clone())
                         } else if n_prev == 0 {
-                            // A first prefill attends over its own tokens.
+                            // A first pass attends over its own tokens.
                             (k, v)
                         } else {
-                            // A turn-boundary prefill (§10.9) attends over the
-                            // accumulated cache: gathered from the pool by
-                            // physical slot, then this pass's tokens. O(kv_len)
-                            // per prefill and never on the decode path.
+                            // A turn-boundary prefill (§10.9), or a decode step
+                            // whose head dim FlashDecoding does not instantiate,
+                            // attends over the accumulated cache: gathered from
+                            // the pool by physical slot, then this pass's
+                            // tokens. O(kv_len) per pass, and on the decode path
+                            // only on that fallback (`AttnRoute`).
                             let (prev_k, prev_v) =
                                 paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
                             let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
@@ -6063,12 +6229,16 @@ impl Attention {
         };
 
         // The paged decode read. `KvAppend::Paged` requires
-        // `AttnImpl::FlashDecoding` at construction, so this is the only decode
-        // path the arm has; a dtype the kernels do not instantiate is an error
-        // here rather than a silent fallback to a kernel that cannot read a
-        // pool (§2.4).
+        // `AttnImpl::FlashDecoding` at construction, so this is the arm's decode
+        // path whenever the route took FlashDecoding; a head dim it does not
+        // instantiate attended over the gathered copy above instead. A dtype
+        // the kernels do not instantiate is an error here rather than a silent
+        // fallback to a kernel that cannot read a pool (§2.4).
         #[cfg(feature = "metal")]
-        let paged_decode = cache.use_kv_cache && cache.kv_append == KvAppend::Paged && seq_len == 1;
+        let paged_decode = cache.use_kv_cache
+            && cache.kv_append == KvAppend::Paged
+            && seq_len == 1
+            && self.route.decode == DecodeAttn::FlashDecoding;
         #[cfg(not(feature = "metal"))]
         let paged_decode = false;
 
@@ -6228,12 +6398,12 @@ struct ShortConv {
     conv_weight: Tensor,
     l_cache: usize,
     hidden_size: usize,
-    /// One weight permutation per rotation phase, built at load time for
-    /// `ConvState::RotatingRing` and `None` otherwise. See `ShortConv::new`.
-    rotating_weights: Option<Vec<Tensor>>,
-    /// The same permutations stacked `[width, hidden, width]`, the operand the
-    /// fused ring kernel indexes by phase (`shortconv_ring_fused`).
-    rotating_table: Option<Tensor>,
+    /// The engine's short-conv block over the `[hidden, l_cache]` taps, in the
+    /// shift layout (`Shuffle`'s fused step).
+    shift: crate::nn::short_conv::ShortConv<crate::nn::short_conv::Shift>,
+    /// The same taps in the ring layout, for `ConvState::RotatingRing` (one
+    /// permutation per phase, built at load time); `None` otherwise.
+    ring: Option<crate::nn::short_conv::ShortConv<crate::nn::short_conv::Ring>>,
     conv_state: ConvState,
     /// Fuse the post-conv residual add onto `out_proj`'s GEMV store (§12.2h).
     /// 22 of the 60 `badd_f16` dispatches per token — the largest of the three.
@@ -6276,81 +6446,28 @@ impl ShortConv {
         // Conv weight shape: (hidden_size, 1, l_cache) or (hidden_size, l_cache)
         let conv_weight = vb.get((hidden_size, 1, l_cache), "conv.weight")?;
 
-        // The rotating arm's per-phase weights, precomputed at load time.
-        //
-        // **This is what makes the rotating form compute the right convolution
-        // rather than a different one.** A rotating buffer's slot `s` holds the
-        // token of age `(s + width - phase - 1) mod width`, so multiplying slot
-        // `s` by weight `s` -- which is what a naive rotation does -- pairs each
-        // tap with the wrong weight. Measured, that is an **O(1)** error (~1e7
-        // ulp), not a rounding: it is a different operator, and it agrees with
-        // the shuffle only on the one phase in `width` where the rotation is the
-        // identity.
-        //
-        // Permuting the weights by phase restores the pairing exactly, and the
-        // residual against the shuffle is then bounded by **1 ulp** and flat in
-        // run length -- a reduction-order difference and nothing more
-        // (`DESIGN.md` §10.2g). The weight is a `[hidden, l_cache]` constant, so
-        // all `width` permutations are built once here and cost nothing per
-        // token; §10.2a lists this as its third fallback.
-        let rotating_weights = match cfg.conv_state {
-            ConvState::RotatingRing { .. } => {
-                let width = cfg.conv_state.width(l_cache);
-                let w = conv_weight.squeeze(1)?;
-                let mut per_phase = Vec::with_capacity(width);
-                for phase in 0..width {
-                    // **The newest token is AT `phase`, and the live window is
-                    // the `l_cache` slots ending there.** Counting `d` slots
-                    // back from `phase` gives the token `d` steps older, which
-                    // the shuffle would have held at column `l_cache - 1 - d`.
-                    // Every other slot is history and gets a zero column, so a
-                    // stale value cannot contribute however many are held.
-                    //
-                    // **This is the arithmetic #141 got wrong for `K > 0`**, and
-                    // the error was invisible on the arm it shipped. Its formula
-                    // — `age = (s + width - phase - 1) % width`, live iff
-                    // `age < l_cache` — is *equivalent* to this one at
-                    // `width == l_cache`, which is `K = 0`, the default and the
-                    // only arm its digest gate ran against. At `K > 0` it selects
-                    // the `l_cache` slots **following** `phase` rather than the
-                    // ones ending at it, so the live window is read from slots
-                    // that hold history and the newest token is weighted zero.
-                    //
-                    // Measured on the CPU backend at f32 — §2.3.5a's load-bearing
-                    // discriminator — `shuffle` and `rotating:0` give an
-                    // identical token stream and `rotating:2` gives a different
-                    // one. That is a computational bug and not a reduction order,
-                    // so §16 6b's *"K is measurably inert"* held only because
-                    // nothing read the history slots yet.
-                    let mut cols = Vec::with_capacity(width);
-                    for s in 0..width {
-                        // How many slots back from the newest, or `None` if this
-                        // slot is outside the live window.
-                        let back = (phase + width - s) % width;
-                        let col = if back < l_cache {
-                            w.narrow(1, l_cache - 1 - back, 1)?
-                        } else {
-                            Tensor::zeros((hidden_size, 1), w.dtype(), w.device())?
-                        };
-                        cols.push(col);
-                    }
-                    per_phase.push(Tensor::cat(&cols, 1)?.contiguous()?);
-                }
-                Some(per_phase)
-            }
+        // The rotating arm's per-phase weights, precomputed at load time: a
+        // rotating buffer's slot holds a different token's input each phase,
+        // so the taps are permuted to match or the fold is a different
+        // operator (`DESIGN.md` §10.2g). All `width` permutations cost nothing
+        // per token.
+        use crate::nn::short_conv::{Ring, Shift, ShortConv};
+        let taps = conv_weight.squeeze(1)?;
+        let ring = match cfg.conv_state {
+            ConvState::RotatingRing { .. } => Some(ShortConv::<Ring>::new(
+                taps.clone(),
+                cfg.conv_state.width(l_cache),
+            )?),
             _ => None,
         };
-        let rotating_table = match &rotating_weights {
-            Some(per_phase) => Some(Tensor::stack(per_phase, 0)?.contiguous()?),
-            None => None,
-        };
+        let shift = ShortConv::<Shift>::new(taps, l_cache);
 
         Ok(Self {
             in_proj,
             out_proj,
             conv_weight,
-            rotating_weights,
-            rotating_table,
+            shift,
+            ring,
             l_cache,
             hidden_size,
             conv_state: cfg.conv_state,
@@ -6359,6 +6476,25 @@ impl ShortConv {
             prefill_ctx: cfg.conv_prefill_ctx,
             span: tracing::span!(tracing::Level::TRACE, "shortconv"),
         })
+    }
+
+    /// The ring columns past the live window a prefill leaves, set for what
+    /// decode reads of them (`pass-plan-design.md` §18). The sliding ring
+    /// reads no slot outside its window before writing it, so its tail is
+    /// left as it is. The rotating ring folds every slot, the history against
+    /// a zero weight, so its tail must be finite, and it is zeroed: that is
+    /// also what keeps a rewind from reaching a slot this prefill did not
+    /// write (`sequence-state.md` §10.2a).
+    fn ring_regions_after_prefill(&self, state: &Tensor) -> Result<()> {
+        let width = self.conv_state.width(self.l_cache);
+        if width == self.l_cache {
+            return Ok(());
+        }
+        let tail = state.narrow(2, self.l_cache, width - self.l_cache)?;
+        match self.conv_state {
+            ConvState::RotatingRing { .. } => zs::zero_region(zs::LFM2_CONV_RING_HISTORY, &tail),
+            _ => zs::poison_region(zs::LFM2_CONV_RING_SLACK, &tail),
+        }
     }
 
     /// The newest `l_cache - 1` columns of the live window, oldest first — the
@@ -6491,7 +6627,6 @@ impl ShortConv {
         x: &Tensor,
         c: &Tensor,
         state: &Tensor,
-        weight: &Tensor,
     ) -> Result<Option<(Tensor, Tensor)>> {
         if !self.conv_fused || conv_c_fusion_disabled() {
             return Ok(None);
@@ -6500,7 +6635,7 @@ impl ShortConv {
         // does not compile off Metal. Fall back to the unfused Shuffle arm.
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (b, x, c, state, weight);
+            let _ = (b, x, c, state);
             return Ok(None);
         }
         #[cfg(feature = "metal")]
@@ -6509,7 +6644,9 @@ impl ShortConv {
                 return Ok(None);
             }
             let k = state.dims3()?.2;
-            if lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none() {
+            if k != self.shift.k()
+                || lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none()
+            {
                 return Ok(None);
             }
             // The kernel reads `state` as dense `[b, hidden, k]` and writes a dense
@@ -6524,8 +6661,7 @@ impl ShortConv {
             if b.stride() != x.stride() || b.stride() != c.stride() {
                 return Ok(None);
             }
-            let (out, new_state) = crate::nn::ops::shortconv_step(b, x, c, state, weight, k)?;
-            Ok(Some((out, new_state)))
+            Ok(Some(self.shift.gated_step(b, x, c, state)?))
         }
     }
 
@@ -6558,7 +6694,7 @@ impl ShortConv {
         }
         #[cfg(feature = "metal")]
         {
-            let Some(table) = &self.rotating_table else {
+            let Some(ring) = &self.ring else {
                 return Ok(None);
             };
             if !state.device().is_metal() || !state.is_contiguous() {
@@ -6569,8 +6705,7 @@ impl ShortConv {
             }
             // `state` is written in place, so the caller's tensor is the
             // updated ring and only the output comes back.
-            let out = crate::nn::ops::shortconv_ring(b, x, c, state, table, phase_last)?;
-            Ok(Some(out))
+            Ok(Some(ring.gated_pass(b, x, c, state, phase_last)?))
         }
     }
 
@@ -6706,7 +6841,7 @@ impl ShortConv {
         if !matches!(self.conv_state, ConvState::RotatingRing { .. })
             || !self.conv_fused
             || conv_c_fusion_disabled()
-            || self.rotating_table.is_none()
+            || self.ring.is_none()
         {
             return false;
         }
@@ -6777,8 +6912,8 @@ impl ShortConv {
         let b = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
-        let table = self.rotating_table.as_ref().expect("checked");
-        crate::nn::ops::shortconv_ring_rows(&b, &x, &c, &pool_t, table, &slots_t, &phases_t)
+        let ring = self.ring.as_ref().expect("checked");
+        ring.gated_rows(&b, &x, &c, &pool_t, &slots_t, &phases_t)
     }
 
     /// `convolve_rows` in one dispatch (§12.2). `bcx` is `[B, 3·hidden, 1]`.
@@ -6886,15 +7021,14 @@ impl ShortConv {
         {
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros(
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
                     (b_sz, self.hidden_size, self.l_cache),
                     c.dtype(),
                     c.device(),
                 )?,
             };
-            if let Some((conv_out, new_state)) =
-                self.shortconv_fused(&b, &x_proj, &c, &state, &conv_weight)?
-            {
+            if let Some((conv_out, new_state)) = self.shortconv_fused(&b, &x_proj, &c, &state)? {
                 if cache.use_kv_cache {
                     cache.set_conv_state(block_idx, new_state)?;
                 }
@@ -6914,7 +7048,12 @@ impl ShortConv {
             let width = self.conv_state.width(self.l_cache);
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros((b_sz, self.hidden_size, width), c.dtype(), c.device())?,
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
+                    (b_sz, self.hidden_size, width),
+                    c.dtype(),
+                    c.device(),
+                )?,
             };
             // `Model::forward`/`forward_all` have advanced `conv_phase` to the
             // slot of this pass's LAST position (§10.2e's one owner).
@@ -6976,7 +7115,12 @@ impl ShortConv {
             let width = self.conv_state.width(self.l_cache);
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?,
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
+                    (b_sz, self.hidden_size, width),
+                    bx.dtype(),
+                    bx.device(),
+                )?,
             };
 
             // `Model::forward_all` has already advanced `conv_phase` by
@@ -7001,11 +7145,10 @@ impl ShortConv {
                 // is what keeps this a per-position index rather than a
                 // per-position permutation (§15.2 #10).
                 let w = self
-                    .rotating_weights
+                    .ring
                     .as_ref()
-                    .expect("rotating weights exist whenever the arm is RotatingRing")
-                    .get(phase)
-                    .expect("phase is taken modulo width, so it indexes the table");
+                    .expect("the ring's weights exist whenever the arm is RotatingRing")
+                    .phase_weight(phase);
                 // The same fold as the decode arm, per position: `conv_fold`
                 // honours `--conv-fused` here too, so a speculative verify runs
                 // the same conv kernel a decode of that token would.
@@ -7037,9 +7180,12 @@ impl ShortConv {
                     let width = self.conv_state.width(self.l_cache);
                     let state = match &cache.conv_states[block_idx] {
                         Some(s) => s.clone(),
-                        None => {
-                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
-                        }
+                        None => zs::zeros(
+                            zs::LFM2_CONV_FIRST_STATE,
+                            (b_sz, self.hidden_size, width),
+                            bx.dtype(),
+                            bx.device(),
+                        )?,
                     };
 
                     // Advanced once per token by `Model::forward`, for the same
@@ -7055,11 +7201,10 @@ impl ShortConv {
                     // is an index rather than a permutation (§15.2 #10: the
                     // answer is computed when the plan is built, not per token).
                     let w = self
-                        .rotating_weights
+                        .ring
                         .as_ref()
-                        .expect("rotating weights are built whenever the arm is RotatingRing")
-                        .get(phase)
-                        .expect("phase is taken modulo width, so it indexes the table");
+                        .expect("the ring's weights are built whenever the arm is RotatingRing")
+                        .phase_weight(phase);
                     // The rotating arm folds the WHOLE `width`-wide buffer against
                     // a phase-permuted weight (not an `l_cache` window), so
                     // `conv_fold`'s depthwise kernel runs at `k_size = width`. The
@@ -7073,9 +7218,12 @@ impl ShortConv {
                     // before the write rather than being produced by it.
                     let mut state = match &cache.conv_states[block_idx] {
                         Some(s) => s.clone(),
-                        None => {
-                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
-                        }
+                        None => zs::zeros(
+                            zs::LFM2_CONV_FIRST_STATE,
+                            (b_sz, self.hidden_size, width),
+                            bx.dtype(),
+                            bx.device(),
+                        )?,
                     };
 
                     // `conv_phase` is the write slot, advanced once per token by
@@ -7094,7 +7242,8 @@ impl ShortConv {
                     if cache.conv_compact {
                         let live_w = self.l_cache + self.conv_state.history();
                         let live = state.narrow(2, width - live_w, live_w)?.contiguous()?;
-                        let pad = Tensor::zeros(
+                        let pad = zs::uninit(
+                            zs::LFM2_CONV_COMPACT_PAD,
                             (b_sz, self.hidden_size, width - live_w),
                             bx.dtype(),
                             bx.device(),
@@ -7132,7 +7281,8 @@ impl ShortConv {
                         Some(s) => s.contiguous()?,
                         None => {
                             let _declared = lloom_tensor::EscapeGuard::new();
-                            Tensor::zeros(
+                            zs::zeros(
+                                zs::LFM2_CONV_FIRST_STATE,
                                 (b_sz, self.hidden_size, self.l_cache),
                                 bx.dtype(),
                                 bx.device(),
@@ -7235,61 +7385,43 @@ impl ShortConv {
                 let src_len = conv_in.dim(2)?;
                 let start = src_len.saturating_sub(self.l_cache);
                 let cache_len = src_len - start;
-                let mut cache_src = conv_in.narrow(2, start, cache_len)?;
-                if cache_len < self.l_cache {
-                    let pad = self.l_cache - cache_len;
-                    let zeros = Tensor::zeros(
-                        (b_sz, self.hidden_size, pad),
-                        cache_src.dtype(),
-                        cache_src.device(),
-                    )?;
-                    cache_src = Tensor::cat(&[zeros, cache_src], 2)?;
-                }
-                // Under the ring the buffer is `l_cache + K + slack` wide and
-                // decode writes into it in place -- so prefill must hand over
-                // storage of the *full* width, with the live window at the front
-                // (write slot `live_w - 1`, which is what `Model::forward` seeds)
-                // and everything after it zeroed. Prefill is off the per-token
-                // path, so this `cat` is paid once per prompt, not once per token.
+                let carried = conv_in.narrow(2, start, cache_len)?.contiguous()?;
+                // The state OUTLIVES this pass, so the carry is written INTO
+                // the storage the cache owns (a cache with none yet allocates
+                // it under an `EscapeGuard`, which no plan serves), and the
+                // regions around it are set in place: nothing this tile
+                // allocates escapes it, and nothing is allocated to pad it.
+                // The live window sits at the front, the newest column at
+                // `l_cache - 1` (what `Model::forward` seeds). What each
+                // region must hold is `nn::zeros`'s classification
+                // (`pass-plan-design.md` §18).
                 let width = self.conv_state.width(self.l_cache);
-                if width > self.l_cache {
-                    let zeros = Tensor::zeros(
-                        (b_sz, self.hidden_size, width - self.l_cache),
-                        cache_src.dtype(),
-                        cache_src.device(),
-                    )?;
-                    cache_src = Tensor::cat(&[cache_src, zeros], 2)?;
-                }
-                // The state OUTLIVES this pass: the next pass reads it. Under
-                // a pass plan (`DESIGN.md` §9.2aa) this pass's activations —
-                // `cache_src` among them — live in slots the next pass reuses,
-                // so the carry is written INTO the storage the cache already
-                // owns (one `copy2d`, ordered after this pass's own read of it
-                // by the barrier chain), and a cache with no state yet gets
-                // one allocated under an `EscapeGuard`, which no plan serves.
-                // This is what makes a prefill tile allocate nothing that
-                // escapes it: measured 2 undeclared escapes per tile on the
-                // tiny fixture before, 0 after (`lfm2_pass_plans.rs`).
-                let carried = cache_src.contiguous()?;
+                let pad = self.l_cache - cache_len;
                 let owned = match &cache.conv_states[block_idx] {
                     Some(prev)
-                        if prev.shape() == carried.shape()
+                        if prev.dims() == [b_sz, self.hidden_size, width]
                             && prev.dtype() == carried.dtype()
                             && prev.is_contiguous() =>
                     {
-                        prev.slice_set(&carried, 2, 0)?;
                         prev.clone()
                     }
                     _ => {
                         // Not `Tensor::copy`: on Metal `try_clone` shares
                         // the buffer, and the storage must be this cache's own.
                         let _declared = lloom_tensor::EscapeGuard::new();
-                        let own =
-                            Tensor::zeros(carried.shape(), carried.dtype(), carried.device())?;
-                        own.slice_set(&carried, 2, 0)?;
-                        own
+                        zs::zeros(
+                            zs::LFM2_CONV_STATE,
+                            (b_sz, self.hidden_size, width),
+                            carried.dtype(),
+                            carried.device(),
+                        )?
                     }
                 };
+                owned.slice_set(&carried, 2, pad)?;
+                if pad > 0 {
+                    zs::zero_region(zs::LFM2_CONV_LEFT_PAD, &owned.narrow(2, 0, pad)?)?;
+                }
+                self.ring_regions_after_prefill(&owned)?;
                 cache.set_conv_state(block_idx, owned)?;
             }
 
@@ -7322,7 +7454,7 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, layer_idx: usize, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
         // LFM2 uses operator_norm and ffn_norm naming
         let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
         let post_attention_layernorm =
@@ -7337,7 +7469,7 @@ impl DecoderLayer {
             .unwrap_or(LayerType::FullAttention);
         let kind = match layer_type {
             LayerType::FullAttention => {
-                LayerKind::Attention(Box::new(Attention::new(cfg, vb.pp("self_attn"))?))
+                LayerKind::Attention(Box::new(Attention::new(cfg, route, vb.pp("self_attn"))?))
             }
             LayerType::Conv => LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"))?),
         };
@@ -7428,6 +7560,10 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
     fusion_report: Option<FusionReport>,
+    /// The attention kernels every attention layer takes, decided once here.
+    attn_route: AttnRoute,
+    /// The warnings construction printed, in order.
+    load_warnings: Vec<String>,
     embedding_norm: RmsNorm,
     lm_head: Linear,
     dtype: DType,
@@ -7787,10 +7923,31 @@ impl Model {
         let embed_tokens =
             Embedding::new(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
 
+        // One route for every attention layer, and so one warning per load. A
+        // model with no attention layer has nothing to route.
+        let has_attention = (0..cfg.num_hidden_layers).any(|l| {
+            cfg.layer_types
+                .get(l)
+                .copied()
+                .unwrap_or(LayerType::FullAttention)
+                == LayerType::FullAttention
+        });
+        let requested = if has_attention {
+            cfg.attn_impl
+        } else {
+            AttnImpl::Generic
+        };
+        let attn_route = AttnRoute::resolve(requested, cfg.head_dim(), vb.dtype(), vb.device());
+        let mut load_warnings = Vec::new();
+        if let Some(w) = attn_route.warning() {
+            eprintln!("{w}");
+            load_warnings.push(w);
+        }
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(cfg, layer_idx, vb_l.pp(layer_idx))?;
+            let layer = DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx))?;
             layers.push(layer);
         }
 
@@ -7814,6 +7971,8 @@ impl Model {
             embed_tokens,
             layers,
             fusion_report: report,
+            attn_route,
+            load_warnings,
             embedding_norm,
             lm_head,
             dtype: vb.dtype(),
@@ -7825,6 +7984,17 @@ impl Model {
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
     pub fn fusion_report(&self) -> Option<&FusionReport> {
         self.fusion_report.as_ref()
+    }
+
+    /// The attention kernels the model's attention layers take.
+    pub fn attn_route(&self) -> AttnRoute {
+        self.attn_route
+    }
+
+    /// The warnings construction printed to stderr, in order: at most one per
+    /// load for the attention route ([`AttnRoute::warning`]).
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
     }
 
     pub fn forward(

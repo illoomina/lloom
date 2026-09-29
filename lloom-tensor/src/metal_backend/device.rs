@@ -328,13 +328,20 @@ pub struct MetalDevice {
     /// for both, set before the first recorded pass.
     pub(crate) base_mode: Arc<std::sync::atomic::AtomicBool>,
     /// Under the pass cache: whether a pass is open (`begin_pass` ..
-    /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open. The
-    /// recorder takes an allocation only while a pass is open: one made
-    /// BETWEEN passes (a sampler's ids, a staged input) is nobody's ordinal
-    /// — recorded, it would be charged to the pass before it and, read by
-    /// the pass after it, counted as that pass's escape (measured: exactly
-    /// one per batched step, the argmax's ids).
+    /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open, bit 2
+    /// = the open pass is served from a cached plan. The recorder takes an
+    /// allocation only while a pass is open: one made BETWEEN passes (a
+    /// sampler's ids, a staged input) is nobody's ordinal — recorded, it
+    /// would be charged to the pass before it and, read by the pass after
+    /// it, counted as that pass's escape (measured: exactly one per batched
+    /// step, the argmax's ids).
     pub(crate) pass_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Requests that reached a buffer pool while a served pass was open,
+    /// `[shared, private]` (`DESIGN.md` §9.2aa, invariant I1). Counted per
+    /// request, hit or miss, so the figure is a function of what the pass
+    /// asked for and never of how far the GPU clock has let the free lists
+    /// refill (§6.3b).
+    pub(crate) served_pass_pool_requests: Arc<[std::sync::atomic::AtomicU64; 2]>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -363,6 +370,9 @@ pub struct PassPlans {
     pending: Option<PassKey>,
     /// What the pass in progress is doing.
     current: Option<PassState>,
+    /// The pass in progress took a data-dependent branch its key does not
+    /// name (`MetalDevice::pass_diverged`).
+    diverged: bool,
     counters: PassPlanCounters,
     /// Per key: ordinals of its first sight the next pass read undeclared,
     /// as `(ordinal, bytes, allocated at dispatch, first read at dispatch of
@@ -430,6 +440,7 @@ impl PassPlans {
             arena_generation: HashMap::new(),
             pending: None,
             current: None,
+            diverged: false,
             counters: PassPlanCounters::default(),
             escapes: HashMap::new(),
             ragged_order: std::collections::VecDeque::new(),
@@ -860,6 +871,19 @@ impl MetalDevice {
     /// it (`kernels::metal::io_queue`).
     pub fn commands(&self) -> &Arc<Commands> {
         &self.commands
+    }
+
+    /// This device's own dispatch census: a window on it counts the
+    /// dispatches encoded here and no other device's
+    /// (`profile::DeviceCensus`).
+    pub fn dispatch_census(&self) -> &Arc<crate::kernels::metal::profile::DeviceCensus> {
+        self.commands.dispatch_census()
+    }
+
+    /// This device's own dispatch trace: a window on it records the
+    /// dispatches encoded here and no other device's (`trace::DeviceTrace`).
+    pub fn dispatch_trace(&self) -> &Arc<crate::kernels::metal::trace::DeviceTrace> {
+        self.commands.dispatch_trace()
     }
 
     pub fn wait_until_completed(&self) -> Result<()> {
@@ -1689,13 +1713,11 @@ impl MetalDevice {
     /// pool, record nothing and are served nothing, and the cache comes back
     /// exactly as it was.
     ///
-    /// A plan is valid only for the allocation sequence its key was recorded
-    /// under, and such passes need not share it: a model that brackets its
-    /// own passes opens them after its embedding, a driver before, so one key
-    /// names two sequences one allocation apart — which size and position
-    /// coincide across (§9.2aa). A key left pending would have the paused
-    /// passes recorded into it; its recording is dropped and it records
-    /// again on its next sight. Refused while a pass is open.
+    /// Unpaused, such passes would leave plans behind, recorded at positions
+    /// no real prompt takes, which no `reset` undoes. A key left pending
+    /// would have the paused passes recorded into it; its recording is
+    /// dropped and it records again on its next sight. Refused while a pass
+    /// is open.
     pub fn pause_pass_plans(&self) -> Result<PassPlansPaused<'_>> {
         let mut g = self.pass_plans.lock();
         if g.as_ref().is_some_and(|pp| pp.current.is_some()) {
@@ -1774,6 +1796,33 @@ impl MetalDevice {
         self.pass_plans.lock().as_ref().map(|p| p.counters)
     }
 
+    /// Requests this device's pools received while a served pass was open,
+    /// `(shared, private)`: zero when every served pass allocated from its
+    /// plan alone (`DESIGN.md` §9.2aa, I1).
+    ///
+    /// The pools' own `allocations` cannot say this. They count misses over
+    /// every allocation, and a request made between passes (a staged input)
+    /// misses or hits according to whether the completion handler has
+    /// drained its same-size predecessor yet (§6.3b), which is the GPU's
+    /// timing, not the plan's coverage. Scoped to the device: a request
+    /// counts whichever thread made it.
+    pub fn served_pass_pool_requests(&self) -> (u64, u64) {
+        let [shared, private] = &*self.served_pass_pool_requests;
+        (
+            shared.load(std::sync::atomic::Ordering::Relaxed),
+            private.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Counts a request that reached pool `which` (0 shared, 1 private) if a
+    /// served pass is open. One relaxed load when none is.
+    fn note_pool_request(&self, which: usize) {
+        if self.pass_state.load(std::sync::atomic::Ordering::Relaxed) & 0b100 != 0 {
+            self.served_pass_pool_requests[which]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The undeclared escapes of `key`'s plan as `(ordinal, bytes, allocated
     /// at dispatch, first read at dispatch of the following pass)` — empty
     /// when it has none or no plan.
@@ -1798,6 +1847,24 @@ impl MetalDevice {
             .collect();
         keys.sort_by_key(|(k, ..)| format!("{k:?}"));
         Some((keys, p.base.as_ref().map_or(0, |b| b.length())))
+    }
+
+    /// The pass in progress took a data-dependent branch its key does not
+    /// name: a model that settles a step and, on a miss, replays it inside
+    /// the same pass. Its recording holds the branch, which a pass of the
+    /// same key that does not take it never runs, so the values the branch
+    /// supersedes (the first computation's logits) would be planned as dead
+    /// and served to a pass whose outputs they are. Such a pass still closes
+    /// the key it observes, and is never itself a plan; its key records
+    /// again on its next sight (`DESIGN.md` §9.2aa). A no-op when no pass is
+    /// open or the cache is off.
+    pub fn pass_diverged(&self) {
+        if let Some(pp) = self.pass_plans.lock().as_mut() {
+            if pp.current.is_some() && !pp.diverged {
+                pp.diverged = true;
+                pp.counters.diverged += 1;
+            }
+        }
     }
 
     /// Open a forward pass of shape `key`. Under a cached plan the pass is
@@ -1829,6 +1896,7 @@ impl MetalDevice {
         }
         self.pass_state
             .fetch_or(0b10, std::sync::atomic::Ordering::Relaxed);
+        pp.diverged = false;
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
@@ -1869,6 +1937,8 @@ impl MetalDevice {
                 }
                 arena.begin_step();
                 pp.counters.served += 1;
+                self.pass_state
+                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
                 PassState::Served(key)
             }
             (None, false) => {
@@ -1895,7 +1965,7 @@ impl MetalDevice {
             return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
         };
         self.pass_state
-            .fetch_and(!0b10, std::sync::atomic::Ordering::Relaxed);
+            .fetch_and(!0b110, std::sync::atomic::Ordering::Relaxed);
         // A plan closed this pass: the recording pass's transients sit in
         // the pool's free list while the base now holds the pass's shape —
         // trimmed after the lock, or a budget that admitted one copy of the
@@ -1921,9 +1991,10 @@ impl MetalDevice {
                     Self::close_pending(self, pp, closes)?;
                     closed_a_plan = true;
                 }
-                if pp.plans.contains_key(&key) {
+                if pp.plans.contains_key(&key) || pp.diverged {
                     // The key it closed was its own (two sightings back to
-                    // back): planned now, nothing left to observe.
+                    // back): planned now, nothing left to observe. Or this
+                    // pass diverged, and its recording is no key's plan.
                     pp.pending = None;
                     self.finish_arena_recording(pp.layout);
                 } else {
@@ -2235,6 +2306,7 @@ impl MetalDevice {
                 }
             }
         }
+        self.note_pool_request(1);
         let buffer = match self.private_buffers.acquire(size) {
             Some(b) => b,
             None => {
@@ -2552,6 +2624,7 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        self.note_pool_request(0);
         if let Some(b) = self.buffers.acquire(size) {
             return Ok(b);
         }

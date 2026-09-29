@@ -240,37 +240,11 @@ pub fn gate_and_beta(
     Ok((g, beta))
 }
 
-/// One decode-step of the depthwise causal conv over the concat-QKV channels
-/// (k=4, no bias — `ssm_conv1d`), mirroring the shift-and-fold pattern Mamba2
-/// uses: shift the per-channel window, append the new token, fold against the
-/// k-wide weight. The window is a [`RecurrentState`] channel (a second recurrent
-/// state alongside `S`), so it migrates and rolls back with the sequence.
-///
-/// `x` is `[channels]` (this token's concat-QKV projection), `weight` is
-/// `[channels, k]` (the depthwise kernel), `window` is the `[channels, k]` state
-/// (oldest..newest, `None` = zero). Returns `(conv_out [channels], new_window)`.
-pub fn conv_decode_step(
-    x: &Tensor,
-    weight: &Tensor,
-    window: Option<&Tensor>,
-    channels: usize,
-    k: usize,
-) -> Result<(Tensor, Tensor)> {
-    let dev = x.device();
-    let dt = x.dtype();
-    // window [channels, k], newest at column k-1.
-    let win = match window {
-        Some(w) => w.clone(),
-        None => Tensor::zeros((channels, k), dt, dev)?,
-    };
-    // shift left by one, append x at the last column.
-    let shifted = win.narrow(1, 1, k - 1)?; // [channels, k-1]
-    let x_col = x.reshape((channels, 1))?;
-    let new_win = Tensor::cat(&[&shifted, &x_col], 1)?; // [channels, k]
-                                                        // fold: sum_i weight[:,i] * window[:,i].
-    let folded = (new_win.contiguous()? * weight)?.sum(1)?; // [channels]
-    Ok((folded, new_win))
-}
+/// The conv's references are the short-conv block's shift window: the step
+/// and the chunk, position by position the same (`nn::short_conv`).
+pub use crate::nn::short_conv::{
+    shift_prefill_reference as conv_prefill, shift_step_reference as conv_decode_step,
+};
 
 /// The chunk size Kernel B tiles a sequence into (the reference's `CS` for the
 /// gated-delta / GDA case, `delta-net-base.cpp`; FLA's default).
@@ -459,41 +433,6 @@ pub fn unit_lower_inverse_composed(a: &Tensor) -> Result<Tensor> {
     Tensor::cat(&rows, dims.len() - 2)
 }
 
-/// The depthwise causal conv over a whole chunk `x [seq, channels]` against
-/// the carried window (the same `[channels, k]` window `conv_decode_step`
-/// keeps: the last `k` inputs, newest last). Returns `(conv_out [seq,
-/// channels], new_window)`; position by position it equals `conv_decode_step`.
-pub fn conv_prefill(
-    x: &Tensor,
-    weight: &Tensor,
-    window: Option<&Tensor>,
-    channels: usize,
-    k: usize,
-) -> Result<(Tensor, Tensor)> {
-    let dev = x.device();
-    let dt = x.dtype();
-    let seq = x.dim(0)?;
-    let x_t = x.t()?.contiguous()?; // [channels, seq]
-    let history = match window {
-        Some(w) => w.to_dtype(dt)?.narrow(1, 1, k - 1)?, // the last k−1 inputs
-        None => Tensor::zeros((channels, k - 1), dt, dev)?,
-    };
-    let padded = Tensor::cat(&[&history, &x_t], 1)?; // [channels, k−1+seq]
-    let w = weight.to_dtype(dt)?;
-    let mut acc: Option<Tensor> = None;
-    for tap in 0..k {
-        let cols = padded.narrow(1, tap, seq)?;
-        let term = cols.broadcast_mul(&w.narrow(1, tap, 1)?)?;
-        acc = Some(match acc {
-            Some(a) => (a + term)?,
-            None => term,
-        });
-    }
-    let out = acc.expect("k >= 1").t()?.contiguous()?; // [seq, channels]
-    let new_window = padded.narrow(1, seq - 1, k)?.contiguous()?; // last k inputs
-    Ok((out, new_window))
-}
-
 /// [`gqa_expand`] over a position-major `[seq, h_k, d]` → `[seq, h_v, d]`,
 /// the same head map (tile: v-head `j` reads k-head `j % h_k`).
 pub fn gqa_expand_seq<const INTERLEAVE: bool>(
@@ -673,25 +612,6 @@ mod tests {
         for (x, y) in nl.iter().zip(&nf) {
             assert!((x - y).abs() < 1e-6);
         }
-    }
-
-    /// The decode conv shifts the window and folds against the k-wide weight,
-    /// exactly the causal depthwise conv. Two tokens through a 1-channel k=3 conv,
-    /// checked by hand.
-    #[test]
-    fn conv_decode_step_folds_causal_window() {
-        let dev = Device::Cpu;
-        let (ch, k) = (1usize, 3usize);
-        // weight [1,3] = [w0,w1,w2]; conv folds oldest..newest = w0*x_{t-2}+w1*x_{t-1}+w2*x_t.
-        let w = Tensor::from_vec(vec![0.5f32, 1.0, 2.0], (ch, k), &dev).unwrap();
-        // token 1 (x=1) onto a zero window: window=[0,0,1], out = 0.5*0+1*0+2*1 = 2.
-        let x1 = Tensor::from_vec(vec![1f32], ch, &dev).unwrap();
-        let (o1, win1) = conv_decode_step(&x1, &w, None, ch, k).unwrap();
-        assert_eq!(o1.to_vec1::<f32>().unwrap()[0], 2.0);
-        // token 2 (x=3): window shifts to [0,1,3], out = 0.5*0+1*1+2*3 = 7.
-        let x2 = Tensor::from_vec(vec![3f32], ch, &dev).unwrap();
-        let (o2, _win2) = conv_decode_step(&x2, &w, Some(&win1), ch, k).unwrap();
-        assert_eq!(o2.to_vec1::<f32>().unwrap()[0], 7.0);
     }
 
     /// softplus matches log(1+exp(x)) including at large |x| (no overflow).
@@ -953,62 +873,6 @@ mod tests {
             smax <= 1e-4 * sscale,
             "states differ by {smax} at scale {sscale}"
         );
-    }
-
-    /// The chunk conv equals the per-position conv with the same carried
-    /// window, including the window it leaves behind.
-    #[test]
-    fn conv_prefill_matches_decode_steps() {
-        let dev = Device::Cpu;
-        let (ch, k, seq) = (3usize, 4usize, 9usize);
-        let w = Tensor::from_vec(
-            (0..ch * k)
-                .map(|i| (i as f32 * 0.3).cos())
-                .collect::<Vec<_>>(),
-            (ch, k),
-            &dev,
-        )
-        .unwrap();
-        let x = Tensor::from_vec(
-            (0..seq * ch)
-                .map(|i| (i as f32 * 0.17).sin())
-                .collect::<Vec<_>>(),
-            (seq, ch),
-            &dev,
-        )
-        .unwrap();
-        let w0 = Tensor::from_vec(
-            (0..ch * k)
-                .map(|i| (i as f32 * 0.5).sin())
-                .collect::<Vec<_>>(),
-            (ch, k),
-            &dev,
-        )
-        .unwrap();
-        // Chunk.
-        let (out, win) = conv_prefill(&x, &w, Some(&w0), ch, k).unwrap();
-        // Steps.
-        let mut cur = w0.clone();
-        let mut rows = Vec::new();
-        for t in 0..seq {
-            let xt = x.narrow(0, t, 1).unwrap().squeeze(0).unwrap();
-            let (o, nw) = conv_decode_step(&xt, &w, Some(&cur), ch, k).unwrap();
-            rows.push(o);
-            cur = nw;
-        }
-        let out_ref = Tensor::stack(&rows, 0).unwrap();
-        let (a, b) = (
-            out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            out_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        );
-        for (x, y) in a.iter().zip(&b) {
-            assert!((x - y).abs() < 1e-5, "{a:?} vs {b:?}");
-        }
-        let (wa, wb) = (
-            win.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            cur.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        );
-        assert_eq!(wa, wb);
     }
 
     /// Forward substitution inverts `I + A` for a strictly-lower `A`, batched,

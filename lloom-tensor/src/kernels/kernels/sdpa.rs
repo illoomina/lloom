@@ -26,6 +26,16 @@ pub enum SdpaDType {
     F32,
 }
 
+/// The `head_dim`s `steel_attention` (`call_sdpa_full`) is instantiated at;
+/// f32 has no 512 (`sdpa_full_tile`).
+pub const SDPA_FULL_HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+
+/// The `head_dim`s the `sdpa_vector` entry points dispatch (`call_sdpa_vector`,
+/// its two-pass and paged siblings). Two fewer than the metallib instantiates:
+/// 72 and 80 have kernels no entry point names
+/// (`sdpa_vector_declares_variants_the_name_table_cannot_reach`).
+pub const SDPA_VECTOR_HEAD_DIMS: [usize; 6] = [32, 64, 96, 128, 256, 512];
+
 /// The tile `steel_attention` runs `head_dim` at: `(BQ, BK, WM, WN)`.
 ///
 /// `Err` for a head dim the kernel does not instantiate, and for f32 at 512
@@ -36,11 +46,11 @@ pub fn sdpa_full_tile(
     head_dim: usize,
     itype: SdpaDType,
 ) -> Result<(usize, usize, usize, usize), MetalKernelError> {
-    if ![32, 64, 72, 80, 96, 128, 256, 512].contains(&head_dim) {
+    if !SDPA_FULL_HEAD_DIMS.contains(&head_dim) {
         return Err(MetalKernelError::SdpaHeadSizeMismatch {
             variation: "full",
             got: head_dim,
-            expected: vec![32, 64, 72, 80, 96, 128, 256, 512],
+            expected: SDPA_FULL_HEAD_DIMS.to_vec(),
         });
     }
     // BD=512 uses reduced tiles to fit 32KB Metal threadgroup memory (f16/bf16 only).
@@ -584,7 +594,7 @@ pub fn call_sdpa_vector_with(
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "vector",
                 got: *other,
-                expected: vec![32, 64, 96, 128, 256, 512],
+                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
             })
         }
     };
@@ -715,7 +725,7 @@ pub fn call_sdpa_vector_paged(
                 return Err(MetalKernelError::SdpaHeadSizeMismatch {
                     variation: "vector_2pass_1_paged",
                     got: other,
-                    expected: vec![32, 64, 96, 128, 256, 512],
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
                 })
             }
         };
@@ -824,7 +834,7 @@ pub fn call_sdpa_vector_paged(
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "vector_paged",
                 got: other,
-                expected: vec![32, 64, 96, 128, 256, 512],
+                expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
             })
         }
     };
@@ -1444,7 +1454,7 @@ pub fn call_sdpa_vector_2pass(
                 return Err(MetalKernelError::SdpaHeadSizeMismatch {
                     variation: "vector_2pass_1",
                     got: *other,
-                    expected: vec![32, 64, 96, 128, 256, 512],
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
                 })
             }
         };
@@ -1533,7 +1543,7 @@ pub fn call_sdpa_vector_2pass(
                 return Err(MetalKernelError::SdpaHeadSizeMismatch {
                     variation: "vector_2pass_2",
                     got: *other,
-                    expected: vec![32, 64, 96, 128, 256, 512],
+                    expected: SDPA_VECTOR_HEAD_DIMS.to_vec(),
                 })
             }
         };

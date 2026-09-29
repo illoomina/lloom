@@ -19,6 +19,7 @@ pub mod moe;
 pub mod mtp;
 pub mod ple;
 pub mod qsa;
+pub mod schema;
 pub mod testing;
 
 pub use config::{Config, ConfigArgs, LayerKind};

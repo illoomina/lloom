@@ -23,7 +23,7 @@ let out = session.decode(&prompt_ids, detokenize, &params, |fragment| print!("{f
 
 - `DecodeParams::readback` selects the readback arm (`design/docs/decode-driver-design.md`,
   seam A). `Auto` takes the device-resident token ring with one forward of
-  lookahead — the arm `lfm2-chat` calls the crown — when the sampler is argmax
+  lookahead — the crown — when the sampler is argmax
   or plain temperature, and the blocking host-readback arm for top-p. `Blocking`
   and `Ring { lookahead, commit_steps }` select explicitly.
 - `decode_until` is `decode` whose fragment hook can end the run (`false` →
@@ -60,6 +60,19 @@ its hot-row cache), `--mtp <gguf>` for the MTP head on the speculative body
 The tokenizer and the chat template come from the HF cache's
 `Qwen/Qwen3.8-Flash-Next` snapshot (`--tokenizer` to point elsewhere).
 
+**The template's variables** (`src/app/template.rs`). `lloom chat --think`
+sets `enable_thinking`; `--reasoning-effort <EFFORT>` sets `reasoning_effort`
+(Qwen4-exp: `low`, `medium`, `xhigh`; its default, and a run with no flag
+renders byte-identically to `xhigh`). Which family supports a variable is
+read from its template — a static parse of the source plus a render probe —
+not from a list: `chat` refuses, before the first turn, an effort the template
+does not read (LFM2), one it renders the same way for any value (Qwen4-exp
+without `--think`) and a value it rejects (its own `raise_exception`
+message); `serve` answers the last with a 400 and serves the first two
+without the effort, naming it in `timings.template_kwargs_ignored`. The turn
+line and `timings` carry `reasoning_effort` and `prompt_ids_sha256`, so a run
+says which prompt it ran.
+
 The request seam is `app::served::Served`, `dyn` per request (§15.2 #9); the
 per-token loop behind it is `DecodeSession`'s, generic over `CausalLM`. On
 Qwen4-exp `--readback auto` resolves to the **blocking** arm: the model's
@@ -76,21 +89,41 @@ chat`'s default before), `--readback ring-fixed` and `--eos-gate=false` stay
 selectable; the gate is off, named at load, wherever the adaptive commit does
 not run and under `--replay`.
 
+### The run reports, and `lloom bench --mode`
+
+`lloom` is also the measurement harness the retired `lfm2-chat` example was
+(`src/app/report.rs`, `src/app/modes.rs`; the flag-for-flag map is
+`design/docs/decode-driver-design.md` Stage 7):
+
+```sh
+lloom chat --raw -p "$PROMPT" -v                     # the turn's diagnostics: first token, cadence, churn, KV, …
+lloom chat --raw -p "$PROMPT" --replay               # + what the ICB executor replayed (arena, packed, pass plans alike)
+lloom chat --raw -p "$PROMPT" --dspark --phase-sync  # + the round breakdown and its DSPARK_ROUNDS line
+CANDLE_METAL_PROFILE=1 lloom chat --raw -p "$PROMPT" # + GPU time by kernel, busy/wall, the idle between buffers
+lloom bench --mode concurrent --batched --sequences 4 --stagger 8   # solo vs the batched driver, each stream checked
+lloom bench --mode concurrent --dspark --sequences 2 --timeline r.csv  # solo vs the pipelined speculative driver
+lloom bench --mode reuse                             # turn 2 through prefix reuse vs a fresh prefill
+```
+
+The modes are LFM2's (`Served::run_mode`; Qwen4-exp refuses by name): each
+drives several sequences of one model directly, carries its solo reference
+arm and prints one `RESULT` line on stdout.
+
 Loads the LFM2.5-2.6B snapshot from the HF cache when no `--model` is given
 (`LFM2_MODEL_DIR` to point elsewhere), warms the Metal pipelines, and serves one
 request at a time on the crown decode configuration (`Sdpa × InPlace ×
-Shuffle`, the GEMV epilogue and conv fusions — `lfm2-chat --cache crown`'s
-arms, every one token-identical to the generic path).
+Shuffle`, the GEMV epilogue and conv fusions — `--cache crown`'s arms, every
+one token-identical to the generic path).
 
 Two contracts on the one port:
 
 | endpoint | shape | for |
 |---|---|---|
-| `GET /health` | `{}` | readiness |
+| `GET /health` | `{}`; `chat_template_reads` says which of the engine's template variables (`enable_thinking`, `reasoning_effort`) the checkpoint's template reads | readiness |
 | `GET /v1/models` | OpenAI | model id |
 | `POST /tokenize` | `{prompt, add_special_tokens?}` → `{tokens, count}` (also `{content, add_special}`) | exact-count prompt construction; counts what `/v1/completions` will report |
 | `POST /v1/completions` | OpenAI + `ignore_eos`; text or token-id prompt; `stream`; `usage`; `timings` | pipette's `end_to_end_latency` / `max_memory_usage` cells, generic clients |
-| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `stream` SSE; `logprobs`/`top_logprobs` at `max_tokens = 1`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
+| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `reasoning_effort` (OpenAI's field, or `chat_template_kwargs.reasoning_effort`; the values are the template's — Qwen4-exp: `low`, `medium`, `xhigh`); a value the template rejects → 400 with its message; an effort the template does not act on (LFM2, or thinking off) is served without it, with a warning; `timings` carries `reasoning_effort`, `template_kwargs_ignored` and `prompt_ids_sha256`; `stream` SSE; `logprobs`/`top_logprobs` at `max_tokens = 1`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
 | `POST /prefill_throughput` | `{prompt_tokens}` → `{prompt_tps, prompt_tokens, prefill_ms}` | the MLX-sidecar contract pipette's throughput runner speaks |
 | `POST /decode_throughput` | `{prompt_tokens, decode_tokens}` → `{generation_tps, decode_tokens, decode_ms, context_ms, readback}` | " |
 | `POST /end_to_end_latency` | `{prompt, decode_tokens}` → `{total_ms, prompt_tokens, completion_tokens}` | " |

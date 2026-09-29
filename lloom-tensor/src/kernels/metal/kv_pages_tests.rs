@@ -550,3 +550,31 @@ fn reserve_reports_exhaustion() {
         "8 more slots need 3 pages of 4 and the pool has 2"
     );
 }
+
+/// The quarantine over another index — a streamed expert's slot — holds and
+/// drains one item at a time in the same epoch order, and a drain into a
+/// kept vector reuses its capacity (the per-token path allocates nothing).
+#[test]
+fn an_epoch_quarantine_of_slots_drains_one_at_a_time_in_epoch_order() {
+    use super::kv_pages::EpochQuarantine;
+    let mut q: EpochQuarantine<usize> = EpochQuarantine::new();
+    q.quarantine_one(3, 7);
+    q.quarantine_one(3, 2);
+    q.quarantine_one(4, 9);
+    let mut out = Vec::with_capacity(8);
+    let cap = out.capacity();
+    q.drain_completed_into(3, &mut out);
+    assert!(out.is_empty(), "epoch 3 has not finished at a count of 3");
+    q.drain_completed_into(4, &mut out);
+    assert_eq!(
+        out,
+        vec![7, 2],
+        "epoch 3's slots, in the order they were held"
+    );
+    assert_eq!(q.held(), 1);
+    out.clear();
+    q.drain_completed_into(5, &mut out);
+    assert_eq!(out, vec![9]);
+    assert!(q.is_empty());
+    assert_eq!(out.capacity(), cap, "the drain reallocated its output");
+}

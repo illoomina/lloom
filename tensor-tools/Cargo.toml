@@ -11,6 +11,8 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 candle = { workspace = true }
+# `tensor-tools tiny`: the tiny checkpoints (`lloom::testing::tiny`, §21.8).
+lloom = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }

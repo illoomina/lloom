@@ -46,7 +46,8 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::token_ring::TokenRing;
 use lloom::generation::{LogitsProcessor, Sampling};
@@ -569,6 +570,13 @@ struct Axes {
     kv_quant: KvQuant,
     /// The conv-state arm (#141), echoed for the run line.
     conv_state: ConvState,
+    /// Whether the decode conv is the fused step, from `Config`: it decides
+    /// which kernel the conv-state arm above runs on.
+    conv_fused: bool,
+    /// The Q/K/V layout and the conv carry, from `Config`. No flag here
+    /// selects them; a preset does, so the line states them.
+    qkv_layout: lloom::models::lfm2::QkvLayout,
+    conv_prefill_ctx: bool,
     /// KV tokens per page, and pages per chunk (#116).
     ///
     /// Only reachable under `AttnImpl=FlashDecoding` and inert otherwise. Held
@@ -931,6 +939,9 @@ impl Axes {
             kv_append: config.kv_append,
             kv_quant: config.kv_quant,
             conv_state: config.conv_state,
+            conv_fused: config.conv_fused,
+            qkv_layout: config.qkv_layout,
+            conv_prefill_ctx: config.conv_prefill_ctx,
             flash_page_size: config.flash_page_size,
             flash_k: config.flash_pages_per_chunk,
             flash_scratch_sizing: config.flash_scratch_sizing,
@@ -1126,6 +1137,16 @@ impl Axes {
             p("KvAppend", kv_append_arm(self.kv_append)),
             p("KvQuant", kv_quant_arm(self.kv_quant)),
             p("ConvState", &conv_state_arm(self.conv_state)),
+            // Read back from `Config`, for the `AttnImpl` reason: the fused
+            // conv decides whether `ConvState` runs on `shortconv_step` or on
+            // the unfused `broadcast_mul + sum`, and a line without it pools
+            // the two.
+            p("ConvFused", if self.conv_fused { "on" } else { "off" }),
+            p("QkvLayout", self.qkv_layout.as_str()),
+            p(
+                "ConvPrefillCtx",
+                if self.conv_prefill_ctx { "on" } else { "off" },
+            ),
             // Only selects anything under `Executor=Icb`, which this harness
             // does not take. Stated at its default rather than omitted: an
             // unstated axis and an axis at its default are different facts, and
@@ -2092,6 +2113,21 @@ struct Args {
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one fused
+    /// dispatch (`ConvFused`, §12.2 row 1): `shortconv_step` on the `shuffle`
+    /// state, `shortconv_ring` on `rotating`. Moves the logits digest.
+    #[arg(long, default_value_t = false)]
+    conv_fused: bool,
+
+    /// The configuration preset the axis flags apply over: `none` (this
+    /// harness's defaults), `crown` (what `lloom chat` decodes at one
+    /// sequence) or `pool` (the rows' preset). The presets are the engine's
+    /// own functions (`lloom::models::lfm2_presets`); under one, only the axis
+    /// flags given on the command line override it, and the resolved axes are
+    /// on the `configuration:` line.
+    #[arg(long, default_value = "none")]
+    preset: String,
+
     /// Fuse SiLU onto `w1`'s GEMV store (#484's kernel, wired by #509,
     /// `DESIGN.md` §12.2i). Moves the digests by construction.
     #[arg(long, default_value_t = false)]
@@ -2763,7 +2799,9 @@ fn run_speculative_decode(r: SpecRun<'_>) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     let profiling = profile::enabled();
 
@@ -2852,15 +2890,38 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading {}", model_dir.join("config.json").display()))?;
     let mut config = parse_config(&config_raw)?;
 
+    // The preset first, then the axis flags over it: every flag when there is
+    // no preset, only the flags given on the command line when there is one
+    // (`lfm2-determinism --preset` has the same rule).
+    let preset = candle_examples::lfm2_setup::preset(&args.preset)?;
+    if let Some(apply) = preset {
+        apply(&mut config);
+        config.conv_prefill_ctx = true;
+    }
+    let set = |id: &str| preset.is_none() || given(id);
+
     // `AttnImpl` is a construction-tier axis on the config (§7.1, #97), so it
     // is selected before the model is built and both arms stay compiled.
-    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    let conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    if set("conv_state") {
+        config.conv_state = conv_state;
+    }
+    if set("conv_fused") {
+        config.conv_fused = args.conv_fused;
+    }
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
     // kernels), construction-tier like `AttnImpl` beside them.
-    config.gemv_silu = args.gemv_silu;
-    config.gemv_residual = args.gemv_residual;
-    config.gemv_gate =
+    if set("gemv_silu") {
+        config.gemv_silu = args.gemv_silu;
+    }
+    if set("gemv_residual") {
+        config.gemv_residual = args.gemv_residual;
+    }
+    let gemv_gate =
         lloom::models::lfm2::GateFusion::parse(&args.gemv_gate).map_err(anyhow::Error::msg)?;
+    if set("gemv_gate") {
+        config.gemv_gate = gemv_gate;
+    }
     // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
     // reason: an unrecognized value silently pinning `exact` would render
     // `SiluImpl=exact` on a RESULT line for a run the caller asked to be a
@@ -2878,9 +2939,11 @@ fn main() -> Result<()> {
         // The SiLU arm rides `Config::silu_impl` now (RESTRUCTURING §1.6):
         // `Model::new` pushes the field into the kernel cache, so setting the
         // atomic directly here would be clobbered by that push.
-        config.silu_impl = silu;
+        if set("silu_impl") {
+            config.silu_impl = silu;
+        }
     }
-    config.attn_impl = match args.attn.as_str() {
+    let attn = match args.attn.as_str() {
         "generic" => lloom::models::lfm2::AttnImpl::Generic,
         "sdpa" => lloom::models::lfm2::AttnImpl::Sdpa,
         // Issue #116. Selectable and never a default: 10.4's argument for it
@@ -2889,25 +2952,41 @@ fn main() -> Result<()> {
         "flash" => lloom::models::lfm2::AttnImpl::FlashDecoding,
         other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
-    config.flash_page_size = args.flash_page_size;
-    config.flash_pages_per_chunk = args.flash_k;
+    if set("attn") {
+        config.attn_impl = attn;
+    }
+    if set("flash_page_size") {
+        config.flash_page_size = args.flash_page_size;
+    }
+    if set("flash_k") {
+        config.flash_pages_per_chunk = args.flash_k;
+    }
     // §9.1a's sizing policy, reaching a model path for the first time (#234).
     // Refused rather than defaulted, for the same reason as `--attn`: a
     // silently-ignored flag makes an A/B arm measure the wrong thing (§2.4).
-    config.flash_scratch_sizing =
+    let sizing =
         FlashScratchSizing::parse(&args.flash_scratch_sizing).map_err(anyhow::Error::msg)?;
+    if set("flash_scratch_sizing") {
+        config.flash_scratch_sizing = sizing;
+    }
     // Refused rather than defaulted, for the same reason as `--attn`.
-    config.kv_append = match args.kv_append.as_str() {
+    let kv_append = match args.kv_append.as_str() {
         "cat" => lloom::models::lfm2::KvAppend::Cat,
         "in-place" => lloom::models::lfm2::KvAppend::InPlace,
         "paged" => lloom::models::lfm2::KvAppend::Paged,
         other => anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"),
     };
+    if set("kv_append") {
+        config.kv_append = kv_append;
+    }
 
     // Refused rather than defaulted, for `--kv-append`'s reason: an
     // unrecognized value silently pinning the default would report the f16
     // arm's digest under a quantized arm's name -- #69's vacuous run (§2.4).
-    config.kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+    let kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+    if set("kv_quant") {
+        config.kv_quant = kv_quant;
+    }
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

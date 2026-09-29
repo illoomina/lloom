@@ -1742,6 +1742,9 @@ pub struct BenchArgs {
     #[arg(long)]
     pub skip_solo: bool,
 
+    #[command(flatten)]
+    pub gate: super::modes::GateConfigArgs,
+
     /// `--mode concurrent`: tokens per visit on the time-sliced interleave.
     #[arg(long, default_value_t = 16)]
     pub chunk: usize,
@@ -1954,7 +1957,8 @@ pub fn bench(args: BenchArgs) -> Result<()> {
 fn bench_mode(args: BenchArgs, mode: super::modes::Mode) -> Result<()> {
     let mut options = super::resolve_options(&args.common)?;
     super::report::arm_trace();
-    let spec = resolve_mode(&args, mode, &mut options)?;
+    let gate = super::modes::GateConfig::resolve(&args.gate)?;
+    let spec = resolve_mode(&args, mode, &mut options, &gate)?;
     let load_start = Instant::now();
     let (engine, model_path) = super::load_engine(
         &args.model,
@@ -2006,9 +2010,25 @@ fn resolve_mode(
     args: &BenchArgs,
     mode: super::modes::Mode,
     options: &mut crate::EngineOptions,
+    gate: &super::modes::GateConfig,
 ) -> Result<super::modes::ModeSpec> {
     let dspark = options.speculative.method == "dspark";
     let decode = &options.decode;
+    // The flag only: the env alias is process-wide, set once for a gate
+    // script's every arm, most of which have no rows gate to read it.
+    let rows_gate = mode == super::modes::Mode::Concurrent && args.batched;
+    if args.gate.fail_on_gate.is_some() && !rows_gate {
+        anyhow::bail!(
+            "--fail-on-gate is read by the rows gate, `--mode concurrent --batched`; \
+             --mode {}{} prints no gate verdict",
+            mode.name(),
+            if mode == super::modes::Mode::Concurrent {
+                " without --batched"
+            } else {
+                ""
+            }
+        );
+    }
     if args.batch > 1 {
         anyhow::bail!(
             "--mode {} drives its own sequences (`--sequences`); --batch starts the serving \
@@ -2093,6 +2113,7 @@ fn resolve_mode(
         rows,
         check_independence: !args.no_independence_check,
         skip_solo: args.skip_solo,
+        fail_on_gate: gate.fail_on_gate,
         first: args.first.clone(),
         timeline: args.timeline.clone(),
     })
@@ -2115,8 +2136,49 @@ mod bench_mode_tests {
             "reuse" => Mode::Reuse,
             _ => Mode::Concurrent,
         };
-        let spec = resolve_mode(&args, mode, &mut o)?;
+        // The gate group without its env layer: `modes.rs`'s env-alias test
+        // sets the variable, and a process-wide read here would race it.
+        let mut gate = crate::app::modes::GateConfig::default();
+        args.gate
+            .apply(&mut gate)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let spec = resolve_mode(&args, mode, &mut o, &gate)?;
         Ok((spec, o))
+    }
+
+    /// `--fail-on-gate` reaches the rows gate, off by default; a mode with
+    /// no rows gate refuses the flag rather than wear it.
+    #[test]
+    fn the_gate_opt_in_reaches_the_rows_gate_only() {
+        let (s, _) = resolve(&["--mode", "concurrent", "--batched"]).unwrap();
+        assert!(!s.fail_on_gate, "a failing gate exits 0 by default");
+        let (s, _) = resolve(&["--mode", "concurrent", "--batched", "--fail-on-gate"]).unwrap();
+        assert!(s.fail_on_gate);
+        let (s, _) = resolve(&[
+            "--mode",
+            "concurrent",
+            "--batched",
+            "--skip-solo",
+            "--fail-on-gate",
+        ])
+        .unwrap();
+        assert!(
+            s.fail_on_gate,
+            "the re-batch still carries a gate without the solo arm"
+        );
+        for (argv, want) in [
+            (
+                &["--mode", "concurrent", "--fail-on-gate"][..],
+                "--mode concurrent without --batched prints no gate verdict",
+            ),
+            (
+                &["--mode", "reuse", "--fail-on-gate=false"],
+                "--mode reuse prints no gate verdict",
+            ),
+        ] {
+            let e = refusal(argv);
+            assert!(e.contains(want), "{argv:?}: {e}");
+        }
     }
 
     fn refusal(argv: &[&str]) -> String {

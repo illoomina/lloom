@@ -282,7 +282,13 @@ impl lloom_tensor::ModuleT for Dropout {
     }
 }
 
-struct SoftmaxLastDim;
+struct SoftmaxLastDim {
+    /// Where the probabilities go, when the caller owns that buffer: a
+    /// host-read slot the sampler reads in place, so a host draw's one
+    /// readback is a mapped read rather than a blit of the whole vocabulary
+    /// (#814 part 5). `None` allocates the output as any op does.
+    out: Option<Tensor>,
+}
 
 impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
     fn name(&self) -> &'static str {
@@ -411,11 +417,31 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
 
         let last_dim = layout.dims()[layout.shape().rank() - 1];
         let elem_count = layout.shape().elem_count();
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(elem_count, storage.dtype())
-            .with_label("softmax")
-            .build()?;
+        let output = match &self.out {
+            Some(t) => {
+                let (os, ol) = t.storage_and_layout();
+                let os = match &*os {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!("softmax: the output slot must be on the metal device"),
+                };
+                if ol.shape().elem_count() != elem_count
+                    || !ol.is_contiguous()
+                    || ol.start_offset() != 0
+                    || os.dtype() != storage.dtype()
+                {
+                    lloom_tensor::bail!(
+                        "softmax: the output slot must be a fresh contiguous {:?} of {elem_count}",
+                        storage.dtype()
+                    )
+                }
+                os.buffer_handle().clone()
+            }
+            None => device
+                .new_buffer_builder()
+                .with_size_for(elem_count, storage.dtype())
+                .with_label("softmax")
+                .build()?,
+        };
         lloom_tensor::kernels::call_last_softmax(
             device.metal_device(),
             &encoder,
@@ -435,7 +461,13 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
-    xs.apply_op1_no_bwd(&SoftmaxLastDim)
+    xs.apply_op1_no_bwd(&SoftmaxLastDim { out: None })
+}
+
+/// [`softmax_last_dim`] writing into `out` — a host-read slot the caller
+/// reads in place (#814 part 5). The same values either way.
+pub fn softmax_last_dim_into(xs: &Tensor, out: Tensor) -> Result<Tensor> {
+    xs.apply_op1_no_bwd(&SoftmaxLastDim { out: Some(out) })
 }
 
 /// Depthwise 1D conv with LFM2's `*C` gate folded into the store (§12.2 row 1).

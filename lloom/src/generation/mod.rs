@@ -56,6 +56,13 @@ pub struct LogitsProcessor {
     /// The processors between the logits and the draw; `None` when every one
     /// is neutral, so the sampler's path is exactly the one it has without them.
     stage: Option<processors::Stage>,
+    /// The host-sort arms' probabilities (#814 part 5): the softmax writes
+    /// this Shared, persistent slot and the host reads it in place, so a
+    /// draw that needs the whole vocabulary on the host does not blit it into
+    /// a staging buffer per token. Made on the first such draw; the device
+    /// arms (argmax, gumbel-max) never make one.
+    #[cfg(feature = "metal")]
+    prs_slot: Option<lloom_tensor::metal_backend::HostSlot>,
 }
 
 impl LogitsProcessor {
@@ -65,6 +72,8 @@ impl LogitsProcessor {
             rng,
             sampling,
             stage: None,
+            #[cfg(feature = "metal")]
+            prs_slot: None,
         }
     }
 
@@ -218,6 +227,29 @@ impl LogitsProcessor {
         (logits + noise.affine(temperature, 0.0)?)?.argmax(lloom_tensor::D::Minus1)
     }
 
+    /// The slot the host-sort arms read their probabilities from, made on
+    /// first use and grown with the vocabulary. `None` off Metal, and on a
+    /// device that refuses the Shared allocation — then the draw reads back
+    /// as it always did.
+    #[cfg(feature = "metal")]
+    fn prs_slot_for<'a>(
+        slot: &'a mut Option<lloom_tensor::metal_backend::HostSlot>,
+        logits: &Tensor,
+    ) -> Result<Option<&'a lloom_tensor::metal_backend::HostSlot>> {
+        let Ok(m) = logits.device().as_metal_device() else {
+            return Ok(None);
+        };
+        let n = logits.elem_count();
+        if !matches!(slot, Some(s) if s.cap() >= n) {
+            *slot = Some(lloom_tensor::metal_backend::HostSlot::new(
+                m,
+                n,
+                DType::F32,
+            )?);
+        }
+        Ok(slot.as_ref())
+    }
+
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
         let distr = rand::distr::weighted::WeightedIndex::new(prs).map_err(Error::wrap)?;
         let next_token = distr.sample(&mut self.rng) as u32;
@@ -336,10 +368,31 @@ impl LogitsProcessor {
             return self.sample_argmax(logits.clone());
         }
         let logits = logits.to_dtype(DType::F32)?;
+        // The probabilities through a host-read slot where there is one: the
+        // softmax writes it and the host reads the mapping, so the whole
+        // vocabulary does not come down by a blit into a staging buffer every
+        // token (#814 part 5). The same values, so the draw is unchanged.
+        #[cfg(feature = "metal")]
+        let slot = Self::prs_slot_for(&mut self.prs_slot, &logits)?;
+        #[cfg(not(feature = "metal"))]
+        let slot: Option<()> = None;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
-            let logits = (&logits / temperature)?;
-            let prs = crate::nn::ops::softmax_last_dim(&logits)?;
-            let mut prs = prs.to_vec1()?;
+            let scaled = (&logits / temperature)?;
+            let n = scaled.elem_count();
+            #[cfg(feature = "metal")]
+            let mut prs = match &slot {
+                Some(slot) => {
+                    let out = slot.tensor(scaled.shape())?;
+                    let _ = crate::nn::ops::softmax_last_dim_into(&scaled, out)?;
+                    slot.read_committed::<f32>(n)?
+                }
+                None => crate::nn::ops::softmax_last_dim(&scaled)?.to_vec1()?,
+            };
+            #[cfg(not(feature = "metal"))]
+            let mut prs = {
+                let _ = (&slot, n);
+                crate::nn::ops::softmax_last_dim(&scaled)?.to_vec1()?
+            };
             f(&mut prs);
             Ok(prs)
         };

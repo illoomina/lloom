@@ -7057,7 +7057,7 @@ impl ShortConv {
             // A cache that keeps the state writes it into the layer's spare
             // and swaps the two; the batch arm's state is a pool row, copied
             // into by `set_conv_state`, so it keeps a fresh one.
-            let next = if cache.use_kv_cache && cache.batch.is_none() {
+            let next = if cache.use_kv_cache && cache.batch_slot().is_none() {
                 Some(cache.conv_spare_for(block_idx, &state)?)
             } else {
                 None

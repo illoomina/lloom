@@ -159,13 +159,20 @@ impl LogitsProcessor {
     pub fn draw_and_read(&mut self, logits: &Tensor) -> Result<Option<(Tensor, u32)>> {
         #[cfg(feature = "metal")]
         {
-            let draw = self.draw_on_device(logits)?;
-            let Ok(m) = draw.device().as_metal_device() else {
+            // The device is decided BEFORE the draw: a draw runs the
+            // processors' stage, which advances their history, and a caller
+            // that took `None` would draw again and advance it twice.
+            let Ok(m) = logits.device().as_metal_device() else {
                 return Ok(None);
             };
+            let m = m.clone();
+            // Through the processors' stage, so the penalties, bias and min-p
+            // apply and their history advances from the drawn token: this is
+            // `sample_argmax_on_device`'s path, not `draw_on_device` bare.
+            let draw = self.sample_argmax_on_device(logits)?;
             if !matches!(&self.draw_slot, Some(s) if s.cap() >= 1) {
                 self.draw_slot = Some(lloom_tensor::metal_backend::HostSlot::new(
-                    m,
+                    &m,
                     1,
                     DType::U32,
                 )?);

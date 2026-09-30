@@ -10,6 +10,11 @@ use lloom_tensor::{Device, Result, Tensor};
 
 const VOCAB: usize = 4099;
 
+/// The readback counters are process-wide, and the test harness runs a
+/// binary's tests on threads: each test holds this for its whole body, so
+/// one test's readbacks never land in another's delta.
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 fn step_logits(step: usize, device: &Device) -> Result<Tensor> {
     let v: Vec<f32> = (0..VOCAB)
         .map(|i| ((i * 31 + step * 17) % 97) as f32 * 0.0625 - 3.0)
@@ -24,6 +29,7 @@ fn step_logits(step: usize, device: &Device) -> Result<Tensor> {
 /// read, not what they are.
 #[test]
 fn a_host_sort_draw_reads_its_probabilities_from_a_slot() -> Result<()> {
+    let _serial = SERIAL.lock();
     let device = Device::new_metal(0)?;
     let inputs: Vec<Tensor> = (0..32)
         .map(|s| step_logits(s, &device))
@@ -71,5 +77,56 @@ fn a_host_sort_draw_reads_its_probabilities_from_a_slot() -> Result<()> {
             .collect::<Result<_>>()?;
         assert_eq!(got, want, "{sampling:?}: the slot moved the draw");
     }
+    Ok(())
+}
+
+/// The blocking arm's greedy draw (#814 part 5, item A): the id the host reads
+/// from the draw's slot, and the device tensor fed as the next input, are
+/// both the host's own argmax of the logits, at every step. The reference is
+/// computed here from the host copy of the logits, not by any sampler, so a
+/// slot the draw never writes (its reads stale or zero) cannot agree with it.
+#[test]
+fn the_greedy_draw_reads_its_id_from_the_slot_it_wrote() -> Result<()> {
+    let _serial = SERIAL.lock();
+    let device = Device::new_metal(0)?;
+    let mut sampler = LogitsProcessor::from_sampling(3, Sampling::ArgMax);
+    let mut seen = std::collections::BTreeSet::new();
+    for step in 0..24 {
+        // A different winner each step, never at index 0.
+        let mut v: Vec<f32> = (0..VOCAB)
+            .map(|i| ((i * 31 + step * 17) % 97) as f32 * 0.0625 - 3.0)
+            .collect();
+        let hot = 1 + (step * 173) % (VOCAB - 1);
+        v[hot] = 100.0;
+        let want = v
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        let x = Tensor::from_vec(v, VOCAB, &device)?;
+        let before = lloom_tensor::metal_backend::readback_counts();
+        let (draw, id) = sampler
+            .draw_and_read(&x)?
+            .expect("a Metal device has a draw slot");
+        let r = lloom_tensor::metal_backend::readback_counts().since(&before);
+        assert_eq!(id, want, "step {step}: the id read from the slot");
+        assert_eq!(
+            r.slot, 1,
+            "step {step}: the id did not come from the slot: {r:?}"
+        );
+        assert_eq!(
+            (r.fast, r.blit, r.staging_allocs),
+            (0, 0, 0),
+            "step {step}: the id was read back: {r:?}"
+        );
+        let fed: Vec<u32> = draw.flatten_all()?.to_vec1()?;
+        assert_eq!(fed, vec![want], "step {step}: the fed tensor");
+        seen.insert(id);
+    }
+    assert!(
+        seen.len() > 20,
+        "the steps did not exercise distinct ids: {seen:?}"
+    );
     Ok(())
 }

@@ -1052,7 +1052,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
             Mixer::Linear(_) => None,
         });
-        let block = ratio.is_some_and(|r| r > 0 && (pos + 1) % r == 0);
+        let block = ratio.is_some_and(|r| (pos + 1).is_multiple_of(r));
         block as u32 | (device_plan as u32) << 1
     }
 

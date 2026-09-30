@@ -1332,6 +1332,10 @@ pub fn print_trace_census(steps: u64) {
     flow.print(steps);
 }
 
+/// A live value in [`OutputFlow`]: `(producer dispatch, producer name,
+/// readers, first reader, last reader)`.
+type Live = (u64, u32, u32, u64, u64);
+
 /// The trace's outputs as values (`#814`, `DESIGN.md` §9.2aa): each output
 /// binding at a `(buffer, offset)` is one value, live until the next output
 /// binding there, and its readers are the later dispatches that bind it as
@@ -1345,9 +1349,8 @@ pub fn print_trace_census(steps: u64) {
 struct OutputFlow {
     names: Vec<String>,
     name_of: std::collections::HashMap<String, u32>,
-    /// Per live value: `(producer dispatch, producer name, readers, first
-    /// reader, last reader)`.
-    live: std::collections::HashMap<(u64, usize), (u64, u32, u32, u64, u64)>,
+    /// Per live value, keyed by `(buffer, offset)`.
+    live: std::collections::HashMap<(u64, usize), Live>,
     at: u64,
     outputs: u64,
     unread: u64,
@@ -1419,7 +1422,7 @@ impl OutputFlow {
             self.outputs, self.next_only, self.unread
         );
         let mut pairs: Vec<_> = self.pairs.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
         let name = |k: u32| self.names.get(k as usize).map_or("<none>", |s| s.as_str());
         for ((p, c), n) in pairs {
             eprintln!("  {n:8} {} -> {}", name(p), name(c));

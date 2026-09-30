@@ -1056,7 +1056,7 @@ impl Inner {
         let fits = matches!(&self.decode_io.slots, Some((_, t)) if t.dims() == [1, n]);
         if !fits {
             let _escape = escape_guard();
-            let buf = m.new_persistent_shared(n * std::mem::size_of::<u32>())?;
+            let buf = m.new_persistent_shared(std::mem::size_of_val(slot_ids))?;
             if buf.contents().is_null() {
                 return Ok(None);
             }

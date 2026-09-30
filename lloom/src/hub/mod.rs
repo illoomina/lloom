@@ -395,6 +395,36 @@ impl TokenizerFromCheckpoint for Tokenizer {
     }
 }
 
+/// `file` of the Hugging Face repo `repo` at its `main` ref, if the local
+/// cache already holds it (`HF_HOME` honoured). Never fetches: a test or a
+/// harness asks whether a checkpoint is on this machine, and a missing one
+/// is an answer, not a download.
+pub fn cached_file(repo: &str, file: &str) -> Option<PathBuf> {
+    hf_hub::Cache::from_env()
+        .model(repo.to_string())
+        .get(file)
+        .filter(|p| p.exists())
+}
+
+/// Every shard of a split GGUF, from its first (`…-00001-of-0000N.gguf`):
+/// the siblings the name promises, in order, as far as they exist. A file
+/// not named as a split is its own only shard.
+pub fn gguf_shards(first: &Path) -> Vec<PathBuf> {
+    let name = first.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let split = name.rsplit_once("-of-").and_then(|(head, tail)| {
+        let count: usize = tail.strip_suffix(".gguf")?.parse().ok()?;
+        let head = head.get(..head.len().checked_sub(5)?)?;
+        Some((head.to_string(), count))
+    });
+    match split {
+        Some((head, count)) => (1..=count)
+            .map(|k| first.with_file_name(format!("{head}{k:05}-of-{count:05}.gguf")))
+            .take_while(|p| p.exists())
+            .collect(),
+        None => vec![first.to_path_buf()],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Readers.
 // ---------------------------------------------------------------------------

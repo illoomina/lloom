@@ -466,3 +466,195 @@ pub fn gguf_bytes(
     lloom_tensor::quantized::gguf_file::write(&mut out, &md_refs, &t_refs)?;
     Ok(out.into_inner())
 }
+
+/// The committed shape of the checkpoint the harness loads by default
+/// (Qwen3.8-Flash-Next GSQ-RCO IQ3_XXS, two shards), under
+/// `lloom/tests/scale_manifests/`: what a synthetic Qwen4-exp is written
+/// from when the checkpoint is not on the machine.
+pub const SCALE_MANIFEST: &str = "qwen3.8-flash-next-gsq-rco-iq3xxs.json";
+
+/// Where [`SCALE_MANIFEST`] is in this source tree.
+pub fn scale_manifest_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/scale_manifests")
+        .join(SCALE_MANIFEST)
+}
+
+/// The config a checkpoint's headers state, as the loader completes it:
+/// the vocabulary is `token_embd.weight`'s row count (the header carries no
+/// vocabulary key).
+pub fn config_of_headers<'a>(
+    metadata: &std::collections::HashMap<String, lloom_tensor::quantized::gguf_file::Value>,
+    mut shapes: impl Iterator<Item = (&'a str, &'a [usize])>,
+) -> Result<Config> {
+    let mut cfg = Config::from_gguf_metadata(metadata)?;
+    match shapes.find(|(n, _)| *n == "token_embd.weight") {
+        Some((_, dims)) => cfg.vocab_size = dims[0],
+        None => lloom_tensor::bail!("the headers have no token_embd.weight"),
+    }
+    Ok(cfg)
+}
+
+/// [`config_of_headers`] of a shape manifest.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn scale_config_of(manifest: &crate::testing::scale::ShapeManifest) -> Result<Config> {
+    config_of_headers(
+        &manifest.metadata(),
+        manifest
+            .tensors()
+            .map(|t| (t.name.as_str(), t.dims.as_slice())),
+    )
+}
+
+/// The role each tensor of `manifest` plays to the value law: the declared
+/// schema's, read at the geometry the manifest's header states; the PLE
+/// table, which the schema does not list, is a matrix of its rows.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn scale_roles(
+    manifest: &crate::testing::scale::ShapeManifest,
+) -> Result<std::collections::HashMap<String, crate::testing::tiny::Role>> {
+    let cfg = scale_config_of(manifest)?;
+    let schema = super::schema::tensor_schema(
+        &cfg,
+        &super::schema::SchemaOptions {
+            ple: true,
+            mtp: false,
+        },
+        &super::schema::Kinds::default(),
+    );
+    Ok(schema
+        .tensors
+        .into_iter()
+        .map(|t| (t.name, t.role))
+        .collect())
+}
+
+/// A synthetic Qwen4-exp of the committed shape (`crate::testing::scale`):
+/// the stems keyed values, the experts and the n-gram table as `syn` says
+/// (holes by default), cached under `~/.cache/lloom/synthetic`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn synthetic_shards(syn: &crate::testing::scale::Synthetic) -> Result<Vec<std::path::PathBuf>> {
+    use crate::testing::tiny::Role;
+    let manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
+    let roles = scale_roles(&manifest)?;
+    manifest.cached(
+        syn,
+        &|t| {
+            roles.get(&t.name).copied().unwrap_or(Role::Matrix {
+                fan_in: *t.dims.last().unwrap_or(&1),
+            })
+        },
+        None,
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod scaled {
+    use super::*;
+    use crate::testing::fixture::{Fixture, Scaled, Source};
+    use crate::testing::scale::Synthetic;
+    use crate::testing::tiny::Weights;
+    use std::path::PathBuf;
+
+    impl Scaled for Qwen4ExpTiny {
+        const CHECKPOINT_ENV: &'static str = "QWEN4EXP_GGUF";
+        const REPO: (&'static str, &'static str) = (
+            "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+            "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+        );
+
+        fn scale_config(source: &Source) -> Result<Config> {
+            match source {
+                Source::Real(first) => {
+                    let content = lloom_tensor::quantized::gguf_file::Content::read(
+                        &mut std::fs::File::open(first)?,
+                    )?;
+                    config_of_headers(
+                        &content.metadata,
+                        content
+                            .tensor_infos
+                            .iter()
+                            .map(|(n, t)| (n.as_str(), t.shape.dims())),
+                    )
+                }
+                Source::Synthetic => scale_config_of(&crate::testing::scale::ShapeManifest::read(
+                    &scale_manifest_path(),
+                )?),
+            }
+        }
+
+        /// Every expert resident, through the loader — which refuses it at
+        /// the default memory fraction on a 64 GB machine (the load is 47 GB,
+        /// `memory.md` §9.5q). A test at scale takes [`Fixture::streamed`].
+        fn scale_model(
+            source: &Source,
+            _cfg: &Config,
+            _dtype: Option<DType>,
+            weights: &Weights,
+            dev: &Device,
+        ) -> Result<Qwen4Exp<Resident>> {
+            Qwen4Exp::from_gguf_shards(
+                &scale_shards(source, weights)?,
+                dev,
+                &super::super::loader::LoadOptions::default(),
+            )
+        }
+    }
+
+    /// The shards `source` names: the real checkpoint's, or a synthetic
+    /// one's with `weights`' law and seed.
+    pub fn scale_shards(source: &Source, weights: &Weights) -> Result<Vec<PathBuf>> {
+        match source {
+            Source::Real(first) => Ok(crate::hub::gguf_shards(first)),
+            Source::Synthetic => synthetic_shards(&Synthetic {
+                law: weights.law,
+                seed: weights.seed,
+                ..Synthetic::default()
+            }),
+        }
+    }
+
+    /// The loader-built model on every backend: the tiny geometry written to
+    /// a scratch GGUF, or the checkpoint at scale — one path, the real
+    /// loader's, whatever the backend.
+    impl Fixture<Qwen4ExpTiny> {
+        /// The checkpoint's shards: at scale the source's, on the tiny
+        /// backend the geometry at `cfg` written once to a scratch file.
+        pub fn shards(&self, cfg: &Config) -> Result<Vec<PathBuf>> {
+            match self.source() {
+                Some(s) => scale_shards(s, self.weights()),
+                None => {
+                    let path = self.scratch("tiny-qwen4exp.gguf");
+                    let ckpt = TinyCheckpoint::<Qwen4ExpTiny>::new(cfg.clone(), *self.weights());
+                    std::fs::write(&path, gguf_bytes(&ckpt, None)?)?;
+                    Ok(vec![path])
+                }
+            }
+        }
+
+        /// Every expert resident, through the loader.
+        pub fn resident(
+            &self,
+            cfg: &Config,
+            dev: &Device,
+            opts: &super::super::loader::LoadOptions,
+        ) -> Result<Qwen4Exp<Resident>> {
+            self.watch(dev);
+            Qwen4Exp::from_gguf_shards(&self.shards(cfg)?, dev, opts)
+        }
+
+        /// The routed experts streamed from the shards into a slot pool.
+        pub fn streamed(
+            &self,
+            cfg: &Config,
+            dev: &Device,
+            opts: &super::super::loader::LoadOptions,
+            stream: &super::super::loader::StreamOptions,
+        ) -> Result<Qwen4Exp<super::super::moe::Streamed>> {
+            self.watch(dev);
+            Qwen4Exp::from_gguf_streamed(&self.shards(cfg)?, dev, opts, stream)
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub use scaled::scale_shards;

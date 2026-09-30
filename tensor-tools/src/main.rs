@@ -197,6 +197,59 @@ enum Command {
         #[arg(long)]
         geometry: Option<String>,
     },
+
+    /// Record a real checkpoint's scale (`docs/porting-models.md` §21.8b):
+    /// for `qwen4exp` the GGUF headers' shape manifest (every tensor's
+    /// name, shape, kind and offset, the header keys without the
+    /// tokenizer); for `lfm2` the geometry `config.json` states. Reads no
+    /// weights.
+    ScaleManifest {
+        /// `lfm2` or `qwen4exp`.
+        #[arg(long)]
+        family: String,
+
+        /// The checkpoint: an LFM2 directory, or a GGUF's first shard.
+        #[arg(long)]
+        checkpoint: std::path::PathBuf,
+
+        /// Where the checkpoint came from (repo, revision, quant), recorded.
+        #[arg(long, default_value = "")]
+        source: String,
+
+        /// The JSON file written.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+
+    /// Write a synthetic Qwen4-exp checkpoint of the committed shape
+    /// (`docs/porting-models.md` §21.8b): the real layout, keyed stems,
+    /// the expert stacks and the n-gram table as holes (or a pool of keyed
+    /// blocks). Prints the shards' paths.
+    Synthetic {
+        /// The directory the shards are written to.
+        #[arg(long)]
+        out: std::path::PathBuf,
+
+        /// The shape manifest; the committed one otherwise.
+        #[arg(long)]
+        manifest: Option<std::path::PathBuf>,
+
+        /// The weights' value law.
+        #[arg(long, default_value = "hash:1")]
+        law: String,
+
+        /// The weights' seed.
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// The routed experts: `hole` (no disk) or `pool` (real bytes).
+        #[arg(long, default_value = "hole")]
+        experts: String,
+
+        /// The n-gram table: `hole` or `pool`.
+        #[arg(long, default_value = "hole")]
+        tables: String,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -639,6 +692,74 @@ fn main() -> anyhow::Result<()> {
                 other => anyhow::bail!("--family {other}: lfm2 | qwen4exp"),
             };
             println!("{}", path.display());
+        }
+        Command::ScaleManifest {
+            family,
+            checkpoint,
+            source,
+            out,
+        } => match family.as_str() {
+            "qwen4exp" => {
+                let shards = lloom::hub::gguf_shards(&checkpoint);
+                let m = lloom::testing::scale::ShapeManifest::from_gguf(&shards, &source)?;
+                m.write(&out)?;
+                let (stems, experts, tables) = m.bytes_by_bulk();
+                println!(
+                    "{}: {} shards, {} tensors; stems {stems} B, experts {experts} B, tables {tables} B",
+                    out.display(),
+                    m.shards.len(),
+                    m.tensors().count()
+                );
+            }
+            "lfm2" => {
+                let cfg: lloom::models::lfm2::Lfm2Config =
+                    serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)?;
+                let j = lloom::models::lfm2_testing::geometry_json(&cfg.into_config(false));
+                std::fs::write(&out, serde_json::to_string_pretty(&j)? + "\n")?;
+                println!("{}", out.display());
+            }
+            other => anyhow::bail!("--family {other}: lfm2 | qwen4exp"),
+        },
+        Command::Synthetic {
+            out,
+            manifest,
+            law,
+            seed,
+            experts,
+            tables,
+        } => {
+            use lloom::testing::scale::{Fill, ShapeManifest, Synthetic};
+            let fill = |s: &str| -> anyhow::Result<Fill> {
+                match s {
+                    "hole" => Ok(Fill::Hole),
+                    "pool" => Ok(Fill::Pool),
+                    other => anyhow::bail!("{other}: hole | pool"),
+                }
+            };
+            let mut syn = Synthetic {
+                law: lloom::testing::tiny::ValueLaw::parse(&law).map_err(anyhow::Error::msg)?,
+                experts: fill(&experts)?,
+                tables: fill(&tables)?,
+                ..Default::default()
+            };
+            if let Some(s) = seed {
+                syn.seed = s;
+            }
+            let path =
+                manifest.unwrap_or_else(lloom::models::qwen4exp::testing::scale_manifest_path);
+            let m = ShapeManifest::read(&path)?;
+            let roles = lloom::models::qwen4exp::testing::scale_roles(&m)?;
+            let paths = m.write_sparse(&out, &syn, &|t| {
+                roles
+                    .get(&t.name)
+                    .copied()
+                    .unwrap_or(lloom::testing::tiny::Role::Matrix {
+                        fan_in: *t.dims.last().unwrap_or(&1),
+                    })
+            })?;
+            for p in paths {
+                println!("{}", p.display());
+            }
         }
     }
     Ok(())

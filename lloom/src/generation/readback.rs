@@ -376,6 +376,19 @@ impl ReadbackStrategy for Blocking {
         sampler: &mut LogitsProcessor,
         logits: &Tensor,
     ) -> Result<Tensor> {
+        // The argmax arm draws ON THE DEVICE and feeds that tensor: the id
+        // comes to the host from a slot for the stream and the EOS test, and
+        // the next forward's input is the draw itself, never re-uploaded
+        // (#814 part 5 item A — the ring's shape, on the blocking arm). The
+        // other arms are host draws by construction (a sort, a multinomial),
+        // so they read the id and upload it as they always did.
+        if self.forcing.is_none() && *sampler.sampling() == Sampling::ArgMax {
+            if let Some((draw, id)) = sampler.draw_and_read(logits)? {
+                self.ids.push(id);
+                self.last = Some(id);
+                return draw.reshape((1, 1));
+            }
+        }
         let id = match &mut self.forcing {
             Some(f) => sampler.sample_fed(logits, |d| f.feed(d))?,
             None => sampler.sample(logits)?,

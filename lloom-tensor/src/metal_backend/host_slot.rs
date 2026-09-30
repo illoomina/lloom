@@ -163,6 +163,61 @@ impl HostSlot {
         Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
     }
 
+    /// The tensor `t`'s values, computed into this slot: the argmax's `[1]`
+    /// u32 draw, so the host reads the id from a mapping that is the
+    /// session's rather than from a buffer the pool rounded (#814 part 5).
+    ///
+    /// One `copy2d` dispatch, in the step's own command buffer — the same
+    /// copy the ring's publish encodes. It is a dispatch rather than a
+    /// blit so that it is ordered by the compute barrier chain when a pass
+    /// plan is installed (`pass-plan-design.md` §9).
+    pub fn write_from(&self, t: &Tensor) -> Result<()> {
+        let (storage, layout) = t.storage_and_layout();
+        let m = match &*storage {
+            Storage::Metal(m) => m,
+            _ => crate::bail!("HostSlot::write_from: a Metal tensor"),
+        };
+        if !layout.is_contiguous() {
+            crate::bail!("HostSlot::write_from: a contiguous tensor")
+        }
+        if m.dtype != self.dtype {
+            crate::bail!(
+                "HostSlot::write_from: slot is {:?}, tensor {:?}",
+                self.dtype,
+                m.dtype
+            )
+        }
+        let n = layout.shape().elem_count();
+        if n > self.cap {
+            crate::bail!("HostSlot::write_from: {n} elements into a slot of {}", self.cap)
+        }
+        let elem = self.dtype.size_in_bytes();
+        let kernel = match self.dtype {
+            DType::U32 => crate::kernels::copy2d::U32,
+            DType::F32 => crate::kernels::copy2d::FLOAT,
+            DType::F16 => crate::kernels::copy2d::HALF,
+            DType::BF16 => crate::kernels::copy2d::BFLOAT,
+            dtype => crate::bail!("HostSlot::write_from: {dtype:?} is not wired"),
+        };
+        let encoder = self.device.command_encoder()?;
+        crate::kernels::call_copy2d(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            kernel,
+            m.buffer(),
+            &self.buffer,
+            1,
+            n,
+            n,
+            n,
+            layout.start_offset() * elem,
+            0,
+        )
+        .map_err(crate::MetalError::from)?;
+        Ok(())
+    }
+
     /// Wait for `marker` (the command buffer that wrote the slot), then read
     /// the first `n` elements in place.
     pub fn read_after<T: Clone + crate::WithDType>(

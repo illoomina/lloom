@@ -63,6 +63,9 @@ pub struct LogitsProcessor {
     /// arms (argmax, gumbel-max) never make one.
     #[cfg(feature = "metal")]
     prs_slot: Option<lloom_tensor::metal_backend::HostSlot>,
+    /// The drawn id's host-read slot ([`Self::draw_and_read`]).
+    #[cfg(feature = "metal")]
+    draw_slot: Option<lloom_tensor::metal_backend::HostSlot>,
 }
 
 impl LogitsProcessor {
@@ -74,6 +77,8 @@ impl LogitsProcessor {
             stage: None,
             #[cfg(feature = "metal")]
             prs_slot: None,
+            #[cfg(feature = "metal")]
+            draw_slot: None,
         }
     }
 
@@ -138,6 +143,47 @@ impl LogitsProcessor {
 
     fn sample_argmax(&mut self, logits: Tensor) -> Result<u32> {
         self.draw_on_device(&logits)?.to_scalar::<u32>()
+    }
+
+    /// The device draw AND its id: the tensor for the next forward's input,
+    /// the id for the host's streaming and EOS test (#814 part 5, item A).
+    ///
+    /// The id is read from a host-read slot the draw's argmax wrote, not from
+    /// the draw's own buffer: whether THAT is CPU-mapped is the pool's
+    /// rounding (§15.2 #12a), so a per-token read of it takes the blit by the
+    /// allocator's luck. The slot is Shared for the session's life, so the
+    /// mapped read is structural.
+    ///
+    /// `None` where there is no slot to write (off Metal): the caller reads
+    /// the draw back as it always did.
+    pub fn draw_and_read(&mut self, logits: &Tensor) -> Result<Option<(Tensor, u32)>> {
+        #[cfg(feature = "metal")]
+        {
+            let draw = self.draw_on_device(logits)?;
+            let Ok(m) = draw.device().as_metal_device() else {
+                return Ok(None);
+            };
+            if !matches!(&self.draw_slot, Some(s) if s.cap() >= 1) {
+                self.draw_slot = Some(lloom_tensor::metal_backend::HostSlot::new(
+                    m,
+                    1,
+                    DType::U32,
+                )?);
+            }
+            let slot = self.draw_slot.as_ref().expect("made above");
+            // One `copy2d` of the drawn id into the slot, in the step's own
+            // command buffer — what the ring's publish encodes. The read that
+            // follows is of the session's mapping, not of whatever bucket the
+            // pool rounded the draw's own buffer into.
+            slot.write_from(&draw)?;
+            let id = slot.read_committed::<u32>(1)?[0];
+            Ok(Some((draw, id)))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = logits;
+            Ok(None)
+        }
     }
 
     /// The draw as a `U32` **device** tensor, never read back: the ring

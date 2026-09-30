@@ -200,6 +200,17 @@ fn the_routing_ids_are_read_in_place_from_the_tiers_slot() -> Result<()> {
         r.slot >= STEPS as u64,
         "the decode steps did not read the ids slot: {r:?}"
     );
-    assert_eq!(r.blit, 0, "a readback blitted: {r:?}");
+    // The `to_cpu` reads left are the PROMPT PREFILL's, one per MoE layer:
+    // that plan is multi-row, so it is not the one-row step's slot path and
+    // reads the ids back. Whether each takes the fast arm or the blit is the
+    // pool's rounding (§15.2 #12a) and varies run to run (#454), so the
+    // assertion is on their COUNT, not on which arm they took — asserting
+    // `blit == 0` here would be asserting that allocator luck.
+    let layers = cfg.n_layers as u64;
+    assert_eq!(
+        r.fast + r.blit,
+        layers,
+        "the only readbacks should be the prefill's {layers} multi-row plans: {r:?}"
+    );
     Ok(())
 }

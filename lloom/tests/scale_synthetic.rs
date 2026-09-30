@@ -28,7 +28,8 @@ fn temp(tag: &str) -> PathBuf {
     p
 }
 
-fn tensors(path: &Path) -> Result<(Content, Vec<(String, Vec<u8>)>)> {
+/// Every tensor of the file at `path`, by name, as the bytes it stores.
+fn tensors(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let mut f = File::open(path)?;
     let content = Content::read(&mut f)?;
     let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
@@ -38,7 +39,7 @@ fn tensors(path: &Path) -> Result<(Content, Vec<(String, Vec<u8>)>)> {
         let q = content.tensor(&mut f, &n, &Device::Cpu)?;
         out.push((n, q.data()?.into_owned()));
     }
-    Ok((content, out))
+    Ok(out)
 }
 
 fn role_of(roles: &std::collections::HashMap<String, Role>) -> impl Fn(&TensorShape) -> Role + '_ {
@@ -84,9 +85,9 @@ fn a_sparse_copy_is_the_checkpoint_where_filled_and_zeros_where_holed() -> Resul
     let full = m.write_sparse(&dir.join("filled"), &filled, &role_of(&roles))?;
     let hole = m.write_sparse(&dir.join("holed"), &holed, &role_of(&roles))?;
 
-    let (_, want) = tensors(&real)?;
-    let (_, got_full) = tensors(&full[0])?;
-    let (_, got_hole) = tensors(&hole[0])?;
+    let want = tensors(&real)?;
+    let got_full = tensors(&full[0])?;
+    let got_hole = tensors(&hole[0])?;
     assert_eq!(want.len(), got_full.len());
     let mut n_experts = 0;
     for ((name, w), ((_, f), (_, h))) in want.iter().zip(got_full.iter().zip(&got_hole)) {
@@ -192,7 +193,7 @@ fn a_hole_costs_no_disk() -> Result<()> {
         "a hole took {} B of disk",
         md.blocks() * 512
     );
-    let (_, t) = tensors(&paths[0])?;
+    let t = tensors(&paths[0])?;
     assert!(t[0].1.iter().all(|b| *b == 0));
     std::fs::remove_dir_all(&dir).ok();
     Ok(())

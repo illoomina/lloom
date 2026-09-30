@@ -87,6 +87,17 @@ fn write_experts(cfg: &Config, path: &Path) -> Result<()> {
 /// Every expert fits its layer's pool: after the first loads nothing
 /// misses, so the device plan arms and stays armed.
 fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Streamed>> {
+    streamed_slots(cfg, dev, path, cfg.n_experts)
+}
+
+/// `slots` experts a layer: below `n_experts` the tier misses, and a step
+/// that missed runs the host plan.
+fn streamed_slots(
+    cfg: &Config,
+    dev: &Device,
+    path: &Path,
+    slots: usize,
+) -> Result<Qwen4Exp<Streamed>> {
     let content = Content::read(&mut File::open(path)?)?;
     testing::model_with_indexer(cfg, dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
@@ -94,7 +105,7 @@ fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Streamed
             src("ffn_gate_exps.weight")?,
             src("ffn_up_exps.weight")?,
             src("ffn_down_exps.weight")?,
-            cfg.n_experts,
+            slots,
             LoaderArm::Pread,
             dev,
         )
@@ -241,6 +252,70 @@ fn a_warm_streamed_decode_is_served_and_asks_the_pools_for_nothing() -> Result<(
     // rebuilt (uploaded) after a settle that loaded: a value of the tier's,
     // outliving every pass, declared. Nothing from the private pool, and no
     // other site.
+    assert_eq!(
+        after.1 - before.1,
+        0,
+        "a served pass asked the private pool: {sites:?}"
+    );
+    let table: u64 = sites
+        .iter()
+        .filter(|(pool, site, _)| *pool == 0 && site.contains("::plan_device"))
+        .map(|(_, _, n)| n)
+        .sum();
+    assert_eq!(
+        after.0 - before.0,
+        table,
+        "a served pass asked the Shared pool for something other than the residency \
+         table: {sites:?}"
+    );
+    Ok(())
+}
+
+/// The regime `lloom chat` runs Qwen4-exp in at `--slots auto`: the tier
+/// misses, so steps run the HOST plan (the per-layer routing readback, the
+/// one-row group's slot ids). Those round trips go through the tier's own
+/// buffers, so a served host-planned pass asks the pools for nothing but the
+/// device plan's declared residency table, and the stream is unplanned.
+#[test]
+fn a_missing_streamed_decode_runs_the_host_plan_served_and_asks_the_pools_for_nothing() -> Result<()>
+{
+    let _serial = SERIAL.lock();
+    let cfg = tiny();
+    let slots = 3;
+    let path = temp_gguf("miss");
+    write_experts(&cfg, &path)?;
+    let want = {
+        let dev = Device::new_metal(0)?;
+        decode(&streamed_slots(&cfg, &dev, &path, slots)?, &dev)?
+    };
+    let dev = Device::new_metal(0)?;
+    let m = metal(&dev);
+    m.enable_pass_plans(ArenaLayout::Packed);
+    let model = streamed_slots(&cfg, &dev, &path, slots)?;
+    lloom_tensor::metal_backend::set_served_request_trace(true);
+    let _ = lloom_tensor::metal_backend::served_pass_request_sites();
+    let before = m.served_pass_pool_requests();
+    let got = decode(&model, &dev)?;
+    let after = m.served_pass_pool_requests();
+    let sites = lloom_tensor::metal_backend::served_pass_request_sites();
+    lloom_tensor::metal_backend::set_served_request_trace(false);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(got, want, "a served decode step moved the stream");
+    let c = m.pass_plan_counters().expect("the cache is on");
+    let plans = decode_plans(m);
+    eprintln!(
+        "[missing] counters {c:?} decode plans {plans:?} served-pass requests {:?}",
+        (after.0 - before.0, after.1 - before.1)
+    );
+    for (pool, site, n) in &sites {
+        eprintln!("[missing] served-pass request site: {n} pool={pool} {site}");
+    }
+    let host: Vec<_> = plans.iter().filter(|p| p.0 & 2 == 0).collect();
+    assert!(
+        host.iter().any(|p| p.1 == p.2 && p.2 > 0),
+        "no host-planned decode was planned whole: {plans:?}"
+    );
+    assert!(c.served > 0, "nothing was served: {c:?}");
     assert_eq!(
         after.1 - before.1,
         0,

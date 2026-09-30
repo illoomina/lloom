@@ -3276,4 +3276,42 @@ mod tests {
             .unwrap();
         assert_eq!(cache.kv[full_layer].len(), 2);
     }
+
+    /// The device plan's replay input is the model's own buffer, reused only
+    /// once the epoch its last reader rode has completed (#814). A read
+    /// stamped in the OPEN epoch, which cannot be complete, sends the next
+    /// copy to the pool. After a wait, the buffer is reused and holds the
+    /// new copy. (A blocking driver retires every step before the next copy,
+    /// so no decode test reaches the refusing arm. A lookahead driver does.)
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_replay_input_is_reused_only_once_its_readers_retired() -> lloom_tensor::Result<()> {
+        use lloom_tensor::{DType, Device, Tensor};
+        let dev = Device::new_metal(0)?;
+        let Device::Metal(m) = &dev else {
+            unreachable!("a Metal device")
+        };
+        // What makes an activation's buffer reusable at all: a plan cache.
+        m.enable_pass_plans(lloom_tensor::metal_backend::ArenaLayout::Packed);
+        let cfg = super::super::config::Config::tiny();
+        let model = super::super::testing::resident_model(&cfg, &dev);
+        let h = Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &dev)?;
+        let a = model.replay_input_owned(&h)?;
+        model.replay_read_encoded(&a);
+        let b = model.replay_input_owned(&h)?;
+        assert_ne!(
+            b.id(),
+            a.id(),
+            "the replay input was overwritten under its readers"
+        );
+        dev.synchronize()?;
+        let h2 = (Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &dev)? * 2.0)?;
+        let c = model.replay_input_owned(&h2)?;
+        assert_eq!(c.id(), a.id(), "not reused once its readers retired");
+        assert_eq!(
+            c.flatten_all()?.to_vec1::<f32>()?,
+            h2.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
 }

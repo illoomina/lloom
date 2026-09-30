@@ -107,6 +107,14 @@ pub trait ExpertResidency {
         Ok(None)
     }
 
+    /// Where a one-row step's router should write its `topk` ids: a tensor
+    /// over the strategy's host-read slot, which [`Self::plan`] then reads in
+    /// place (#814 part 5). `None` where the strategy reads nothing back
+    /// (`Resident`) or off Metal: the router allocates its own output.
+    fn decode_ids_slot(&self, _topk: usize) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     /// Read a device plan's record back (the one host sync, at the end of
     /// the pass, for every layer at once), touch the residency of what the
     /// pass used and load what it lacked. `true` when the pass computed on
@@ -1003,6 +1011,12 @@ struct Inner {
 #[derive(Default)]
 struct DecodeIo {
     ids_dst: Option<lloom_tensor::kernels::metal::BufferHandle>,
+    /// The routing ids' host-read slot (#814 part 5): `moe_topk` writes a
+    /// one-row step's ids straight into it and [`Streamed::plan`] reads it in
+    /// place — no copy dispatch into `ids_dst`, no staging buffer. One per
+    /// tier, so one per MoE layer: a layer's write never lands on another
+    /// layer's value inside a step.
+    ids_slot: Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
     slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
     /// The epoch of the command buffer the slot ids' last readers were
     /// encoded into (`down` stamps it), or `BUSY` from the write until then.
@@ -1015,6 +1029,29 @@ const BUSY: u64 = u64::MAX;
 
 #[cfg(feature = "metal")]
 impl Inner {
+    /// The routing ids' host-read slot for a one-row step of `topk` ids,
+    /// made on first use and kept for the tier's life.
+    fn decode_ids_slot(
+        &mut self,
+        topk: usize,
+    ) -> Result<Option<Arc<lloom_tensor::metal_backend::HostSlot>>> {
+        let Ok(m) = self.device.as_metal_device() else {
+            return Ok(None);
+        };
+        if let Some(s) = &self.decode_io.ids_slot {
+            if s.cap() >= topk {
+                return Ok(Some(Arc::clone(s)));
+            }
+        }
+        let slot = Arc::new(lloom_tensor::metal_backend::HostSlot::new(
+            m,
+            topk,
+            lloom_tensor::DType::U32,
+        )?);
+        self.decode_io.ids_slot = Some(Arc::clone(&slot));
+        Ok(Some(slot))
+    }
+
     /// The destination a one-row plan's routing ids are read back into:
     /// the tier's own Shared buffer of at least `bytes`, so the readback asks
     /// no pool for one per step.
@@ -2776,6 +2813,19 @@ impl ExpertResidency for Streamed {
         self.counters.misses.load(Ordering::Relaxed)
     }
 
+    fn decode_ids_slot(&self, topk: usize) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        {
+            let slot = self.inner.lock().decode_ids_slot(topk)?;
+            slot.map(|s| s.tensor((1, topk))).transpose()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = topk;
+            Ok(None)
+        }
+    }
+
     fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
@@ -2867,7 +2917,24 @@ impl ExpertResidency for Streamed {
         // to fetch it; the wait runs without it). The same bytes `to_vec1`
         // reads.
         #[cfg(feature = "metal")]
-        let decode = if rows == 1 {
+        let slot = if rows == 1 {
+            self.inner
+                .lock()
+                .decode_io
+                .ids_slot
+                .as_ref()
+                .filter(|s| s.holds(ids))
+                .map(Arc::clone)
+        } else {
+            None
+        };
+        // The router wrote the ids straight into the tier's slot
+        // (`MoeLayer::prefill_route`): wait for that work and read them in
+        // place, with no copy (#814 part 5).
+        #[cfg(feature = "metal")]
+        let decode = if let Some(slot) = slot {
+            Some(slot.read_committed::<u32>(topk)?)
+        } else if rows == 1 {
             let flat = ids.flatten_all()?.contiguous()?;
             let bytes = flat.elem_count() * std::mem::size_of::<u32>();
             let dst = self.inner.lock().decode_ids_dst(bytes)?;

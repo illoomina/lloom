@@ -720,6 +720,10 @@ pub(crate) fn hc_combine(
 pub(crate) struct MoeTopk {
     pub k: usize,
     pub w: Tensor,
+    /// Where the ids go, when the caller owns that buffer: a host-read slot
+    /// the host reads in place after the pass, with no copy (#814 part 5).
+    /// `None` allocates the output as any op does.
+    pub ids: Option<Tensor>,
 }
 
 impl lloom_tensor::CustomOp1 for MoeTopk {
@@ -755,11 +759,33 @@ impl lloom_tensor::CustomOp1 for MoeTopk {
         let encoder = device.command_encoder()?;
         encoder.set_label("moe_topk");
         let elem_count = rows * self.k;
-        let ids = device
-            .new_buffer_builder()
-            .with_size_for(elem_count, lloom_tensor::DType::U32)
-            .with_label("moe_topk_ids")
-            .build()?;
+        // The caller's buffer when it brought one (a host-read slot), else
+        // this op's own. Checked like `w`: the kernel writes every entry, so
+        // a destination of another extent would write past it.
+        let ids = match &self.ids {
+            Some(t) => {
+                let (is, il) = t.storage_and_layout();
+                let is = match &*is {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!("moe_topk: the ids output must be on the metal device"),
+                };
+                if il.shape().elem_count() != elem_count
+                    || !il.is_contiguous()
+                    || il.start_offset() != 0
+                {
+                    lloom_tensor::bail!("moe_topk: ids must be a fresh contiguous [rows, k]")
+                }
+                if is.dtype() != lloom_tensor::DType::U32 {
+                    lloom_tensor::bail!("moe_topk: ids must be U32")
+                }
+                is.buffer_handle().clone()
+            }
+            None => device
+                .new_buffer_builder()
+                .with_size_for(elem_count, lloom_tensor::DType::U32)
+                .with_label("moe_topk_ids")
+                .build()?,
+        };
         lloom_tensor::kernels::call_moe_topk(
             device.metal_device(),
             &encoder,
@@ -932,6 +958,16 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
 /// The fused router selection: `(ids [.., k] u32, w [.., k] f32)`, or `None`
 /// where the composed path applies.
 pub(crate) fn moe_topk(logits: &Tensor, k: usize) -> Option<Result<(Tensor, Tensor)>> {
+    moe_topk_into(logits, k, None)
+}
+
+/// [`moe_topk`] writing the ids into `ids` when given — a host-read slot the
+/// caller reads in place after the pass, with no copy (#814 part 5).
+pub(crate) fn moe_topk_into(
+    logits: &Tensor,
+    k: usize,
+    ids: Option<Tensor>,
+) -> Option<Result<(Tensor, Tensor)>> {
     if !fused_applies(logits) || logits.rank() < 1 {
         return None;
     }
@@ -951,7 +987,11 @@ pub(crate) fn moe_topk(logits: &Tensor, k: usize) -> Option<Result<(Tensor, Tens
         // the Metal arm refuses a `w` that is not a fresh contiguous
         // `[rows, k]`, and the CPU arm never takes this path.
         let w = unsafe { Tensor::empty(dims.as_slice(), lloom_tensor::DType::F32, logits.device())? };
-        let ids = logits.apply_op1_no_bwd(&MoeTopk { k, w: w.clone() })?;
+        let ids = logits.apply_op1_no_bwd(&MoeTopk {
+            k,
+            w: w.clone(),
+            ids,
+        })?;
         Ok((ids, w))
     })())
 }

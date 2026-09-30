@@ -28,6 +28,8 @@ pub use device::{
     PassPlansPaused,
 };
 mod host_fed;
+mod host_slot;
+pub use host_slot::HostSlot;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
@@ -2527,6 +2529,13 @@ impl MetalStorage {
     }
 
     pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    /// The storage's buffer HANDLE, for a caller that must keep the
+    /// allocation alive beside a borrow of it (an op whose output buffer is
+    /// either the caller's slot or its own fresh one, #814 part 5).
+    pub fn buffer_handle(&self) -> &crate::kernels::metal::BufferHandle {
         &self.buffer
     }
 

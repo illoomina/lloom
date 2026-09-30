@@ -13,8 +13,8 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Config, Qwen4Exp};
-use lloom::nn::expert_stream::{ExpertSource, LoaderArm, Streamed};
+use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
+use lloom::nn::expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Streamed};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKind, PassOpener};
@@ -23,6 +23,21 @@ use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{Device, Result};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
+
+/// The tests share the device's global recorder and the tuning pin.
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+fn pin_host_plan() {
+    let mut t = lloom::tuning::Tuning::default();
+    t.stream.plan = "host".into();
+    let _ = lloom::tuning::install(t);
+    assert_eq!(
+        lloom::tuning::tuning().stream.plan,
+        "host",
+        "the host plan is not pinned"
+    );
+}
 
 const PROMPT: [u32; 9] = [3, 5, 2, 8, 8, 1, 9, 3, 5];
 const STEPS: usize = 40;
@@ -69,7 +84,14 @@ fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Streamed
     })
 }
 
-fn decode(model: &Qwen4Exp<Streamed>, dev: &Device) -> Result<Vec<u32>> {
+fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+    testing::model_with_indexer(cfg, dev, |l| {
+        let [g, u, d] = testing::expert_stacks(cfg, l, dev, GgmlDType::F32);
+        Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
+    })
+}
+
+fn decode<R: ExpertResidency>(model: &Qwen4Exp<R>, dev: &Device) -> Result<Vec<u32>> {
     let mut session = Session::new(model, model.new_cache(&tiny(), dev)?);
     let mut spec = IdentityProposer;
     let mut rb = Blocking::new(&[u32::MAX], dev)?;
@@ -83,14 +105,8 @@ fn decode(model: &Qwen4Exp<Streamed>, dev: &Device) -> Result<Vec<u32>> {
 
 #[test]
 fn a_missing_host_planned_decode_is_served_and_asks_the_pools_for_nothing() -> Result<()> {
-    let mut t = lloom::tuning::Tuning::default();
-    t.stream.plan = "host".into();
-    let _ = lloom::tuning::install(t);
-    assert_eq!(
-        lloom::tuning::tuning().stream.plan,
-        "host",
-        "the host plan is not pinned"
-    );
+    let _serial = SERIAL.lock();
+    pin_host_plan();
     let cfg = tiny();
     let path = std::env::temp_dir().join(format!("lloom-814-{}-host.gguf", std::process::id()));
     write_experts(&cfg, &path)?;
@@ -148,5 +164,42 @@ fn a_missing_host_planned_decode_is_served_and_asks_the_pools_for_nothing() -> R
         (0, 0),
         "a served host-planned pass asked the pools: {sites:?}"
     );
+    Ok(())
+}
+
+/// The routing ids of a one-row step are written by the router straight into
+/// the tier's host-read slot and read there, in place (#814 part 5): every
+/// decode step's MoE layers read the slot, none copies into a staging
+/// destination, and the stream is the `Resident` tier's, which reads nothing
+/// back — so a router that wrote anywhere but the slot the plan reads would
+/// route on stale ids and move it.
+#[test]
+fn the_routing_ids_are_read_in_place_from_the_tiers_slot() -> Result<()> {
+    let _serial = SERIAL.lock();
+    pin_host_plan();
+    let cfg = tiny();
+    let want = {
+        let dev = Device::new_metal(0)?;
+        decode(&resident(&cfg, &dev)?, &dev)?
+    };
+    let path = std::env::temp_dir().join(format!("lloom-814-{}-slot.gguf", std::process::id()));
+    write_experts(&cfg, &path)?;
+    let dev = Device::new_metal(0)?;
+    let model = streamed(&cfg, &dev, &path)?;
+    let before = lloom_tensor::metal_backend::readback_counts();
+    let got = decode(&model, &dev)?;
+    let r = lloom_tensor::metal_backend::readback_counts().since(&before);
+    let _ = std::fs::remove_file(&path);
+    eprintln!("[ids slot] readbacks over {STEPS} steps: {r:?}");
+    assert_eq!(got, want, "the host-planned stream is not the resident one");
+    assert_eq!(
+        r.staged_readback, 0,
+        "a one-row step copied its ids into a staging destination: {r:?}"
+    );
+    assert!(
+        r.slot >= STEPS as u64,
+        "the decode steps did not read the ids slot: {r:?}"
+    );
+    assert_eq!(r.blit, 0, "a readback blitted: {r:?}");
     Ok(())
 }

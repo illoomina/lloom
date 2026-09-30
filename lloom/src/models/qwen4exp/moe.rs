@@ -221,7 +221,14 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // one launch on Metal (`kernels::MoeTopk`), the composed six elsewhere.
         let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [seq, n_experts]
         super::trace("moe.logits", usize::MAX, &logits);
-        let (ids, w) = match super::kernels::moe_topk(&logits, topk) {
+        // One row: the ids go straight into the residency's host-read slot,
+        // which its host plan reads in place (#814 part 5).
+        let ids_slot = if seq == 1 {
+            self.experts.decode_ids_slot(topk)?
+        } else {
+            None
+        };
+        let (ids, w) = match super::kernels::moe_topk_into(&logits, topk, ids_slot) {
             Some(r) => r?,
             None => {
                 let probs = ops::softmax_last_dim(&logits)?; // [seq, n_experts]

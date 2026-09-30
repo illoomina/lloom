@@ -20,7 +20,8 @@ use super::budgets::{self, PromptMode};
 use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
 use super::report;
 use super::served::Served;
-use super::template::{Rejected, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
+use super::template::{Rejected, Unrenderable, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
+use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
@@ -55,10 +56,21 @@ pub struct ChatArgs {
     #[arg(long)]
     pub system: Option<String>,
 
-    /// Let the model think (`enable_thinking` on the template); off by
-    /// default so the reply is the answer.
-    #[arg(long)]
+    /// Let the model think: the template's `enable_thinking` where it reads
+    /// one, and otherwise the thinking block its generation prompt opens
+    /// (LFM2.5's opens one on every turn). Refused where the prompt leaves no
+    /// block open and the template has no switch. Without `--think` or
+    /// `--no-think`, a template with the switch renders thinking off, so the
+    /// reply is the answer, and one without it renders as it does.
+    #[arg(long, conflicts_with = "no_think")]
     pub think: bool,
+
+    /// Do not let the model think: the template's `enable_thinking=false`
+    /// where it reads one, and otherwise the engine closes the block the
+    /// generation prompt opens with the template's own end marker, so the
+    /// reply starts after an empty block.
+    #[arg(long)]
+    pub no_think: bool,
 
     /// How long the model thinks: the chat template's `reasoning_effort`
     /// (Qwen4-exp's: `low`, `medium`, `xhigh`, its default `xhigh`). The
@@ -143,9 +155,14 @@ fn check_kwargs(
     probe.push(json!({ "role": "user", "content": "." }));
     let rendered = engine
         .render_checked(&json!(probe), kwargs, &[REASONING_EFFORT])
-        .map_err(|e| match e.downcast_ref::<Rejected>() {
-            Some(r) => anyhow::anyhow!("--reasoning-effort {effort}: {r}"),
-            None => e,
+        .map_err(|e| {
+            if let Some(r) = e.downcast_ref::<Rejected>() {
+                anyhow::anyhow!("--reasoning-effort {effort}: {r}")
+            } else if let Some(r) = e.downcast_ref::<Unrenderable>() {
+                anyhow::anyhow!("--reasoning-effort {effort}: {r}")
+            } else {
+                e
+            }
         })?;
     if let Some(ignored) = rendered.ignored.first() {
         let family = engine.capabilities().family;
@@ -168,6 +185,27 @@ fn check_kwargs(
     Ok(())
 }
 
+/// Refuses `--think` before the first turn where the prompt cannot think: a
+/// one-message probe conversation's prompt leaves no block open and the
+/// template has no switch that opens one.
+fn check_thinking(
+    engine: &dyn Served,
+    system: Option<&str>,
+    kwargs: &Map<String, Value>,
+    want: Option<bool>,
+) -> Result<()> {
+    let mut probe = Vec::new();
+    if let Some(s) = system {
+        probe.push(json!({ "role": "system", "content": s }));
+    }
+    probe.push(json!({ "role": "user", "content": "." }));
+    let mut ids = engine.encode(&engine.render_chat(&json!(probe), kwargs)?, true)?;
+    if let Err(why) = thinking::apply(want, engine.think_tags().as_ref(), &mut ids) {
+        anyhow::bail!("--think: {}: {why}", engine.capabilities().family);
+    }
+    Ok(())
+}
+
 /// Refuses `--thinking-budget` before the first turn where it cannot apply:
 /// a template that writes no thinking block, or a generation prompt that
 /// leaves none open (Qwen4-exp without `--think`), on a one-message probe
@@ -176,6 +214,7 @@ fn check_thinking_budget(
     engine: &dyn Served,
     system: Option<&str>,
     kwargs: &Map<String, Value>,
+    want: Option<bool>,
     budget: usize,
 ) -> Result<()> {
     let mut probe = Vec::new();
@@ -183,7 +222,8 @@ fn check_thinking_budget(
         probe.push(json!({ "role": "system", "content": s }));
     }
     probe.push(json!({ "role": "user", "content": "." }));
-    let ids = engine.encode(&engine.render_chat(&json!(probe), kwargs)?, true)?;
+    let mut ids = engine.encode(&engine.render_chat(&json!(probe), kwargs)?, true)?;
+    let _ = thinking::apply(want, engine.think_tags().as_ref(), &mut ids);
     if let Err(why) = budgets::thinking(
         engine.thinking_budget_refused(),
         engine.think_tags().as_ref(),
@@ -192,10 +232,11 @@ fn check_thinking_budget(
         &[],
     )? {
         let family = engine.capabilities().family;
-        let hint = if why == budgets::NOT_THINKING
-            && kwargs.get(ENABLE_THINKING) == Some(&json!(false))
-            && engine.template_reads(ENABLE_THINKING) == Some(true)
-        {
+        let hint = if why != budgets::NOT_THINKING {
+            ""
+        } else if want == Some(false) {
+            " (drop --no-think)"
+        } else if kwargs.get(ENABLE_THINKING) == Some(&json!(false)) {
             " (add --think)"
         } else {
             ""
@@ -209,6 +250,16 @@ pub fn run(args: ChatArgs) -> Result<()> {
     if args.raw && args.reasoning_effort.is_some() {
         anyhow::bail!(
             "--reasoning-effort sets a chat-template variable; --raw renders no template"
+        );
+    }
+    let want = match (args.think, args.no_think) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    };
+    if args.raw && want.is_some() {
+        anyhow::bail!(
+            "--think / --no-think act on the chat template's prompt; --raw renders no template"
         );
     }
     let options = super::resolve_options(&args.common)?;
@@ -256,14 +307,19 @@ pub fn run(args: ChatArgs) -> Result<()> {
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
+    // A template with the switch renders thinking off unless asked, so the
+    // reply is the answer; one without it renders as it does.
     let mut kwargs = Map::new();
-    kwargs.insert(ENABLE_THINKING.into(), json!(args.think));
+    thinking::set_kwarg(engine.as_ref(), Some(want.unwrap_or(false)), &mut kwargs);
     if let Some(effort) = &args.reasoning_effort {
         kwargs.insert(REASONING_EFFORT.into(), json!(effort));
     }
     check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
+    if !args.raw {
+        check_thinking(engine.as_ref(), args.system.as_deref(), &kwargs, want)?;
+    }
     if let (Some(n), false) = (sampling.thinking_budget, args.raw) {
-        check_thinking_budget(engine.as_ref(), args.system.as_deref(), &kwargs, n)?;
+        check_thinking_budget(engine.as_ref(), args.system.as_deref(), &kwargs, want, n)?;
     }
     let budget_message = match &sampling.thinking_budget_message {
         Some(m) => engine.encode(m, false)?,
@@ -362,6 +418,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
             expand_image_tokens(&rendered, &expansions)?
         };
         let mut ids = engine.encode(&rendered, !args.no_bos)?;
+        let tags = engine.think_tags();
+        let think: Option<Thinking> = if args.raw {
+            None
+        } else {
+            let t = thinking::apply(want, tags.as_ref(), &mut ids)
+                .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
+            Some(t)
+        };
         // The prompt budget, before the prompt reaches the engine: truncated,
         // the conversation itself loses its oldest turns, so the next turn
         // extends the cache this one leaves.
@@ -384,7 +448,11 @@ pub fn run(args: ChatArgs) -> Result<()> {
                     );
                 }
                 let fitted = budgets::fit_messages(&messages, k, ids.len(), |ms| {
-                    engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, !args.no_bos)
+                    let mut ids =
+                        engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, !args.no_bos)?;
+                    thinking::apply(want, tags.as_ref(), &mut ids)
+                        .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
+                    Ok(ids)
                 })?;
                 let Some(fitted) = fitted else {
                     anyhow::bail!(budgets::over_budget(
@@ -400,7 +468,6 @@ pub fn run(args: ChatArgs) -> Result<()> {
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
-            let tags = engine.think_tags();
             params.thinking =
                 match budgets::thinking(refused, tags.as_ref(), &ids, n, &budget_message)? {
                     Ok(b) => Some(b),
@@ -441,7 +508,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -469,6 +536,8 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.readback.eos_index_late,
             st.prefill_units,
             report::param_style_arm(),
+            think.map_or("none", Thinking::name),
+            think.map_or("none", |t| t.by.name()),
             opt(sampling.thinking_budget),
             opt(decoded.thinking.map(|t| t.thought)),
             opt(decoded.thinking.map(|t| t.fired)),

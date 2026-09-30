@@ -124,6 +124,118 @@ pub fn to_cpu_staged_count() -> u64 {
     TO_CPU_STAGED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `stage_readback` reads completed (`StagedReadback::finish`), which
+/// `TO_CPU_STAGED` (`stage_read`'s) does not count (#814 part 5).
+pub static TO_CPU_STAGED_READBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads of a host-read slot ([`HostSlot::read`]): the producing kernel
+/// wrote a Shared, persistent buffer the host reads in place, so there is no
+/// copy and no staging allocation (#814 part 5).
+pub static TO_CPU_SLOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Staging buffers allocated for a readback: `to_cpu`'s blit destination,
+/// `stage_read`'s staging buffer, `stage_readback`'s destination when the
+/// caller brings none (#814 part 5).
+pub static TO_CPU_STAGING_ALLOCS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Every readback counter at once, since process start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadbackCounts {
+    /// `to_cpu` read the source in place (it was CPU-mapped).
+    pub fast: u64,
+    /// `to_cpu` copied into a staging buffer first.
+    pub blit: u64,
+    /// Of `blit`: the source was mapped before the wait and null after (#366).
+    pub null_after_wait: u64,
+    /// `stage_read` reads.
+    pub staged: u64,
+    /// `stage_readback` reads.
+    pub staged_readback: u64,
+    /// Host-read slot reads.
+    pub slot: u64,
+    /// Staging buffers allocated for readbacks.
+    pub staging_allocs: u64,
+}
+
+/// [`ReadbackCounts`] now.
+pub fn readback_counts() -> ReadbackCounts {
+    use std::sync::atomic::Ordering::Relaxed;
+    ReadbackCounts {
+        fast: TO_CPU_FAST.load(Relaxed),
+        blit: TO_CPU_BLIT.load(Relaxed),
+        null_after_wait: TO_CPU_NULL_AFTER_WAIT.load(Relaxed),
+        staged: TO_CPU_STAGED.load(Relaxed),
+        staged_readback: TO_CPU_STAGED_READBACK.load(Relaxed),
+        slot: TO_CPU_SLOT.load(Relaxed),
+        staging_allocs: TO_CPU_STAGING_ALLOCS.load(Relaxed),
+    }
+}
+
+impl ReadbackCounts {
+    /// `self - before`, field by field.
+    pub fn since(&self, before: &ReadbackCounts) -> ReadbackCounts {
+        ReadbackCounts {
+            fast: self.fast - before.fast,
+            blit: self.blit - before.blit,
+            null_after_wait: self.null_after_wait - before.null_after_wait,
+            staged: self.staged - before.staged,
+            staged_readback: self.staged_readback - before.staged_readback,
+            slot: self.slot - before.slot,
+            staging_allocs: self.staging_allocs - before.staging_allocs,
+        }
+    }
+}
+
+/// `LLOOM_READBACK_TRACE`: 0 unread, 1 off, 2 on.
+static READBACK_TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn readback_trace_on() -> bool {
+    match READBACK_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().instrument.readback_trace;
+            set_readback_trace(on);
+            on
+        }
+    }
+}
+
+/// Turn the readback attribution on or off for the process (a test's
+/// switch; the knob sets it for a run).
+pub fn set_readback_trace(on: bool) {
+    READBACK_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+type ReadbackSites = std::collections::HashMap<(&'static str, String), u64>;
+
+fn readback_sites_map() -> &'static parking_lot::Mutex<ReadbackSites> {
+    static SITES: std::sync::OnceLock<parking_lot::Mutex<ReadbackSites>> =
+        std::sync::OnceLock::new();
+    SITES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Count one readback of `kind` at its call site, when the trace is on.
+fn note_readback(kind: &'static str) {
+    if readback_trace_on() {
+        let site = device::call_site();
+        *readback_sites_map().lock().entry((kind, site)).or_default() += 1;
+    }
+}
+
+/// What `LLOOM_READBACK_TRACE` attributed since the last call: `(kind, site,
+/// readbacks)`, most first. Taking clears it, so a caller reads one window.
+pub fn readback_sites() -> Vec<(&'static str, String, u64)> {
+    let mut v: Vec<(&'static str, String, u64)> = std::mem::take(&mut *readback_sites_map().lock())
+        .into_iter()
+        .map(|((k, s), n)| (k, s, n))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    v
+}
+
 /// A rank-1 storage's bytes copied to a CPU-mapped staging buffer and fenced by
 /// the command buffer that produced them (`MetalStorage::stage_read`).
 ///
@@ -191,6 +303,7 @@ impl StagedReadback {
         if let Some(marker) = &self.marker {
             self.device.wait_marker(marker)?;
         }
+        TO_CPU_STAGED_READBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(read_to_vec(&self.buffer, self.count))
     }
 }
@@ -245,9 +358,12 @@ fn stage_readback_with(
                     d.length()
                 )
             }
+            note_readback("stage_readback_into");
             d.clone()
         }
         None => {
+            TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            note_readback("stage_readback");
             let _escape = EscapeGuard::new();
             m.device
                 .new_buffer_builder()
@@ -2512,6 +2628,8 @@ impl MetalStorage {
         }
         let elem = self.dtype.size_in_bytes();
         let bytes = (count * elem).max(1);
+        TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_readback("stage_read");
         let staging = self
             .device
             .new_buffer_builder()
@@ -2822,6 +2940,7 @@ impl MetalStorage {
             let src = std::hint::black_box(self.buffer.contents());
             if !src.is_null() {
                 TO_CPU_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                note_readback("to_cpu fast");
                 // The same pointer that was tested, not a second read of it.
                 // SAFETY: `src` is non-null and CPU-mapped, the GPU work that
                 // writes it has completed above, and `self.buffer` keeps the
@@ -2835,6 +2954,8 @@ impl MetalStorage {
             TO_CPU_NULL_AFTER_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         TO_CPU_BLIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TO_CPU_STAGING_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_readback("to_cpu blit");
 
         // The copy's destination is the host's, never a later dispatch's:
         // outside any pass plan.

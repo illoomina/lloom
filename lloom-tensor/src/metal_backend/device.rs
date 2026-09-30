@@ -452,6 +452,18 @@ fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
 /// frames of the `lloom` crate (the model's call site and its caller) of a
 /// backtrace, counted per pool. Process-wide, like the trace recorder.
 fn note_served_request_site(which: usize) {
+    let site = call_site();
+    *served_request_sites_map()
+        .lock()
+        .entry((which, site))
+        .or_default() += 1;
+}
+
+/// The call site of the current backtrace as the instruments name it: the
+/// tensor-crate entry the model called, then the model's (`lloom` crate's)
+/// two innermost frames. For attribution instruments only: it takes one
+/// backtrace a call.
+pub(crate) fn call_site() -> String {
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     let frames: Vec<&str> = bt
         .lines()
@@ -471,15 +483,11 @@ fn note_served_request_site(which: usize) {
         .map(|i| frames[i])
         .unwrap_or("?");
     let mut ours = frames.iter().filter(|f| model(f));
-    let site = match (ours.next(), ours.next()) {
+    match (ours.next(), ours.next()) {
         (Some(a), Some(b)) => format!("{api} <- {a} <- {b}"),
         (Some(a), None) => format!("{api} <- {a}"),
         _ => "(no lloom frame)".to_string(),
-    };
-    *served_request_sites_map()
-        .lock()
-        .entry((which, site))
-        .or_default() += 1;
+    }
 }
 
 /// What `LLOOM_SERVED_REQUEST_TRACE` attributed since the last call:

@@ -502,6 +502,9 @@ pub struct InstrumentTuning {
     /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
     #[opt(flag = "served-request-trace", env = "LLOOM_SERVED_REQUEST_TRACE", bool)]
     pub served_request_trace: bool,
+    /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
+    #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool)]
+    pub readback_trace: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(flag = "upload-shadow", env = "LLOOM_UPLOAD_SHADOW", bool)]
     pub upload_shadow: bool,

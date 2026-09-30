@@ -762,6 +762,7 @@ struct ChurnSnapshot {
     to_cpu_blit: u64,
     to_cpu_null: u64,
     to_cpu_staged: u64,
+    readbacks: lloom_tensor::metal_backend::ReadbackCounts,
 }
 
 #[cfg(feature = "metal")]
@@ -782,6 +783,7 @@ fn churn_snapshot(m: &lloom_tensor::MetalDevice) -> ChurnSnapshot {
         to_cpu_blit: blit,
         to_cpu_null: lloom_tensor::metal_backend::to_cpu_null_after_wait(),
         to_cpu_staged: lloom_tensor::metal_backend::to_cpu_staged_count(),
+        readbacks: lloom_tensor::metal_backend::readback_counts(),
     }
 }
 
@@ -795,7 +797,7 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
     eprintln!(
         "[churn over the run: pool lookups={} hits={} allocations={} evicted={} \
          trims={} | residency adds={} removes={} commits={} | to_cpu fast={} blit={} \
-         null_after_wait={} staged={}]",
+         null_after_wait={} staged={} staged_readback={} slot={} staging_allocs={}]",
         after.lookups - before.lookups,
         after.hits - before.hits,
         after.allocations - before.allocations,
@@ -808,7 +810,14 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
         after.to_cpu_blit - before.to_cpu_blit,
         after.to_cpu_null - before.to_cpu_null,
         after.to_cpu_staged - before.to_cpu_staged,
+        after.readbacks.staged_readback - before.readbacks.staged_readback,
+        after.readbacks.slot - before.readbacks.slot,
+        after.readbacks.staging_allocs - before.readbacks.staging_allocs,
     );
+    // `LLOOM_READBACK_TRACE`: every readback of the run by kind and site.
+    for (kind, site, n) in lloom_tensor::metal_backend::readback_sites() {
+        eprintln!("[readback sites: {n} {kind} {site}]");
+    }
     let (shared, private) = m.pool_free_summary(6);
     let fmt = |s: &lloom_tensor::metal_backend::FreeSummary| {
         let top: Vec<String> = s

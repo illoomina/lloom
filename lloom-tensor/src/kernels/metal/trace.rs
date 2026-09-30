@@ -459,11 +459,32 @@ pub fn record_pipeline(device: Option<&DeviceTrace>, name: &str) {
 /// (§9.2e's simulation does; see `tools/barrier-count/`). The kinds exist only
 /// here: `prev_outputs` and `prev_inputs` are replaced right after, so a
 /// downstream reconstruction has no evidence left to attribute from (§9.2f).
+/// Barriers emitted, encoder sessions opened and command buffers committed
+/// since process start, for a per-token census of what a pass plan changes
+/// about the shape of a step (#814 item B). Three relaxed increments on paths
+/// that already take a lock; unlike everything else in this module they are
+/// NOT gated on a trace being recorded, for `record_barrier_suppressed`'s
+/// reason: the runs that need them do not call `set_recording`.
+pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENCODER_SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMMAND_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(barriers, encoder sessions, command buffers)` since process start.
+pub fn shape_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BARRIERS.load(Relaxed),
+        ENCODER_SESSIONS.load(Relaxed),
+        COMMAND_BUFFERS.load(Relaxed),
+    )
+}
+
 #[inline]
 pub fn record_barrier(
     device: Option<&DeviceTrace>,
     kinds: crate::kernels::metal::encoder::HazardKinds,
 ) {
+    BARRIERS.fetch_add(1, Ordering::Relaxed);
     if !enabled() {
         return;
     }
@@ -565,6 +586,18 @@ static USE_RESOURCE: AtomicU64 = AtomicU64::new(0);
 /// uninterpretable without knowing where the sessions divide. Candle opens one
 /// every `CANDLE_METAL_COMPUTE_PER_BUFFER` dispatches.
 #[inline]
+/// One encoder session opened ([`ENCODER_SESSIONS`]).
+#[inline]
+pub fn note_encoder_session() {
+    ENCODER_SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One command buffer committed ([`COMMAND_BUFFERS`]).
+#[inline]
+pub fn note_command_buffer() {
+    COMMAND_BUFFERS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_encoder_begin(device: Option<&DeviceTrace>) {
     if !enabled() {
         return;

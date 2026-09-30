@@ -991,6 +991,7 @@ impl Commands {
             }
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
+            crate::kernels::metal::trace::note_encoder_session();
             crate::kernels::metal::trace::record_encoder_begin(enc.trace.as_deref());
             crate::kernels::metal::profile::record_encoder();
             // The audit needs the seam as a first-class ordering primitive, not
@@ -1389,6 +1390,7 @@ impl Commands {
         //
         // Both happen under the state lock, so no release can observe the new
         // epoch before the old one is accounted for.
+        crate::kernels::metal::trace::note_command_buffer();
         let epoch = self.clock.commit_epoch();
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {

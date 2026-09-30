@@ -17,6 +17,7 @@ pub mod report;
 pub mod serve;
 pub mod served;
 pub mod template;
+pub mod thinking;
 pub mod vision;
 
 use anyhow::{Context, Result};

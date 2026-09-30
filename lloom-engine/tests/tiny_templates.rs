@@ -54,8 +54,9 @@ impl Family {
 enum Outcome {
     Tokens(Vec<String>),
     Rejected,
-    /// A render failure that is not the template's `raise_exception` (a 500
-    /// on `lloom serve`, where a rejection is a 400).
+    /// A render failure that is not the template's `raise_exception` (on
+    /// `lloom serve` a 400 like a rejection when the template renders a
+    /// one-message conversation, `template::Unrenderable`).
     Failed(String),
 }
 
@@ -164,12 +165,14 @@ impl Path {
 
 /// Every template path the engine drives, per family. `lloom chat` renders
 /// a system message (`--system`), the user's turns and its own replies as
-/// `content` (thinking text and all), with `enable_thinking` always set (from
-/// `--think`) and `reasoning_effort` when given, and an image as a
-/// `{"type": "image"}` part. `lloom serve` passes a client's messages through
-/// as sent (image URLs become image parts), with `chat_template_kwargs` as
-/// the template's variables (`tools`, `preserve_thinking`, …) and
-/// `reasoning_effort` folded in. Every render sets `add_generation_prompt`.
+/// `content` (thinking text and all), with `enable_thinking` set where the
+/// template reads it (`--think` / `--no-think`, off by default) and
+/// `reasoning_effort` when given, and an image as a `{"type": "image"}` part.
+/// `lloom serve` passes a client's messages through as sent (image URLs
+/// become image parts), with `chat_template_kwargs` as the template's
+/// variables (`tools`, `preserve_thinking`, …) and the top-level
+/// `reasoning_effort`, `enable_thinking` and `tools` folded in. Every render
+/// sets `add_generation_prompt`.
 fn paths() -> Vec<Path> {
     use Family::*;
     let off = json!({ "enable_thinking": false });
@@ -439,8 +442,9 @@ fn paths() -> Vec<Path> {
         ])
         .has(&["Checking.", "get_time", "noon"]),
         // OpenAI sends the arguments as a JSON string. The checkpoint's
-        // template fails on them outside `raise_exception` (a 500 on
-        // `lloom serve`); the tiny one renders the string.
+        // template fails on them outside `raise_exception` (a 400 on
+        // `lloom serve`, as the request's data); the tiny one renders the
+        // string.
         path(
             Qwen4Exp,
             "tool_call_arguments_as_a_string",

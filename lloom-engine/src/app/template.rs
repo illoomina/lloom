@@ -8,21 +8,31 @@
 //! names but renders identically for any value (Qwen4-exp's
 //! `reasoning_effort` with thinking off) is treated the same way. A value the
 //! template itself rejects (`raise_exception`) is a [`Rejected`] error, which
-//! `serve` answers with a 400.
+//! `serve` answers with a 400; so is a render the template fails on the
+//! request's own data ([`Unrenderable`]).
 
 use anyhow::Result;
 use hf_chat_template::ChatTemplate;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
-/// Thinking on or off (`lloom chat --think`, `/eval`'s `enable_thinking`).
+/// Thinking on or off (`lloom chat --think` / `--no-think`, a request's
+/// `enable_thinking`): the template's own switch where it reads it
+/// (`thinking.rs` applies it where it does not).
 pub const ENABLE_THINKING: &str = "enable_thinking";
 /// How long the model thinks (`lloom chat --reasoning-effort`, OpenAI's
 /// `reasoning_effort` request field). The values are the template's.
 pub const REASONING_EFFORT: &str = "reasoning_effort";
 
+/// The tool list (OpenAI's `tools` request field).
+pub const TOOLS: &str = "tools";
+
 /// The variables the engine sets from its own flags and request fields.
 pub const ENGINE_KWARGS: [&str; 2] = [ENABLE_THINKING, REASONING_EFFORT];
+
+/// The top-level request fields a chat request folds into the template's
+/// variables, beside its `chat_template_kwargs`.
+pub const REQUEST_FIELDS: [&str; 3] = [REASONING_EFFORT, ENABLE_THINKING, TOOLS];
 
 /// A value no template recognises: rendering with it in place of a
 /// variable's value shows whether the template's output depends on that
@@ -41,6 +51,20 @@ impl std::fmt::Display for Rejected {
 }
 
 impl std::error::Error for Rejected {}
+
+/// The template failed on the request's data outside `raise_exception` (a
+/// type it does not handle, an attribute the data lacks): the same template
+/// renders the engine's own one-message conversation.
+#[derive(Debug)]
+pub struct Unrenderable(pub String);
+
+impl std::fmt::Display for Unrenderable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the chat template cannot render the request: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unrenderable {}
 
 /// A variable a request set that the rendered prompt does not reflect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,27 +123,41 @@ impl Template {
     }
 
     /// Render `messages` with the generation prompt appended; `kwargs` are
-    /// extra template variables, laid over the defaults.
+    /// extra template variables, laid over the defaults. A failure is the
+    /// request's ([`Rejected`], [`Unrenderable`]) when the template renders a
+    /// one-message conversation with no variables of the caller's, and the
+    /// engine's otherwise.
     pub fn render(
         &self,
         messages: &Value,
         bos_token: &str,
         kwargs: &Map<String, Value>,
     ) -> Result<String> {
-        let mut ctx = json!({
-            "messages": messages,
-            "bos_token": bos_token,
-            "add_generation_prompt": true,
-        });
-        for (k, v) in kwargs {
-            ctx[k] = v.clone();
-        }
-        self.compiled.render_context(&ctx).map_err(|e| match e {
-            hf_chat_template::Error::TemplateRaised { message } => {
-                anyhow::Error::new(Rejected(message))
+        let ctx = |messages: &Value, kwargs: &Map<String, Value>| {
+            let mut ctx = json!({
+                "messages": messages,
+                "bos_token": bos_token,
+                "add_generation_prompt": true,
+            });
+            for (k, v) in kwargs {
+                ctx[k] = v.clone();
             }
-            e => anyhow::anyhow!("rendering the chat template: {e}"),
-        })
+            ctx
+        };
+        self.compiled
+            .render_context(&ctx(messages, kwargs))
+            .map_err(|e| match e {
+                hf_chat_template::Error::TemplateRaised { message } => {
+                    anyhow::Error::new(Rejected(message))
+                }
+                e => {
+                    let own = json!([{ "role": "user", "content": PROBE_USER }]);
+                    match self.compiled.render_context(&ctx(&own, &Map::new())) {
+                        Ok(_) => anyhow::Error::new(Unrenderable(e.to_string())),
+                        Err(_) => anyhow::anyhow!("rendering the chat template: {e}"),
+                    }
+                }
+            })
     }
 
     /// [`Self::render`], with each of `checked` that `kwargs` sets tested
@@ -196,6 +234,9 @@ impl ThinkTags {
     }
 }
 
+/// A user message no template writes on its own, for the probe renders.
+const PROBE_USER: &str = "lloom-probe-user";
+
 /// Reasoning text no template writes on its own, for the probe renders.
 const PROBE_REASONING: &str = "lloom-probe-reasoning";
 
@@ -214,7 +255,7 @@ impl Template {
         encode: impl Fn(&str) -> Result<Vec<u32>>,
         is_marker: impl Fn(u32) -> bool,
     ) -> Option<ThinkTags> {
-        let user = json!({ "role": "user", "content": "lloom-probe-user" });
+        let user = json!({ "role": "user", "content": PROBE_USER });
         let reasoned = json!([user, {
             "role": "assistant",
             "content": "lloom-probe-answer",
@@ -382,7 +423,7 @@ fn without_generation_blocks(source: &str) -> String {
 
 /// The template variables a request sets: its `chat_template_kwargs`, with
 /// each of the top-level `fields` folded in under the same name. A field set
-/// both ways must agree.
+/// both ways must agree; one set to `null` either way is unset.
 pub fn request_kwargs(
     v: &Value,
     fields: &[&str],
@@ -393,6 +434,9 @@ pub fn request_kwargs(
         Some(_) => return Err("field 'chat_template_kwargs' must be an object".to_string()),
     };
     for &field in fields {
+        if kwargs.get(field) == Some(&Value::Null) {
+            kwargs.remove(field);
+        }
         let top = match v.get(field) {
             None | Some(Value::Null) => continue,
             Some(t) => t,
@@ -411,6 +455,13 @@ pub fn request_kwargs(
     if let Some(e) = kwargs.get(REASONING_EFFORT) {
         if !e.is_string() && !e.is_null() {
             return Err(format!("'{REASONING_EFFORT}' must be a string, not {e}"));
+        }
+    }
+    if let Some(e) = kwargs.get(ENABLE_THINKING) {
+        if !e.is_boolean() && !e.is_null() {
+            return Err(format!(
+                "'{ENABLE_THINKING}' must be true or false, not {e}"
+            ));
         }
     }
     Ok(kwargs)
@@ -685,6 +736,56 @@ mod tests {
         assert_eq!(t.close_ids(), vec![2, 3]);
     }
 
+    /// A render that fails outside `raise_exception` is the request's
+    /// ([`Unrenderable`]) when the template renders the engine's own
+    /// one-message conversation, and the engine's otherwise: a content the
+    /// tiny templates cannot iterate; a template that fails on everything.
+    /// And the checkpoint's Qwen template on OpenAI's string tool-call
+    /// arguments, when it is in the Hugging Face cache.
+    #[test]
+    fn a_failure_on_the_requests_data_is_the_requests() {
+        let number = json!([{ "role": "user", "content": 5 }]);
+        for (t, bos) in [(lfm2(), "<|startoftext|>"), (qwen(), "")] {
+            let err = t.render(&number, bos, &Map::new()).unwrap_err();
+            assert!(err.downcast_ref::<Unrenderable>().is_some(), "{err:#}");
+            assert!(err.downcast_ref::<Rejected>().is_none(), "{err:#}");
+            assert!(t.render(&user(), bos, &Map::new()).is_ok());
+        }
+        let broken = Template::compile("{{ messages[0].content }}{{ 1 + 'a' }}").unwrap();
+        let err = broken.render(&user(), "", &Map::new()).unwrap_err();
+        assert!(err.downcast_ref::<Unrenderable>().is_none(), "{err:#}");
+        assert!(err.downcast_ref::<Rejected>().is_none(), "{err:#}");
+
+        let hub = std::env::var("HF_HUB_CACHE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join(".cache/huggingface/hub")
+            });
+        let snapshots = hub.join("models--Qwen--Qwen3.8-Flash-Next/snapshots");
+        let sources: Vec<String> = std::fs::read_dir(&snapshots)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("chat_template.jinja")).ok())
+            .collect();
+        if sources.is_empty() {
+            eprintln!("skipped: no Qwen3.8-Flash-Next chat template under {snapshots:?}");
+        }
+        let called = json!([
+            { "role": "user", "content": "Weather?" },
+            { "role": "assistant", "content": "", "tool_calls": [{ "type": "function",
+              "function": { "name": "get_weather", "arguments": "{\"city\": \"Paris\"}" } }] },
+        ]);
+        for src in sources {
+            let err = Template::compile(&src)
+                .unwrap()
+                .render(&called, "", &Map::new())
+                .unwrap_err();
+            assert!(err.downcast_ref::<Unrenderable>().is_some(), "{err:#}");
+        }
+    }
+
     /// The request's two spellings fold into one variable, agree or are
     /// refused, and a malformed one is refused by name.
     #[test]
@@ -714,5 +815,23 @@ mod tests {
         assert!(e.contains("must be a string"), "{e}");
         let e = get(json!({"chat_template_kwargs": "enable_thinking=true"})).unwrap_err();
         assert!(e.contains("must be an object"), "{e}");
+
+        let get = |v: Value| request_kwargs(&v, &REQUEST_FIELDS);
+        let tools = json!([{ "type": "function", "function": { "name": "f" } }]);
+        assert_eq!(
+            get(json!({"tools": tools, "enable_thinking": false})).unwrap(),
+            kw(&[(TOOLS, tools.clone()), (ENABLE_THINKING, json!(false))])
+        );
+        assert_eq!(
+            get(
+                json!({"chat_template_kwargs": {"enable_thinking": null, "reasoning_effort": null}})
+            )
+            .unwrap(),
+            Map::new()
+        );
+        let e = get(json!({"tools": tools, "chat_template_kwargs": {"tools": []}})).unwrap_err();
+        assert!(e.contains("disagree"), "{e}");
+        let e = get(json!({"enable_thinking": "yes"})).unwrap_err();
+        assert_eq!(e, "'enable_thinking' must be true or false, not \"yes\"");
     }
 }

@@ -115,6 +115,14 @@ pub trait ExpertResidency {
         Ok(None)
     }
 
+    /// The device plan's `record`, read in place from the strategy's
+    /// host-read slot when `record` is that slot's value; `None` otherwise
+    /// (the caller reads it back). **The caller has waited** for the pass that
+    /// wrote it (#814 part 5).
+    fn read_record_in_place(&self, _record: &Tensor) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Read a device plan's record back (the one host sync, at the end of
     /// the pass, for every layer at once), touch the residency of what the
     /// pass used and load what it lacked. `true` when the pass computed on
@@ -1017,6 +1025,9 @@ struct DecodeIo {
     /// tier, so one per MoE layer: a layer's write never lands on another
     /// layer's value inside a step.
     ids_slot: Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
+    /// The device plan's record host-read slot: `SlotMap` writes a one-row
+    /// step's record into it and the settle reads it in place (#814 part 5).
+    record_slot: Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
     slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
     /// The epoch of the command buffer the slot ids' last readers were
     /// encoded into (`down` stamps it), or `BUSY` from the write until then.
@@ -1049,6 +1060,29 @@ impl Inner {
             lloom_tensor::DType::U32,
         )?);
         self.decode_io.ids_slot = Some(Arc::clone(&slot));
+        Ok(Some(slot))
+    }
+
+    /// The device plan's record slot for a one-row step's `len` words, made
+    /// on first use and kept for the tier's life.
+    fn decode_record_slot(
+        &mut self,
+        len: usize,
+    ) -> Result<Option<Arc<lloom_tensor::metal_backend::HostSlot>>> {
+        let Ok(m) = self.device.as_metal_device() else {
+            return Ok(None);
+        };
+        if let Some(s) = &self.decode_io.record_slot {
+            if s.cap() >= len {
+                return Ok(Some(Arc::clone(s)));
+            }
+        }
+        let slot = Arc::new(lloom_tensor::metal_backend::HostSlot::new(
+            m,
+            len,
+            lloom_tensor::DType::U32,
+        )?);
+        self.decode_io.record_slot = Some(Arc::clone(&slot));
         Ok(Some(slot))
     }
 
@@ -2464,6 +2498,9 @@ fn trace_settle() -> bool {
 struct SlotMap {
     table: Tensor,
     n_experts: usize,
+    /// Where the record goes, when the tier brings its host-read slot (a
+    /// one-row step): the settle reads it in place (#814 part 5).
+    out: Option<Tensor>,
 }
 
 impl lloom_tensor::CustomOp1 for SlotMap {
@@ -2524,11 +2561,28 @@ impl lloom_tensor::CustomOp1 for SlotMap {
         let device = s.device();
         let encoder = device.command_encoder()?;
         encoder.set_label("moe_slot_map");
-        let output = device
-            .new_buffer_builder()
-            .with_size_for(3 * n, lloom_tensor::DType::U32)
-            .with_label("moe_slot_map")
-            .build()?;
+        let output = match &self.out {
+            Some(t) => {
+                let (os, ol) = t.storage_and_layout();
+                let os = match &*os {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!("slot_map: the record slot must be on the metal device"),
+                };
+                if ol.shape().elem_count() != 3 * n
+                    || !ol.is_contiguous()
+                    || ol.start_offset() != 0
+                    || os.dtype() != lloom_tensor::DType::U32
+                {
+                    lloom_tensor::bail!("slot_map: the record slot must be a fresh u32 [3·n]")
+                }
+                os.buffer_handle().clone()
+            }
+            None => device
+                .new_buffer_builder()
+                .with_size_for(3 * n, lloom_tensor::DType::U32)
+                .with_label("moe_slot_map")
+                .build()?,
+        };
         lloom_tensor::kernels::call_moe_slot_map(
             device.metal_device(),
             &encoder,
@@ -2813,6 +2867,27 @@ impl ExpertResidency for Streamed {
         self.counters.misses.load(Ordering::Relaxed)
     }
 
+    fn read_record_in_place(&self, record: &Tensor) -> Result<Option<Vec<u32>>> {
+        #[cfg(feature = "metal")]
+        {
+            let slot = self
+                .inner
+                .lock()
+                .decode_io
+                .record_slot
+                .as_ref()
+                .filter(|s| s.holds(record))
+                .map(Arc::clone);
+            slot.map(|s| s.read_unchecked::<u32>(record.elem_count()))
+                .transpose()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = record;
+            Ok(None)
+        }
+    }
+
     fn decode_ids_slot(&self, topk: usize) -> Result<Option<Tensor>> {
         #[cfg(feature = "metal")]
         {
@@ -2851,9 +2926,21 @@ impl ExpertResidency for Streamed {
             self.device_table(&mut inner)?
         };
         self.counters.device_plans.fetch_add(1, Ordering::Relaxed);
+        // One row: the record goes into the tier's host-read slot, which the
+        // settle reads in place (#814 part 5).
+        #[cfg(feature = "metal")]
+        let out = if rows == 1 {
+            let slot = self.inner.lock().decode_record_slot(3 * n)?;
+            slot.map(|s| s.tensor(3 * n)).transpose()?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "metal"))]
+        let out = None;
         let plan = ids.apply_op1_no_bwd(&SlotMap {
             table,
             n_experts: self.n_experts,
+            out,
         })?; // [3·n]
         let slots = plan.narrow(0, 0, n)?.reshape((rows, topk))?;
         Ok(Some((slots, plan)))

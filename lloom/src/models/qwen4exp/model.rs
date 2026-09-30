@@ -2096,6 +2096,29 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if records.is_empty() {
             return Ok((false, 0));
         }
+        // Every layer's record in its tier's host-read slot (a one-row
+        // step): one wait for the pass, then each read in place — no `cat`,
+        // no copy (#814 part 5).
+        #[cfg(feature = "metal")]
+        if let Ok(m) = records[0].1.device().as_metal_device() {
+            let marker = m.flush_marker()?;
+            m.wait_marker(&marker)?;
+            let mut owned: Vec<Vec<u32>> = Vec::with_capacity(records.len());
+            for (l, r) in records {
+                match self.layers[*l].moe().experts().read_record_in_place(r)? {
+                    Some(v) => owned.push(v),
+                    None => break,
+                }
+            }
+            if owned.len() == records.len() {
+                let parts: Vec<(&R, &[u32])> = records
+                    .iter()
+                    .zip(&owned)
+                    .map(|((l, _), v)| (self.layers[*l].moe().experts(), v.as_slice()))
+                    .collect();
+                return Self::redo_of(R::settle_batch(&parts)?);
+            }
+        }
         let flat: Vec<Tensor> = records
             .iter()
             .map(|(_, r)| r.flatten_all())
@@ -2120,7 +2143,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             parts.push((self.layers[*l].moe().experts(), slice));
             at += n;
         }
-        let settled = R::settle_batch(&parts)?;
+        Self::redo_of(R::settle_batch(&parts)?)
+    }
+
+    /// A settle's verdicts as `(redo, misses after the first)`.
+    fn redo_of(settled: Vec<(bool, u64)>) -> Result<(bool, u64)> {
         let mut redo = false;
         let mut after_first = 0u64;
         for (missed, n) in settled {

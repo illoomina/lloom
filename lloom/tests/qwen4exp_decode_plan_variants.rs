@@ -209,12 +209,23 @@ fn a_warm_streamed_decode_is_served_and_asks_the_pools_for_nothing() -> Result<(
     lloom_tensor::metal_backend::set_served_request_trace(true);
     let _ = lloom_tensor::metal_backend::served_pass_request_sites();
     let before = m.served_pass_pool_requests();
+    let reads = lloom_tensor::metal_backend::readback_counts();
     let got = decode(&model, &dev)?;
+    let reads = lloom_tensor::metal_backend::readback_counts().since(&reads);
     let after = m.served_pass_pool_requests();
     let sites = lloom_tensor::metal_backend::served_pass_request_sites();
     lloom_tensor::metal_backend::set_served_request_trace(false);
     let _ = std::fs::remove_file(&path);
     assert_eq!(got, want, "a served decode step moved the stream");
+    // The settle reads each layer's record in place from its tier's slot
+    // (#814 part 5): no staged copy, no blit, a slot read per layer a step.
+    eprintln!("[streamed] readbacks {reads:?}");
+    assert_eq!(
+        reads.staged_readback, 0,
+        "a record was copied to be read: {reads:?}"
+    );
+    assert_eq!(reads.blit, 0, "a readback blitted: {reads:?}");
+    assert!(reads.slot > 0, "no record was read in place: {reads:?}");
     let c = m.pass_plan_counters().expect("the cache is on");
     let plans = decode_plans(m);
     eprintln!(

@@ -957,6 +957,12 @@ mod executor_and_memory_tests {
         assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=false");
         let o = resolve_options_uninstalled(&common(&["--arena"])).unwrap();
         assert_eq!(o.executor.line(), "arena=packed packed=false replay=off pass_plans=false");
+        // The layout selects the plans' layout too, and the line says so.
+        let o = resolve_options_uninstalled(&common(&["--arena-layout", "non-aliasing"])).unwrap();
+        assert_eq!(
+            o.executor.line(),
+            "arena=off packed=false replay=off pass_plans=true/non-aliasing"
+        );
         assert_eq!(o.memory.kv_capacity, 8704, "the serving default");
     }
 }

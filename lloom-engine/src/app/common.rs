@@ -320,7 +320,9 @@ pub fn install_executor(
             installed.replay = Some(exec);
         }
         if cfg.pass_plans_armed() {
-            dev.enable_pass_plans(ArenaLayout::Packed);
+            // `--arena-layout` selects the plans' layout too: `non-aliasing`
+            // gives every value its own slot, so no slot is reused inside a pass.
+            dev.enable_pass_plans(layout);
             installed.pass_plans = true;
         }
         Ok(installed)

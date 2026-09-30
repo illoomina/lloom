@@ -1070,7 +1070,7 @@ pub struct ExecutorConfig {
     /// The activation arena (§9.2), recorded from the first decode steps (one skipped, two recorded); not under a speculative body.
     #[opt(bool)]
     pub arena: bool,
-    /// The arena's layout: `packed` (values with disjoint liveness share a slot) or `non-aliasing` (the reference layout).
+    /// The layout of the arena and of the pass-plan cache's plans: `packed` (values with disjoint liveness share a slot) or `non-aliasing` (the reference layout, every value its own slot).
     #[opt(flag = "arena-layout", parser = "parse_arena_layout", variants = ["packed", "non-aliasing"])]
     pub arena_layout: String,
     /// Every decode dispatch through its `_packed` entry point with the constants pool (implied by `replay`).
@@ -1121,7 +1121,11 @@ impl ExecutorConfig {
             } else {
                 "off".to_string()
             },
-            self.pass_plans_armed()
+            match (self.pass_plans_armed(), self.arena_layout.as_str()) {
+                (true, "non-aliasing") => "true/non-aliasing",
+                (true, _) => "true",
+                (false, _) => "false",
+            }
         )
     }
 }

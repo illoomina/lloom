@@ -119,14 +119,20 @@ mod metal {
     }
 
     /// The largest |got - want| over a pass, relative to the reference's
-    /// largest magnitude.
+    /// largest magnitude; NaN if any logit is NaN (`f32::max` would drop it).
     fn rel(got: &[f32], want: &[f32]) -> f32 {
         let scale = want.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
         let d = got
             .iter()
             .zip(want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, |m, d| {
+                if d.is_nan() || m.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
         d / scale
     }
 

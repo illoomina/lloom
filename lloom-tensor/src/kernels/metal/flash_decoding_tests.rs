@@ -608,17 +608,25 @@ fn flash_matches_the_reference_at_every_head_dim() {
                         64,
                         dtype,
                     );
+                    // `f32::max` drops a NaN operand, so a NaN output would
+                    // read as agreement: fold it in explicitly.
                     let worst = got
                         .iter()
                         .zip(want.iter())
                         .map(|(g, w)| (g - w).abs())
-                        .fold(0f32, f32::max);
+                        .fold(0f32, |m, d| {
+                            if d.is_nan() || m.is_nan() {
+                                f32::NAN
+                            } else {
+                                m.max(d)
+                            }
+                        });
                     println!(
                         "{dtype:?} head_dim {hd} n_keys {n_keys} chunks {n_chunks} width {width}: \
                          worst |delta| {worst:e}"
                     );
                     assert!(
-                        worst < tol,
+                        worst.is_finite() && worst < tol,
                         "{dtype:?} head_dim {hd} n_keys {n_keys} chunks {n_chunks} width \
                          {width}: worst |delta| {worst:e} against the f64 reference"
                     );

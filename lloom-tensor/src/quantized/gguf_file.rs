@@ -587,11 +587,39 @@ fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn write<W: std::io::Seek + std::io::Write>(
+/// One tensor's entry in a GGUF header: its name, its dims (row-major, as
+/// `Shape` holds them), its type, and its offset from the start of the data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderTensor<'a> {
+    pub name: &'a str,
+    pub dims: &'a [usize],
+    pub dtype: GgmlDType,
+    pub offset: u64,
+}
+
+/// The offsets [`write`] gives tensors of these byte sizes, in file order:
+/// each tensor's data padded to 32 bytes.
+pub fn packed_offsets(sizes: impl IntoIterator<Item = usize>) -> Vec<u64> {
+    let mut offset = 0usize;
+    sizes
+        .into_iter()
+        .map(|size_in_bytes| {
+            let at = offset;
+            offset += size_in_bytes + (31 - (31 + size_in_bytes) % 32);
+            at as u64
+        })
+        .collect()
+}
+
+/// A version-2 GGUF header: the metadata, then each tensor's entry at the
+/// offset it names, padded to 32 bytes. Returns the position the tensor data
+/// starts at. Nothing past the header is written, so a caller can place the
+/// data itself (or leave it a hole in a sparse file).
+pub fn write_header<W: std::io::Seek + std::io::Write>(
     w: &mut W,
     metadata: &[(&str, &Value)],
-    tensors: &[(&str, &QTensor)],
-) -> Result<()> {
+    tensors: &[HeaderTensor<'_>],
+) -> Result<u64> {
     w.write_u32::<LittleEndian>(0x46554747)?;
     w.write_u32::<LittleEndian>(2)?; // version 2.
     w.write_u64::<LittleEndian>(tensors.len() as u64)?;
@@ -601,27 +629,40 @@ pub fn write<W: std::io::Seek + std::io::Write>(
         w.write_u32::<LittleEndian>(value.value_type().to_u32())?;
         value.write(w)?;
     }
-    let mut offset = 0usize;
-    let mut offsets = Vec::with_capacity(tensors.len());
-    for (name, tensor) in tensors.iter() {
-        write_string(w, name)?;
-        let dims = tensor.shape().dims();
-        w.write_u32::<LittleEndian>(dims.len() as u32)?;
-        for &dim in dims.iter().rev() {
+    for t in tensors {
+        write_string(w, t.name)?;
+        w.write_u32::<LittleEndian>(t.dims.len() as u32)?;
+        for &dim in t.dims.iter().rev() {
             w.write_u64::<LittleEndian>(dim as u64)?;
         }
-        w.write_u32::<LittleEndian>(tensor.dtype().to_u32())?;
-        w.write_u64::<LittleEndian>(offset as u64)?;
-        offsets.push(offset);
-        let size_in_bytes = tensor.storage_size_in_bytes();
-        let padding = 31 - (31 + size_in_bytes) % 32;
-        offset += size_in_bytes + padding;
+        w.write_u32::<LittleEndian>(t.dtype.to_u32())?;
+        w.write_u64::<LittleEndian>(t.offset)?;
     }
     let pos = w.stream_position()? as usize;
     let padding = 31 - (31 + pos) % 32;
     w.write_all(&vec![0u8; padding])?;
-    let tensor_start_pos = w.stream_position()? as usize;
-    for (offset, (_name, tensor)) in offsets.iter().zip(tensors.iter()) {
+    Ok(w.stream_position()?)
+}
+
+pub fn write<W: std::io::Seek + std::io::Write>(
+    w: &mut W,
+    metadata: &[(&str, &Value)],
+    tensors: &[(&str, &QTensor)],
+) -> Result<()> {
+    let offsets = packed_offsets(tensors.iter().map(|(_, t)| t.storage_size_in_bytes()));
+    let header: Vec<HeaderTensor<'_>> = tensors
+        .iter()
+        .zip(&offsets)
+        .map(|((name, t), &offset)| HeaderTensor {
+            name,
+            dims: t.shape().dims(),
+            dtype: t.dtype(),
+            offset,
+        })
+        .collect();
+    let tensor_start_pos = write_header(w, metadata, &header)? as usize;
+    for (&offset, (_name, tensor)) in offsets.iter().zip(tensors.iter()) {
+        let offset = offset as usize;
         let pos = w.stream_position()? as usize;
         if tensor_start_pos + offset != pos {
             crate::bail!(

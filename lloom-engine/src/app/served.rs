@@ -14,6 +14,7 @@ use super::template::Rendered;
 use super::vision::DecodedImage;
 use crate::{DecodeParams, Decoded, ReadbackArm};
 use anyhow::Result;
+use lloom::load_warning::LoadWarning;
 use lloom_tensor::Device;
 use serde_json::{Map, Value};
 
@@ -42,6 +43,14 @@ pub trait Served: Send + Sync {
     fn describe(&self) -> String;
     /// What the family can do (`family.rs`): the loaded line and `/health` say it.
     fn capabilities(&self) -> super::family::Capabilities;
+    /// Every load-time degradation, in the order found: the notes recorded
+    /// before the family loaded, the family's own, then each emulated type
+    /// the device has admitted (`lloom::load_warning`). The loaded line,
+    /// `/health` and the model card render it.
+    fn load_warnings(&self) -> Vec<LoadWarning>;
+    /// Record the warnings found before the family loaded (the readback
+    /// clamps `load_engine` applies), ahead of the family's own.
+    fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>);
     /// The checkpoint's `generation_config.json`, when it carries one (the
     /// sampling defaults under `--sampling-defaults checkpoint`).
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
@@ -221,6 +230,10 @@ mod tests {
         fn capabilities(&self) -> super::super::family::Capabilities {
             QWEN4EXP_CAPABILITIES
         }
+        fn load_warnings(&self) -> Vec<LoadWarning> {
+            Vec::new()
+        }
+        fn note_load_warnings(&mut self, _: Vec<LoadWarning>) {}
         fn encode(&self, _: &str, _: bool) -> Result<Vec<u32>> {
             unreachable!("the refusal comes first")
         }

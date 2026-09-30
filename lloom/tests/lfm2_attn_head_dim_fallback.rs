@@ -1,8 +1,9 @@
-//! LFM2's attention on a head dim a fused kernel is not instantiated at
-//! (`models::lfm2::AttnRoute`): the phase takes the composed attention,
-//! decided once at load, with one warning naming the head dim, the kernel
-//! requested and the kernel taken — on decode as on prefill, on the
-//! contiguous cache, the private page pool and a shared pool's rows.
+//! LFM2's attention route (`models::lfm2::AttnRoute`), decided once at load:
+//! each phase takes the requested fused kernel where it covers the head dim
+//! and dtype, else the nearest fused kernel that does, else the composed
+//! attention, with one warning naming the head dim, the kernel requested and
+//! the kernel taken — on decode as on prefill, on the contiguous cache, the
+//! private page pool and a shared pool's rows.
 //!
 //! The reference is the CPU backend at f32 over the same f16-rounded tiny
 //! weights (`lloom::testing::tiny`), so each arm is held to an absolute
@@ -82,10 +83,10 @@ mod metal {
 
     /// The CPU model at f32 over the weights a `dtype` Metal model holds.
     fn cpu_model(cfg: &Config, dtype: DType) -> Result<Model> {
-        let dense = if dtype == DType::F16 {
-            GgmlDType::F16
-        } else {
-            GgmlDType::F32
+        let dense = match dtype {
+            DType::F16 => GgmlDType::F16,
+            DType::BF16 => GgmlDType::BF16,
+            _ => GgmlDType::F32,
         };
         TinyCheckpoint::<Lfm2Tiny>::new(
             cpu_config(cfg),
@@ -118,14 +119,20 @@ mod metal {
     }
 
     /// The largest |got - want| over a pass, relative to the reference's
-    /// largest magnitude.
+    /// largest magnitude; NaN if any logit is NaN (`f32::max` would drop it).
     fn rel(got: &[f32], want: &[f32]) -> f32 {
         let scale = want.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
         let d = got
             .iter()
             .zip(want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, |m, d| {
+                if d.is_nan() || m.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
         d / scale
     }
 
@@ -133,15 +140,17 @@ mod metal {
     /// weights. Measured at most 5.1e-3, on the fused and the composed arms
     /// alike (head_dim 256); a wrong route or a wrong read is far outside it.
     const TOL: f32 = 1e-2;
+    /// bf16 activations: eight mantissa bits where f16 has eleven.
+    const TOL_BF16: f32 = 5e-2;
 
-    fn assert_close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>]) {
+    fn assert_close(what: &str, got: &[Vec<f32>], want: &[Vec<f32>], tol: f32) {
         assert_eq!(got.len(), want.len(), "{what}: pass count");
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             let r = rel(g, w);
             eprintln!("{what}: pass {i}: |metal - cpu| / scale = {r:e}");
             assert!(
-                r.is_finite() && r <= TOL,
-                "{what}: pass {i} is {r:e} from the CPU (tolerance {TOL})"
+                r.is_finite() && r <= tol,
+                "{what}: pass {i} is {r:e} from the CPU (tolerance {tol})"
             );
         }
     }
@@ -180,9 +189,9 @@ mod metal {
         prefill_census: Vec<(String, u64)>,
     }
 
-    fn run_on_metal(cfg: &Config, dev: &Device) -> Result<Run> {
-        let model = build(cfg, dev, DType::F16)?;
-        let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
+    fn run_on_metal(cfg: &Config, dev: &Device, dtype: DType) -> Result<Run> {
+        let model = build(cfg, dev, dtype)?;
+        let mut cache = Cache::new(true, dtype, cfg, dev)?;
         let census = dev.as_metal_device()?.dispatch_census().clone();
         let mut out = Vec::new();
         let mut decode = Vec::new();
@@ -212,225 +221,354 @@ mod metal {
         })
     }
 
-    fn reference(cfg: &Config) -> Result<Vec<Vec<f32>>> {
+    fn reference(cfg: &Config, dtype: DType) -> Result<Vec<Vec<f32>>> {
         let cpu = cpu_config(cfg);
-        let model = cpu_model(cfg, DType::F16)?;
+        let model = cpu_model(cfg, dtype)?;
         let mut cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
         passes(&model, &mut cache, &Device::Cpu)
     }
 
-    /// The route an arm must take at `head_dim` on f16, by the kernels'
-    /// instantiated sets, with the kernel the head dim refused.
-    fn expected(
+    use DecodeAttn::{FlashDecoding as Flash, Generic as DGeneric, SdpaVector as Vector};
+    use PrefillAttn::{Generic as PGeneric, Steel};
+
+    /// One cell of the route: the arm, head dim, dtype and KV store asked
+    /// for, and the kernels each phase must take, with the kernel the arm
+    /// requested when the route took another.
+    struct Cell {
         arm: AttnImpl,
         head_dim: usize,
-    ) -> (
-        DecodeAttn,
-        Option<DecodeAttn>,
-        PrefillAttn,
-        Option<PrefillAttn>,
-    ) {
-        let wanted = match arm {
-            AttnImpl::Sdpa => DecodeAttn::SdpaVector,
-            _ => DecodeAttn::FlashDecoding,
-        };
-        let decode_fits = match arm {
-            AttnImpl::Sdpa => [32, 64, 96, 128, 256, 512].contains(&head_dim),
-            _ => [32, 64, 96, 128].contains(&head_dim),
-        };
-        let steel_fits = [32, 64, 72, 80, 96, 128, 256, 512].contains(&head_dim);
-        let (d, dr) = if decode_fits {
-            (wanted, None)
-        } else {
-            (DecodeAttn::Generic, Some(wanted))
-        };
-        let (p, pr) = if steel_fits {
-            (PrefillAttn::Steel, None)
-        } else {
-            (PrefillAttn::Generic, Some(PrefillAttn::Steel))
-        };
-        (d, dr, p, pr)
+        dtype: DType,
+        paged: bool,
+        decode: DecodeAttn,
+        decode_refused: Option<DecodeAttn>,
+        prefill: PrefillAttn,
+        prefill_refused: Option<PrefillAttn>,
     }
 
-    /// Each arm across head dims inside and outside its kernels' sets: the
-    /// model builds, every pass agrees with the CPU, the route is the one
-    /// the sets give, the census shows the kernel the route names and none
-    /// it refused, and a load that fell back printed exactly one warning
-    /// naming the head dim, the kernel requested and the kernel taken.
+    #[allow(clippy::too_many_arguments)]
+    fn cell(
+        arm: AttnImpl,
+        head_dim: usize,
+        dtype: DType,
+        paged: bool,
+        decode: DecodeAttn,
+        decode_refused: Option<DecodeAttn>,
+        prefill: PrefillAttn,
+        prefill_refused: Option<PrefillAttn>,
+    ) -> Cell {
+        Cell {
+            arm,
+            head_dim,
+            dtype,
+            paged,
+            decode,
+            decode_refused,
+            prefill,
+            prefill_refused,
+        }
+    }
+
+    fn kernel_name(k: DecodeAttn) -> &'static str {
+        match k {
+            DGeneric => "generic",
+            Vector => "sdpa_vector",
+            Flash => "flash_decoding",
+        }
+    }
+
+    /// `maxTotalThreadsPerThreadgroup` of a compiled `sdpa_vector` pipeline,
+    /// read here rather than through the route's own check.
+    fn sdpa_vector_threads(dev: &Device, name: &str) -> usize {
+        use lloom_tensor::kernels::metal::library::{ConstantValues, Value};
+        use lloom_tensor::kernels::source::Source;
+        let m = dev.as_metal_device().unwrap();
+        m.kernels()
+            .load_pipeline_with_constants(
+                m.device(),
+                Source::Sdpa,
+                name.to_string(),
+                Some(ConstantValues::new(vec![(20, Value::Bool(false))])),
+            )
+            .unwrap()
+            .max_total_threads_per_threadgroup()
+    }
+
+    /// The preference order, cell by cell: the requested fused kernel where it
+    /// covers the shape; else the other fused decode kernel (72 and 80 are
+    /// FlashDecoding's alone, bf16 `sdpa_vector`'s alone, over a contiguous
+    /// cache and over a gathered page pool); else the composed attention,
+    /// which `--attn generic` also forces without a warning.
+    fn cells(dev: &Device) -> Vec<Cell> {
+        use lloom::models::lfm2::AttnImpl::{FlashDecoding as F, Generic as G, Sdpa as S};
+        let f16 = DType::F16;
+        let bf16 = DType::BF16;
+        let mut v = vec![
+            cell(
+                S,
+                16,
+                f16,
+                false,
+                DGeneric,
+                Some(Vector),
+                PGeneric,
+                Some(Steel),
+            ),
+            cell(
+                S,
+                48,
+                f16,
+                false,
+                DGeneric,
+                Some(Vector),
+                PGeneric,
+                Some(Steel),
+            ),
+            cell(S, 64, f16, false, Vector, None, Steel, None),
+            cell(S, 72, f16, false, Flash, Some(Vector), Steel, None),
+            cell(S, 80, f16, false, Flash, Some(Vector), Steel, None),
+            cell(S, 256, f16, false, Vector, None, Steel, None),
+            cell(S, 512, f16, false, Vector, None, Steel, None),
+            cell(
+                F,
+                16,
+                f16,
+                false,
+                DGeneric,
+                Some(Flash),
+                PGeneric,
+                Some(Steel),
+            ),
+            cell(
+                F,
+                48,
+                f16,
+                false,
+                DGeneric,
+                Some(Flash),
+                PGeneric,
+                Some(Steel),
+            ),
+            cell(F, 64, f16, false, Flash, None, Steel, None),
+            cell(F, 72, f16, false, Flash, None, Steel, None),
+            cell(F, 80, f16, false, Flash, None, Steel, None),
+            cell(F, 256, f16, false, Flash, None, Steel, None),
+            cell(F, 512, f16, false, Flash, None, Steel, None),
+            cell(
+                F,
+                48,
+                f16,
+                true,
+                DGeneric,
+                Some(Flash),
+                PGeneric,
+                Some(Steel),
+            ),
+            cell(F, 64, f16, true, Flash, None, Steel, None),
+            cell(F, 72, f16, true, Flash, None, Steel, None),
+            cell(F, 256, f16, true, Flash, None, Steel, None),
+            cell(G, 64, f16, false, DGeneric, None, PGeneric, None),
+            cell(F, 64, bf16, false, Vector, Some(Flash), Steel, None),
+            cell(F, 64, bf16, true, Vector, Some(Flash), Steel, None),
+        ];
+        // `sdpa_vector` at bf16 x 512 is dispatched at 1024 threads; where its
+        // pipeline admits fewer it writes nothing, and nothing else covers bf16.
+        let fits = sdpa_vector_threads(dev, "sdpa_vector_bfloat16_t_512") >= 1024;
+        v.push(if fits {
+            cell(S, 512, bf16, false, Vector, None, Steel, None)
+        } else {
+            cell(S, 512, bf16, false, DGeneric, Some(Vector), Steel, None)
+        });
+        v
+    }
+
+    /// Every cell: the model builds, every pass agrees with the CPU at f32
+    /// over the same rounded weights, the route is the cell's, the census
+    /// shows the kernel the route names and none other, and a load that took
+    /// another kernel than requested printed exactly one warning naming the
+    /// head dim, the dtype, the kernel requested and the kernel taken, with
+    /// "composed" only where no fused kernel covers the shape.
     #[test]
-    fn off_set_head_dims_take_the_composed_attention_and_match_the_cpu() -> Result<()> {
+    fn each_shape_takes_the_nearest_kernel_that_covers_it_and_matches_the_cpu() -> Result<()> {
         profile_on();
         let dev = Device::new_metal(0)?;
-        for arm in [AttnImpl::Sdpa, AttnImpl::FlashDecoding] {
-            for head_dim in [16, 48, 64, 72, 80, 256] {
-                let what = format!("{arm:?} head_dim {head_dim}");
-                let cfg = config(arm, head_dim);
-                let run = run_on_metal(&cfg, &dev)?;
-                assert_close(&what, &run.logits, &reference(&cfg)?);
-
-                let route = run.model.attn_route();
-                let (d, dr, p, pr) = expected(arm, head_dim);
-                assert_eq!(
-                    (
-                        route.decode,
-                        route.decode_refused,
-                        route.prefill,
-                        route.prefill_refused
-                    ),
-                    (d, dr, p, pr),
-                    "{what}: the route"
-                );
-
-                let (vec_d, flash_d, steel_d, soft_d) = attention_labels(&run.decode_census);
-                let (vec_p, flash_p, steel_p, soft_p) = attention_labels(&run.prefill_census);
-                eprintln!(
-                    "{what}: decode sdpa_vector {vec_d} flash {flash_d} steel {steel_d} softmax {soft_d}; \
-                     prefill sdpa_vector {vec_p} flash {flash_p} steel {steel_p} softmax {soft_p}"
-                );
-                // Two attention layers, three decode steps.
-                let (want_vec, want_flash, want_soft) = match d {
-                    DecodeAttn::SdpaVector => (6, 0, 0),
-                    DecodeAttn::FlashDecoding => (0, 6, 0),
-                    DecodeAttn::Generic => (0, 0, 6),
-                };
-                assert_eq!(
-                    (vec_d, flash_d, steel_d, soft_d),
-                    (want_vec, want_flash, 0, want_soft),
-                    "{what}: the decode census"
-                );
-                let (want_steel, want_soft) = match p {
-                    PrefillAttn::Steel => (2, 0),
-                    PrefillAttn::Generic => (0, 2),
-                };
-                assert_eq!(
-                    (vec_p, flash_p, steel_p, soft_p),
-                    (0, 0, want_steel, want_soft),
-                    "{what}: the second prefill's census"
-                );
-
-                let warnings = run.model.load_warnings();
-                if dr.is_none() && pr.is_none() {
-                    assert!(warnings.is_empty(), "{what}: {warnings:?}");
-                    continue;
-                }
-                assert_eq!(
-                    warnings.len(),
-                    1,
-                    "{what}: one warning per load: {warnings:?}"
-                );
-                let w = &warnings[0];
-                assert!(w.contains(&format!("head_dim {head_dim} ")), "{what}: {w}");
-                assert!(w.contains(&format!("{arm:?}")), "{what}: {w}");
-                if let Some(k) = dr {
-                    let requested = match k {
-                        DecodeAttn::SdpaVector => "decode requested sdpa_vector and takes generic",
-                        _ => "decode requested flash_decoding and takes generic",
-                    };
-                    assert!(w.contains(requested), "{what}: {w}");
-                } else {
-                    assert!(!w.contains("decode"), "{what}: {w}");
-                }
-                assert_eq!(
-                    w.contains("prefill requested steel_attention and takes generic"),
-                    pr.is_some(),
-                    "{what}: {w}"
-                );
-                assert_eq!(
-                    Some(w.clone()),
-                    route.warning(),
-                    "{what}: the printed line is the route's"
-                );
+        lloom_tensor::test_utils::allow_emulated(&dev, DType::BF16);
+        for c in cells(&dev) {
+            let what = format!(
+                "{:?} head_dim {} {:?}{}",
+                c.arm,
+                c.head_dim,
+                c.dtype,
+                if c.paged { " paged" } else { "" }
+            );
+            let mut cfg = config(c.arm, c.head_dim);
+            if c.paged {
+                cfg.kv_append = KvAppend::Paged;
             }
+            let run = run_on_metal(&cfg, &dev, c.dtype)?;
+            let tol = if c.dtype == DType::BF16 {
+                TOL_BF16
+            } else {
+                TOL
+            };
+            assert_close(&what, &run.logits, &reference(&cfg, c.dtype)?, tol);
+
+            let route = run.model.attn_route();
+            assert_eq!(
+                (
+                    route.decode,
+                    route.decode_refused,
+                    route.prefill,
+                    route.prefill_refused
+                ),
+                (c.decode, c.decode_refused, c.prefill, c.prefill_refused),
+                "{what}: the route"
+            );
+
+            let (vec_d, flash_d, steel_d, soft_d) = attention_labels(&run.decode_census);
+            let (vec_p, flash_p, steel_p, soft_p) = attention_labels(&run.prefill_census);
+            eprintln!(
+                "{what}: decode sdpa_vector {vec_d} flash {flash_d} steel {steel_d} softmax {soft_d}; \
+                 prefill sdpa_vector {vec_p} flash {flash_p} steel {steel_p} softmax {soft_p}"
+            );
+            // Two attention layers, three decode steps.
+            let (want_vec, want_flash, want_soft) = match c.decode {
+                Vector => (6, 0, 0),
+                Flash => (0, 6, 0),
+                DGeneric => (0, 0, 6),
+            };
+            assert_eq!(
+                (vec_d, flash_d, steel_d, soft_d),
+                (want_vec, want_flash, 0, want_soft),
+                "{what}: the decode census"
+            );
+            let (want_steel, want_soft) = match c.prefill {
+                Steel => (2, 0),
+                PGeneric => (0, 2),
+            };
+            assert_eq!(
+                (vec_p, flash_p, steel_p, soft_p),
+                (0, 0, want_steel, want_soft),
+                "{what}: the second prefill's census"
+            );
+
+            let warnings = run.model.load_warnings();
+            if c.decode_refused.is_none() && c.prefill_refused.is_none() {
+                assert!(warnings.is_empty(), "{what}: {warnings:?}");
+                continue;
+            }
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{what}: one warning per load: {warnings:?}"
+            );
+            let w = &warnings[0];
+            assert_eq!(w.kind, lloom::load_warning::LoadWarningKind::AttentionRoute);
+            let m = &w.message;
+            assert!(
+                m.starts_with(&format!(
+                    "lfm2: attention head_dim {} at {:?} under {:?}: ",
+                    c.head_dim, c.dtype, c.arm
+                )),
+                "{what}: {m}"
+            );
+            match c.decode_refused {
+                Some(k) => {
+                    let taken = if c.decode == DGeneric {
+                        "generic (the composed attention, slower: no fused kernel covers this shape)"
+                    } else {
+                        &format!("{} (the nearest fused kernel)", kernel_name(c.decode))
+                    };
+                    let phrase = format!("decode requested {} and takes {taken}", kernel_name(k));
+                    assert!(m.contains(&phrase), "{what}: {m}\n  wants: {phrase}");
+                }
+                None => assert!(!m.contains("decode"), "{what}: {m}"),
+            }
+            assert_eq!(
+                m.contains(
+                    "prefill requested steel_attention and takes generic (the composed attention"
+                ),
+                c.prefill_refused.is_some(),
+                "{what}: {m}"
+            );
+            assert_eq!(
+                m.matches("composed").count(),
+                usize::from(c.decode == DGeneric && c.decode_refused.is_some())
+                    + usize::from(c.prefill_refused.is_some()),
+                "{what}: \"composed\" names only the phases no fused kernel covers: {m}"
+            );
+            assert_eq!(
+                Some(m.clone()),
+                route.warning(),
+                "{what}: the printed line is the route's"
+            );
         }
         Ok(())
     }
 
-    /// f32 has no 512 in either `sdpa_vector` or `steel_attention`: the
-    /// dtype's half of the check, on its own. A route resolved without the
-    /// device's dtype would take the fused kernels here.
+    /// f32 has no 512 in `sdpa_vector`, `steel_attention` or FlashDecoding
+    /// (none admits the width it is dispatched at): the dtype's half of the
+    /// check, on its own, on both fused arms. A route resolved without the
+    /// device's dtype would take a fused kernel here.
     #[test]
     fn head_dim_512_at_f32_takes_the_composed_attention() -> Result<()> {
         profile_on();
         let dev = Device::new_metal(0)?;
-        let cfg = config(AttnImpl::Sdpa, 512);
-        let model = build(&cfg, &dev, DType::F32)?;
-        let route = model.attn_route();
-        assert_eq!(
-            (
-                route.decode,
-                route.decode_refused,
-                route.prefill,
-                route.prefill_refused
-            ),
-            (
-                DecodeAttn::Generic,
-                Some(DecodeAttn::SdpaVector),
-                PrefillAttn::Generic,
-                Some(PrefillAttn::Steel)
-            )
-        );
-        assert_eq!(
-            model.load_warnings().len(),
-            1,
-            "{:?}",
-            model.load_warnings()
-        );
-        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
-        let got = passes(&model, &mut cache, &dev)?;
-        let cpu = cpu_config(&cfg);
-        let reference_model = cpu_model(&cfg, DType::F32)?;
-        let mut cpu_cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
-        let want = passes(&reference_model, &mut cpu_cache, &Device::Cpu)?;
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            let r = rel(g, w);
-            eprintln!("Sdpa head_dim 512 f32: pass {i}: {r:e}");
-            assert!(r <= 1e-4, "pass {i} is {r:e} from the CPU");
-        }
-        // At f16 the same head dim is inside both sets.
-        let f16 = build(&cfg, &dev, DType::F16)?.attn_route();
-        assert_eq!(
-            (f16.decode, f16.prefill),
-            (DecodeAttn::SdpaVector, PrefillAttn::Steel)
-        );
-        Ok(())
-    }
-
-    /// The private page pool (`KvAppend::Paged`, which requires the flash
-    /// arm): at a head dim FlashDecoding does not instantiate, a decode step
-    /// attends over the keys gathered from the pool. 256 keeps the steel
-    /// prefill; 48 loses it too.
-    #[test]
-    fn the_page_pool_decodes_an_off_set_head_dim_over_a_gathered_copy() -> Result<()> {
-        profile_on();
-        let dev = Device::new_metal(0)?;
-        for head_dim in [48, 256, 64] {
-            let mut cfg = config(AttnImpl::FlashDecoding, head_dim);
-            cfg.kv_append = KvAppend::Paged;
-            let what = format!("Paged head_dim {head_dim}");
-            let run = run_on_metal(&cfg, &dev)?;
-            assert_close(&what, &run.logits, &reference(&cfg)?);
-            let (_, flash_d, _, soft_d) = attention_labels(&run.decode_census);
-            let fits = head_dim == 64;
+        for (arm, wanted) in [
+            (AttnImpl::Sdpa, DecodeAttn::SdpaVector),
+            (AttnImpl::FlashDecoding, DecodeAttn::FlashDecoding),
+        ] {
+            let cfg = config(arm, 512);
+            let model = build(&cfg, &dev, DType::F32)?;
+            let route = model.attn_route();
             assert_eq!(
-                (flash_d > 0, soft_d > 0),
-                (fits, !fits),
-                "{what}: {:?}",
-                run.decode_census
+                (
+                    route.decode,
+                    route.decode_refused,
+                    route.prefill,
+                    route.prefill_refused
+                ),
+                (
+                    DecodeAttn::Generic,
+                    Some(wanted),
+                    PrefillAttn::Generic,
+                    Some(PrefillAttn::Steel)
+                ),
+                "{arm:?}"
             );
             assert_eq!(
-                run.model.load_warnings().len(),
-                usize::from(!fits),
-                "{what}"
+                model.load_warnings().len(),
+                1,
+                "{:?}",
+                model.load_warnings()
+            );
+            let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+            let got = passes(&model, &mut cache, &dev)?;
+            let cpu = cpu_config(&cfg);
+            let reference_model = cpu_model(&cfg, DType::F32)?;
+            let mut cpu_cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
+            let want = passes(&reference_model, &mut cpu_cache, &Device::Cpu)?;
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                let r = rel(g, w);
+                eprintln!("{arm:?} head_dim 512 f32: pass {i}: {r:e}");
+                assert!(r <= 1e-4, "{arm:?}: pass {i} is {r:e} from the CPU");
+            }
+            // At f16 the same head dim is covered by the requested kernel.
+            let f16 = build(&cfg, &dev, DType::F16)?.attn_route();
+            assert_eq!(
+                (f16.decode, f16.prefill),
+                (wanted, PrefillAttn::Steel),
+                "{arm:?}"
             );
         }
         Ok(())
     }
 
-    /// A shared pool's rows (`BatchPool`, the `--preset pool` arms): at an
-    /// off-set head dim the batched arms decline — their paged kernels are
-    /// FlashDecoding and the paged steel read — and every row decodes alone
-    /// over its gathered keys, each agreeing with its own CPU forward. At an
-    /// instantiated head dim the batched arms run: the control.
+    /// A shared pool's rows (`BatchPool`, the `--preset pool` arms): at a
+    /// head dim no fused kernel covers the batched arms decline — their paged
+    /// kernels are FlashDecoding and the paged steel read — and every row
+    /// decodes alone over its gathered keys, each agreeing with its own CPU
+    /// forward. At an instantiated head dim the batched arms run: 64, and 72
+    /// on FlashDecoding's masked lanes.
     #[test]
     fn a_shared_pool_decodes_an_off_set_head_dim_row_by_row() -> Result<()> {
         profile_on();
@@ -440,7 +578,7 @@ mod metal {
             (&[40, 2], 33),
             (&[1, 4, 9, 16, 25, 36, 49, 8], 21),
         ];
-        for head_dim in [48, 64] {
+        for head_dim in [48, 64, 72] {
             let mut cfg = config(AttnImpl::FlashDecoding, head_dim);
             cfg.kv_append = KvAppend::Paged;
             cfg.conv_state = ConvState::RotatingRing { k: 2 };
@@ -483,7 +621,7 @@ mod metal {
             // composed attention per row per layer (three rows, two layers).
             let (_, flash, _, soft) = attention_labels(&census);
             eprintln!("{what}: forward_rows flash {flash} softmax {soft}");
-            let fits = head_dim == 64;
+            let fits = head_dim != 48;
             assert_eq!(
                 (flash > 0, soft),
                 (fits, if fits { 0 } else { 6 }),

@@ -292,14 +292,15 @@ pub fn run(args: ChatArgs) -> Result<()> {
         },
     )?;
     eprintln!(
-        "[loaded {} from {} in {:.1}s on {:?}; readback={} reuse_prefix={} {}]",
+        "[loaded {} from {} in {:.1}s on {:?}; readback={} reuse_prefix={} {}; load_warnings={}]",
         engine.model_name(),
         path.display(),
         t.elapsed().as_secs_f64(),
         engine.device(),
         engine.readback().name(),
         !args.no_reuse,
-        engine.describe()
+        engine.describe(),
+        lloom::load_warning::LoadWarning::line(&engine.load_warnings()),
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     sampling.apply_checkpoint(engine.generation_config().as_ref());

@@ -26,14 +26,51 @@
 //!
 //! Metal only. The fusions are Metal GEMV epilogues and have no CPU arm — the
 //! op `bail!`s rather than falling back, per `DESIGN.md` §2.4.
+//!
+//! Dual (`lloom::testing::fixture`): under `LLOOM_FIXTURE=real|synthetic`
+//! every reachability and equivalence assertion runs at LFM2.5-2.6B's
+//! geometry, where the decode tiles the GEMV derives are the served ones.
+//! The CPU references — the pinned fingerprint and the tolerance measured
+//! against it — are the tiny model's and run on it alone.
 
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::testing::fixture::Fixture;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
+
+/// The tiny geometry with the arms applied: what the CPU reference builds.
+fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
+    let mut cfg = tiny_geometry();
+    arms(gemv_silu, gemv_residual)(&mut cfg);
+    cfg
+}
+
+/// The arms every test here runs, on whichever geometry the fixture holds:
+/// the in-place KV and the f16 KV every recorded digest belongs to, the
+/// default attention and conv state, and the two epilogue flags.
+fn arms(gemv_silu: bool, gemv_residual: bool) -> impl FnOnce(&mut Config) {
+    move |c| {
+        c.use_flash_attn = false;
+        c.attn_impl = Default::default();
+        c.kv_append = KvAppend::InPlace;
+        c.kv_quant = Default::default();
+        c.conv_state = Default::default();
+        c.memory_budget = None;
+        c.gemv_silu = gemv_silu;
+        c.gemv_residual = gemv_residual;
+        c.tap_layers = Vec::new();
+        c.tap_dtype = DType::F32;
+    }
+}
+
+/// The fixture a test runs on: [`tiny_geometry`] by default.
+fn fixture(test: &str) -> Result<Option<Fixture<Lfm2Tiny>>> {
+    Fixture::new(test, tiny_geometry())
+}
 
 /// A two-layer LFM2 — one conv layer, one attention layer — so **all three**
 /// residual producers are exercised: `conv.out_proj`, `self_attn.out_proj` and
@@ -42,7 +79,7 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 /// `hidden_size` and `intermediate_size` are multiples of 4 so the GEMV's `TM`
 /// tiling is exercised, and both are ≥ 512 so `derive_gemv_tile` selects an
 /// instantiated decode tile rather than one the fused arms do not carry.
-fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
+fn tiny_geometry() -> Config {
     Config {
         vocab_size: 64,
         hidden_size: 512,
@@ -59,34 +96,17 @@ fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
         tie_embedding: true,
         bos_token_id: None,
         eos_token_id: None,
-        use_flash_attn: false,
-        attn_impl: Default::default(),
         flash_page_size: 256,
         flash_pages_per_chunk: 1,
         flash_scratch_sizing: Default::default(),
-        kv_append: KvAppend::InPlace,
-        // `Off`, the f16 arm every recorded digest belongs to. Added by #218
-        // after this file was written, which is why it stopped compiling --
-        // `flash_scratch_sizing` above carries the same note from #116.
-        kv_quant: Default::default(),
-        conv_state: Default::default(),
-        memory_budget: None,
-        gemv_silu,
-        gemv_residual,
-        // #363's tap: off, as every pre-#363 caller had it.
-        tap_layers: Vec::new(),
-        tap_dtype: DType::F32,
         ..Default::default()
     }
 }
 
-/// The tiny LFM2 at `cfg`'s geometry and arms (`lloom::testing::tiny`,
-/// keyed weights), at f16 — so two runs agree and any difference between
-/// two *arms* is attributable to the arms.
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
-    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
-        .with_dtype(DType::F16)
-        .model(dev)
+/// The fixture's LFM2 at `cfg`'s geometry and arms, at f16 — so two runs
+/// agree and any difference between two *arms* is attributable to the arms.
+fn build(fx: &Fixture<Lfm2Tiny>, cfg: &Config, dev: &Device) -> Result<Model> {
+    fx.model_in(cfg, Some(DType::F16), dev)
 }
 
 /// The same decode step on the CPU backend at f32, over the weights the f16
@@ -141,8 +161,8 @@ fn assert_near_cpu(tag: &str, arm: &[f32], cpu: &[f32]) {
 /// Prefill a prompt, then take one **decode** step, and return that step's
 /// logits. The decode step is the only one the fusions apply to: `seq_len > 1`
 /// is a GEMM and takes the eager path by construction.
-fn decode_logits(cfg: &Config, dev: &Device) -> Result<Vec<f32>> {
-    let model = build(cfg, dev)?;
+fn decode_logits(fx: &Fixture<Lfm2Tiny>, cfg: &Config, dev: &Device) -> Result<Vec<f32>> {
+    let model = build(fx, cfg, dev)?;
     decode_with(&model, cfg, dev, DType::F16)
 }
 
@@ -183,9 +203,12 @@ fn flags_off_is_deterministic_and_is_the_shipping_path() -> Result<()> {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
-    let cfg = tiny_config(false, false);
-    let a = decode_logits(&cfg, &dev)?;
-    let b = decode_logits(&cfg, &dev)?;
+    let Some(fx) = fixture("gemv_wiring_flags_off")? else {
+        return Ok(());
+    };
+    let cfg = fx.config(arms(false, false));
+    let a = decode_logits(&fx, &cfg, &dev)?;
+    let b = decode_logits(&fx, &cfg, &dev)?;
     assert_eq!(a, b, "the default path must be bit-identical run to run");
     assert!(
         a.iter().any(|v| *v != 0.0),
@@ -214,13 +237,18 @@ fn gemv_silu_is_reached_from_the_decode_path() -> Result<()> {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
-    let base = decode_logits(&tiny_config(false, false), &dev)?;
-    let fused = decode_logits(&tiny_config(true, false), &dev)?;
-    assert_near_cpu(
-        "gemv_silu",
-        &fused,
-        &cpu_decode_logits(&tiny_config(true, false))?,
-    );
+    let Some(fx) = fixture("gemv_wiring_silu")? else {
+        return Ok(());
+    };
+    let base = decode_logits(&fx, &fx.config(arms(false, false)), &dev)?;
+    let fused = decode_logits(&fx, &fx.config(arms(true, false)), &dev)?;
+    if !fx.at_scale() {
+        assert_near_cpu(
+            "gemv_silu",
+            &fused,
+            &cpu_decode_logits(&tiny_config(true, false))?,
+        );
+    }
 
     let (delta, mag) = max_abs_delta(&base, &fused);
     eprintln!("gemv_silu: max|delta| = {delta:e}, max|logit| = {mag:e}");
@@ -255,13 +283,18 @@ fn gemv_residual_is_reached_from_the_decode_path() -> Result<()> {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
-    let base = decode_logits(&tiny_config(false, false), &dev)?;
-    let fused = decode_logits(&tiny_config(false, true), &dev)?;
-    assert_near_cpu(
-        "gemv_residual",
-        &fused,
-        &cpu_decode_logits(&tiny_config(false, true))?,
-    );
+    let Some(fx) = fixture("gemv_wiring_residual")? else {
+        return Ok(());
+    };
+    let base = decode_logits(&fx, &fx.config(arms(false, false)), &dev)?;
+    let fused = decode_logits(&fx, &fx.config(arms(false, true)), &dev)?;
+    if !fx.at_scale() {
+        assert_near_cpu(
+            "gemv_residual",
+            &fused,
+            &cpu_decode_logits(&tiny_config(false, true))?,
+        );
+    }
 
     let (delta, mag) = max_abs_delta(&base, &fused);
     eprintln!("gemv_residual: max|delta| = {delta:e}, max|logit| = {mag:e}");
@@ -295,9 +328,12 @@ fn prefill_is_bit_identical_with_the_flags_on() -> Result<()> {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
+    let Some(fx) = fixture("gemv_wiring_prefill")? else {
+        return Ok(());
+    };
 
     let prefill_logits = |cfg: &Config| -> Result<Vec<f32>> {
-        let model = build(cfg, &dev)?;
+        let model = build(&fx, cfg, &dev)?;
         let mut cache = Cache::new(true, DType::F16, cfg, &dev)?;
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
@@ -305,14 +341,14 @@ fn prefill_is_bit_identical_with_the_flags_on() -> Result<()> {
         logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()
     };
 
-    let base = prefill_logits(&tiny_config(false, false))?;
-    let with_silu = prefill_logits(&tiny_config(true, false))?;
+    let base = prefill_logits(&fx.config(arms(false, false)))?;
+    let with_silu = prefill_logits(&fx.config(arms(true, false)))?;
     assert_eq!(
         base, with_silu,
         "gemv_silu must not reach prefill: it is a decode-path GEMV fusion"
     );
 
-    match prefill_logits(&tiny_config(false, true)) {
+    match prefill_logits(&fx.config(arms(false, true))) {
         Ok(with_res) => assert_eq!(
             base, with_res,
             "gemv_residual must not reach prefill: it is a decode-path GEMV fusion"
@@ -334,13 +370,21 @@ fn prefill_is_bit_identical_with_the_flags_on() -> Result<()> {
 /// **The unfused arm is the CPU backend's answer at f16's precision**: the
 /// level [`CPU_TOL`] is set from, and the absolute reference the shape
 /// checks above (flag off agrees with itself; a fused arm is near the
-/// unfused one) cannot see — a defect that moves every arm alike.
+/// unfused one) cannot see — a defect that moves every arm alike. The tiny
+/// model's own reference: it runs on the tiny backend only.
 #[test]
 fn the_unfused_arm_is_within_the_cpu_reference() -> Result<()> {
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
+    let Some(fx) = fixture("gemv_wiring_cpu_reference")? else {
+        return Ok(());
+    };
+    if fx.at_scale() {
+        println!("the CPU fingerprint is the tiny model's; nothing to check at scale");
+        return Ok(());
+    }
     let cfg = tiny_config(false, false);
     let cpu = cpu_decode_logits(&cfg)?;
     assert_eq!(
@@ -349,6 +393,6 @@ fn the_unfused_arm_is_within_the_cpu_reference() -> Result<()> {
         "the CPU reference moved: {:#x}",
         fingerprint(&cpu)
     );
-    assert_near_cpu("unfused", &decode_logits(&cfg, &dev)?, &cpu);
+    assert_near_cpu("unfused", &decode_logits(&fx, &cfg, &dev)?, &cpu);
     Ok(())
 }

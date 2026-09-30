@@ -55,10 +55,16 @@ use objc2_metal::MTLSize;
 /// `lfm2.rs`'s `flash_decoding_applies` excludes `BF16` to match, which makes
 /// `--attn flash --dtype bf16` a silent decline to the generic path — see the
 /// note there before reading a flash run's config line.
+///
+/// The attention kernels are instantiated at `F16` and `F32` only
+/// ([`FlashDType::head_dims`] is empty at `BF16`). The KV scatter moves
+/// elements without arithmetic and carries `BF16` as well, so a page pool can
+/// be written at bf16 and read by a kernel that has a bf16 arm.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FlashDType {
     F16,
     F32,
+    BF16,
 }
 
 impl FlashDType {
@@ -73,11 +79,22 @@ impl FlashDType {
         match self {
             FlashDType::F16 => "half",
             FlashDType::F32 => "float",
+            FlashDType::BF16 => "bfloat",
+        }
+    }
+
+    /// The head dims the attention kernels are instantiated at in this
+    /// dtype: [`FLASH_HEAD_DIMS`] at f16, without 512 at f32, none at bf16.
+    pub fn head_dims(self) -> &'static [usize] {
+        match self {
+            FlashDType::F16 => &FLASH_HEAD_DIMS,
+            FlashDType::F32 => &FLASH_F32_HEAD_DIMS,
+            FlashDType::BF16 => &[],
         }
     }
 }
 
-/// Head dimensions `flash_decoding.metal` instantiates.
+/// Head dimensions `flash_decoding.metal` instantiates, at f16 and f32.
 ///
 /// **This list and the `.metal` instantiation list must agree, and the registry
 /// is what checks it.** #103 found `scaled_dot_product_attention.metal`
@@ -86,7 +103,25 @@ impl FlashDType {
 /// a capability that silently does not exist and dead instantiations paid for
 /// at every cold compile. Declaring the list once here and resolving every name
 /// against the compiled library is what stops that.
-pub const FLASH_HEAD_DIMS: [usize; 4] = [32, 64, 96, 128];
+///
+/// A lane holds `ceil(head_dim / 32)` elements, so 72 and 80 run with a masked
+/// tail; every pipeline must admit the threadgroup width it is dispatched at
+/// (`every_flash_pipeline_admits_its_dispatch_width`). This is the f16 list;
+/// f32 is [`FLASH_F32_HEAD_DIMS`].
+pub const FLASH_HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+
+/// [`FLASH_HEAD_DIMS`] at f32: no 512. Sixteen `float`s of `q`, `k` and `o`
+/// per lane leave the pipeline admitting fewer threads per threadgroup than
+/// the 1024 the single-chunk and square partial passes dispatch
+/// (`docs/porting-models.md` §21.8).
+pub const FLASH_F32_HEAD_DIMS: [usize; 7] = [32, 64, 72, 80, 96, 128, 256];
+
+/// The threadgroup width, in threads, each flash kernel is dispatched at:
+/// the single-chunk pass and the square partial run 32 simdgroups, the
+/// narrow partial and the combine 8. A pipeline whose
+/// `maxTotalThreadsPerThreadgroup` is below its width cannot be dispatched.
+pub const FLASH_SINGLE_THREADS: usize = 32 * 32;
+pub const FLASH_COMBINE_THREADS: usize = 8 * 32;
 
 /// The partial pass's threadgroup widths, in simdgroups: 32 (1024 threads,
 /// 8 keys per simdgroup over a 256-key chunk) and 8 (256 threads, 32 keys
@@ -143,11 +178,11 @@ impl FlashKernel {
     }
 
     fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
-        if !FLASH_HEAD_DIMS.contains(&head_dim) {
+        if !dtype.head_dims().contains(&head_dim) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "flash_decoding",
                 got: head_dim,
-                expected: FLASH_HEAD_DIMS.to_vec(),
+                expected: dtype.head_dims().to_vec(),
             });
         }
         Ok(format!("{stem}_{}_{head_dim}", dtype.suffix()))
@@ -156,8 +191,8 @@ impl FlashKernel {
     /// Every declared name, for `flash_names_resolve` and for exhaustive tests.
     pub fn all() -> Vec<String> {
         let mut names = Vec::new();
-        for dtype in [FlashDType::F16, FlashDType::F32] {
-            for head_dim in FLASH_HEAD_DIMS {
+        for dtype in [FlashDType::F16, FlashDType::F32, FlashDType::BF16] {
+            for &head_dim in dtype.head_dims() {
                 names.push(Self::name("flash_decoding_partial", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_partial8", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_combine", dtype, head_dim).unwrap());
@@ -167,6 +202,39 @@ impl FlashKernel {
         }
         names
     }
+}
+
+/// Whether every FlashDecoding pipeline at `(head_dim, dtype)` is
+/// instantiated and admits the threadgroup width it is dispatched at
+/// ([`FLASH_SINGLE_THREADS`], both [`FLASH_PARTIAL_WIDTHS`],
+/// [`FLASH_COMBINE_THREADS`]). A load-time check, never a per-dispatch one.
+pub fn flash_admits_its_widths(
+    device: &Device,
+    kernels: &Kernels,
+    head_dim: usize,
+    dtype: FlashDType,
+) -> Result<bool, MetalKernelError> {
+    if !dtype.head_dims().contains(&head_dim) {
+        return Ok(false);
+    }
+    let mut cells = vec![
+        (FlashKernel::single(dtype, head_dim)?, FLASH_SINGLE_THREADS),
+        (
+            FlashKernel::combine(dtype, head_dim)?,
+            FLASH_COMBINE_THREADS,
+        ),
+    ];
+    for width in FLASH_PARTIAL_WIDTHS {
+        cells.push((FlashKernel::partial(dtype, head_dim, width)?, width * 32));
+    }
+    for (name, threads) in cells {
+        let pipeline =
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+        if pipeline.max_total_threads_per_threadgroup() < threads {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// How a chunk table is built for one step.
@@ -488,7 +556,7 @@ pub fn call_flash_decoding(
             depth: 1,
         };
         let group_dims = MTLSize {
-            width: 32 * 32,
+            width: FLASH_SINGLE_THREADS,
             height: 1,
             depth: 1,
         };
@@ -576,7 +644,7 @@ pub fn call_flash_decoding(
         // Eight simdgroups per head: the kernel's `BN` (chunks striped across
         // them, a fixed-order sum at the end).
         let group_dims = MTLSize {
-            width: 8 * 32,
+            width: FLASH_COMBINE_THREADS,
             height: 1,
             depth: 1,
         };

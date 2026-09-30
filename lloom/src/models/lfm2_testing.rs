@@ -188,6 +188,18 @@ impl TinyFamily for Lfm2Tiny {
 /// `config.json` for `cfg`, in the checkpoint's own keys, with the token ids
 /// of the tokenizer the files carry.
 pub fn config_json(cfg: &Config, tok: &TinyTokenizer) -> String {
+    let mut j = geometry_json(cfg);
+    j["bos_token_id"] = serde_json::json!(tok.id("<|startoftext|>"));
+    j["eos_token_id"] = serde_json::json!(tok.id("<|im_end|>"));
+    j["pad_token_id"] = serde_json::json!(tok.id("<|pad|>"));
+    serde_json::to_string_pretty(&j).expect("a JSON value serializes")
+}
+
+/// `cfg`'s geometry in the checkpoint's own keys, the FFN width stated
+/// rather than derived: what `Lfm2Config::into_config` reads back to `cfg`'s
+/// geometry, and the form a real checkpoint's geometry is committed in
+/// ([`SCALE_GEOMETRY`]).
+pub fn geometry_json(cfg: &Config) -> serde_json::Value {
     let kinds: Vec<&str> = cfg
         .layer_types
         .iter()
@@ -196,7 +208,7 @@ pub fn config_json(cfg: &Config, tok: &TinyTokenizer) -> String {
             LayerType::FullAttention => "full_attention",
         })
         .collect();
-    let j = serde_json::json!({
+    serde_json::json!({
         "architectures": ["Lfm2ForCausalLM"],
         "model_type": "lfm2",
         "vocab_size": cfg.vocab_size,
@@ -213,11 +225,67 @@ pub fn config_json(cfg: &Config, tok: &TinyTokenizer) -> String {
         "conv_bias": cfg.conv_bias,
         "layer_types": kinds,
         "tie_embedding": cfg.tie_embedding,
-        "bos_token_id": tok.id("<|startoftext|>"),
-        "eos_token_id": tok.id("<|im_end|>"),
-        "pad_token_id": tok.id("<|pad|>"),
-    });
-    serde_json::to_string_pretty(&j).expect("a JSON value serializes")
+        "bos_token_id": cfg.bos_token_id,
+        "eos_token_id": cfg.eos_token_id,
+    })
+}
+
+/// The committed geometry of the checkpoint `lloom` serves by default
+/// (LFM2.5-2.6B), under `lloom/tests/scale_manifests/`: what a synthetic
+/// LFM2 is built at when the checkpoint is not on the machine.
+pub const SCALE_GEOMETRY: &str = "lfm2.5-2.6b.json";
+
+/// Where [`SCALE_GEOMETRY`] is in this source tree.
+pub fn scale_geometry_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/scale_manifests")
+        .join(SCALE_GEOMETRY)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::testing::fixture::Scaled for Lfm2Tiny {
+    const CHECKPOINT_ENV: &'static str = "LFM2_MODEL_DIR";
+    const REPO: (&'static str, &'static str) = ("LiquidAI/LFM2.5-2.6B", "config.json");
+
+    fn checkpoint_of(file: PathBuf) -> PathBuf {
+        file.parent().map(Path::to_path_buf).unwrap_or(file)
+    }
+
+    fn scale_config(source: &crate::testing::fixture::Source) -> Result<Config> {
+        use crate::testing::fixture::Source;
+        let json = match source {
+            Source::Real(dir) => std::fs::read(dir.join("config.json"))?,
+            Source::Synthetic => std::fs::read(scale_geometry_path())?,
+        };
+        let cfg: Lfm2Config = serde_json::from_slice(&json).map_err(lloom_tensor::Error::wrap)?;
+        Ok(cfg.into_config(false))
+    }
+
+    /// The real checkpoint through the loader the engine uses (the mapped
+    /// safetensors), or the synthetic one in memory: the recording backend's
+    /// keyed values at the real geometry, no file read.
+    fn scale_model(
+        source: &crate::testing::fixture::Source,
+        cfg: &Config,
+        dtype: Option<DType>,
+        weights: &crate::testing::tiny::Weights,
+        dev: &Device,
+    ) -> Result<Model> {
+        use crate::testing::fixture::Source;
+        let dtype = dtype.unwrap_or_else(|| run_dtype(dev));
+        match source {
+            Source::Real(dir) => {
+                let ckpt = crate::hub::Checkpoint::from_safetensors_dir(dir)?;
+                // SAFETY: a checkpoint in the cache is not modified while a
+                // test maps it.
+                let vb = unsafe { ckpt.var_builder(dtype, dev)? };
+                Model::new(cfg, vb)
+            }
+            Source::Synthetic => TinyCheckpoint::<Self>::new(cfg.clone(), *weights)
+                .with_dtype(dtype)
+                .model(dev),
+        }
+    }
 }
 
 /// A checkpoint directory through the loader the engine uses

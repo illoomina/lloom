@@ -28,7 +28,8 @@
 
 use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams, FlashScatterParams};
 use crate::kernels::kernels::{
-    flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS,
+    flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_COMBINE_THREADS, FLASH_HEAD_DIMS,
+    FLASH_PARTIAL_WIDTHS, FLASH_SINGLE_THREADS,
 };
 use crate::kernels::metal::kv_pages::KvPagePool;
 use crate::kernels::metal::{Commands, ResidencySet};
@@ -269,6 +270,102 @@ fn run_flash_sized_width(
     chunk_capacity: usize,
     partial_width: usize,
 ) -> Vec<f32> {
+    run_flash_guarded(
+        device,
+        kernels,
+        queries,
+        keys,
+        values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        pages_per_chunk,
+        scale,
+        table,
+        chunk_capacity,
+        partial_width,
+        0,
+        FlashDType::F32,
+    )
+    .0
+}
+
+/// The sentinel `run_flash_guarded` fills the output's guard band with;
+/// exact in f16 and f32.
+const GUARD: f32 = 1234.0;
+
+/// `values` as the storage `dtype` holds them: f32 as they are, f16 rounded.
+fn stored(values: &[f32], dtype: FlashDType) -> Vec<f32> {
+    match dtype {
+        FlashDType::F16 => values
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect(),
+        _ => values.to_vec(),
+    }
+}
+
+fn new_typed(device: &Device, values: &[f32], dtype: FlashDType) -> crate::kernels::Buffer {
+    match dtype {
+        FlashDType::F32 => new_f32(device, values),
+        FlashDType::F16 => {
+            let bits: Vec<u16> = values
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_bits())
+                .collect();
+            let buf = device
+                .new_buffer(std::mem::size_of_val(bits.as_slice()).max(4), SHARED)
+                .unwrap();
+            // SAFETY: freshly allocated shared storage of at least this length.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bits.as_ptr(), buf.contents() as *mut u16, bits.len())
+            };
+            buf
+        }
+        FlashDType::BF16 => unreachable!("no bf16 attention kernel"),
+    }
+}
+
+fn read_typed(buf: &crate::kernels::Buffer, n: usize, dtype: FlashDType) -> Vec<f32> {
+    match dtype {
+        FlashDType::F16 => {
+            // SAFETY: the buffer holds at least `n` f16 values written by the kernel.
+            let bits = unsafe { std::slice::from_raw_parts(buf.contents() as *const u16, n) };
+            bits.iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect()
+        }
+        _ => read_f32(buf, n),
+    }
+}
+
+/// [`run_flash_sized_width`] at storage `dtype` with `guard` sentinel values
+/// past the output: returns the output and the guard band as the kernel left
+/// it, so a write past the last head's vector is visible.
+#[allow(clippy::too_many_arguments)]
+fn run_flash_guarded(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    capacity: usize,
+    n_keys: usize,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scale: f32,
+    table: &ChunkTable,
+    chunk_capacity: usize,
+    partial_width: usize,
+    guard: usize,
+    dtype: FlashDType,
+) -> (Vec<f32>, Vec<f32>) {
     let cmds = commands(device);
     let chunk_size = page_size * pages_per_chunk;
     let n_chunks = flash_chunk_count(n_keys, chunk_size);
@@ -278,10 +375,12 @@ fn run_flash_sized_width(
          computes; the partial pass would write past it"
     );
 
-    let q_buf = new_f32(device, queries);
-    let k_buf = new_f32(device, keys);
-    let v_buf = new_f32(device, values);
-    let out = device.new_buffer(n_q_heads * head_dim * 4, SHARED).unwrap();
+    let q_buf = new_typed(device, queries, dtype);
+    let k_buf = new_typed(device, keys, dtype);
+    let v_buf = new_typed(device, values, dtype);
+    let mut init = vec![0f32; n_q_heads * head_dim];
+    init.extend(std::iter::repeat_n(GUARD, guard));
+    let out = new_typed(device, &init, dtype);
     // Sized for the CAPACITY, exactly as `FlashDecoding::metal_fwd` sizes it,
     // so a reserving arm here allocates the region the kernel then strides by.
     let partials = device
@@ -358,13 +457,15 @@ fn run_flash_sized_width(
             n_q_heads,
             head_dim,
             n_chunks,
-            FlashDType::F32,
+            dtype,
             partial_width,
         )
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
-    read_f32(&out, n_q_heads * head_dim)
+    let all = read_typed(&out, n_q_heads * head_dim + guard, dtype);
+    let (out, tail) = all.split_at(n_q_heads * head_dim);
+    (out.to_vec(), tail.to_vec())
 }
 
 /// **Every declared name resolves against the compiled library.**
@@ -397,10 +498,146 @@ fn flash_names_resolve() {
 fn flash_refuses_an_uninstantiated_head_dim() {
     assert!(FlashKernel::partial(FlashDType::F16, 63, 32).is_err());
     assert!(FlashKernel::partial(FlashDType::F16, 64, 16).is_err());
-    assert!(FlashKernel::combine(FlashDType::F16, 512).is_err());
+    assert!(FlashKernel::combine(FlashDType::F16, 48).is_err());
+    assert!(FlashKernel::single(FlashDType::F32, 16).is_err());
+    assert!(FlashKernel::single(FlashDType::F32, 1024).is_err());
+    assert!(FlashKernel::single(FlashDType::F32, 512).is_err());
+    assert!(FlashKernel::single(FlashDType::F16, 512).is_ok());
+    assert!(FlashKernel::single(FlashDType::BF16, 64).is_err());
     for hd in FLASH_HEAD_DIMS {
         assert!(FlashKernel::partial(FlashDType::F16, hd, 32).is_ok());
         assert!(FlashKernel::partial(FlashDType::F16, hd, 8).is_ok());
+    }
+}
+
+/// **Every pipeline admits the threadgroup width it is dispatched at.**
+///
+/// A kernel's register demand grows with the head dim (`ceil(D / 32)`
+/// elements of `q`, `k` and `o` per lane), and a pipeline whose
+/// `maxTotalThreadsPerThreadgroup` falls below its dispatch width cannot run
+/// that dispatch. The widths are the host's own constants.
+#[test]
+fn every_flash_pipeline_admits_its_dispatch_width() {
+    let device = device();
+    let kernels = Kernels::new();
+    for dtype in [FlashDType::F16, FlashDType::F32] {
+        for &hd in dtype.head_dims() {
+            let cells = [
+                (
+                    FlashKernel::single(dtype, hd).unwrap(),
+                    FLASH_SINGLE_THREADS,
+                ),
+                (FlashKernel::partial(dtype, hd, 32).unwrap(), 32 * 32),
+                (FlashKernel::partial(dtype, hd, 8).unwrap(), 8 * 32),
+                (
+                    FlashKernel::combine(dtype, hd).unwrap(),
+                    FLASH_COMBINE_THREADS,
+                ),
+            ];
+            for (name, width) in cells {
+                let pipeline = kernels
+                    .load_pipeline(&device, Source::FlashDecoding, name.clone())
+                    .unwrap();
+                let max = pipeline.max_total_threads_per_threadgroup();
+                println!("{name}: maxTotalThreadsPerThreadgroup {max}, dispatched at {width}");
+                assert!(
+                    max >= width,
+                    "{name} admits {max} threads per threadgroup and is dispatched at {width}"
+                );
+            }
+        }
+    }
+}
+
+/// **Parity at every instantiated head dim and dtype, both partial widths,
+/// one chunk and several**, with NaN in the reserved capacity past the live
+/// keys and a guard band past the output: a head dim that is not a multiple
+/// of 32 (72, 80) masks each lane's tail, and a tail element read or written
+/// shows as a NaN, a wrong answer or a moved guard. The reference is the f64 softmax over the values as stored; f16
+/// output rounding is below 1e-3 at these magnitudes, f32 is held at 2e-5.
+#[test]
+fn flash_matches_the_reference_at_every_head_dim() {
+    let device = device();
+    let kernels = Kernels::new();
+    let n_q_heads = 8;
+    let n_kv_heads = 2;
+    let capacity = 1100;
+    let page_size = 256;
+    for (dtype, tol) in [(FlashDType::F32, 2e-5f32), (FlashDType::F16, 1e-3)] {
+        for &hd in dtype.head_dims() {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let queries = stored(&fill(n_q_heads * hd, 21), dtype);
+            let keys = stored(&fill(n_kv_heads * capacity * hd, 22), dtype);
+            let values = stored(&fill(n_kv_heads * capacity * hd, 23), dtype);
+            for &n_keys in &[1usize, 200, 300, 1037] {
+                // The reserved capacity past the live keys holds NaN, as an
+                // unwritten cache may: a lane that reads past its head
+                // vector reads the next token, and at the last live token
+                // that is a NaN no zero weight cancels.
+                let poison = |v: &[f32]| -> Vec<f32> {
+                    let mut v = v.to_vec();
+                    for h in 0..n_kv_heads {
+                        let live = (h * capacity + n_keys) * hd;
+                        v[live..(h + 1) * capacity * hd].fill(f32::NAN);
+                    }
+                    v
+                };
+                let (keys, values) = (poison(&keys), poison(&values));
+                let want = reference_attention(
+                    &queries, &keys, &values, n_q_heads, n_kv_heads, hd, capacity, n_keys, scale,
+                );
+                let n_chunks = flash_chunk_count(n_keys, page_size);
+                for width in FLASH_PARTIAL_WIDTHS {
+                    let (got, tail) = run_flash_guarded(
+                        &device,
+                        &kernels,
+                        &queries,
+                        &keys,
+                        &values,
+                        n_q_heads,
+                        n_kv_heads,
+                        hd,
+                        capacity,
+                        n_keys,
+                        page_size,
+                        1,
+                        scale,
+                        &ChunkTable::Contiguous,
+                        n_chunks,
+                        width,
+                        64,
+                        dtype,
+                    );
+                    // `f32::max` drops a NaN operand, so a NaN output would
+                    // read as agreement: fold it in explicitly.
+                    let worst = got
+                        .iter()
+                        .zip(want.iter())
+                        .map(|(g, w)| (g - w).abs())
+                        .fold(0f32, |m, d| {
+                            if d.is_nan() || m.is_nan() {
+                                f32::NAN
+                            } else {
+                                m.max(d)
+                            }
+                        });
+                    println!(
+                        "{dtype:?} head_dim {hd} n_keys {n_keys} chunks {n_chunks} width {width}: \
+                         worst |delta| {worst:e}"
+                    );
+                    assert!(
+                        worst.is_finite() && worst < tol,
+                        "{dtype:?} head_dim {hd} n_keys {n_keys} chunks {n_chunks} width \
+                         {width}: worst |delta| {worst:e} against the f64 reference"
+                    );
+                    assert!(
+                        tail.iter().all(|&t| t == GUARD),
+                        "{dtype:?} head_dim {hd} n_keys {n_keys} width {width}: a write past \
+                         the last head"
+                    );
+                }
+            }
+        }
     }
 }
 

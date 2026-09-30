@@ -32,6 +32,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::load_warning::{LoadWarning, LoadWarningKind};
 use lloom::models::lfm2::{
     AttnImpl, BatchPool, Cache, Config, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
@@ -251,6 +252,9 @@ pub struct Engine {
     /// What warmup measured: the in-flight depth and the `(host_ns, gpu_ns)`
     /// balance it implies (the pacer takes `decode.in_flight`, not this).
     pub warm_in_flight: Option<(usize, (u64, u64))>,
+    /// The load's degradations: `load_engine`'s notes, the model's, this
+    /// engine's (`Served::load_warnings`).
+    load_warnings: Vec<LoadWarning>,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -440,14 +444,17 @@ impl Engine {
         // 8 / 16, 2.1–2.4 accepted of 9 per round against a B × 10-position
         // verify); structured prompts (7.8–8.3 accepted) pay at every B.
         // Said once at load; the flag is honoured either way.
+        let mut load_warnings = Vec::new();
         if dspark_dir.is_some() && opts.batch >= 16 && opts.dspark_k.is_none() {
-            eprintln!(
-                "[dspark: at --batch {} the speculative loop measured slower than plain \
-                 batched decode on natural text even at the batch's draft length (K=3: −13 % \
-                 at 16; +52 % at 4, +14 % at 8); it pays where the drafter's acceptance is \
-                 high (structured, repetitive context). Serving it as asked.]",
+            let note = format!(
+                "at --batch {} the speculative loop measured slower than plain batched decode \
+                 on natural text even at the batch's draft length (K=3: −13 % at 16; +52 % at \
+                 4, +14 % at 8); it pays where the drafter's acceptance is high (structured, \
+                 repetitive context). Serving it as asked.",
                 opts.batch
             );
+            eprintln!("[dspark: {note}]");
+            load_warnings.push(LoadWarning::new(LoadWarningKind::Speculation, note));
         }
         let dcfg = match &dspark_dir {
             Some(dir) => {
@@ -587,6 +594,7 @@ impl Engine {
             vb
         };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
+        load_warnings.splice(0..0, model.load_warnings().iter().cloned());
         let vision = if vl {
             let vl_config: Lfm2VlConfig = serde_json::from_value(root.clone())
                 .context("parsing config.json's vision half")?;
@@ -696,6 +704,7 @@ impl Engine {
             dspark_setup: dspark_dir.clone().zip(dcfg.clone()),
             installed,
             warm_in_flight: None,
+            load_warnings,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -2400,6 +2409,14 @@ impl super::served::Served for Engine {
     }
     fn capabilities(&self) -> super::family::Capabilities {
         super::family::LFM2_CAPABILITIES
+    }
+    fn load_warnings(&self) -> Vec<LoadWarning> {
+        let mut w = self.load_warnings.clone();
+        w.extend(lloom::load_warning::emulated(&self.core.device));
+        w
+    }
+    fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>) {
+        self.load_warnings.splice(0..0, warnings);
     }
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
         Engine::encode(self, text, add_special)

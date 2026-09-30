@@ -4203,6 +4203,7 @@ impl MetalStorage {
         let itype = match self.dtype {
             DType::F16 => FlashDType::F16,
             DType::F32 => FlashDType::F32,
+            DType::BF16 => FlashDType::BF16,
             other => crate::bail!("Metal kv_scatter {other:?} not implemented"),
         };
         if slots.dtype != DType::U32 {

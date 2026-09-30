@@ -11,6 +11,7 @@ pub mod tuning;
 
 pub mod fused_moe;
 pub mod generation;
+pub mod load_warning;
 // The hub module downloads checkpoints (hf-hub) and owns the tokenizer
 // (tokenizers), neither of which compiles to wasm32; a browser loads bytes and
 // tokenizes in JS (#656). Host-only.

@@ -6412,6 +6412,48 @@ fn sdpa_packed_names_resolve() {
 /// #82 out and #81 left `left_size` alone. Pinned in #64's shape instead:
 /// asserting the **current** state, so it turns red when corrected rather than
 /// sitting as a TODO.
+/// **Why `sdpa_vector` computes nothing at f32 x head_dim 512**: its pipeline
+/// admits fewer threads per threadgroup than the 1024 `call_sdpa_vector`
+/// dispatches, so the dispatch writes no output (the "returns ~0" of
+/// `docs/porting-models.md` §21.8). bf16 x 512 does the same on a GPU that
+/// emulates bf16 (Apple7). f16 at 512 and f32 at 256 admit 1024: the
+/// control. Asserting the current state, so a toolchain that fits it turns
+/// this red and the refusal can be revisited.
+#[test]
+fn sdpa_vector_f32_512_admits_fewer_threads_than_it_is_dispatched_at() {
+    let device = device();
+    let kernels = Kernels::new();
+    let constants = || {
+        Some(ConstantValues::new(vec![(
+            20,
+            Value::Bool(/* sdpa_vector_has_mask */ false),
+        )]))
+    };
+    let max = |name: &str| {
+        kernels
+            .load_pipeline_with_constants(&device, Source::Sdpa, name.to_string(), constants())
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"))
+            .max_total_threads_per_threadgroup()
+    };
+    for name in [
+        "sdpa_vector_float_512",
+        "sdpa_vector_float16_t_512",
+        "sdpa_vector_bfloat16_t_512",
+        "sdpa_vector_float_256",
+    ] {
+        println!("{name}: maxTotalThreadsPerThreadgroup {}", max(name));
+    }
+    assert!(max("sdpa_vector_float_512") < 1024);
+    let bf16_native = crate::kernels::metal::arms::for_device(&device)
+        .has(crate::kernels::metal::arms::Feature::Bf16);
+    if !bf16_native {
+        assert!(max("sdpa_vector_bfloat16_t_512") < 1024);
+    }
+    for control in ["sdpa_vector_float16_t_512", "sdpa_vector_float_256"] {
+        assert_eq!(max(control), 1024, "{control}");
+    }
+}
+
 #[test]
 fn sdpa_vector_declares_variants_the_name_table_cannot_reach() {
     let device = device();

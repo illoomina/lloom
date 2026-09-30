@@ -217,6 +217,23 @@ struct FlashCombineParams {
 /// a strided or `narrow`ed KV cache, and §10.7's int8 KV, are a different value
 /// here rather than a different kernel. The single-chunk tail below inherits
 /// that capability, which is why it is NOT a rewiring to `sdpa_vector`.
+/// Lanes per head vector and whether element `e` of it is live.
+///
+/// Each of a simdgroup's 32 lanes holds `ceil(D / 32)` consecutive elements of
+/// the head vector. A head dim that is a multiple of 32 has no tail and
+/// `flash_live` folds to `true`, so those instantiations compile to the
+/// unmasked body; 72 and 80 run three elements per lane and mask the tail,
+/// which is never read, never accumulated and never written.
+template <int D>
+constexpr int flash_elems() {
+  return (D + 31) / 32;
+}
+
+template <int D>
+inline bool flash_live(int e) {
+  return (D % 32) == 0 || e < D;
+}
+
 template <typename T, int D, int BN, int BD, int elem_per_thread>
 inline void flash_decoding_core(
     const device T* queries,
@@ -257,7 +274,8 @@ inline void flash_decoding_core(
   thread U q[elem_per_thread];
   thread U k[elem_per_thread];
 
-  queries += head_idx * D + simd_lid * elem_per_thread;
+  const int lane_base = (int)simd_lid * elem_per_thread;
+  queries += head_idx * D + lane_base;
 
   const device T* k_base = keys + (size_t)seq_idx * p.k_seq_stride +
                            kv_head_idx * k_head_stride + simd_lid * elem_per_thread;
@@ -265,7 +283,7 @@ inline void flash_decoding_core(
                            kv_head_idx * v_head_stride + simd_lid * elem_per_thread;
 
   for (int i = 0; i < elem_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+    q[i] = flash_live<D>(lane_base + i) ? static_cast<U>(scale) * queries[i] : 0;
   }
   for (int i = 0; i < elem_per_thread; i++) {
     o[i] = 0;
@@ -283,7 +301,7 @@ inline void flash_decoding_core(
     const device T* vp = v_base + (size_t)t * v_token_stride;
 
     for (int j = 0; j < elem_per_thread; j++) {
-      k[j] = kp[j];
+      k[j] = flash_live<D>(lane_base + j) ? static_cast<U>(kp[j]) : 0;
     }
 
     U score = 0;
@@ -304,7 +322,7 @@ inline void flash_decoding_core(
     sum_exp_score = sum_exp_score * factor + exp_score;
 
     for (int j = 0; j < elem_per_thread; j++) {
-      o[j] = o[j] * factor + exp_score * vp[j];
+      o[j] = o[j] * factor + exp_score * (flash_live<D>(lane_base + j) ? static_cast<U>(vp[j]) : 0);
     }
   }
 
@@ -373,7 +391,7 @@ template <typename T, int D, int BN>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BD = 32;
-  constexpr int elem_per_thread = D / BD;
+  constexpr int elem_per_thread = flash_elems<D>();
 
   typedef float U;
 
@@ -464,7 +482,7 @@ template <typename T, int D, int BN>
       threadgroup_barrier(mem_flags::mem_threadgroup);
       U v = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (simd_lid == 0) {
+      if (simd_lid == 0 && flash_live<D>(simd_gid * elem_per_thread + i)) {
         acc_out[simd_gid * elem_per_thread + i] = empty ? 0.0f : v;
       }
     }
@@ -478,7 +496,7 @@ template <typename T, int D, int BN>
       outputs[simd_lid * BN + simd_gid] =
           o[i] * fast::exp(max_scores[simd_gid] - new_max);
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (simd_gid == 0) {
+      if (simd_gid == 0 && flash_live<D>(simd_lid * elem_per_thread + i)) {
         U v = outputs[simd_lid * BN];
         for (int j = 1; j < BN; j++) {
           v += outputs[simd_lid * BN + j];
@@ -538,7 +556,7 @@ template <typename T, int D>
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int BN = 32;
   constexpr int BD = 32;
-  constexpr int elem_per_thread = D / BD;
+  constexpr int elem_per_thread = flash_elems<D>();
 
   typedef float U;
 
@@ -575,7 +593,7 @@ template <typename T, int D>
     threadgroup_barrier(mem_flags::mem_threadgroup);
     U v = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && flash_live<D>(simd_gid * elem_per_thread + i)) {
       head_out[simd_gid * elem_per_thread + i] = static_cast<T>(v * inv_denom);
     }
   }
@@ -642,11 +660,11 @@ template <typename T, int D>
   // 8k, on 256 threads instead of 32.
   constexpr int BN = 8;
   constexpr int BD = 32;
-  constexpr int elem_per_thread = D / BD;
+  constexpr int elem_per_thread = flash_elems<D>();
 
   typedef float U;
 
-  threadgroup U red[BN * D];
+  threadgroup U red[BN * BD * elem_per_thread];
 
   const FlashCombineParams p = *params;
   const int n_chunks = p.n_chunks;
@@ -708,13 +726,16 @@ template <typename T, int D>
     const U rescale = fast::exp(head_maxs[c] - global_max);
     const device float* chunk_acc = head_partials + (size_t)c * D;
     for (int i = 0; i < elem_per_thread; i++) {
-      acc[i] += chunk_acc[lane_base + i] * rescale;
+      if (flash_live<D>(lane_base + i)) {
+        acc[i] += chunk_acc[lane_base + i] * rescale;
+      }
     }
   }
 
   // The BN partial merges, summed in simdgroup order by simdgroup 0.
+  constexpr int red_stride = BD * elem_per_thread;
   for (int i = 0; i < elem_per_thread; i++) {
-    red[simd_gid * D + lane_base + i] = acc[i];
+    red[simd_gid * red_stride + lane_base + i] = acc[i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const U inv_denom = denom > 0 ? 1.0f / denom : 0.0f;
@@ -723,9 +744,11 @@ template <typename T, int D>
     for (int i = 0; i < elem_per_thread; i++) {
       U v = 0;
       for (int g = 0; g < BN; g++) {
-        v += red[g * D + lane_base + i];
+        v += red[g * red_stride + lane_base + i];
       }
-      head_out[i] = static_cast<T>(v * inv_denom);
+      if (flash_live<D>(lane_base + i)) {
+        head_out[i] = static_cast<T>(v * inv_denom);
+      }
     }
   }
 }
@@ -858,12 +881,12 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
 // Instantiations
 // ============================================================================
 //
-// Named per §7.4's convention. The head dimensions match `call_sdpa_vector`'s
-// `match` arms rather than the file's own instantiation list, because #103
-// found those two disagreeing in `scaled_dot_product_attention.metal` -- eight
-// instantiated, six reachable -- and a registry that declares an unreachable
-// name is the inverse of §8.1b's absent-variant class. `FlashKernel::ALL`
-// resolves every name below against the compiled library.
+// Named per §7.4's convention. The head dimensions are `FLASH_HEAD_DIMS` (half)
+// and `FLASH_F32_HEAD_DIMS` (float), one list per dtype on the Rust side,
+// because #103 found `scaled_dot_product_attention.metal` instantiating eight
+// head dims its entry points reach six of, and a registry that declares an
+// unreachable name is the inverse of §8.1b's absent-variant class.
+// `FlashKernel::all` resolves every name below against the compiled library.
 
 // clang-format off
 #define instantiate_flash_decoding_partial(type, head_dim, bn, name)         \
@@ -912,11 +935,18 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
 #define instantiate_flash_decoding_heads(type) \
   instantiate_flash_decoding(type, 32)         \
   instantiate_flash_decoding(type, 64)         \
+  instantiate_flash_decoding(type, 72)         \
+  instantiate_flash_decoding(type, 80)         \
   instantiate_flash_decoding(type, 96)         \
-  instantiate_flash_decoding(type, 128)
+  instantiate_flash_decoding(type, 128)        \
+  instantiate_flash_decoding(type, 256)
 
+// 512 at half only: at float the pipeline admits fewer threads per
+// threadgroup than the 1024 the single and square partial passes dispatch
+// (`FLASH_F32_HEAD_DIMS`).
 instantiate_flash_decoding_heads(float)
 instantiate_flash_decoding_heads(half)
+instantiate_flash_decoding(half, 512)
 
 // The scatter is per element and has no head-dimension template: one
 // instantiation per dtype.
@@ -931,9 +961,13 @@ instantiate_flash_decoding_heads(half)
 
 instantiate_flash_kv_scatter(float)
 instantiate_flash_kv_scatter(half)
+#if defined(__HAVE_BFLOAT__)
+instantiate_flash_kv_scatter(bfloat)
+#endif
 // clang-format on
 
-// **`bfloat` is deliberately not instantiated, and that is still a scope
+// **`bfloat` attention is deliberately not instantiated (the scatter above
+// moves bf16 without arithmetic and is), and that is still a scope
 // statement rather than an omission -- but every reason this comment used to
 // give for it is FALSE.** Measured 2026-08-30 (#307, `DESIGN.md` §3.9).
 //

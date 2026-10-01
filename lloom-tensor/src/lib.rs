@@ -98,6 +98,7 @@ pub mod kernels;
 /// (LFM2's `BatchPool`, Qwen4-exp's `KvPool`; #749 P29 (8)). Re-exported at
 /// `kernels::metal::kv_pages`, its former home, for the Metal callers.
 pub mod kv_pages;
+pub mod retire;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod nditer;

@@ -606,7 +606,7 @@ struct Generation {
     /// last set.
     used: bool,
     /// `(clock id, epoch)` of the last step that executed from it.
-    last_use: Option<(u64, u64)>,
+    last_use: Option<(u64, crate::retire::Epoch)>,
 }
 
 /// Generations a plan may hold. Beyond it a step whose generations are all

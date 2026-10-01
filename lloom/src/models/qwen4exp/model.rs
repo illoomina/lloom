@@ -1004,7 +1004,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// than a pool buffer per step (`replay_input_owned`), and the epoch of
     /// the command buffer its last reader was encoded into.
     #[cfg(feature = "metal")]
-    replay_h: parking_lot::Mutex<Option<(Tensor, Option<u64>)>>,
+    replay_h: parking_lot::Mutex<Option<(Tensor, Option<lloom_tensor::kernels::metal::Epoch>)>>,
     /// A one-position step's PLE rows, gathered on the host into a Shared
     /// buffer the model keeps rather than uploaded per step
     /// (`ple_rows_owned`), and the epoch of its last reader.
@@ -1013,7 +1013,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
         Option<(
             lloom_tensor::kernels::metal::BufferHandle,
             Tensor,
-            Option<u64>,
+            Option<lloom_tensor::kernels::metal::Epoch>,
         )>,
     >,
     cfg: Config,

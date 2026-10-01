@@ -36,6 +36,7 @@ use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
 use lloom_tensor::quantized::QMatMul;
+use lloom_tensor::retire::{Completed, Epoch};
 use lloom_tensor::{DType, Module, Result, Tensor, D};
 
 /// Per-layer growing KV state for one sequence (full-attn layers only). Unlike
@@ -875,31 +876,37 @@ impl KvPool {
 
 impl KvPoolInner {
     /// The GPU's current epoch (Metal), the epoch a released page waits for.
-    fn epoch(&self) -> u64 {
+    fn epoch(&self) -> Epoch {
         #[cfg(feature = "metal")]
         {
-            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
+            self.clock
+                .as_ref()
+                .map(|c| c.current_epoch())
+                .unwrap_or(Epoch::ZERO)
         }
         #[cfg(not(feature = "metal"))]
         {
-            0
+            Epoch::ZERO
         }
     }
 
     /// Epochs the GPU has completed (every one, without a clock).
-    fn completed(&self) -> u64 {
+    fn completed(&self) -> Completed {
         #[cfg(feature = "metal")]
         {
-            self.clock.as_ref().map(|c| c.completed_count()).unwrap_or(u64::MAX)
+            self.clock
+                .as_ref()
+                .map(|c| c.completed_count())
+                .unwrap_or(Completed::ALL)
         }
         #[cfg(not(feature = "metal"))]
         {
-            u64::MAX
+            Completed::ALL
         }
     }
 
     fn recycle_quarantined(&mut self) {
-        let ready = self.quarantine.drain_completed(self.completed());
+        let ready = self.quarantine.drain(self.completed());
         if !ready.is_empty() {
             self.pages.recycle(&ready).expect("quarantined pages are unallocated");
         }
@@ -908,7 +915,7 @@ impl KvPoolInner {
     fn release_pages(&mut self, slot: usize) {
         let freed = self.pages.release(slot);
         let epoch = self.epoch();
-        self.quarantine.quarantine(epoch, freed);
+        self.quarantine.retire_all(epoch, freed);
     }
 
     fn rewind_table(&mut self, slot: usize) {

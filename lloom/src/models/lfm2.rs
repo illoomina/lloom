@@ -2207,7 +2207,7 @@ impl PagedKv {
         // session recycles rather than exhausts.
         let ready = self
             .quarantine
-            .drain_completed(self.clock.completed_count());
+            .drain(self.clock.completed_count());
         let (pool_pages, page_size) = (self.pool_pages(), self.page_size);
         let pool = self.pool.as_mut().expect("created above");
         pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
@@ -2376,7 +2376,7 @@ impl PagedKv {
                 freed.extend(pool.release(s));
             }
             self.quarantine
-                .quarantine(self.clock.current_epoch(), freed);
+                .retire_all(self.clock.current_epoch(), freed);
         }
         self.len = 0;
         self.pass_len = 0;
@@ -2461,7 +2461,7 @@ impl PagedKv {
     fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
         let ready = self
             .quarantine
-            .drain_completed(self.clock.completed_count());
+            .drain(self.clock.completed_count());
         let (pool_pages, page_size, ppc) = (self.pool_pages(), self.page_size, self.pages_per_chunk);
         let pool = self
             .pool
@@ -2484,7 +2484,7 @@ impl PagedKv {
                     device.synchronize()?;
                     let ready = self
                         .quarantine
-                        .drain_completed(self.clock.completed_count());
+                        .drain(self.clock.completed_count());
                     pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
                     pool.append(slot, n)
                 }
@@ -2633,7 +2633,7 @@ impl PagedKv {
         };
         let freed = pool.release(slot);
         self.quarantine
-            .quarantine(self.clock.current_epoch(), freed.clone());
+            .retire_all(self.clock.current_epoch(), freed.clone());
         freed
     }
 

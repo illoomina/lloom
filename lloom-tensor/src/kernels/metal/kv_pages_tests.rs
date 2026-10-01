@@ -8,6 +8,7 @@
 //! worth writing.
 
 use super::kv_pages::{reserve_pages_for, KvPagePool, PageError, PageQuarantine};
+use crate::retire::{Completed, Epoch};
 
 /// A pool sized so the tests below can exhaust it deliberately.
 fn pool(pool_pages: usize) -> KvPagePool {
@@ -304,7 +305,7 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
     // Sequence 0 takes pages 0 and 1; a command buffer in epoch 7 reads them.
     let taken = p.append(0, 8).unwrap();
     assert_eq!(taken, vec![0, 1], "a fresh pool hands out the identity");
-    let reading_epoch = 7u64;
+    let reading_epoch = Epoch(7);
 
     // The CPU gives the sequence up. The refcount half says the pages are free.
     let freed = p.release(0);
@@ -312,14 +313,14 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
 
     // The epoch half says they are not yet SAFE, which is the distinction the
     // whole mechanism exists to make.
-    q.quarantine(reading_epoch, freed);
+    q.retire_all(reading_epoch, freed);
     assert_eq!(q.held(), 2);
 
     // Epoch 7 has not completed: `completed_count` counts FINISHED epochs, so
     // 7 means epochs 0..=6 are done and 7 is still running (GpuClock's own
     // off-by-one, inherited rather than re-derived).
     assert_eq!(
-        q.drain_completed(7),
+        q.drain(Completed(7)),
         Vec::<u32>::new(),
         "the reader is still in flight; nothing may be recycled"
     );
@@ -337,7 +338,7 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
     );
 
     // Once epoch 7 finishes, the pages become eligible and the pool takes them.
-    let ready = q.drain_completed(8);
+    let ready = q.drain(Completed(8));
     assert_eq!(ready, vec![0, 1]);
     assert_eq!(q.held(), 0);
     p.recycle(&ready).unwrap();
@@ -381,21 +382,21 @@ fn recycling_without_the_epoch_hands_back_a_page_the_gpu_is_reading() {
 #[test]
 fn the_quarantine_drains_in_epoch_order_and_stops_at_the_first_unfinished() {
     let mut q = PageQuarantine::new();
-    q.quarantine(1, vec![10, 11]);
-    q.quarantine(2, vec![20]);
-    q.quarantine(5, vec![50, 51]);
+    q.retire_all(Epoch(1), vec![10, 11]);
+    q.retire_all(Epoch(2), vec![20]);
+    q.retire_all(Epoch(5), vec![50, 51]);
     assert_eq!(q.held(), 5);
 
     // Epoch 1 finished (count 2 == epochs 0 and 1 done), 2 has not.
-    assert_eq!(q.drain_completed(2), vec![10, 11]);
+    assert_eq!(q.drain(Completed(2)), vec![10, 11]);
     assert_eq!(q.held(), 3, "epoch 2's and epoch 5's pages stay");
 
     // Epoch 2 finished; epoch 5 has not, so the walk must stop rather than
     // sweeping the whole list.
-    assert_eq!(q.drain_completed(3), vec![20]);
+    assert_eq!(q.drain(Completed(3)), vec![20]);
     assert_eq!(q.held(), 2);
 
-    assert_eq!(q.drain_completed(6), vec![50, 51]);
+    assert_eq!(q.drain(Completed(6)), vec![50, 51]);
     assert!(q.is_empty());
 }
 
@@ -410,7 +411,7 @@ fn the_quarantine_drains_in_epoch_order_and_stops_at_the_first_unfinished() {
 fn quarantining_nothing_records_nothing() {
     let mut q = PageQuarantine::new();
     for epoch in 0..1000 {
-        q.quarantine(epoch, Vec::new());
+        q.retire_all(Epoch(epoch), Vec::new());
     }
     assert!(
         q.is_empty(),
@@ -558,14 +559,14 @@ fn reserve_reports_exhaustion() {
 fn an_epoch_quarantine_of_slots_drains_one_at_a_time_in_epoch_order() {
     use super::kv_pages::EpochQuarantine;
     let mut q: EpochQuarantine<usize> = EpochQuarantine::new();
-    q.quarantine_one(3, 7);
-    q.quarantine_one(3, 2);
-    q.quarantine_one(4, 9);
+    q.retire(Epoch(3), 7);
+    q.retire(Epoch(3), 2);
+    q.retire(Epoch(4), 9);
     let mut out = Vec::with_capacity(8);
     let cap = out.capacity();
-    q.drain_completed_into(3, &mut out);
+    q.drain_into(Completed(3), &mut out);
     assert!(out.is_empty(), "epoch 3 has not finished at a count of 3");
-    q.drain_completed_into(4, &mut out);
+    q.drain_into(Completed(4), &mut out);
     assert_eq!(
         out,
         vec![7, 2],
@@ -573,7 +574,7 @@ fn an_epoch_quarantine_of_slots_drains_one_at_a_time_in_epoch_order() {
     );
     assert_eq!(q.held(), 1);
     out.clear();
-    q.drain_completed_into(5, &mut out);
+    q.drain_into(Completed(5), &mut out);
     assert_eq!(out, vec![9]);
     assert!(q.is_empty());
     assert_eq!(out.capacity(), cap, "the drain reallocated its output");

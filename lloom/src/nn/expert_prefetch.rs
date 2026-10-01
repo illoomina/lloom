@@ -43,6 +43,7 @@
 
 use lloom_tensor::kernels::metal::staging::SharedStagingRing;
 use lloom_tensor::kernels::metal::BufferHandle;
+use lloom_tensor::kernels::metal::Epoch;
 use lloom_tensor::{MetalDevice, Result};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -108,7 +109,7 @@ struct Req {
     part: Part,
     /// A direct read: into these slots, once `epoch` is complete; the
     /// batch it belongs to (`direct_pending`) is told when it lands.
-    direct: Option<(u64, [DirectDst; 3], u64)>,
+    direct: Option<(u64, [DirectDst; 3], Epoch)>,
     /// A `load_now` request: the layer is waiting for it, so it is read
     /// past the staged-bytes cap — the cap bounds what the HINTS hold, and
     /// a hint's leftovers holding the cap against a needed read is a
@@ -241,7 +242,7 @@ pub struct DirectJob {
     pub expert: u32,
     pub planes: [PlaneSource; 3],
     pub dsts: [DirectDst; 3],
-    pub epoch: u64,
+    pub epoch: Epoch,
 }
 
 /// A [`Prefetcher::submit_now`] in flight: what was already staged, and
@@ -378,7 +379,7 @@ impl Prefetcher {
         expert: u32,
         planes: &[PlaneSource; 3],
         now: bool,
-        direct: Option<(u64, [DirectDst; 3], u64)>,
+        direct: Option<(u64, [DirectDst; 3], Epoch)>,
         out: &mut Vec<Req>,
     ) {
         let split = self.shared.split;
@@ -895,7 +896,7 @@ fn acquire_three(
 /// What a popped request reads into.
 enum Target {
     /// Straight into a slot (`read_direct`).
-    Direct(u64, [DirectDst; 3], u64),
+    Direct(u64, [DirectDst; 3], Epoch),
     /// Into ring entries of its own (`Part::Whole`, `stage`).
     Stage,
     /// A piece of an assembly, into this plane's ring entry.

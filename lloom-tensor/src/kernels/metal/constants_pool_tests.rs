@@ -62,7 +62,7 @@ fn a_slot_is_rewritten_only_after_its_last_reader_completes() {
 
     // The GPU finishes epoch 0.
     let closed = clock.commit_epoch();
-    assert_eq!(closed, 0);
+    assert_eq!(closed, crate::retire::Epoch(0));
     clock.mark_completed(closed);
 
     // Step 3, new bytes, every reader of the slot complete: rewritten in place,

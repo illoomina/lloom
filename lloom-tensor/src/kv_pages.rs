@@ -105,6 +105,8 @@
 /// base pointer and arithmetic on a number.
 pub type PageIdx = u32;
 
+pub use crate::retire::{Completed, Epoch, Retire};
+
 /// Why a page allocation failed.
 ///
 /// Exhaustion is an error rather than a grow *here*: the pool is a pure
@@ -545,141 +547,14 @@ impl KvPagePool {
 }
 
 /// Items freed on the CPU and not yet safe to reuse, held until the command
-/// buffer that last read them completes — generic over what is held: a KV
-/// page ([`PageQuarantine`]), a streamed expert's slot
-/// (`lloom::nn::expert_stream`).
-///
-/// # The obligation this discharges, and why it is not a fence
-///
-/// §10.3h works the fence story through paging and finds the count unchanged at
-/// 2 per attention layer per step — and then names **one non-fence obligation**
-/// that paging adds and that a barrier cannot express:
-///
-/// > *"A page returned to the free list and immediately reallocated to another
-/// > sequence is a **write-after-read across sequences** — the new owner writes
-/// > bytes the old reader may still be reading on the GPU. This is §6.7 L4
-/// > exactly, and it is the bug #23 fixed in the buffer pool, reappearing one
-/// > layer up. A page returns to the free list **when the command buffer holding
-/// > its last read completes**, not when its refcount hits zero on the CPU."*
-///
-/// A `MTLFence` orders work *within* a queue against a hazard the encoder can
-/// see; this hazard is between a read that has already been encoded and a write
-/// that has not been encoded yet, by a different sequence, possibly in a
-/// different command buffer. There is nothing for a barrier to order, which is
-/// why §10.3h calls the honest fence count *unchanged* and the obligation
-/// *additional*. A streamed expert's evicted slot is the same hazard: the next
-/// expert's bytes land in memory an encoded pass may still read.
-///
-/// # The shape is `GpuClock`'s, deliberately
-///
-/// §10.3h names §6.3b's epoch counter as the shape, and
-/// [`GpuClock`](super::buffer_pool::GpuClock) is that counter. This type holds
-/// the same two-number discipline — an epoch an item must *outlive*, against a
-/// count of epochs that have *finished* — so a reader who has understood the
-/// buffer pool's liveness rule has understood this one. It is a separate type
-/// rather than a field on [`KvPagePool`] so the pool stays what §10.3i asked
-/// for: a pure function of a configuration and an allocation history, with no
-/// device, no buffer and no dispatch.
-///
-/// # Why the epoch is captured at `quarantine` and not at `release`
-///
-/// The item must outlive **every** command buffer that could read it, and the
-/// last of those is the one in flight when the CPU gives the item up — not the
-/// one that was in flight when its refcount happened to reach zero. Capturing
-/// later is always safe and capturing earlier is not, so the capture belongs at
-/// the moment the caller hands the items over. A caller that batches several
-/// `release` results into one `quarantine` call therefore stays correct.
-#[derive(Clone, Debug)]
-pub struct EpochQuarantine<I> {
-    /// `(epoch the item must outlive, item)`, oldest first.
-    ///
-    /// Drained in order from the front: the epoch is non-decreasing by
-    /// construction, and §15.2 #10 forbids O(N) work on the per-token path —
-    /// `drain_completed` pops only the prefix that is ready and stops at the
-    /// first entry that is not.
-    pending: std::collections::VecDeque<(u64, I)>,
-}
+/// buffer that last read them completes: [`Retire`], the one liveness rule
+/// (`retire.rs`). The name survives for the pages' half of §10.3h — *"a page
+/// returns to the free list when the command buffer holding its last read
+/// completes, not when its refcount hits zero on the CPU"* — which is the
+/// obligation [`KvPagePool::release`] hands over and [`KvPagePool::recycle`]
+/// discharges; the two stay separate so the pool remains a pure function of
+/// its allocation history, with no device, buffer or dispatch.
+pub type EpochQuarantine<I> = Retire<I>;
 
 /// The KV pages' quarantine (§10.3h).
-pub type PageQuarantine = EpochQuarantine<PageIdx>;
-
-impl<I> Default for EpochQuarantine<I> {
-    fn default() -> Self {
-        Self {
-            pending: std::collections::VecDeque::new(),
-        }
-    }
-}
-
-impl<I> EpochQuarantine<I> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Hold `items` until epoch `epoch` has completed.
-    ///
-    /// `epoch` is the *current* epoch at the moment of the call — the one a
-    /// command buffer being encoded right now belongs to — so the items become
-    /// eligible once that epoch is known finished. Empty input records
-    /// nothing, so an idle step costs nothing.
-    pub fn quarantine(&mut self, epoch: u64, items: Vec<I>) {
-        self.pending.extend(items.into_iter().map(|i| (epoch, i)));
-    }
-
-    /// [`Self::quarantine`] of one item, allocating nothing once the queue
-    /// has grown to its working size.
-    pub fn quarantine_one(&mut self, epoch: u64, item: I) {
-        self.pending.push_back((epoch, item));
-    }
-
-    /// Items whose epoch has completed, removed from the quarantine.
-    ///
-    /// `completed_count` is [`GpuClock::completed_count`]'s value: a *count* of
-    /// finished epochs, so epoch `e` is finished iff `completed_count > e`. That
-    /// off-by-one is `GpuClock`'s own and is inherited rather than re-derived,
-    /// because the two must agree — see that type's `mark_completed`, which
-    /// stores `epoch + 1` precisely so zero can mean *"nothing has completed"*
-    /// rather than *"epoch 0 has"*.
-    pub fn drain_completed(&mut self, completed_count: u64) -> Vec<I> {
-        let mut out = Vec::new();
-        self.drain_completed_into(completed_count, &mut out);
-        out
-    }
-
-    /// [`Self::drain_completed`] appending to `out`, which keeps its capacity
-    /// across calls.
-    pub fn drain_completed_into(&mut self, completed_count: u64, out: &mut Vec<I>) {
-        while self
-            .pending
-            .front()
-            .is_some_and(|(epoch, _)| completed_count > *epoch)
-        {
-            out.push(self.pending.pop_front().expect("front checked").1);
-        }
-    }
-
-    /// Items a [`Self::drain_completed`] at `completed_count` would return,
-    /// counted without draining: what a planner may count as available
-    /// before the drain runs.
-    pub fn ready(&self, completed_count: u64) -> usize {
-        self.pending
-            .iter()
-            .take_while(|(epoch, _)| completed_count > *epoch)
-            .count()
-    }
-
-    /// Items held and not yet eligible.
-    ///
-    /// The quantity a leak would grow without bound, so it is worth reporting
-    /// rather than only asserting — §3.4a-iv's *"a curve that climbs without
-    /// plateauing is a leak or an allocator defect"*, which this document
-    /// records having seen three times and late every time.
-    pub fn held(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Whether anything is held.
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-}
+pub type PageQuarantine = Retire<PageIdx>;

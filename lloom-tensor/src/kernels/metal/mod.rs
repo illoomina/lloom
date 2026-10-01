@@ -91,6 +91,7 @@ pub mod io_queue;
 /// and an allocation history — no device, no buffer, no dispatch — which is the
 /// half §10.3i says to build **before** the page-walking kernel.
 pub use crate::kv_pages;
+pub use crate::retire::{self, Completed, Epoch, Retire, Tick};
 #[cfg(test)]
 mod kv_pages_tests;
 pub mod library;

@@ -24,6 +24,7 @@
 
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::{GgmlDType, MoeArm, QTensor};
+use lloom_tensor::retire::{Completed, Epoch, Retire};
 use lloom_tensor::{Device, Result, Tensor};
 use std::fs::File;
 use std::ops::Range;
@@ -618,18 +619,18 @@ pub struct ResidencyMap {
     /// buffer that read or wrote it: a direct read into the slot waits for
     /// it to complete before the bytes land (`Prefetcher::read_direct`).
     /// Read through [`Self::reader_epoch`].
-    last_epoch: Vec<u64>,
+    last_epoch: Vec<Epoch>,
     /// The epoch of the last device plan: that pass may read ANY slot, so
     /// every slot's last reader is at least this recent. One store per plan
     /// instead of a stamp per slot.
-    plan_epoch: u64,
+    plan_epoch: Epoch,
     tick: u64,
     /// Slots the quarantined arm keeps free (0: the in-place arm).
     spare: usize,
     /// Slots holding nothing whose last reader has completed.
     free: Vec<u32>,
     /// Slots evicted and not yet safe to write, with the epoch they outlive.
-    quarantine: lloom_tensor::kv_pages::EpochQuarantine<u32>,
+    quarantine: Retire<u32>,
     /// Slots evicted while a device plan was open: that plan's readers are
     /// not all encoded yet, so the epoch they must outlive is known only
     /// once it settles (`release_deferred`).
@@ -649,12 +650,12 @@ impl ResidencyMap {
             last_use: vec![0; n_slots],
             pinned: vec![false; n_slots],
             inflight: vec![0; n_slots],
-            last_epoch: vec![0; n_slots],
-            plan_epoch: 0,
+            last_epoch: vec![Epoch::ZERO; n_slots],
+            plan_epoch: Epoch::ZERO,
             tick: 0,
             spare: 0,
             free: Vec::new(),
-            quarantine: lloom_tensor::kv_pages::EpochQuarantine::new(),
+            quarantine: Retire::new(),
             deferred: Vec::new(),
             recycled: Vec::new(),
         }
@@ -693,9 +694,8 @@ impl ResidencyMap {
 
     /// Move every quarantined slot whose epoch has completed to the free
     /// list; how many.
-    fn recycle(&mut self, completed: u64) -> usize {
-        self.quarantine
-            .drain_completed_into(completed, &mut self.recycled);
+    fn recycle(&mut self, completed: Completed) -> usize {
+        self.quarantine.drain_into(completed, &mut self.recycled);
         let n = self.recycled.len();
         self.free.append(&mut self.recycled);
         n
@@ -730,22 +730,22 @@ impl ResidencyMap {
     /// is quarantined at `epoch` — every reader encoded so far is in an
     /// epoch at most `epoch` — or deferred while a device plan is open.
     /// Returns the expert evicted.
-    fn evict_lru(&mut self, tick: u64, epoch: u64, plan_open: bool) -> Option<u32> {
+    fn evict_lru(&mut self, tick: u64, epoch: Epoch, plan_open: bool) -> Option<u32> {
         let s = self.lru_resident(tick)?;
         let e = self.uninstall(s);
         if plan_open {
             self.deferred.push(s as u32);
         } else {
-            self.quarantine.quarantine_one(epoch, s as u32);
+            self.quarantine.retire(epoch, s as u32);
         }
         Some(e)
     }
 
     /// The device plans are settled: every reader of a slot evicted while
     /// one was open is encoded now, in an epoch at most `epoch`.
-    fn release_deferred(&mut self, epoch: u64) {
+    fn release_deferred(&mut self, epoch: Epoch) {
         for s in self.deferred.drain(..) {
-            self.quarantine.quarantine_one(epoch, s);
+            self.quarantine.retire(epoch, s);
         }
     }
 
@@ -796,16 +796,16 @@ impl ResidencyMap {
     /// only when no other is (the IO queue is in order, so the second load
     /// lands after the first; the hint's bytes were read for nothing).
     fn victim(&self, tick: u64) -> Option<(usize, bool)> {
-        self.victim_settled(tick, u64::MAX)
+        self.victim_settled(tick, Completed::ALL)
     }
 
     /// [`Self::victim`] preferring a slot whose last GPU reader's epoch is
     /// below `settled_before` (the pool clock's completed count): a direct
     /// read into it waits for nothing. Falls back to any slot.
-    fn victim_settled(&self, tick: u64, settled_before: u64) -> Option<(usize, bool)> {
+    fn victim_settled(&self, tick: u64, settled_before: Completed) -> Option<(usize, bool)> {
         self.victim_in(tick, true, settled_before)
-            .or_else(|| self.victim_in(tick, true, u64::MAX))
-            .or_else(|| self.victim_in(tick, false, u64::MAX))
+            .or_else(|| self.victim_in(tick, true, Completed::ALL))
+            .or_else(|| self.victim_in(tick, false, Completed::ALL))
     }
 
     /// [`Self::victim`] over the slots not in flight (`skip_inflight`) or
@@ -815,14 +815,14 @@ impl ResidencyMap {
         &self,
         tick: u64,
         skip_inflight: bool,
-        settled_before: u64,
+        settled_before: Completed,
     ) -> Option<(usize, bool)> {
         let mut best: Option<(usize, u64)> = None;
         for s in 0..self.expert_in.len() {
             if self.pinned[s]
                 || self.last_use[s] == tick
                 || (skip_inflight && self.inflight[s] != 0)
-                || self.reader_epoch(s) >= settled_before
+                || !settled_before.covers(self.reader_epoch(s))
             {
                 continue;
             }
@@ -839,12 +839,12 @@ impl ResidencyMap {
     }
 
     /// The epoch of slot `s`'s last GPU reader or writer.
-    fn reader_epoch(&self, s: usize) -> u64 {
+    fn reader_epoch(&self, s: usize) -> Epoch {
         self.last_epoch[s].max(self.plan_epoch)
     }
 
     /// A device plan in epoch `epoch` may read every slot.
-    fn plan_read_all(&mut self, epoch: u64) {
+    fn plan_read_all(&mut self, epoch: Epoch) {
         self.plan_epoch = self.plan_epoch.max(epoch);
     }
 
@@ -1174,7 +1174,7 @@ struct Inner {
     live: Option<LiveTable>,
     /// Entries whose bytes land by a copy encoded while a device plan was
     /// open: stored once the copy's epoch is complete.
-    landing: lloom_tensor::kv_pages::EpochQuarantine<(u32, u32)>,
+    landing: Retire<(u32, u32)>,
     landed_scratch: Vec<(u32, u32)>,
     /// A one-row host plan's buffers (Metal), kept for the tier's life so a
     /// decode step asks no pool for them (`DESIGN.md` §9.2aa): the routing
@@ -1200,12 +1200,12 @@ struct DecodeIo {
     slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
     /// The epoch of the command buffer the slot ids' last readers were
     /// encoded into (`down` stamps it), or `BUSY` from the write until then.
-    slots_read_at: Option<u64>,
+    slots_read_at: Option<Epoch>,
 }
 
 /// [`DecodeIo::slots_read_at`] between a write and its group's `down`.
 #[cfg(feature = "metal")]
-const BUSY: u64 = u64::MAX;
+const BUSY: Epoch = Epoch(u64::MAX);
 
 #[cfg(feature = "metal")]
 impl Inner {
@@ -1375,7 +1375,7 @@ impl Inner {
         }
         let done = self.completed_epochs();
         let mut ready = std::mem::take(&mut self.landed_scratch);
-        self.landing.drain_completed_into(done, &mut ready);
+        self.landing.drain_into(done, &mut ready);
         for &(e, slot) in &ready {
             if self.map.slot_of(e as usize) == Some(slot as usize) {
                 self.table_set(e, slot);
@@ -1576,7 +1576,7 @@ impl Streamed {
         // still pending would zero what the read landed.
         let mut map = ResidencyMap::new(n_experts, n_slots);
         #[cfg(feature = "metal")]
-        map.plan_read_all(clock.as_ref().map_or(0, |c| c.current_epoch()));
+        map.plan_read_all(clock.as_ref().map_or(Epoch::ZERO, |c| c.current_epoch()));
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 pools,
@@ -1597,7 +1597,7 @@ impl Streamed {
                 scratch_missing: Vec::new(),
                 plans_open: 0,
                 live: None,
-                landing: lloom_tensor::kv_pages::EpochQuarantine::new(),
+                landing: Retire::new(),
                 landed_scratch: Vec::new(),
                 #[cfg(feature = "metal")]
                 decode_io: DecodeIo::default(),
@@ -2049,7 +2049,7 @@ impl Streamed {
                     let (now, later): (Vec<_>, Vec<_>) = misses
                         .iter()
                         .copied()
-                        .partition(|&(_, s)| inner.map.reader_epoch(s) < settled);
+                        .partition(|&(_, s)| settled.covers(inner.map.reader_epoch(s)));
                     misses = later;
                     let mut jobs = Vec::with_capacity(now.len());
                     let mut bytes = 0u64;
@@ -2216,7 +2216,7 @@ impl Streamed {
             if inner.plans_open == 0 || direct_landed.contains(&e) {
                 inner.table_set(e, slot);
             } else {
-                inner.landing.quarantine_one(epoch, (e, slot));
+                inner.landing.retire(epoch, (e, slot));
             }
         }
     }
@@ -2291,7 +2291,7 @@ impl Streamed {
                     None => break,
                 }
             } else {
-                let Some((s, false)) = inner.map.victim_in(protect, true, u64::MAX) else {
+                let Some((s, false)) = inner.map.victim_in(protect, true, Completed::ALL) else {
                     break;
                 };
                 s
@@ -2390,7 +2390,10 @@ impl Streamed {
         let mut ring = ring.lock();
         let n = landed.len() as u64;
         let mut bytes = 0u64;
-        let epoch = clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
+        let epoch = clock
+            .as_ref()
+            .map(|c| c.current_epoch())
+            .unwrap_or(Epoch::ZERO);
         for (_, s, st) in landed {
             for (i, pool) in pools.iter_mut().enumerate() {
                 let plane = pool.plane_bytes;
@@ -2686,29 +2689,32 @@ fn escape_guard() -> Option<()> {
 impl Inner {
     /// Epochs the pool clock shows complete (`u64::MAX` off Metal: nothing
     /// to wait for).
-    fn completed_epochs(&self) -> u64 {
+    fn completed_epochs(&self) -> Completed {
         #[cfg(feature = "metal")]
         {
             self.clock
                 .as_ref()
                 .map(|c| c.completed_count())
-                .unwrap_or(u64::MAX)
+                .unwrap_or(Completed::ALL)
         }
         #[cfg(not(feature = "metal"))]
         {
-            u64::MAX
+            Completed::ALL
         }
     }
 
     /// The pool clock's current epoch (0 off Metal).
-    fn current_epoch(&self) -> u64 {
+    fn current_epoch(&self) -> Epoch {
         #[cfg(feature = "metal")]
         {
-            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
+            self.clock
+                .as_ref()
+                .map(|c| c.current_epoch())
+                .unwrap_or(Epoch::ZERO)
         }
         #[cfg(not(feature = "metal"))]
         {
-            0
+            Epoch::ZERO
         }
     }
 }
@@ -2980,7 +2986,7 @@ impl Streamed {
                 t0: std::time::Instant::now(),
             }));
         }
-        if inner.completed_epochs() < inner.current_epoch() {
+        if inner.completed_epochs().0 < inner.current_epoch().0 {
             self.counters
                 .settle_clock_lag
                 .fetch_add(1, Ordering::Relaxed);
@@ -4160,31 +4166,31 @@ mod tests {
         m.install(3, 1);
         m.touch(3, t);
         // Refill the spare: the LRU expert out, its slot held at epoch 10.
-        assert_eq!(m.evict_lru(t, 10, false), Some(5));
+        assert_eq!(m.evict_lru(t, Epoch(10), false), Some(5));
         assert_eq!(m.slot_of(5), None);
         assert_eq!((m.held(), m.free_slots()), (1, 0));
         assert_eq!(
-            m.recycle(10),
+            m.recycle(Completed(10)),
             0,
             "epoch 10 is not finished at a count of 10"
         );
         assert_eq!(m.take_free(), None);
-        assert_eq!(m.recycle(11), 1);
+        assert_eq!(m.recycle(Completed(11)), 1);
         assert_eq!(m.take_free(), Some(0), "the recycled slot");
         // A plan open: the eviction is deferred, not quarantined.
         let t = m.begin();
         m.install(0, 2);
         m.touch(0, t);
-        assert_eq!(m.evict_lru(t, 12, true), Some(6));
+        assert_eq!(m.evict_lru(t, Epoch(12), true), Some(6));
         assert_eq!(m.held(), 1);
         assert_eq!(
-            m.recycle(u64::MAX),
+            m.recycle(Completed::ALL),
             0,
             "a slot evicted under an open plan was recycled before the plan settled"
         );
-        m.release_deferred(20);
-        assert_eq!(m.recycle(20), 0);
-        assert_eq!(m.recycle(21), 1);
+        m.release_deferred(Epoch(20));
+        assert_eq!(m.recycle(Completed(20)), 0);
+        assert_eq!(m.recycle(Completed(21)), 1);
         assert_eq!(m.take_free(), Some(1));
     }
 
@@ -4262,7 +4268,7 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            while clock.completed_count() < clock.current_epoch() {
+            while clock.completed_count().0 < clock.current_epoch().0 {
                 std::thread::yield_now();
             }
         };

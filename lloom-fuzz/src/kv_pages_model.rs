@@ -38,6 +38,7 @@
 
 use lloom_tensor::kernels::metal::buffer_pool::GpuClock;
 use lloom_tensor::kernels::metal::kv_pages::{KvPagePool, PageError, PageIdx, PageQuarantine};
+use lloom_tensor::retire::Epoch;
 
 /// The fixture: what `KvPagePool::new` is called with.
 #[derive(Clone, Copy, Debug)]
@@ -293,13 +294,13 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                 eng.releases += 1;
                 eng.pages_quarantined += freed.len() as u64;
                 let epoch = clock.current_epoch();
-                quarantine.quarantine(epoch, freed.clone());
+                quarantine.retire_all(epoch, freed.clone());
                 if !freed.is_empty() {
-                    model.quarantined.push((epoch, freed));
+                    model.quarantined.push((epoch.0, freed));
                 }
             }
             Op::Commit => {
-                let closed = clock.commit_epoch();
+                let closed = clock.commit_epoch().0;
                 if closed != model.submitted {
                     return Err(at(format!(
                         "commit_epoch returned {closed}, model expected {}",
@@ -314,22 +315,22 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                 }
                 let newest = model.submitted - 1;
                 let epoch = newest - (back as u64 % (newest + 1));
-                clock.mark_completed(epoch);
+                clock.mark_completed(Epoch(epoch));
                 model.completed = model.completed.max(epoch + 1);
             }
             Op::Drain => {
                 let completed = clock.completed_count();
-                if completed != model.completed {
+                if completed.0 != model.completed {
                     return Err(at(format!(
                         "completed_count reads {completed}, model says {}",
                         model.completed
                     )));
                 }
-                let ready = quarantine.drain_completed(completed);
+                let ready = quarantine.drain(completed);
                 let n_ready = model
                     .quarantined
                     .iter()
-                    .take_while(|(e, _)| completed > *e)
+                    .take_while(|(e, _)| completed.0 > *e)
                     .count();
                 let want: Vec<PageIdx> = model
                     .quarantined

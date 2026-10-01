@@ -81,6 +81,8 @@
 use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as TracedLinear};
 use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Speculator};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
+#[cfg(feature = "metal")]
+use lloom_tensor::kernels::metal::Epoch;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
 #[cfg(feature = "metal")]
 use parking_lot::Mutex;
@@ -470,7 +472,7 @@ pub struct DSparkRotary {
     /// context pool's slot tensors (`paged_ctx::SeqSlots`). Behind a mutex
     /// because the forward takes `&self`; one short section per draft.
     #[cfg(feature = "metal")]
-    positions: Mutex<(Vec<u32>, Option<Tensor>, u64)>,
+    positions: Mutex<(Vec<u32>, Option<Tensor>, Epoch)>,
 }
 
 impl Clone for DSparkRotary {
@@ -480,7 +482,7 @@ impl Clone for DSparkRotary {
             sin: self.sin.clone(),
             interleaved: self.interleaved,
             #[cfg(feature = "metal")]
-            positions: Mutex::new((Vec::new(), None, 0)),
+            positions: Mutex::new((Vec::new(), None, Epoch::ZERO)),
         }
     }
 }
@@ -503,7 +505,7 @@ impl DSparkRotary {
             sin: freqs.sin()?.to_dtype(dtype)?,
             interleaved: !cfg.rope_is_neox_style,
             #[cfg(feature = "metal")]
-            positions: Mutex::new((Vec::new(), None, 0)),
+            positions: Mutex::new((Vec::new(), None, Epoch::ZERO)),
         })
     }
 
@@ -931,7 +933,7 @@ impl CtxCache {
 #[cfg(feature = "metal")]
 mod paged_ctx {
     use super::{Arc, Device, Mutex, Result, Tensor};
-    use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
+    use lloom_tensor::kernels::metal::{Epoch, GpuClock, KvPagePool, PageError, PageQuarantine};
 
     /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
     /// so a drafter and its target widen at the same cadence.
@@ -959,7 +961,7 @@ mod paged_ctx {
         block_host: Vec<u32>,
         /// The epoch of the last dispatch that read or wrote `block_all`; an
         /// in-place write waits for it to be complete, else a fresh tensor.
-        block_epoch: u64,
+        block_epoch: Epoch,
     }
 
     /// The slot tensor one sequence's layers share within a round.
@@ -989,7 +991,7 @@ mod paged_ctx {
     struct SeqSlots {
         slots: Vec<u32>,
         slots_t: Option<Tensor>,
-        epoch: u64,
+        epoch: Epoch,
     }
 
     /// Every layer's pool, one clock. Behind a `Mutex` because the forward
@@ -1046,7 +1048,7 @@ mod paged_ctx {
                     block: vec![None; n_seqs.max(1)],
                     block_all: None,
                     block_host: Vec::new(),
-                    block_epoch: 0,
+                    block_epoch: Epoch::ZERO,
                 })
                 .collect();
             Self {
@@ -1146,7 +1148,7 @@ mod paged_ctx {
             let completed = self.clock.completed_count();
             {
                 let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain_completed(completed);
+                let ready = lp.quarantine.drain(completed);
                 lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
             }
             // Room for the append and the block behind it, a bucket at a time.
@@ -1220,7 +1222,7 @@ mod paged_ctx {
             let completed = self.clock.completed_count();
             {
                 let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain_completed(completed);
+                let ready = lp.quarantine.drain(completed);
                 lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
             }
             let mut slots = std::mem::take(&mut self.scratch_slots);
@@ -1592,7 +1594,7 @@ mod paged_ctx {
                 return;
             }
             let freed = lp.pool.release(seq);
-            lp.quarantine.quarantine(epoch, freed);
+            lp.quarantine.retire_all(epoch, freed);
             lp.block[seq] = None;
         }
     }

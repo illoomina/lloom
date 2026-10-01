@@ -15,6 +15,7 @@
 //!
 //! Off, every entry point is one relaxed load. Never the shipping path.
 
+use crate::retire::Epoch;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -38,8 +39,8 @@ pub(crate) fn armed() -> bool {
 }
 
 /// Released buffers by object address, with the epoch they were stamped with.
-fn released() -> &'static parking_lot::Mutex<HashMap<usize, u64>> {
-    static MAP: OnceLock<parking_lot::Mutex<HashMap<usize, u64>>> = OnceLock::new();
+fn released() -> &'static parking_lot::Mutex<HashMap<usize, Epoch>> {
+    static MAP: OnceLock<parking_lot::Mutex<HashMap<usize, Epoch>>> = OnceLock::new();
     MAP.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
@@ -75,7 +76,7 @@ pub fn report() -> LateBindReport {
 }
 
 /// A pool took `buffer` back, stamped with `epoch`.
-pub fn on_release(buffer: &Buffer, epoch: u64) {
+pub fn on_release(buffer: &Buffer, epoch: Epoch) {
     if !armed() {
         return;
     }

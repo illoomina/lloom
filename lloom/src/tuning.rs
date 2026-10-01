@@ -253,6 +253,9 @@ pub struct Qwen4ExpTuning {
     /// The QSA block score as a broadcast product + reduce instead of the matmul (an A/B instrument).
     #[opt(flag = "score-no-matmul", env = "QWEN4EXP_SCORE_NO_MATMUL", bool)]
     pub score_no_matmul: bool,
+    /// A prefill chunk's queries past the QSA dense range attend through one masked dense attention over every cell instead of the paged kernel over each query's cells (an A/B arm).
+    #[opt(flag = "sparse-masked", env = "QWEN4EXP_SPARSE_MASKED", bool)]
+    pub sparse_masked: bool,
     /// Read the QSA selection back and check it every position — an instrument (a host sync per full layer per token).
     #[opt(flag = "check-sel", env = "QWEN4EXP_CHECK_SEL", bool)]
     pub check_sel: bool,
@@ -287,6 +290,7 @@ impl Default for Qwen4ExpTuning {
             spec_ahead: 0,
             mem_check: "refuse".into(),
             score_no_matmul: false,
+            sparse_masked: false,
             check_sel: false,
             watch_nan: false,
             trace: false,

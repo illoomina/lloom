@@ -141,6 +141,10 @@ impl Default for KvCache {
     }
 }
 
+/// The bytes a tile of a chunk's sparse rows may take in either of its two
+/// row-proportional transients (`QsaAttention::sparse_rows`).
+pub const SPARSE_TILE_BYTES: usize = 64 << 20;
+
 /// Tokens a KV slab holds before it grows by another slab.
 pub const KV_SLAB_TOKENS: usize = 1024;
 
@@ -416,6 +420,59 @@ impl KvCache {
             }
         }
     }
+    /// The f32 k / v `[n_kv_heads, tokens, head_dim]` (contiguous) a chunk's
+    /// selected cells are read from, and how a cell maps into them: the
+    /// dense f32 slab itself (a cell is its row), a pooled row's layer pool
+    /// (a cell through the row's page table), or — a 16-bit or quantized
+    /// store — its live rows read up to f32 once for the chunk.
+    fn cell_store(&mut self) -> Result<CellStore> {
+        let f32 = DType::F32;
+        if let KvBacking::Slab(s) = &self.kv {
+            if let (Some(k), Some(v)) = (s.k_cache().all_data(), s.v_cache().all_data()) {
+                if k.dtype() == f32 && v.dtype() == f32 {
+                    return Ok(CellStore {
+                        k: k.clone(),
+                        v: v.clone(),
+                        pages: None,
+                    });
+                }
+            }
+        }
+        if let KvBacking::Pooled {
+            pool,
+            slot,
+            layer,
+            table_t,
+            ..
+        } = &mut self.kv
+        {
+            let pages = pool.pages(*layer, *slot);
+            let pt = match table_t {
+                Some((t, n)) if *n == pages.len() => t.clone(),
+                _ => {
+                    let dev = pool.device();
+                    let t = Tensor::from_vec(pages.clone(), pages.len(), &dev)?;
+                    *table_t = Some((t.clone(), pages.len()));
+                    t
+                }
+            };
+            return match pool.tensors(*layer)? {
+                Some((k, v)) => Ok(CellStore {
+                    k,
+                    v,
+                    pages: Some((pool.clone(), pt)),
+                }),
+                None => lloom_tensor::bail!("qsa cell_store on an empty pooled row"),
+            };
+        }
+        let (k, v) = self.dense(None)?;
+        Ok(CellStore {
+            k: k.to_dtype(f32)?.contiguous()?,
+            v: v.to_dtype(f32)?.contiguous()?,
+            pages: None,
+        })
+    }
+
     /// The rows `sel [n_sel]` (u32, all `< len`) of k and v:
     /// `[n_kv_heads, n_sel, head_dim]` each. Gathers from the slab itself
     /// (contiguous), so the cost is the selection's size, not the context's;
@@ -463,6 +520,27 @@ impl KvCache {
                 };
                 Ok((pk.index_select(&slots, 1)?, pv.index_select(&slots, 1)?))
             }
+        }
+    }
+}
+
+/// Where a chunk's selected cells are read ([`KvCache::cell_store`]).
+struct CellStore {
+    k: Tensor,
+    v: Tensor,
+    /// A pooled row: its pool and page table, through which a cell maps to
+    /// its pool slot.
+    pages: Option<(KvPool, Tensor)>,
+}
+
+impl CellStore {
+    /// `table`'s cells as rows of `k` / `v`.
+    fn rows_of(&self, table: &Tensor) -> Result<Tensor> {
+        match &self.pages {
+            None => Ok(table.clone()),
+            Some((pool, pt)) => pool
+                .slots_of(pt, &table.flatten_all()?)?
+                .reshape(table.shape()),
         }
     }
 }
@@ -555,6 +633,10 @@ impl KvPool {
                     .collect(),
             })),
         }
+    }
+
+    pub fn device(&self) -> lloom_tensor::Device {
+        self.inner.lock().device.clone()
     }
 
     pub fn same(&self, other: &KvPool) -> bool {
@@ -996,7 +1078,38 @@ impl Indexer {
             return Ok(None);
         }
         let dev = x1.device();
-        let visible = n_kv / self.ratio; // complete blocks at or before pos
+        let visible = n_kv / self.ratio;
+        let score = self.score_one(x1, pos, kv)?;
+        let topk = self.block_topk().min(visible);
+        // Descending by score = ascending by −score (the ascending sort is the
+        // arm every width runs on Metal).
+        let order = score.neg()?.arg_sort_last_dim(true)?; // [visible] u32
+        let blocks = order.narrow(0, 0, topk)?.contiguous()?; // [topk]
+                                                              // Expand to cells: block·ratio + (0..ratio).
+        let base = (blocks.to_dtype(DType::F32)? * self.ratio as f64)?
+            .reshape((topk, 1))?
+            .broadcast_as((topk, self.ratio))?;
+        let offs = Tensor::arange(0f32, self.ratio as f32, dev)?
+            .reshape((1, self.ratio))?
+            .broadcast_as((topk, self.ratio))?;
+        let cells = (base + offs)?
+            .reshape(topk * self.ratio)?
+            .to_dtype(DType::U32)?;
+        let tail_start = n_kv / self.ratio * self.ratio;
+        let sel = if tail_start < n_kv {
+            let tail = Tensor::arange(tail_start as u32, n_kv as u32, dev)?;
+            Tensor::cat(&[&cells, &tail], 0)?
+        } else {
+            cells
+        };
+        Ok(Some(sel))
+    }
+
+    /// The fp32 score `Σ_h relu(q_h · K_C[b])` of every block complete at
+    /// or before `pos` for the query `x1 [1, hidden]` at `pos` → `[visible]`.
+    fn score_one(&self, x1: &Tensor, pos: usize, kv: &KvCache) -> Result<Tensor> {
+        let dev = x1.device();
+        let visible = (pos + 1) / self.ratio; // complete blocks at or before pos
         if kv.n_blocks() < visible {
             lloom_tensor::bail!(
                 "indexer: {} compressed blocks, {visible} visible at pos {pos}",
@@ -1035,29 +1148,124 @@ impl Indexer {
             let q32 = q.to_dtype(DType::F32)?.t()?.contiguous()?; // [head_dim, n_heads]
             k32.matmul(&q32)?.relu()?.sum(1)? // [visible]
         };
-        let topk = self.block_topk().min(visible);
-        // Descending by score = ascending by −score (the ascending sort is the
-        // arm every width runs on Metal).
-        let order = score.neg()?.arg_sort_last_dim(true)?; // [visible] u32
-        let blocks = order.narrow(0, 0, topk)?.contiguous()?; // [topk]
-                                                              // Expand to cells: block·ratio + (0..ratio).
-        let base = (blocks.to_dtype(DType::F32)? * self.ratio as f64)?
-            .reshape((topk, 1))?
-            .broadcast_as((topk, self.ratio))?;
-        let offs = Tensor::arange(0f32, self.ratio as f32, dev)?
-            .reshape((1, self.ratio))?
-            .broadcast_as((topk, self.ratio))?;
+        Ok(score)
+    }
+
+    /// [`Self::select`] for `s` consecutive queries at once — their inputs
+    /// `x [s, hidden]`, the first at `pos0`, every one past the dense range —
+    /// against a cache that has observed all of them. Row `t` is the
+    /// selection `select` makes for the query at `pos0 + t`, cell for cell
+    /// and in the same order: its top `budget / ratio` blocks among the
+    /// `(pos0 + t + 1) / ratio` complete at or before it (the blocks the
+    /// chunk's own earlier tokens completed included, the later ones masked
+    /// below every visible score), expanded to cells, then its incomplete
+    /// tail. The scores are one `[blocks, s · n_heads]` product.
+    fn select_rows(&self, x: &Tensor, pos0: usize, kv: &KvCache) -> Result<RowSelection> {
+        let s = x.dim(0)?;
+        let dev = x.device();
+        let (r, topk) = (self.ratio, self.block_topk());
+        let n_blocks = (pos0 + s) / r;
+        if pos0 < self.dense_limit() || s == 0 || kv.n_blocks() < n_blocks {
+            lloom_tensor::bail!(
+                "indexer rows: {s} queries from pos {pos0} (dense limit {}), {} of {n_blocks} blocks",
+                self.dense_limit(),
+                kv.n_blocks()
+            )
+        }
+        let k_c = match kv.blocks.current_data()? {
+            Some(b) => b
+                .narrow(1, 0, n_blocks)?
+                .reshape((n_blocks, self.head_dim))?,
+            None => lloom_tensor::bail!("indexer rows: no compressed keys at pos {pos0}"),
+        };
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((s, self.n_heads, self.head_dim))?;
+        let q = self.q_norm.forward(&q)?;
+        let positions: Vec<usize> = (pos0..pos0 + s).collect();
+        let (cos, sin) = rope_cs_at(self.n_rot, self.rope_theta, &positions, dev)?;
+        let half = self.n_rot / 2;
+        let q = partial_rope_seq(
+            &q,
+            &cos.reshape((s, 1, half))?,
+            &sin.reshape((s, 1, half))?,
+            self.n_rot,
+        )?; // [s, n_heads, head_dim]
+        let k32 = k_c.to_dtype(DType::F32)?.contiguous()?;
+        let q32 = q
+            .to_dtype(DType::F32)?
+            .reshape((s * self.n_heads, self.head_dim))?
+            .t()?
+            .contiguous()?;
+        let score = k32
+            .matmul(&q32)?
+            .relu()?
+            .reshape((n_blocks, s, self.n_heads))?
+            .sum(2)?
+            .t()?
+            .contiguous()?; // [s, n_blocks], every score >= 0
+                            // A block completed after the query scores −1, below every visible
+                            // block: a query past the dense range sees more than `topk` blocks.
+        let visible: Vec<u32> = (0..s).map(|t| ((pos0 + t + 1) / r) as u32).collect();
+        let visible = Tensor::from_vec(visible, (s, 1), dev)?;
+        let block = Tensor::arange(0u32, n_blocks as u32, dev)?.reshape((1, n_blocks))?;
+        let seen = block.broadcast_lt(&visible)?;
+        let score = seen.where_cond(&score, &Tensor::full(-1f32, (s, n_blocks), dev)?)?;
+        let order = score.neg()?.arg_sort_last_dim(true)?; // [s, n_blocks]
+        let blocks = order.narrow(1, 0, topk)?.contiguous()?; // [s, topk]
+        let base = (blocks.to_dtype(DType::F32)? * r as f64)?
+            .reshape((s, topk, 1))?
+            .broadcast_as((s, topk, r))?;
+        let offs = Tensor::arange(0f32, r as f32, dev)?
+            .reshape((1, 1, r))?
+            .broadcast_as((s, topk, r))?;
         let cells = (base + offs)?
-            .reshape(topk * self.ratio)?
+            .reshape((s, topk * r))?
             .to_dtype(DType::U32)?;
-        let tail_start = n_kv / self.ratio * self.ratio;
-        let sel = if tail_start < n_kv {
-            let tail = Tensor::arange(tail_start as u32, n_kv as u32, dev)?;
-            Tensor::cat(&[&cells, &tail], 0)?
+        // The tails, `[visible·r, pos]` per row, padded to `r − 1` cells.
+        let mut tail = vec![0u32; s * (r - 1)];
+        let mut n_keys = Vec::with_capacity(s);
+        for t in 0..s {
+            let n_kv = pos0 + t + 1;
+            let start = n_kv / r * r;
+            for (j, c) in (start..n_kv).enumerate() {
+                tail[t * (r - 1) + j] = c as u32;
+            }
+            n_keys.push((topk * r + n_kv - start) as u32);
+        }
+        let table = if r > 1 {
+            let tail = Tensor::from_vec(tail, (s, r - 1), dev)?;
+            Tensor::cat(&[&cells, &tail], 1)?
         } else {
             cells
         };
-        Ok(Some(sel))
+        Ok(RowSelection {
+            stride: topk * r + r - 1,
+            table,
+            n_keys,
+        })
+    }
+}
+
+/// The cells `s` queries attend to past the dense range
+/// ([`Indexer::select_rows`]): row `t`'s first `n_keys[t]` entries of
+/// `table`, the rest padding.
+#[derive(Debug)]
+pub struct RowSelection {
+    /// `u32 [s, stride]`.
+    pub table: Tensor,
+    pub stride: usize,
+    pub n_keys: Vec<u32>,
+}
+
+impl RowSelection {
+    /// Row `t`'s cells, `u32 [n_keys[t]]`.
+    pub fn row(&self, t: usize) -> Result<Tensor> {
+        self.table
+            .narrow(0, t, 1)?
+            .narrow(1, 0, self.n_keys[t] as usize)?
+            .reshape(self.n_keys[t] as usize)
     }
 }
 
@@ -1147,6 +1355,25 @@ impl QsaAttention {
     pub fn selection(&self, x: &Tensor, pos: usize, kv: &KvCache) -> Result<Option<Tensor>> {
         match &self.indexer {
             Some(ix) => ix.select(&x.reshape((1, x.dim(D::Minus1)?))?, pos, kv),
+            None => Ok(None),
+        }
+    }
+
+    /// The cells a chunk's queries `x [1, s, hidden]` at `pos0 ..` select,
+    /// every one past the dense range, against a cache that has observed
+    /// them ([`Indexer::select_rows`]) — `None` without an indexer.
+    /// Test/probe surface for the chunk's selection.
+    pub fn selection_rows(
+        &self,
+        x: &Tensor,
+        pos0: usize,
+        kv: &KvCache,
+    ) -> Result<Option<RowSelection>> {
+        match &self.indexer {
+            Some(ix) => {
+                let (_, s, h) = x.dims3()?;
+                ix.select_rows(&x.reshape((s, h))?, pos0, kv).map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -1377,11 +1604,23 @@ impl QsaAttention {
             check_sel(sel, pos, kv)?;
         }
         let (k_all, v_all) = kv.dense(sel.as_ref())?; // [nkv, n_sel | len, hd] each
-        let seq = k_all.dim(1)?;
+        let ctx = self
+            .attend_composed(&q, &k_all, &v_all)?
+            .to_dtype(x.dtype())?;
 
-        // GQA expand kv heads nkv → nh (tile, the reference repeat), then dense
-        // attention: scores = q·kᵀ·scale, softmax, ·v. No mask needed at decode
-        // (the single query attends to all past keys, all causal).
+        // output gate: · sigmoid(gate), then wo.
+        let gate_flat = gate.reshape((1, nh * hd))?;
+        let gated = (ctx * ops::sigmoid(&gate_flat)?)?;
+        self.wo.forward(&gated)?.reshape((1, 1, hidden))
+    }
+
+    /// One query's attention as tensor ops, the composed reference: `q
+    /// [nh, hd]` (normed, roped) over every row of `k_all`, `v_all`
+    /// `[nkv, n, hd]` (all at or before it, so no mask) → `[1, nh·hd]` f32.
+    /// GQA expands the kv heads by tiling, as the reference repeats them.
+    fn attend_composed(&self, q: &Tensor, k_all: &Tensor, v_all: &Tensor) -> Result<Tensor> {
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let seq = k_all.dim(1)?;
         let rep = nh / nkv;
         let k_exp = k_all
             .reshape((nkv, 1, seq, hd))?
@@ -1391,19 +1630,231 @@ impl QsaAttention {
             .reshape((nkv, 1, seq, hd))?
             .broadcast_as((nkv, rep, seq, hd))?
             .reshape((nh, seq, hd))?;
-
         let scale = 1.0 / (hd as f64).sqrt();
         let q_h = q.reshape((nh, 1, hd))?.to_dtype(lloom_tensor::DType::F32)?; // [nh,1,hd]
         let k_h = k_exp.to_dtype(lloom_tensor::DType::F32)?; // [nh,seq,hd]
         let scores = (q_h.matmul(&k_h.transpose(1, 2)?.contiguous()?)? * scale)?; // [nh,1,seq]
         let probs = ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v_exp.to_dtype(lloom_tensor::DType::F32)?)?; // [nh,1,hd]
-        let ctx = ctx.reshape((1, nh * hd))?.to_dtype(x.dtype())?;
+        ctx.reshape((1, nh * hd))
+    }
 
-        // output gate: · sigmoid(gate), then wo.
-        let gate_flat = gate.reshape((1, nh * hd))?;
-        let gated = (ctx * ops::sigmoid(&gate_flat)?)?;
-        self.wo.forward(&gated)?.reshape((1, 1, hidden))
+    /// The queries of a chunk at `past .. past + seq` that lie within the
+    /// dense range — a prefix of the chunk; the rest attend to a selection.
+    fn dense_rows(&self, past: usize, seq: usize) -> usize {
+        match &self.indexer {
+            Some(ix) => seq.min(ix.dense_limit().saturating_sub(past)),
+            None => seq,
+        }
+    }
+
+    /// The chunk's queries past the dense range — inputs `x [s, hidden]`,
+    /// `q [s, nh, hd]` (normed, roped), the first at `pos0` — selected
+    /// ([`Indexer::select_rows`]) and attended ([`Self::attend_rows_paged`]) in
+    /// tiles of rows, so neither the score `[blocks, rows · n_heads]` nor the
+    /// two-pass kernel's partials (`rows · nh · 32 · hd`) outgrow
+    /// [`SPARSE_TILE_BYTES`] at any chunk or context → `[s, nh·hd]` f32.
+    fn sparse_rows(
+        &self,
+        x: &Tensor,
+        q: &Tensor,
+        pos0: usize,
+        kv: &mut KvCache,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let ix = self.indexer.as_ref().expect("rows past the dense range");
+        let s = x.dim(0)?;
+        let n_blocks = (pos0 + s) / ix.ratio;
+        let score_row = n_blocks.max(1) * ix.n_heads * 4;
+        // The two-pass kernel's partials: 32 blocks of `hd` f32 a head.
+        let partials_row = self.n_heads * 32 * self.head_dim * 4;
+        let tile = (SPARSE_TILE_BYTES / score_row.max(partials_row)).max(1);
+        if sparse_masked() && self.paged_rows(q) {
+            return self.sparse_rows_masked(ix, x, q, pos0, kv, scale, tile);
+        }
+        let store = if self.paged_rows(q) {
+            Some(kv.cell_store()?)
+        } else {
+            None
+        };
+        let mut parts = Vec::with_capacity(s.div_ceil(tile));
+        for t0 in (0..s).step_by(tile) {
+            let n = tile.min(s - t0);
+            let x_t = x.narrow(0, t0, n)?;
+            let sel = ix.select_rows(&x_t, pos0 + t0, kv)?;
+            check_rows(ix, &x_t, pos0 + t0, &sel, kv)?;
+            let q_t = q.narrow(0, t0, n)?;
+            parts.push(match &store {
+                Some(store) => self.attend_rows_paged(&q_t, &sel, store, scale)?,
+                None => self.attend_rows_composed(&q_t, &sel, kv)?,
+            });
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one tile"));
+        }
+        Tensor::cat(&parts, 0)
+    }
+
+    /// [`Self::sparse_rows`]'s A/B arm (`QWEN4EXP_SPARSE_MASKED`): each tile
+    /// of rows through the steel full-attention kernel over every cell of
+    /// the cache, an additive mask `[rows, cells]` (0 on the row's selected
+    /// cells, −∞ elsewhere) in place of the per-row cell lists. The same
+    /// selection; O(rows · context) attention where the paged arm is
+    /// O(rows · budget).
+    #[allow(clippy::too_many_arguments)]
+    fn sparse_rows_masked(
+        &self,
+        ix: &Indexer,
+        x: &Tensor,
+        q: &Tensor,
+        pos0: usize,
+        kv: &mut KvCache,
+        scale: f32,
+        tile: usize,
+    ) -> Result<Tensor> {
+        let (hd, nh) = (self.head_dim, self.n_heads);
+        let f32 = DType::F32;
+        let s = x.dim(0)?;
+        let dev = q.device();
+        let (k_all, v_all) = kv.dense(None)?;
+        let (k_all, v_all) = (k_all.to_dtype(f32)?, v_all.to_dtype(f32)?);
+        let n_kv = k_all.dim(1)?;
+        // Rows of a tile are bounded by the mask's bytes as well.
+        let tile = tile.min((SPARSE_TILE_BYTES / (n_kv * 4)).max(1));
+        let mut parts = Vec::with_capacity(s.div_ceil(tile));
+        for t0 in (0..s).step_by(tile) {
+            let n = tile.min(s - t0);
+            let x_t = x.narrow(0, t0, n)?;
+            let sel = ix.select_rows(&x_t, pos0 + t0, kv)?;
+            check_rows(ix, &x_t, pos0 + t0, &sel, kv)?;
+            // 1 on each row's live entries of the table, 0 on its padding;
+            // scattered onto the cells, any count > 0 is a selected cell.
+            let live = Tensor::arange(0u32, sel.stride as u32, dev)?
+                .reshape((1, sel.stride))?
+                .broadcast_lt(&Tensor::from_vec(sel.n_keys.clone(), (n, 1), dev)?)?
+                .to_dtype(f32)?;
+            let hits = Tensor::zeros((n, n_kv), f32, dev)?.scatter_add(&sel.table, &live, 1)?;
+            let mask = hits
+                .gt(0f64)?
+                .where_cond(
+                    &Tensor::zeros((n, n_kv), f32, dev)?,
+                    &Tensor::full(f32::NEG_INFINITY, (n, n_kv), dev)?,
+                )?
+                .reshape((1, 1, n, n_kv))?
+                .broadcast_as((1, nh, n, n_kv))?;
+            let q_t = q.narrow(0, t0, n)?.transpose(0, 1)?.contiguous()?.unsqueeze(0)?; // [1, nh, n, hd]
+            let ctx = ops::sdpa(
+                &q_t,
+                &k_all.unsqueeze(0)?,
+                &v_all.unsqueeze(0)?,
+                Some(&mask),
+                false,
+                scale,
+                1.0,
+            )?; // [1, nh, n, hd]
+            parts.push(
+                ctx.reshape((nh, n, hd))?
+                    .transpose(0, 1)?
+                    .contiguous()?
+                    .reshape((n, nh * hd))?,
+            );
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one tile"));
+        }
+        Tensor::cat(&parts, 0)
+    }
+
+    /// Whether the chunk's queries past the dense range run the paged-vector
+    /// kernel ([`Self::attend_rows_paged`]): Metal, f32 queries, a head width
+    /// the kernel carries.
+    fn paged_rows(&self, q: &Tensor) -> bool {
+        q.device().is_metal()
+            && q.dtype() == DType::F32
+            && !super::kernels::fused_off()
+            && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+    }
+
+    /// The composed reference of [`Self::attend_rows_paged`]: row by row,
+    /// the row's cells gathered and [`Self::attend_composed`] over them.
+    fn attend_rows_composed(
+        &self,
+        q: &Tensor,
+        sel: &RowSelection,
+        kv: &mut KvCache,
+    ) -> Result<Tensor> {
+        let mut rows = Vec::with_capacity(q.dim(0)?);
+        for t in 0..q.dim(0)? {
+            let (k, v) = kv.dense(Some(&sel.row(t)?))?;
+            rows.push(self.attend_composed(&q.narrow(0, t, 1)?.squeeze(0)?, &k, &v)?);
+        }
+        Tensor::cat(&rows, 0)
+    }
+
+    /// The attention of the chunk's queries past the dense range: `q
+    /// [s, nh, hd]` (normed, roped, f32), row `t` over the cells
+    /// `sel.row(t)` of `store` → `[s, nh·hd]`. `kernels::SdpaVectorPaged`
+    /// with a page of one cell and the row's cells for its table, one launch
+    /// per kernel arm: per row the arithmetic of the vector `ops::sdpa` a
+    /// decode step runs over the same cells gathered in the same order.
+    fn attend_rows_paged(
+        &self,
+        q: &Tensor,
+        sel: &RowSelection,
+        store: &CellStore,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let (hd, nh) = (self.head_dim, self.n_heads);
+        let s = q.dim(0)?;
+        let table = store.rows_of(&sel.table)?;
+        let dev = q.device();
+        let long = |t: usize| sel.n_keys[t] as usize >= ops::SDPA_TWO_PASS_K_THRESHOLD;
+        let groups: [Vec<usize>; 2] = [
+            (0..s).filter(|&t| !long(t)).collect(),
+            (0..s).filter(|&t| long(t)).collect(),
+        ];
+        let mut parts: Vec<(Vec<usize>, Tensor)> = Vec::with_capacity(2);
+        for (two_pass, grp) in groups.into_iter().enumerate() {
+            if grp.is_empty() {
+                continue;
+            }
+            let ng = grp.len();
+            let (q_g, table_g) = if ng == s {
+                (q.contiguous()?, table.clone())
+            } else {
+                let idx: Vec<u32> = grp.iter().map(|&t| t as u32).collect();
+                let idx = Tensor::from_vec(idx, ng, dev)?;
+                (q.index_select(&idx, 0)?, table.index_select(&idx, 0)?)
+            };
+            let keys: Vec<u32> = grp.iter().map(|&t| sel.n_keys[t]).collect();
+            let ctx = q_g.apply_op3_no_bwd(
+                &store.k,
+                &store.v,
+                &super::kernels::SdpaVectorPaged {
+                    nh,
+                    nkv: self.n_kv_heads,
+                    hd,
+                    page_size: 1,
+                    table_stride: sel.stride,
+                    scale,
+                    two_pass: two_pass == 1,
+                    table: table_g.flatten_all()?.contiguous()?,
+                    n_keys: Tensor::from_vec(keys, ng, dev)?,
+                },
+            )?; // [ng, nh, hd]
+            parts.push((grp, ctx.reshape((ng, nh * hd))?));
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().expect("one group").1);
+        }
+        let mut by_row: Vec<Option<Tensor>> = vec![None; s];
+        for (grp, ctx) in &parts {
+            for (i, &t) in grp.iter().enumerate() {
+                by_row[t] = Some(ctx.narrow(0, i, 1)?);
+            }
+        }
+        let rows: Vec<Tensor> = by_row.into_iter().map(|r| r.expect("every row")).collect();
+        Tensor::cat(&rows, 0)
     }
 
     /// [`Self::decode_rows`] as launches: the projections once over all rows, then per row `kernels::QsaPrep` (the
@@ -1715,10 +2166,14 @@ impl QsaAttention {
         Tensor::cat(&rows, 0)
     }
 
-    /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]`: the same dense
-    /// QK-norm GQA composition as [`Self::decode`] over every position at once,
-    /// causal over the chunk, attending to everything already cached. Valid
-    /// while the cache stays within the indexer's dense range.
+    /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]`: QSA over every
+    /// position at once. The projections, norms, rope, the KV append and
+    /// the indexer's observe run over the chunk; the queries within the
+    /// dense range attend densely and causally to everything cached, and
+    /// each query past it to the cells the indexer selects for it, the
+    /// blocks the chunk's earlier tokens completed included
+    /// ([`Indexer::select_rows`]) — what [`Self::decode`] computes position
+    /// by position, up to the order of fp32 reductions.
     pub fn prefill(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
         let (b, seq, hidden) = x.dims3()?;
         if b != 1 {
@@ -1751,53 +2206,68 @@ impl QsaAttention {
         let k_new = k.transpose(0, 1)?.contiguous()?; // [nkv, seq, hd]
         let v_new = v.transpose(0, 1)?.contiguous()?;
         kv.append(&k_new, &v_new)?;
-        let (k_all, v_all) = kv.dense(None)?;
-        let kv_len = k_all.dim(1)?;
+        let d = self.dense_rows(past, seq);
+        let dense = if d > 0 { Some(kv.dense(None)?) } else { None };
         if let Some(ix) = &self.indexer {
-            // Every position of a chunk attends densely, so the chunk must
-            // stay within the range where dense IS the selection; the model
-            // runs positions past it one at a time.
-            if kv_len > ix.dense_limit() {
-                lloom_tensor::bail!(
-                    "qsa prefill: {kv_len} cells exceed the dense range {}; decode past it",
-                    ix.dense_limit()
-                )
-            }
             ix.observe(&x2, kv)?;
         }
-
-        let rep = nh / nkv;
         let f32 = lloom_tensor::DType::F32;
-        let k_exp = k_all
-            .reshape((nkv, 1, kv_len, hd))?
-            .broadcast_as((nkv, rep, kv_len, hd))?
-            .reshape((nh, kv_len, hd))?
-            .to_dtype(f32)?;
-        let v_exp = v_all
-            .reshape((nkv, 1, kv_len, hd))?
-            .broadcast_as((nkv, rep, kv_len, hd))?
-            .reshape((nh, kv_len, hd))?
-            .to_dtype(f32)?;
-        let q_h = q.transpose(0, 1)?.contiguous()?.to_dtype(f32)?; // [nh, seq, hd]
         let scale = 1.0 / (hd as f64).sqrt();
-        let scores = (q_h.matmul(&k_exp.transpose(1, 2)?.contiguous()?)? * scale)?; // [nh, seq, kv_len]
-                                                                                    // Causal over the chunk: query t (at position past + t) sees keys ≤ past + t.
-        let scores = if seq > 1 {
-            let mask = causal_mask(seq, kv_len, past, dev)?
-                .broadcast_as((nh, seq, kv_len))?
-                .contiguous()?;
-            let neg = Tensor::full(f32::NEG_INFINITY, (nh, seq, kv_len), dev)?;
-            mask.where_cond(&scores, &neg)?
+        let mut parts = Vec::with_capacity(2);
+        if let Some((k_all, v_all)) = dense {
+            // Query t (at position past + t) sees keys ≤ past + t.
+            let (k_all, v_all, q) = if d < seq {
+                (
+                    k_all.narrow(1, 0, past + d)?,
+                    v_all.narrow(1, 0, past + d)?,
+                    q.narrow(0, 0, d)?,
+                )
+            } else {
+                (k_all, v_all, q.clone())
+            };
+            let kv_len = k_all.dim(1)?;
+            let rep = nh / nkv;
+            let k_exp = k_all
+                .reshape((nkv, 1, kv_len, hd))?
+                .broadcast_as((nkv, rep, kv_len, hd))?
+                .reshape((nh, kv_len, hd))?
+                .to_dtype(f32)?;
+            let v_exp = v_all
+                .reshape((nkv, 1, kv_len, hd))?
+                .broadcast_as((nkv, rep, kv_len, hd))?
+                .reshape((nh, kv_len, hd))?
+                .to_dtype(f32)?;
+            let q_h = q.transpose(0, 1)?.contiguous()?.to_dtype(f32)?; // [nh, d, hd]
+            let scores = (q_h.matmul(&k_exp.transpose(1, 2)?.contiguous()?)? * scale)?; // [nh, d, kv_len]
+            let scores = if d > 1 {
+                let mask = causal_mask(d, kv_len, past, dev)?
+                    .broadcast_as((nh, d, kv_len))?
+                    .contiguous()?;
+                let neg = Tensor::full(f32::NEG_INFINITY, (nh, d, kv_len), dev)?;
+                mask.where_cond(&scores, &neg)?
+            } else {
+                scores
+            };
+            let probs = ops::softmax_last_dim(&scores)?;
+            let ctx = probs.matmul(&v_exp)?; // [nh, d, hd]
+            parts.push(
+                ctx.transpose(0, 1)?
+                    .contiguous()?
+                    .reshape((d, nh * hd))?
+                    .to_dtype(x.dtype())?,
+            );
+        }
+        if d < seq {
+            let x_s = x2.narrow(0, d, seq - d)?;
+            let q_s = q.narrow(0, d, seq - d)?.contiguous()?.to_dtype(f32)?;
+            let ctx = self.sparse_rows(&x_s, &q_s, past + d, kv, scale as f32)?;
+            parts.push(ctx.to_dtype(x.dtype())?);
+        }
+        let ctx = if parts.len() == 1 {
+            parts.pop().expect("one part")
         } else {
-            scores
+            Tensor::cat(&parts, 0)?
         };
-        let probs = ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v_exp)?; // [nh, seq, hd]
-        let ctx = ctx
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((seq, nh * hd))?
-            .to_dtype(x.dtype())?;
         let gated = (ctx * ops::sigmoid(&gate.reshape((seq, nh * hd))?)?)?;
         self.wo.forward(&gated)?.reshape((1, seq, hidden))
     }
@@ -1869,40 +2339,66 @@ impl QsaAttention {
             .narrow(0, 2 * q_len + kv_len_e, kv_len_e)?
             .reshape((nkv, seq, hd))?;
         kv.append(&k_new, &v_new)?;
+        let d = self.dense_rows(past, seq);
         // [nkv, kv_len, hd]: the dense store's views (a 16-bit store read up
-        // to f32), a quantized store's dequantized — at most `dense_limit`
-        // rows, which the check below holds.
-        let (k_all, v_all) = kv.dense(None)?;
-        let (k_all, v_all) = (k_all.to_dtype(f32)?, v_all.to_dtype(f32)?);
-        let kv_len = k_all.dim(1)?;
+        // to f32), a quantized store's dequantized — the dense range's
+        // `past + d ≤ dense_limit` rows are what the queries within it read.
+        let dense = if d > 0 {
+            let (k_all, v_all) = kv.dense(None)?;
+            Some((k_all.to_dtype(f32)?, v_all.to_dtype(f32)?))
+        } else {
+            None
+        };
         if let Some(ix) = &self.indexer {
-            if kv_len > ix.dense_limit() {
-                lloom_tensor::bail!(
-                    "qsa prefill: {kv_len} cells exceed the dense range {}; decode past it",
-                    ix.dense_limit()
-                )
-            }
             ix.observe(&x2, kv)?;
         }
-        // The steel full-attention kernel over the cache as it lies: GQA and
-        // the causal window against the cached prefix in the kernel (query
-        // t at position past + t sees keys ≤ past + t: the kernel's window
-        // is offset by kv_len − seq), no mask tensor, no head expansion.
         let scale = 1.0 / (hd as f64).sqrt();
-        let ctx = ops::sdpa(
-            &q_h,
-            &k_all.unsqueeze(0)?,
-            &v_all.unsqueeze(0)?,
-            None,
-            true,
-            scale as f32,
-            1.0,
-        )?; // [1, nh, seq, hd]
-        let ctx = ctx
-            .reshape((nh, seq, hd))?
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((seq, nh * hd))?;
+        let mut parts = Vec::with_capacity(2);
+        if let Some((k_all, v_all)) = dense {
+            // The steel full-attention kernel over the cache as it lies: GQA
+            // and the causal window against the cached prefix in the kernel
+            // (query t at position past + t sees keys ≤ past + t: the
+            // kernel's window is offset by kv_len − d), no mask tensor, no
+            // head expansion.
+            let (k_all, v_all, q_d) = if d < seq {
+                (
+                    k_all.narrow(1, 0, past + d)?,
+                    v_all.narrow(1, 0, past + d)?,
+                    q_h.narrow(2, 0, d)?.contiguous()?,
+                )
+            } else {
+                (k_all, v_all, q_h.clone())
+            };
+            let ctx = ops::sdpa(
+                &q_d,
+                &k_all.unsqueeze(0)?,
+                &v_all.unsqueeze(0)?,
+                None,
+                true,
+                scale as f32,
+                1.0,
+            )?; // [1, nh, d, hd]
+            parts.push(
+                ctx.reshape((nh, d, hd))?
+                    .transpose(0, 1)?
+                    .contiguous()?
+                    .reshape((d, nh * hd))?,
+            );
+        }
+        if d < seq {
+            let s = seq - d;
+            let q_s = q_h
+                .reshape((nh, seq, hd))?
+                .narrow(1, d, s)?
+                .transpose(0, 1)?
+                .contiguous()?; // [s, nh, hd]
+            parts.push(self.sparse_rows(&x2.narrow(0, d, s)?, &q_s, past + d, kv, scale as f32)?);
+        }
+        let ctx = if parts.len() == 1 {
+            parts.pop().expect("one part")
+        } else {
+            Tensor::cat(&parts, 0)?
+        };
         let gated = match sigmoid_mul(&gate, &ctx) {
             Some(g) => g?,
             None => (ctx * ops::sigmoid(&gate)?)?,
@@ -1917,6 +2413,14 @@ impl QsaAttention {
 fn score_without_matmul() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.score_no_matmul)
+}
+
+/// A/B arm (`QWEN4EXP_SPARSE_MASKED`, read once): a prefill chunk's rows
+/// past the dense range through one masked dense attention over every cell
+/// (`QsaAttention::sparse_rows_masked`). Never the shipping path.
+fn sparse_masked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.sparse_masked)
 }
 
 /// The `QWEN4EXP_CHECK_SEL` instrument on one selection (a no-op unless set).
@@ -1943,6 +2447,64 @@ fn check_sel(sel: &Tensor, pos: usize, kv: &KvCache) -> Result<()> {
         &ids[..4],
         &ids[ids.len() - 4..]
     );
+    Ok(())
+}
+
+/// The `QWEN4EXP_CHECK_SEL` instrument on a chunk's rows past the dense
+/// range (a no-op unless set): each row's cells against the selection the
+/// one-query path ([`Indexer::select`]) makes for the same input on the
+/// same cache, as sets. A row that differs prints a `SELROWS` line naming
+/// the blocks only one side took and their one-query scores beside the
+/// score at its top-k boundary (a near-tie reads as equal scores); every
+/// call prints a summary line.
+fn check_rows(
+    ix: &Indexer,
+    x: &Tensor,
+    pos0: usize,
+    sel: &RowSelection,
+    kv: &KvCache,
+) -> Result<()> {
+    if !check_selection() {
+        return Ok(());
+    }
+    let s = x.dim(0)?;
+    let mut differ = 0usize;
+    for t in 0..s {
+        let p = pos0 + t;
+        let mut got = sel.row(t)?.to_vec1::<u32>()?;
+        let bad = got.iter().filter(|&&c| c as usize > p).count();
+        let mut want = match ix.select(&x.narrow(0, t, 1)?, p, kv)? {
+            Some(w) => w.to_vec1::<u32>()?,
+            None => lloom_tensor::bail!("SELROWS pos={p}: within the dense range"),
+        };
+        got.sort_unstable();
+        want.sort_unstable();
+        let dup = got.windows(2).filter(|w| w[0] == w[1]).count();
+        if bad > 0 || dup > 0 {
+            lloom_tensor::bail!("SELROWS pos={p}: {bad} cells past it, {dup} duplicates")
+        }
+        if got == want {
+            continue;
+        }
+        differ += 1;
+        let blocks = |v: &[u32]| -> std::collections::BTreeSet<usize> {
+            v.iter().map(|&c| c as usize / ix.ratio).collect()
+        };
+        let (bg, bw) = (blocks(&got), blocks(&want));
+        let only_rows: Vec<usize> = bg.difference(&bw).copied().collect();
+        let only_one: Vec<usize> = bw.difference(&bg).copied().collect();
+        let score = ix.score_one(&x.narrow(0, t, 1)?, p, kv)?.to_vec1::<f32>()?;
+        let mut ranked = score.clone();
+        ranked.sort_by(|a, b| b.total_cmp(a));
+        let edge = ranked[ix.block_topk().min(ranked.len()) - 1];
+        let at = |b: &[usize]| -> Vec<(usize, f32)> { b.iter().map(|&i| (i, score[i])).collect() };
+        eprintln!(
+            "SELROWS pos={p} differ: rows-only {:?} one-query-only {:?} (one-query scores; top-k edge {edge})",
+            at(&only_rows),
+            at(&only_one)
+        );
+    }
+    eprintln!("SELROWS pos0={pos0} rows={s} differ={differ}");
     Ok(())
 }
 
@@ -3097,6 +3659,458 @@ mod tests {
             differed,
             "the selection never changed the output past the dense range"
         );
+    }
+
+    /// NaN-carrying max |a − b|: a NaN on either side is the answer (a fold
+    /// over `f32::max` would drop it and read as agreement).
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "compared rows differ in length");
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            })
+    }
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// [`indexed_attn`]'s layer without its indexer: dense over every cell.
+    fn dense_twin(cfg: &Config, dev: &Device) -> QsaAttention {
+        let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        QsaAttention::new(
+            lin(nh * hd * 2, h, 1.0, dev),
+            lin(nkv * hd, h, 2.0, dev),
+            lin(nkv * hd, h, 3.0, dev),
+            lin(h, nh * hd, 4.0, dev),
+            rms(hd, dev),
+            rms(hd, dev),
+            cfg,
+        )
+    }
+
+    /// A pooled row whose cells are NOT its pool slots: another row takes
+    /// the pool's first page before it, so a read that skipped the page
+    /// table would read that row's tokens. Returns the row's cache and the
+    /// other row's (kept alive for the test).
+    fn pooled_row_off_page_zero(cfg: &Config, dev: &Device) -> (KvCache, KvCache) {
+        let (nkv, hd) = (cfg.n_kv_heads, cfg.head_dim);
+        let pool = KvPool::new(2, 1, nkv, hd, DType::F32, dev);
+        let other = pool.lease().unwrap();
+        let mut kv_o = KvCache::in_pool(&pool, &other, 0);
+        let k = Tensor::ones((nkv, 1, hd), DType::F32, dev).unwrap();
+        kv_o.append(&(&k * 7.0).unwrap(), &(&k * -7.0).unwrap())
+            .unwrap();
+        let lease = pool.lease().unwrap();
+        let kv = KvCache::in_pool(&pool, &lease, 0);
+        (kv, kv_o)
+    }
+
+    /// The inputs `tok(h, s0 + p)` for `n` positions.
+    fn inputs(h: usize, n: usize, s0: f32) -> Vec<Vec<f32>> {
+        (0..n).map(|p| tok(h, s0 + p as f32)).collect()
+    }
+
+    /// Each of `xs` through `attn` as one decode step on `kv` (at `pos0 +
+    /// i`): every output, and the selection made at each step.
+    fn decode_steps(
+        attn: &QsaAttention,
+        xs: &[Vec<f32>],
+        pos0: usize,
+        kv: &mut KvCache,
+        dev: &Device,
+    ) -> (Vec<Vec<f32>>, Vec<Option<Vec<u32>>>) {
+        let h = xs[0].len();
+        let mut outs = Vec::new();
+        let mut sels = Vec::new();
+        for (i, x) in xs.iter().enumerate() {
+            let x = Tensor::from_vec(x.clone(), (1, 1, h), dev).unwrap();
+            outs.push(host(&attn.decode(&x, kv).unwrap()));
+            sels.push(
+                attn.selection(&x, pos0 + i, kv)
+                    .unwrap()
+                    .map(|s| s.to_device(&Device::Cpu).unwrap().to_vec1().unwrap()),
+            );
+        }
+        (outs, sels)
+    }
+
+    /// `xs` as one chunk through `attn.prefill` on `kv`: one output row per
+    /// position.
+    fn prefill_chunk(
+        attn: &QsaAttention,
+        xs: &[Vec<f32>],
+        kv: &mut KvCache,
+        dev: &Device,
+    ) -> Vec<Vec<f32>> {
+        let h = xs[0].len();
+        let x = Tensor::from_vec(xs.concat(), (1, xs.len(), h), dev).unwrap();
+        let out = host(&attn.prefill(&x, kv).unwrap());
+        out.chunks(h).map(|r| r.to_vec()).collect()
+    }
+
+    /// The chunk's selection for its rows past the dense range, read back:
+    /// row `t` (position `pos0 + t`)'s cells.
+    fn chunk_selection(
+        attn: &QsaAttention,
+        xs: &[Vec<f32>],
+        pos0: usize,
+        kv: &KvCache,
+        dev: &Device,
+    ) -> Vec<Vec<u32>> {
+        let h = xs[0].len();
+        let x = Tensor::from_vec(xs.concat(), (1, xs.len(), h), dev).unwrap();
+        let sel = attn.selection_rows(&x, pos0, kv).unwrap().unwrap();
+        (0..xs.len())
+            .map(|t| {
+                sel.row(t)
+                    .unwrap()
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// A chunk that starts inside the dense range, crosses it and completes
+    /// blocks on its way selects, for every query past the range, the same
+    /// cells `select` names for that query on a cache built one decode step
+    /// at a time: the same set, the tail in it, every cell at or before the
+    /// query. Non-vacuous by construction, asserted: the reference itself
+    /// takes blocks the chunk completed (a chunk blind to its own blocks
+    /// would differ there), and some rows have a tail.
+    #[test]
+    fn chunk_selection_equals_the_decode_selection() {
+        let dev = Device::Cpu;
+        let cfg = tiny_indexed();
+        let attn = indexed_attn(&cfg, &dev);
+        let (h, r) = (cfg.hidden_size, cfg.indexer_compress_ratio);
+        let limit = attn.dense_limit().unwrap();
+        let (past, n) = (6usize, 31usize);
+        let xs = inputs(h, n, 0.0);
+        let mut kv_d = KvCache::with_capacity(4);
+        let (_, want) = decode_steps(&attn, &xs, 0, &mut kv_d, &dev);
+        let mut kv_c = KvCache::with_capacity(4);
+        decode_steps(&attn, &xs[..past], 0, &mut kv_c, &dev);
+        prefill_chunk(&attn, &xs[past..], &mut kv_c, &dev);
+        assert_eq!(kv_c.lens(), kv_d.lens());
+        assert_eq!(kv_c.lens(), (n, n / r));
+        let got = chunk_selection(&attn, &xs[limit..], limit, &kv_c, &dev);
+        let (mut chunk_blocks, mut tails) = (0, 0);
+        for (t, g) in got.iter().enumerate() {
+            let p = limit + t;
+            let w = want[p].as_ref().expect("past the dense range");
+            let (mut gs, mut ws) = (g.clone(), w.clone());
+            gs.sort_unstable();
+            ws.sort_unstable();
+            assert_eq!(gs, ws, "pos {p}: the chunk's selection vs decode's");
+            assert!(g.iter().all(|&c| c as usize <= p), "pos {p}: a future cell");
+            let complete = (p + 1) / r * r;
+            if w.iter()
+                .any(|&c| (c as usize) < complete && c as usize / r * r + r > past)
+            {
+                chunk_blocks += 1;
+            }
+            if complete <= p {
+                tails += 1;
+            }
+        }
+        assert!(
+            chunk_blocks > 0,
+            "no query selects a block the chunk completed: the fixture is blind"
+        );
+        assert!(tails > 0, "no query past the range has a tail");
+    }
+
+    /// The chunk prefill past the dense range computes what the decode
+    /// replay computes, within fp32 reordering: a chunk crossing the range,
+    /// then one starting mid-block wholly past it, against one decode step
+    /// per position — CPU, the composed reference. The level is pinned by
+    /// a control: the same layer without an indexer (dense over every cell)
+    /// is far further from the replay than the tolerance, so a prefill that
+    /// ignored the selection fails. A pooled row computes the slab's bits.
+    #[test]
+    fn chunk_prefill_past_the_dense_range_matches_decode_replay() {
+        let dev = Device::Cpu;
+        let cfg = tiny_indexed();
+        let attn = indexed_attn(&cfg, &dev);
+        let dense = dense_twin(&cfg, &dev);
+        let h = cfg.hidden_size;
+        let (n, cuts) = (40usize, [3usize, 27]);
+        let xs = inputs(h, n, 0.5);
+        let mut kv_d = KvCache::with_capacity(4);
+        let (want, _) = decode_steps(&attn, &xs, 0, &mut kv_d, &dev);
+        let mut kv_all = KvCache::with_capacity(4);
+        let (all, _) = decode_steps(&dense, &xs, 0, &mut kv_all, &dev);
+        let run = |kv: &mut KvCache| -> Vec<Vec<f32>> {
+            let mut out = decode_steps(&attn, &xs[..cuts[0]], 0, kv, &dev).0;
+            out.extend(prefill_chunk(&attn, &xs[cuts[0]..cuts[1]], kv, &dev));
+            out.extend(prefill_chunk(&attn, &xs[cuts[1]..], kv, &dev));
+            out
+        };
+        let mut kv_c = KvCache::with_capacity(4);
+        let got = run(&mut kv_c);
+        assert_eq!(kv_c.lens(), kv_d.lens());
+        let scale = want.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
+        let limit = attn.dense_limit().unwrap();
+        let err = (0..n)
+            .map(|p| max_diff(&got[p], &want[p]))
+            .fold(0f32, |m, d| if d.is_nan() { d } else { m.max(d) });
+        let d_sel = (limit..n)
+            .map(|p| max_diff(&all[p], &want[p]))
+            .fold(0f32, f32::max);
+        println!("chunk vs replay {err:e}, dense-over-all vs replay {d_sel:e}, scale {scale}");
+        assert!(
+            err <= 1e-5 * scale,
+            "chunk vs replay: {err} at scale {scale}"
+        );
+        assert!(
+            d_sel > 1e3 * 1e-5 * scale,
+            "the selection barely moves the output ({d_sel}): the control is blind"
+        );
+        let (mut kv_p, _other) = pooled_row_off_page_zero(&cfg, &dev);
+        let pooled = run(&mut kv_p);
+        for p in 0..n {
+            let same = pooled[p]
+                .iter()
+                .zip(&got[p])
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "pos {p}: the pooled row is not the slab's bits");
+        }
+    }
+
+    /// The Metal chunk prefill past the dense range (the paged-vector
+    /// attention over each row's cells, single-pass at this budget) against
+    /// the Metal decode replay and the CPU chunk, at the real head geometry
+    /// (24/2 × 256, indexer 4 × 128); the chunk's selection equals the
+    /// decode's per query; a pooled row computes the slab's bits.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn chunk_prefill_past_the_dense_range_metal() {
+        let (cpu, gpu) = (Device::Cpu, Device::new_metal(0).unwrap());
+        let cfg = kv_arm_cfg();
+        let (a_gpu, a_cpu) = (indexed_attn(&cfg, &gpu), indexed_attn(&cfg, &cpu));
+        let h = cfg.hidden_size;
+        let limit = a_gpu.dense_limit().unwrap();
+        let (n, cuts) = (64usize, [5usize, 43]);
+        let xs = inputs(h, n, 0.37);
+        let mut kv_d = KvCache::with_capacity(16);
+        let (want, want_sel) = decode_steps(&a_gpu, &xs, 0, &mut kv_d, &gpu);
+        let run = |attn: &QsaAttention, kv: &mut KvCache, dev: &Device| -> Vec<Vec<f32>> {
+            let mut out = decode_steps(attn, &xs[..cuts[0]], 0, kv, dev).0;
+            out.extend(prefill_chunk(attn, &xs[cuts[0]..cuts[1]], kv, dev));
+            out.extend(prefill_chunk(attn, &xs[cuts[1]..], kv, dev));
+            out
+        };
+        let mut kv_g = KvCache::with_capacity(16);
+        let got = run(&a_gpu, &mut kv_g, &gpu);
+        let mut kv_c = KvCache::with_capacity(16);
+        let got_cpu = run(&a_cpu, &mut kv_c, &cpu);
+        assert_eq!(kv_g.lens(), kv_d.lens());
+        let scale = want.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
+        let worst = |a: &[Vec<f32>], b: &[Vec<f32>]| {
+            (0..n)
+                .map(|p| max_diff(&a[p], &b[p]))
+                .fold(0f32, |m, d| if d.is_nan() { d } else { m.max(d) })
+        };
+        let (e_replay, e_cpu) = (worst(&got, &want), worst(&got, &got_cpu));
+        println!("metal chunk vs metal replay {e_replay:e}, vs cpu chunk {e_cpu:e}, scale {scale}");
+        assert!(e_replay <= 1e-3 * scale, "vs replay: {e_replay}");
+        assert!(e_cpu <= 1e-3 * scale, "vs cpu: {e_cpu}");
+        let rows = chunk_selection(&a_gpu, &xs[limit..cuts[1]], limit, &kv_g, &gpu);
+        for (t, g) in rows.iter().enumerate() {
+            let p = limit + t;
+            let (mut gs, mut ws) = (g.clone(), want_sel[p].clone().expect("sparse"));
+            gs.sort_unstable();
+            ws.sort_unstable();
+            assert_eq!(
+                gs, ws,
+                "pos {p}: the chunk's selection vs decode's on Metal"
+            );
+        }
+        let (mut kv_p, _other) = pooled_row_off_page_zero(&cfg, &gpu);
+        let pooled = run(&a_gpu, &mut kv_p, &gpu);
+        for p in 0..n {
+            let same = pooled[p]
+                .iter()
+                .zip(&got[p])
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(
+                same,
+                "pos {p}: the pooled row is not the slab's bits on Metal"
+            );
+        }
+    }
+
+    /// At the model's own indexer (budget 2048, ratio 4: dense range 2051):
+    /// a 2000-position prefix prefilled, then one chunk crossing the range
+    /// (each sparse row's 2048–2051 cells take the two-pass arm), against
+    /// the same prefix followed by decode steps. Outputs within fp32
+    /// reordering; the selection the same set per query.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn chunk_prefill_crosses_the_real_dense_range_on_metal() {
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let attn = indexed_attn(&cfg, &gpu);
+        let h = cfg.hidden_size;
+        let limit = attn.dense_limit().unwrap();
+        assert_eq!(limit, 2051);
+        let (pre, n) = (2000usize, 2302usize);
+        let xs = inputs(h, n, 0.013);
+        let prefix = |kv: &mut KvCache| {
+            for c in xs[..pre].chunks(500) {
+                prefill_chunk(&attn, c, kv, &gpu);
+            }
+        };
+        let mut kv_d = KvCache::with_capacity(1024);
+        prefix(&mut kv_d);
+        let (want, want_sel) = decode_steps(&attn, &xs[pre..], pre, &mut kv_d, &gpu);
+        let mut kv_c = KvCache::with_capacity(1024);
+        prefix(&mut kv_c);
+        let got = prefill_chunk(&attn, &xs[pre..], &mut kv_c, &gpu);
+        assert_eq!(kv_c.lens(), kv_d.lens());
+        let scale = want.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
+        let err = (0..n - pre)
+            .map(|t| max_diff(&got[t], &want[t]))
+            .fold(0f32, |m, d| if d.is_nan() { d } else { m.max(d) });
+        println!("real indexer: chunk vs replay {err:e} at scale {scale}");
+        assert!(
+            err <= 1e-3 * scale,
+            "chunk vs replay: {err} at scale {scale}"
+        );
+        let rows = chunk_selection(&attn, &xs[limit..], limit, &kv_c, &gpu);
+        let mut differ = Vec::new();
+        for (t, g) in rows.iter().enumerate() {
+            let p = limit + t;
+            assert!(
+                g.len() >= 2048 && g.len() <= 2051,
+                "pos {p}: {} cells",
+                g.len()
+            );
+            let (mut gs, mut ws) = (g.clone(), want_sel[p - pre].clone().expect("sparse"));
+            gs.sort_unstable();
+            ws.sort_unstable();
+            if gs != ws {
+                differ.push(p);
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "queries whose selection differs: {differ:?}"
+        );
+    }
+
+    /// Each KV store's chunk past the dense range against its own decode
+    /// replay: the f16 store's cells and the quantized stores' dequantized
+    /// cells feed the paged attention, where decode reads the f16 gather
+    /// and the codes. Within fp32 reordering of the same values — far under
+    /// the gap a store that attended every cell would show.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn chunk_prefill_past_the_dense_range_on_every_store() {
+        use crate::nn::ops::KvQuant;
+        let gpu = Device::new_metal(0).unwrap();
+        let cfg = kv_arm_cfg();
+        let attn = indexed_attn(&cfg, &gpu);
+        let h = cfg.hidden_size;
+        let (n, cuts) = (56usize, [3usize, 37]);
+        let xs = inputs(h, n, 0.21);
+        let limit = attn.dense_limit().unwrap();
+        let (sel32, _) = decode_steps(&attn, &xs, 0, &mut KvCache::with_capacity(16), &gpu);
+        let (all32, _) = decode_steps(
+            &dense_twin(&cfg, &gpu),
+            &xs,
+            0,
+            &mut KvCache::with_capacity(16),
+            &gpu,
+        );
+        let d_sel = (limit..n)
+            .map(|q| max_diff(&all32[q], &sel32[q]))
+            .fold(0f32, f32::max);
+        let arms = [
+            ("f16", KvPrecision::dense(DType::F16)),
+            ("int8", KvPrecision::quantized(KvQuant::Int8).unwrap()),
+            ("int4", KvPrecision::quantized(KvQuant::Int4).unwrap()),
+        ];
+        for (name, p) in arms {
+            let mut kv_d = KvCache::with_precision(16, p).unwrap();
+            let (want, _) = decode_steps(&attn, &xs, 0, &mut kv_d, &gpu);
+            let mut kv_c = KvCache::with_precision(16, p).unwrap();
+            let mut got = decode_steps(&attn, &xs[..cuts[0]], 0, &mut kv_c, &gpu).0;
+            got.extend(prefill_chunk(&attn, &xs[cuts[0]..cuts[1]], &mut kv_c, &gpu));
+            got.extend(prefill_chunk(&attn, &xs[cuts[1]..], &mut kv_c, &gpu));
+            assert_eq!(kv_c.lens(), kv_d.lens(), "{name}");
+            let scale = want.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
+            let err = (0..n)
+                .map(|q| max_diff(&got[q], &want[q]))
+                .fold(0f32, |m, d| if d.is_nan() { d } else { m.max(d) });
+            println!("{name}: chunk vs its decode replay {err:e}, dense-over-all {d_sel:e}, scale {scale}");
+            assert!(
+                err <= 1e-3 * scale,
+                "{name}: chunk vs replay {err} at scale {scale}"
+            );
+            assert!(
+                d_sel > 10.0 * 1e-3 * scale,
+                "the control is blind ({d_sel})"
+            );
+        }
+    }
+
+    /// The A/B arm (`QWEN4EXP_SPARSE_MASKED`) computes what the shipping arm
+    /// does: the same queries over the same cache, one masked dense attention
+    /// over every cell against the paged kernel over each row's cells, within
+    /// fp32 reordering — so a timing between the two compares one result.
+    /// At the real head geometry, rows past the dense range in two tiles.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_masked_arm_attends_as_the_paged_arm() {
+        let gpu = Device::new_metal(0).unwrap();
+        let cfg = kv_arm_cfg();
+        let attn = indexed_attn(&cfg, &gpu);
+        let (h, hd, nh) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads);
+        let n = 70usize;
+        let xs = inputs(h, n, 0.61);
+        let mut kv = KvCache::with_capacity(16);
+        decode_steps(&attn, &xs, 0, &mut kv, &gpu);
+        let pos0 = attn.dense_limit().unwrap() + 3;
+        let s = n - pos0;
+        let x = Tensor::from_vec(xs[pos0..].concat(), (s, h), &gpu).unwrap();
+        let q = Tensor::from_vec(
+            (0..s * nh * hd)
+                .map(|i| ((i as f32) * 0.0137).sin())
+                .collect::<Vec<f32>>(),
+            (s, nh, hd),
+            &gpu,
+        )
+        .unwrap();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let ix = attn.indexer().unwrap();
+        let tile = s.div_ceil(2);
+        let paged = host(&attn.sparse_rows(&x, &q, pos0, &mut kv, scale).unwrap());
+        let masked = host(
+            &attn
+                .sparse_rows_masked(ix, &x, &q, pos0, &mut kv, scale, tile)
+                .unwrap(),
+        );
+        let sc = paged.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let err = max_diff(&masked, &paged);
+        println!("masked vs paged {err:e} at scale {sc}");
+        assert!(err <= 1e-5 * sc, "masked vs paged: {err} at scale {sc}");
+        assert!(paged.iter().any(|v| v.abs() > 1e-3), "a degenerate output");
     }
 
     /// The Metal decode with the indexer matches the CPU decode past the

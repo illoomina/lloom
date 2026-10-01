@@ -21,7 +21,9 @@ use crate::nn::ops;
 use lloom_tensor::quantized::{MoeArm, QMatMul};
 use lloom_tensor::{DType, Module, Result, Tensor, D};
 
-pub use crate::nn::expert_stream::{ExpertResidency, Resident, RoutedGroup, Streamed};
+pub use crate::nn::expert_stream::{
+    ExpertResidency, Resident, RoutedGroup, Streamed, WindowRecord,
+};
 
 /// What a device-planned layer does at its two join points: right after
 /// the routed experts are planned (`after_plan`, handed the plan's record)
@@ -38,6 +40,42 @@ pub trait PlanHook {
 }
 
 impl PlanHook for () {}
+
+/// How a speculative window's routed experts are planned
+/// ([`MoeLayer::decode_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowPlanKind {
+    /// On the device: no readback at the layer; the record is read after
+    /// the pass.
+    Device,
+    /// On the host: the ids read back at the layer; the first `real_rows`
+    /// rows loaded and counted as used, the rows up to `loaded_rows` loaded
+    /// and counted only if accepted, the rest — the drafts — resolved
+    /// against what is resident, a miss flagged.
+    Host {
+        real_rows: usize,
+        loaded_rows: usize,
+    },
+}
+
+/// A window layer's plan record ([`MoeLayer::decode_window`]): a device
+/// plan's `[3·n]` tensor, read back after the pass, or a host plan's
+/// record already on the host.
+#[derive(Debug)]
+pub enum WindowPlan {
+    Device(Tensor),
+    Host(WindowRecord),
+}
+
+impl WindowPlan {
+    /// A device plan's record tensor; `None` for a host plan's.
+    pub fn into_device(self) -> Option<Tensor> {
+        match self {
+            WindowPlan::Device(t) => Some(t),
+            WindowPlan::Host(_) => None,
+        }
+    }
+}
 
 /// One layer's MoE, generic over the residency strategy (static dispatch).
 #[derive(Debug, Clone)]
@@ -121,6 +159,11 @@ impl<R: ExpertResidency> MoeLayer<R> {
         &self.experts
     }
 
+    /// Experts routed per token.
+    pub fn topk(&self) -> usize {
+        self.n_experts_per_tok
+    }
+
     /// One decode token through the MoE. `x` is `[1, 1, hidden]`, returns
     /// `[1, 1, hidden]` = routed top-k combine + gated shared expert.
     pub fn decode(&self, x: &Tensor) -> Result<Tensor> {
@@ -167,6 +210,45 @@ impl<R: ExpertResidency> MoeLayer<R> {
         let (shared, sh_logit) = self.shared_expert(&r)?;
         hook.at_join()?;
         Ok((self.combine(&r, &y, &shared, &sh_logit)?, Some(rec)))
+    }
+
+    /// A speculative window's `T` positions through the MoE (`x [T, 1,
+    /// hidden]`, row 0 the real next token, the rows after it drafts),
+    /// planned as `kind` says: on the device (`plan_device`, settled after
+    /// the pass) or on the host (`plan_window`: the real rows loaded, a
+    /// draft row's miss flagged, never loaded). Either way the plan's record comes back
+    /// for the caller to settle AFTER the accept (`settle_window`), so a
+    /// rejected row touches, counts and loads nothing (`expert-streaming.md`
+    /// §20.16). `None` record: a strategy with no pool (`Resident`) took the
+    /// plain groups.
+    pub fn decode_window(
+        &self,
+        x: &Tensor,
+        kind: WindowPlanKind,
+    ) -> Result<(Tensor, Option<WindowPlan>)> {
+        let r = self.prefill_route(x)?;
+        match kind {
+            WindowPlanKind::Device => {
+                if let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? {
+                    let y = self.routed_one_group(&r.x3, &slot_ids)?;
+                    return Ok((self.finish(&r, &y)?, Some(WindowPlan::Device(rec))));
+                }
+            }
+            WindowPlanKind::Host {
+                real_rows,
+                loaded_rows,
+            } => {
+                if let Some((slot_ids, rec)) =
+                    self.experts.plan_window(&r.ids, real_rows, loaded_rows)?
+                {
+                    let y = self.routed_one_group(&r.x3, &slot_ids)?;
+                    return Ok((self.finish(&r, &y)?, Some(WindowPlan::Host(rec))));
+                }
+            }
+        }
+        let groups = self.experts.plan(&r.ids)?;
+        let y = self.routed_groups(&r.x3, &groups)?;
+        Ok((self.finish(&r, &y)?, None))
     }
 
     /// The router alone: the top-k expert ids `[seq, topk]` (u32) of `x

@@ -12,7 +12,7 @@
 use super::config::Config;
 use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
-use super::moe::{ExpertResidency, MoeLayer};
+use super::moe::{ExpertResidency, MoeLayer, WindowPlan, WindowPlanKind, WindowRecord};
 use super::ple::{NgramHash, NgramWindow, PleLayer, PleTable};
 use super::qsa::{KvCache, KvPool, QsaAttention};
 use super::trace;
@@ -98,7 +98,14 @@ impl<R: ExpertResidency> Layer<R> {
         cache: &mut Cache,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, &mut ())
+        let (a, b, c, r) = self.decode_parts_rows_with(
+            res_hc,
+            l,
+            &mut [cache],
+            RowPlan::of(device_plan),
+            &mut (),
+        )?;
+        Ok((a, b, c, r.and_then(WindowPlan::into_device)))
     }
 
     /// [`Self::decode_parts_planned`] with `hook` at the MoE's join points
@@ -111,7 +118,9 @@ impl<R: ExpertResidency> Layer<R> {
         device_plan: bool,
         hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, hook)
+        let (a, b, c, r) =
+            self.decode_parts_rows_with(res_hc, l, &mut [cache], RowPlan::of(device_plan), hook)?;
+        Ok((a, b, c, r.and_then(WindowPlan::into_device)))
     }
 
     /// [`Self::decode_parts_planned`] over `B` rows: `res_hc [B, 1, n·d]`,
@@ -125,7 +134,9 @@ impl<R: ExpertResidency> Layer<R> {
         caches: &mut [&mut Cache],
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows_with(res_hc, l, caches, device_plan, &mut ())
+        let (a, b, c, r) =
+            self.decode_parts_rows_with(res_hc, l, caches, RowPlan::of(device_plan), &mut ())?;
+        Ok((a, b, c, r.and_then(WindowPlan::into_device)))
     }
 
     fn decode_parts_rows_with<H: super::moe::PlanHook>(
@@ -133,9 +144,9 @@ impl<R: ExpertResidency> Layer<R> {
         res_hc: &Tensor,
         l: usize,
         caches: &mut [&mut Cache],
-        device_plan: bool,
+        plan: RowPlan,
         hook: &mut H,
-    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+    ) -> Result<(Tensor, Tensor, Tensor, Option<WindowPlan>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
         trace("attn.mix", l, &cur);
@@ -161,15 +172,47 @@ impl<R: ExpertResidency> Layer<R> {
         // HC prologue (ffn bracket) → MoE → HC epilogue.
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
         trace("ffn.mix", l, &cur);
-        let (moe_out, record) = if device_plan {
-            self.moe.decode_planned_with(&cur, hook)?
-        } else {
-            (self.moe.decode(&cur)?, None)
+        let (moe_out, record) = match plan {
+            RowPlan::Host => (self.moe.decode(&cur)?, None),
+            RowPlan::Device => {
+                let (o, r) = self.moe.decode_planned_with(&cur, hook)?;
+                (o, r.map(WindowPlan::Device))
+            }
+            RowPlan::WindowRow { real, loaded } => self.moe.decode_window(
+                &cur,
+                WindowPlanKind::Host {
+                    real_rows: real as usize,
+                    loaded_rows: (real || loaded) as usize,
+                },
+            )?,
         };
         trace("moe", l, &moe_out);
         let res_hc = self.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
         trace("ffn.combine", l, &res_hc);
         Ok((res_hc, mixed, moe_out, record))
+    }
+
+    /// One window position through the layer, its routed experts planned as
+    /// `RowPlan::WindowRow` (row 0 of a verify window loaded and counted, a
+    /// draft row loaded beside it or resolved against what is resident):
+    /// the carry and the plan record (the verify's reference path, position
+    /// by position).
+    pub fn decode_parts_window_row(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        real: bool,
+        loaded: bool,
+    ) -> Result<(Tensor, Option<WindowPlan>)> {
+        let (a, _, _, r) = self.decode_parts_rows_with(
+            res_hc,
+            l,
+            &mut [cache],
+            RowPlan::WindowRow { real, loaded },
+            &mut (),
+        )?;
+        Ok((a, r))
     }
 
     /// `T` positions of ONE sequence through the layer as one pass (a
@@ -183,7 +226,7 @@ impl<R: ExpertResidency> Layer<R> {
         res_hc: &Tensor,
         l: usize,
         cache: &mut Cache,
-        device_plan: bool,
+        plan: super::moe::WindowPlanKind,
     ) -> Result<SeqParts> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [T, 1, d]
         let (mixed, lens) = match &self.mixer {
@@ -198,11 +241,7 @@ impl<R: ExpertResidency> Layer<R> {
         };
         let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
-        let (moe_out, record) = if device_plan {
-            self.moe.decode_planned(&cur)?
-        } else {
-            (self.moe.decode(&cur)?, None)
-        };
+        let (moe_out, record) = self.moe.decode_window(&cur, plan)?;
         let res_hc = self.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
         Ok((res_hc, record, lens))
     }
@@ -218,6 +257,21 @@ impl<R: ExpertResidency> Layer<R> {
         let (res_hc, cur, inject) = self.prefill_mix(res_hc, l, cache)?;
         let moe_out = self.moe.forward(&cur)?;
         self.prefill_finish(&res_hc, &moe_out, &inject, l)
+    }
+
+    /// [`Self::prefill`] with the MoE planned as a window (`MoeLayer::
+    /// decode_window`): every row real, the plan's record returned for the
+    /// caller to settle after its readback (the MTP head's observe).
+    pub fn prefill_window(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        kind: WindowPlanKind,
+    ) -> Result<(Tensor, Option<WindowPlan>)> {
+        let (res_hc, cur, inject) = self.prefill_mix(res_hc, l, cache)?;
+        let (moe_out, record) = self.moe.decode_window(&cur, kind)?;
+        Ok((self.prefill_finish(&res_hc, &moe_out, &inject, l)?, record))
     }
 
     /// The mixer half of [`Self::prefill`]: the carry after the mixer's
@@ -254,10 +308,74 @@ impl<R: ExpertResidency> Layer<R> {
     }
 }
 
-/// What `Layer::decode_parts_seq` returns: the carry, the MoE's device-plan
-/// record, and — on a full-attention layer — the KV lengths after every
-/// position.
-pub type SeqParts = (Tensor, Option<Tensor>, Option<Vec<(usize, usize)>>);
+/// How one decode position's routed experts are planned
+/// (`Layer::decode_parts_rows_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPlan {
+    /// The host plan: the ids read back at the layer, every row's misses
+    /// loaded.
+    Host,
+    /// The device plan: no readback, the record settled after the pass.
+    Device,
+    /// A verify window's position on the host plan: `real` (the next
+    /// token: loaded, counted), a draft `loaded` beside it (loaded, counted
+    /// only if accepted) or a draft resolved against what is resident (a
+    /// miss flagged) — `MoeLayer::decode_window`.
+    WindowRow { real: bool, loaded: bool },
+}
+
+impl RowPlan {
+    fn of(device_plan: bool) -> Self {
+        if device_plan {
+            RowPlan::Device
+        } else {
+            RowPlan::Host
+        }
+    }
+}
+
+/// A verify window's pass, run and read back, awaiting its accept
+/// (`Qwen4Exp::verify_window_run` → `verify_window_settle`).
+#[derive(Debug)]
+pub struct VerifyPass {
+    /// Each window position's argmax.
+    pub argmax: Vec<u32>,
+    /// Per layer (in layer order), the plan record over the window's rows.
+    records: Vec<(usize, WindowRecord)>,
+    /// The window ran on the device plan.
+    pub planned: bool,
+    t0: std::time::Instant,
+    tokens: Vec<u32>,
+    /// The window's embeddings, for a redo (Metal; the reference path
+    /// re-embeds).
+    h: Option<Tensor>,
+    /// A host-planned window that loaded for its draft rows too.
+    drafts_loaded: bool,
+}
+
+/// What a settled verify window is worth (`Qwen4Exp::verify_window_settle`).
+#[derive(Debug, Clone)]
+pub struct WindowVerdict {
+    /// Each position's argmax (the redo's, if one ran).
+    pub argmax: Vec<u32>,
+    /// The rows that stand: the accept's count, cut at the first flagged
+    /// draft row.
+    pub accepted: usize,
+    pub planned: bool,
+    pub redo: bool,
+    pub first_flagged: Option<usize>,
+    /// Flags on the rows past `accepted`, over the layers.
+    pub rejected_flags: u64,
+}
+
+/// What `Layer::decode_parts_seq` returns: the carry, the MoE's plan record
+/// (device or host, settled after the accept), and — on a full-attention
+/// layer — the KV lengths after every position.
+pub type SeqParts = (
+    Tensor,
+    Option<super::moe::WindowPlan>,
+    Option<Vec<(usize, usize)>>,
+);
 
 /// The per-sequence state the forward threads: DeltaNet `S`, the conv window,
 /// and per-QSA-layer growing KV. The recurrent channels carry the migrate/
@@ -322,6 +440,27 @@ pub struct Cache {
     /// Experts a settle loaded for layers past the first layer that missed:
     /// their ids were routed from a carry already wrong at that layer.
     pub settle_after_first: u64,
+    /// Verify windows whose accepted prefix was cut at a draft row that
+    /// computed on a missing expert (no redo: the rows before it stand).
+    pub window_truncations: u64,
+    /// Flags on the rows a verify rejected, summed over layers: the
+    /// wrong-path misses no settle loaded (`expert-streaming.md` §20.16).
+    pub window_rejected_flags: u64,
+    /// Verify windows run: host-planned, device-planned, and the device
+    /// plan's redos (a flag on row 0, the real next token) — `redos`
+    /// counts those too.
+    pub window_host: u64,
+    pub window_device: u64,
+    pub window_redos: u64,
+    /// Whether the next host-planned verify window loads its drafts' misses
+    /// beside row 0's (`QWEN4EXP_MTP_DRAFT_LOADS=auto`): on while the real
+    /// row's loads a window (`window_real_loads_ema`, a moving average over
+    /// the host-planned windows) say the pool is missing the stream.
+    pub window_draft_loads: bool,
+    /// The real row's loads per host-planned window, averaged (×1/4 the
+    /// last window, ×3/4 the average before it): the regime the drafts'
+    /// loads follow — ≥ 2 turns them on, < 1 turns them off.
+    pub window_real_loads_ema: f32,
     /// The `(pos, seq)` the last `prepare_pass` sized and admitted, so the
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
@@ -475,6 +614,13 @@ impl Cache {
             replay_ns: 0,
             host_pass_ns: 0,
             settle_after_first: 0,
+            window_truncations: 0,
+            window_rejected_flags: 0,
+            window_host: 0,
+            window_device: 0,
+            window_redos: 0,
+            window_draft_loads: false,
+            window_real_loads_ema: 0.0,
             prepared: None,
         }
     }
@@ -1047,6 +1193,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// than read back per layer. Two steps of one variant allocate the same
     /// ordinals, so each is served its own plan instead of the one recorded
     /// at the other phase drifting on it.
+    /// Which of this model's prefill sequences a chunk of `w` positions at
+    /// `pos` runs, as its pass key's variant: 0 inside the QSA indexer's
+    /// dense range (dense attention), 1 crossing it (a dense part, then the
+    /// selection), 2 wholly past it (the selection alone, as wide as the
+    /// context's blocks). A plan recorded at one is not an allocation
+    /// sequence of another (`pass-plan-design.md` "what would move this").
+    /// Chunks past the range still differ in size with the context's
+    /// blocks — the drift guard re-records those; the kind keeps one
+    /// sequence from being served another's.
+    fn prefill_variant(&self, pos: usize, w: usize) -> u32 {
+        match self.dense_limit() {
+            None => 0,
+            Some(limit) if pos + w <= limit => 0,
+            Some(limit) if pos >= limit => 2,
+            Some(_) => 1,
+        }
+    }
+
     fn decode_variant(&self, pos: usize, device_plan: bool) -> u32 {
         let ratio = self.layers.iter().find_map(|l| match &l.mixer {
             Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
@@ -1207,7 +1371,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         w: seq,
                         fresh: cache.pos == 0,
                     };
-                    if Self::pass_key(shape, opener).is_some_and(|k| m.pass_plan_cached(&k)) {
+                    let variant = self.prefill_variant(cache.pos, seq);
+                    if Self::pass_key(shape, opener)
+                        .is_some_and(|k| m.pass_plan_cached(&k.with_variant(variant)))
+                    {
                         plan.transient = 0;
                     }
                 }
@@ -1264,6 +1431,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Attach the MTP head.
     pub fn set_mtp(&mut self, head: super::mtp::MtpHead<R>) {
         self.mtp = Some(head);
+    }
+
+    /// Whether the streamed tier's routed experts may be planned on the
+    /// device (`ExpertResidency::plan_device`; on when any layer's tier
+    /// can). Off, every pass takes the host plan — the A/B arm a test picks
+    /// per model where `QWEN4EXP_PLAN=host` would pick it per process.
+    pub fn set_device_plan(&mut self, on: bool) {
+        self.device_plan = on
+            && self
+                .layers
+                .iter()
+                .any(|l| l.moe().experts().plans_on_device());
+    }
+
+    pub fn device_plan(&self) -> bool {
+        self.device_plan
     }
 
     pub fn mtp_head(&self) -> Option<&super::mtp::MtpHead<R>> {
@@ -1757,10 +1940,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         }
                         let total: usize = lens.iter().sum();
                         self.prepare_pass_as(cache, total, true)?;
-                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
-                            w: total,
-                            fresh: cache.pos == 0,
-                        })?;
+                        let bracket = self.open_pass_variant(
+                            crate::nn::decode::PassShape::Prefill {
+                                w: total,
+                                fresh: cache.pos == 0,
+                            },
+                            self.prefill_variant(cache.pos, total),
+                        )?;
                         logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
                         self.close_pass(bracket)?;
                         start += total;
@@ -1773,10 +1959,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {
-                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
-                            w: len,
-                            fresh: cache.pos == 0,
-                        })?;
+                        let bracket = self.open_pass_variant(
+                            crate::nn::decode::PassShape::Prefill {
+                                w: len,
+                                fresh: cache.pos == 0,
+                            },
+                            self.prefill_variant(cache.pos, len),
+                        )?;
                         let l = self.prefill_embeds(&h, cache, obs)?;
                         self.close_pass(bracket)?;
                         l
@@ -2028,7 +2217,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 cache.open_window()?;
             }
             let logits = self
-                .decode_embed_pass(h, cache, obs, false)
+                .decode_embed_pass(h, cache, obs, RowPlan::Host)
                 .map(|(l, _)| l)?;
             if own {
                 cache.keep_standing();
@@ -2043,7 +2232,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let t0 = std::time::Instant::now();
             cache.open_window()?;
             let logits = self
-                .decode_embed_pass(h, cache, obs, false)
+                .decode_embed_pass(h, cache, obs, RowPlan::Host)
                 .map(|(l, _)| l)?;
             cache.keep_standing();
             cache.host_plan_passes += 1;
@@ -2062,8 +2251,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // resident for the tokens after it.
         let h = &self.replay_input_owned(h)?;
         cache.open_window()?;
-        let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
+        let (logits, records) = self.decode_embed_pass(h, cache, obs, RowPlan::Device)?;
         self.replay_read_encoded(h);
+        let records: Vec<(usize, Tensor)> = records
+            .into_iter()
+            .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
+            .collect();
         let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             // The step's window stays open as the standing one.
@@ -2078,7 +2271,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         cache.device_plan_armed = false;
         cache.open_window()?;
         let logits = self
-            .decode_embed_pass(h, cache, obs, false)
+            .decode_embed_pass(h, cache, obs, RowPlan::Host)
             .map(|(l, _)| l)?;
         self.replay_read_encoded(h);
         cache.keep_standing();
@@ -2096,9 +2289,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if records.is_empty() {
             return Ok((false, 0));
         }
-        // Every layer's record in its tier's host-read slot (a one-row
-        // step): one wait for the pass, then each read in place — no `cat`,
-        // no copy (#814 part 5).
+        let owned = self.read_records_host(records)?;
+        let parts: Vec<(&R, &[u32])> = records
+            .iter()
+            .zip(&owned)
+            .map(|((l, _), v)| (self.layers[*l].moe().experts(), v.as_slice()))
+            .collect();
+        Self::redo_of(R::settle_batch(&parts)?)
+    }
+
+    /// Every layer's device-plan record on the host, in ONE wait: read in
+    /// place from the tiers' host-read slots when they hold them (a one-row
+    /// step, #814 part 5), else a `cat` and one readback.
+    fn read_records_host(&self, records: &[(usize, Tensor)]) -> Result<Vec<Vec<u32>>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
         #[cfg(feature = "metal")]
         if let Ok(m) = records[0].1.device().as_metal_device() {
             let marker = m.flush_marker()?;
@@ -2111,12 +2317,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 }
             }
             if owned.len() == records.len() {
-                let parts: Vec<(&R, &[u32])> = records
-                    .iter()
-                    .zip(&owned)
-                    .map(|((l, _), v)| (self.layers[*l].moe().experts(), v.as_slice()))
-                    .collect();
-                return Self::redo_of(R::settle_batch(&parts)?);
+                return Ok(owned);
             }
         }
         let flat: Vec<Tensor> = records
@@ -2129,7 +2330,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let refs: Vec<&Tensor> = flat.iter().collect();
             self.read_records(&Tensor::cat(&refs, 0)?)?
         };
-        let mut parts: Vec<(&R, &[u32])> = Vec::with_capacity(records.len());
+        let mut owned = Vec::with_capacity(records.len());
         let mut at = 0usize;
         for ((l, _), f) in records.iter().zip(&flat) {
             let n = f.elem_count();
@@ -2140,10 +2341,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     at + n
                 ))
             })?;
-            parts.push((self.layers[*l].moe().experts(), slice));
+            owned.push(slice.to_vec());
             at += n;
         }
-        Self::redo_of(R::settle_batch(&parts)?)
+        Ok(owned)
     }
 
     /// A settle's verdicts as `(redo, misses after the first)`.
@@ -2192,6 +2393,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.layers
             .iter()
             .map(|l| l.moe().experts().misses_so_far())
+            .sum()
+    }
+
+    /// The streamed tier's misses and evictions so far, summed over the
+    /// layers (0 for `Resident`): the per-round trace's counters.
+    pub(crate) fn stream_misses_total(&self) -> u64 {
+        self.stream_misses()
+    }
+
+    pub(crate) fn stream_evictions_total(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| l.moe().experts().evictions_so_far())
             .sum()
     }
 
@@ -2299,11 +2513,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         h: &Tensor,
         cache: &mut Cache,
         obs: &mut O,
-        device_plan: bool,
-    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        plan: RowPlan,
+    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
-        let mut records: Vec<(usize, Tensor)> = Vec::new();
+        let device_plan = plan == RowPlan::Device;
+        let mut records: Vec<(usize, WindowPlan)> = Vec::new();
         let bracket = self.open_pass_variant(
             crate::nn::decode::PassShape::Decode { b: 1 },
             self.decode_variant(cache.pos, device_plan),
@@ -2373,7 +2588,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
 
             let (next, mixed, moe_out, record) =
-                layer.decode_parts_planned_with(&res_hc, l, cache, device_plan, &mut join)?;
+                layer.decode_parts_rows_with(&res_hc, l, &mut [cache], plan, &mut join)?;
             if let Some(r) = record {
                 records.push((l, r));
             }
@@ -2477,15 +2692,18 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
 
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         #[cfg(feature = "metal")]
-        if seq_len == 1 {
-            if let Ok(m) = self.device().as_metal_device() {
-                if m.pass_plans_enabled() {
+        if let Ok(m) = self.device().as_metal_device() {
+            if m.pass_plans_enabled() {
+                let variant = if seq_len == 1 {
                     let device_plan = self.device_plan
                         && plan_on_device()
                         && !cache.window_open()
                         && cache.device_plan_armed;
-                    m.set_next_pass_variant(self.decode_variant(cache.pos, device_plan));
-                }
+                    self.decode_variant(cache.pos, device_plan)
+                } else {
+                    self.prefill_variant(cache.pos, seq_len)
+                };
+                m.set_next_pass_variant(variant);
             }
         }
         self.prepare_pass_inner(cache, seq_len)
@@ -2851,7 +3069,27 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// arithmetic of a decode step (the row gemvs, the per-position state
     /// kernels), so the argmaxes are the sequential decode's. Needs
     /// `cache.ring_holds(T, ple)`.
+    ///
+    /// Every row is settled as real here (a streamed tier loads what any
+    /// row lacks, and a row that computed on a missing expert redoes the
+    /// window). A speculative verify, whose rows past the accept are not
+    /// real, takes [`Self::verify_window_run`] and
+    /// [`Self::verify_window_settle`] instead.
     pub fn verify_window(&self, tokens: &[u32], cache: &mut Cache) -> Result<Vec<u32>> {
+        let t = tokens.len();
+        let pass = self.verify_window_run(tokens, cache)?;
+        let v = self.verify_window_settle(pass, |_| t, false, cache)?;
+        Ok(v.argmax)
+    }
+
+    /// [`Self::verify_window`]'s pass alone: the window opened and run, the
+    /// argmax read back, every layer's plan record on the host — settled
+    /// by [`Self::verify_window_settle`] once the accept is known. On the
+    /// streamed tier a device-planned window flags a missing expert per
+    /// row; a host-planned one loads row 0's (the real next token) and
+    /// flags a draft row's instead of loading it (`QWEN4EXP_MTP_DRAFT_LOADS`
+    /// loads those too, the A/B arm).
+    pub fn verify_window_run(&self, tokens: &[u32], cache: &mut Cache) -> Result<VerifyPass> {
         let t = tokens.len();
         if t == 0 {
             lloom_tensor::bail!("qwen4exp verify_window: no tokens")
@@ -2868,100 +3106,324 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if let Some(w) = &mut cache.window {
             w.tokens = tokens.to_vec();
         }
+        let t0 = std::time::Instant::now();
         let dev = self.device();
         if !dev.is_metal() {
             // The reference path: the positions one by one through the
             // decode step (the CPU's gemm sums in an order that depends on
             // the row count, so a rows pass would not be the sequential
             // math there); the ring channels take the writes phase by phase.
-            let mut argmax = Vec::with_capacity(t);
-            let base_lens: Vec<(usize, usize)> = cache.kv.iter().map(|k| k.lens()).collect();
-            let mut kv_after = Vec::with_capacity(t);
-            let _ = base_lens;
-            for &tok in tokens {
-                let input = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
-                let logits = self
-                    .decode_embed_pass(&self.embed(&input)?, cache, &mut (), false)?
-                    .0;
-                argmax.push(
-                    logits
-                        .flatten_all()?
-                        .argmax(D::Minus1)?
-                        .to_scalar::<u32>()?,
-                );
-                kv_after.push(cache.kv.iter().map(|k| k.lens()).collect::<Vec<_>>());
-            }
-            if let Some(w) = &mut cache.window {
-                w.kv_after = kv_after;
-            }
-            return Ok(argmax);
+            let drafts = cache.window_loads_drafts();
+            let (argmax, records) = self.verify_rows_reference(tokens, cache, false, drafts)?;
+            return Ok(VerifyPass {
+                argmax,
+                records,
+                planned: false,
+                t0,
+                tokens: tokens.to_vec(),
+                h: None,
+                drafts_loaded: drafts,
+            });
         }
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
         let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
         let h = if planned { Self::replay_input(&h)? } else { h };
-        // The cold phase, as `decode_embed`'s: a host-planned window that
-        // completed with every expert resident arms the device plan for the
-        // rounds after it. Without this the speculative body — a prefill,
-        // then verify windows, never a decode step — planned every round on
-        // the host (P29 (9): 137 ms a round against the 40 ms step).
-        let misses_before = (!planned).then(|| {
-            (
-                self.stream_misses(),
-                self.device_plan.then(std::time::Instant::now),
-            )
-        });
-        let (logits, records) = self.verify_pass(&h, cache, planned)?;
-        let mut logits = logits;
-        if let Some((before, t0)) = misses_before {
-            cache.host_plan_passes += 1;
-            cache.host_pass_ns += t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
-            if self.device_plan && plan_on_device() && self.stream_misses() == before {
-                cache.device_plan_armed = true;
+        let drafts = !planned && cache.window_loads_drafts();
+        let kind = if planned {
+            WindowPlanKind::Device
+        } else {
+            WindowPlanKind::Host {
+                real_rows: 1,
+                loaded_rows: if drafts { t } else { 1 },
+            }
+        };
+        let (logits, plans) = self.verify_pass(&h, cache, kind)?;
+        let argmax = logits.argmax(D::Minus1)?; // [T]
+        let (argmax, records) = self.window_read(argmax, plans, t)?;
+        Ok(VerifyPass {
+            argmax,
+            records,
+            planned,
+            t0,
+            tokens: tokens.to_vec(),
+            h: Some(h),
+            drafts_loaded: drafts,
+        })
+    }
+
+    /// The window's argmax `[T]` and its device plans' records in ONE
+    /// readback (their `cat`, through the model's own destination): the
+    /// round's one wait on the pass. A host plan's records are on the
+    /// host already.
+    fn window_read(
+        &self,
+        argmax: Tensor,
+        plans: Vec<(usize, WindowPlan)>,
+        rows: usize,
+    ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
+        let topk = self.cfg.n_experts_per_tok;
+        let mut device: Vec<(usize, Tensor)> = Vec::new();
+        let mut out: Vec<(usize, WindowRecord)> = Vec::with_capacity(plans.len());
+        for (l, p) in plans {
+            match p {
+                WindowPlan::Host(r) => out.push((l, r)),
+                WindowPlan::Device(t) => device.push((l, t.flatten_all()?)),
             }
         }
+        if device.is_empty() {
+            return Ok((argmax.to_vec1::<u32>()?, out));
+        }
+        let mut refs: Vec<&Tensor> = device.iter().map(|(_, t)| t).collect();
+        refs.push(&argmax);
+        let all = self.read_records(&Tensor::cat(&refs, 0)?)?;
+        let mut at = 0usize;
+        for (l, t) in &device {
+            let n = t.elem_count();
+            let slice = all.get(at..at + n).ok_or_else(|| {
+                lloom_tensor::Error::Msg(format!(
+                    "window read: the cat is {} long, layer {l} needs {at}..{}",
+                    all.len(),
+                    at + n
+                ))
+            })?;
+            out.push((*l, WindowRecord::device(slice.to_vec(), rows, topk)?));
+            at += n;
+        }
+        let am = all.get(at..at + rows).ok_or_else(|| {
+            lloom_tensor::Error::Msg(format!(
+                "window read: the cat is {} long, the argmax needs {at}..{}",
+                all.len(),
+                at + rows
+            ))
+        })?;
+        out.sort_by_key(|(l, _)| *l);
+        Ok((am.to_vec(), out))
+    }
+
+    /// Settle [`Self::verify_window_run`]'s pass once `accept` has read its
+    /// argmax (the accepted row count, `1..=T`; row 0 is always real), and
+    /// decide what the window is worth (`expert-streaming.md` §20.16):
+    ///
+    /// - a flag on row 0 (the real next token computed on a missing expert)
+    ///   redoes the window on the host plan — row 0's experts loaded as the
+    ///   pass reaches each layer — and disarms the device plan;
+    /// - a flag on a draft row `p ≥ 1` the accept would have kept cuts the
+    ///   accepted prefix at `p` when `truncate` (the rows before it stand:
+    ///   nothing after `p` is read by them) and disarms the device plan;
+    ///   without `truncate` (every row real) it redoes the window with every
+    ///   row's experts loaded;
+    /// - a flag on a rejected row costs nothing: its experts are neither
+    ///   loaded, nor touched, nor counted.
+    ///
+    /// The residency is then touched and the usage counted for the accepted
+    /// rows alone. A host-planned window that loaded nothing for row 0 and
+    /// was not cut arms the device plan for the windows after it.
+    pub fn verify_window_settle(
+        &self,
+        pass: VerifyPass,
+        accept: impl Fn(&[u32]) -> usize,
+        truncate: bool,
+        cache: &mut Cache,
+    ) -> Result<WindowVerdict> {
+        let VerifyPass {
+            mut argmax,
+            mut records,
+            planned,
+            t0,
+            tokens,
+            h,
+            drafts_loaded,
+        } = pass;
+        let mut drafts_loaded = drafts_loaded;
+        let t = tokens.len();
         if planned {
-            let (redo, after_first) = self.settle_records(&records)?;
-            if redo {
-                cache.settle_after_first += after_first;
-                let t0 = std::time::Instant::now();
-                self.note_replay();
-                // The host plan over the same window from the base.
-                let tokens_v = cache
-                    .window
-                    .as_ref()
-                    .map(|w| w.tokens.clone())
-                    .unwrap_or_default();
-                cache.accept_window(0)?;
-                cache.redos += 1;
-                cache.device_plan_armed = false;
-                cache.open_window()?;
-                cache.set_pending_tokens(&tokens_v);
-                if let Some(w) = &mut cache.window {
-                    w.tokens = tokens_v;
+            cache.window_device += 1;
+        } else {
+            cache.window_host += 1;
+            cache.host_plan_passes += 1;
+            cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
+        }
+        let mut a = accept(&argmax).clamp(1, t);
+        let mut first_flagged = Self::first_flagged(&records);
+        let redo = match first_flagged {
+            Some(0) => true,
+            Some(p) => !truncate && p < a,
+            None => false,
+        };
+        if redo {
+            // The plans closed (nothing accepted of them), the window put
+            // back, the pass again on the host plan from the base: row 0's
+            // experts loaded as it reaches each layer (every row's, when
+            // every row is real).
+            let parts: Vec<(&R, &WindowRecord)> = records
+                .iter()
+                .map(|(l, r)| (self.layers[*l].moe().experts(), r))
+                .collect();
+            R::settle_window(&parts, 0)?;
+            let t1 = std::time::Instant::now();
+            self.note_replay();
+            cache.accept_window(0)?;
+            cache.redos += 1;
+            cache.window_redos += 1;
+            cache.device_plan_armed = false;
+            cache.open_window()?;
+            cache.set_pending_tokens(&tokens);
+            if let Some(w) = &mut cache.window {
+                w.tokens = tokens.clone();
+            }
+            let all_loaded = !truncate || cache.window_loads_drafts();
+            drafts_loaded = all_loaded;
+            let (am, recs) = match &h {
+                Some(h) => {
+                    let kind = WindowPlanKind::Host {
+                        real_rows: if truncate { 1 } else { t },
+                        loaded_rows: if all_loaded { t } else { 1 },
+                    };
+                    let (logits, plans) = self.verify_pass(h, cache, kind)?;
+                    self.window_read(logits.argmax(D::Minus1)?, plans, t)?
                 }
-                logits = self.verify_pass(&h, cache, false)?.0;
-                cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                None => self.verify_rows_reference(&tokens, cache, !truncate, all_loaded)?,
+            };
+            argmax = am;
+            records = recs;
+            cache.replay_ns += t1.elapsed().as_nanos() as u64;
+            a = accept(&argmax).clamp(1, t);
+            first_flagged = Self::first_flagged(&records);
+        }
+        let accepted = match first_flagged {
+            Some(p) if p < a => p.max(1),
+            _ => a,
+        };
+        let parts: Vec<(&R, &WindowRecord)> = records
+            .iter()
+            .map(|(l, r)| (self.layers[*l].moe().experts(), r))
+            .collect();
+        let rejected_flags = R::settle_window(&parts, accepted)?;
+        cache.window_rejected_flags += rejected_flags;
+        let truncated = accepted < a;
+        if truncated {
+            cache.window_truncations += 1;
+        }
+        // The device plan: a window it computed whole stays armed; one cut
+        // at a draft the accept would have kept names a token whose
+        // experts are not all held — the host plan's round.
+        if planned && !redo && truncated {
+            cache.device_plan_armed = false;
+        }
+        // The host plan: a window whose real row(s) loaded nothing and that
+        // was not cut found its experts resident — the device plan's round.
+        // (The drafts loaded beside row 0 do not count: they are not the
+        // next round's row 0.)
+        let real_loads: u64 = records.iter().map(|(_, r)| r.real_loads).sum();
+        let draft_loads: u64 = records.iter().map(|(_, r)| r.draft_loads).sum();
+        // The drafts' loads under `auto` follow the real row's loads a
+        // host-planned window (a redo's replay is one): the pool's regime.
+        if !planned || redo {
+            cache.window_real_loads_ema =
+                0.75 * cache.window_real_loads_ema + 0.25 * real_loads as f32;
+            if cache.window_real_loads_ema >= 2.0 {
+                cache.window_draft_loads = true;
+            } else if cache.window_real_loads_ema < 1.0 {
+                cache.window_draft_loads = false;
             }
         }
-        let argmax = logits.argmax(D::Minus1)?.to_vec1::<u32>()?; // [T]
-        Ok(argmax)
+        let _ = (drafts_loaded, draft_loads);
+        if (!planned || redo)
+            && self.device_plan
+            && plan_on_device()
+            && !truncated
+            && real_loads == 0
+        {
+            cache.device_plan_armed = true;
+        }
+        Ok(WindowVerdict {
+            argmax,
+            accepted,
+            planned,
+            redo,
+            first_flagged,
+            rejected_flags,
+        })
+    }
+
+    /// The first row of the window any layer flagged: the window is valid
+    /// up to it.
+    fn first_flagged(records: &[(usize, WindowRecord)]) -> Option<usize> {
+        records
+            .iter()
+            .filter_map(|(_, r)| r.first_flagged_row())
+            .min()
+    }
+
+    /// The window position by position through the decode step (the
+    /// reference path): each position's argmax, and per layer one record
+    /// over the window's rows — row 0 real (every row, when `all_real`),
+    /// the drafts loaded beside it when `all_loaded`, else resolved
+    /// against what is resident.
+    fn verify_rows_reference(
+        &self,
+        tokens: &[u32],
+        cache: &mut Cache,
+        all_real: bool,
+        all_loaded: bool,
+    ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
+        let dev = self.device();
+        let t = tokens.len();
+        let mut argmax = Vec::with_capacity(t);
+        let mut kv_after = Vec::with_capacity(t);
+        let mut per_layer: Vec<Vec<WindowRecord>> = vec![Vec::new(); self.layers.len()];
+        for (p, &tok) in tokens.iter().enumerate() {
+            let input = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+            let plan = RowPlan::WindowRow {
+                real: p == 0 || all_real,
+                loaded: p == 0 || all_loaded,
+            };
+            let (logits, recs) =
+                self.decode_embed_pass(&self.embed(&input)?, cache, &mut (), plan)?;
+            argmax.push(
+                logits
+                    .flatten_all()?
+                    .argmax(D::Minus1)?
+                    .to_scalar::<u32>()?,
+            );
+            kv_after.push(cache.kv.iter().map(|k| k.lens()).collect::<Vec<_>>());
+            for (l, r) in recs {
+                match r {
+                    WindowPlan::Host(rec) => per_layer[l].push(rec),
+                    WindowPlan::Device(_) => {
+                        lloom_tensor::bail!(
+                            "qwen4exp verify_window: a device plan on the reference path"
+                        )
+                    }
+                }
+            }
+        }
+        if let Some(w) = &mut cache.window {
+            w.kv_after = kv_after;
+        }
+        let mut records = Vec::new();
+        for (l, recs) in per_layer.into_iter().enumerate() {
+            if !recs.is_empty() {
+                records.push((l, WindowRecord::concat_rows(&recs)?));
+            }
+        }
+        Ok((argmax, records))
     }
 
     /// The layer stack over the window's `T` positions → logits `[T, vocab]`
-    /// and the device plans' records; the KV lengths after each position
+    /// and the layers' plan records; the KV lengths after each position
     /// recorded in the window.
     fn verify_pass(
         &self,
         h: &Tensor,
         cache: &mut Cache,
-        device_plan: bool,
-    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        kind: WindowPlanKind,
+    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let t = h.dim(0)?;
-        let n_layers = self.layers.len();
-        let mut records: Vec<(usize, Tensor)> = Vec::new();
+        let mut records: Vec<(usize, WindowPlan)> = Vec::new();
         let mut kv_after: Vec<Vec<(usize, usize)>> = (0..t)
             .map(|_| cache.kv.iter().map(|k| k.lens()).collect())
             .collect();
@@ -2986,7 +3448,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     res_hc = (res_hc + delta)?;
                 }
             }
-            let (next, record, lens) = layer.decode_parts_seq(&res_hc, l, cache, device_plan)?;
+            let (next, record, lens) = layer.decode_parts_seq(&res_hc, l, cache, kind)?;
             if let Some(r) = record {
                 records.push((l, r));
             }
@@ -2996,7 +3458,6 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         row[l] = ln;
                     }
                 }
-                let _ = n_layers;
             }
             res_hc = next;
         }
@@ -3071,6 +3532,45 @@ impl super::moe::PlanHook for JoinHook {
 fn spike0_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().stream.spike0 == "wait")
+}
+
+/// Whether a host-planned verify window loads the DRAFT rows' missing
+/// experts beside row 0's (`QWEN4EXP_MTP_DRAFT_LOADS`, read once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftLoads {
+    /// While the real row's loads a window say the pool is missing the
+    /// stream (≥ 2 on average: the 171-slot regime, code and math at
+    /// `auto`, §20.16a — a kept draft would be cut every round and the
+    /// loads are what the verify needs to accept anything); off where the
+    /// pool holds it (< 1: prose and count at `auto` — a wrong draft's
+    /// loads are the cost §20.16 removes).
+    Auto,
+    On,
+    Off,
+}
+
+fn mtp_draft_loads() -> DraftLoads {
+    static ON: std::sync::OnceLock<DraftLoads> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match crate::tuning::tuning().qwen4exp.mtp_draft_loads.as_str() {
+            "on" => DraftLoads::On,
+            "off" => DraftLoads::Off,
+            _ => DraftLoads::Auto,
+        },
+    )
+}
+
+impl Cache {
+    /// Whether the next host-planned verify window loads its draft rows'
+    /// misses (`DraftLoads`): under `Auto`, while the real row's loads a
+    /// window average 2 or more (off again under 1).
+    fn window_loads_drafts(&self) -> bool {
+        match mtp_draft_loads() {
+            DraftLoads::On => true,
+            DraftLoads::Off => false,
+            DraftLoads::Auto => self.window_draft_loads,
+        }
+    }
 }
 
 /// Whether the streamed tier's routed experts are planned on the device

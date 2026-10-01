@@ -235,13 +235,17 @@ pub fn resident_model(cfg: &Config, dev: &Device) -> Qwen4Exp<Resident> {
     model_with(cfg, dev, |l| Ok(resident_experts(cfg, l, dev))).expect("resident build")
 }
 
-/// A one-layer MTP head around `experts` (a full-attention layer).
+/// A one-layer MTP head around `experts` (a full-attention layer, with the
+/// QSA indexer as the loader builds it: a fixture's prompt past the dense
+/// range runs the head's selection and its chunk prefill past the range).
 pub fn mtp_head<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> MtpHead<R> {
     let d = cfg.hidden_size;
     let nd = cfg.hc_dim();
     let layer = Layer::new(
         hc(cfg, 300.0, dev),
-        Mixer::Full(qsa_seeded(cfg, dev, 11.0)),
+        Mixer::Full(
+            qsa_seeded(cfg, dev, 11.0).with_indexer(indexer(cfg, dev).expect("the tiny indexer")),
+        ),
         hc(cfg, 350.0, dev),
         moe_with(cfg, dev, experts),
     );

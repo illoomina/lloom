@@ -318,6 +318,42 @@ fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
     Ok(())
 }
 
+/// The identity with a prompt past the head's QSA dense range (the tiny
+/// indexer's 19 positions): the drafter's seeding observe keys the prompt's
+/// rows through the head's chunk prefill past the range (#897's path), and
+/// every round after it keys past it — the shape the fixture could not see
+/// while its head had no indexer.
+#[test]
+fn mtp_identity_holds_with_a_prompt_past_the_dense_range() -> Result<()> {
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model(&cfg, &dev);
+    // `Indexer::dense_limit` = budget + ratio − 1 (19 on the tiny template).
+    let limit = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
+    let prompt: Vec<u32> = (0..limit + 11).map(|i| (i as u32 * 7 + 1) % 120).collect();
+    let max = 24;
+    let (ref_ids, ref_eos) = greedy(&model, &cfg, &prompt, max)?;
+    assert!(ref_ids.len() >= 6, "a stream of {} tokens", ref_ids.len());
+    for k in [1usize, 2] {
+        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let mut mtp =
+            MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
+        let (ids, eos, accepted) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
+        assert_eq!(
+            ids, ref_ids,
+            "k = {k}: MTP drafter past the dense range: not the greedy stream"
+        );
+        assert_eq!(eos, ref_eos);
+        assert!(
+            mtp.rows_seen() > limit,
+            "k = {k}: the head was keyed with {} rows, inside the range of {limit}",
+            mtp.rows_seen()
+        );
+        println!("MTPPASTDENSE k={k} limit={limit} prompt={} accepted={accepted}", prompt.len());
+    }
+    Ok(())
+}
+
 /// After a verify that accepts `a` of `k + 1` positions, every state channel
 /// equals a fresh cache's after decoding the prompt + the accepted tokens —
 /// an absolute reference from a different route (§3.1b), checked per channel

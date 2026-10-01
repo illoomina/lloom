@@ -1286,6 +1286,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// The routed experts' activation dtype (the first layer's; every layer
+    /// is set together, [`Self::set_routed_act`]).
+    pub fn routed_act(&self) -> lloom_tensor::DType {
+        self.layers
+            .first()
+            .map_or(lloom_tensor::DType::F32, |l| l.moe.routed_act())
+    }
+
     pub fn prefill_mode(&self) -> PrefillMode {
         self.prefill_mode
     }

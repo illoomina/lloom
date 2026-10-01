@@ -71,11 +71,13 @@ impl Contract {
         self == Contract::Fast
     }
 
-    /// The arms `fast` takes, by name. Empty: every candidate measured so
-    /// far bought nothing on this device (`architecture.md` §2.3.5b), so a
-    /// `fast` run computes a `deterministic` run's bits. An arm joins this
-    /// list in the change that makes it read [`contract`].
-    pub const FAST_ARMS: &'static [&'static str] = &[];
+    /// The arms `fast` takes, by name (`architecture.md` §2.3.5b). An arm
+    /// joins this list in the change that makes it read [`contract`], and
+    /// that change pins the bit suites that reach it.
+    ///
+    /// - `moe-act-f16`: Qwen4-exp's routed experts on f16 activations where
+    ///   the matmul-vec runs (`lloom`'s `--moe-act auto`).
+    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16"];
 
     /// `profile=<name> arms=<list>`, for the report lines that say which
     /// contract a run held.
@@ -740,7 +742,7 @@ mod tests {
             Contract::Deterministic.report(),
             "profile=deterministic arms=none"
         );
-        assert_eq!(Contract::Fast.report(), "profile=fast arms=none");
+        assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
     }
 
     #[test]

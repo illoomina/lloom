@@ -244,9 +244,10 @@ struct Args {
     #[arg(long, default_value = "chunk")]
     prefill: String,
 
-    /// The routed experts' activation dtype: `f32` (the byte-identical routed
-    /// arm) or `f16` (the `(f16, f32, f16)` arm, issue #748).
-    #[arg(long, default_value = "f32")]
+    /// The routed experts' activation dtype: `auto` (the contract's: `f16`
+    /// under `fast`, `f32` under `deterministic`, this gate's pin), `f32`
+    /// (the byte-identical routed arm) or `f16` (the `(f16, f32, f16)` arm).
+    #[arg(long, default_value = "auto")]
     moe_act: String,
 
     #[arg(
@@ -722,10 +723,10 @@ fn main() -> Result<()> {
     if let Some(p) = &args.mtp {
         shards.push(p.clone());
     }
-    let moe_act = match args.moe_act.as_str() {
-        "f32" => None,
-        "f16" => Some(candle::DType::F16),
-        other => anyhow::bail!("--moe-act {other}: f32 | f16"),
+    let moe_act = match (args.moe_act.as_str(), contract.is_fast()) {
+        ("auto", true) | ("f16", _) => Some(candle::DType::F16),
+        ("auto", false) | ("f32", _) => None,
+        (other, _) => anyhow::bail!("--moe-act {other}: auto | f32 | f16"),
     };
     let opts = LoadOptions {
         ple_shard: None,
@@ -1069,7 +1070,7 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
         if model.has_ple() { "on" } else { "off" },
         args.ple_cache_rows,
         model.prefill_mode(),
-        args.moe_act,
+        format!("{:?}", model.routed_act()).to_lowercase(),
         args.experts,
         args.slots,
         args.loader,

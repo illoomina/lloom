@@ -1,39 +1,71 @@
 //! Whether a row of a dense f16 `x · Wᵀ` keeps its bits when the number of
 //! rows beside it changes — the property a batched decode's row needs for its
-//! logits not to depend on who else is in the batch (§2.3.3 #7), checked
-//! against the tile the live `m` selects (`mlx_gemm::select_tile_config`:
-//! the GEMV at `m = 1`, the 16-row tile below `skinny_max`, the 64-row tile
-//! from it).
+//! logits not to depend on who else is in the batch (§2.3.3 #7) — against the
+//! kernel the live `m` selects (`mlx_gemm::select_tile_config`: the GEMV at
+//! `m = 1`, the 16-row tile below `skinny_max`, a 64-row tile from it). The
+//! dispatch census names the kernel each `m` ran, so the comparison is between
+//! kernels shown to differ, not assumed to.
 //!
-//! Prints, for each `m`, whether row 0..2 match the `m = 2` result bit for
-//! bit, at LFM2's decode shapes (hidden 2048 → 8192 and back), in the two
-//! layouts a batched step takes (`[m, k]` and the rows-as-batch `[m, 1, k]`).
-//! The assertion is the partition measured on this device: the GEMV differs
-//! from the tiles, and every `m` on one tile agrees with every other.
+//! At LFM2's decode shapes (hidden 2048 → 8192 and back), in the two layouts a
+//! batched step takes (`[m, k]` and the rows-as-batch `[m, 1, k]`): row 0 of
+//! every `m` from 2 to 128 is the `m = 2` row bit for bit, on the 16-row and
+//! the 64-row tiles alike, and the GEMV's row at `m = 1` is not. So the tile
+//! the batch selects costs no batch invariance; the `m = 1` route is the one
+//! seam (`architecture.md` §2.3.5b).
+//!
+//! Its own binary: the census switch is read once per process.
 #![cfg(feature = "metal")]
 
 use lloom_tensor::{DType, Device, Result, Tensor};
 
-fn rows_bits(t: &Tensor, rows: usize) -> Result<Vec<Vec<u32>>> {
+fn device() -> Device {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut t = lloom_tensor::tuning::Tuning::default();
+        t.instrument.profile = true;
+        let _ = lloom_tensor::tuning::install(t);
+    });
+    assert!(lloom_tensor::kernels::metal::profile::enabled());
+    Device::new_metal(0).expect("a Metal device")
+}
+
+fn row0_bits(t: &Tensor) -> Result<Vec<u32>> {
     let t = t.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
     let n = t.dim(t.rank() - 1)?;
-    let t = t.reshape(((), n))?;
-    (0..rows)
-        .map(|r| {
-            Ok(t.get(r)?
-                .to_vec1::<f32>()?
-                .iter()
-                .map(|v| v.to_bits())
-                .collect())
-        })
-        .collect()
+    Ok(t.reshape(((), n))?
+        .get(0)?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+/// The matmul kernels `f` dispatched on `dev`, by label.
+fn kernels(dev: &Device, f: impl FnOnce() -> Result<Tensor>) -> Result<(Tensor, Vec<String>)> {
+    dev.synchronize()?;
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("a census window on this test's device");
+    let y = f()?;
+    dev.synchronize()?;
+    let mut labels: Vec<String> = window
+        .close()
+        .into_iter()
+        .map(|(l, _)| l)
+        .filter(|l| l.starts_with("gemm") || l.starts_with("gemv"))
+        .collect();
+    labels.sort();
+    Ok((y, labels))
 }
 
 #[test]
-fn a_rows_bits_by_the_tile_its_batch_selects() -> Result<()> {
-    let dev = Device::new_metal(0)?;
+fn a_rows_bits_by_the_kernel_its_batch_selects() -> Result<()> {
+    let dev = device();
     let ms = [1usize, 2, 3, 8, 16, 31, 32, 33, 40, 64, 128];
-    let mut verdicts = Vec::new();
+    let skinny = lloom_tensor::tuning::tuning().gemm.skinny_max;
+    let mut failures = Vec::new();
     for (n, k) in [(8192usize, 2048usize), (2048, 8192)] {
         let w = Tensor::randn(0f32, 0.02, (n, k), &dev)?.to_dtype(DType::F16)?;
         let x = Tensor::randn(0f32, 1.0, (128, k), &dev)?.to_dtype(DType::F16)?;
@@ -41,43 +73,42 @@ fn a_rows_bits_by_the_tile_its_batch_selects() -> Result<()> {
             let mut by_m = Vec::new();
             for &m in &ms {
                 let xm = x.narrow(0, 0, m)?;
-                let y = if rank3 {
-                    xm.reshape((m, 1, k))?.broadcast_matmul(&w.t()?)?
-                } else {
-                    xm.matmul(&w.t()?)?
+                let (y, labels) = kernels(&dev, || {
+                    if rank3 {
+                        xm.reshape((m, 1, k))?.broadcast_matmul(&w.t()?)
+                    } else {
+                        xm.matmul(&w.t()?)
+                    }
+                })?;
+                by_m.push((m, row0_bits(&y)?, labels));
+            }
+            let reference = by_m.iter().find(|(m, _, _)| *m == 2).unwrap().1.clone();
+            for (m, bits, labels) in &by_m {
+                let same = *bits == reference;
+                println!(
+                    "ROWINV n={n} k={k} rank3={rank3} m={m} row0_vs_m2={} kernels={labels:?}",
+                    if same { "=" } else { "≠" }
+                );
+                let gemv = labels.iter().any(|l| l.starts_with("gemv"));
+                let tile16 = labels.iter().any(|l| l.contains("_16_32_16_"));
+                let tile64 = labels.iter().any(|l| l.contains("_64_"));
+                let ok = match *m {
+                    1 => gemv && !same,
+                    m if m < skinny => tile16 && same,
+                    _ => tile64 && same,
                 };
-                by_m.push((m, rows_bits(&y, 1)?));
-            }
-            let reference = by_m.iter().find(|(m, _)| *m == 2).unwrap().1.clone();
-            let line: Vec<String> = by_m
-                .iter()
-                .map(|(m, b)| format!("m={m}:{}", if *b == reference { "=" } else { "≠" }))
-                .collect();
-            println!(
-                "ROWINV n={n} k={k} rank3={rank3} row0 vs m=2: {}",
-                line.join(" ")
-            );
-            verdicts.push((n, k, rank3, by_m, reference));
-        }
-    }
-    // The measured partition (see the module docs), asserted.
-    let skinny = lloom_tensor::tuning::tuning().gemm.skinny_max;
-    for (n, k, rank3, by_m, reference) in &verdicts {
-        for (m, b) in by_m {
-            let same = b == reference;
-            let on_16_tile = *m >= 2 && *m < skinny;
-            if *m == 1 {
-                assert!(
-                    !same,
-                    "n={n} k={k} rank3={rank3}: the GEMV row matched the GEMM's — the seam moved"
-                );
-            } else if on_16_tile {
-                assert!(
-                    same,
-                    "n={n} k={k} rank3={rank3} m={m}: a row moved within the 16-row tile"
-                );
+                if !ok {
+                    failures.push(format!(
+                        "n={n} k={k} rank3={rank3} m={m}: same={same} kernels={labels:?}"
+                    ));
+                }
             }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "expected the GEMV to differ at m = 1 and every tile to keep row 0's bits:\n{}",
+        failures.join("\n")
+    );
     Ok(())
 }

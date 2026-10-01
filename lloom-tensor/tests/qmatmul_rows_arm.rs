@@ -165,7 +165,7 @@ fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
                     .to_vec1::<f32>()?
                     == again.flatten_all()?.to_vec1::<f32>()?;
                 println!("ROWS {dtype:?} n={n} m={m} worst_rel={err:e} {nr1}_launches={rows} repeat_identical={same}");
-                if !(err < 2e-3) {
+                if err.is_nan() || err >= 2e-3 {
                     failures.push(format!("{dtype:?} n={n} m={m}: worst rel err {err}"));
                 }
                 if rows != 1 {
@@ -204,7 +204,7 @@ fn the_rows_arm_is_a_reordering_of_the_one_row_core() -> Result<()> {
             let one = w.forward(&x.narrow(0, r, 1)?.contiguous()?)?;
             let err = worst_rel(&rows.narrow(0, r, 1)?, &one.to_device(&Device::Cpu)?)?;
             println!("REORDER {dtype:?} row={r} worst_rel_vs_one_row={err:e}");
-            if !(err < 1e-5) {
+            if err.is_nan() || err >= 1e-5 {
                 failures.push(format!("{dtype:?} row {r}: {err} against the one-row core"));
             }
         }

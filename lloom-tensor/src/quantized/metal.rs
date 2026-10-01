@@ -703,27 +703,13 @@ impl QMetalStorage {
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
-        use crate::kernels::{GemvFloat, GemvTriple};
+        use crate::kernels::GemvTriple;
         let (n_experts, n, k) = self_shape.dims3()?;
         if !input_l.is_contiguous() || !ids_l.is_contiguous() {
             crate::bail!("indexed_moe_forward needs contiguous input and ids")
         }
-        // The activation dtype chooses the triple, as the plain matmul-vec does
-        // (issue #748): f16 activations read and store f16 on the quantized
-        // rows; f32 keeps the byte-identical `_f32` routed arm.
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
-        let triple = match input.dtype() {
-            DType::F32 => GemvTriple::F32F32F32,
-            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
-            other => crate::bail!(
-                "indexed_moe_forward on Metal has no ({other:?}, f32, _) arm for weight {:?}",
-                self.dtype
-            ),
-        };
-        let store_dtype = match triple.store() {
-            GemvFloat::F16 => DType::F16,
-            GemvFloat::F32 => DType::F32,
-        };
+        let (triple, store_dtype) = self.routed_triple(input.dtype(), "indexed_moe_forward")?;
         if ids.dtype() != DType::U32 {
             crate::bail!("indexed_moe_forward ids must be u32, got {:?}", ids.dtype())
         }
@@ -832,11 +818,12 @@ impl QMetalStorage {
         Ok((out, dst_shape))
     }
 
-    /// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2`,
-    /// lloom #749 P31 (3)): `other` is the second stacked weight of the SAME
-    /// kind and shape; the result is `[2, batch, topk, n]` f32 — plane set 0
-    /// this weight's, plane set 1 `other`'s, each what
-    /// [`Self::indexed_moe_forward`] computes for it. f32 activations only.
+    /// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2`):
+    /// `other` is the second stacked weight of the SAME kind and shape; the
+    /// result is `[2, batch, topk, n]` in the activation's triple's store
+    /// dtype — plane set 0 this weight's, plane set 1 `other`'s, each what
+    /// [`Self::indexed_moe_forward`]'s matmul-vec computes for it on the same
+    /// activations.
     pub fn indexed_moe_forward_pair(
         &self,
         other: &Self,
@@ -866,9 +853,8 @@ impl QMetalStorage {
                 need
             )
         }
-        if input.dtype() != DType::F32 {
-            crate::bail!("indexed_moe_forward_pair: f32 activations only, got {:?}", input.dtype())
-        }
+        let (triple, store_dtype) =
+            self.routed_triple(input.dtype(), "indexed_moe_forward_pair")?;
         if ids.dtype() != DType::U32 {
             crate::bail!("indexed_moe_forward_pair ids must be u32, got {:?}", ids.dtype())
         }
@@ -887,7 +873,7 @@ impl QMetalStorage {
         let dst_shape = Shape::from((2, batch, topk, n));
         let dst = device
             .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul_id2")
             .build()?;
         let encoder = device.command_encoder()?;
@@ -896,19 +882,43 @@ impl QMetalStorage {
             &encoder,
             device.kernels(),
             ggml_dtype,
+            triple,
             (n_experts, n, k),
             (batch, topk, in_dim1),
             &self.buffer,
             &other.buffer,
             input.buffer(),
-            input_l.start_offset() * DType::F32.size_in_bytes(),
+            input_l.start_offset() * input.dtype().size_in_bytes(),
             ids.buffer(),
             ids_l.start_offset() * DType::U32.size_in_bytes(),
             &dst,
         )
         .map_err(MetalError::from)?;
-        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
         Ok((out, dst_shape))
+    }
+
+    /// The routed launches' `(activation, f32, store)` triple for an `act`
+    /// activation on this weight, and the store's dtype: f16 activations read
+    /// and store f16 on the quantized weight rows, f32 keeps the
+    /// byte-identical `_f32` arm. Any other pairing is refused, never read
+    /// under the wrong dtype (§8.1.4).
+    fn routed_triple(&self, act: DType, op: &str) -> Result<(crate::kernels::GemvTriple, DType)> {
+        use crate::kernels::{GemvFloat, GemvTriple};
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let triple = match act {
+            DType::F32 => GemvTriple::F32F32F32,
+            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
+            other => crate::bail!(
+                "{op} on Metal has no ({other:?}, f32, _) arm for weight {:?}",
+                self.dtype
+            ),
+        };
+        let store = match triple.store() {
+            GemvFloat::F16 => DType::F16,
+            GemvFloat::F32 => DType::F32,
+        };
+        Ok((triple, store))
     }
 
     /// Overwrite `len` bytes at `offset` with what `fill` writes: the bytes go

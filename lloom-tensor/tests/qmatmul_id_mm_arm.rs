@@ -294,3 +294,80 @@ fn the_pair_takes_the_callers_arm() {
         );
     }
 }
+
+fn bits16(t: &Tensor) -> Vec<u16> {
+    t.flatten_all()
+        .unwrap()
+        .to_vec1::<half::f16>()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// The pair on f16 activations (the `fast` contract's routed arm): on the
+/// matmul-vec it is ONE launch, the `_f16_f16` pair, whose halves are the two
+/// f16 matmul-vec calls bit for bit and stored f16. The GEMM has no f16
+/// activation arm, so on `Gemm` each half falls to the f16 matmul-vec and the
+/// pair is two of those launches — the arm's rule, not the dtype's.
+#[test]
+fn the_f16_pair_is_one_launch_on_the_matvec() {
+    let Some(dev) = device() else {
+        return;
+    };
+    assert!(
+        lloom_tensor::kernels::metal::profile::enabled(),
+        "the census decides which kernels ran"
+    );
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::IQ4NL] {
+        let g = weight(&dev, dtype, 0.0);
+        let u = weight(&dev, dtype, 1.0);
+        for in_dim1 in [1usize, TOPK] {
+            let (x, ids) = (
+                input(&dev, 8, in_dim1)
+                    .to_dtype(lloom_tensor::DType::F16)
+                    .unwrap(),
+                ids(&dev, 8),
+            );
+            for arm in [MoeArm::MatVec, MoeArm::Gemm] {
+                let mut got = None;
+                let census = launches(&dev, || {
+                    let (pg, pu) = g.indexed_moe_forward_pair_with(&u, &x, &ids, arm).unwrap();
+                    assert_eq!(pg.dtype(), lloom_tensor::DType::F16);
+                    assert_eq!(pu.dtype(), lloom_tensor::DType::F16);
+                    got = Some((bits16(&pg), bits16(&pu)));
+                });
+                let want = (
+                    bits16(&g.indexed_moe_forward_with(&x, &ids, arm).unwrap()),
+                    bits16(&u.indexed_moe_forward_with(&x, &ids, arm).unwrap()),
+                );
+                assert_eq!(
+                    got.unwrap(),
+                    want,
+                    "{dtype:?} in_dim1={in_dim1} {arm:?}: the f16 pair's halves are not the two f16 calls"
+                );
+                let (pair, pair16, mv16, mm) = (
+                    count(&census, "mul_mv_id2_"),
+                    count(&census, "_f16_f16"),
+                    count(&census, "mul_mv_id_"),
+                    count(&census, "mul_mm_id"),
+                );
+                println!(
+                    "PAIR16 {dtype:?} in_dim1={in_dim1} {arm:?}: mul_mv_id2={pair} f16_f16={pair16} mul_mv_id={mv16} mul_mm_id={mm}"
+                );
+                match arm {
+                    MoeArm::MatVec => assert_eq!(
+                        (pair, pair16, mv16, mm),
+                        (1, 1, 0, 0),
+                        "{dtype:?} in_dim1={in_dim1}: the f16 matmul-vec pair is not one f16 paired launch ({census:?})"
+                    ),
+                    MoeArm::Gemm => assert_eq!(
+                        (pair, pair16, mv16, mm),
+                        (0, 2, 2, 0),
+                        "{dtype:?} in_dim1={in_dim1}: the f16 pair on Gemm is not two f16 matmul-vec launches ({census:?})"
+                    ),
+                }
+            }
+        }
+    }
+}

@@ -1193,6 +1193,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// than read back per layer. Two steps of one variant allocate the same
     /// ordinals, so each is served its own plan instead of the one recorded
     /// at the other phase drifting on it.
+    /// Which of this model's prefill sequences a chunk of `w` positions at
+    /// `pos` runs, as its pass key's variant: 0 inside the QSA indexer's
+    /// dense range (dense attention), 1 crossing it (a dense part, then the
+    /// selection), 2 wholly past it (the selection alone, as wide as the
+    /// context's blocks). A plan recorded at one is not an allocation
+    /// sequence of another (`pass-plan-design.md` "what would move this").
+    /// Chunks past the range still differ in size with the context's
+    /// blocks — the drift guard re-records those; the kind keeps one
+    /// sequence from being served another's.
+    fn prefill_variant(&self, pos: usize, w: usize) -> u32 {
+        match self.dense_limit() {
+            None => 0,
+            Some(limit) if pos + w <= limit => 0,
+            Some(limit) if pos >= limit => 2,
+            Some(_) => 1,
+        }
+    }
+
     fn decode_variant(&self, pos: usize, device_plan: bool) -> u32 {
         let ratio = self.layers.iter().find_map(|l| match &l.mixer {
             Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
@@ -1353,7 +1371,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         w: seq,
                         fresh: cache.pos == 0,
                     };
-                    if Self::pass_key(shape, opener).is_some_and(|k| m.pass_plan_cached(&k)) {
+                    let variant = self.prefill_variant(cache.pos, seq);
+                    if Self::pass_key(shape, opener)
+                        .is_some_and(|k| m.pass_plan_cached(&k.with_variant(variant)))
+                    {
                         plan.transient = 0;
                     }
                 }
@@ -1919,10 +1940,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         }
                         let total: usize = lens.iter().sum();
                         self.prepare_pass_as(cache, total, true)?;
-                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
-                            w: total,
-                            fresh: cache.pos == 0,
-                        })?;
+                        let bracket = self.open_pass_variant(
+                            crate::nn::decode::PassShape::Prefill {
+                                w: total,
+                                fresh: cache.pos == 0,
+                            },
+                            self.prefill_variant(cache.pos, total),
+                        )?;
                         logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
                         self.close_pass(bracket)?;
                         start += total;
@@ -1935,10 +1959,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {
-                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
-                            w: len,
-                            fresh: cache.pos == 0,
-                        })?;
+                        let bracket = self.open_pass_variant(
+                            crate::nn::decode::PassShape::Prefill {
+                                w: len,
+                                fresh: cache.pos == 0,
+                            },
+                            self.prefill_variant(cache.pos, len),
+                        )?;
                         let l = self.prefill_embeds(&h, cache, obs)?;
                         self.close_pass(bracket)?;
                         l
@@ -2665,15 +2692,18 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
 
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         #[cfg(feature = "metal")]
-        if seq_len == 1 {
-            if let Ok(m) = self.device().as_metal_device() {
-                if m.pass_plans_enabled() {
+        if let Ok(m) = self.device().as_metal_device() {
+            if m.pass_plans_enabled() {
+                let variant = if seq_len == 1 {
                     let device_plan = self.device_plan
                         && plan_on_device()
                         && !cache.window_open()
                         && cache.device_plan_armed;
-                    m.set_next_pass_variant(self.decode_variant(cache.pos, device_plan));
-                }
+                    self.decode_variant(cache.pos, device_plan)
+                } else {
+                    self.prefill_variant(cache.pos, seq_len)
+                };
+                m.set_next_pass_variant(variant);
             }
         }
         self.prepare_pass_inner(cache, seq_len)

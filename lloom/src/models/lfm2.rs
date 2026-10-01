@@ -2100,6 +2100,40 @@ impl PagedKv {
         }
     }
 
+    /// Pages per sequence a pass of `seq_len` tokens would fail to take from
+    /// the pool as it stands: the pages every sequence's append pops, less the
+    /// free list and what the quarantine releases at the pass's drain. Zero
+    /// before the pool exists (it is created sized for the slab) and under a
+    /// pinned pool (exhaustion at it stays loud).
+    ///
+    /// Positions alone under-size the pool after a `clear`: the cleared
+    /// sequence's pages are held until the epoch open at the clear completes,
+    /// and nothing commits between a chat's turns, so the next turn's first
+    /// pass finds every one of them held. Sized by positions, a pool of one
+    /// turn refuses the refill of an empty sequence; this is the term that
+    /// widens it instead (§10.3h's liveness kept, never a wait on the GPU).
+    fn pages_short(&self, seq_len: usize) -> usize {
+        let Some(pool) = self.pool.as_ref() else {
+            return 0;
+        };
+        if self.pool_pages_override.is_some() || seq_len == 0 {
+            return 0;
+        }
+        let n_seqs = self.n_seqs.max(1);
+        let needed: usize = (0..n_seqs)
+            .map(|s| {
+                let (len, held) = pool
+                    .seq(s)
+                    .map(|q| (q.len(), q.pages().len()))
+                    .unwrap_or((0, 0));
+                (len + seq_len).div_ceil(self.page_size).saturating_sub(held)
+            })
+            .sum();
+        let available =
+            pool.pages_free() + self.quarantine.ready(self.clock.completed_count());
+        needed.saturating_sub(available).div_ceil(n_seqs)
+    }
+
     /// Widen the pool to `slab` tokens per sequence — `KvSlot::grow_to`'s
     /// contract on a pool.
     ///
@@ -2111,8 +2145,11 @@ impl PagedKv {
     /// handed out before a fresh one — the order a pool this wide from the
     /// start would have taken. Under `LLOOM_148_POOL_PAGES` the pool is pinned
     /// and exhaustion at it stays loud.
+    ///
+    /// The ceiling bounds positions, not the pool: `Cache::plan_pass` refuses
+    /// a pass past `kv_capacity`, and may size the pool past it by the pages a
+    /// quarantine still holds (`pages_short`), so `slab` is taken as planned.
     fn grow_to(&mut self, slab: usize) -> Result<()> {
-        let slab = slab.min(self.kv_capacity);
         if slab <= self.slab {
             return Ok(());
         }
@@ -4304,10 +4341,26 @@ impl Cache {
                 shared: true,
             }));
         }
-        if need <= self.kv_slab {
+        let mut slab = if need <= self.kv_slab {
+            self.kv_slab
+        } else {
+            (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity)
+        };
+        // The paged pool is sized by the pages a pass can take, not by
+        // positions alone: pages a quarantine still holds are neither the
+        // sequence's nor free (`PagedKv::pages_short`). The headroom may take
+        // the pool past the ceiling; the ceiling check above bounds positions.
+        #[cfg(feature = "metal")]
+        if let Some(p) = self.paged.as_ref() {
+            let short = p.pages_short(seq_len);
+            if short > 0 {
+                let wide = self.kv_slab + short * p.page_size;
+                slab = slab.max(wide.div_ceil(self.kv_bucket) * self.kv_bucket);
+            }
+        }
+        if slab <= self.kv_slab {
             return Ok(None);
         }
-        let slab = (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity);
         Ok(Some(GrowPlan {
             from: self.kv_slab,
             slab,

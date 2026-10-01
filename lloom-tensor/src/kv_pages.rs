@@ -658,6 +658,16 @@ impl<I> EpochQuarantine<I> {
         }
     }
 
+    /// Items a [`Self::drain_completed`] at `completed_count` would return,
+    /// counted without draining: what a planner may count as available
+    /// before the drain runs.
+    pub fn ready(&self, completed_count: u64) -> usize {
+        self.pending
+            .iter()
+            .take_while(|(epoch, _)| completed_count > *epoch)
+            .count()
+    }
+
     /// Items held and not yet eligible.
     ///
     /// The quantity a leak would grow without bound, so it is worth reporting

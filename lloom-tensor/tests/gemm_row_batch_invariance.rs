@@ -65,7 +65,10 @@ fn kernels(dev: &Device, f: impl FnOnce() -> Result<Tensor>) -> Result<(Tensor, 
 fn a_rows_bits_by_the_kernel_its_batch_selects() -> Result<()> {
     let dev = device();
     let ms = [1usize, 2, 3, 8, 16, 31, 32, 33, 40, 64, 128];
-    let skinny = lloom_tensor::tuning::tuning().gemm.skinny_max;
+    // The boundary the shipped selection draws (`skinny_max`'s default,
+    // 33): written here rather than read from the knob, so a moved boundary
+    // fails this test instead of moving its expectation with it.
+    const SKINNY: usize = 33;
     let mut failures = Vec::new();
     for (n, k) in [(8192usize, 2048usize), (2048, 8192)] {
         let w = Tensor::randn(0f32, 0.02, (n, k), &dev)?.to_dtype(DType::F16)?;
@@ -95,7 +98,7 @@ fn a_rows_bits_by_the_kernel_its_batch_selects() -> Result<()> {
                 let tile64 = labels.iter().any(|l| l.contains("_64_"));
                 let ok = match *m {
                     1 => gemv && !same,
-                    m if m < skinny => tile16 && same,
+                    m if m < SKINNY => tile16 && same,
                     _ => tile64 && same,
                 };
                 if !ok {

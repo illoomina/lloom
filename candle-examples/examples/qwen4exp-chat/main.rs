@@ -932,7 +932,11 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
         for (i, o) in outs.iter().enumerate() {
             println!(
                 "ROWTOKENS run={run} row={i} {}",
-                o.ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+                o.ids
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
         }
         // The whole run: the rows' prefills and the batched steps (per
@@ -1362,7 +1366,11 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let mtp_digest = sha256::hex(&h.finalize());
         println!(
             "MTPTOKENS {}",
-            out.ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+            out.ids
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         let rounds = out.stats.rounds.len();
         let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();

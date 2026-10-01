@@ -55,7 +55,10 @@ fn prefill_logits<R: ExpertResidency>(
 ) -> Result<Vec<f32>> {
     let mut cache: Cache = model.new_cache(cfg, dev)?;
     let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), dev)?;
-    model.forward(&input, 0, &mut cache)?.flatten_all()?.to_vec1()
+    model
+        .forward(&input, 0, &mut cache)?
+        .flatten_all()?
+        .to_vec1()
 }
 
 fn bits(row: &[f32]) -> Vec<u32> {
@@ -91,7 +94,12 @@ fn under_fast_a_split_tiles_groups_take_their_own_arm() -> Result<()> {
     let streamed = fx.streamed(&cfg, &dev, &opts, &stream(40))?;
     let got = prefill_logits(&streamed, &cfg, &dev, &prompt)?;
     let st = streamed.stream_stats();
-    let again = prefill_logits(&fx.streamed(&cfg, &dev, &opts, &stream(40))?, &cfg, &dev, &prompt)?;
+    let again = prefill_logits(
+        &fx.streamed(&cfg, &dev, &opts, &stream(40))?,
+        &cfg,
+        &dev,
+        &prompt,
+    )?;
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
     let worst = got.iter().zip(&want).fold(0f32, |m, (a, b)| {
         let d = (a - b).abs();
@@ -110,7 +118,14 @@ fn under_fast_a_split_tiles_groups_take_their_own_arm() -> Result<()> {
         bits(&got) != bits(&want),
         "the split tile's logits are the resident model's bit for bit: the groups did not take their own arm"
     );
-    assert!(worst.is_finite() && worst <= 1e-3 * scale.max(1.0), "max |Δ| {worst} against a logit scale {scale}");
-    assert_eq!(bits(&got), bits(&again), "two fresh pools of one size disagree");
+    assert!(
+        worst.is_finite() && worst <= 1e-3 * scale.max(1.0),
+        "max |Δ| {worst} against a logit scale {scale}"
+    );
+    assert_eq!(
+        bits(&got),
+        bits(&again),
+        "two fresh pools of one size disagree"
+    );
     Ok(())
 }

@@ -69,12 +69,18 @@ fn raw_weight(dtype: GgmlDType, n: usize, seed: u32) -> Result<Vec<u8>> {
 /// The weight on `dev` and its CPU f32 dequant, from the same bytes.
 fn weight(dtype: GgmlDType, n: usize, seed: u32, dev: &Device) -> Result<(QMatMul, Tensor)> {
     let raw = raw_weight(dtype, n, seed)?;
-    let on_dev = QTensor::new(QStorage::from_data(Cow::Borrowed(&raw), dev, dtype)?, (n, K))?;
+    let on_dev = QTensor::new(
+        QStorage::from_data(Cow::Borrowed(&raw), dev, dtype)?,
+        (n, K),
+    )?;
     let on_cpu = QTensor::new(
         QStorage::from_data(Cow::Borrowed(&raw), &Device::Cpu, dtype)?,
         (n, K),
     )?;
-    Ok((QMatMul::from_qtensor(on_dev)?, on_cpu.dequantize(&Device::Cpu)?))
+    Ok((
+        QMatMul::from_qtensor(on_dev)?,
+        on_cpu.dequantize(&Device::Cpu)?,
+    ))
 }
 
 fn activations(m: usize) -> Result<Tensor> {
@@ -88,7 +94,10 @@ fn activations(m: usize) -> Result<Tensor> {
 /// largest magnitude; a NaN anywhere reads as NaN (a NaN-dropping fold
 /// would read a poisoned row as agreement).
 fn worst_rel(got: &Tensor, want: &Tensor) -> Result<f32> {
-    let got = got.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let got = got
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let want = want.flatten_all()?.to_vec1::<f32>()?;
     assert_eq!(got.len(), want.len());
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
@@ -116,7 +125,11 @@ fn launches(dev: &Device, f: impl FnOnce()) -> Vec<(String, u64)> {
 }
 
 fn count(census: &[(String, u64)], pred: impl Fn(&str) -> bool) -> u64 {
-    census.iter().filter(|(l, _)| pred(l)).map(|(_, n)| *n).sum()
+    census
+        .iter()
+        .filter(|(l, _)| pred(l))
+        .map(|(_, n)| *n)
+        .sum()
 }
 
 /// Every output row of the rows arm against the CPU reference, `m` 2..=8,
@@ -144,14 +157,19 @@ fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
                 let nr1 = if m <= 2 { "_r2" } else { "_r4" };
                 let rows = count(&census, |l| l.contains("kernel_mul_mv_") && l.contains(nr1));
                 let again = w.forward(&xd)?.to_device(&Device::Cpu)?;
-                let same = got.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?
+                let same = got
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
                     == again.flatten_all()?.to_vec1::<f32>()?;
                 println!("ROWS {dtype:?} n={n} m={m} worst_rel={err:e} {nr1}_launches={rows} repeat_identical={same}");
                 if !(err < 2e-3) {
                     failures.push(format!("{dtype:?} n={n} m={m}: worst rel err {err}"));
                 }
                 if rows != 1 {
-                    failures.push(format!("{dtype:?} n={n} m={m}: {rows} {nr1} launches ({census:?})"));
+                    failures.push(format!(
+                        "{dtype:?} n={n} m={m}: {rows} {nr1} launches ({census:?})"
+                    ));
                 }
                 if !same {
                     failures.push(format!("{dtype:?} n={n} m={m}: two calls disagree"));
@@ -159,7 +177,12 @@ fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
             }
         }
     }
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
     Ok(())
 }
 

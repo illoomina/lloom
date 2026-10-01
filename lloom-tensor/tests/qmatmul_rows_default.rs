@@ -44,20 +44,33 @@ fn weight(dtype: GgmlDType, n: usize, dev: &Device) -> Result<QMatMul> {
         }
         raw
     };
-    QMatMul::from_qtensor(QTensor::new(QStorage::from_data(Cow::Borrowed(&raw), dev, dtype)?, (n, K))?)
+    QMatMul::from_qtensor(QTensor::new(
+        QStorage::from_data(Cow::Borrowed(&raw), dev, dtype)?,
+        (n, K),
+    )?)
 }
 
 #[test]
 fn a_row_is_the_same_bits_whatever_rows_share_its_launch() -> Result<()> {
     let dev = device();
     assert!(lloom_tensor::kernels::metal::profile::enabled());
-    for dtype in [GgmlDType::Q6K, GgmlDType::Q4K, GgmlDType::IQ4XS, GgmlDType::IQ4NL, GgmlDType::IQ3S] {
+    for dtype in [
+        GgmlDType::Q6K,
+        GgmlDType::Q4K,
+        GgmlDType::IQ4XS,
+        GgmlDType::IQ4NL,
+        GgmlDType::IQ3S,
+    ] {
         let w = weight(dtype, 40, &dev)?;
         for m in 2..=8usize {
             let data: Vec<f32> = (0..m * K).map(|i| ((i as f32) * 0.013).sin()).collect();
             let x = Tensor::from_vec(data, (m, K), &dev)?;
             dev.synchronize()?;
-            let window = dev.as_metal_device()?.dispatch_census().open().expect("a window");
+            let window = dev
+                .as_metal_device()?
+                .dispatch_census()
+                .open()
+                .expect("a window");
             let rows = w.forward(&x)?;
             dev.synchronize()?;
             let census = window.close();
@@ -66,12 +79,29 @@ fn a_row_is_the_same_bits_whatever_rows_share_its_launch() -> Result<()> {
                 .filter(|(l, _)| l.contains("_r2") || l.contains("_r4"))
                 .map(|(_, n)| *n)
                 .sum();
-            assert_eq!(rows_kernels, 0, "{dtype:?} m={m}: a rows kernel ran under deterministic ({census:?})");
+            assert_eq!(
+                rows_kernels, 0,
+                "{dtype:?} m={m}: a rows kernel ran under deterministic ({census:?})"
+            );
             for r in 0..m {
                 let one = w.forward(&x.narrow(0, r, 1)?.contiguous()?)?;
-                let a: Vec<u32> = rows.narrow(0, r, 1)?.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect();
-                let b: Vec<u32> = one.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect();
-                assert_eq!(a, b, "{dtype:?} m={m} row {r}: the batch moved a row's bits");
+                let a: Vec<u32> = rows
+                    .narrow(0, r, 1)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                let b: Vec<u32> = one
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect();
+                assert_eq!(
+                    a, b,
+                    "{dtype:?} m={m} row {r}: the batch moved a row's bits"
+                );
             }
         }
     }

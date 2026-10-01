@@ -1738,11 +1738,29 @@ fn the_cpu_matmul_of_a_read_only_type_is_refused_by_name() -> Result<()> {
 fn a_groups_arm_is_the_tiles_unless_fast() {
     use lloom_tensor::quantized::MoeArm;
     use lloom_tensor::tuning::Contract;
-    assert_eq!(MoeArm::for_rows(64), MoeArm::Gemm, "the default threshold moved");
-    for (tile, rows) in [(MoeArm::Gemm, 10usize), (MoeArm::MatVec, 100), (MoeArm::Gemm, 64), (MoeArm::MatVec, 63)] {
+    assert_eq!(
+        MoeArm::for_rows(64),
+        MoeArm::Gemm,
+        "the default threshold moved"
+    );
+    for (tile, rows) in [
+        (MoeArm::Gemm, 10usize),
+        (MoeArm::MatVec, 100),
+        (MoeArm::Gemm, 64),
+        (MoeArm::MatVec, 63),
+    ] {
         assert_eq!(MoeArm::for_group(tile, rows, Contract::Deterministic), tile);
-        assert_eq!(MoeArm::for_group(tile, rows, Contract::Fast), MoeArm::for_rows(rows));
+        assert_eq!(
+            MoeArm::for_group(tile, rows, Contract::Fast),
+            MoeArm::for_rows(rows)
+        );
     }
-    assert_eq!(MoeArm::for_group(MoeArm::Gemm, 10, Contract::Fast), MoeArm::MatVec);
-    assert_eq!(MoeArm::for_group(MoeArm::MatVec, 100, Contract::Fast), MoeArm::Gemm);
+    assert_eq!(
+        MoeArm::for_group(MoeArm::Gemm, 10, Contract::Fast),
+        MoeArm::MatVec
+    );
+    assert_eq!(
+        MoeArm::for_group(MoeArm::MatVec, 100, Contract::Fast),
+        MoeArm::Gemm
+    );
 }

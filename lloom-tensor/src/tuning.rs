@@ -678,7 +678,10 @@ mod tests {
         assert_eq!(t.contract.profile, "fast");
         assert_eq!(Contract::parse(&t.contract.profile), Ok(Contract::Fast));
         t.set("contract.profile", "deterministic").unwrap();
-        assert_eq!(Contract::parse(&t.contract.profile), Ok(Contract::Deterministic));
+        assert_eq!(
+            Contract::parse(&t.contract.profile),
+            Ok(Contract::Deterministic)
+        );
         assert!(Contract::Fast.is_fast() && !Contract::Deterministic.is_fast());
     }
 

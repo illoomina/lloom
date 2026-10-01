@@ -301,6 +301,27 @@ pub trait Speculator {
     /// Seed sequence `seq`'s state from its prompt.
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()>;
 
+    /// [`Self::begin`] for a request the target reuses a cached prefix for:
+    /// the target already holds `kept` (`kept.len()` positions) and will be
+    /// fed `prompt` after them. A family with its own KV (`KvSource::Own`)
+    /// must keep its state for `kept` — or rewind to it — rather than reset,
+    /// and key `prompt` at position `kept.len()`: a context that restarts at
+    /// zero holds the suffix alone at the wrong positions, and the verify
+    /// hides it as a lower acceptance rate (issue #894). The default is
+    /// [`Self::begin`], right for a family whose state lives in the target's
+    /// cache (MTP, the identity) and for a request with nothing reused.
+    fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        let _ = kept;
+        self.begin(seq, prompt)
+    }
+
+    /// The positions sequence `seq`'s own state covers, for a driver that
+    /// checks it against the target's. `None` for a family with no state of
+    /// its own.
+    fn context_len(&self, _seq: SeqId) -> Option<usize> {
+        None
+    }
+
     /// Propose for the flagged-active sequences — ONE call, ALL sequences, so
     /// the driver verifies them in one batched target forward (§10.2m's B>1 win).
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>>;
@@ -355,6 +376,12 @@ impl<T: Speculator> Speculator for &mut T {
     }
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
         T::begin(self, seq, prompt)
+    }
+    fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        T::begin_at(self, seq, prompt, kept)
+    }
+    fn context_len(&self, seq: SeqId) -> Option<usize> {
+        T::context_len(self, seq)
     }
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
         T::draft(self, active)
@@ -603,6 +630,16 @@ pub struct RoundTiming {
     pub draft_census: Option<PhaseCensus>,
     pub verify_census: Option<PhaseCensus>,
     pub observe_census: Option<PhaseCensus>,
+    /// Fresh `MTLBuffer` allocations the round made (both pools) and the
+    /// residency adds that went with them; 0 off Metal. A steady-state round
+    /// owes zero of each: the target's verify is a planned pass and the
+    /// drafter's state is owned (issue #894).
+    pub pool_allocations: u64,
+    pub residency_adds: u64,
+    /// Of `pool_allocations`, those made while a buffer of the same size
+    /// was released and not yet complete (`PoolCounters::pending_twin_allocations`):
+    /// the pool's deferred-release window, not a size the round lacked.
+    pub pool_allocations_pending_twin: u64,
 }
 
 impl RoundTiming {
@@ -629,6 +666,24 @@ pub(crate) fn readbacks() -> u64 {
     {
         0
     }
+}
+
+/// `(fresh buffer allocations over both pools, residency adds, allocations
+/// with a pending twin)` on `device`
+/// so far; `(0, 0)` off Metal or with no device. Two relaxed counter reads,
+/// taken around a round to show what it allocated (`RoundTiming`).
+pub(crate) fn allocation_counters(device: Option<&Device>) -> (u64, u64, u64) {
+    #[cfg(feature = "metal")]
+    if let Some(Device::Metal(m)) = device {
+        let (shared, private) = m.pool_counters();
+        return (
+            shared.allocations + private.allocations,
+            m.residency_counters().added,
+            shared.pending_twin_allocations + private.pending_twin_allocations,
+        );
+    }
+    let _ = device;
+    (0, 0, 0)
 }
 
 /// One sequence: a cache, the token ids whose state it holds, and how far it
@@ -1012,6 +1067,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
             ReuseAction::Rewound(drop)
+        } else if self.seq.cache.can_restore(keep) {
+            // Past the horizon but within a turn checkpoint's reach: the
+            // chat re-render that drops the previous generation prompt's
+            // last token and the whole reply diverges exactly here.
+            self.seq.cache.restore(keep)?;
+            self.seq.pos = keep;
+            self.seq.tokens.truncate(keep);
+            self.seq.last_logits = None;
+            ReuseAction::Rewound(drop)
         } else {
             self.reset();
             ReuseAction::Fresh
@@ -1107,6 +1171,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         M: Probes<S::Probe>,
     {
         let mut timing = RoundTiming::default();
+        let alloc_before = allocation_counters(verify_key.map(|(d, _)| d));
         let t = std::time::Instant::now();
         let rb = readbacks();
         // The hint is produced only when this round will read it (§3.4.4: the
@@ -1166,6 +1231,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         timing.observe_gpu_s = gpu;
         timing.observe_disp = disp;
         timing.observe_census = census;
+        let alloc_after = allocation_counters(verify_key.map(|(d, _)| d));
+        timing.pool_allocations = alloc_after.0 - alloc_before.0;
+        timing.residency_adds = alloc_after.1 - alloc_before.1;
+        timing.pool_allocations_pending_twin = alloc_after.2 - alloc_before.2;
         Ok((accepted, timing))
     }
 

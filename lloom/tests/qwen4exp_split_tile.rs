@@ -5,10 +5,9 @@
 //!
 //! The tiny model reaches the routed GEMM only at a geometry the template
 //! does not have: the experts' `down` K is 32 (the GEMM reads K in 32-wide
-//! blocks; the template's 16 keeps the matmul-vec at every row count) and
-//! the indexer's budget covers the prompt (a chunk stops at the dense range,
-//! 19 positions on the template, and the rest run one at a time). So a
-//! 100-row tile, over `LLOOM_MOE_MM_FROM`, takes the GEMM on the resident
+//! blocks; the template's 16 keeps the matmul-vec at every row count), and
+//! the indexer's budget covers the prompt, so its attention is the dense
+//! range's. So a 100-row tile, over `LLOOM_MOE_MM_FROM`, takes the GEMM on the resident
 //! model. With 64 experts the streamed tier splits it into many groups at 40
 //! slots and fewer, larger ones at 56: a group choosing its own arm by its
 //! rows would compute the two pools' rows on different kernels. The same

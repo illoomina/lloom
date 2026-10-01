@@ -1715,32 +1715,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 }
             }
             PrefillMode::Chunk => {
-                // A chunk attends densely, which is QSA only while the context
-                // stays within the indexer's dense range; positions past it
-                // run one at a time through the selection.
-                let dense_limit = self.dense_limit();
+                // A chunk is QSA at every position: past the indexer's dense
+                // range each query attends to its own selection.
                 let chunk = prefill_chunk();
-                let chunk_len = |start: usize, pos: usize| -> usize {
-                    let mut len = (seq - start).min(chunk);
-                    if let Some(limit) = dense_limit {
-                        len = len.min(limit.saturating_sub(pos)).max(1);
-                    }
-                    len
-                };
+                let chunk_len = |start: usize| -> usize { (seq - start).min(chunk) };
                 let pair_ok = prefill_pair_on()
                     && self.spec_ahead == 0
                     && !(0..self.layers.len())
                         .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
                 let mut start = 0;
                 while start < seq {
-                    let len = chunk_len(start, cache.pos);
+                    let len = chunk_len(start);
                     // Up to `prefill_tiles` multi-position chunks in a row:
                     // one pass, the tiles interleaved a layer apart.
                     let mut lens = vec![len];
                     if pair_ok && len > 1 {
                         let mut at = start + len;
                         while lens.len() < prefill_tiles() && at < seq {
-                            let l = chunk_len(at, cache.pos + (at - start));
+                            let l = chunk_len(at);
                             if l <= 1 {
                                 break;
                             }

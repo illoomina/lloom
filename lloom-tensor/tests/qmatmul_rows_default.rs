@@ -1,4 +1,4 @@
-//! Under the default knobs and the `deterministic` contract an `m`-row
+//! Under the default knobs and the `deterministic` contract (pinned here) an `m`-row
 //! quantized matmul-vec (2..=8 rows) is one launch with the rows on the
 //! grid's second axis, and each row is bit-identical to a one-row launch of
 //! that row: a sequence's logits do not depend on how many rows share its
@@ -15,6 +15,7 @@ fn device() -> Device {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
+        t.contract.profile = "deterministic".into();
         t.instrument.profile = true;
         let _ = lloom_tensor::tuning::install(t);
     });

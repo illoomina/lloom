@@ -333,7 +333,11 @@ struct Turn {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    println!("CONTRACT {}", candle::tuning::contract().report());
+    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
+        .map_err(anyhow::Error::msg)?;
+    let contract = candle::tuning::gate_contract("lfm2-smoke").map_err(anyhow::Error::msg)?;
+    println!("CONTRACT {}", contract.report());
 
     let model_dir = args.model_dir.clone().or_else(default_model_dir).context(
         "no --model-dir given and the LFM2.5-VL-3B snapshot was not found in the HF cache",

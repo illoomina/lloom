@@ -671,7 +671,11 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    println!("CONTRACT {}", candle::tuning::contract().report());
+    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
+        .map_err(anyhow::Error::msg)?;
+    let contract = candle::tuning::gate_contract("qwen4exp-chat").map_err(anyhow::Error::msg)?;
+    println!("CONTRACT {}", contract.report());
     let gguf = match &args.gguf {
         Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")

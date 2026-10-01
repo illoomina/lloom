@@ -28,17 +28,18 @@ use std::sync::OnceLock;
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
 /// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
-/// `architecture.md` §2.3.5).
+/// `architecture.md` §2.3.5b).
 ///
-/// `Deterministic` is the default and the contract every gate and
-/// correctness suite runs: the same inputs and seed give the same bits,
-/// whatever the scheduling, the batch composition, the pool size, the tile
-/// split or the lookahead. `Fast` promises the same distribution, not the
-/// same bits: it licenses the arms whose bits depend on who else is in the
-/// batch, on completion order, or on which math path verifies a
-/// speculation. Every such arm has a deterministic twin the bit-identity
-/// suites cover; a fast arm is judged by the quality gate, never in place
-/// of the bit gates.
+/// `Fast` is the default (RESTRUCTURING_DESIGN.md §2): the same
+/// distribution, not the same bits — it licenses the arms whose bits depend
+/// on who else is in the batch, on completion order, or on which math path
+/// verifies a speculation. `Deterministic` is the opt-in and the contract
+/// every gate, test and digest runs, pinned explicitly ([`pin_contract`],
+/// [`gate_contract`]) rather than inherited: the same inputs and seed give
+/// the same bits, whatever the scheduling, the pool size, the tile split or
+/// the lookahead. Every fast arm has a deterministic twin the bit-identity
+/// suites cover; it is judged by the quality gate, never in place of the
+/// bit gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Contract {
     Deterministic,
@@ -94,6 +95,41 @@ impl Contract {
 pub fn contract() -> Contract {
     static C: OnceLock<Contract> = OnceLock::new();
     *C.get_or_init(|| Contract::parse(&tuning().contract.profile).expect("the parser accepted it"))
+}
+
+static CONTRACT_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pin the contract for the process, before anything reads the tuning: the
+/// defaults with the env aliases applied, then `c` — unless `LLOOM_PROFILE`
+/// names one, which wins (a quality run asking a gate harness for `fast` has
+/// named it). `Err` if the group was already fixed. What a gate harness or a
+/// bit-identity test calls first, so its contract is stated, not inherited.
+pub fn pin_contract(c: Contract) -> Result<Contract, String> {
+    let mut t = Tuning::default();
+    t.from_env().map_err(|e| format!("tuning: {e}"))?;
+    if std::env::var_os("LLOOM_PROFILE").is_none() {
+        t.contract.profile = c.name().to_string();
+    }
+    let pinned = Contract::parse(&t.contract.profile)?;
+    install(t).map_err(|_| "pin_contract: the tuning was read before the pin".to_string())?;
+    CONTRACT_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(pinned)
+}
+
+/// The contract a gate runs, refused unless it was stated: pinned
+/// ([`pin_contract`]) or named by `LLOOM_PROFILE`. A gate that inherited the
+/// default would run `fast` silently, which is the failure the pin exists
+/// for.
+pub fn gate_contract(who: &str) -> Result<Contract, String> {
+    let named = std::env::var_os("LLOOM_PROFILE").is_some();
+    if !(CONTRACT_PINNED.load(std::sync::atomic::Ordering::Relaxed) || named) {
+        return Err(format!(
+            "{who}: a gate runs on a stated contract; it inherited the default ({}) — \
+             pin it (`tuning::pin_contract`) or set LLOOM_PROFILE (architecture.md §2.3.5b)",
+            ContractTuning::default().profile
+        ));
+    }
+    Ok(contract())
 }
 
 /// The group in force for this process. First use resolves it: the
@@ -263,7 +299,7 @@ fn parse_cflags(v: &str) -> Result<Option<String>, String> {
 #[options(krate = "crate")]
 #[serde(default)]
 pub struct ContractTuning {
-    /// The determinism contract: `deterministic` (same inputs + seed → same bits; every gate runs it) or `fast` (the same distribution: licenses the arms whose bits depend on scheduling or batch composition).
+    /// The determinism contract: `fast` (the default: the same distribution; licenses the arms whose bits depend on scheduling or batch composition) or `deterministic` (same inputs + seed → same bits; every gate pins it).
     #[opt(flag = "profile", env = "LLOOM_PROFILE", parser = "parse_profile", variants = ["deterministic", "fast"])]
     pub profile: String,
 }
@@ -271,7 +307,7 @@ pub struct ContractTuning {
 impl Default for ContractTuning {
     fn default() -> Self {
         ContractTuning {
-            profile: "deterministic".into(),
+            profile: "fast".into(),
         }
     }
 }
@@ -683,7 +719,7 @@ mod tests {
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
-        assert_eq!(t.contract.profile, "deterministic");
+        assert_eq!(t.contract.profile, "fast");
     }
 
     #[test]

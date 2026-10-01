@@ -2029,17 +2029,26 @@ fn run_batched_concurrent(
                 .map(|(i, _, line)| format!("seq {i} across the re-batch: {line}")),
         )
         .collect();
+    // A bit gate under the `fast` contract certifies nothing: its arms may
+    // move a row's bits by design (architecture.md §2.3.5b), so the rows
+    // gate reads `unverified` there and passes only under `--profile
+    // deterministic`. A failure stays a failure under either.
+    let fast = lloom_tensor::tuning::contract().is_fast();
     let gate = if !failures.is_empty() {
         "fail"
-    } else if verdicts
-        .iter()
-        .chain(independence.iter().flatten().map(|(_, v, _)| v))
-        .any(|v| matches!(v, RowVerdict::Unverified(_)))
+    } else if fast
+        || verdicts
+            .iter()
+            .chain(independence.iter().flatten().map(|(_, v, _)| v))
+            .any(|v| matches!(v, RowVerdict::Unverified(_)))
     {
         "unverified"
     } else {
         "pass"
     };
+    if fast && failures.is_empty() {
+        eprintln!("[rows gate: unverified under the fast contract; --profile deterministic to certify]");
+    }
 
     // The batched arm's step shape: median step, mean live rows per step.
     let mut step_ms: Vec<f64> = batched

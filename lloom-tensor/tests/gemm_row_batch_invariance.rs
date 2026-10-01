@@ -22,6 +22,7 @@ fn device() -> Device {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
+        t.contract.profile = "deterministic".into();
         t.instrument.profile = true;
         let _ = lloom_tensor::tuning::install(t);
     });

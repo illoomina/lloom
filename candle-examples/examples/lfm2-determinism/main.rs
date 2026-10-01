@@ -644,7 +644,11 @@ fn parse_forced_tokens(raw: &str) -> Result<Vec<u32>> {
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
-    println!("CONTRACT {}", candle::tuning::contract().report());
+    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
+        .map_err(anyhow::Error::msg)?;
+    let contract = candle::tuning::gate_contract("lfm2-determinism").map_err(anyhow::Error::msg)?;
+    println!("CONTRACT {}", contract.report());
     let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     if args.self_test {

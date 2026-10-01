@@ -551,16 +551,13 @@ impl DecodeConfig {
 /// env alias is the `LLOOM_*` / `CANDLE_*` / `QWEN4EXP_*` variable it
 /// replaces, so the scripts keep working. Installed into both crates before
 /// the model loads ([`TuningOptions::install`]).
-///
-/// One default differs from the library's: the determinism contract is
-/// `fast` here, because `lloom chat|serve` ship the fastest configuration
-/// and `--profile deterministic` is the opt-in (RESTRUCTURING_DESIGN.md §2,
-/// `architecture.md` §2.3.5b). The library, its tests and the gate harnesses
-/// keep `deterministic`; a gate run through `lloom` passes it explicitly.
-#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// `lloom chat|serve` ship the `fast` contract, the library's default
+/// (RESTRUCTURING_DESIGN.md §2); a gate run through `lloom` passes
+/// `--profile deterministic` (`architecture.md` §2.3.5b).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct TuningOptions {
-    /// The determinism contract (`--profile fast|deterministic`; `fast` is `lloom`'s default).
+    /// The determinism contract (`--profile fast|deterministic`).
     #[opt(nested)]
     pub contract: lloom_tensor::tuning::ContractTuning,
     /// The dense GEMM/GEMV tiles.
@@ -605,30 +602,6 @@ pub struct TuningOptions {
     /// The token ring and the decode thread.
     #[opt(nested)]
     pub ring: lloom::tuning::RingTuning,
-}
-
-impl Default for TuningOptions {
-    fn default() -> Self {
-        TuningOptions {
-            contract: lloom_tensor::tuning::ContractTuning {
-                profile: "fast".into(),
-            },
-            gemm: Default::default(),
-            qmv: Default::default(),
-            qmm: Default::default(),
-            moe: Default::default(),
-            gdn: Default::default(),
-            metal: Default::default(),
-            pool: Default::default(),
-            instrument: Default::default(),
-            cpu: Default::default(),
-            lfm2: Default::default(),
-            dspark: Default::default(),
-            stream: Default::default(),
-            qwen4exp: Default::default(),
-            ring: Default::default(),
-        }
-    }
 }
 
 impl TuningOptions {

@@ -80,9 +80,10 @@ pub struct ModelArgs {
     #[arg(long)]
     pub no_ple: bool,
 
-    /// Qwen4-exp: the routed experts' activation dtype, `f32` (the
+    /// Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under
+    /// the `fast` contract, `f32` under `deterministic`), `f32` (the
     /// byte-identical routed arm) or `f16`.
-    #[arg(long, default_value = "f32")]
+    #[arg(long, default_value = "auto")]
     pub moe_act: String,
 
     /// Qwen4-exp `--experts stream`: the expert hotlist file — read at load
@@ -282,6 +283,7 @@ pub struct CommonArgs {
 pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
     let o = resolve_options_uninstalled(common)?;
     o.tuning.install().map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!("[contract: {}]", lloom_tensor::tuning::contract().report());
     Ok(o)
 }
 
@@ -545,6 +547,29 @@ mod option_layer_tests {
         let back = resolve_options_uninstalled(&common(&["--config", dumped.to_str().unwrap()])).unwrap();
         assert_eq!(back, o);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `lloom` ships `fast` and `--profile deterministic` is the opt-in; the
+    /// tensor crate's half carries what the flag resolved; the profiler's
+    /// switch moved to `--gpu-profile` and still takes a bool.
+    #[test]
+    fn the_contract_defaults_to_fast_and_the_flag_pins_deterministic() {
+        if std::env::var_os("LLOOM_PROFILE").is_some() {
+            eprintln!("LLOOM_PROFILE is set; the default is not observable here");
+            return;
+        }
+        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        assert_eq!(o.tuning.contract.profile, "fast");
+        assert_eq!(o.tuning.tensor().contract.profile, "fast");
+        let o = resolve_options_uninstalled(&common(&["--profile", "deterministic"])).unwrap();
+        assert_eq!(o.tuning.tensor().contract.profile, "deterministic");
+        assert!(
+            resolve_options_uninstalled(&common(&["--set", "tuning.contract.profile=relaxed"]))
+                .is_err()
+        );
+        let o = resolve_options_uninstalled(&common(&["--gpu-profile"])).unwrap();
+        assert!(o.tuning.instrument.profile);
+        assert_eq!(o.tuning.contract.profile, "fast");
     }
 
     #[test]

@@ -96,6 +96,22 @@ pub struct LoadOptions {
     pub kv_precision: Option<lloom::nn::ops::KvPrecision>,
 }
 
+/// The routed experts' activation dtype for `--moe-act`: `auto` is `f16`
+/// under the `fast` contract (one of its arms, `Contract::FAST_ARMS`) and
+/// `f32` under `deterministic`, the byte-identical routed arm; `f32` and
+/// `f16` pin it either way.
+pub fn routed_act(
+    spelling: &str,
+    contract: lloom_tensor::tuning::Contract,
+) -> anyhow::Result<DType> {
+    Ok(match spelling {
+        "auto" if contract.is_fast() => DType::F16,
+        "auto" | "f32" => DType::F32,
+        "f16" => DType::F16,
+        other => anyhow::bail!("--moe-act {other}: auto | f32 | f16"),
+    })
+}
+
 /// The model, shared with the batch thread.
 pub struct QwenCore<R: ExpertResidency + HasStreamStats> {
     pub model: Qwen4Exp<R>,
@@ -258,10 +274,9 @@ impl Engine<Resident> {
             }
             shards.push(p.clone());
         }
-        let moe_act = match opts.moe_act.as_str() {
-            "f32" => None,
-            "f16" => Some(DType::F16),
-            other => anyhow::bail!("--moe-act {other}: f32 | f16"),
+        let moe_act = match routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? {
+            DType::F16 => Some(DType::F16),
+            _ => None,
         };
         let mload = ModelLoad {
             ple_shard: None,
@@ -434,7 +449,12 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         tier["mtp"] = json!(mtp);
         tier["ple"] = json!(opts.ple);
         tier["ple_cache_rows"] = json!(opts.ple_cache_rows);
-        tier["moe_act"] = json!(opts.moe_act);
+        tier["moe_act"] = json!(
+            match routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? {
+                DType::F16 => "f16",
+                _ => "f32",
+            }
+        );
         tier["config"] = json!(model.config().axes_line());
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
         let mut engine = Engine {
@@ -1251,6 +1271,25 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
 #[cfg(test)]
 mod tests {
     use super::resolve_readback;
+
+    /// `--moe-act auto` follows the contract: f16 is a `fast` arm, f32 the
+    /// `deterministic` routed arm; an explicit spelling holds under both.
+    #[test]
+    fn moe_act_auto_follows_the_contract() {
+        use lloom_tensor::tuning::Contract::{Deterministic, Fast};
+        use lloom_tensor::DType;
+        assert_eq!(super::routed_act("auto", Fast).unwrap(), DType::F16);
+        assert_eq!(
+            super::routed_act("auto", Deterministic).unwrap(),
+            DType::F32
+        );
+        for c in [Fast, Deterministic] {
+            assert_eq!(super::routed_act("f32", c).unwrap(), DType::F32);
+            assert_eq!(super::routed_act("f16", c).unwrap(), DType::F16);
+        }
+        assert!(super::routed_act("bf16", Fast).is_err());
+        assert!(lloom_tensor::tuning::Contract::FAST_ARMS.contains(&"moe-act-f16"));
+    }
     use crate::{ReadbackArm, RingArm};
     use lloom::generation::EosRead;
 

@@ -27,6 +27,113 @@ use std::sync::OnceLock;
 
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
+/// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
+/// `architecture.md` §2.3.5b).
+///
+/// `Fast` is the default (RESTRUCTURING_DESIGN.md §2): the same
+/// distribution, not the same bits — it licenses the arms whose bits depend
+/// on who else is in the batch, on completion order, or on which math path
+/// verifies a speculation. `Deterministic` is the opt-in and the contract
+/// every gate, test and digest runs, pinned explicitly ([`pin_contract`],
+/// [`gate_contract`]) rather than inherited: the same inputs and seed give
+/// the same bits, whatever the scheduling, the pool size, the tile split or
+/// the lookahead. Every fast arm has a deterministic twin the bit-identity
+/// suites cover; it is judged by the quality gate, never in place of the
+/// bit gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contract {
+    Deterministic,
+    Fast,
+}
+
+impl Contract {
+    pub const SPELLINGS: [&'static str; 2] = ["deterministic", "fast"];
+
+    pub fn parse(v: &str) -> Result<Contract, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "deterministic" => Ok(Contract::Deterministic),
+            "fast" => Ok(Contract::Fast),
+            other => Err(format!(
+                "profile: `{other}` is not one of {}",
+                Contract::SPELLINGS.join(", ")
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Contract::Deterministic => "deterministic",
+            Contract::Fast => "fast",
+        }
+    }
+
+    pub fn is_fast(self) -> bool {
+        self == Contract::Fast
+    }
+
+    /// The arms `fast` takes, by name (`architecture.md` §2.3.5b). An arm
+    /// joins this list in the change that makes it read [`contract`], and
+    /// that change pins the bit suites that reach it.
+    ///
+    /// - `moe-act-f16`: Qwen4-exp's routed experts on f16 activations where
+    ///   the matmul-vec runs (`lloom`'s `--moe-act auto`).
+    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16"];
+
+    /// `profile=<name> arms=<list>`, for the report lines that say which
+    /// contract a run held.
+    pub fn report(self) -> String {
+        let arms = match self {
+            Contract::Deterministic => "none".to_string(),
+            Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
+            Contract::Fast => Contract::FAST_ARMS.join(","),
+        };
+        format!("profile={} arms={arms}", self.name())
+    }
+}
+
+/// The contract in force for this process: [`tuning`]'s `contract.profile`,
+/// parsed once. Every fast arm reads it here, so the contract is one value
+/// read once (a compile-time profile type would replace this function).
+pub fn contract() -> Contract {
+    static C: OnceLock<Contract> = OnceLock::new();
+    *C.get_or_init(|| Contract::parse(&tuning().contract.profile).expect("the parser accepted it"))
+}
+
+static CONTRACT_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pin the contract for the process, before anything reads the tuning: the
+/// defaults with the env aliases applied, then `c` — unless `LLOOM_PROFILE`
+/// names one, which wins (a quality run asking a gate harness for `fast` has
+/// named it). `Err` if the group was already fixed. What a gate harness or a
+/// bit-identity test calls first, so its contract is stated, not inherited.
+pub fn pin_contract(c: Contract) -> Result<Contract, String> {
+    let mut t = Tuning::default();
+    t.from_env().map_err(|e| format!("tuning: {e}"))?;
+    if std::env::var_os("LLOOM_PROFILE").is_none() {
+        t.contract.profile = c.name().to_string();
+    }
+    let pinned = Contract::parse(&t.contract.profile)?;
+    install(t).map_err(|_| "pin_contract: the tuning was read before the pin".to_string())?;
+    CONTRACT_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(pinned)
+}
+
+/// The contract a gate runs, refused unless it was stated: pinned
+/// ([`pin_contract`]) or named by `LLOOM_PROFILE`. A gate that inherited the
+/// default would run `fast` silently, which is the failure the pin exists
+/// for.
+pub fn gate_contract(who: &str) -> Result<Contract, String> {
+    let named = std::env::var_os("LLOOM_PROFILE").is_some();
+    if !(CONTRACT_PINNED.load(std::sync::atomic::Ordering::Relaxed) || named) {
+        return Err(format!(
+            "{who}: a gate runs on a stated contract; it inherited the default ({}) — \
+             pin it (`tuning::pin_contract`) or set LLOOM_PROFILE (architecture.md §2.3.5b)",
+            ContractTuning::default().profile
+        ));
+    }
+    Ok(contract())
+}
+
 /// The group in force for this process. First use resolves it: the
 /// installed group if [`install`] ran, else the defaults with the env
 /// aliases applied (a malformed alias panics, naming the variable).
@@ -155,6 +262,9 @@ fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
     }
     one_of(v, "mmap advice", &["willneed", "will_need", "sequential", "seq"]).map(Some)
 }
+fn parse_profile(v: &str) -> Result<String, String> {
+    Contract::parse(v).map(|c| c.name().to_string())
+}
 fn parse_dequant_gemm(v: &str) -> Result<String, String> {
     one_of(v, "dequant gemm", &["qmm", "steel"])
 }
@@ -184,6 +294,24 @@ fn parse_cflags(v: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     Ok(Some(v.to_string()))
+}
+
+/// The determinism contract ([`Contract`]).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[options(krate = "crate")]
+#[serde(default)]
+pub struct ContractTuning {
+    /// The determinism contract: `fast` (the default: the same distribution; licenses the arms whose bits depend on scheduling or batch composition) or `deterministic` (same inputs + seed → same bits; every gate pins it).
+    #[opt(flag = "profile", env = "LLOOM_PROFILE", parser = "parse_profile", variants = ["deterministic", "fast"])]
+    pub profile: String,
+}
+
+impl Default for ContractTuning {
+    fn default() -> Self {
+        ContractTuning {
+            profile: "fast".into(),
+        }
+    }
 }
 
 /// The dense GEMM/GEMV tile selection (`mlx_gemm.rs`).
@@ -485,7 +613,7 @@ impl Default for PoolTuning {
 #[serde(default)]
 pub struct InstrumentTuning {
     /// The GPU profiler: per-command-buffer GPU intervals and per-label census (`PROFILE` lines).
-    #[opt(flag = "profile", env = "CANDLE_METAL_PROFILE", bool)]
+    #[opt(flag = "gpu-profile", env = "CANDLE_METAL_PROFILE", bool)]
     pub profile: bool,
     /// Under `profile`: time every compute encoder with stage-boundary counter samples.
     #[opt(flag = "profile-counters", env = "CANDLE_METAL_PROFILE_COUNTERS", bool)]
@@ -534,6 +662,9 @@ pub struct CpuTuning {
 #[options(krate = "crate")]
 #[serde(default)]
 pub struct Tuning {
+    /// The determinism contract.
+    #[opt(nested)]
+    pub contract: ContractTuning,
     /// The dense GEMM/GEMV tiles.
     #[opt(nested)]
     pub gemm: GemmTuning,
@@ -590,6 +721,28 @@ mod tests {
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
+        assert_eq!(t.contract.profile, "fast");
+    }
+
+    #[test]
+    fn the_contract_parses_two_spellings_and_refuses_the_rest() {
+        let mut t = Tuning::default();
+        assert!(t.set("contract.profile", "relaxed").is_err());
+        assert!(t.set("contract.profile", "").is_err());
+        t.set("contract.profile", "Fast").unwrap();
+        assert_eq!(t.contract.profile, "fast");
+        assert_eq!(Contract::parse(&t.contract.profile), Ok(Contract::Fast));
+        t.set("contract.profile", "deterministic").unwrap();
+        assert_eq!(
+            Contract::parse(&t.contract.profile),
+            Ok(Contract::Deterministic)
+        );
+        assert!(Contract::Fast.is_fast() && !Contract::Deterministic.is_fast());
+        assert_eq!(
+            Contract::Deterministic.report(),
+            "profile=deterministic arms=none"
+        );
+        assert_eq!(Contract::Fast.report(), "profile=fast arms=moe-act-f16");
     }
 
     #[test]

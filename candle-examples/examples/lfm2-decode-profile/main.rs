@@ -2801,6 +2801,12 @@ fn run_speculative_decode(r: SpecRun<'_>) -> Result<()> {
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
+    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
+        .map_err(anyhow::Error::msg)?;
+    let contract =
+        candle::tuning::gate_contract("lfm2-decode-profile").map_err(anyhow::Error::msg)?;
+    println!("CONTRACT {}", contract.report());
     let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     let profiling = profile::enabled();

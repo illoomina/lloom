@@ -140,6 +140,20 @@ impl<R: ExpertResidency> MoeLayer<R> {
         self.routed_act
     }
 
+    /// The activation dtype a tile of `rows` rows routes in. The routed
+    /// GEMM has the f32 activation arm only, so a tile on it keeps f32 and
+    /// computes what the f32 default computes; the `F16` choice reaches the
+    /// matmul-vec rows (a decode step, a verify window, a small tile). An
+    /// f16 tile would leave the GEMM for the matmul-vec planes, a third of a
+    /// prefill (`architecture.md` §2.3.5b, arm 8).
+    fn tile_act(&self, rows: usize) -> DType {
+        if MoeArm::for_rows(rows) == MoeArm::Gemm {
+            DType::F32
+        } else {
+            self.routed_act
+        }
+    }
+
     /// The residency strategy behind the routed experts.
     pub fn experts(&self) -> &R {
         &self.experts
@@ -338,7 +352,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // per group, in the routed arm's activation dtype. `Resident` plans
         // one group over the ids as they are; `Streamed` groups the rows to
         // its slot pool and resolves each group's ids to slots first.
-        let x3 = x1.to_dtype(self.routed_act)?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
+        let x3 = x1.to_dtype(self.tile_act(seq))?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
         Ok(PrefillRouted {
             x1,
             x3,

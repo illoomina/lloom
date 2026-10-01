@@ -244,9 +244,10 @@ struct Args {
     #[arg(long, default_value = "chunk")]
     prefill: String,
 
-    /// The routed experts' activation dtype: `f32` (the byte-identical routed
-    /// arm) or `f16` (the `(f16, f32, f16)` arm, issue #748).
-    #[arg(long, default_value = "f32")]
+    /// The routed experts' activation dtype: `auto` (the contract's: `f16`
+    /// under `fast`, `f32` under `deterministic`, this gate's pin), `f32`
+    /// (the byte-identical routed arm) or `f16` (the `(f16, f32, f16)` arm).
+    #[arg(long, default_value = "auto")]
     moe_act: String,
 
     #[arg(
@@ -671,6 +672,11 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
+        .map_err(anyhow::Error::msg)?;
+    let contract = candle::tuning::gate_contract("qwen4exp-chat").map_err(anyhow::Error::msg)?;
+    println!("CONTRACT {}", contract.report());
     let gguf = match &args.gguf {
         Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
@@ -717,10 +723,10 @@ fn main() -> Result<()> {
     if let Some(p) = &args.mtp {
         shards.push(p.clone());
     }
-    let moe_act = match args.moe_act.as_str() {
-        "f32" => None,
-        "f16" => Some(candle::DType::F16),
-        other => anyhow::bail!("--moe-act {other}: f32 | f16"),
+    let moe_act = match (args.moe_act.as_str(), contract.is_fast()) {
+        ("auto", true) | ("f16", _) => Some(candle::DType::F16),
+        ("auto", false) | ("f32", _) => None,
+        (other, _) => anyhow::bail!("--moe-act {other}: auto | f32 | f16"),
     };
     let opts = LoadOptions {
         ple_shard: None,
@@ -928,6 +934,16 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
         let wall = t.elapsed();
         let mem = gauge.finish(device);
         let generated: usize = outs.iter().map(|o| o.ids.len()).sum();
+        for (i, o) in outs.iter().enumerate() {
+            println!(
+                "ROWTOKENS run={run} row={i} {}",
+                o.ids
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         // The whole run: the rows' prefills and the batched steps (per
         // token = per generated token over all rows).
         profile_line(run, "rows", generated, wall.as_secs_f64() * 1e3);
@@ -1054,7 +1070,7 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
         if model.has_ple() { "on" } else { "off" },
         args.ple_cache_rows,
         model.prefill_mode(),
-        args.moe_act,
+        format!("{:?}", model.routed_act()).to_lowercase(),
         args.experts,
         args.slots,
         args.loader,
@@ -1353,6 +1369,14 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             h.update(&t.to_le_bytes());
         }
         let mtp_digest = sha256::hex(&h.finalize());
+        println!(
+            "MTPTOKENS {}",
+            out.ids
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let rounds = out.stats.rounds.len();
         let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
         let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();

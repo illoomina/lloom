@@ -27,6 +27,58 @@ use std::sync::OnceLock;
 
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
+/// The determinism contract a run is held to (`--profile`, `LLOOM_PROFILE`;
+/// `architecture.md` §2.3.5).
+///
+/// `Deterministic` is the default and the contract every gate and
+/// correctness suite runs: the same inputs and seed give the same bits,
+/// whatever the scheduling, the batch composition, the pool size, the tile
+/// split or the lookahead. `Fast` promises the same distribution, not the
+/// same bits: it licenses the arms whose bits depend on who else is in the
+/// batch, on completion order, or on which math path verifies a
+/// speculation. Every such arm has a deterministic twin the bit-identity
+/// suites cover; a fast arm is judged by the quality gate, never in place
+/// of the bit gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contract {
+    Deterministic,
+    Fast,
+}
+
+impl Contract {
+    pub const SPELLINGS: [&'static str; 2] = ["deterministic", "fast"];
+
+    pub fn parse(v: &str) -> Result<Contract, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "deterministic" => Ok(Contract::Deterministic),
+            "fast" => Ok(Contract::Fast),
+            other => Err(format!(
+                "profile: `{other}` is not one of {}",
+                Contract::SPELLINGS.join(", ")
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Contract::Deterministic => "deterministic",
+            Contract::Fast => "fast",
+        }
+    }
+
+    pub fn is_fast(self) -> bool {
+        self == Contract::Fast
+    }
+}
+
+/// The contract in force for this process: [`tuning`]'s `contract.profile`,
+/// parsed once. Every fast arm reads it here, so the contract is one value
+/// read once (a compile-time profile type would replace this function).
+pub fn contract() -> Contract {
+    static C: OnceLock<Contract> = OnceLock::new();
+    *C.get_or_init(|| Contract::parse(&tuning().contract.profile).expect("the parser accepted it"))
+}
+
 /// The group in force for this process. First use resolves it: the
 /// installed group if [`install`] ran, else the defaults with the env
 /// aliases applied (a malformed alias panics, naming the variable).
@@ -155,6 +207,9 @@ fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
     }
     one_of(v, "mmap advice", &["willneed", "will_need", "sequential", "seq"]).map(Some)
 }
+fn parse_profile(v: &str) -> Result<String, String> {
+    Contract::parse(v).map(|c| c.name().to_string())
+}
 fn parse_dequant_gemm(v: &str) -> Result<String, String> {
     one_of(v, "dequant gemm", &["qmm", "steel"])
 }
@@ -184,6 +239,24 @@ fn parse_cflags(v: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     Ok(Some(v.to_string()))
+}
+
+/// The determinism contract ([`Contract`]).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[options(krate = "crate")]
+#[serde(default)]
+pub struct ContractTuning {
+    /// The determinism contract: `deterministic` (same inputs + seed → same bits; every gate runs it) or `fast` (the same distribution: licenses the arms whose bits depend on scheduling or batch composition).
+    #[opt(flag = "profile", env = "LLOOM_PROFILE", parser = "parse_profile", variants = ["deterministic", "fast"])]
+    pub profile: String,
+}
+
+impl Default for ContractTuning {
+    fn default() -> Self {
+        ContractTuning {
+            profile: "deterministic".into(),
+        }
+    }
 }
 
 /// The dense GEMM/GEMV tile selection (`mlx_gemm.rs`).
@@ -485,7 +558,7 @@ impl Default for PoolTuning {
 #[serde(default)]
 pub struct InstrumentTuning {
     /// The GPU profiler: per-command-buffer GPU intervals and per-label census (`PROFILE` lines).
-    #[opt(flag = "profile", env = "CANDLE_METAL_PROFILE", bool)]
+    #[opt(flag = "gpu-profile", env = "CANDLE_METAL_PROFILE", bool)]
     pub profile: bool,
     /// Under `profile`: time every compute encoder with stage-boundary counter samples.
     #[opt(flag = "profile-counters", env = "CANDLE_METAL_PROFILE_COUNTERS", bool)]
@@ -534,6 +607,9 @@ pub struct CpuTuning {
 #[options(krate = "crate")]
 #[serde(default)]
 pub struct Tuning {
+    /// The determinism contract.
+    #[opt(nested)]
+    pub contract: ContractTuning,
     /// The dense GEMM/GEMV tiles.
     #[opt(nested)]
     pub gemm: GemmTuning,
@@ -590,6 +666,20 @@ mod tests {
         assert_eq!(t.qmm.dequant_from, 64);
         assert_eq!(t.moe.mm_from, 64);
         assert!(t.qmm.f16_mm);
+        assert_eq!(t.contract.profile, "deterministic");
+    }
+
+    #[test]
+    fn the_contract_parses_two_spellings_and_refuses_the_rest() {
+        let mut t = Tuning::default();
+        assert!(t.set("contract.profile", "relaxed").is_err());
+        assert!(t.set("contract.profile", "").is_err());
+        t.set("contract.profile", "Fast").unwrap();
+        assert_eq!(t.contract.profile, "fast");
+        assert_eq!(Contract::parse(&t.contract.profile), Ok(Contract::Fast));
+        t.set("contract.profile", "deterministic").unwrap();
+        assert_eq!(Contract::parse(&t.contract.profile), Ok(Contract::Deterministic));
+        assert!(Contract::Fast.is_fast() && !Contract::Deterministic.is_fast());
     }
 
     #[test]

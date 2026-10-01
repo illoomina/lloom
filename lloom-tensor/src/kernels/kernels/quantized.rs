@@ -359,15 +359,32 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
     }
 }
 
-/// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
-/// activation rows per weight read (`kernel_mul_mv_*_rows_impl`). OFF by
-/// default: on this device it is 0–17 % faster than the per-row launches
-/// (the re-read rows are served from the on-chip cache; the register form
-/// spills at NR1 = 4 on q4_K) and, under Metal's fast-math contraction, not
-/// bit-identical to the one-row core (1.9e-7 relative) — the measurement
-/// arm, kept for the record (`qmatmul_rows_timing`).
+/// The small-batch rows arm — `NR1` activation rows per weight read
+/// (`kernel_mul_mv_*_rows_impl`): `LLOOM_QMV_ROWS=on`, or the `fast`
+/// contract. Not under `deterministic`: a row's bits then depend on how
+/// many rows share its launch (the `NR1` the batch selects, and the rows
+/// kernel's contraction against the one-row core's), so a sequence's
+/// logits would depend on who else is in its batch (§2.3.3 #7).
 fn rows_arm_on() -> bool {
-    crate::tuning::tuning().qmv.rows
+    crate::tuning::tuning().qmv.rows || crate::tuning::contract().is_fast()
+}
+
+/// The threadgroup geometry each rows kernel is written for: the rows a
+/// threadgroup covers are a property of the kernel's own row indexing, not
+/// of the one-row core's tunable geometry (`q6k_nr0`, `iq_nsg`), which the
+/// rows kernels do not read.
+fn rows_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
+    match dtype {
+        // `row = 2 * r0 + sgitg`: two simdgroups of one row.
+        GgmlDType::Q6K => (2, 32, 2),
+        // `first_row = r0 * N_DST`: one simdgroup of four rows.
+        GgmlDType::Q4K => (4, 8, 4),
+        // `first_row = (r0 * 2 + sgitg) * 2`: two simdgroups of two rows.
+        GgmlDType::IQ4XS | GgmlDType::IQ4NL => (4, 16, 4),
+        // `first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST`: two of four.
+        GgmlDType::IQ3S => (4, 16, 8),
+        _ => mv_threadgroup(dtype),
+    }
 }
 
 /// Whether the dtype's matmul-vec core stages a codebook into threadgroup
@@ -499,9 +516,9 @@ pub fn call_quantized_matmul_mv_t(
     // The small-batch arm: `m` activation rows (2..=8) share the weight
     // read (`kernel_mul_mv_*_rows_impl`, the f32 triple, the five stem
     // types it is built for) — `NR1` rows per threadgroup, the grid's
-    // second axis over the row groups; each row bit-identical to the
-    // one-row kernel. Elsewhere the rows stay the grid's second axis, one
-    // weight read each.
+    // second axis over the row groups, at the rows kernel's own geometry; a
+    // row is a reordering of the one-row kernel's, not its bits. Elsewhere
+    // the rows stay the grid's second axis, one weight read each.
     let (name, rows_per_group) = match (triple, dtype, m) {
         (
             GemvTriple::F32F32F32,
@@ -517,10 +534,22 @@ pub fn call_quantized_matmul_mv_t(
         }
         _ => (name, 1),
     };
-    let thread_groups_count = MTLSize {
-        width: thread_groups_count.width,
-        height: (ne11 as usize).div_ceil(rows_per_group),
-        depth: thread_groups_count.depth,
+    let (thread_groups_count, threads_per_threadgroup) = if rows_per_group > 1 {
+        let (nth0, nth1, align) = rows_threadgroup(dtype);
+        (
+            MTLSize {
+                width: divide(ne01 as usize, align),
+                height: (ne11 as usize).div_ceil(rows_per_group),
+                depth: thread_groups_count.depth,
+            },
+            MTLSize {
+                width: nth0,
+                height: nth1,
+                depth: 1,
+            },
+        )
+    } else {
+        (thread_groups_count, threads_per_threadgroup)
     };
 
     let iq_shared = needs_iq_shared(dtype);

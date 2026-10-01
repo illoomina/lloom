@@ -9601,10 +9601,12 @@ template [[host_name("kernel_mul_mv_q2_0_f16_f16")]] kernel decltype(kernel_mul_
 // decode batch of `m` rows — B > 1's rows, a speculative window's positions
 // — dequantizes the matrix `m` times. These are the same cores with `NR1`
 // activation rows in flight: the weights are dequantized once and multiplied
-// against every row, and each row's arithmetic is the core's, operation for
-// operation, in the same order — so a row's result is bit-identical to the
-// one-row kernel's. `tgpig.y` indexes a group of `NR1` rows; a group past
-// `ne11` clamps its reads to the last row and stores nothing for them.
+// against every row, and each row's arithmetic is the core's expression in
+// the same order — but not its bits: the compiler contracts the differently
+// shaped loop differently, and each kernel keeps the incumbent one-row
+// geometry its row indexing is written for (`rows_threadgroup`). `tgpig.y`
+// indexes a group of `NR1` rows; a group past `ne11` clamps its reads to the
+// last row and stores nothing for them.
 // The five stems this checkpoint decodes through (q6_K, q4_K, iq4_xs, iq3_s,
 // iq4_nl), the f32 triple.
 // =============================================================================

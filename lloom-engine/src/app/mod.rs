@@ -282,6 +282,7 @@ pub struct CommonArgs {
 pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
     let o = resolve_options_uninstalled(common)?;
     o.tuning.install().map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!("[contract: {}]", lloom_tensor::tuning::contract().name());
     Ok(o)
 }
 

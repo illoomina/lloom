@@ -333,7 +333,8 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// misses loaded) as the pass reaches it, the later groups' misses
     /// prefetched while it runs. Every group runs the tile's routed arm, so
     /// how the pool splits the tile never changes a row's arithmetic
-    /// (`expert-streaming.md` §20.15).
+    /// (`expert-streaming.md` §20.15) — under `fast`, its own
+    /// ([`MoeArm::for_group`]).
     fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
         // The routed GEMMs' outputs are sized by the plan's groups, which
@@ -355,6 +356,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
             } else {
                 x3.narrow(0, group.rows.start, group.rows.len())?
             };
+            let arm = MoeArm::for_group(arm, xg.dim(0)?, lloom_tensor::tuning::contract());
             let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm)?; // [rows, topk, n_ff] each
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);

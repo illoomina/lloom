@@ -554,6 +554,9 @@ impl DecodeConfig {
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct TuningOptions {
+    /// The determinism contract (`--profile deterministic|fast`).
+    #[opt(nested)]
+    pub contract: lloom_tensor::tuning::ContractTuning,
     /// The dense GEMM/GEMV tiles.
     #[opt(nested)]
     pub gemm: lloom_tensor::tuning::GemmTuning,
@@ -602,6 +605,7 @@ impl TuningOptions {
     /// The tensor crate's half.
     pub fn tensor(&self) -> lloom_tensor::tuning::Tuning {
         lloom_tensor::tuning::Tuning {
+            contract: self.contract.clone(),
             gemm: self.gemm.clone(),
             qmv: self.qmv.clone(),
             qmm: self.qmm.clone(),

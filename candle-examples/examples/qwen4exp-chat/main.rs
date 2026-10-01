@@ -671,6 +671,7 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    println!("CONTRACT profile={}", candle::tuning::contract().name());
     let gguf = match &args.gguf {
         Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
@@ -928,6 +929,12 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
         let wall = t.elapsed();
         let mem = gauge.finish(device);
         let generated: usize = outs.iter().map(|o| o.ids.len()).sum();
+        for (i, o) in outs.iter().enumerate() {
+            println!(
+                "ROWTOKENS run={run} row={i} {}",
+                o.ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+            );
+        }
         // The whole run: the rows' prefills and the batched steps (per
         // token = per generated token over all rows).
         profile_line(run, "rows", generated, wall.as_secs_f64() * 1e3);
@@ -1353,6 +1360,10 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             h.update(&t.to_le_bytes());
         }
         let mtp_digest = sha256::hex(&h.finalize());
+        println!(
+            "MTPTOKENS {}",
+            out.ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",")
+        );
         let rounds = out.stats.rounds.len();
         let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
         let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();

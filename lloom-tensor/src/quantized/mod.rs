@@ -1646,6 +1646,21 @@ impl MoeArm {
     }
 }
 
+impl MoeArm {
+    /// The arm a group of `group_rows` rows of a tile on `tile` takes.
+    /// Under `deterministic` it is the tile's, so how the pool splits the
+    /// tile never changes a row's arithmetic (`expert-streaming.md`
+    /// §20.15a). Under `fast` each group takes [`MoeArm::for_rows`] over its
+    /// own rows: a row's bits then depend on the pool's split.
+    pub fn for_group(tile: MoeArm, group_rows: usize, contract: crate::tuning::Contract) -> Self {
+        if contract.is_fast() {
+            MoeArm::for_rows(group_rows)
+        } else {
+            tile
+        }
+    }
+}
+
 /// The routed gate|up pair launch on the matmul-vec arm (`LLOOM_MOE_PAIR`,
 /// read once): on unless `off` | `0`.
 #[cfg(feature = "metal")]

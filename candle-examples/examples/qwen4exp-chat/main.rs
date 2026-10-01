@@ -1375,14 +1375,53 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             sum(&|t| t.observe_ns),
         );
         let s = model.stream_stats();
-        let (redos, host_passes, armed) = {
-            let c = session.cache_mut();
-            (c.redos, c.host_plan_passes, c.device_plan_armed)
+        let c = session.cache_mut();
+        let rb = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> u64 {
+            out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>()
         };
         println!(
-            "MTPSTREAM plans={} device_plans={} hits={} misses={} settled_misses={} redos={redos} host_plan_passes={host_passes} device_plan_armed={armed}",
-            s.plans, s.device_plans, s.hits, s.misses, s.settled_misses,
+            "MTPSTREAM plans={} device_plans={} hits={} misses={} evictions={} bytes_loaded={} settled_misses={} settle_loads={} redos={} window_redos={} window_host={} window_device={} truncations={} rejected_flags={} host_plan_passes={} device_plan_armed={} readbacks_draft={} readbacks_verify={} readbacks_observe={} readbacks_per_round={:.2}",
+            s.plans,
+            s.device_plans,
+            s.hits,
+            s.misses,
+            s.evictions,
+            s.bytes_loaded,
+            s.settled_misses,
+            s.settle_loads,
+            c.redos,
+            c.window_redos,
+            c.window_host,
+            c.window_device,
+            c.window_truncations,
+            c.window_rejected_flags,
+            c.host_plan_passes,
+            c.device_plan_armed,
+            rb(&|t| t.draft_readbacks),
+            rb(&|t| t.verify_readbacks),
+            rb(&|t| t.observe_readbacks),
+            (rb(&|t| t.draft_readbacks + t.verify_readbacks + t.observe_readbacks)) as f64
+                / rounds.max(1) as f64,
         );
+        let (od, oh, orr) = drafter.observe_plans();
+        println!("MTPOBSERVE device={od} host={oh} redos={orr}");
+        // Under the model's per-round trace (`QWEN4EXP_MTP_TRACE`), each
+        // round's phase brackets in round order, to join with its
+        // `MTPTRACE` line (the same order).
+        if std::env::var_os("QWEN4EXP_MTP_TRACE").is_some_and(|v| v == "1") {
+            for (i, r) in out.stats.rounds.iter().enumerate() {
+                println!(
+                    "MTPROUND i={i} accepted={} draft_ms={:.2} verify_ms={:.2} observe_ms={:.2} rb_draft={} rb_verify={} rb_observe={}",
+                    r.accepted,
+                    r.timing.draft_ns as f64 / 1e6,
+                    r.timing.verify_ns as f64 / 1e6,
+                    r.timing.observe_ns as f64 / 1e6,
+                    r.timing.draft_readbacks,
+                    r.timing.verify_readbacks,
+                    r.timing.observe_readbacks,
+                );
+            }
+        }
         if !same {
             anyhow::bail!("the MTP run's tokens differ from the greedy run's");
         }

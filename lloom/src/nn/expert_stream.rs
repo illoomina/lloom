@@ -47,6 +47,130 @@ enum GroupIds {
     Host { ids: Vec<u32>, topk: usize },
 }
 
+/// One layer's plan of a speculative window, on the host: the `[3·n]` record
+/// a device plan writes (the slot ids | the expert ids | a miss flag per id,
+/// `n = rows × topk`, row-major) or the same layout a host plan filled in.
+/// Settled after the accept ([`ExpertResidency::settle_window`]).
+#[derive(Debug, Clone)]
+pub struct WindowRecord {
+    pub data: Vec<u32>,
+    pub rows: usize,
+    pub topk: usize,
+    /// A device plan's record: the settle closes the plan.
+    pub device: bool,
+    /// Rows the host plan already resolved with loads (touched and counted
+    /// then): the settle touches the accepted rows from this one on. 0 for
+    /// a device plan.
+    pub resolved_rows: usize,
+    /// Experts the host plan loaded for those rows (a device plan loads
+    /// nothing): the arming reads the real rows' loads alone.
+    pub real_loads: u64,
+    /// Experts the host plan loaded for the draft rows beside them (0 when
+    /// the drafts were resolved against what is resident, or resident).
+    pub draft_loads: u64,
+}
+
+impl WindowRecord {
+    /// A device plan's `[3·n]` record read back.
+    pub fn device(data: Vec<u32>, rows: usize, topk: usize) -> Result<Self> {
+        if data.len() != 3 * rows * topk {
+            lloom_tensor::bail!(
+                "window record: [3·n] with n = {rows} × {topk}, got {}",
+                data.len()
+            )
+        }
+        Ok(Self {
+            data,
+            rows,
+            topk,
+            device: true,
+            resolved_rows: 0,
+            real_loads: 0,
+            draft_loads: 0,
+        })
+    }
+
+    fn n(&self) -> usize {
+        self.rows * self.topk
+    }
+
+    pub fn ids(&self) -> &[u32] {
+        &self.data[self.n()..2 * self.n()]
+    }
+
+    pub fn flags(&self) -> &[u32] {
+        &self.data[2 * self.n()..]
+    }
+
+    /// The first row with a flagged (missing) expert, if any. A row's
+    /// state and carry are wrong from the layer that flagged it, and so is
+    /// every row after it (attention and the recurrence read the rows
+    /// before them): the window is valid up to this row.
+    pub fn first_flagged_row(&self) -> Option<usize> {
+        let flags = self.flags();
+        (0..self.rows).find(|&r| {
+            flags[r * self.topk..(r + 1) * self.topk]
+                .iter()
+                .any(|&f| f != 0)
+        })
+    }
+
+    /// One record over the rows of several (a reference path that planned
+    /// the window position by position): the resolved rows must be a
+    /// prefix.
+    pub fn concat_rows(recs: &[WindowRecord]) -> Result<Self> {
+        let Some(first) = recs.first() else {
+            lloom_tensor::bail!("window record: no rows to join")
+        };
+        let topk = first.topk;
+        let rows: usize = recs.iter().map(|r| r.rows).sum();
+        let n = rows * topk;
+        let mut data = vec![0u32; 3 * n];
+        let mut at = 0usize;
+        let mut resolved_rows = 0usize;
+        let mut resolved_done = false;
+        let mut real_loads = 0u64;
+        let mut draft_loads = 0u64;
+        for r in recs {
+            real_loads += r.real_loads;
+            draft_loads += r.draft_loads;
+            if r.topk != topk || r.device != first.device {
+                lloom_tensor::bail!("window record: rows of different shape or plan")
+            }
+            let m = r.n();
+            data[at..at + m].copy_from_slice(&r.data[..m]);
+            data[n + at..n + at + m].copy_from_slice(&r.data[m..2 * m]);
+            data[2 * n + at..2 * n + at + m].copy_from_slice(&r.data[2 * m..]);
+            at += m;
+            if r.resolved_rows == r.rows && !resolved_done {
+                resolved_rows += r.rows;
+            } else if r.resolved_rows == 0 {
+                resolved_done = true;
+            } else {
+                lloom_tensor::bail!("window record: the resolved rows are not a prefix")
+            }
+        }
+        Ok(Self {
+            data,
+            rows,
+            topk,
+            device: first.device,
+            resolved_rows,
+            real_loads,
+            draft_loads,
+        })
+    }
+
+    /// Flags set on the rows from `from` on.
+    pub fn flags_from(&self, from: usize) -> u64 {
+        let flags = self.flags();
+        flags[(from.min(self.rows) * self.topk)..]
+            .iter()
+            .filter(|&&f| f != 0)
+            .count() as u64
+    }
+}
+
 /// How a layer's routed experts are held and applied.
 ///
 /// The contract is the routed matmul's: the strategy receives the activation
@@ -98,6 +222,11 @@ pub trait ExpertResidency {
     /// Experts loaded so far (the miss counter), 0 when nothing streams —
     /// a pass that leaves it unchanged found everything resident.
     fn misses_so_far(&self) -> u64 {
+        0
+    }
+
+    /// Experts evicted so far, 0 when nothing streams.
+    fn evictions_so_far(&self) -> u64 {
         0
     }
 
@@ -160,6 +289,42 @@ pub trait ExpertResidency {
                 Ok((redo, r.misses_so_far() - before))
             })
             .collect()
+    }
+
+    /// The host plan of a speculative window `ids [rows, topk]` (u32, on
+    /// the device; row 0 the real next token, the rows after it drafts):
+    /// the first `real_rows` rows' experts made resident (loaded, counted
+    /// as used); the rows up to `loaded_rows` made resident too but counted
+    /// only once the accept keeps them; every other row resolved against
+    /// what is resident — a miss maps to slot 0 and FLAGS the row instead
+    /// of loading, so a wrong draft loads nothing and evicts nothing
+    /// (`expert-streaming.md` §20.16). Returns the slot ids the dispatch
+    /// reads and the window's record for [`Self::settle_window`]; `None`
+    /// where the strategy keeps no pool (`Resident`: the caller takes
+    /// [`Self::plan`] / [`Self::ensure`]).
+    fn plan_window(
+        &self,
+        _ids: &Tensor,
+        _real_rows: usize,
+        _loaded_rows: usize,
+    ) -> Result<Option<(Tensor, WindowRecord)>> {
+        Ok(None)
+    }
+
+    /// Settle a window's records AFTER the accept, in layer order: the plans
+    /// closed, and the residency touched and the usage counted for the
+    /// experts of the `accepted` rows alone — a rejected row's experts are
+    /// neither touched, nor counted, nor loaded. The caller has already
+    /// bounded `accepted` by the first flagged row ([`WindowRecord::first_flagged_row`]):
+    /// every accepted row's expert was resident when its plan ran. Returns
+    /// the flags set on the rows past `accepted` (the wrong-path misses not
+    /// loaded).
+    fn settle_window(parts: &[(&Self, &WindowRecord)], _accepted: usize) -> Result<u64>
+    where
+        Self: Sized,
+    {
+        let _ = parts;
+        Ok(0)
     }
 
     /// A hint that a multi-token pass is about to run this layer: stage the
@@ -2327,6 +2492,121 @@ impl Streamed {
 }
 
 impl Streamed {
+    /// The routing `ids [rows, topk]` read back to the host — the one host
+    /// wait of a host-planned layer, timed (`readback_ns`).
+    fn read_ids_host(&self, ids: &Tensor, rows: usize, topk: usize) -> Result<Vec<u32>> {
+        let t0 = std::time::Instant::now();
+        // One row: read through the tier's own destination (the lock only
+        // to fetch it; the wait runs without it). The same bytes `to_vec1`
+        // reads.
+        #[cfg(feature = "metal")]
+        let slot = if rows == 1 {
+            self.inner
+                .lock()
+                .decode_io
+                .ids_slot
+                .as_ref()
+                .filter(|s| s.holds(ids))
+                .map(Arc::clone)
+        } else {
+            None
+        };
+        // The router wrote the ids straight into the tier's slot
+        // (`MoeLayer::prefill_route`): wait for that work and read them in
+        // place, with no copy (#814 part 5).
+        #[cfg(feature = "metal")]
+        let decode = if let Some(slot) = slot {
+            Some(slot.read_committed::<u32>(topk)?)
+        } else if rows == 1 {
+            let flat = ids.flatten_all()?.contiguous()?;
+            let bytes = flat.elem_count() * std::mem::size_of::<u32>();
+            let dst = self.inner.lock().decode_ids_dst(bytes)?;
+            match dst {
+                Some(dst) => {
+                    Some(lloom_tensor::metal_backend::stage_readback_into(&flat, &dst)?.finish()?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "metal"))]
+        let decode: Option<Vec<u32>> = None;
+        let host: Vec<u32> = match decode {
+            Some(v) => v,
+            None => ids.flatten_all()?.to_vec1::<u32>()?,
+        };
+        if host.len() != rows * topk {
+            lloom_tensor::bail!("read_ids_host: {} ids for {rows} rows × {topk}", host.len())
+        }
+        self.counters
+            .readback_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Ok(host)
+    }
+
+    /// One layer's window settle ([`ExpertResidency::settle_window`]): its
+    /// device plan closed, the accepted rows' experts touched and counted
+    /// (those a host plan resolved with loads were, at the plan). Returns
+    /// the flags on the rows past `accepted`.
+    fn settle_window_one(&self, rec: &WindowRecord, accepted: usize) -> Result<u64> {
+        let n = rec.n();
+        if rec.data.len() != 3 * n {
+            lloom_tensor::bail!("settle_window: a record is [3·n], got {}", rec.data.len())
+        }
+        let mut inner = self.inner.lock();
+        if rec.device {
+            // The plan this record came from is closed: its pass is encoded,
+            // so a slot evicted while it was open outlives the current epoch.
+            inner.plans_open = inner.plans_open.saturating_sub(1);
+            if inner.plans_open == 0 {
+                let epoch = inner.current_epoch();
+                inner.map.release_deferred(epoch);
+            }
+        }
+        let accepted = accepted.min(rec.rows);
+        let from = rec.resolved_rows.min(accepted);
+        let ids = rec.ids();
+        let mut distinct = std::mem::take(&mut inner.scratch_ids);
+        distinct.clear();
+        distinct.extend_from_slice(&ids[from * rec.topk..accepted * rec.topk]);
+        distinct.sort_unstable();
+        distinct.dedup();
+        let tick = inner.map.begin();
+        for &e in &distinct {
+            match inner.map.slot_of(e as usize) {
+                Some(s) => {
+                    inner.map.touch(s, tick);
+                    inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
+                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                // Quarantined, an expert the plan mapped can have been
+                // evicted after its map ran (its bytes intact until the
+                // readers complete): it is loaded when next needed. In
+                // place nothing is evicted while a plan is open, so an
+                // accepted row's expert is resident or the caller's
+                // bound was wrong.
+                None if inner.map.quarantined() => {}
+                None => lloom_tensor::bail!(
+                    "settle_window: accepted row's expert {e} is not resident (the window was \
+                     accepted past its first flagged row)"
+                ),
+            }
+        }
+        inner.scratch_ids = distinct;
+        let rejected = rec.flags_from(accepted);
+        if trace_settle() {
+            eprintln!(
+                "SETTLEWIN tick={tick} rows={} accepted={accepted} device={} first_flagged={:?} rejected_flags={rejected} resident={}",
+                rec.rows,
+                rec.device,
+                rec.first_flagged_row(),
+                inner.map.resident().len()
+            );
+        }
+        Ok(rejected)
+    }
+
     /// The host plan over ids on the host: the greedy row grouping to the
     /// pool, counted.
     fn plan_rows_host(&self, host: &[u32], rows: usize, topk: usize) -> Vec<RoutedGroup> {
@@ -2871,6 +3151,10 @@ impl ExpertResidency for Streamed {
         self.counters.misses.load(Ordering::Relaxed)
     }
 
+    fn evictions_so_far(&self) -> u64 {
+        self.counters.evictions.load(Ordering::Relaxed)
+    }
+
     fn read_record_in_place(&self, record: &Tensor) -> Result<Option<Vec<u32>>> {
         #[cfg(feature = "metal")]
         {
@@ -3003,50 +3287,7 @@ impl ExpertResidency for Streamed {
 
     fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
         let (rows, topk) = ids.dims2()?;
-        let t0 = std::time::Instant::now();
-        // One row: read through the tier's own destination (the lock only
-        // to fetch it; the wait runs without it). The same bytes `to_vec1`
-        // reads.
-        #[cfg(feature = "metal")]
-        let slot = if rows == 1 {
-            self.inner
-                .lock()
-                .decode_io
-                .ids_slot
-                .as_ref()
-                .filter(|s| s.holds(ids))
-                .map(Arc::clone)
-        } else {
-            None
-        };
-        // The router wrote the ids straight into the tier's slot
-        // (`MoeLayer::prefill_route`): wait for that work and read them in
-        // place, with no copy (#814 part 5).
-        #[cfg(feature = "metal")]
-        let decode = if let Some(slot) = slot {
-            Some(slot.read_committed::<u32>(topk)?)
-        } else if rows == 1 {
-            let flat = ids.flatten_all()?.contiguous()?;
-            let bytes = flat.elem_count() * std::mem::size_of::<u32>();
-            let dst = self.inner.lock().decode_ids_dst(bytes)?;
-            match dst {
-                Some(dst) => {
-                    Some(lloom_tensor::metal_backend::stage_readback_into(&flat, &dst)?.finish()?)
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "metal"))]
-        let decode: Option<Vec<u32>> = None;
-        let host: Vec<u32> = match decode {
-            Some(v) => v,
-            None => ids.flatten_all()?.to_vec1::<u32>()?,
-        };
-        self.counters
-            .readback_ns
-            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let host = self.read_ids_host(ids, rows, topk)?;
         Ok(self.plan_rows_host(&host, rows, topk))
     }
 
@@ -3055,6 +3296,125 @@ impl ExpertResidency for Streamed {
             lloom_tensor::bail!("plan_host: {} ids for {rows} rows × {topk}", ids.len())
         }
         Ok(Some(self.plan_rows_host(ids, rows, topk)))
+    }
+
+    fn plan_window(
+        &self,
+        ids: &Tensor,
+        real_rows: usize,
+        loaded_rows: usize,
+    ) -> Result<Option<(Tensor, WindowRecord)>> {
+        // What the tier allocates depends on the pool's state, not the
+        // pass's shape: declared outside any pass plan (§9.2aa).
+        let _escape = escape_guard();
+        let (rows, topk) = ids.dims2()?;
+        let n = rows * topk;
+        let host = self.read_ids_host(ids, rows, topk)?;
+        self.counters.plans.fetch_add(1, Ordering::Relaxed);
+        self.counters.groups.fetch_add(1, Ordering::Relaxed);
+        let loaded_rows = loaded_rows.min(rows);
+        // The real rows (the first `real_rows`, row 0 of a verify window):
+        // resident within this epoch, their misses loaded, their uses
+        // counted. The draft rows loaded beside them (`loaded_rows` past
+        // `real_rows`) are loaded and touched but counted only once the
+        // accept keeps them (`settle_window`): a wrong draft's experts never
+        // enter the usage profile the hotlist is written from.
+        let real_rows = real_rows.min(loaded_rows);
+        let mut distinct: Vec<u32> = host[..real_rows * topk].to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut drafts: Vec<u32> = host[real_rows * topk..loaded_rows * topk]
+            .iter()
+            .copied()
+            .filter(|e| distinct.binary_search(e).is_err())
+            .collect();
+        drafts.sort_unstable();
+        drafts.dedup();
+        let mut inner = self.inner.lock();
+        // The loaded rows must be resident at once: wider than the pool's
+        // unpinned capacity, they are the grouped host plan's (`plan` /
+        // `ensure`, a group at a time) — no record, nothing speculative.
+        let capacity = self
+            .n_slots
+            .saturating_sub(inner.map.pinned_count() + inner.map.spare());
+        if distinct.len() + drafts.len() > capacity {
+            return Ok(None);
+        }
+        let tick = inner.map.begin();
+        let misses_before = self.counters.misses.load(Ordering::Relaxed);
+        let slots = self.resolve(&mut inner, &distinct, tick)?;
+        let real_loads = self.counters.misses.load(Ordering::Relaxed) - misses_before;
+        let draft_slots = if drafts.is_empty() {
+            Vec::new()
+        } else {
+            let usage_before = inner.map.usage.clone();
+            let s = self.resolve(&mut inner, &drafts, tick)?;
+            inner.map.usage = usage_before;
+            s
+        };
+        let draft_loads = self.counters.misses.load(Ordering::Relaxed) - misses_before - real_loads;
+        let mut data = vec![0u32; 3 * n];
+        let mut open_slots: Vec<usize> = slots.clone();
+        open_slots.extend_from_slice(&draft_slots);
+        for (i, &e) in host.iter().enumerate() {
+            let (slot, miss) = if i / topk < real_rows {
+                let j = distinct
+                    .binary_search(&e)
+                    .expect("distinct covers the real rows");
+                (slots[j] as u32, false)
+            } else if i / topk < loaded_rows && distinct.binary_search(&e).is_ok() {
+                let j = distinct.binary_search(&e).expect("checked");
+                (slots[j] as u32, false)
+            } else if i / topk < loaded_rows {
+                let j = drafts
+                    .binary_search(&e)
+                    .expect("drafts covers the loaded rows");
+                (draft_slots[j] as u32, false)
+            } else if (e as usize) < self.n_experts {
+                // A draft row reads what is resident; a miss reads slot 0
+                // and flags the row — nothing is loaded for it.
+                match inner.map.slot_of(e as usize) {
+                    Some(s) => {
+                        open_slots.push(s);
+                        (s as u32, false)
+                    }
+                    None => (0, true),
+                }
+            } else {
+                lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
+            };
+            data[i] = slot;
+            data[n + i] = e;
+            data[2 * n + i] = miss as u32;
+        }
+        // Every slot the dispatch reads is a reader of this epoch (`down`
+        // stamps them: a direct read into one waits for it).
+        open_slots.sort_unstable();
+        open_slots.dedup();
+        inner.open_epoch = Some(tick);
+        inner.open_slots = open_slots;
+        let slot_ids = Tensor::from_vec(data[..n].to_vec(), (rows, topk), &inner.device)?;
+        Ok(Some((
+            slot_ids,
+            WindowRecord {
+                data,
+                rows,
+                topk,
+                device: false,
+                resolved_rows: real_rows,
+                real_loads,
+                draft_loads,
+            },
+        )))
+    }
+
+    fn settle_window(parts: &[(&Self, &WindowRecord)], accepted: usize) -> Result<u64> {
+        let _escape = escape_guard();
+        let mut rejected_flags = 0u64;
+        for (r, rec) in parts {
+            rejected_flags += r.settle_window_one(rec, accepted)?;
+        }
+        Ok(rejected_flags)
     }
 
     fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {

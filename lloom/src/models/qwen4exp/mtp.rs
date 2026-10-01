@@ -23,8 +23,8 @@
 
 use super::config::Config;
 use super::hc::HyperConnection;
-use super::model::{Cache, Layer, Qwen4Exp};
-use super::moe::ExpertResidency;
+use super::model::{Cache, Layer, Qwen4Exp, VerifyPass};
+use super::moe::{ExpertResidency, WindowPlan, WindowPlanKind, WindowRecord};
 use crate::nn::speculator::{
     accept_prefix, Anchor, Draft, DraftTokens, KvSource, NextnHidden, Probes, SeqId, Speculator,
     VerifyRowRef,
@@ -96,6 +96,22 @@ impl<R: ExpertResidency> MtpHead<R> {
         cache: &mut Cache,
         swap_eh: bool,
     ) -> Result<(Tensor, Tensor)> {
+        let (sample, multi, _) = self.forward_planned(hidden, embeds, cache, swap_eh, None)?;
+        Ok((sample, multi))
+    }
+
+    /// [`Self::forward_with`] with the layer's routed experts planned as a
+    /// window when `kind` is given (`Layer::prefill_window`): the plan's
+    /// record comes back for the caller to settle after its own readback
+    /// (`MtpDrafter::observe`); `None` is the plain host plan.
+    pub fn forward_planned(
+        &self,
+        hidden: &Tensor,
+        embeds: &Tensor,
+        cache: &mut Cache,
+        swap_eh: bool,
+        kind: Option<WindowPlanKind>,
+    ) -> Result<(Tensor, Tensor, Option<WindowPlan>)> {
         let (b, a, nd) = hidden.dims3()?;
         let (n, d) = (self.n, self.d);
         if b != 1 || nd != n * d || embeds.dims3()? != (1, a, d) {
@@ -119,10 +135,13 @@ impl<R: ExpertResidency> MtpHead<R> {
         }
         .reshape((a * n, 2 * d))?;
         let h0 = self.eh_proj.forward(&eh)?.reshape((1, a, n * d))?;
-        let multi = self.layer.prefill(&h0, 0, cache)?;
+        let (multi, record) = match kind {
+            Some(kind) => self.layer.prefill_window(&h0, 0, cache, kind)?,
+            None => (self.layer.prefill(&h0, 0, cache)?, None),
+        };
         cache.pos += a;
         let (sample, _) = self.head_mix.mix(&multi)?;
-        Ok((sample, multi))
+        Ok((sample, multi, record))
     }
 
     pub fn layer(&self) -> &Layer<R> {
@@ -165,6 +184,11 @@ struct MtpLane {
     /// state a second draft step continues from.
     multi: Option<Tensor>,
     rows_seen: usize,
+    /// The observes planned on the head's device plan, on its host plan,
+    /// and the device-planned ones redone on a miss.
+    observe_device: u64,
+    observe_host: u64,
+    observe_redos: u64,
 }
 
 impl MtpLane {
@@ -176,6 +200,9 @@ impl MtpLane {
             draft: None,
             multi: None,
             rows_seen: 0,
+            observe_device: 0,
+            observe_host: 0,
+            observe_redos: 0,
         }
     }
 }
@@ -210,6 +237,18 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
             k: 1,
             lanes: (0..n.max(1)).map(|_| MtpLane::new(cfg)).collect(),
         }
+    }
+
+    /// The observes planned on the head's device plan, on its host plan,
+    /// and the device-planned ones redone on a miss, over every lane.
+    pub fn observe_plans(&self) -> (u64, u64, u64) {
+        self.lanes.iter().fold((0, 0, 0), |(d, h, r), l| {
+            (
+                d + l.observe_device,
+                h + l.observe_host,
+                r + l.observe_redos,
+            )
+        })
     }
 
     /// Propose `k` tokens a round (`k ≥ 1`; the target verifies `k + 1`
@@ -360,20 +399,107 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
             self.probe_prefill_rows(seq, probe, &nexts)?;
         }
         let lane = self.lane(seq)?;
+        let rows_seen_before = lane.rows_seen;
         let toks = Tensor::from_vec(nexts, (1, a), &device)?;
         let emb = embed.embedding(&toks)?; // [1, a, d]
-        let (sample, multi) = head.forward(probe, &emb, &mut lane.cache)?;
-        lane.multi = Some(multi.narrow(1, a - 1, 1)?);
+                                           // The head's own streamed experts planned on the device when its
+                                           // pool held the last round's whole (`QWEN4EXP_MTP_OBSERVE_PLAN`):
+                                           // no readback at its layer; the record is settled after the draft's
+                                           // argmax — a miss rewinds the head's cache and runs the rows again
+                                           // on the host plan, as the target's decode step does.
+        let tier = head.layer().moe().experts();
+        // The seeding observe keys the prompt's rows — wider than a round's
+        // and, on a streamed head, than its pool: the grouped host plan's.
+        let planned = observe_on_device() && tier.plans_on_device() && rows_seen_before > 0;
+        let kind = planned.then(|| {
+            if lane.cache.device_plan_armed {
+                WindowPlanKind::Device
+            } else {
+                WindowPlanKind::Host {
+                    real_rows: a,
+                    loaded_rows: a,
+                }
+            }
+        });
+        if planned {
+            lane.cache.open_window()?;
+        }
+        let misses_before = tier.misses_so_far();
+        let (sample, multi, record) =
+            head.forward_planned(probe, &emb, &mut lane.cache, false, kind)?;
         let last = sample.narrow(1, a - 1, 1)?;
         let logits = lm_head.forward(&last)?; // [1, 1, vocab]
-        let next = logits
+        let mut next = logits
             .flatten_all()?
             .argmax(D::Minus1)?
             .to_scalar::<u32>()?;
+        let mut multi = multi;
+        if let Some(kind) = kind {
+            let rec = match record {
+                Some(WindowPlan::Host(r)) => Some(r),
+                Some(WindowPlan::Device(t)) => {
+                    // The pass is complete (the argmax above waited for it):
+                    // the record in place from the tier's slot, else read.
+                    let data = match tier.read_record_in_place(&t)? {
+                        Some(v) => v,
+                        None => t.flatten_all()?.to_vec1::<u32>()?,
+                    };
+                    Some(WindowRecord::device(data, a, head.layer().moe().topk())?)
+                }
+                None => None,
+            };
+            let flagged = rec.as_ref().and_then(|r| r.first_flagged_row()).is_some();
+            if let Some(r) = &rec {
+                // Every row is real: closed and touched whole, or closed
+                // alone before the rows run again.
+                R::settle_window(&[(tier, r)], if flagged { 0 } else { a })?;
+            }
+            if flagged {
+                lane.cache.rewind_window()?;
+                lane.cache.device_plan_armed = false;
+                lane.cache.open_window()?;
+                let kind = WindowPlanKind::Host {
+                    real_rows: a,
+                    loaded_rows: a,
+                };
+                let (sample, m, record) =
+                    head.forward_planned(probe, &emb, &mut lane.cache, false, Some(kind))?;
+                if let Some(WindowPlan::Host(r)) = record {
+                    R::settle_window(&[(tier, &r)], a)?;
+                }
+                let last = sample.narrow(1, a - 1, 1)?;
+                let logits = lm_head.forward(&last)?;
+                next = logits
+                    .flatten_all()?
+                    .argmax(D::Minus1)?
+                    .to_scalar::<u32>()?;
+                multi = m;
+                lane.observe_redos += 1;
+            } else if kind != WindowPlanKind::Device && tier.misses_so_far() == misses_before {
+                // A host-planned observe that found its experts resident
+                // arms the device plan for the rounds after it.
+                lane.cache.device_plan_armed = true;
+            }
+            lane.cache.resolve_window()?;
+            if kind == WindowPlanKind::Device {
+                lane.observe_device += 1;
+            } else {
+                lane.observe_host += 1;
+            }
+        }
+        lane.multi = Some(multi.narrow(1, a - 1, 1)?);
         lane.draft = Some(next);
         lane.rows_seen += a;
         Ok(())
     }
+}
+
+/// `QWEN4EXP_MTP_OBSERVE_PLAN` (read once): `device` plans the MTP head's
+/// own streamed experts on the device in the observe; `host` (the default)
+/// is the per-round readback.
+fn observe_on_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.mtp_observe_plan == "device")
 }
 
 impl<R: ExpertResidency> MtpDrafter<'_, R> {
@@ -455,9 +581,10 @@ pub struct MtpPending {
     /// The window's input tokens `[anchor, proposed…]`.
     tokens: Vec<u32>,
     want_was: bool,
-    /// The window ran as one pass over the phase rings (`verify_window`):
-    /// the accept is by phase.
-    by_phase: bool,
+    /// The window ran as one pass over the phase rings
+    /// (`verify_window_run`): the accept is by phase, and the streamed
+    /// tier's plans are settled once it is known (`verify_window_settle`).
+    pass: Option<VerifyPass>,
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
@@ -571,30 +698,35 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         let want_was = cache.want_nextn;
         cache.want_nextn = true;
         // The window as ONE pass with every position's state kept (the
-        // phase rings, `verify_window`) when the cache holds them; else the
-        // sequential steps with the replay on a partial accept.
+        // phase rings, `verify_window_run`) when the cache holds them; else
+        // the sequential steps with the replay on a partial accept.
         let by_phase = cache.ring_holds(tokens.len(), self.has_ple());
-        let argmax = if by_phase {
-            self.verify_window(&tokens, cache)?
+        let (argmax, pass) = if by_phase {
+            let pass = self.verify_window_run(&tokens, cache)?;
+            (pass.argmax.clone(), Some(pass))
         } else {
             cache.open_window()?;
             let mut argmaxes = Vec::with_capacity(tokens.len());
             for &t in &tokens {
                 argmaxes.push(self.step_argmax(t, cache)?);
             }
-            Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?
+            (Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?, None)
         };
         Ok(MtpPending {
             argmax,
             tokens,
             want_was,
-            by_phase,
+            pass,
         })
     }
 
     /// Accept the longest agreeing prefix; on a partial accept rewind the
     /// window and replay the accepted prefix. The probe is the carry at each
-    /// accepted position.
+    /// accepted position. Over the phase rings the streamed tier's plans are
+    /// settled AFTER the accept: a rejected draft's experts are neither
+    /// loaded nor touched, a draft that computed on a missing expert cuts
+    /// the prefix at itself, only a miss at the real next token redoes the
+    /// window (`expert-streaming.md` §20.16).
     fn verify_complete(
         &self,
         pending: MtpPending,
@@ -605,20 +737,42 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
             argmax,
             tokens,
             want_was,
-            by_phase,
+            pass,
         } = pending;
-        let accepted = accept_prefix(&argmax, &tokens[1..], eos_ids);
-        let a = accepted.len();
+        let (argmax, a, verdict) = match pass {
+            Some(pass) => {
+                let proposed = &tokens[1..];
+                let v = self.verify_window_settle(
+                    pass,
+                    |argmax| accept_prefix(argmax, proposed, eos_ids).len(),
+                    true,
+                    cache,
+                )?;
+                let a = v.accepted;
+                (v.argmax.clone(), a, Some(v))
+            }
+            None => {
+                let a = accept_prefix(&argmax, &tokens[1..], eos_ids).len();
+                (argmax, a, None)
+            }
+        };
+        let accepted: Vec<u32> = argmax[..a].to_vec();
         if mtp_trace() {
+            let (planned, redo, first_flagged, rejected) = verdict
+                .as_ref()
+                .map(|v| (v.planned, v.redo, v.first_flagged, v.rejected_flags))
+                .unwrap_or((false, false, None, 0));
             eprintln!(
-                "MTPTRACE pos={} window={:?} argmax={:?} accepted={:?}",
+                "MTPTRACE pos={} window={:?} argmax={:?} accepted={:?} planned={planned} redo={redo} first_flagged={first_flagged:?} rejected_flags={rejected} misses={} evictions={}",
                 cache.pos - tokens.len(),
                 tokens,
                 argmax,
-                accepted
+                accepted,
+                self.stream_misses_total(),
+                self.stream_evictions_total(),
             );
         }
-        let probe = if by_phase {
+        let probe = if verdict.is_some() {
             // The accepted prefix by phase: no replay.
             cache.accept_window(a)?;
             cache.take_nextn()?

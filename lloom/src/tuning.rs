@@ -82,6 +82,13 @@ fn parse_spike0(v: &str) -> Result<String, String> {
 fn parse_mem_check(v: &str) -> Result<String, String> {
     one_of(v, "mem check", &["off", "report", "refuse"])
 }
+fn parse_draft_loads(v: &str) -> Result<String, String> {
+    match v {
+        "auto" | "on" | "off" => Ok(v.to_string()),
+        _ => Err(format!("{v:?}: expected auto, on or off")),
+    }
+}
+
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
@@ -274,6 +281,12 @@ pub struct Qwen4ExpTuning {
     /// Print every MTP verify round's window, argmax and accepted prefix — an instrument.
     #[opt(flag = "mtp-trace", env = "QWEN4EXP_MTP_TRACE", bool)]
     pub mtp_trace: bool,
+    /// Whether a host-planned MTP verify window loads the DRAFT rows' missing experts beside row 0's: `auto` (while the real row's loads per host-planned window average 2 or more — the pool is missing the stream — off again under 1), `on` (always), `off` (never: a draft row's miss flags the row and loads nothing).
+    #[opt(flag = "mtp-draft-loads", env = "QWEN4EXP_MTP_DRAFT_LOADS", parser = "parse_draft_loads", variants = ["auto", "on", "off"])]
+    pub mtp_draft_loads: String,
+    /// Where the MTP head's own streamed experts are planned in the drafter's observe: `device` (no readback at its layer; its record settled after the draft's argmax) or `host` (a readback per round, the A/B arm).
+    #[opt(flag = "mtp-observe-plan", env = "QWEN4EXP_MTP_OBSERVE_PLAN", parser = "parse_plan", variants = ["device", "host"])]
+    pub mtp_observe_plan: String,
 }
 
 impl Default for Qwen4ExpTuning {
@@ -297,6 +310,8 @@ impl Default for Qwen4ExpTuning {
             trace_load: false,
             mtp_probe: false,
             mtp_trace: false,
+            mtp_draft_loads: "auto".into(),
+            mtp_observe_plan: "host".into(),
         }
     }
 }

@@ -671,7 +671,7 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    println!("CONTRACT profile={}", candle::tuning::contract().name());
+    println!("CONTRACT {}", candle::tuning::contract().report());
     let gguf = match &args.gguf {
         Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")

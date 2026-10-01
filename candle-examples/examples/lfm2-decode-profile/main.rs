@@ -2801,7 +2801,7 @@ fn run_speculative_decode(r: SpecRun<'_>) -> Result<()> {
 fn main() -> Result<()> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;
-    println!("CONTRACT profile={}", candle::tuning::contract().name());
+    println!("CONTRACT {}", candle::tuning::contract().report());
     let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     let profiling = profile::enabled();

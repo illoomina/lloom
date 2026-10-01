@@ -359,14 +359,14 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
     }
 }
 
-/// The small-batch rows arm — `NR1` activation rows per weight read
-/// (`kernel_mul_mv_*_rows_impl`): `LLOOM_QMV_ROWS=on`, or the `fast`
-/// contract. Not under `deterministic`: a row's bits then depend on how
-/// many rows share its launch (the `NR1` the batch selects, and the rows
-/// kernel's contraction against the one-row core's), so a sequence's
-/// logits would depend on who else is in its batch (§2.3.3 #7).
+/// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
+/// activation rows per weight read (`kernel_mul_mv_*_rows_impl`). Off by
+/// default, and not taken by the `fast` contract either: a row's bits
+/// depend on how many rows share its launch, which only `fast` licenses,
+/// and on the real checkpoint it is slower than the per-row launches at
+/// three rows and up (`architecture.md` §2.3.5b).
 fn rows_arm_on() -> bool {
-    crate::tuning::tuning().qmv.rows || crate::tuning::contract().is_fast()
+    crate::tuning::tuning().qmv.rows
 }
 
 /// The threadgroup geometry each rows kernel is written for: the rows a

@@ -1,14 +1,16 @@
-//! The small-batch quantized matmul-vec under the `fast` contract: `m`
+//! The small-batch quantized matmul-vec (`LLOOM_QMV_ROWS=on`): `m`
 //! activation rows (2..=8) share one weight read (`kernel_mul_mv_*_rows_impl`,
 //! `NR1` rows a threadgroup) for the five stem types it is built for. Every
 //! output row is checked against the CPU dequant reference, at a row count
 //! that fills the last threadgroup (`n = 40`) and one that does not (`n = 37`),
 //! and the dispatch census shows the rows kernels ran — a parity test the
-//! per-row launches pass is not a test of this arm.
+//! per-row launches pass is not a test of this arm. Each rows kernel indexes
+//! its rows for its own threadgroup geometry, so a one-row core whose
+//! geometry is tuned (`q6k_nr0`, `iq_nsg`) must not lend it its grid.
 //!
-//! Its own binary: the contract is a process-wide value read once, installed
-//! here before any tensor exists. The deterministic twin (the per-row
-//! launches, bit-identical to `m` one-row launches) is `qmatmul_rows_default`.
+//! Its own binary: the arm's switch is read once per process, installed here
+//! before any tensor exists. The default (the per-row launches, bit-identical
+//! to `m` one-row launches) is `qmatmul_rows_default`.
 #![cfg(feature = "metal")]
 
 use half::f16;
@@ -29,13 +31,13 @@ fn device() -> Device {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
-        t.contract.profile = "fast".into();
+        t.qmv.rows = true;
         t.instrument.profile = true;
         let _ = lloom_tensor::tuning::install(t);
     });
     assert!(
-        lloom_tensor::tuning::contract().is_fast(),
-        "the contract was read before this binary installed it"
+        lloom_tensor::tuning::tuning().qmv.rows,
+        "the switch was read before this binary installed it"
     );
     Device::new_metal(0).expect("a Metal device")
 }

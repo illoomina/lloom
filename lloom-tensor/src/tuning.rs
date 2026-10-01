@@ -69,6 +69,23 @@ impl Contract {
     pub fn is_fast(self) -> bool {
         self == Contract::Fast
     }
+
+    /// The arms `fast` takes, by name. Empty: every candidate measured so
+    /// far bought nothing on this device (`architecture.md` §2.3.5b), so a
+    /// `fast` run computes a `deterministic` run's bits. An arm joins this
+    /// list in the change that makes it read [`contract`].
+    pub const FAST_ARMS: &'static [&'static str] = &[];
+
+    /// `profile=<name> arms=<list>`, for the report lines that say which
+    /// contract a run held.
+    pub fn report(self) -> String {
+        let arms = match self {
+            Contract::Deterministic => "none".to_string(),
+            Contract::Fast if Contract::FAST_ARMS.is_empty() => "none".to_string(),
+            Contract::Fast => Contract::FAST_ARMS.join(","),
+        };
+        format!("profile={} arms={arms}", self.name())
+    }
 }
 
 /// The contract in force for this process: [`tuning`]'s `contract.profile`,
@@ -683,6 +700,11 @@ mod tests {
             Ok(Contract::Deterministic)
         );
         assert!(Contract::Fast.is_fast() && !Contract::Deterministic.is_fast());
+        assert_eq!(
+            Contract::Deterministic.report(),
+            "profile=deterministic arms=none"
+        );
+        assert_eq!(Contract::Fast.report(), "profile=fast arms=none");
     }
 
     #[test]

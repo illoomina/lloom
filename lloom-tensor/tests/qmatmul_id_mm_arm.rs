@@ -6,7 +6,9 @@
 //! tile does, once every group runs the tile's arm.
 //!
 //! No test here sets the process-wide `LLOOM_MOE_MM_FROM` / block overrides:
-//! the default entry point is checked against `MoeArm::for_rows`.
+//! the default entry point is checked against `MoeArm::for_rows`. The
+//! dispatch census is on in this binary (`device`), so the gate|up pair's
+//! test can read which kernels ran.
 #![cfg(feature = "metal")]
 use lloom_tensor::quantized::{GgmlDType, MoeArm, QTensor};
 use lloom_tensor::{Device, Tensor};
@@ -16,6 +18,14 @@ const N: usize = 128;
 const K: usize = 256;
 const TOPK: usize = 4;
 const ROWS: usize = 70;
+
+/// The Metal device, with the dispatch census on. The profiler reads its
+/// switch once per process, so every test sets it before its first Metal
+/// call; counting changes no bits.
+fn device() -> Option<Device> {
+    std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    Device::new_metal(0).ok()
+}
 
 fn weight(dev: &Device, dtype: GgmlDType, seed: f32) -> QTensor {
     if matches!(dtype, GgmlDType::Q2_0 | GgmlDType::IQ4NL) {
@@ -115,7 +125,7 @@ fn grouped(q: &QTensor, x: &Tensor, ids: &Tensor, cuts: &[usize], arm: MoeArm) -
 /// from the other arm; and the entry point without an arm is `for_rows`'.
 #[test]
 fn the_callers_arm_is_the_kernel_that_runs() {
-    let Ok(dev) = Device::new_metal(0) else {
+    let Some(dev) = device() else {
         return;
     };
     for dtype in KINDS {
@@ -151,7 +161,7 @@ fn the_callers_arm_is_the_kernel_that_runs() {
 /// activation layouts.
 #[test]
 fn a_row_does_not_depend_on_the_group_it_is_computed_in() {
-    let Ok(dev) = Device::new_metal(0) else {
+    let Some(dev) = device() else {
         return;
     };
     for dtype in KINDS {
@@ -172,35 +182,105 @@ fn a_row_does_not_depend_on_the_group_it_is_computed_in() {
     }
 }
 
-/// The gate|up pair: one launch, the matmul-vec, whatever the arm (the GEMM
-/// has no paired form) — so its choice is the weights', never the rows'; and
-/// where it falls back to two launches (the kinds differ), each is the
-/// caller's arm.
+/// Each dispatch encoded on `dev` while `f` runs, counted by kernel label
+/// (the device's own census window, so the other tests' devices do not
+/// count).
+fn launches(dev: &Device, f: impl FnOnce()) -> Vec<(String, u64)> {
+    dev.synchronize().unwrap();
+    let window = dev
+        .as_metal_device()
+        .unwrap()
+        .dispatch_census()
+        .open()
+        .expect("a census window on this test's device");
+    f();
+    dev.synchronize().unwrap();
+    window.close()
+}
+
+fn count(census: &[(String, u64)], label: &str) -> u64 {
+    census
+        .iter()
+        .filter(|(l, _)| l.contains(label))
+        .map(|(_, n)| *n)
+        .sum()
+}
+
+/// The gate|up pair takes the caller's arm. On the matmul-vec it is ONE
+/// launch (`kernel_mul_mv_id2`) whose halves are the two matmul-vec calls
+/// bit for bit; on the GEMM it is two GEMM calls — the GEMM has no paired
+/// form, so a tile never leaves it for the pair — and the two arms' bits
+/// differ. The entry point without an arm is `for_rows`' arm (8 rows and
+/// 70); where the kinds differ, two calls on either arm.
 #[test]
-fn the_pair_is_the_matvec_and_its_fallback_takes_the_arm() {
-    let Ok(dev) = Device::new_metal(0) else {
+fn the_pair_takes_the_callers_arm() {
+    let Some(dev) = device() else {
         return;
     };
-    let (x, ids) = (input(&dev, ROWS, 1), ids(&dev, ROWS));
+    assert!(
+        lloom_tensor::kernels::metal::profile::enabled(),
+        "the census decides which kernels ran"
+    );
     let g = weight(&dev, GgmlDType::Q4K, 0.0);
     let u = weight(&dev, GgmlDType::Q4K, 1.0);
-    for arm in [MoeArm::MatVec, MoeArm::Gemm] {
-        let (pg, pu) = g.indexed_moe_forward_pair_with(&u, &x, &ids, arm).unwrap();
-        assert_eq!(
-            (bits(&pg), bits(&pu)),
-            (
-                bits(
-                    &g.indexed_moe_forward_with(&x, &ids, MoeArm::MatVec)
-                        .unwrap()
+    for in_dim1 in [1usize, TOPK] {
+        let (x, ids) = (input(&dev, ROWS, in_dim1), ids(&dev, ROWS));
+        let mut pairs = Vec::new();
+        for arm in [MoeArm::MatVec, MoeArm::Gemm] {
+            let mut got = None;
+            let census = launches(&dev, || {
+                let (pg, pu) = g.indexed_moe_forward_pair_with(&u, &x, &ids, arm).unwrap();
+                got = Some((bits(&pg), bits(&pu)));
+            });
+            let got = got.unwrap();
+            let want = (
+                bits(&g.indexed_moe_forward_with(&x, &ids, arm).unwrap()),
+                bits(&u.indexed_moe_forward_with(&x, &ids, arm).unwrap()),
+            );
+            assert_eq!(
+                got, want,
+                "in_dim1={in_dim1} {arm:?}: the pair's halves are not the two calls on its arm"
+            );
+            let (pair, mv, mm) = (
+                count(&census, "mul_mv_id2_"),
+                count(&census, "mul_mv_id_"),
+                count(&census, "mul_mm_id"),
+            );
+            println!(
+                "PAIR in_dim1={in_dim1} {arm:?}: mul_mv_id2={pair} mul_mv_id={mv} mul_mm_id={mm}"
+            );
+            match arm {
+                MoeArm::MatVec => assert_eq!(
+                    (pair, mv, mm),
+                    (1, 0, 0),
+                    "in_dim1={in_dim1}: the matmul-vec pair is not one paired launch ({census:?})"
                 ),
-                bits(
-                    &u.indexed_moe_forward_with(&x, &ids, MoeArm::MatVec)
-                        .unwrap()
-                )
-            ),
-            "{arm:?}: the one-launch pair is not the matmul-vec"
+                MoeArm::Gemm => assert_eq!(
+                    (pair, mv, mm),
+                    (0, 0, 2),
+                    "in_dim1={in_dim1}: the GEMM pair is not two GEMM launches ({census:?})"
+                ),
+            }
+            pairs.push(got);
+        }
+        assert_ne!(
+            pairs[0], pairs[1],
+            "in_dim1={in_dim1}: the pair's two arms agree bit for bit — did the GEMM run?"
         );
+        for rows in [8usize, ROWS] {
+            let (xr, ir) = (input(&dev, rows, in_dim1), self::ids(&dev, rows));
+            let (dg, du) = g.indexed_moe_forward_pair(&u, &xr, &ir).unwrap();
+            let (wg, wu) = g
+                .indexed_moe_forward_pair_with(&u, &xr, &ir, MoeArm::for_rows(rows))
+                .unwrap();
+            assert_eq!(
+                (bits(&dg), bits(&du)),
+                (bits(&wg), bits(&wu)),
+                "in_dim1={in_dim1} rows={rows}: the pair without an arm is not for_rows' arm"
+            );
+        }
     }
+    let (x, ids) = (input(&dev, ROWS, 1), ids(&dev, ROWS));
     let u8 = weight(&dev, GgmlDType::Q8_0, 1.0);
     for arm in [MoeArm::MatVec, MoeArm::Gemm] {
         let (pg, pu) = g.indexed_moe_forward_pair_with(&u8, &x, &ids, arm).unwrap();

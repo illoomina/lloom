@@ -1147,24 +1147,24 @@ impl QTensor {
         })
     }
 
-    /// Gate and up of one routed layer — two stacked weights of one kind and
-    /// shape — in ONE Metal launch (`kernel_mul_mv_id2`, lloom #749 P31 (3)):
-    /// `(self · x, up · x)` each `[batch, topk, n]`, each byte-identical to
-    /// its own matmul-vec launch. Two launches off Metal, with f16
-    /// activations, when the pair's kinds or shapes differ, or under
-    /// `LLOOM_MOE_PAIR=off` (the A/B arm). The arm is `batch`'s
-    /// ([`MoeArm::for_rows`]); [`Self::indexed_moe_forward_pair_with`] takes
-    /// it from the caller.
+    /// Gate and up of one routed layer: `(self · x, up · x)`, each
+    /// `[batch, topk, n]` and each bit for bit what
+    /// [`Self::indexed_moe_forward_with`] computes for it on the same arm.
+    /// The arm is `batch`'s ([`MoeArm::for_rows`]);
+    /// [`Self::indexed_moe_forward_pair_with`] takes it from the caller.
     pub fn indexed_moe_forward_pair(&self, up: &QTensor, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
         self.indexed_moe_forward_pair_with(up, x, ids, MoeArm::for_rows(x.dim(0)?))
     }
 
-    /// [`Self::indexed_moe_forward_pair`] on the caller's `arm`. The one
-    /// launch is the matmul-vec whatever `arm` says — the GEMM has no paired
-    /// form — and `arm` decides the two launches it falls back to. Whether
-    /// the pair is one launch depends on the two weights and the activation
-    /// dtype alone, never on `batch`, so every group of a tile makes the
-    /// same choice.
+    /// [`Self::indexed_moe_forward_pair`] on the caller's `arm`. On
+    /// [`MoeArm::MatVec`] (a decode step) the two halves are ONE Metal launch,
+    /// `kernel_mul_mv_id2`, when both weights share a kind and shape and the
+    /// activations are f32, unless `LLOOM_MOE_PAIR=off`. The GEMM has no
+    /// paired form, so on [`MoeArm::Gemm`] (a prefill tile) the halves are two
+    /// calls on that arm, and the pair never takes a tile off the GEMM. The
+    /// choice depends on the arm, the weights and the activation dtype, never
+    /// on `batch`, so every group of a tile makes the same one
+    /// (`docs/expert-streaming.md` §20.15a).
     pub fn indexed_moe_forward_pair_with(
         &self,
         up: &QTensor,
@@ -1173,7 +1173,12 @@ impl QTensor {
         arm: MoeArm,
     ) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "metal")]
-        if moe_pair_on() && self.dtype() == up.dtype() && self.shape() == up.shape() && x.dtype() == DType::F32 {
+        if arm == MoeArm::MatVec
+            && moe_pair_on()
+            && self.dtype() == up.dtype()
+            && self.shape() == up.shape()
+            && x.dtype() == DType::F32
+        {
             if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
                 let (xs, is) = (x.storage(), ids.storage());
                 if let (Storage::Metal(xs), Storage::Metal(is)) = (&*xs, &*is) {
@@ -1641,8 +1646,8 @@ impl MoeArm {
     }
 }
 
-/// The routed gate|up pair launch (`LLOOM_MOE_PAIR`, read once): on unless
-/// `off` | `0` — the A/B arm of lloom #749 P31 (3).
+/// The routed gate|up pair launch on the matmul-vec arm (`LLOOM_MOE_PAIR`,
+/// read once): on unless `off` | `0`.
 #[cfg(feature = "metal")]
 fn moe_pair_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

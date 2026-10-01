@@ -252,7 +252,7 @@ impl ExpertResidency for Resident {
     }
     #[inline]
     fn gate_up(&self, x: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)> {
-        // One launch for the pair on Metal (#749 P31 (3)); two elsewhere.
+        // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
         self.gate
             .indexed_moe_forward_pair_with(&self.up, x, ids, arm)
     }
@@ -3091,7 +3091,7 @@ impl ExpertResidency for Streamed {
 
     fn gate_up(&self, x: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)> {
         let inner = self.inner.lock();
-        // One launch for the pair on Metal (#749 P31 (3)); two elsewhere.
+        // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
         inner.pools[0]
             .qt
             .indexed_moe_forward_pair_with(&inner.pools[1].qt, x, slot_ids, arm)

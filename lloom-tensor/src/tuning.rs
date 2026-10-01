@@ -309,7 +309,7 @@ pub struct MoeTuning {
     /// Pin the routed GEMM's row block: 16 or 32 (0 = the rule: 16 when the experts see few rows each).
     #[opt(flag = "moe-mm-bn", env = "LLOOM_MOE_MM_BN", variants = ["0", "16", "32"])]
     pub mm_bn: usize,
-    /// Gate and up of a routed layer in one launch (`kernel_mul_mv_id2`, P31 (3)); off = two launches, the A/B arm.
+    /// Gate and up of a routed layer in one launch on the matmul-vec arm (`kernel_mul_mv_id2`; a GEMM tile always takes two); off = two launches, the A/B arm.
     #[opt(flag = "moe-pair", env = "LLOOM_MOE_PAIR", bool)]
     pub pair: bool,
 }

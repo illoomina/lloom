@@ -199,6 +199,71 @@ fn a_hole_costs_no_disk() -> Result<()> {
     Ok(())
 }
 
+/// `Fill::Heads`: every expert of a stack non-zero in its leading rows and
+/// zero past them, no two experts' heads alike, and the stack's disk a few
+/// KiB an expert — 64 experts of 1 MiB on under a MiB of blocks.
+#[cfg(unix)]
+#[test]
+fn heads_make_every_expert_nonzero_and_distinct_for_a_few_kib_each() -> Result<()> {
+    use lloom::testing::scale::HEAD_BYTES;
+    use std::os::unix::fs::MetadataExt;
+    let dir = temp("heads");
+    let (experts, rows, cols) = (64usize, 512usize, 512usize);
+    let m = ShapeManifest {
+        source: "heads".into(),
+        shards: vec![ShardShape {
+            file: "heads.gguf".into(),
+            metadata: vec![],
+            tensors: vec![TensorShape {
+                name: "blk.0.ffn_down_exps.weight".into(),
+                dims: vec![experts, rows, cols],
+                dtype: GgmlDType::F32,
+                offset: 0,
+            }],
+        }],
+    };
+    let syn = Synthetic {
+        experts: Fill::Heads,
+        ..Synthetic::default()
+    };
+    let paths = m.write_sparse(&dir, &syn, &|_| Role::Matrix { fan_in: cols })?;
+    let md = std::fs::metadata(&paths[0])?;
+    let data = &tensors(&paths[0])?[0].1;
+    let plane = rows * cols * 4;
+    let head = HEAD_BYTES.div_ceil(cols * 4) * cols * 4;
+    println!(
+        "HEADS len={} allocated={} experts={experts} plane={plane} head={head}",
+        md.len(),
+        md.blocks() * 512
+    );
+    let mut heads: Vec<&[u8]> = Vec::with_capacity(experts);
+    for e in 0..experts {
+        let p = &data[e * plane..(e + 1) * plane];
+        assert!(
+            p[..head].iter().any(|b| *b != 0),
+            "expert {e}: its head is zeros"
+        );
+        assert!(
+            p[head..].iter().all(|b| *b == 0),
+            "expert {e}: written past its head"
+        );
+        heads.push(&p[..head]);
+    }
+    for (e, h) in heads.iter().enumerate() {
+        assert!(
+            heads[..e].iter().all(|o| o != h),
+            "expert {e}'s head repeats an earlier expert's"
+        );
+    }
+    assert!(
+        md.blocks() * 512 < 1 << 20,
+        "{experts} heads of {head} B took {} B of disk",
+        md.blocks() * 512
+    );
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
 /// The committed Qwen3.8-Flash-Next shape holds #749 P18's byte counts
 /// (`qwen4exp-dispatches-raw/p18-*.txt`: `resident_bytes=4115863040
 /// expert_bytes_per_slot=83814400`, 47.03 GB predicted resident) and the

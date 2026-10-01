@@ -1150,10 +1150,28 @@ impl QTensor {
     /// Gate and up of one routed layer — two stacked weights of one kind and
     /// shape — in ONE Metal launch (`kernel_mul_mv_id2`, lloom #749 P31 (3)):
     /// `(self · x, up · x)` each `[batch, topk, n]`, each byte-identical to
-    /// its own [`Self::indexed_moe_forward`]. Two launches off Metal, with
-    /// f16 activations, when the pair's kinds or shapes differ, or under
-    /// `LLOOM_MOE_PAIR=off` (the A/B arm).
+    /// its own matmul-vec launch. Two launches off Metal, with f16
+    /// activations, when the pair's kinds or shapes differ, or under
+    /// `LLOOM_MOE_PAIR=off` (the A/B arm). The arm is `batch`'s
+    /// ([`MoeArm::for_rows`]); [`Self::indexed_moe_forward_pair_with`] takes
+    /// it from the caller.
     pub fn indexed_moe_forward_pair(&self, up: &QTensor, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.indexed_moe_forward_pair_with(up, x, ids, MoeArm::for_rows(x.dim(0)?))
+    }
+
+    /// [`Self::indexed_moe_forward_pair`] on the caller's `arm`. The one
+    /// launch is the matmul-vec whatever `arm` says — the GEMM has no paired
+    /// form — and `arm` decides the two launches it falls back to. Whether
+    /// the pair is one launch depends on the two weights and the activation
+    /// dtype alone, never on `batch`, so every group of a tile makes the
+    /// same choice.
+    pub fn indexed_moe_forward_pair_with(
+        &self,
+        up: &QTensor,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+    ) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "metal")]
         if moe_pair_on() && self.dtype() == up.dtype() && self.shape() == up.shape() && x.dtype() == DType::F32 {
             if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
@@ -1173,7 +1191,10 @@ impl QTensor {
                 }
             }
         }
-        Ok((self.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?))
+        Ok((
+            self.indexed_moe_forward_with(x, ids, arm)?,
+            up.indexed_moe_forward_with(x, ids, arm)?,
+        ))
     }
 
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`:
@@ -1181,7 +1202,21 @@ impl QTensor {
     /// → `[batch, topk, n]`, where plane `(b, t)` is `x[b, t or 0] · Wᵀ[ids[b, t]]`.
     /// The weight stays packed on every backend; the CPU arm dequantizes rows on
     /// the fly and is the reference the Metal `mul_mv_id` arm is gated against.
+    /// On Metal the kernel is `batch`'s ([`MoeArm::for_rows`]).
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        self.indexed_moe_forward_with(x, ids, MoeArm::for_rows(x.dim(0)?))
+    }
+
+    /// [`Self::indexed_moe_forward`] on the caller's `arm`: a caller that
+    /// splits a tile into groups decides the arm once for the tile, so each
+    /// row is computed as the unsplit tile would compute it
+    /// (`docs/expert-streaming.md` §20.15).
+    pub fn indexed_moe_forward_with(
+        &self,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+    ) -> Result<Tensor> {
         let none = crate::op::BackpropOp::none();
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
@@ -1210,6 +1245,7 @@ impl QTensor {
                         x.layout(),
                         ids_storage,
                         ids.layout(),
+                        arm,
                     )?;
                     Ok(crate::tensor::from_storage(
                         Storage::Metal(storage),
@@ -1572,6 +1608,36 @@ impl QMatMul {
             epilogue,
             scale,
         }))
+    }
+}
+
+/// The kernel a routed matmul runs on Metal: the matmul-vec (a plane per
+/// `(row, slot)`, the decode step's) or the GEMM with the rows grouped by
+/// expert (a prefill tile's). The two are not bit-identical — the GEMM
+/// multiplies the weights as f16 — so whoever splits a tile into groups
+/// decides the arm once, for the tile, and hands it to every group
+/// (`docs/expert-streaming.md` §20.15). The CPU and CUDA arms have one
+/// kernel and ignore it; a weight or activation the GEMM does not take
+/// runs the matmul-vec under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeArm {
+    MatVec,
+    Gemm,
+}
+
+impl MoeArm {
+    /// The arm of a tile of `rows` rows: the GEMM from `LLOOM_MOE_MM_FROM`
+    /// rows (default 64; 0 = never), the matmul-vec below.
+    pub fn for_rows(rows: usize) -> Self {
+        #[cfg(feature = "metal")]
+        let from = metal::moe_mm_from();
+        #[cfg(not(feature = "metal"))]
+        let from = crate::tuning::tuning().moe.mm_from;
+        if from > 0 && rows >= from {
+            MoeArm::Gemm
+        } else {
+            MoeArm::MatVec
+        }
     }
 }
 

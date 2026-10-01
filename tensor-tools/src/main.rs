@@ -242,7 +242,8 @@ enum Command {
         #[arg(long)]
         seed: Option<u64>,
 
-        /// The routed experts: `hole` (no disk) or `pool` (real bytes).
+        /// The routed experts: `hole` (no disk), `pool` (real bytes) or
+        /// `heads` (each expert's first rows real bytes, the rest a hole).
         #[arg(long, default_value = "hole")]
         experts: String,
 
@@ -733,7 +734,8 @@ fn main() -> anyhow::Result<()> {
                 match s {
                     "hole" => Ok(Fill::Hole),
                     "pool" => Ok(Fill::Pool),
-                    other => anyhow::bail!("{other}: hole | pool"),
+                    "heads" => Ok(Fill::Heads),
+                    other => anyhow::bail!("{other}: hole | pool | heads"),
                 }
             };
             let mut syn = Synthetic {

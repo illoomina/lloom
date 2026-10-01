@@ -18,7 +18,7 @@
 
 use super::config::Config;
 use crate::nn::ops;
-use lloom_tensor::quantized::QMatMul;
+use lloom_tensor::quantized::{MoeArm, QMatMul};
 use lloom_tensor::{DType, Module, Result, Tensor, D};
 
 pub use crate::nn::expert_stream::{ExpertResidency, Resident, RoutedGroup, Streamed};
@@ -320,18 +320,22 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// outputs are shaped by the pass alone (`[rows, topk, ·]`, one group),
     /// so a pass plan serves them (`DESIGN.md` §9.2aa).
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
-        let (g, u) = self.experts.gate_up(x3, slot_ids)?;
+        let arm = MoeArm::for_rows(x3.dim(0)?);
+        let (g, u) = self.experts.gate_up(x3, slot_ids, arm)?;
         let h = match super::kernels::silu_mul(&g, &u) {
             Some(h) => h?,
             None => (ops::silu(&g)? * u)?,
         };
-        self.experts.down(&h, slot_ids)
+        self.experts.down(&h, slot_ids, arm)
     }
 
     /// The routed experts over the host plan's groups, each ensured (its
     /// misses loaded) as the pass reaches it, the later groups' misses
-    /// prefetched while it runs.
+    /// prefetched while it runs. Every group runs the tile's routed arm, so
+    /// how the pool splits the tile never changes a row's arithmetic
+    /// (`expert-streaming.md` §20.15).
     fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
+        let arm = MoeArm::for_rows(x3.dim(0)?);
         // The routed GEMMs' outputs are sized by the plan's groups, which
         // the pool's state decides: not a pass-shape allocation, so
         // declared outside the plan (§9.2aa) and served by the pool. One
@@ -351,14 +355,14 @@ impl<R: ExpertResidency> MoeLayer<R> {
             } else {
                 x3.narrow(0, group.rows.start, group.rows.len())?
             };
-            let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
+            let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm)?; // [rows, topk, n_ff] each
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);
             let h = match super::kernels::silu_mul(&g, &u) {
                 Some(h) => h?,
                 None => (ops::silu(&g)? * u)?,
             };
-            ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
+            ys.push(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
         }
         if ys.len() == 1 {
             Ok(ys.pop().expect("one group"))

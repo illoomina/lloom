@@ -577,6 +577,7 @@ fn routed_mv_id_census() {
     use lloom::nn::expert_stream::{ExpertResidency, Resident};
     use lloom_tensor::kernels::metal::profile;
     use lloom_tensor::quantized::gguf_file::Content;
+    use lloom_tensor::quantized::MoeArm;
     let dev = Device::new_metal(0).unwrap();
     let path = std::env::var("QWEN4EXP_GGUF").unwrap_or_else(|_| {
         format!(
@@ -687,7 +688,7 @@ fn routed_mv_id_census() {
             gu_bytes,
             tiers.len(),
             &|k| {
-                let _ = tiers[k].0.gate_up(&x, &ids).unwrap();
+                let _ = tiers[k].0.gate_up(&x, &ids, MoeArm::MatVec).unwrap();
             },
         );
     }
@@ -700,7 +701,7 @@ fn routed_mv_id_census() {
             d_bytes,
             tiers.len(),
             &|k| {
-                let _ = tiers[k].0.down(&h, &ids).unwrap();
+                let _ = tiers[k].0.down(&h, &ids, MoeArm::MatVec).unwrap();
             },
         );
     }

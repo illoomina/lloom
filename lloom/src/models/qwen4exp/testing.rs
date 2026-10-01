@@ -329,7 +329,10 @@ impl TinyFamily for Qwen4ExpTiny {
                 prompt: 7,
                 decode: 2,
             },
-            // `LLOOM_MOE_MM_FROM` rows: the routed grouped GEMM.
+            // 64 rows, but never one 64-row tile: a chunk stops at the
+            // indexer's dense range (19 positions here), and `down`'s K (16)
+            // is off the routed GEMM's 32-wide blocks. `qwen4exp_split_tile`
+            // widens the geometry to reach the GEMM.
             Workload {
                 prompt: 64,
                 decode: 1,
@@ -565,7 +568,8 @@ pub fn scale_roles(
 
 /// A synthetic Qwen4-exp of the committed shape (`crate::testing::scale`):
 /// the stems keyed values, the experts and the n-gram table as `syn` says
-/// (holes by default), cached under `~/.cache/lloom/synthetic`.
+/// (holes by default; the fixture's experts are `Fill::Heads`), cached
+/// under `~/.cache/lloom/synthetic`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn synthetic_shards(syn: &crate::testing::scale::Synthetic) -> Result<Vec<std::path::PathBuf>> {
     use crate::testing::tiny::Role;
@@ -636,13 +640,16 @@ mod scaled {
     }
 
     /// The shards `source` names: the real checkpoint's, or a synthetic
-    /// one's with `weights`' law and seed.
+    /// one's with `weights`' law and seed, every expert non-zero in its
+    /// leading rows (`Fill::Heads`: a zero expert gives zero on both routed
+    /// arms, `expert-streaming.md` §20.15) and the n-gram table a hole.
     pub fn scale_shards(source: &Source, weights: &Weights) -> Result<Vec<PathBuf>> {
         match source {
             Source::Real(first) => Ok(crate::hub::gguf_shards(first)),
             Source::Synthetic => synthetic_shards(&Synthetic {
                 law: weights.law,
                 seed: weights.seed,
+                experts: crate::testing::scale::Fill::Heads,
                 ..Synthetic::default()
             }),
         }

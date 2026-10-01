@@ -11,7 +11,9 @@
 //! expert stacks, the n-gram table) is a hole. A hole costs no disk, reads
 //! as zero pages — a valid tensor of every kind — and goes through the page
 //! cache like any written page, so every path that opens the file (`pread`,
-//! a memory map, an IO queue) runs unchanged.
+//! a memory map, an IO queue) runs unchanged. An expert stack may instead
+//! carry keyed values in each expert's first rows ([`Fill::Heads`]): every
+//! expert non-zero and distinct, for a few hundred MB of disk.
 
 use super::tiny::init::{name_hash, splitmix64, Role, ValueLaw};
 use super::tiny::packed::{self, ALL_KINDS};
@@ -30,6 +32,10 @@ pub const FORMAT: &str = "lloom shape manifest v1";
 /// pool of [`POOL_BYTES`] of whole rows.
 pub const WHOLE_BYTES: usize = 4 << 20;
 pub const POOL_BYTES: usize = 1 << 20;
+
+/// The bytes of each expert's leading rows [`Fill::Heads`] writes (whole
+/// rows, at least one).
+pub const HEAD_BYTES: usize = 4 << 10;
 
 /// One tensor of a shard: its name, row-major dims, kind, and offset from
 /// the shard's data start.
@@ -72,6 +78,13 @@ pub enum Fill {
     /// A pool of keyed blocks, repeated: real bytes on disk, so a read costs
     /// what a read of the real file does.
     Pool,
+    /// An expert stack `[experts, rows, cols]`: each expert's first
+    /// [`HEAD_BYTES`] of rows keyed values, a different slice of the pool
+    /// per expert, the rest a hole. Every expert computes something and no
+    /// two alike — what a value-dependent path (two kernels that round
+    /// differently) needs to be seen, where zero experts give zero on every
+    /// kernel — for a few KiB of disk an expert.
+    Heads,
 }
 
 /// How a synthetic checkpoint is made.
@@ -316,6 +329,10 @@ impl ShapeManifest {
                     continue;
                 }
                 let block = pool_block(t, syn, role(t))?;
+                if fill == Fill::Heads {
+                    write_heads(&mut f, at, t, &block)?;
+                    continue;
+                }
                 f.seek(SeekFrom::Start(at))?;
                 let mut left = n;
                 while left > 0 {
@@ -374,6 +391,85 @@ impl ShapeManifest {
         }
         Ok(paths)
     }
+}
+
+/// [`Fill::Heads`] over `t` at file offset `at`: each expert's leading rows
+/// from `block` (whole rows of `t`), expert `e` from row `e · head` of the
+/// pool, wrapped, so neighbouring experts differ. The rest of each plane is
+/// punched out: APFS zero-fills a gap of a few MB between two writes when
+/// the file closes, which would put the whole stack on disk.
+fn write_heads(f: &mut std::fs::File, at: u64, t: &TensorShape, block: &[u8]) -> Result<()> {
+    let [experts, rows, _] = t.dims[..] else {
+        bail!(
+            "{}: heads fill an expert stack [experts, rows, cols], got {:?}",
+            t.name,
+            t.dims
+        )
+    };
+    let plane = t.bytes() / experts;
+    let row = plane / rows;
+    let head = HEAD_BYTES.div_ceil(row).clamp(1, rows);
+    let pool = block.len() / row;
+    if pool < head {
+        bail!("{}: a pool of {pool} rows for heads of {head}", t.name)
+    }
+    let end = at + t.bytes() as u64;
+    if f.metadata()?.len() < end {
+        f.set_len(end)?;
+    }
+    for e in 0..experts {
+        let r0 = (e * head) % (pool - head + 1);
+        f.seek(SeekFrom::Start(at + (e * plane) as u64))?;
+        f.write_all(&block[r0 * row..(r0 + head) * row])?;
+    }
+    const PAGE: u64 = 4096;
+    for e in 0..experts {
+        let from = (at + (e * plane + head * row) as u64).next_multiple_of(PAGE);
+        let to = (at + ((e + 1) * plane) as u64) / PAGE * PAGE;
+        if to > from {
+            punch_hole(f, from, to - from)?;
+        }
+    }
+    Ok(())
+}
+
+/// Deallocate `len` bytes at `offset` (page-aligned), which then read as
+/// zeros. A no-op where the platform has no call for it.
+fn punch_hole(f: &std::fs::File, offset: u64, len: u64) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let arg = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: offset as libc::off_t,
+            fp_length: len as libc::off_t,
+        };
+        // SAFETY: `arg` is a valid `fpunchhole_t` that outlives the call, and
+        // the descriptor is `f`'s, open for writing.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PUNCHHOLE, &arg) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain syscall on `f`'s descriptor; no memory is passed.
+        let r = unsafe {
+            libc::fallocate(
+                f.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (f, offset, len);
+    Ok(())
 }
 
 /// Where cached synthetic checkpoints live.

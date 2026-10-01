@@ -23,7 +23,7 @@
 //! neither arm does an eviction wait on the GPU.
 
 use lloom_tensor::quantized::gguf_file::Content;
-use lloom_tensor::quantized::{GgmlDType, QTensor};
+use lloom_tensor::quantized::{GgmlDType, MoeArm, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
 use std::fs::File;
 use std::ops::Range;
@@ -65,12 +65,15 @@ pub trait ExpertResidency {
     fn ensure(&self, group: &RoutedGroup) -> Result<Tensor>;
 
     /// `gate` and `up` projections of `x [rows, 1, hidden]` through the experts
-    /// `slot_ids [rows, topk]`: each `[rows, topk, n_ff]`.
-    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor) -> Result<(Tensor, Tensor)>;
+    /// `slot_ids [rows, topk]`: each `[rows, topk, n_ff]`. `arm` is the
+    /// tile's ([`MoeArm::for_rows`] over every row of the pass), not the
+    /// group's: a split changes which slots are read, never how a row is
+    /// computed (§20.15).
+    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)>;
 
     /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
-    /// `[rows, topk, hidden]`.
-    fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor>;
+    /// `[rows, topk, hidden]`, on the tile's `arm` as [`Self::gate_up`].
+    fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor>;
 
     /// Whether [`Self::plan_device`] can answer: the strategy keeps a
     /// residency table on the device. `Resident` never needs to.
@@ -248,13 +251,14 @@ impl ExpertResidency for Resident {
         }
     }
     #[inline]
-    fn gate_up(&self, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn gate_up(&self, x: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)> {
         // One launch for the pair on Metal (#749 P31 (3)); two elsewhere.
-        self.gate.indexed_moe_forward_pair(&self.up, x, ids)
+        self.gate
+            .indexed_moe_forward_pair_with(&self.up, x, ids, arm)
     }
     #[inline]
-    fn down(&self, h: &Tensor, ids: &Tensor) -> Result<Tensor> {
-        self.down.indexed_moe_forward(h, ids)
+    fn down(&self, h: &Tensor, ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
+        self.down.indexed_moe_forward_with(h, ids, arm)
     }
 }
 
@@ -3085,17 +3089,19 @@ impl ExpertResidency for Streamed {
         Tensor::from_vec(slot_ids, (group.rows.len(), topk), &inner.device)
     }
 
-    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)> {
         let inner = self.inner.lock();
         // One launch for the pair on Metal (#749 P31 (3)); two elsewhere.
         inner.pools[0]
             .qt
-            .indexed_moe_forward_pair(&inner.pools[1].qt, x, slot_ids)
+            .indexed_moe_forward_pair_with(&inner.pools[1].qt, x, slot_ids, arm)
     }
 
-    fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
+    fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
         let mut inner = self.inner.lock();
-        let y = inner.pools[2].qt.indexed_moe_forward(h, slot_ids)?;
+        let y = inner.pools[2]
+            .qt
+            .indexed_moe_forward_with(h, slot_ids, arm)?;
         // The group's last dispatch is encoded: its slots may be given away
         // — to a direct read once this command buffer has run.
         inner.open_epoch = None;
@@ -3165,13 +3171,14 @@ mod tests {
 
     fn run<R: ExpertResidency>(r: &R, x3: &Tensor, ids: &Tensor) -> Vec<f32> {
         let groups = r.plan(ids).unwrap();
+        let arm = MoeArm::for_rows(x3.dim(0).unwrap());
         let mut ys = Vec::new();
         for g in &groups {
             let slot_ids = r.ensure(g).unwrap();
             let xg = x3.narrow(0, g.rows.start, g.rows.len()).unwrap();
-            let (gt, u) = r.gate_up(&xg, &slot_ids).unwrap();
+            let (gt, u) = r.gate_up(&xg, &slot_ids, arm).unwrap();
             let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
-            ys.push(r.down(&h, &slot_ids).unwrap());
+            ys.push(r.down(&h, &slot_ids, arm).unwrap());
         }
         let y = Tensor::cat(&ys, 0).unwrap();
         y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
@@ -3296,15 +3303,15 @@ mod tests {
                 );
                 let out = {
                     let x3 = xs.reshape((1, 1, d)).unwrap();
-                    let (g, u) = streamed.gate_up(&x3, &slots2).unwrap();
+                    let (g, u) = streamed.gate_up(&x3, &slots2, MoeArm::MatVec).unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    streamed.down(&hh, &slots2).unwrap()
+                    streamed.down(&hh, &slots2, MoeArm::MatVec).unwrap()
                 };
                 let want = {
                     let x3 = xs.reshape((1, 1, d)).unwrap();
-                    let (g, u) = resident.gate_up(&x3, &id).unwrap();
+                    let (g, u) = resident.gate_up(&x3, &id, MoeArm::MatVec).unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    resident.down(&hh, &id).unwrap()
+                    resident.down(&hh, &id, MoeArm::MatVec).unwrap()
                 };
                 assert_eq!(
                     out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -3734,9 +3741,9 @@ mod tests {
                         !tier.settle(&rec).unwrap(),
                         "token {t} layer {l}: still missing"
                     );
-                    let (g, u) = tier.gate_up(&xs, &slots).unwrap();
+                    let (g, u) = tier.gate_up(&xs, &slots, MoeArm::MatVec).unwrap();
                     let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-                    tier.down(&hh, &slots)
+                    tier.down(&hh, &slots, MoeArm::MatVec)
                         .unwrap()
                         .flatten_all()
                         .unwrap()
@@ -3877,9 +3884,10 @@ mod tests {
             t
         };
         let routed = |t: &Streamed, slots: &Tensor| -> Vec<f32> {
-            let (g, u) = t.gate_up(&xs, slots).unwrap();
+            let arm = MoeArm::for_rows(xs.dim(0).unwrap());
+            let (g, u) = t.gate_up(&xs, slots, arm).unwrap();
             let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
-            t.down(&hh, slots)
+            t.down(&hh, slots, arm)
                 .unwrap()
                 .flatten_all()
                 .unwrap()

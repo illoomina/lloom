@@ -688,8 +688,10 @@ impl QMetalStorage {
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`
     /// (the MoE seam `QTensor::indexed_moe_forward`, CUDA's contract): `input`
     /// `[batch, in_dim1, k]` f32 with `in_dim1 ∈ {1, topk}`, `ids` `[batch,
-    /// topk]` u32 → `[batch, topk, n]` f32, one `kernel_mul_mv_id` dispatch.
-    /// The weight stays packed; each core dequantizes in-kernel (§3.3a).
+    /// topk]` u32 → `[batch, topk, n]` f32, one `kernel_mul_mv_id` dispatch
+    /// or, on `arm` = [`super::MoeArm::Gemm`], the GEMM with the rows grouped
+    /// by expert. The weight stays packed; each core dequantizes in-kernel
+    /// (§3.3a).
     pub fn indexed_moe_forward(
         &self,
         self_shape: &Shape,
@@ -697,6 +699,7 @@ impl QMetalStorage {
         input_l: &Layout,
         ids: &MetalStorage,
         ids_l: &Layout,
+        arm: super::MoeArm,
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
@@ -742,15 +745,13 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul_id")
             .build()?;
-        // The rows-grouped-by-expert GEMM for a tile (lloom #749 P22): from
-        // `moe_mm_from()` rows, f32 activations, every weight kind with a
-        // `kernel_mul_mm_id_mapped` arm. The matmul-vec keeps the decode
-        // rows byte-identical. The GEMM reads K in 32-wide blocks, as the
-        // f16-weight GEMM does (#749 P30 (1)): a K off the block reads past
-        // the row, so such a weight keeps the matmul-vec at every row count.
-        let from = moe_mm_from();
-        if from > 0
-            && batch >= from
+        // The rows-grouped-by-expert GEMM for a tile (lloom #749 P22): the
+        // caller's arm, f32 activations, every weight kind with a
+        // `kernel_mul_mm_id_mapped` arm. The GEMM reads K in 32-wide blocks,
+        // as the f16-weight GEMM does (#749 P30 (1)): a K off the block
+        // reads past the row, so such a weight keeps the matmul-vec at every
+        // row count.
+        if arm == super::MoeArm::Gemm
             && triple == GemvTriple::F32F32F32
             && mm_id_has_arm(ggml_dtype)
             && crate::shape_req!(moe_mm_id, k % 32 == 0; k)
@@ -1164,9 +1165,10 @@ impl From<GgmlDType> for crate::kernels::GgmlDType {
     }
 }
 
-/// Rows from which `QMetalStorage::indexed_moe_forward` takes the GEMM with
-/// the rows grouped by expert (`kernel_mul_mm_id_mapped`) instead of the
-/// matmul-vec: `LLOOM_MOE_MM_FROM` (0 = never), read once; default 64
+/// Rows from which a tile's routed matmul takes the GEMM with the rows
+/// grouped by expert (`kernel_mul_mm_id_mapped`) instead of the matmul-vec
+/// ([`super::MoeArm::for_rows`]): `LLOOM_MOE_MM_FROM` (0 = never), read
+/// once; default 64
 /// ([`DEFAULT_MOE_MM_FROM`]) — a decode step (1 row, a batch of up to 8, an
 /// MTP verify of K+1) keeps the byte-identical matmul-vec, a prefill tile
 /// takes the GEMM. Settable for the tests and an A/B (`set_moe_mm_from`).

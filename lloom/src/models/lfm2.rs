@@ -3169,10 +3169,15 @@ pub struct Cache {
     /// The turn checkpoints: the last [`TURN_CHECKPOINTS`] multi-token
     /// passes, each the tail of its conv input per conv layer, so the cache
     /// can be put back at any position within [`TURN_CHECKPOINT_SLACK`] of a
-    /// pass's end ([`Cache::restore`]). A ring: a slot's buffers are reused
-    /// by the pass that takes it over, so a prefill allocates none after the
-    /// first `TURN_CHECKPOINTS` passes.
+    /// pass's end ([`Cache::restore`]). The slots' tails live in `turn_ring`,
+    /// one allocation per sequence; this is their bookkeeping.
     turn_checkpoints: Vec<TurnCheckpoint>,
+    /// The checkpoints' tails: [`TURN_CHECKPOINTS`] frames of `[conv layers,
+    /// b, hidden, l_cache + TURN_CHECKPOINT_SLACK]`, allocated once at a
+    /// sequence's first checkpointing pass and kept across `clear` (the next
+    /// sequence of the same geometry writes over it), so no pass allocates a
+    /// tail (`nn::ring::Ring`).
+    turn_ring: Option<crate::nn::ring::Ring>,
     /// The ring slot the pass in flight writes its tails into, `None` on a
     /// pass that takes no checkpoint (a decode step, a verify, `Cat`).
     turn_ckpt_cur: Option<usize>,
@@ -3495,11 +3500,10 @@ pub const TURN_CHECKPOINT_SLACK: usize = 16;
 /// the input it convolved over (`[b, hidden, l_cache + TURN_CHECKPOINT_SLACK]`,
 /// the valid columns at the front). The KV needs nothing kept — a restore is
 /// a length decrement there.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct TurnCheckpoint {
     pos: usize,
     tail_len: usize,
-    tails: Vec<Option<Tensor>>,
     valid: bool,
 }
 
@@ -3781,6 +3785,7 @@ impl Cache {
             conv_states: vec![None; num_layers],
             conv_spare: vec![None; num_layers],
             turn_checkpoints: Vec::with_capacity(TURN_CHECKPOINTS),
+            turn_ring: None,
             turn_ckpt_cur: None,
             turn_ckpt_next: 0,
             conv_phase: 0,
@@ -5073,7 +5078,6 @@ impl Cache {
             return;
         }
         let pos = self.kv_len() + seq_len;
-        let layers = self.conv_states.len();
         let slot = self.turn_ckpt_next % TURN_CHECKPOINTS;
         if slot < self.turn_checkpoints.len() {
             let c = &mut self.turn_checkpoints[slot];
@@ -5084,7 +5088,6 @@ impl Cache {
             self.turn_checkpoints.push(TurnCheckpoint {
                 pos,
                 tail_len: 0,
-                tails: vec![None; layers],
                 valid: false,
             });
         }
@@ -5109,33 +5112,42 @@ impl Cache {
         let want = l_cache + TURN_CHECKPOINT_SLACK;
         let keep = src_len.min(want);
         let src = conv_in.narrow(2, src_len - keep, keep)?;
-        let c = &mut self.turn_checkpoints[slot];
-        let buf = match &c.tails[layer] {
-            Some(t)
-                if t.dims() == [b_sz, hidden, want]
-                    && t.dtype() == conv_in.dtype()
-                    && t.is_contiguous() =>
-            {
-                t.clone()
-            }
-            _ => {
-                // Outlives every pass, so no plan serves it; a fresh slot's
-                // buffer, allocated once.
-                #[cfg(feature = "metal")]
-                let _declared = lloom_tensor::EscapeGuard::new();
-                zs::zeros(
-                    zs::LFM2_CONV_STATE,
-                    (b_sz, hidden, want),
-                    conv_in.dtype(),
-                    conv_in.device(),
-                )?
-            }
+        let layers = self.conv_states.len();
+        let frame = (layers, b_sz, hidden, want);
+        // The whole ring at a sequence's first checkpointing pass — one
+        // request, session state, outside every plan — and kept for the next
+        // sequence of the same geometry.
+        let fresh = match &self.turn_ring {
+            Some(r) => !r.fits(TURN_CHECKPOINTS, frame, conv_in.dtype()),
+            None => true,
         };
-        buf.slice_set(&src.contiguous()?, 2, 0)?;
-        c.tails[layer] = Some(buf);
+        if fresh {
+            self.turn_ring = Some(crate::nn::ring::Ring::allocate(
+                TURN_CHECKPOINTS,
+                frame,
+                conv_in.dtype(),
+                conv_in.device(),
+                zs::LFM2_CONV_STATE,
+                "lfm2-turn-ring",
+            )?);
+        }
+        // The strided source is written where it lies (`slice_set`): no
+        // transient copy.
+        self.turn_tail_view(slot, layer)?.slice_set(&src, 2, 0)?;
+        let c = &mut self.turn_checkpoints[slot];
         c.tail_len = keep;
         c.valid = true;
         Ok(())
+    }
+
+    /// Slot `slot`'s tail for conv layer `layer`: a contiguous
+    /// `[b, hidden, l_cache + TURN_CHECKPOINT_SLACK]` view into the ring.
+    fn turn_tail_view(&self, slot: usize, layer: usize) -> Result<Tensor> {
+        let ring = self
+            .turn_ring
+            .as_ref()
+            .ok_or_else(|| lloom_tensor::Error::msg("lfm2 turn ring: no ring allocated"))?;
+        ring.frame(slot)?.narrow(0, layer, 1)?.squeeze(0)
     }
 
     /// The checkpoint [`Cache::restore`] would take `pos` from: a valid one
@@ -5197,9 +5209,7 @@ impl Cache {
         let width = self.conv_state.width(l_cache);
         let layers = self.conv_states.len();
         for layer in 0..layers {
-            let Some(tail) = self.turn_checkpoints[idx].tails[layer].clone() else {
-                continue;
-            };
+            let tail = self.turn_tail_view(idx, layer)?;
             let window = tail
                 .narrow(2, tail_len - back - l_cache, l_cache)?
                 .contiguous()?;

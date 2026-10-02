@@ -46,6 +46,7 @@ pub mod observer;
 pub mod ops;
 pub mod optim;
 pub mod recurrent;
+pub mod ring;
 pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;

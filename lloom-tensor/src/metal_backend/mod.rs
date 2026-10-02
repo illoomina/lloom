@@ -9,7 +9,8 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
     metal::{
-        heap_chunk_bytes, Buffer, BufferHandle, BufferPool, Commands, Device, HeapChunks,
+        heap_chunk_bytes, transient_heaps_on, Backing, Backings, Buffer, BufferHandle, BufferPool,
+        Commands, Commit, Device, DeviceBuffer, HeapChunks, MTLResourceOptions, Mapped,
         ResidencySet,
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
@@ -3067,22 +3068,51 @@ impl BackendDevice for MetalDevice {
         let buffers = BufferPool::with_clock(commands.clock());
         let private_buffers = BufferPool::with_clock(commands.clock());
         let ledger = crate::kernels::metal::ledger::Ledger::new();
-        let transient_heaps = Arc::new((
-            HeapChunks::new(
+        // The backings (`profiles-and-memory-design.md` §4.1, L0). A pool
+        // miss takes from placement heap chunks when `transient_heaps_on()`,
+        // else from one `MTLBuffer` per miss with its residency committed at
+        // the next cut; a persistent allocation takes from a resident
+        // backing, wired when it is Shared.
+        let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
+            if transient_heaps_on() {
+                Arc::new(HeapChunks::new(
+                    &device,
+                    Arc::clone(&residency_set),
+                    options,
+                    heap_chunk_bytes(),
+                    Some(Arc::clone(&ledger)),
+                ))
+            } else {
+                Arc::new(DeviceBuffer::new(
+                    &device,
+                    Arc::clone(&residency_set),
+                    options,
+                    Commit::Deferred,
+                ))
+            }
+        };
+        let backings = Arc::new(Backings {
+            transient_shared: transient(RESOURCE_OPTIONS),
+            transient_private: transient(PRIVATE_RESOURCE_OPTIONS),
+            resident_shared: DeviceBuffer::new(
                 &device,
                 Arc::clone(&residency_set),
                 RESOURCE_OPTIONS,
-                heap_chunk_bytes(),
-                Some(Arc::clone(&ledger)),
+                Commit::Now,
             ),
-            HeapChunks::new(
+            resident_private: DeviceBuffer::new(
                 &device,
                 Arc::clone(&residency_set),
                 PRIVATE_RESOURCE_OPTIONS,
-                heap_chunk_bytes(),
-                Some(Arc::clone(&ledger)),
+                Commit::Now,
             ),
-        ));
+            mapped_shared: Mapped::new(
+                &device,
+                Arc::clone(&residency_set),
+                RESOURCE_OPTIONS,
+                Commit::Now,
+            ),
+        });
         // The pools do not subscribe to command-buffer completion. The handler
         // advances the clock, and each pool drains what it made reusable at
         // its next `acquire`, on the host: a handler that took the pool's lock
@@ -3097,7 +3127,7 @@ impl BackendDevice for MetalDevice {
             // (`DESIGN.md` §6.3c).
             let observer = Arc::new(ResidencyEvictionObserver::new(
                 Arc::clone(&residency_set),
-                Arc::clone(&transient_heaps),
+                Arc::clone(&backings),
             ));
             buffers.set_eviction_observer(observer.clone());
             private_buffers.set_eviction_observer(observer);
@@ -3125,7 +3155,7 @@ impl BackendDevice for MetalDevice {
             commands,
             buffers,
             private_buffers,
-            transient_heaps,
+            backings,
             kernels,
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
@@ -3877,6 +3907,97 @@ mod issue_336_to_cpu {
         );
         heaps.release(&placed);
         heaps.release(&first);
+    }
+
+    /// The L0 seam (`profiles-and-memory-design.md` §4.1): a heap backing
+    /// takes its sub-buffer's range back on `reclaim` and a whole-buffer
+    /// backing does not (its buffer frees on drop; the residency entry is
+    /// the holder's), and `Fallback` serves from its first backing, else
+    /// its second, reclaiming through whichever placed the buffer.
+    #[test]
+    fn a_backing_reclaims_what_it_placed_and_a_fallback_serves_from_the_first_that_can() {
+        use crate::kernels::metal::{Backing, Buffer, Commit, DeviceBuffer, Fallback, HeapChunks};
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let heap = HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            1 << 20,
+            None,
+        );
+        let device = DeviceBuffer::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            Commit::Now,
+        );
+        let sub = Backing::alloc(&heap, 4096).unwrap();
+        let whole = device.alloc(4096).unwrap();
+        assert_eq!(Backing::stats(&heap).live, 1);
+        assert!(!heap.reclaim(&whole), "a heap reclaims only its own ranges");
+        assert!(
+            !device.reclaim(&whole),
+            "a whole buffer frees on drop, not by reclaim"
+        );
+        assert!(heap.reclaim(&sub));
+        assert_eq!(Backing::stats(&heap).live, 0);
+        assert!(!heap.reclaim(&sub), "reclaimed once");
+        m.residency_set_handle().remove(&whole);
+
+        /// A backing that refuses everything.
+        #[derive(Debug)]
+        struct Refusing;
+        impl Backing for Refusing {
+            fn alloc(&self, bytes: usize) -> Result<Buffer, crate::kernels::MetalKernelError> {
+                Err(crate::kernels::MetalKernelError::FailedToCreateResource(
+                    format!("refused {bytes}"),
+                ))
+            }
+            fn reclaim(&self, _: &Buffer) -> bool {
+                false
+            }
+            fn stats(&self) -> crate::kernels::metal::BackingStats {
+                Default::default()
+            }
+        }
+        let fb = Fallback {
+            first: Refusing,
+            then: HeapChunks::new(
+                m.device(),
+                m.residency_set_handle(),
+                super::PRIVATE_RESOURCE_OPTIONS,
+                1 << 20,
+                None,
+            ),
+        };
+        let b = fb.alloc(512).unwrap();
+        assert_eq!(fb.stats().live, 1, "served by the second backing");
+        assert!(
+            fb.reclaim(&b),
+            "reclaimed through the backing that placed it"
+        );
+        assert_eq!(fb.stats().live, 0);
+        let fb2 = Fallback {
+            first: HeapChunks::new(
+                m.device(),
+                m.residency_set_handle(),
+                super::PRIVATE_RESOURCE_OPTIONS,
+                1 << 20,
+                None,
+            ),
+            then: Refusing,
+        };
+        let b = fb2.alloc(512).unwrap();
+        assert_eq!(fb2.first.stats().live, 1, "served by the first backing");
+        assert!(fb2.reclaim(&b));
+        assert!(
+            fb2.alloc(0).is_ok(),
+            "the first serves; the second is never asked"
+        );
+        assert!(Refusing.alloc(1).is_err());
     }
 
     /// The env switch resolves, and it defaults to the fast path.

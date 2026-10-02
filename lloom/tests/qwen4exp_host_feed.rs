@@ -26,7 +26,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::model::{CausalLM, Model};
 use lloom::nn::ngram_memory::{HostFeed, NgramWindow, RowTable};
-use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder};
+use lloom::nn::{DecodeOptions, DecodeOut, FeedWait, IdentityProposer, Session, VarBuilder};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -251,13 +251,15 @@ fn every_ring_arm_fills_the_rows_the_blocking_arm_hashes() -> Result<()> {
     Ok(())
 }
 
-/// The producer waits by sleeping, at its stated class, and says so in the
-/// run's report: a spinning producer costs a host-planned pass ~30 ms a token
-/// of GPU time on the streamed tier (`expert-streaming.md` §20.14a), and a
-/// spawned thread is at `default` unless it claims (`invariants.md` §15.2
-/// #10b). The report carries what the producer used, not what was asked.
+/// The producer waits on demand, at its stated class, and says so in the
+/// run's report: it spins only while a forward waits on a value it has not
+/// filled, because a core spinning through the streamed tier's host-planned
+/// pass costs that pass ~30 ms a token of GPU time (`expert-streaming.md`
+/// §20.14a), and a spawned thread is at `default` unless it claims
+/// (`invariants.md` §15.2 #10b). The report carries what the producer used,
+/// not what was asked.
 #[test]
-fn the_producer_sleeps_between_tokens_at_its_stated_class() -> Result<()> {
+fn the_producer_waits_on_demand_at_its_stated_class() -> Result<()> {
     let path = temp_gguf("class");
     let cfg = tiny();
     write_table(&cfg, 80, &path)?;
@@ -272,8 +274,12 @@ fn the_producer_sleeps_between_tokens_at_its_stated_class() -> Result<()> {
     let feed = out.stats.host_feed.expect("the ring run took no host fill");
     assert_eq!(
         feed.poll,
-        PollMechanism::Sleep(Duration::from_micros(50)),
+        FeedWait::OnDemand { idle_us: 50 },
         "the producer's wait: {feed:?}"
+    );
+    assert!(
+        feed.spun + feed.slept > 0,
+        "the producer never waited: {feed:?}"
     );
     #[cfg(target_os = "macos")]
     assert_eq!(
@@ -283,6 +289,32 @@ fn the_producer_sleeps_between_tokens_at_its_stated_class() -> Result<()> {
     );
     assert_eq!(feed.forwards, 10);
     Ok(())
+}
+
+/// The on-demand wait spins exactly while a forward waits on a value the
+/// producer has not filled, and sleeps otherwise; a fixed arm is that arm.
+#[test]
+fn the_on_demand_wait_spins_only_on_a_pending_demand() {
+    let w = FeedWait::OnDemand { idle_us: 50 };
+    let sleep = PollMechanism::Sleep(Duration::from_micros(50));
+    assert_eq!(
+        w.arm(5, 4),
+        PollMechanism::DEFAULT,
+        "a forward waits on value 5"
+    );
+    assert_eq!(w.arm(4, 4), sleep, "every demanded value is filled");
+    assert_eq!(w.arm(3, 4), sleep, "the producer is ahead of the host");
+    assert_ne!(PollMechanism::DEFAULT, sleep, "the two arms must differ");
+    let fixed = FeedWait::Fixed(sleep);
+    assert_eq!(fixed.arm(9, 0), sleep);
+    assert_eq!("on-demand".parse::<FeedWait>().unwrap(), w);
+    assert_eq!(
+        "on-demand:10".parse::<FeedWait>().unwrap(),
+        FeedWait::OnDemand { idle_us: 10 }
+    );
+    assert_eq!("sleep:50".parse::<FeedWait>().unwrap(), fixed);
+    assert_eq!(w.to_string().parse::<FeedWait>().unwrap(), w);
+    assert!("on-demand:".parse::<FeedWait>().is_err());
 }
 
 /// With the host fill off the ring arm reads its input ids back: the same

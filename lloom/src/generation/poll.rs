@@ -119,10 +119,10 @@ pub enum PollMechanism {
     ///
     /// cpu/wall 0.3606 (§3.7h) -- the only arm that genuinely gates. Its wake
     /// latency at an 18 ms cadence is **unmeasured**, which is why it is not
-    /// the token ring's default. It is the host fill producer's
-    /// (`LLOOM_HOST_FEED_POLL`): a thread that spins for a whole run holds the
-    /// GPU at low clocks through the streamed tier's host-planned passes
-    /// (`expert-streaming.md` §20.14a).
+    /// the token ring's default. It is the host fill producer's wait while no
+    /// forward waits on it (`nn::decode::FeedWait::OnDemand`): a core that
+    /// spins through the streamed tier's host-planned pass holds the GPU at
+    /// low clocks (`expert-streaming.md` §20.14a).
     Sleep(std::time::Duration),
 }
 

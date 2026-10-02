@@ -342,7 +342,7 @@ pub struct RingTuning {
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
     #[opt(flag = "host-feed-qos", env = "LLOOM_HOST_FEED_QOS", parser = "parse_spawned_qos")]
     pub feed_qos: String,
-    /// How the host fill producer waits between tokens: `sleep:<µs>` (a spinning wait costs the streamed tier's host-planned pass GPU time), `sleep`, `wfe`, `spin-hint` or `spin`.
+    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (spin only while a forward waits on an unfilled value, else sleep µs: a spinning core costs the streamed tier's host-planned pass GPU time), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
     #[opt(flag = "host-feed-poll", env = "LLOOM_HOST_FEED_POLL", parser = "parse_poll")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
@@ -355,8 +355,8 @@ fn parse_spawned_qos(v: &str) -> Result<String, String> {
 }
 fn parse_poll(v: &str) -> Result<String, String> {
     v.trim()
-        .parse::<crate::generation::poll::PollMechanism>()
-        .map(|m| m.to_string())
+        .parse::<crate::nn::decode::FeedWait>()
+        .map(|w| w.to_string())
 }
 
 impl Default for RingTuning {
@@ -365,7 +365,7 @@ impl Default for RingTuning {
             slack_bytes: crate::generation::readback::RING_SLACK_BYTES_DEFAULT,
             hot_thread: "interactive".into(),
             feed_qos: "user-interactive".into(),
-            feed_poll: "sleep:50".into(),
+            feed_poll: "on-demand:50".into(),
             feed_trace: false,
         }
     }

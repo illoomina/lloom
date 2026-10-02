@@ -385,7 +385,10 @@ mod tests {
         assert_eq!(read("inherit").join().unwrap(), (QosClass::Default, 0));
         assert!(parse_spawned_arm("unknown").is_err());
         assert!(parse_spawned_arm("unspecified").is_err());
-        assert_eq!(parse_spawned_arm("Interactive").unwrap(), "user-interactive");
+        assert_eq!(
+            parse_spawned_arm("Interactive").unwrap(),
+            "user-interactive"
+        );
         assert_eq!(parse_spawned_arm("inherit").unwrap(), "inherit");
     }
 

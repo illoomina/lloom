@@ -592,10 +592,86 @@ pub struct HostFeedReport {
     pub qos: crate::generation::QosClass,
     pub qos_errno: i32,
     /// How the producer waited between tokens (`LLOOM_HOST_FEED_POLL`).
-    pub poll: crate::generation::poll::PollMechanism,
+    pub poll: FeedWait,
+    /// The producer's waits by the spinning arm and by the sleeping one.
+    pub spun: u64,
+    pub slept: u64,
     /// Under `LLOOM_HOST_FEED_TRACE`: per-fill host times and the
     /// producer's scheduling, for the park a forward's wait can see.
     pub trace: Option<HostFeedTrace>,
+}
+
+/// How the host fill's producer waits for the next token
+/// (`LLOOM_HOST_FEED_POLL`).
+///
+/// A spinning wait holds a core for as long as it spins, and while a core
+/// spins through the streamed tier's host-planned pass the GPU runs that pass
+/// at low clocks; a wait that sleeps throughout costs the pipelined decode
+/// ~0.5 ms a token (`expert-streaming.md` §20.14a). [`FeedWait::OnDemand`]
+/// spins only while a forward already waits for a value the producer has not
+/// filled — the pipelined case — and sleeps otherwise, which is every token
+/// of a host-planned pass: there the host encodes a forward's wait only after
+/// it has itself waited for the token the producer fills from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedWait {
+    /// One poll arm throughout.
+    Fixed(crate::generation::poll::PollMechanism),
+    /// [`crate::generation::poll::PollMechanism::DEFAULT`] while a wait is
+    /// pending on an unfilled value, a sleep of `idle_us` otherwise.
+    OnDemand { idle_us: u64 },
+}
+
+impl Default for FeedWait {
+    fn default() -> Self {
+        FeedWait::OnDemand { idle_us: 50 }
+    }
+}
+
+impl FeedWait {
+    /// The arm for the next wait, given the highest value a forward of the
+    /// run waits for and the values filled so far.
+    pub fn arm(self, demanded: u64, filled: u64) -> crate::generation::poll::PollMechanism {
+        match self {
+            FeedWait::Fixed(m) => m,
+            FeedWait::OnDemand { .. } if demanded > filled => {
+                crate::generation::poll::PollMechanism::DEFAULT
+            }
+            FeedWait::OnDemand { idle_us } => crate::generation::poll::PollMechanism::Sleep(
+                std::time::Duration::from_micros(idle_us),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for FeedWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeedWait::Fixed(m) => write!(f, "{m}"),
+            FeedWait::OnDemand { idle_us } => write!(f, "on-demand:{idle_us}"),
+        }
+    }
+}
+
+impl std::str::FromStr for FeedWait {
+    type Err = String;
+
+    /// `on-demand` (a 50 µs idle sleep), `on-demand:<µs>`, or any
+    /// [`crate::generation::poll::PollMechanism`] spelling for one arm
+    /// throughout.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim();
+        if s == "on-demand" {
+            return Ok(FeedWait::default());
+        }
+        if let Some(us) = s.strip_prefix("on-demand:") {
+            return us
+                .parse::<u64>()
+                .map(|idle_us| FeedWait::OnDemand { idle_us })
+                .map_err(|e| format!("host feed wait {s:?}: bad microseconds: {e}"));
+        }
+        s.parse::<crate::generation::poll::PollMechanism>()
+            .map(FeedWait::Fixed)
+    }
 }
 
 /// One traced run of the host fill's producer (`LLOOM_HOST_FEED_TRACE`), on
@@ -1210,7 +1286,9 @@ struct ProducerRun {
     fill_ns: Vec<u64>,
     qos: crate::generation::QosClass,
     qos_errno: i32,
-    poll: crate::generation::poll::PollMechanism,
+    poll: FeedWait,
+    spun: u64,
+    slept: u64,
     trace: Option<HostFeedTrace>,
 }
 
@@ -1262,7 +1340,12 @@ impl FeedThread {
             t.encoded_ns = (1..=t.observed_ns.len() as u64)
                 .map(|k| self.link.encoded_ns(k))
                 .collect();
-            eprintln!("HOSTFEED {}", t.line(run.qos, &poll.to_string()));
+            eprintln!(
+                "HOSTFEED {} spun={} slept={}",
+                t.line(run.qos, &poll.to_string()),
+                run.spun,
+                run.slept
+            );
             t
         });
         let report = HostFeedReport {
@@ -1272,6 +1355,8 @@ impl FeedThread {
             qos: run.qos,
             qos_errno: run.qos_errno,
             poll,
+            spun: run.spun,
+            slept: run.slept,
             trace,
         };
         Ok((fill.into_consumed(), report))
@@ -1289,18 +1374,15 @@ impl Drop for FeedThread {
 }
 
 /// How the producer waits between tokens (`LLOOM_HOST_FEED_POLL`, read once).
-fn feed_poll() -> crate::generation::poll::PollMechanism {
-    static POLL: std::sync::OnceLock<crate::generation::poll::PollMechanism> =
-        std::sync::OnceLock::new();
+fn feed_poll() -> FeedWait {
+    static POLL: std::sync::OnceLock<FeedWait> = std::sync::OnceLock::new();
     *POLL.get_or_init(|| {
         crate::tuning::tuning()
             .ring
             .feed_poll
             .parse()
             // The knob's parser has already refused anything else.
-            .unwrap_or(crate::generation::poll::PollMechanism::Sleep(
-                std::time::Duration::from_micros(50),
-            ))
+            .unwrap_or_default()
     })
 }
 
@@ -1322,7 +1404,8 @@ fn thread_cpu_ns() -> u64 {
 /// The producer's loop: fill every token the ring stamps until `done` and
 /// every demanded value is filled (or the run released its waits). The GPU
 /// waits on this thread, so it takes its stated class first
-/// (`docs/invariants.md` §15.2 #10b). Each fill's host time in a debug or
+/// (`docs/invariants.md` §15.2 #10b) and spins only while a forward waits on
+/// it ([`FeedWait`]). Each fill's host time in a debug or
 /// `profile` build; the trace under `LLOOM_HOST_FEED_TRACE`.
 fn produce(
     fill: &mut crate::nn::ngram_memory::NgramFill,
@@ -1333,11 +1416,11 @@ fn produce(
     use crate::nn::ngram_memory::trace_now_ns;
     let (qos, qos_errno) =
         crate::generation::hot_thread::claim_for_spawned(&crate::tuning::tuning().ring.feed_qos);
-    let mechanism = feed_poll();
+    let wait = feed_poll();
     let mut run = ProducerRun {
         qos,
         qos_errno,
-        poll: mechanism,
+        poll: wait,
         ..ProducerRun::default()
     };
     let mut trace = link.traced().then(|| HostFeedTrace {
@@ -1376,7 +1459,12 @@ fn produce(
                 }
                 return Ok(run);
             }
-            reader.wait_for_publish(mechanism);
+            let arm = wait.arm(link.demanded(), fill.filled());
+            match arm {
+                crate::generation::poll::PollMechanism::Sleep(_) => run.slept += 1,
+                _ => run.spun += 1,
+            }
+            reader.wait_for_publish(arm);
             continue;
         }
         let observed = if trace.is_some() { trace_now_ns() } else { 0 };

@@ -709,3 +709,175 @@ fn routed_mv_id_census() {
         );
     }
 }
+
+/// The routed gate|up arms as the decode step runs them: a CHAIN, each
+/// launch waiting for the one before it (gate|up → `silu·u` → down → the sum
+/// over the slots, scaled, as the next layer's activation), on the
+/// checkpoint's own expert tensors (`QWEN4EXP_CHAIN_LAYERS` layers from 0,
+/// default 8, cycled in order so the experts stream from memory), one
+/// token, ten experts. Where `routed_mv_id_census` issues independent
+/// launches that overlap (throughput), this is the step's latency. The arms
+/// take turns within every round, so drift is shared:
+///   H X T S   the pair in each grid order (`PairOrder`)
+///   U         gate and up as two single launches
+///   F         (f16 only) the fold: the f32 activation into the pair, no cast
+/// At f16 (the `fast` step) every arm but F casts the activation first, as
+/// the step does; at f32 nothing is cast. GPU time from the profiler's busy
+/// union over a batch (`CANDLE_METAL_PROFILE=1`), per routed layer.
+#[test]
+#[ignore]
+fn routed_pair_order_chain() {
+    use lloom_tensor::kernels::metal::profile;
+    use lloom_tensor::quantized::gguf_file::Content;
+    use lloom_tensor::quantized::{MoeArm, PairOrder};
+    let dev = Device::new_metal(0).unwrap();
+    assert!(
+        profile::enabled(),
+        "run with CANDLE_METAL_PROFILE=1: the GPU time is the profiler's"
+    );
+    let path = std::env::var("QWEN4EXP_GGUF").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF/snapshots/2c4721899b4382bd07dfb61ae4fbad90c09caf7d/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+            std::env::var("HOME").unwrap()
+        )
+    });
+    let n_layers = std::env::var("QWEN4EXP_CHAIN_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    let rounds = std::env::var("QWEN4EXP_CHAIN_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(12);
+    let mut file = std::fs::File::open(&path).unwrap();
+    let content = Content::read(&mut file).unwrap();
+    let layers: Vec<(Arc<QTensor>, Arc<QTensor>, Arc<QTensor>)> = (0..n_layers)
+        .map(|l| {
+            let mut load = |n: &str| {
+                Arc::new(
+                    content
+                        .tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev)
+                        .unwrap(),
+                )
+            };
+            (
+                load("ffn_gate_exps"),
+                load("ffn_up_exps"),
+                load("ffn_down_exps"),
+            )
+        })
+        .collect();
+    println!(
+        "CHAIN shard={path} layers={n_layers} rounds={rounds} kinds={:?}",
+        layers
+            .iter()
+            .map(|(g, _, d)| format!("{:?}/{:?}", g.dtype(), d.dtype()))
+            .collect::<Vec<_>>()
+    );
+    let (hidden, topk) = (2560usize, 10usize);
+    let mut ids_v: Vec<u32> = (0..topk as u32).map(|i| (i * 47 + 3) % 512).collect();
+    ids_v.sort_unstable();
+    let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
+    let x0 = Tensor::randn(0f32, 1.0, (1, 1, hidden), &dev).unwrap();
+    // One routed layer of the chain: `x` [1, 1, hidden] f32 in, the next out.
+    let layer = |arm: char, act: DType, l: usize, x: &Tensor| -> Tensor {
+        let (g, u, d) = &layers[l];
+        let order = match arm {
+            'X' => PairOrder::Expert,
+            'T' => PairOrder::Tile,
+            'S' => PairOrder::Split,
+            _ => PairOrder::Half,
+        };
+        let xin = if arm == 'F' {
+            x.clone()
+        } else {
+            x.to_dtype(act).unwrap()
+        };
+        let (gg, uu) = if arm == 'U' {
+            (
+                g.indexed_moe_forward_as(&xin, &ids, MoeArm::MatVec, act)
+                    .unwrap(),
+                u.indexed_moe_forward_as(&xin, &ids, MoeArm::MatVec, act)
+                    .unwrap(),
+            )
+        } else {
+            g.indexed_moe_forward_pair_in(u, &xin, &ids, MoeArm::MatVec, act, order)
+                .unwrap()
+        };
+        let h = (lloom::nn::ops::silu(&gg).unwrap() * uu).unwrap();
+        let y = d
+            .indexed_moe_forward_with(&h, &ids, MoeArm::MatVec)
+            .unwrap();
+        (y.sum_keepdim(1).unwrap().to_dtype(DType::F32).unwrap() * 1e-3).unwrap()
+    };
+    for (act, arms) in [(DType::F16, "HXTSUF"), (DType::F32, "HXTSU")] {
+        let arms: Vec<char> = arms.chars().collect();
+        let iters = 4 * n_layers;
+        let batch = |arm: char| -> f64 {
+            let mut x = x0.clone();
+            for i in 0..2 * n_layers {
+                x = layer(arm, act, i % n_layers, &x);
+            }
+            dev.synchronize().unwrap();
+            profile::reset();
+            for i in 0..iters {
+                x = layer(arm, act, i % n_layers, &x);
+            }
+            dev.synchronize().unwrap();
+            profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+        };
+        let warm = Instant::now();
+        while warm.elapsed().as_secs_f64() < 1.0 {
+            batch('H');
+        }
+        let mut per: std::collections::BTreeMap<char, Vec<f64>> = Default::default();
+        for r in 0..rounds {
+            // A rotation of the arms each round, mirrored every other round.
+            let mut order: Vec<char> = arms
+                .iter()
+                .cycle()
+                .skip(r % arms.len())
+                .take(arms.len())
+                .cloned()
+                .collect();
+            if r % 2 == 1 {
+                order.reverse();
+            }
+            for &arm in &order {
+                per.entry(arm).or_default().push(batch(arm));
+            }
+            println!(
+                "CHAIN act={act:?} round={r} {}",
+                order
+                    .iter()
+                    .map(|a| format!("{a}={:.2}", per[a].last().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        let med = |v: &[f64]| {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (s[(s.len() - 1) / 2] + s[s.len() / 2]) / 2.0
+        };
+        for &arm in &arms {
+            let v = &per[&arm];
+            let d: Vec<f64> = v.iter().zip(&per[&'H']).map(|(a, b)| a - b).collect();
+            let du: Vec<f64> = v.iter().zip(&per[&'U']).map(|(a, b)| a - b).collect();
+            let lo = d.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = d.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "CHAINSUM act={act:?} arm={arm} us_per_layer={:.2} min={:.2} max={:.2} minus_H={:+.2} [{lo:+.2}, {hi:+.2}] below_H={}/{} minus_U={:+.2} below_U={}/{}",
+                med(v),
+                v.iter().cloned().fold(f64::INFINITY, f64::min),
+                v.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                med(&d),
+                d.iter().filter(|x| **x < 0.0).count(),
+                d.len(),
+                med(&du),
+                du.iter().filter(|x| **x < 0.0).count(),
+                du.len()
+            );
+        }
+    }
+}

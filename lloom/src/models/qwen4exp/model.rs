@@ -397,6 +397,10 @@ pub struct Cache {
     /// first; set by [`CausalLM::forward`], empty when the caller only had
     /// embeddings (an image), in which case the hash uses the image stand-in.
     pub pending_tokens: std::collections::VecDeque<u32>,
+    /// This cache's KV row on the device's ledger (`ledger.rs`), registered
+    /// by `new_cache`; a clone shares it, a drop removes it.
+    #[cfg(feature = "metal")]
+    pub(crate) ledger: Option<std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
     /// `pending_tokens` was filled by the driver (`CausalLM::note_input_ids`)
     /// for the NEXT forward, which consumes the note instead of reading its
     /// input ids back from the device. Cleared by that forward.
@@ -600,6 +604,8 @@ impl Cache {
             ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
+            #[cfg(feature = "metal")]
+            ledger: None,
             pending_noted: false,
             host: HostFill::default(),
             pos: 0,
@@ -1394,6 +1400,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         let mut plan = self.plan_pass(cache, seq);
         cache.prepared = Some((cache.pos, seq));
+        // The ledger hears the KV row at the passes that allocate — a grow,
+        // or a sequence's first — never on a decode step inside its slab.
+        #[cfg(feature = "metal")]
+        if plan.kv_grow > 0 || cache.pos == 0 {
+            if let Some(g) = &cache.ledger {
+                use lloom_tensor::kernels::metal::ledger::Tenant;
+                let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
+                let held: usize = cache.kv.iter().map(|k| k.bytes_held(nkv, hd)).sum::<usize>()
+                    + plan.kv_grow;
+                let mut claim = g.claim();
+                claim.floor = held;
+                claim.want = held;
+                g.set_claim(claim);
+                g.set_held(held);
+            }
+        }
         // A pass a cached plan serves allocates its activations from the
         // base, which is already allocated and counted: it owes no transient.
         #[cfg(feature = "metal")]
@@ -2732,8 +2754,30 @@ impl<R: ExpertResidency> ModelTrait for Qwen4Exp<R> {
 impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     type Cache = Cache;
 
-    fn new_cache(&self, cfg: &Self::Config, _dev: &lloom_tensor::Device) -> Result<Self::Cache> {
-        Ok(Cache::new(cfg))
+    fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut cache = Cache::new(cfg);
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = dev {
+            use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+            // The slabs grow a slab at a time with no ceiling of their own:
+            // the row's floor is what it holds, its unit one slab across the
+            // full-attention layers; `prepare_pass` keeps it current.
+            let gauge = Gauge::new(
+                "qwen4exp-kv",
+                Claim {
+                    floor: 0,
+                    want: 0,
+                    unit: super::qsa::KV_SLAB_TOKENS * super::loader::kv_bytes_per_token(cfg),
+                    class: Class::Capability,
+                },
+                0,
+            );
+            let tenant: std::sync::Arc<dyn Tenant> = gauge.clone();
+            m.ledger().register(&tenant);
+            cache.ledger = Some(gauge);
+        }
+        Ok(cache)
     }
 
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {

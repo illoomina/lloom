@@ -253,6 +253,21 @@ impl KvCache {
         }
     }
 
+    /// Bytes this row's k / v planes hold on the device now: the slab at
+    /// its capacity once allocated, the quantized planes' bytes; a pooled
+    /// row's are the pool's (its own tenant, not this row's).
+    pub fn bytes_held(&self, nkv: usize, hd: usize) -> usize {
+        let per_token = self.precision.bytes_per_token(nkv, hd, DType::F32);
+        match &self.kv {
+            KvBacking::Slab(s) if s.k_cache().all_data().is_some() => {
+                s.k_cache().max_seq_len() * per_token
+            }
+            KvBacking::Slab(_) => 0,
+            KvBacking::Quant(s) => s.bytes(),
+            KvBacking::Pooled { .. } => 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.kv {
             KvBacking::Slab(s) => s.current_seq_len(),

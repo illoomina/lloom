@@ -592,6 +592,16 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// The bytes of one activation element and one stored element under `triple`:
+/// the routed launches step `src1` and `dst` by them.
+fn triple_leg_bytes(triple: GemvTriple) -> (u64, u64) {
+    let bytes = |leg: GemvFloat| match leg {
+        GemvFloat::F32 => core::mem::size_of::<f32>() as u64,
+        GemvFloat::F16 => core::mem::size_of::<half::f16>() as u64,
+    };
+    (bytes(triple.activation()), bytes(triple.store()))
+}
+
 /// The `kernel_mul_mv_id_<stem>` / `kernel_mul_mv_id2_<stem>` stem of a weight kind.
 fn mv_id_stem(dtype: GgmlDType) -> Result<&'static str, MetalKernelError> {
     Ok(match dtype {
@@ -665,14 +675,7 @@ pub fn call_quantized_matmul_mv_id_t(
     }
     let stem = mv_id_stem(dtype)?;
     let name = format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix());
-    let act_size = match triple.activation() {
-        GemvFloat::F32 => core::mem::size_of::<f32>(),
-        GemvFloat::F16 => 2,
-    } as u64;
-    let store_size = match triple.store() {
-        GemvFloat::F32 => core::mem::size_of::<f32>(),
-        GemvFloat::F16 => 2,
-    } as u64;
+    let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "routed matmul-vec activation dim1 must be 1 or topk",
@@ -1286,18 +1289,20 @@ fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
 
-/// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2_<q>_f32`,
-/// lloom #749 P31 (3)): `src0a` and `src0b` are two stacked weights of the
-/// same kind and `[n_experts, n, k]`; `dst` is `[2, batch, topk, n]` f32
-/// (plane set 0 from `src0a`, 1 from `src0b`). f32 activations only — the
-/// arm the decode step runs. Each plane computes exactly what
-/// [`call_quantized_matmul_mv_id_t`] computes for it.
+/// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2_<q>_<triple>`):
+/// `src0a` and `src0b` are two stacked weights of the same kind and
+/// `[n_experts, n, k]`; `dst` is `[2, batch, topk, n]` in the triple's store
+/// leg (plane set 0 from `src0a`, 1 from `src0b`). `triple` is
+/// [`call_quantized_matmul_mv_id_t`]'s, with the same reach — the f16 arm on
+/// quantized weight rows only — and each plane computes exactly what that
+/// launch computes for it under the same triple.
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_id2_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    triple: GemvTriple,
     (n_experts, n, k): (usize, usize, usize),
     (batch, topk, in_dim1): (usize, usize, usize),
     src0a: &Buffer,
@@ -1308,10 +1313,16 @@ pub fn call_quantized_matmul_mv_id2_t(
     ids_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    triple.check(device, "routed quantized matmul-vec pair")?;
+    if triple != GemvTriple::F32F32F32 && !dtype.has_gemv_triple() {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "non-f32 GemvTriple",
+            "dense/Q8 routed quantized matmul-vec pair",
+        ));
+    }
     let stem = mv_id_stem(dtype)?;
-    let name = format!("kernel_mul_mv_id2_{stem}_f32");
-    let act_size = core::mem::size_of::<f32>() as u64;
-    let store_size = act_size;
+    let name = format!("kernel_mul_mv_id2_{stem}_{}", triple.name_suffix());
+    let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "routed matmul-vec activation dim1 must be 1 or topk",

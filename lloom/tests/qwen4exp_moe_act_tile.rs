@@ -8,7 +8,9 @@
 //! f32 expert has no f16 activation arm at all): the prefill's logits under f16
 //! are the f32 run's bit for bit and the census shows the GEMM ran; the
 //! decode step after it (one row, the matmul-vec) differs, so the f16 arm is
-//! on the path where it should be.
+//! on the path where it should be. The decode step's census shows gate|up as
+//! one paired launch a layer on either dtype (`_f16_f16` under f16), so the
+//! f16 step pays the f32 step's routed launch count.
 //!
 //! Its own binary: the census switch and the contract are read once.
 #![cfg(feature = "metal")]
@@ -85,11 +87,44 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
             .map(|(_, n)| *n)
             .sum();
         let step = Tensor::from_vec(vec![7u32], (1, 1), &dev)?;
+        dev.synchronize()?;
+        let window = dev
+            .as_metal_device()?
+            .dispatch_census()
+            .open()
+            .expect("a census window on this test's device");
         let decode: Vec<f32> = model
             .forward(&step, cache.pos, &mut cache)?
             .flatten_all()?
             .to_vec1()?;
-        println!("MOEACT act={act:?} prefill_mul_mm_id={gemm}");
+        dev.synchronize()?;
+        let step_census = window.close();
+        let launches = |label: &str| -> u64 {
+            step_census
+                .iter()
+                .filter(|(l, _)| l.contains(label))
+                .map(|(_, n)| *n)
+                .sum()
+        };
+        let suffix = if act == DType::F16 {
+            "_f16_f16"
+        } else {
+            "_f32"
+        };
+        let (pair, single) = (
+            launches(&format!("kernel_mul_mv_id2_q8_0{suffix}")),
+            launches(&format!("kernel_mul_mv_id_q8_0{suffix}")),
+        );
+        println!(
+            "MOEACT act={act:?} prefill_mul_mm_id={gemm} decode_mul_mv_id2={pair} decode_mul_mv_id={single} decode_routed={}",
+            launches("mul_mv_id")
+        );
+        let layers = cfg.n_layers as u64;
+        assert_eq!(
+            (pair, single, launches("mul_mv_id")),
+            (layers, layers, 2 * layers),
+            "{act:?}: a decode step's routed launches are not one gate|up pair and one down a layer ({step_census:?})"
+        );
         runs.push((act, prefill, decode, gemm));
     }
     let (f32_run, f16_run) = (&runs[0], &runs[1]);

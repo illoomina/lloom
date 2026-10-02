@@ -583,3 +583,150 @@ fn routed_pair_q2_0_gate_shape() -> Result<()> {
 fn routed_pair_iq4_nl_gate_shape() -> Result<()> {
     routed_pair_is_the_two_launches(GgmlDType::IQ4NL, false)
 }
+
+fn bits16(t: &Tensor) -> Result<Vec<u16>> {
+    Ok(t.flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<f16>()?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+/// The gate|up pair on the `(f16, f32, f16)` triple: each half is the f16
+/// routed launch (`kernel_mul_mv_id_<q>_f16_f16`) bit for bit, stored f16,
+/// at every weight kind with an f16 routed arm. Batch 2 so the activation's
+/// row stride is read; `n = 37` beside `n = 64` so a half's last plane
+/// over-writing past its rows lands on the other half's first plane, which
+/// this compares (CONTRIBUTING §3.1b rule 5).
+fn routed_pair_f16_is_the_two_f16_launches(
+    dtype: GgmlDType,
+    in_dim1_is_topk: bool,
+    n: usize,
+) -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, k) = (6usize, 256usize);
+    let (batch, topk) = (2usize, 3usize);
+    let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
+    let (g, _) = stacked_weight(dtype, (e, n, k), 17, &dev)?;
+    let (u, _) = stacked_weight(dtype, (e, n, k), 23, &dev)?;
+    let x = activations((batch, in_dim1, k), 0.2)?
+        .to_dtype(DType::F16)?
+        .to_device(&dev)?;
+    let ids_t = Tensor::from_vec(vec![5u32, 0, 5, 2, 4, 5], (batch, topk), &dev)?;
+    let want_g = g.indexed_moe_forward(&x, &ids_t)?;
+    let want_u = u.indexed_moe_forward(&x, &ids_t)?;
+    assert_eq!(
+        want_g.dtype(),
+        DType::F16,
+        "{dtype:?}: the single launch is not on the f16 arm"
+    );
+    let (want_g, want_u) = (bits16(&want_g)?, bits16(&want_u)?);
+    assert_ne!(
+        want_g, want_u,
+        "the two weights must differ for the select to be testable"
+    );
+    let (got_g, got_u) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
+    for (half_name, t) in [("gate", &got_g), ("up", &got_u)] {
+        assert_eq!(
+            t.dims(),
+            &[batch, topk, n],
+            "{dtype:?}: the pair's {half_name} half's shape"
+        );
+        assert_eq!(
+            t.dtype(),
+            DType::F16,
+            "{dtype:?}: the f16 pair must store f16 ({half_name})"
+        );
+    }
+    assert_eq!(
+        bits16(&got_g)?,
+        want_g,
+        "{dtype:?} in_dim1={in_dim1} n={n}: the f16 pair's gate half is not the f16 gate launch"
+    );
+    assert_eq!(
+        bits16(&got_u)?,
+        want_u,
+        "{dtype:?} in_dim1={in_dim1} n={n}: the f16 pair's up half is not the f16 up launch"
+    );
+    let (sw_u, sw_g) = u.indexed_moe_forward_pair(&g, &x, &ids_t)?;
+    assert_eq!(
+        bits16(&sw_u)?,
+        want_u,
+        "{dtype:?}: the f16 pair the other way round: first half"
+    );
+    assert_eq!(
+        bits16(&sw_g)?,
+        want_g,
+        "{dtype:?}: the f16 pair the other way round: second half"
+    );
+    let (g2, u2) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
+    assert_eq!(
+        bits16(&g2)?,
+        want_g,
+        "{dtype:?}: the f16 pair is not bit-stable (gate)"
+    );
+    assert_eq!(
+        bits16(&u2)?,
+        want_u,
+        "{dtype:?}: the f16 pair is not bit-stable (up)"
+    );
+    Ok(())
+}
+
+/// Every kind with an f16 routed arm whose blocks this file builds: the
+/// checkpoint's gate|up kinds (IQ2_XS, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S), its
+/// `down` kinds (IQ4_NL, Q2_0) and the tiny model's Q8_0, plus the K-quants
+/// and the legacy blocks.
+const F16_PAIR_KINDS: [GgmlDType; 15] = [
+    GgmlDType::IQ2XS,
+    GgmlDType::IQ2XXS,
+    GgmlDType::IQ2S,
+    GgmlDType::IQ3XXS,
+    GgmlDType::IQ3S,
+    GgmlDType::IQ4NL,
+    GgmlDType::IQ4XS,
+    GgmlDType::Q2_0,
+    GgmlDType::Q8_0,
+    GgmlDType::Q4_0,
+    GgmlDType::Q4_1,
+    GgmlDType::Q5_0,
+    GgmlDType::Q4K,
+    GgmlDType::Q5K,
+    GgmlDType::Q6K,
+];
+
+#[test]
+fn routed_pair_f16_every_kind_gate_shape() -> Result<()> {
+    for dtype in F16_PAIR_KINDS {
+        routed_pair_f16_is_the_two_f16_launches(dtype, false, 64)?;
+    }
+    Ok(())
+}
+#[test]
+fn routed_pair_f16_every_kind_rows_not_multiple_of_tile() -> Result<()> {
+    for dtype in F16_PAIR_KINDS {
+        routed_pair_f16_is_the_two_f16_launches(dtype, false, 37)?;
+    }
+    Ok(())
+}
+#[test]
+fn routed_pair_f16_down_shape() -> Result<()> {
+    for dtype in [GgmlDType::IQ4NL, GgmlDType::Q2_0, GgmlDType::Q8_0] {
+        routed_pair_f16_is_the_two_f16_launches(dtype, true, 37)?;
+    }
+    Ok(())
+}
+
+/// A dense weight has no f16 routed arm, paired or not: refused, never read
+/// under the wrong dtype.
+#[test]
+fn routed_pair_f16_refuses_dense_weight() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, n, k) = (2usize, 8usize, 64usize);
+    let w = QTensor::quantize(&Tensor::zeros((e, n, k), DType::F32, &dev)?, GgmlDType::F32)?;
+    let x = Tensor::zeros((1, 1, k), DType::F16, &dev)?;
+    let ids = Tensor::from_vec(vec![0u32, 1], (1, 2), &dev)?;
+    assert!(w.indexed_moe_forward_pair(&w, &x, &ids).is_err());
+    Ok(())
+}

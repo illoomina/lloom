@@ -1159,11 +1159,12 @@ impl QTensor {
     /// [`Self::indexed_moe_forward_pair`] on the caller's `arm`. On
     /// [`MoeArm::MatVec`] (a decode step) the two halves are ONE Metal launch,
     /// `kernel_mul_mv_id2`, when both weights share a kind and shape and the
-    /// activations are f32, unless `LLOOM_MOE_PAIR=off`. The GEMM has no
-    /// paired form, so on [`MoeArm::Gemm`] (a prefill tile) the halves are two
-    /// calls on that arm, and the pair never takes a tile off the GEMM. The
-    /// choice depends on the arm, the weights and the activation dtype, never
-    /// on `batch`, so every group of a tile makes the same one
+    /// activations are f32 or f16 (each its own triple, as the single
+    /// launch's), unless `LLOOM_MOE_PAIR=off`. The GEMM has no paired form,
+    /// so on [`MoeArm::Gemm`] (a prefill tile) the halves are two calls on
+    /// that arm, and the pair never takes a tile off the GEMM. The choice
+    /// depends on the arm, the weights and the activation dtype, never on
+    /// `batch`, so every group of a tile makes the same one
     /// (`docs/expert-streaming.md` §20.15a).
     pub fn indexed_moe_forward_pair_with(
         &self,
@@ -1177,7 +1178,7 @@ impl QTensor {
             && moe_pair_on()
             && self.dtype() == up.dtype()
             && self.shape() == up.shape()
-            && x.dtype() == DType::F32
+            && matches!(x.dtype(), DType::F32 | DType::F16)
         {
             if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
                 let (xs, is) = (x.storage(), ids.storage());

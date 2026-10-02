@@ -1427,18 +1427,25 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if let Ok(m) = self.device().as_metal_device() {
             use crate::models::lfm2::{kv_grow_budget, kv_grow_fits};
             let dev = m.device();
-            let allocated = dev.current_allocated_size();
             let working_set = dev.recommended_max_working_set_size();
             // The transients come from the heap chunks first (§6.3k), whose
-            // whole size `allocated` already counts: what the chunks have
-            // free is transient the pass will NOT allocate.
+            // whole size the allocated figure already counts: what the chunks
+            // have free is transient the pass will NOT allocate.
             let (hs, hp) = m.heap_stats();
             let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
             let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
-            let fits = kv_grow_fits(allocated, working_set, self.memory_fraction, need);
+            // Read with the free lists given back first when the first
+            // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
+            // is `kv_grow_fits`'.
+            let a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+            let (allocated, fits) = (a.allocated, a.fits);
+            debug_assert_eq!(
+                fits,
+                kv_grow_fits(allocated, working_set, self.memory_fraction, need)
+            );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB allocated={:.2} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB allocated={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
@@ -1446,6 +1453,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 gb(heap_free),
                 gb(need),
                 gb(allocated),
+                gb(a.reclaimed),
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,
                 gb(working_set),

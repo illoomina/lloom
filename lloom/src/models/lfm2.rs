@@ -4680,23 +4680,28 @@ impl Cache {
             return Ok(());
         };
         let dev = metal.device();
-        let allocated = dev.current_allocated_size();
         let working_set = dev.recommended_max_working_set_size();
-        if kv_grow_fits(allocated, working_set, self.kv_grow_fraction, grow) {
+        // The free lists are given back before a refusal stands
+        // (`MetalDevice::admit_bytes`); the arithmetic is `kv_grow_fits`'.
+        let a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+        if a.fits {
+            debug_assert!(kv_grow_fits(a.allocated, working_set, self.kv_grow_fraction, grow));
             return Ok(());
         }
         let gb = |b: usize| b as f64 / 1e9;
         lloom_tensor::bail!(
             "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the process already \
              holds {:.2} GB of the {:.2} GB it may ({:.2} x recommendedMaxWorkingSetSize \
-             {:.2} GB). The reply stops here, before anything is written, rather than risk \
+             {:.2} GB) after giving back {:.3} GB of free lists. The reply stops here, \
+             before anything is written, rather than risk \
              the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
              free memory, or bound the run.",
             gb(grow),
-            gb(allocated),
+            gb(a.allocated),
             gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
             self.kv_grow_fraction,
             gb(working_set),
+            gb(a.reclaimed),
         )
     }
 

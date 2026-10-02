@@ -208,6 +208,16 @@ impl Drop for DeviceTeardown {
     }
 }
 
+/// What [`MetalDevice::admit_bytes`] read: the device's allocated bytes at
+/// the decision (after a reclaim, when one ran), what the reclaim freed, and
+/// the verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassAdmission {
+    pub allocated: usize,
+    pub reclaimed: usize,
+    pub fits: bool,
+}
+
 #[derive(Clone)]
 pub struct MetalDevice {
     /// Argument blocks and small tables keyed by their bytes, so a value a
@@ -830,16 +840,50 @@ impl MetalDevice {
     ///
     /// Now a free buffer is already known to be free, so this exists only to
     /// hand memory back under pressure. Nothing calls it on the hot path.
-    pub fn trim_unused_buffers(&self) {
+    /// Returns the bytes given back.
+    pub fn trim_unused_buffers(&self) -> usize {
+        let mut freed = 0usize;
         for buffer in self.buffers.trim() {
+            freed += buffer.length();
             if !self.transient_heaps.0.release(&buffer) {
                 self.residency_set.remove(&buffer);
             }
         }
         for buffer in self.private_buffers.trim() {
+            freed += buffer.length();
             if !self.transient_heaps.1.release(&buffer) {
                 self.residency_set.remove(&buffer);
             }
+        }
+        freed
+    }
+
+    /// A pass-level admission against the device: whether `need` more bytes
+    /// fit under `budget` beside what the process holds — and, when they do
+    /// not at first, after the pools' free lists are given back (the simplest
+    /// cache yielding before a capability is refused,
+    /// `profiles-and-memory-design.md` §2 principle 5). The free lists are
+    /// elastic by definition and `currentAllocatedSize` counts them, so a
+    /// refusal read on the first figure refuses a pass the process had room
+    /// for. The caller decides on the figure returned; a reclaim is counted on
+    /// the ledger. Not on the hot path: a decode step inside its slab asks
+    /// nothing (§9.5e).
+    pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
+        let allocated = self.device.current_allocated_size();
+        if allocated.saturating_add(need) <= budget {
+            return PassAdmission {
+                allocated,
+                reclaimed: 0,
+                fits: true,
+            };
+        }
+        let reclaimed = self.trim_unused_buffers();
+        self.ledger.note_reclaim(reclaimed);
+        let allocated = self.device.current_allocated_size();
+        PassAdmission {
+            allocated,
+            reclaimed,
+            fits: allocated.saturating_add(need) <= budget,
         }
     }
 
@@ -2218,24 +2262,26 @@ impl MetalDevice {
             // actually rises by.
             if pp.admit_fraction > 0.0 {
                 let grow = needed.saturating_sub(have);
-                let allocated = self.device.current_allocated_size();
                 let working_set = self.device.recommended_max_working_set_size();
                 let budget = (working_set as f64 * pp.admit_fraction) as usize;
-                if allocated.saturating_add(grow) > budget {
+                let a = self.admit_bytes(grow, budget);
+                if !a.fits {
                     let gb = |b: usize| b as f64 / 1e9;
                     return Err(MetalError::Message(format!(
                         "pass plan base grow refused for {:?}: it needs {:.3} GB more, and the \
                          process already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
-                         recommendedMaxWorkingSetSize {:.2} GB). Nothing was allocated and no \
+                         recommendedMaxWorkingSetSize {:.2} GB) after giving back {:.3} GB of \
+                         free lists. Nothing was allocated and no \
                          plan was cached; the pass runs on the pool as it did before \
                          (DESIGN.md 9.5, 3.5). Raise the fraction, narrow the pass (a smaller \
                          prefill tile), or bound the run.",
                         closes.kind,
                         gb(grow),
-                        gb(allocated),
+                        gb(a.allocated),
                         gb(budget),
                         pp.admit_fraction,
                         gb(working_set),
+                        gb(a.reclaimed),
                     ))
                     .into());
                 }

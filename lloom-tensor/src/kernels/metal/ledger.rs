@@ -147,6 +147,8 @@ pub struct LedgerSnapshot {
     pub quota: usize,
     /// Bytes under live reservations.
     pub committed: usize,
+    /// Pass-level admissions that reclaimed the free lists, and their bytes.
+    pub reclaims: (u32, usize),
     pub tenants: Vec<TenantRow>,
 }
 
@@ -165,11 +167,13 @@ impl LedgerSnapshot {
     pub fn line(&self) -> String {
         let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
         let mut s = format!(
-            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB",
+            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB reclaims={}/{:.1} MiB",
             mib(self.quota),
             mib(self.committed),
             mib(self.floors()),
-            mib(self.wants())
+            mib(self.wants()),
+            self.reclaims.0,
+            mib(self.reclaims.1)
         );
         for t in &self.tenants {
             s.push_str(&format!(
@@ -190,6 +194,11 @@ impl LedgerSnapshot {
 pub struct Ledger {
     quota: AtomicUsize,
     committed: AtomicUsize,
+    /// Pass-level admissions that gave the pools' free lists back before
+    /// deciding, and the bytes they freed (`MetalDevice::admit_bytes`): the
+    /// release counter on the path a refusal used to take at once.
+    reclaims: AtomicU32,
+    reclaimed_bytes: AtomicUsize,
     next_id: AtomicU32,
     tenants: parking_lot::Mutex<Vec<(TenantId, Weak<dyn Tenant>)>>,
 }
@@ -199,6 +208,8 @@ impl Default for Ledger {
         Self {
             quota: AtomicUsize::new(0),
             committed: AtomicUsize::new(0),
+            reclaims: AtomicU32::new(0),
+            reclaimed_bytes: AtomicUsize::new(0),
             next_id: AtomicU32::new(1),
             tenants: parking_lot::Mutex::new(Vec::new()),
         }
@@ -223,6 +234,20 @@ impl Ledger {
     /// Bytes under live reservations.
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
+    }
+
+    /// A pass-level admission gave the free lists back: count it.
+    pub fn note_reclaim(&self, bytes: usize) {
+        self.reclaims.fetch_add(1, Ordering::Relaxed);
+        self.reclaimed_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// `(reclaims, bytes freed by them)` so far.
+    pub fn reclaims(&self) -> (u32, usize) {
+        (
+            self.reclaims.load(Ordering::Relaxed),
+            self.reclaimed_bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// Commit `bytes` for as long as the reservation lives. Never refuses
@@ -272,6 +297,7 @@ impl Ledger {
         LedgerSnapshot {
             quota: self.quota(),
             committed: self.committed(),
+            reclaims: self.reclaims(),
             tenants,
         }
     }
@@ -349,7 +375,11 @@ mod tests {
         let _id = ledger.register(&g_dyn);
         let _r = ledger.reserve(40 << 20);
         let line = ledger.snapshot().line();
-        assert!(line.starts_with("quota=100.0 MiB committed=40.0 MiB"), "{line}");
+        assert!(
+            line.starts_with("quota=100.0 MiB committed=40.0 MiB"),
+            "{line}"
+        );
+        assert!(line.contains("reclaims=0/0.0 MiB"), "{line}");
         assert!(line.contains("experts:cache floor=8.0 want=80.0 held=40.0"), "{line}");
     }
 }
@@ -381,5 +411,55 @@ mod device_tests {
         drop(a);
         drop(c);
         assert_eq!(ledger.committed(), before, "all released");
+    }
+}
+
+#[cfg(test)]
+mod admit_tests {
+    //! A pass-level admission that would refuse gives the pools' free lists
+    //! back first and decides on the figure after (`MetalDevice::admit_bytes`).
+    use crate::Device;
+
+    #[test]
+    fn a_refusal_reclaims_the_free_lists_before_it_stands() {
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let mib = 1usize << 20;
+        // 32 MiB through the Shared pool, released: parked, then free once
+        // the epoch they were released in completes.
+        let held: Vec<_> = (0..32).map(|_| m.allocate_buffer(mib).unwrap()).collect();
+        drop(held);
+        let clock = m.gpu_clock();
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        let allocated = m.device().current_allocated_size();
+        // A budget 8 MiB short for `need` on the first figure, and 24 MiB
+        // over it once the 32 MiB of free lists are gone.
+        let need = 4 * mib;
+        let budget = allocated + need - 8 * mib;
+        let before = m.ledger().reclaims();
+        let a = m.admit_bytes(need, budget);
+        assert!(
+            a.reclaimed >= 32 * mib,
+            "the free lists held 32 MiB; reclaimed {}",
+            a.reclaimed
+        );
+        assert!(
+            a.allocated + need <= budget,
+            "after the reclaim the pass fits: allocated {} + need {} vs budget {}",
+            a.allocated,
+            need,
+            budget
+        );
+        assert!(a.fits, "{a:?}");
+        let after = m.ledger().reclaims();
+        assert_eq!(after.0, before.0 + 1, "one reclaim counted");
+        assert!(after.1 >= before.1 + 32 * mib);
+        // A pass that fits on the first figure reclaims nothing.
+        let a = m.admit_bytes(need, m.device().current_allocated_size() + need);
+        assert_eq!(a.reclaimed, 0);
+        assert!(a.fits);
+        assert_eq!(m.ledger().reclaims().0, after.0);
     }
 }

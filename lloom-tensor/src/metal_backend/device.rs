@@ -2721,8 +2721,8 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
         Ok(BufferHandle::new(
-        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-            .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+                .reserved(self.ledger.reserve(size)),
         ))
     }
 
@@ -2746,8 +2746,8 @@ impl MetalDevice {
         // not. Pin them.
         wire_pages(buffer.contents(), size);
         Ok(BufferHandle::new(
-        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-            .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+                .reserved(self.ledger.reserve(size)),
         ))
     }
 
@@ -2758,8 +2758,8 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
         Ok(BufferHandle::new(
-        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-            .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+                .reserved(self.ledger.reserve(size)),
         ))
     }
 
@@ -2833,8 +2833,8 @@ impl MetalDevice {
         // holds, so an unpooled upload that stayed in it was never freed at
         // all — neither these staging buffers nor a per-round `Tensor::new`.
         Ok(BufferHandle::new(
-        PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
-            .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
+                .reserved(self.ledger.reserve(size)),
         ))
     }
 

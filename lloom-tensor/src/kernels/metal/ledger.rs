@@ -127,7 +127,9 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.ledger.committed.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.ledger
+            .committed
+            .fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -322,7 +324,11 @@ mod tests {
         let b = ledger.reserve(3 << 20);
         assert_eq!(ledger.committed(), 4 << 20, "two live reservations sum");
         drop(a);
-        assert_eq!(ledger.committed(), 3 << 20, "a dropped reservation is released");
+        assert_eq!(
+            ledger.committed(),
+            3 << 20,
+            "a dropped reservation is released"
+        );
         drop(b);
         assert_eq!(ledger.committed(), 0);
     }
@@ -380,7 +386,10 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("reclaims=0/0.0 MiB"), "{line}");
-        assert!(line.contains("experts:cache floor=8.0 want=80.0 held=40.0"), "{line}");
+        assert!(
+            line.contains("experts:cache floor=8.0 want=80.0 held=40.0"),
+            "{line}"
+        );
     }
 }
 
@@ -407,7 +416,11 @@ mod device_tests {
             "three persistent allocations commit their bytes"
         );
         drop(b);
-        assert_eq!(ledger.committed() - before, 5 << 20, "a dropped handle releases");
+        assert_eq!(
+            ledger.committed() - before,
+            5 << 20,
+            "a dropped handle releases"
+        );
         drop(a);
         drop(c);
         assert_eq!(ledger.committed(), before, "all released");
@@ -470,7 +483,9 @@ mod admit_tests {
         let Ok(dev @ Device::Metal(_)) = Device::new_metal(0) else {
             return;
         };
-        let Device::Metal(m) = &dev else { unreachable!() };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
         let mib = 1usize << 20;
         // 32 MiB of fills encoded into the open command buffer, then dropped:
         // pending against an epoch nothing has committed.

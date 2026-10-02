@@ -2126,7 +2126,9 @@ impl PagedKv {
                     .seq(s)
                     .map(|q| (q.len(), q.pages().len()))
                     .unwrap_or((0, 0));
-                (len + seq_len).div_ceil(self.page_size).saturating_sub(held)
+                (len + seq_len)
+                    .div_ceil(self.page_size)
+                    .saturating_sub(held)
             })
             .sum();
         let available =
@@ -2205,9 +2207,7 @@ impl PagedKv {
         }
         // Pages whose last reader has completed come back first, so a long
         // session recycles rather than exhausts.
-        let ready = self
-            .quarantine
-            .drain(self.clock.completed_count());
+        let ready = self.quarantine.drain(self.clock.completed_count());
         let (pool_pages, page_size) = (self.pool_pages(), self.page_size);
         let pool = self.pool.as_mut().expect("created above");
         pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
@@ -2357,7 +2357,8 @@ impl PagedKv {
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
             let ids: Vec<u32> = (0..n_prev)
                 .map(|t| {
-                    pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32
+                    pages[t / self.page_size].0 * self.page_size as u32
+                        + (t % self.page_size) as u32
                 })
                 .collect();
             let ids = Tensor::new(ids.as_slice(), device)?;
@@ -2482,9 +2483,7 @@ impl PagedKv {
                 // them, rather than refusing a pool that is free in fact.
                 Err(PageError::Exhausted { .. }) if !self.quarantine.is_empty() => {
                     device.synchronize()?;
-                    let ready = self
-                        .quarantine
-                        .drain(self.clock.completed_count());
+                    let ready = self.quarantine.drain(self.clock.completed_count());
                     pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
                     pool.append(slot, n)
                 }
@@ -2611,7 +2610,9 @@ impl PagedKv {
             .expect("the layer has a pool once a token was written");
         let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
         let ids: Vec<u32> = (0..n_prev)
-            .map(|t| pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32)
+            .map(|t| {
+                pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32
+            })
             .collect();
         let ids = Tensor::new(ids.as_slice(), device)?;
         Ok((pk.index_select(&ids, 2)?, pv.index_select(&ids, 2)?))

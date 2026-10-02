@@ -161,6 +161,9 @@ fn serial(
     Ok((out.ids, seen))
 }
 
+/// Every probe one lane read, flattened, in order.
+type Probes = Vec<Vec<f32>>;
+
 /// Two requests through the pipelined driver, one lane each.
 fn pipelined(
     model: &Qwen4Exp<Resident>,
@@ -168,7 +171,7 @@ fn pipelined(
     dev: &Device,
     prompts: &[&[u32]],
     token: u32,
-) -> Result<(Vec<Vec<u32>>, Vec<Vec<Vec<f32>>>)> {
+) -> Result<(Vec<Vec<u32>>, Vec<Probes>)> {
     let mut sessions: Vec<Session<'_, Qwen4Exp<Resident>>> = prompts
         .iter()
         .map(|_| Ok(Session::new(model, spec_cache(model, cfg, dev)?)))

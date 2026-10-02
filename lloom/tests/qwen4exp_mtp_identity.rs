@@ -497,6 +497,10 @@ fn mtp_rows_are_each_their_greedy_stream() -> Result<()> {
     Ok(())
 }
 
+/// A turn's stream, whether it ended on EOS, and `(drafter context, target
+/// position)`.
+type Turn = (Vec<u32>, bool, Option<(usize, usize)>);
+
 /// One turn of the speculative body on a kept session: the stream, whether
 /// it ended on EOS, and the drafter's context against the target's position.
 fn turn(
@@ -505,7 +509,7 @@ fn turn(
     cfg: &Config,
     prompt: &[u32],
     max: usize,
-) -> Result<(Vec<u32>, bool, Option<(usize, usize)>)> {
+) -> Result<Turn> {
     let dev = Device::Cpu;
     let eos = [cfg.eos_token_id];
     let mut rb = Blocking::new(&eos, &dev)?;

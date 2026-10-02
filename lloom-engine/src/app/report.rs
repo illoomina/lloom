@@ -353,6 +353,18 @@ fn print_speculative(
              {:.1} tok/s steady (rounds/s × tokens/round), K={k}]",
             rounds_per_s * tokens_per_round,
         );
+        // The drafter's own context against the target's position: equal
+        // when it followed the request's prefix reuse (issue #894).
+        if let Some((ctx, pos)) = stats.drafter_ctx {
+            eprintln!(
+                "[dspark drafter context: {ctx} positions, target at {pos}{}]",
+                if ctx == pos {
+                    ""
+                } else {
+                    " — NOT FOLLOWING THE TARGET"
+                }
+            );
+        }
     }
     print_rounds(stats, wanted);
 }
@@ -444,6 +456,34 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
             rb_verify as f64 / n,
             rb_observe as f64 / n,
             (rb_draft + rb_verify + rb_observe) as f64 / n
+        );
+        // What the steady-state round allocated: the issue #894 gate reads
+        // zero of both after warm-up (the verify is a planned pass, the
+        // drafter's context is owned pages), and the round's spread beside
+        // it, since the churn is the noise source the gate is for.
+        let allocs: u64 = timed.iter().map(|r| r.timing.pool_allocations).sum();
+        let adds: u64 = timed.iter().map(|r| r.timing.residency_adds).sum();
+        let twins: u64 = timed
+            .iter()
+            .map(|r| r.timing.pool_allocations_pending_twin)
+            .sum();
+        let allocating = timed
+            .iter()
+            .filter(|r| r.timing.pool_allocations > 0 || r.timing.residency_adds > 0)
+            .count();
+        eprintln!(
+            "[dspark allocations after warm-up: pool allocations={allocs} (of which pending-twin={twins}) \
+             residency adds={adds} over {} rounds, {allocating} rounds allocated anything]",
+            timed.len()
+        );
+        let mut walls: Vec<f64> = timed.iter().map(|r| ms(r.timing.wall_ns())).collect();
+        walls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!(
+            "[dspark round ms after warm-up: p50 {:.3} p90 {:.3} p99 {:.3} max {:.3}]",
+            quantile(&walls, 0.5),
+            quantile(&walls, 0.9),
+            quantile(&walls, 0.99),
+            quantile(&walls, 1.0)
         );
         if profiled {
             eprintln!("[dspark GPU-busy per round, ms (mean of union):  draft {:.3}   verify {:.3}   observe {:.3}   round {:.3}  — idle (wall−busy) {:.3}]",

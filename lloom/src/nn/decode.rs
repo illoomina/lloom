@@ -532,6 +532,11 @@ pub struct DecodeStats {
     pub readback: ReadbackCounters,
     /// One entry per speculative round, empty on the baseline body.
     pub rounds: Vec<RoundStats>,
+    /// At the end of a speculative run, `(the drafter's own context length,
+    /// the target's position)` — equal when the drafter followed the target
+    /// through the request's prefix reuse (issue #894). `None` on the
+    /// baseline body and for a family with no state of its own.
+    pub drafter_ctx: Option<(usize, usize)>,
     /// The first [`FIRST_STEPS_TRACED`] steps' host time, by phase, on the
     /// `lookahead = 1` arm; empty on `lookahead = 0` and the speculative bodies.
     pub first_steps: Vec<StepPhases>,
@@ -1389,7 +1394,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             lloom_tensor::bail!("Session::decode: empty prompt and no held logits to resume from");
         }
         readback.check_sampler(sampler.sampling())?;
-        spec.begin(SeqId(0), prompt)?;
+        spec.begin_at(SeqId(0), prompt, &self.seq.tokens)?;
 
         let device = readback.device().clone();
         // The hot thread's scheduling class, held for the run and restored on
@@ -2263,7 +2268,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        spec.begin(seq, prompt)?;
+        // The drafter follows the target's reuse: what the cache kept is
+        // `self.seq.tokens` (`Session::prepare` left the log at the reused
+        // prefix), and `prompt` is keyed after it.
+        spec.begin_at(seq, prompt, &self.seq.tokens)?;
         // Whatever an earlier forward left in the probe slots — a warmup's, a
         // previous request's — predates this seed and is nobody's positions:
         // drained here, so the count below can move only between two probes
@@ -2599,6 +2607,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let overrun = fed - in_cache;
         self.seq.overrun = overrun;
         stats.overrun = overrun;
+        stats.drafter_ctx = spec.context_len(seq).map(|n| (n, self.seq.pos));
 
         stats.produced = produced;
         stats.readback = readback.counters();

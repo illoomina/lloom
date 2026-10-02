@@ -69,6 +69,11 @@ fn parse_flash_bn(v: &str) -> Result<usize, String> {
     }
 }
 fn parse_ctx_kv(v: &str) -> Result<String, String> {
+    if v.trim()
+        .eq_ignore_ascii_case(crate::models::lfm2_dspark::CtxKv::AUTO)
+    {
+        return Ok(crate::models::lfm2_dspark::CtxKv::AUTO.to_string());
+    }
     crate::models::lfm2_dspark::CtxKv::parse(v)
         .map(|_| v.trim().to_string())
         .map_err(|e| e.to_string())
@@ -147,8 +152,8 @@ impl Default for Lfm2Tuning {
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct DsparkTuning {
-    /// Where the drafter keeps its context KV: `contiguous` (cat-grown; every recorded digest) or `paged[:<page_size>][:shared]`.
-    #[opt(flag = "dspark-ctx", env = "LLOOM_DSPARK_CTX_KV", parser = "parse_ctx_kv", variants = ["contiguous", "paged[:page][:shared]"])]
+    /// Where the drafter keeps its context KV: `auto` (paged per sequence on Metal, contiguous on the CPU), `contiguous` (cat-grown) or `paged[:<page_size>][:shared]`.
+    #[opt(flag = "dspark-ctx", env = "LLOOM_DSPARK_CTX_KV", parser = "parse_ctx_kv", variants = ["auto", "contiguous", "paged[:page][:shared]"])]
     pub ctx_kv: String,
     /// The drafter's eager attention arm (the parity gate's A/B).
     #[opt(flag = "dspark-eager-attn", env = "LLOOM_DSPARK_EAGER_ATTN", bool)]
@@ -158,7 +163,7 @@ pub struct DsparkTuning {
 impl Default for DsparkTuning {
     fn default() -> Self {
         DsparkTuning {
-            ctx_kv: "contiguous".into(),
+            ctx_kv: "auto".into(),
             eager_attn: false,
         }
     }

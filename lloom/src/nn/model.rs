@@ -254,6 +254,27 @@ pub trait CacheRewind {
     fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
         self.rewind(n)
     }
+
+    /// Whether [`Self::restore`] can take the cache back to exactly `pos`
+    /// from a turn checkpoint — the state a multi-token pass left, kept with
+    /// enough of its input to stand at the positions just before its end.
+    ///
+    /// A chat turn re-renders the previous reply without the generation
+    /// prompt's trailing token (LFM2's `<think>`) and without the thinking it
+    /// opened, so the request diverges one position before the previous
+    /// prompt's end: past every rewind horizon and before every reply. The
+    /// checkpoint is what makes that a rewind instead of a fresh prefill
+    /// (`design/docs/sequence-reuse-design.md`). The default has none.
+    fn can_restore(&self, _pos: usize) -> bool {
+        false
+    }
+
+    /// Take the cache back to `pos` from a turn checkpoint: the KV to that
+    /// length, the recurrent state as a pass ending at `pos` leaves it.
+    /// Refused where [`Self::can_restore`] is false, before any mutation.
+    fn restore(&mut self, pos: usize) -> Result<()> {
+        lloom_tensor::bail!("this cache keeps no turn checkpoint to restore position {pos} from")
+    }
 }
 
 /// The verifier's entry and the speculative rollback seam.

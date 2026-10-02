@@ -587,6 +587,180 @@ pub struct HostFeedReport {
     /// fill, in a debug or `profile` build (empty in release, where the
     /// producer reads no clock).
     pub fill_ns: Vec<u64>,
+    /// The producer's scheduling class for the run (`LLOOM_HOST_FEED_QOS`),
+    /// and the errno of a refused claim (0 if none).
+    pub qos: crate::generation::QosClass,
+    pub qos_errno: i32,
+    /// How the producer waited between tokens (`LLOOM_HOST_FEED_POLL`).
+    pub poll: FeedWait,
+    /// The producer's waits by the spinning arm and by the sleeping one.
+    pub spun: u64,
+    pub slept: u64,
+    /// Under `LLOOM_HOST_FEED_TRACE`: per-fill host times and the
+    /// producer's scheduling, for the park a forward's wait can see.
+    pub trace: Option<HostFeedTrace>,
+}
+
+/// How the host fill's producer waits for the next token
+/// (`LLOOM_HOST_FEED_POLL`).
+///
+/// A spinning wait holds a core for as long as it spins, and while a core
+/// spins through the streamed tier's host-planned pass the GPU runs that pass
+/// at low clocks; a wait that sleeps throughout costs the pipelined decode
+/// ~0.5 ms a token (`expert-streaming.md` §20.14a). [`FeedWait::OnDemand`]
+/// spins only while a forward already waits for a value the producer has not
+/// filled — the pipelined case — and sleeps otherwise, which is every token
+/// of a host-planned pass: there the host encodes a forward's wait only after
+/// it has itself waited for the token the producer fills from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedWait {
+    /// One poll arm throughout.
+    Fixed(crate::generation::poll::PollMechanism),
+    /// [`crate::generation::poll::PollMechanism::DEFAULT`] while a wait is
+    /// pending on an unfilled value, a sleep of `idle_us` otherwise.
+    OnDemand { idle_us: u64 },
+}
+
+impl Default for FeedWait {
+    fn default() -> Self {
+        FeedWait::OnDemand { idle_us: 50 }
+    }
+}
+
+impl FeedWait {
+    /// The arm for the next wait, given the highest value a forward of the
+    /// run waits for and the values filled so far.
+    pub fn arm(self, demanded: u64, filled: u64) -> crate::generation::poll::PollMechanism {
+        match self {
+            FeedWait::Fixed(m) => m,
+            FeedWait::OnDemand { .. } if demanded > filled => {
+                crate::generation::poll::PollMechanism::DEFAULT
+            }
+            FeedWait::OnDemand { idle_us } => crate::generation::poll::PollMechanism::Sleep(
+                std::time::Duration::from_micros(idle_us),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for FeedWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeedWait::Fixed(m) => write!(f, "{m}"),
+            FeedWait::OnDemand { idle_us } => write!(f, "on-demand:{idle_us}"),
+        }
+    }
+}
+
+impl std::str::FromStr for FeedWait {
+    type Err = String;
+
+    /// `on-demand` (a 50 µs idle sleep), `on-demand:<µs>`, or any
+    /// [`crate::generation::poll::PollMechanism`] spelling for one arm
+    /// throughout.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim();
+        if s == "on-demand" {
+            return Ok(FeedWait::default());
+        }
+        if let Some(us) = s.strip_prefix("on-demand:") {
+            return us
+                .parse::<u64>()
+                .map(|idle_us| FeedWait::OnDemand { idle_us })
+                .map_err(|e| format!("host feed wait {s:?}: bad microseconds: {e}"));
+        }
+        s.parse::<crate::generation::poll::PollMechanism>()
+            .map(FeedWait::Fixed)
+    }
+}
+
+/// One traced run of the host fill's producer (`LLOOM_HOST_FEED_TRACE`), on
+/// the clock of [`crate::nn::ngram_memory::trace_now_ns`]. Index `k - 1` is
+/// run value `k`: the forward that waits for it, the token it is filled
+/// from.
+#[derive(Debug, Clone, Default)]
+pub struct HostFeedTrace {
+    /// When the waiting forward's wait was first encoded on the host.
+    pub encoded_ns: Vec<Option<u64>>,
+    /// When the producer read the token's stamp.
+    pub observed_ns: Vec<u64>,
+    /// When the producer raised the event for it.
+    pub signalled_ns: Vec<u64>,
+    /// Passes of the producer's loop, and the longest wall time between two
+    /// of them: a gap far above the poll's own wait is time the thread was
+    /// not running.
+    pub iterations: u64,
+    pub max_gap_ns: u64,
+    /// Gaps over 1 ms: how many, and their total.
+    pub gaps_over_1ms: u64,
+    pub gap_over_1ms_ns: u64,
+    /// The producer thread's CPU time and wall time over the run.
+    pub cpu_ns: u64,
+    pub wall_ns: u64,
+    /// The prefetcher's reader threads' and the PLE read pool's classes.
+    pub prefetch_qos: crate::generation::QosClass,
+    pub read_pool_qos: crate::generation::QosClass,
+}
+
+impl HostFeedTrace {
+    /// One line for a harness log: the classes, the loop, and the three
+    /// per-fill intervals (µs) the park is read from.
+    pub fn line(&self, qos: crate::generation::QosClass, poll: &str) -> String {
+        fn dist(mut v: Vec<i64>) -> String {
+            if v.is_empty() {
+                return "n=0".into();
+            }
+            v.sort_unstable();
+            let q = |p: f64| v[((v.len() - 1) as f64 * p).round() as usize] as f64 / 1e3;
+            format!(
+                "n={} p50={:.1} p90={:.1} p99={:.1} max={:.1}",
+                v.len(),
+                q(0.5),
+                q(0.9),
+                q(0.99),
+                q(1.0)
+            )
+        }
+        let n = self.observed_ns.len().min(self.signalled_ns.len());
+        let mut late = Vec::new();
+        let mut park = Vec::new();
+        let mut fill = Vec::new();
+        let mut parked = 0usize;
+        let mut park_sum = 0i64;
+        for i in 0..n {
+            let (o, s) = (self.observed_ns[i] as i64, self.signalled_ns[i] as i64);
+            fill.push(s - o);
+            if let Some(Some(e)) = self.encoded_ns.get(i) {
+                let e = *e as i64;
+                late.push(o - e);
+                park.push(s - e);
+                if s > e {
+                    parked += 1;
+                    park_sum += s - e;
+                }
+            }
+        }
+        format!(
+            "producer_qos={} poll={poll} prefetch_qos={} read_pool_qos={} cpu_ms={:.1} wall_ms={:.1} \
+             cpu_wall={:.3} iterations={} max_gap_us={:.1} gaps_over_1ms={} gap_over_1ms_ms={:.1} \
+             signalled_after_encode={parked} signal_minus_encode_sum_ms={:.1} \
+             observed_minus_encode_us=[{}] signal_minus_encode_us=[{}] signal_minus_observed_us=[{}]",
+            qos.as_str(),
+            self.prefetch_qos.as_str(),
+            self.read_pool_qos.as_str(),
+            self.cpu_ns as f64 / 1e6,
+            self.wall_ns as f64 / 1e6,
+            self.cpu_ns as f64 / self.wall_ns.max(1) as f64,
+            self.iterations,
+            self.max_gap_ns as f64 / 1e3,
+            self.gaps_over_1ms,
+            self.gap_over_1ms_ns as f64 / 1e6,
+            park_sum as f64 / 1e6,
+            dist(late),
+            dist(park),
+            dist(fill),
+        )
+    }
 }
 
 /// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
@@ -1102,9 +1276,21 @@ struct FeedThread {
     handle: Option<std::thread::JoinHandle<Result<Produced>>>,
 }
 
-/// What the producer hands back: its fill (the tokens it filled) and each
-/// fill's host time.
-type Produced = (crate::nn::ngram_memory::NgramFill, Vec<u64>);
+/// What the producer hands back: its fill (the tokens it filled), each
+/// fill's host time, its class and its trace.
+type Produced = (crate::nn::ngram_memory::NgramFill, ProducerRun);
+
+/// The producer's own account of a run.
+#[derive(Default)]
+struct ProducerRun {
+    fill_ns: Vec<u64>,
+    qos: crate::generation::QosClass,
+    qos_errno: i32,
+    poll: FeedWait,
+    spun: u64,
+    slept: u64,
+    trace: Option<HostFeedTrace>,
+}
 
 impl FeedThread {
     fn start(
@@ -1121,7 +1307,7 @@ impl FeedThread {
             .name("host-feed".into())
             .spawn(
                 move || match produce(&mut fill, &mut reader, &link_t, &done_t) {
-                    Ok(fill_ns) => Ok((fill, fill_ns)),
+                    Ok(run) => Ok((fill, run)),
                     Err(e) => {
                         link_t.fail(&e);
                         Err(e)
@@ -1146,13 +1332,32 @@ impl FeedThread {
     fn finish(mut self) -> Result<(Vec<u32>, HostFeedReport)> {
         self.done.store(true, std::sync::atomic::Ordering::Release);
         let handle = self.handle.take().expect("finished once");
-        let (fill, fill_ns) = handle
+        let (fill, run) = handle
             .join()
             .map_err(|_| lloom_tensor::Error::Msg("host feed: the producer panicked".into()))??;
+        let poll = run.poll;
+        let trace = run.trace.map(|mut t| {
+            t.encoded_ns = (1..=t.observed_ns.len() as u64)
+                .map(|k| self.link.encoded_ns(k))
+                .collect();
+            eprintln!(
+                "HOSTFEED {} spun={} slept={}",
+                t.line(run.qos, &poll.to_string()),
+                run.spun,
+                run.slept
+            );
+            t
+        });
         let report = HostFeedReport {
             fills: fill.filled(),
             forwards: self.link.demanded(),
-            fill_ns,
+            fill_ns: run.fill_ns,
+            qos: run.qos,
+            qos_errno: run.qos_errno,
+            poll,
+            spun: run.spun,
+            slept: run.slept,
+            trace,
         };
         Ok((fill.into_consumed(), report))
     }
@@ -1168,19 +1373,75 @@ impl Drop for FeedThread {
     }
 }
 
+/// How the producer waits between tokens (`LLOOM_HOST_FEED_POLL`, read once).
+fn feed_poll() -> FeedWait {
+    static POLL: std::sync::OnceLock<FeedWait> = std::sync::OnceLock::new();
+    *POLL.get_or_init(|| {
+        crate::tuning::tuning()
+            .ring
+            .feed_poll
+            .parse()
+            // The knob's parser has already refused anything else.
+            .unwrap_or_default()
+    })
+}
+
+/// The calling thread's CPU time (0 where the clock is unavailable).
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a pointer to a live local.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    if rc == 0 {
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    } else {
+        0
+    }
+}
+
 /// The producer's loop: fill every token the ring stamps until `done` and
-/// every demanded value is filled (or the run released its waits). Each
-/// fill's host time in a debug or `profile` build.
+/// every demanded value is filled (or the run released its waits). The GPU
+/// waits on this thread, so it takes its stated class first
+/// (`docs/invariants.md` §15.2 #10b) and spins only while a forward waits on
+/// it ([`FeedWait`]). Each fill's host time in a debug or
+/// `profile` build; the trace under `LLOOM_HOST_FEED_TRACE`.
 fn produce(
     fill: &mut crate::nn::ngram_memory::NgramFill,
     reader: &mut crate::generation::RingReader,
     link: &crate::nn::ngram_memory::FeedLink,
     done: &std::sync::atomic::AtomicBool,
-) -> Result<Vec<u64>> {
-    let mechanism = crate::generation::poll::PollMechanism::DEFAULT;
+) -> Result<ProducerRun> {
+    use crate::nn::ngram_memory::trace_now_ns;
+    let (qos, qos_errno) =
+        crate::generation::hot_thread::claim_for_spawned(&crate::tuning::tuning().ring.feed_qos);
+    let wait = feed_poll();
+    let mut run = ProducerRun {
+        qos,
+        qos_errno,
+        poll: wait,
+        ..ProducerRun::default()
+    };
+    let mut trace = link.traced().then(|| HostFeedTrace {
+        cpu_ns: thread_cpu_ns(),
+        wall_ns: trace_now_ns(),
+        ..HostFeedTrace::default()
+    });
+    let mut last = trace.as_ref().map_or(0, |t| t.wall_ns);
     let mut tokens: Vec<u32> = Vec::with_capacity(64);
-    let mut fill_ns: Vec<u64> = Vec::new();
     loop {
+        if let Some(t) = trace.as_mut() {
+            let now = trace_now_ns();
+            let gap = now - last;
+            last = now;
+            t.iterations += 1;
+            t.max_gap_ns = t.max_gap_ns.max(gap);
+            if gap > 1_000_000 {
+                t.gaps_over_1ms += 1;
+                t.gap_over_1ms_ns += gap;
+            }
+        }
         tokens.clear();
         reader
             .read_all_new(&mut tokens)
@@ -1189,18 +1450,47 @@ fn produce(
             if done.load(std::sync::atomic::Ordering::Acquire)
                 && (fill.filled() >= link.demanded() || link.released())
             {
-                return Ok(fill_ns);
+                if let Some(mut t) = trace.take() {
+                    t.cpu_ns = thread_cpu_ns().saturating_sub(t.cpu_ns);
+                    t.wall_ns = trace_now_ns() - t.wall_ns;
+                    t.prefetch_qos = prefetch_worker_qos();
+                    t.read_pool_qos = crate::nn::ngram_memory::read_pool_qos();
+                    run.trace = Some(t);
+                }
+                return Ok(run);
             }
-            reader.wait_for_publish(mechanism);
+            let arm = wait.arm(link.demanded(), fill.filled());
+            match arm {
+                crate::generation::poll::PollMechanism::Sleep(_) => run.slept += 1,
+                _ => run.spun += 1,
+            }
+            reader.wait_for_publish(arm);
             continue;
         }
+        let observed = if trace.is_some() { trace_now_ns() } else { 0 };
         for &t in &tokens {
             #[cfg(any(debug_assertions, feature = "profile"))]
             let t0 = std::time::Instant::now();
             fill.fill(t)?;
             #[cfg(any(debug_assertions, feature = "profile"))]
-            fill_ns.push(t0.elapsed().as_nanos() as u64);
+            run.fill_ns.push(t0.elapsed().as_nanos() as u64);
+            if let Some(tr) = trace.as_mut() {
+                tr.observed_ns.push(observed);
+                tr.signalled_ns.push(trace_now_ns());
+            }
         }
+    }
+}
+
+/// The prefetcher's reader threads' class, where the tier exists.
+fn prefetch_worker_qos() -> crate::generation::QosClass {
+    #[cfg(feature = "metal")]
+    {
+        crate::nn::expert_prefetch::worker_qos()
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        crate::generation::QosClass::Unknown
     }
 }
 

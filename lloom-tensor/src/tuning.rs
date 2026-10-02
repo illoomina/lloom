@@ -443,8 +443,8 @@ pub struct MoeTuning {
     /// Gate and up of a routed layer in one launch on the matmul-vec arm (`kernel_mul_mv_id2`; a GEMM tile always takes two); off = two launches, the A/B arm.
     #[opt(flag = "moe-pair", env = "LLOOM_MOE_PAIR", bool)]
     pub pair: bool,
-    /// Where the pair's half sits in its launch's grid: `half` (the slowest axis), `expert` (an expert's gate and up adjacent), `tile` (a row tile's gate and up adjacent), or `split` (the pair's kernel once a half, the A/B's discriminator). Same bits on every arm.
-    #[opt(flag = "moe-pair-order", env = "LLOOM_MOE_PAIR_ORDER", parser = "parse_pair_order", variants = ["half", "expert", "tile", "split"])]
+    /// Where the pair's half sits in its launch's grid: `expert` (an expert's gate and up adjacent, the default), `half` (the slowest axis, read by a division: the previous default), `half-cmp` (the same, read by a compare), `tile` (a row tile's gate and up adjacent), or `split` (the pair's kernel once a half, a discriminator). Same bits on every arm.
+    #[opt(flag = "moe-pair-order", env = "LLOOM_MOE_PAIR_ORDER", parser = "parse_pair_order", variants = ["expert", "half", "half-cmp", "tile", "split"])]
     pub pair_order: String,
 }
 
@@ -454,7 +454,7 @@ impl Default for MoeTuning {
             mm_from: 64,
             mm_bn: 0,
             pair: true,
-            pair_order: "half".into(),
+            pair_order: "expert".into(),
         }
     }
 }

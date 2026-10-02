@@ -231,3 +231,12 @@ fn each_order_names_its_grid_and_constant() {
     );
     assert_eq!(PairGrid::OneHalf.order(), 0);
 }
+
+/// The order a process runs without `LLOOM_MOE_PAIR_ORDER` is `expert`, the
+/// fastest at the decode step's shape (`expert-streaming.md` §20.15e). Read
+/// off the tuning's default, since this binary sets the variable.
+#[test]
+fn the_default_order_is_expert() {
+    let default = lloom_tensor::tuning::Tuning::default().moe.pair_order;
+    assert_eq!(PairOrder::parse(&default), Ok(PairOrder::Expert));
+}

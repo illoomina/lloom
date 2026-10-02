@@ -1720,17 +1720,19 @@ impl MoeArm {
 }
 
 /// How the routed gate|up pair lays its two halves out on Metal
-/// (`LLOOM_MOE_PAIR_ORDER`): one launch with the half on the grid's slowest
-/// axis, next to the plane, or on its fastest axis; or the pair's kernel
-/// launched once a half. Every order computes each plane with the same core,
-/// so the bits never depend on it (`docs/expert-streaming.md` §20.15e).
+/// (`LLOOM_MOE_PAIR_ORDER`): one launch with the half next to the plane (the
+/// default), on the grid's slowest axis, or on its fastest axis; or the
+/// pair's kernel launched once a half. Every order computes each plane with
+/// the same core, so the bits never depend on it; the default is the one the
+/// decode step runs fastest (`docs/expert-streaming.md` §20.15e).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairOrder {
-    /// Gate's planes, then up's: the incumbent.
+    /// Gate's planes, then up's, the half read by a division (the previous
+    /// default).
     Half,
-    /// The incumbent's grid, the half read by a compare, not a division.
+    /// [`PairOrder::Half`]'s grid, the half read by a compare.
     HalfCmp,
-    /// One expert's gate and up planes adjacent.
+    /// One expert's gate and up planes adjacent: the default.
     Expert,
     /// One row tile's gate and up threadgroups adjacent.
     Tile,

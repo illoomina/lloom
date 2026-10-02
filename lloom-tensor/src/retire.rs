@@ -76,8 +76,16 @@ impl std::fmt::Display for Completed {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Tick(pub u64);
 
+impl std::fmt::Display for Tick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl Tick {
     pub const ZERO: Tick = Tick(0);
+    /// A tick no use is ever in: "protect nothing" for a victim search.
+    pub const NEVER: Tick = Tick(u64::MAX);
 
     /// The next tick.
     pub fn next(self) -> Tick {

@@ -103,7 +103,35 @@
 /// §3.5's `useResource` requirement makes expensive. Indices keep everything
 /// `base + offset` — the kernel computes `kv_pool + page_idx * page_stride`, one
 /// base pointer and arithmetic on a number.
-pub type PageIdx = u32;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct PageIdx(pub u32);
+
+impl PageIdx {
+    /// The page's position in the pool's arrays.
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The page at position `i`.
+    pub fn from_index(i: usize) -> Self {
+        Self(i as u32)
+    }
+
+    /// The indices as the kernel reads them (`base + page × stride`): the
+    /// same bytes, viewed as `u32`.
+    pub fn as_u32s(pages: &[PageIdx]) -> &[u32] {
+        // SAFETY: `PageIdx` is `repr(transparent)` over `u32`, so a slice of
+        // one is a slice of the other, same length and alignment.
+        unsafe { std::slice::from_raw_parts(pages.as_ptr() as *const u32, pages.len()) }
+    }
+}
+
+impl std::fmt::Display for PageIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 pub use crate::retire::{Completed, Epoch, Retire};
 
@@ -262,7 +290,7 @@ impl KvPagePool {
         // `ChunkTable::Contiguous` and a fresh paged pool are the same table and
         // #568's page-invariance digests stay comparable. A recycled pool then
         // diverges from it, which is the fixture §10.3h needs.
-        let free: Vec<PageIdx> = (0..pool_pages as PageIdx).rev().collect();
+        let free: Vec<PageIdx> = (0..pool_pages).rev().map(PageIdx::from_index).collect();
         Self {
             page_size: page_size.max(1),
             free,
@@ -314,8 +342,11 @@ impl KvPagePool {
     /// that could not name the new pages would report `TableFull` for a pool
     /// with room.
     pub fn grow(&mut self, extra: usize) {
-        let first = self.refcount.len() as PageIdx;
-        let fresh: Vec<PageIdx> = (first..first + extra as PageIdx).rev().collect();
+        let first = self.refcount.len();
+        let fresh: Vec<PageIdx> = (first..first + extra)
+            .rev()
+            .map(PageIdx::from_index)
+            .collect();
         self.free.splice(0..0, fresh);
         self.refcount.extend(std::iter::repeat_n(0, extra));
         self.table_capacity_pages += extra;
@@ -341,7 +372,7 @@ impl KvPagePool {
                 let page = self.free.pop().ok_or(PageError::Exhausted {
                     pool_pages: self.refcount.len(),
                 })?;
-                self.refcount[page as usize] += 1;
+                self.refcount[page.index()] += 1;
                 self.seqs[seq].pages.push(page);
                 fresh.push(page);
             }
@@ -376,7 +407,7 @@ impl KvPagePool {
             let page = self.free.pop().ok_or(PageError::Exhausted {
                 pool_pages: self.refcount.len(),
             })?;
-            self.refcount[page as usize] += 1;
+            self.refcount[page.index()] += 1;
             self.seqs[seq].pages.push(page);
             fresh.push(page);
         }
@@ -424,11 +455,11 @@ impl KvPagePool {
     /// linearly from it, so at `k > 1` the pages of a chunk must be consecutive.
     /// [`Self::chunk_pages_are_contiguous`] is the check, and it is a check
     /// rather than an assumption because §3.5 makes the failure silent.
-    pub fn table_for(&self, seq: usize, pages_per_chunk: usize) -> Vec<PageIdx> {
+    pub fn table_for(&self, seq: usize, pages_per_chunk: usize) -> Vec<u32> {
         let k = pages_per_chunk.max(1);
         self.seqs
             .get(seq)
-            .map(|s| s.pages.iter().copied().step_by(k).collect())
+            .map(|s| s.pages.iter().step_by(k).map(|p| p.0).collect())
             .unwrap_or_default()
     }
 
@@ -449,7 +480,7 @@ impl KvPagePool {
         };
         s.pages
             .chunks(k)
-            .all(|run| run.windows(2).all(|w| w[1] == w[0] + 1))
+            .all(|run| run.windows(2).all(|w| w[1].0 == w[0].0 + 1))
     }
 
     /// Point `dst`'s first `n_pages` at `src`'s, sharing them (§10.3g).
@@ -479,12 +510,12 @@ impl KvPagePool {
             });
         }
         for &p in &pages {
-            if self.refcount[p as usize] == 0 {
+            if self.refcount[p.index()] == 0 {
                 return Err(PageError::NotAllocated { page: p });
             }
         }
         for &p in &pages {
-            self.refcount[p as usize] += 1;
+            self.refcount[p.index()] += 1;
             self.seqs[dst].pages.push(p);
             self.seqs[dst].len += self.page_size;
         }
@@ -516,7 +547,7 @@ impl KvPagePool {
         self.seqs[seq].len = 0;
         let mut freed = Vec::new();
         for p in pages {
-            let rc = &mut self.refcount[p as usize];
+            let rc = &mut self.refcount[p.index()];
             *rc -= 1;
             if *rc == 0 {
                 freed.push(p);
@@ -537,7 +568,7 @@ impl KvPagePool {
     /// call is safe, and it is the half §10.3h says no fence can substitute for.
     pub fn recycle(&mut self, pages: &[PageIdx]) -> Result<(), PageError> {
         for &p in pages {
-            if self.refcount[p as usize] != 0 {
+            if self.refcount[p.index()] != 0 {
                 return Err(PageError::NotAllocated { page: p });
             }
             self.free.push(p);

@@ -694,7 +694,7 @@ impl KvPool {
             .lock()
             .pages
             .seq(slot)
-            .map(|s| s.pages().to_vec())
+            .map(|s| lloom_tensor::kv_pages::PageIdx::as_u32s(s.pages()).to_vec())
             .unwrap_or_default()
     }
 
@@ -742,7 +742,7 @@ impl KvPool {
         let out: Vec<u32> = {
             let pages = g.pages.seq(slot).expect("a leased slot").pages();
             (start..need)
-                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
                 .collect()
         };
         g.layers[layer].lens[slot] = need;
@@ -827,7 +827,7 @@ impl KvPool {
             let ps = g.page_size;
             let pages = g.pages.seq(slot).expect("a leased slot").pages();
             let ids: Vec<u32> = (0..len)
-                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
                 .collect();
             (pk, pv, ids)
         };

@@ -7,10 +7,16 @@
 //! a table that is **not** the identity before the kernel that reads one is
 //! worth writing.
 
-use super::kv_pages::{reserve_pages_for, KvPagePool, PageError, PageQuarantine};
+use super::kv_pages::{reserve_pages_for, KvPagePool, PageError, PageIdx, PageQuarantine};
 use crate::retire::{Completed, Epoch};
 
 /// A pool sized so the tests below can exhaust it deliberately.
+
+/// Page indices from their numbers, for the assertions.
+fn pg<const N: usize>(pages: [u32; N]) -> Vec<PageIdx> {
+    pages.into_iter().map(PageIdx).collect()
+}
+
 fn pool(pool_pages: usize) -> KvPagePool {
     KvPagePool::new(4, pool_pages, 4, 64)
 }
@@ -86,7 +92,7 @@ fn a_recycled_pool_produces_a_non_identity_table() {
 
     // Sequence 0 goes away and its pages are recycled.
     let freed = p.release(0);
-    assert_eq!(freed, vec![0, 1]);
+    assert_eq!(freed, pg([0, 1]));
     p.recycle(&freed).unwrap();
 
     // A third sequence now takes them back in free-list order (LIFO), so its
@@ -157,7 +163,7 @@ fn a_shared_page_returns_only_on_the_last_release() {
     assert_eq!(p.pages_in_use(), 2);
     assert_eq!(
         p.release(1),
-        vec![0, 1],
+        pg([0, 1]),
         "the last referent's release is what frees the pages"
     );
     assert_eq!(p.pages_in_use(), 0);
@@ -188,8 +194,8 @@ fn exhaustion_is_a_loud_failure() {
 fn recycling_a_live_page_is_refused() {
     let mut p = pool(8);
     p.append(0, 4).unwrap();
-    let err = p.recycle(&[0]).unwrap_err();
-    assert_eq!(err, PageError::NotAllocated { page: 0 });
+    let err = p.recycle(&[PageIdx(0)]).unwrap_err();
+    assert_eq!(err, PageError::NotAllocated { page: PageIdx(0) });
 }
 
 /// The saving paging buys at B>1, computed from an allocation history rather
@@ -304,12 +310,12 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
 
     // Sequence 0 takes pages 0 and 1; a command buffer in epoch 7 reads them.
     let taken = p.append(0, 8).unwrap();
-    assert_eq!(taken, vec![0, 1], "a fresh pool hands out the identity");
+    assert_eq!(taken, pg([0, 1]), "a fresh pool hands out the identity");
     let reading_epoch = Epoch(7);
 
     // The CPU gives the sequence up. The refcount half says the pages are free.
     let freed = p.release(0);
-    assert_eq!(freed, vec![0, 1], "both pages lost their last CPU referent");
+    assert_eq!(freed, pg([0, 1]), "both pages lost their last CPU referent");
 
     // The epoch half says they are not yet SAFE, which is the distinction the
     // whole mechanism exists to make.
@@ -321,7 +327,7 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
     // off-by-one, inherited rather than re-derived).
     assert_eq!(
         q.drain(Completed(7)),
-        Vec::<u32>::new(),
+        Vec::<PageIdx>::new(),
         "the reader is still in flight; nothing may be recycled"
     );
     assert_eq!(q.held(), 2, "and the pages are still held");
@@ -331,7 +337,7 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
     let next = p.append(1, 8).unwrap();
     assert_eq!(
         next,
-        vec![2, 3],
+        pg([2, 3]),
         "sequence 1 must be served from untouched pages while 0 and 1 are in \
          flight; serving [0, 1] here is the write-after-read across sequences \
          DESIGN.md 10.3h forbids"
@@ -339,7 +345,7 @@ fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
 
     // Once epoch 7 finishes, the pages become eligible and the pool takes them.
     let ready = q.drain(Completed(8));
-    assert_eq!(ready, vec![0, 1]);
+    assert_eq!(ready, pg([0, 1]));
     assert_eq!(q.held(), 0);
     p.recycle(&ready).unwrap();
     assert_eq!(p.pages_free(), 2, "both are back on the free list");
@@ -365,7 +371,7 @@ fn recycling_without_the_epoch_hands_back_a_page_the_gpu_is_reading() {
     let next = p.append(1, 8).unwrap();
     assert_eq!(
         next,
-        vec![1, 0],
+        pg([1, 0]),
         "this is the DEFECT, pinned so the quarantine's contribution is a \
          measured difference rather than a claim: sequence 1 is handed the very \
          pages an in-flight command buffer is reading"
@@ -382,21 +388,21 @@ fn recycling_without_the_epoch_hands_back_a_page_the_gpu_is_reading() {
 #[test]
 fn the_quarantine_drains_in_epoch_order_and_stops_at_the_first_unfinished() {
     let mut q = PageQuarantine::new();
-    q.retire_all(Epoch(1), vec![10, 11]);
-    q.retire_all(Epoch(2), vec![20]);
-    q.retire_all(Epoch(5), vec![50, 51]);
+    q.retire_all(Epoch(1), pg([10, 11]));
+    q.retire_all(Epoch(2), pg([20]));
+    q.retire_all(Epoch(5), pg([50, 51]));
     assert_eq!(q.held(), 5);
 
     // Epoch 1 finished (count 2 == epochs 0 and 1 done), 2 has not.
-    assert_eq!(q.drain(Completed(2)), vec![10, 11]);
+    assert_eq!(q.drain(Completed(2)), pg([10, 11]));
     assert_eq!(q.held(), 3, "epoch 2's and epoch 5's pages stay");
 
     // Epoch 2 finished; epoch 5 has not, so the walk must stop rather than
     // sweeping the whole list.
-    assert_eq!(q.drain(Completed(3)), vec![20]);
+    assert_eq!(q.drain(Completed(3)), pg([20]));
     assert_eq!(q.held(), 2);
 
-    assert_eq!(q.drain(Completed(6)), vec![50, 51]);
+    assert_eq!(q.drain(Completed(6)), pg([50, 51]));
     assert!(q.is_empty());
 }
 
@@ -521,15 +527,15 @@ fn reserved_pages_are_filled_before_new_ones_are_allocated() {
     let mut p = pool(16);
     assert_eq!(
         p.append(0, 3).unwrap(),
-        vec![0],
+        pg([0]),
         "the first token opens page 0"
     );
     // Room for 6 more past len 3 at page size 4: pages [0, 1, 2] (12 slots >= 9).
-    assert_eq!(p.reserve(0, 6).unwrap(), vec![1, 2]);
+    assert_eq!(p.reserve(0, 6).unwrap(), pg([1, 2]));
     assert_eq!(p.table_for(0, 1), vec![0, 1, 2]);
     assert_eq!(p.seq(0).unwrap().len(), 3, "reserve moves no live length");
     // Already covered: a second reserve allocates nothing.
-    assert_eq!(p.reserve(0, 6).unwrap(), Vec::<u32>::new());
+    assert_eq!(p.reserve(0, 6).unwrap(), Vec::<PageIdx>::new());
     // Nine appends consume the reserve; the boundary token 13 opens page 3.
     let fresh: Vec<usize> = (0..10).map(|_| p.append(0, 1).unwrap().len()).collect();
     assert_eq!(fresh, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -537,7 +543,7 @@ fn reserved_pages_are_filled_before_new_ones_are_allocated() {
     // A rewind keeps the reserved pages; a release returns them all.
     p.rewind(0, 10).unwrap();
     assert_eq!(p.table_for(0, 1), vec![0, 1, 2, 3]);
-    assert_eq!(p.release(0), vec![0, 1, 2, 3]);
+    assert_eq!(p.release(0), pg([0, 1, 2, 3]));
 }
 
 /// A reserve past the pool is the same loud failure an append past it is.

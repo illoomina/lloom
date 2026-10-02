@@ -17,7 +17,7 @@ use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
-use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
+use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageIdx, PageQuarantine};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
@@ -2225,7 +2225,7 @@ impl PagedKv {
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
             for t in start..start + seq_len {
                 slots.push(
-                    (pages[t / self.page_size] * self.page_size as u32)
+                    (pages[t / self.page_size].0 * self.page_size as u32)
                         + (t % self.page_size) as u32,
                 );
             }
@@ -2357,7 +2357,7 @@ impl PagedKv {
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
             let ids: Vec<u32> = (0..n_prev)
                 .map(|t| {
-                    pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32
+                    pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32
                 })
                 .collect();
             let ids = Tensor::new(ids.as_slice(), device)?;
@@ -2499,7 +2499,7 @@ impl PagedKv {
             })?;
             let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
             for t in start..start + n {
-                slots.push((pages[t / page_size] * page_size as u32) + (t % page_size) as u32);
+                slots.push((pages[t / page_size].0 * page_size as u32) + (t % page_size) as u32);
             }
         }
         let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
@@ -2517,7 +2517,7 @@ impl PagedKv {
                 )
             }
             n_keys.push(seq.len() as u32);
-            pages.push(seq.pages().to_vec());
+            pages.push(PageIdx::as_u32s(seq.pages()).to_vec());
             per_row.push(pool.table_for(slot, ppc));
         }
         let table_stride = n_keys
@@ -2611,7 +2611,7 @@ impl PagedKv {
             .expect("the layer has a pool once a token was written");
         let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
         let ids: Vec<u32> = (0..n_prev)
-            .map(|t| pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32)
+            .map(|t| pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32)
             .collect();
         let ids = Tensor::new(ids.as_slice(), device)?;
         Ok((pk.index_select(&ids, 2)?, pv.index_select(&ids, 2)?))
@@ -2627,7 +2627,7 @@ impl PagedKv {
 
     /// Drop slot `slot`'s pages into the quarantine; returns the pages whose
     /// last referent this was.
-    fn release_slot(&mut self, slot: usize) -> Vec<u32> {
+    fn release_slot(&mut self, slot: usize) -> Vec<PageIdx> {
         let Some(pool) = self.pool.as_mut() else {
             return Vec::new();
         };
@@ -2638,7 +2638,7 @@ impl PagedKv {
     }
 
     /// Slot `slot`'s page table.
-    fn row_pages(&self, slot: usize) -> Vec<u32> {
+    fn row_pages(&self, slot: usize) -> Vec<PageIdx> {
         self.pool
             .as_ref()
             .and_then(|p| p.seq(slot))
@@ -2747,7 +2747,7 @@ struct BatchInner {
     /// when a row's pass begins at a page boundary, dropped when the page's
     /// last referent goes. What a row sharing the page starts its own ring
     /// from (`batched-decode-design.md` §12.3).
-    snapshots: HashMap<u32, RingSnapshot>,
+    snapshots: HashMap<PageIdx, RingSnapshot>,
     /// Whether the layers take the batched arms (one dispatch per kernel for
     /// the batch) or the per-row loop over the same pool — the A/B, and the
     /// identity gate's two arms. `LLOOM_148_ROWS_ARM=per-row` turns them off.

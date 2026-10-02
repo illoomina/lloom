@@ -101,7 +101,7 @@ impl Model {
     fn new(f: &Fixture) -> Self {
         Self {
             page_size: f.page_size.max(1),
-            free: (0..f.pool_pages as PageIdx).rev().collect(),
+            free: (0..f.pool_pages).rev().map(PageIdx::from_index).collect(),
             refcount: vec![0; f.pool_pages],
             seqs: vec![(Vec::new(), 0); f.max_seqs],
             table_capacity: f.table_capacity_pages,
@@ -139,7 +139,7 @@ impl Model {
                 let page = self.free.pop().ok_or(PageError::Exhausted {
                     pool_pages: self.pool_pages(),
                 })?;
-                self.refcount[page as usize] += 1;
+                self.refcount[page.index()] += 1;
                 self.seqs[seq].0.push(page);
                 fresh.push(page);
             }
@@ -265,7 +265,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                         at(format!("share_prefix({src}, {dst}, {pages}) refused: {e}"))
                     })?;
                     for p in &shared {
-                        model.refcount[*p as usize] += 1;
+                        model.refcount[p.index()] += 1;
                         model.seqs[dst].0.push(*p);
                         model.seqs[dst].1 += model.page_size;
                     }
@@ -280,7 +280,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                 let (pages, _) = std::mem::take(&mut model.seqs[seq]);
                 let mut want = Vec::new();
                 for p in pages {
-                    let rc = &mut model.refcount[p as usize];
+                    let rc = &mut model.refcount[p.index()];
                     *rc -= 1;
                     if *rc == 0 {
                         want.push(p);
@@ -354,8 +354,11 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
             }
             Op::Grow { extra } => {
                 pool.grow(extra);
-                let first = model.pool_pages() as PageIdx;
-                let fresh: Vec<PageIdx> = (first..first + extra as PageIdx).rev().collect();
+                let first = model.pool_pages();
+                let fresh: Vec<PageIdx> = (first..first + extra)
+                    .rev()
+                    .map(PageIdx::from_index)
+                    .collect();
                 model.free.splice(0..0, fresh);
                 model.refcount.extend(std::iter::repeat_n(0, extra));
                 model.table_capacity += extra;
@@ -364,11 +367,11 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
             Op::Table { seq, k } => {
                 let seq = seq as usize % n_seqs;
                 let table = pool.table_for(seq, k);
-                let want: Vec<PageIdx> = model.seqs[seq]
+                let want: Vec<u32> = model.seqs[seq]
                     .0
                     .iter()
-                    .copied()
                     .step_by(k.max(1))
+                    .map(|p| p.0)
                     .collect();
                 if table != want {
                     return Err(at(format!(
@@ -380,14 +383,14 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                     || model.seqs[seq]
                         .0
                         .chunks(k.max(1))
-                        .all(|run| run.windows(2).all(|w| w[1] == w[0] + 1));
+                        .all(|run| run.windows(2).all(|w| w[1].0 == w[0].0 + 1));
                 if contiguous != want_contig {
                     return Err(at(format!(
                         "chunk_pages_are_contiguous({seq}, {k}) = {contiguous}, model {want_contig}"
                     )));
                 }
-                let identity: Vec<PageIdx> = (0..want.len() as PageIdx)
-                    .map(|c| c * k.max(1) as PageIdx)
+                let identity: Vec<u32> = (0..want.len() as u32)
+                    .map(|c| c * k.max(1) as u32)
                     .collect();
                 if !want.is_empty() && want != identity {
                     eng.tables_non_identity += 1;
@@ -399,7 +402,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                 let seq = seq as usize % n_seqs;
                 let live: Vec<PageIdx> = model.seqs[seq].0.clone();
                 for p in live {
-                    if model.refcount[p as usize] > 0 {
+                    if model.refcount[p.index()] > 0 {
                         match pool.recycle(&[p]) {
                             Err(PageError::NotAllocated { page }) if page == p => {
                                 eng.recycle_refusals += 1;
@@ -409,7 +412,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                                     "recycle of live page {p} (refcount {}) returned {other:?}; \
                                      a live page handed back to the free list aliases two \
                                      sequences",
-                                    model.refcount[p as usize]
+                                    model.refcount[p.index()]
                                 )))
                             }
                         }
@@ -465,7 +468,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
         let n = model.pool_pages();
         let mut place = vec![0u8; n];
         for p in &model.free {
-            place[*p as usize] |= 1;
+            place[p.index()] |= 1;
         }
         for (p, rc) in model.refcount.iter().enumerate() {
             if *rc > 0 {
@@ -474,7 +477,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
         }
         for (_, pages) in &model.quarantined {
             for p in pages {
-                place[*p as usize] |= 4;
+                place[p.index()] |= 4;
             }
         }
         for (p, where_) in place.iter().enumerate() {
@@ -493,7 +496,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
         let mut named = vec![0u16; n];
         for (pages, _) in &model.seqs {
             for p in pages {
-                named[*p as usize] += 1;
+                named[p.index()] += 1;
             }
         }
         if named != model.refcount {

@@ -24,7 +24,7 @@
 
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::{GgmlDType, MoeArm, QTensor};
-use lloom_tensor::retire::{Completed, Epoch, Retire};
+use lloom_tensor::retire::{Completed, Epoch, Retire, Tick};
 use lloom_tensor::{Device, Result, Tensor};
 use std::fs::File;
 use std::ops::Range;
@@ -607,7 +607,7 @@ pub struct ResidencyMap {
     /// frequency profile the hotlist is (§20.3 R2).
     usage: Vec<u32>,
     expert_in: Vec<u32>,
-    last_use: Vec<u64>,
+    last_use: Vec<Tick>,
     pinned: Vec<bool>,
     /// Per slot, the `io` arm's event value its expert lands on — an
     /// in-flight entry (a hint issued, the DMA not yet waited for); 0 when
@@ -624,7 +624,7 @@ pub struct ResidencyMap {
     /// every slot's last reader is at least this recent. One store per plan
     /// instead of a stamp per slot.
     plan_epoch: Epoch,
-    tick: u64,
+    tick: Tick,
     /// Slots the quarantined arm keeps free (0: the in-place arm).
     spare: usize,
     /// Slots holding nothing whose last reader has completed.
@@ -647,12 +647,12 @@ impl ResidencyMap {
             slot_of: vec![NONE; n_experts],
             usage: vec![0; n_experts],
             expert_in: vec![NONE; n_slots],
-            last_use: vec![0; n_slots],
+            last_use: vec![Tick::ZERO; n_slots],
             pinned: vec![false; n_slots],
             inflight: vec![0; n_slots],
             last_epoch: vec![Epoch::ZERO; n_slots],
             plan_epoch: Epoch::ZERO,
-            tick: 0,
+            tick: Tick::ZERO,
             spare: 0,
             free: Vec::new(),
             quarantine: Retire::new(),
@@ -708,8 +708,8 @@ impl ResidencyMap {
 
     /// The least-recently-used RESIDENT unpinned slot not used in `tick` and
     /// not in flight.
-    fn lru_resident(&self, tick: u64) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
+    fn lru_resident(&self, tick: Tick) -> Option<usize> {
+        let mut best: Option<(usize, Tick)> = None;
         for s in 0..self.expert_in.len() {
             if self.expert_in[s] == NONE
                 || self.pinned[s]
@@ -730,7 +730,7 @@ impl ResidencyMap {
     /// is quarantined at `epoch` — every reader encoded so far is in an
     /// epoch at most `epoch` — or deferred while a device plan is open.
     /// Returns the expert evicted.
-    fn evict_lru(&mut self, tick: u64, epoch: Epoch, plan_open: bool) -> Option<u32> {
+    fn evict_lru(&mut self, tick: Tick, epoch: Epoch, plan_open: bool) -> Option<u32> {
         let s = self.lru_resident(tick)?;
         let e = self.uninstall(s);
         if plan_open {
@@ -782,12 +782,12 @@ impl ResidencyMap {
     }
 
     /// Open a new use epoch (one per `ensure`).
-    fn begin(&mut self) -> u64 {
-        self.tick += 1;
+    fn begin(&mut self) -> Tick {
+        self.tick = self.tick.next();
         self.tick
     }
 
-    fn touch(&mut self, slot: usize, tick: u64) {
+    fn touch(&mut self, slot: usize, tick: Tick) {
         self.last_use[slot] = tick;
     }
 
@@ -795,14 +795,14 @@ impl ResidencyMap {
     /// whether it held an expert (an eviction). An in-flight slot is taken
     /// only when no other is (the IO queue is in order, so the second load
     /// lands after the first; the hint's bytes were read for nothing).
-    fn victim(&self, tick: u64) -> Option<(usize, bool)> {
+    fn victim(&self, tick: Tick) -> Option<(usize, bool)> {
         self.victim_settled(tick, Completed::ALL)
     }
 
     /// [`Self::victim`] preferring a slot whose last GPU reader's epoch is
     /// below `settled_before` (the pool clock's completed count): a direct
     /// read into it waits for nothing. Falls back to any slot.
-    fn victim_settled(&self, tick: u64, settled_before: Completed) -> Option<(usize, bool)> {
+    fn victim_settled(&self, tick: Tick, settled_before: Completed) -> Option<(usize, bool)> {
         self.victim_in(tick, true, settled_before)
             .or_else(|| self.victim_in(tick, true, Completed::ALL))
             .or_else(|| self.victim_in(tick, false, Completed::ALL))
@@ -813,11 +813,11 @@ impl ResidencyMap {
     /// `settled_before`.
     fn victim_in(
         &self,
-        tick: u64,
+        tick: Tick,
         skip_inflight: bool,
         settled_before: Completed,
     ) -> Option<(usize, bool)> {
-        let mut best: Option<(usize, u64)> = None;
+        let mut best: Option<(usize, Tick)> = None;
         for s in 0..self.expert_in.len() {
             if self.pinned[s]
                 || self.last_use[s] == tick
@@ -1149,7 +1149,7 @@ struct Inner {
     /// dispatches are not all encoded yet (`down` closes it): the `io` arm's
     /// hint between the two must not give its slots away — the load is
     /// ordered after what IS encoded, nothing orders it after what is not.
-    open_epoch: Option<u64>,
+    open_epoch: Option<Tick>,
     /// That group's slots: stamped with the GPU epoch at `down` (their last
     /// reader's command buffer), for the direct read's wait.
     open_slots: Vec<usize>,
@@ -1830,7 +1830,7 @@ impl Streamed {
 
     /// Make every expert of `experts` resident within epoch `tick`, loading
     /// the misses; returns each one's slot.
-    fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
+    fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: Tick) -> Result<Vec<usize>> {
         let pending = self.resolve_begin(inner, experts, tick, true)?;
         self.resolve_finish(inner, pending)
     }
@@ -1848,7 +1848,7 @@ impl Streamed {
         &self,
         inner: &mut Inner,
         experts: &[u32],
-        tick: u64,
+        tick: Tick,
         replenish: bool,
     ) -> Result<Pending> {
         let mut slots = Vec::with_capacity(experts.len());
@@ -2270,7 +2270,7 @@ impl Streamed {
         // slots are never victims. Any other epoch's dispatches are encoded
         // and the load is ordered after them.
         let tick = inner.map.tick;
-        let protect = inner.open_epoch.unwrap_or(u64::MAX);
+        let protect = inner.open_epoch.unwrap_or(Tick::NEVER);
         let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(experts.len());
         for &e in experts {
             let e = e as usize;

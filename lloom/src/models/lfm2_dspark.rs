@@ -933,7 +933,9 @@ impl CtxCache {
 #[cfg(feature = "metal")]
 mod paged_ctx {
     use super::{Arc, Device, Mutex, Result, Tensor};
-    use lloom_tensor::kernels::metal::{Epoch, GpuClock, KvPagePool, PageError, PageQuarantine};
+    use lloom_tensor::kernels::metal::{
+        Epoch, GpuClock, KvPagePool, PageError, PageIdx, PageQuarantine,
+    };
 
     /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
     /// so a drafter and its target widen at the same cadence.
@@ -1131,8 +1133,8 @@ mod paged_ctx {
         }
 
         /// The token slot of position `t` in `pages`.
-        fn slot(pages: &[u32], t: usize, page_size: usize) -> u32 {
-            pages[t / page_size] * page_size as u32 + (t % page_size) as u32
+        fn slot(pages: &[PageIdx], t: usize, page_size: usize) -> u32 {
+            pages[t / page_size].0 * page_size as u32 + (t % page_size) as u32
         }
 
         /// Append `[1, H_kv, n, D]` `k`/`v` to `(layer, seq)`: the context
@@ -1428,7 +1430,7 @@ mod paged_ctx {
             k.kv_scatter_into(pk, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             let s = lp.pool.seq(seq).expect("seq within n_seqs");
-            let table = s.pages();
+            let table = PageIdx::as_u32s(s.pages());
             crate::nn::ops::sdpa_paged(
                 q,
                 pk,
@@ -1526,7 +1528,7 @@ mod paged_ctx {
             for &s in seqs {
                 let sp = lp.pool.seq(s).expect("seq within n_seqs");
                 let p = sp.pages();
-                tables.extend_from_slice(p);
+                tables.extend_from_slice(PageIdx::as_u32s(p));
                 tables.extend(std::iter::repeat_n(0, stride - p.len()));
                 n_keys.push((sp.len() + width) as u32);
             }
@@ -1781,7 +1783,7 @@ mod paged_ctx {
             g.layers[self.layer]
                 .pool
                 .seq(self.seq)
-                .map(|s| s.pages().to_vec())
+                .map(|s| PageIdx::as_u32s(s.pages()).to_vec())
                 .unwrap_or_default()
         }
     }

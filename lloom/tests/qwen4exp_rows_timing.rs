@@ -688,7 +688,10 @@ fn routed_mv_id_census() {
             gu_bytes,
             tiers.len(),
             &|k| {
-                let _ = tiers[k].0.gate_up(&x, &ids, MoeArm::MatVec).unwrap();
+                let _ = tiers[k]
+                    .0
+                    .gate_up(&x, &ids, MoeArm::MatVec, x.dtype())
+                    .unwrap();
             },
         );
     }

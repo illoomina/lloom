@@ -241,6 +241,9 @@ pub struct Qwen4ExpTuning {
     /// The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm).
     #[opt(flag = "qwen-f16-fuse", env = "QWEN4EXP_F16_FUSE", bool)]
     pub f16_fuse: bool,
+    /// The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way.
+    #[opt(flag = "qwen-f16-fold", env = "QWEN4EXP_F16_FOLD", bool)]
+    pub f16_fold: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
     #[opt(flag = "chunk-scan", env = "QWEN4EXP_CHUNK_SCAN", bool)]
     pub chunk_scan: bool,
@@ -303,6 +306,7 @@ impl Default for Qwen4ExpTuning {
             hc_mix: false,
             fused_off: false,
             f16_fuse: true,
+            f16_fold: false,
             chunk_scan: true,
             delta_reduce: false,
             state_write: "in-place".into(),

@@ -700,6 +700,7 @@ impl QMetalStorage {
         ids: &MetalStorage,
         ids_l: &Layout,
         arm: super::MoeArm,
+        act: DType,
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
@@ -709,7 +710,8 @@ impl QMetalStorage {
             crate::bail!("indexed_moe_forward needs contiguous input and ids")
         }
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
-        let (triple, store_dtype) = self.routed_triple(input.dtype(), "indexed_moe_forward")?;
+        let (triple, store_dtype) =
+            self.routed_triple(input.dtype(), act, "indexed_moe_forward")?;
         if ids.dtype() != DType::U32 {
             crate::bail!("indexed_moe_forward ids must be u32, got {:?}", ids.dtype())
         }
@@ -836,6 +838,7 @@ impl QMetalStorage {
         ids: &MetalStorage,
         ids_l: &Layout,
         order: super::PairOrder,
+        act: DType,
     ) -> Result<(MetalStorage, Option<MetalStorage>, Shape)> {
         use crate::MetalError;
         let (n_experts, n, k) = self_shape.dims3()?;
@@ -858,7 +861,7 @@ impl QMetalStorage {
             )
         }
         let (triple, store_dtype) =
-            self.routed_triple(input.dtype(), "indexed_moe_forward_pair")?;
+            self.routed_triple(input.dtype(), act, "indexed_moe_forward_pair")?;
         if ids.dtype() != DType::U32 {
             crate::bail!("indexed_moe_forward_pair ids must be u32, got {:?}", ids.dtype())
         }
@@ -925,19 +928,27 @@ impl QMetalStorage {
         Ok((both, None, shape))
     }
 
-    /// The routed launches' `(activation, f32, store)` triple for an `act`
-    /// activation on this weight, and the store's dtype: f16 activations read
-    /// and store f16 on the quantized weight rows, f32 keeps the
-    /// byte-identical `_f32` arm. Any other pairing is refused, never read
-    /// under the wrong dtype (§8.1.4).
-    fn routed_triple(&self, act: DType, op: &str) -> Result<(crate::kernels::GemvTriple, DType)> {
+    /// The routed launches' `(activation, f32, store)` triple for an `input`
+    /// activation computed in `act` on this weight, and the store's dtype:
+    /// f16 reads and stores f16 on the quantized weight rows, f32 keeps the
+    /// byte-identical `_f32` arm, and an f32 input computed in f16 is the f16
+    /// arm with the rounding in the load (`F32AsF16F32F16`). Any other pairing
+    /// is refused, never read under the wrong dtype (§8.1.4).
+    fn routed_triple(
+        &self,
+        input: DType,
+        act: DType,
+        op: &str,
+    ) -> Result<(crate::kernels::GemvTriple, DType)> {
         use crate::kernels::{GemvFloat, GemvTriple};
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
-        let triple = match act {
-            DType::F32 => GemvTriple::F32F32F32,
-            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
-            other => crate::bail!(
-                "{op} on Metal has no ({other:?}, f32, _) arm for weight {:?}",
+        let f16_arm = ggml_dtype.has_gemv_triple();
+        let triple = match (input, act) {
+            (DType::F32, DType::F32) => GemvTriple::F32F32F32,
+            (DType::F16, DType::F16) if f16_arm => GemvTriple::F16F32F16,
+            (DType::F32, DType::F16) if f16_arm => GemvTriple::F32AsF16F32F16,
+            (input, act) => crate::bail!(
+                "{op} on Metal has no ({input:?} as {act:?}, f32, _) arm for weight {:?}",
                 self.dtype
             ),
         };

@@ -100,7 +100,7 @@ fn each_order_dispatches_its_own_grid() {
             let mut got = None;
             let seen = grids(&dev, || {
                 got = Some(
-                    g.indexed_moe_forward_pair_in(&u, &x, &ids, MoeArm::MatVec, order)
+                    g.indexed_moe_forward_pair_in(&u, &x, &ids, MoeArm::MatVec, act, order)
                         .unwrap(),
                 );
             });
@@ -154,7 +154,7 @@ fn the_configured_order_is_the_environments() {
             .unwrap();
     });
     let tile = grids(&dev, || {
-        g.indexed_moe_forward_pair_in(&u, &x, &ids, MoeArm::MatVec, PairOrder::Tile)
+        g.indexed_moe_forward_pair_in(&u, &x, &ids, MoeArm::MatVec, DType::F16, PairOrder::Tile)
             .unwrap();
     });
     assert_eq!(
@@ -162,4 +162,48 @@ fn the_configured_order_is_the_environments() {
         "the configured entry point did not take LLOOM_MOE_PAIR_ORDER=tile"
     );
     assert_eq!(configured.len(), 1);
+}
+
+/// The f16 arm over an f32 activation (the cast folded into the launch): the
+/// pair is one `_f32h_f16` launch and nothing else — no cast — where the
+/// cast-then-launch path is a `cast_f32_f16` and the `_f16_f16` pair.
+#[test]
+fn the_folded_pair_is_one_launch_and_no_cast() {
+    let Some(dev) = device() else {
+        return;
+    };
+    let (g, u) = (
+        weight(&dev, GgmlDType::Q8_0, 0.0),
+        weight(&dev, GgmlDType::Q8_0, 1.0),
+    );
+    let (x, ids) = inputs(&dev, DType::F32);
+    let order = PairOrder::Half;
+    let folded = grids(&dev, || {
+        g.indexed_moe_forward_pair_in(&u, &x, &ids, MoeArm::MatVec, DType::F16, order)
+            .unwrap();
+    });
+    let cast = grids(&dev, || {
+        let x16 = x.to_dtype(DType::F16).unwrap();
+        g.indexed_moe_forward_pair_in(&u, &x16, &ids, MoeArm::MatVec, DType::F16, order)
+            .unwrap();
+    });
+    println!("FOLD folded={folded:?}\nFOLD cast={cast:?}");
+    let names = |v: &[(String, (usize, usize, usize))]| {
+        v.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&folded),
+        vec!["kernel_mul_mv_id2_q8_0_f32h_f16".to_string()]
+    );
+    assert_eq!(
+        names(&cast),
+        vec![
+            "cast_f32_f16".to_string(),
+            "kernel_mul_mv_id2_q8_0_f16_f16".to_string()
+        ]
+    );
+    assert_eq!(
+        folded[0].1, cast[1].1,
+        "the folded launch's grid is the f16 pair's"
+    );
 }

@@ -103,6 +103,11 @@ pub enum GemvTriple {
     F32F32F32,
     /// `(f16, f32, f16)` — f16 activations, f32 accumulate, f16 store.
     F16F32F16,
+    /// `(f16, f32, f16)` over an f32 activation buffer: each element rounded
+    /// to half as the core loads it, so the arm computes what `F16F32F16`
+    /// computes from a cast-to-f16 copy of the buffer, without the copy. The
+    /// routed launches only (`kernel_mul_mv_id{,2}_<q>_f32h_f16`).
+    F32AsF16F32F16,
     /// `(i8, i32, i8)` — the M5 native-integer arm: int8 activations and store,
     /// int32 accumulate. **Declared but unimplemented** (issue #750): the triple
     /// is named so the M5 arm is one more instantiation of the generic core rather
@@ -127,7 +132,9 @@ impl GemvTriple {
     pub fn requires(self) -> Features {
         match self {
             GemvTriple::F32F32F32 => Features::empty().with(Feature::F32),
-            GemvTriple::F16F32F16 => Features::empty().with(Feature::F16).with(Feature::F32),
+            GemvTriple::F16F32F16 | GemvTriple::F32AsF16F32F16 => {
+                Features::empty().with(Feature::F16).with(Feature::F32)
+            }
             GemvTriple::I8I32I8 => Features::empty().with(Feature::Int8Mma),
         }
     }
@@ -137,6 +144,7 @@ impl GemvTriple {
         match self {
             GemvTriple::F32F32F32 => "(f32, f32, f32)",
             GemvTriple::F16F32F16 => "(f16, f32, f16)",
+            GemvTriple::F32AsF16F32F16 => "(f32 as f16, f32, f16)",
             GemvTriple::I8I32I8 => "(i8, i32, i8)",
         }
     }
@@ -155,12 +163,13 @@ impl GemvTriple {
         Ok(())
     }
 
-    /// The activation (`src1`) dtype leg, for the two float arms. The native-int
+    /// The activation (`src1`) dtype leg as it sits in memory, for the float
+    /// arms (`F32AsF16F32F16`'s is f32: it rounds on load). The native-int
     /// arm's legs are integer and have no [`GemvFloat`]; it is declared-only, so
     /// callers gate on [`is_implemented`](Self::is_implemented) first.
     pub fn activation(self) -> GemvFloat {
         match self {
-            GemvTriple::F32F32F32 => GemvFloat::F32,
+            GemvTriple::F32F32F32 | GemvTriple::F32AsF16F32F16 => GemvFloat::F32,
             GemvTriple::F16F32F16 => GemvFloat::F16,
             GemvTriple::I8I32I8 => GemvFloat::F32, // unreachable: declared-only
         }
@@ -170,7 +179,7 @@ impl GemvTriple {
     pub fn store(self) -> GemvFloat {
         match self {
             GemvTriple::F32F32F32 => GemvFloat::F32,
-            GemvTriple::F16F32F16 => GemvFloat::F16,
+            GemvTriple::F16F32F16 | GemvTriple::F32AsF16F32F16 => GemvFloat::F16,
             GemvTriple::I8I32I8 => GemvFloat::F32, // unreachable: declared-only
         }
     }
@@ -183,6 +192,7 @@ impl GemvTriple {
     fn name_suffix(self) -> String {
         match self {
             GemvTriple::F32F32F32 => "f32".to_string(),
+            GemvTriple::F32AsF16F32F16 => "f32h_f16".to_string(),
             GemvTriple::I8I32I8 => "i8_i8".to_string(), // no kernel; is_implemented() gates it
             other => format!("{}_{}", other.activation().suffix(), other.store().suffix()),
         }
@@ -469,6 +479,12 @@ pub fn call_quantized_matmul_mv_t(
         depth: 1,
     };
     triple.check(device, "quantized matmul-vec")?;
+    if triple == GemvTriple::F32AsF16F32F16 {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "the f32-as-f16 activation leg (routed launches only)",
+            "quantized matmul-vec",
+        ));
+    }
 
     // The weight-dtype stem, e.g. `kernel_mul_mv_q4_0`. The `(activation, store)`
     // triple suffix is appended below. The dense-weight rows (F16/BF16/F32/Q8K)

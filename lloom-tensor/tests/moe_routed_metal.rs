@@ -567,7 +567,7 @@ fn routed_pair_is_the_two_launches_n(
     );
     for order in PairOrder::ALL {
         let pair = |a: &QTensor, b: &QTensor| {
-            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, order)
+            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, x.dtype(), order)
         };
         let (got_g, got_u) = pair(&g, &u)?;
         assert_eq!(got_g.dims(), &[batch, topk, n]);
@@ -681,7 +681,7 @@ fn routed_pair_f16_is_the_two_f16_launches(
     );
     for order in PairOrder::ALL {
         let pair = |a: &QTensor, b: &QTensor| {
-            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, order)
+            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, x.dtype(), order)
         };
         let (got_g, got_u) = pair(&g, &u)?;
         for (half_name, t) in [("gate", &got_g), ("up", &got_u)] {
@@ -786,5 +786,111 @@ fn routed_pair_f16_refuses_dense_weight() -> Result<()> {
     let x = Tensor::zeros((1, 1, k), DType::F16, &dev)?;
     let ids = Tensor::from_vec(vec![0u32, 1], (1, 2), &dev)?;
     assert!(w.indexed_moe_forward_pair(&w, &x, &ids).is_err());
+    Ok(())
+}
+
+/// The f16 routed arm over an f32 activation, the rounding in the load
+/// (`GemvTriple::F32AsF16F32F16`): the single launch and the pair in every
+/// order are the f16 launches over the activation cast to f16 (`cast_f32_f16`,
+/// the step's launch this replaces), bit for bit, stored f16. The inputs are
+/// not representable in f16, and the f32 arm on the same f32 inputs lands
+/// elsewhere, so a fold that skipped the rounding (or ran the f32 core) fails.
+fn routed_fold_is_the_cast_then_the_f16_launch(
+    dtype: GgmlDType,
+    in_dim1_is_topk: bool,
+    n: usize,
+) -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, k) = (6usize, 256usize);
+    let (batch, topk) = (2usize, 3usize);
+    let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
+    let (g, _) = stacked_weight(dtype, (e, n, k), 17, &dev)?;
+    let (u, _) = stacked_weight(dtype, (e, n, k), 23, &dev)?;
+    let x32 = activations((batch, in_dim1, k), 0.2)?.to_device(&dev)?;
+    let x16 = x32.to_dtype(DType::F16)?;
+    let rounded = x16.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let exact = x32.flatten_all()?.to_vec1::<f32>()?;
+    assert!(
+        rounded.iter().zip(&exact).filter(|(a, b)| a != b).count() > exact.len() / 2,
+        "the activations must round in f16 for the fold's rounding to be tested"
+    );
+    let ids_t = Tensor::from_vec(vec![5u32, 0, 5, 2, 4, 5], (batch, topk), &dev)?;
+    let want_g = bits16(&g.indexed_moe_forward(&x16, &ids_t)?)?;
+    let want_u = bits16(&u.indexed_moe_forward(&x16, &ids_t)?)?;
+    let f32_arm = bits16(&g.indexed_moe_forward(&x32, &ids_t)?.to_dtype(DType::F16)?)?;
+    assert_ne!(
+        f32_arm, want_g,
+        "{dtype:?}: the f32 arm agrees with the f16 arm here, so the fold's rounding is untested"
+    );
+    let single = g.indexed_moe_forward_as(&x32, &ids_t, MoeArm::MatVec, DType::F16)?;
+    assert_eq!(
+        single.dtype(),
+        DType::F16,
+        "{dtype:?}: the fold must store f16"
+    );
+    assert_eq!(
+        bits16(&single)?,
+        want_g,
+        "{dtype:?} in_dim1={in_dim1} n={n}: the folded single launch is not the cast then the f16 launch"
+    );
+    for order in PairOrder::ALL {
+        let (pg, pu) =
+            g.indexed_moe_forward_pair_in(&u, &x32, &ids_t, MoeArm::MatVec, DType::F16, order)?;
+        assert_eq!((pg.dtype(), pu.dtype()), (DType::F16, DType::F16));
+        assert_eq!(
+            bits16(&pg)?,
+            want_g,
+            "{dtype:?} in_dim1={in_dim1} n={n} {order:?}: the folded pair's gate half is not the cast then the f16 launch"
+        );
+        assert_eq!(
+            bits16(&pu)?,
+            want_u,
+            "{dtype:?} in_dim1={in_dim1} n={n} {order:?}: the folded pair's up half is not the cast then the f16 launch"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn routed_fold_every_kind_gate_shape() -> Result<()> {
+    for dtype in F16_PAIR_KINDS {
+        routed_fold_is_the_cast_then_the_f16_launch(dtype, false, 64)?;
+    }
+    Ok(())
+}
+#[test]
+fn routed_fold_every_kind_rows_not_multiple_of_tile() -> Result<()> {
+    for dtype in F16_PAIR_KINDS {
+        routed_fold_is_the_cast_then_the_f16_launch(dtype, false, 37)?;
+    }
+    Ok(())
+}
+#[test]
+fn routed_fold_down_shape() -> Result<()> {
+    for dtype in [
+        GgmlDType::IQ4NL,
+        GgmlDType::IQ4XS,
+        GgmlDType::Q2_0,
+        GgmlDType::Q8_0,
+    ] {
+        routed_fold_is_the_cast_then_the_f16_launch(dtype, true, 37)?;
+    }
+    Ok(())
+}
+
+/// A dense weight has no f16 routed arm, folded or not: refused.
+#[test]
+fn routed_fold_refuses_dense_weight() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, n, k) = (2usize, 8usize, 64usize);
+    let w = QTensor::quantize(&Tensor::zeros((e, n, k), DType::F32, &dev)?, GgmlDType::F32)?;
+    let x = Tensor::zeros((1, 1, k), DType::F32, &dev)?;
+    let ids = Tensor::from_vec(vec![0u32, 1], (1, 2), &dev)?;
+    assert!(w
+        .indexed_moe_forward_as(&x, &ids, MoeArm::MatVec, DType::F16)
+        .is_err());
+    assert!(w
+        .indexed_moe_forward_pair_as(&w, &x, &ids, MoeArm::MatVec, DType::F16)
+        .is_err());
     Ok(())
 }

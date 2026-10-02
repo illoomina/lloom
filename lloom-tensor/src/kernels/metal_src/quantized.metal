@@ -2404,6 +2404,34 @@ constant bool NR0_Q6K_SET = is_function_constant_defined(NR0_Q6K_FC);
 #define NR0_Q6K (NR0_Q6K_SET ? (int)NR0_Q6K_FC : 1)
 #define NR0_Q6K_MAX 4
 #define N_SIMDGROUP 2  // number of SIMD groups in a thread group
+
+// An f32 activation read as the half it rounds to: as `ACT`, it gives the
+// `<half, STORE>` cores an f32 buffer, every element rounded to half as it is
+// loaded, so a core computes exactly what it computes from a cast-to-f16 copy
+// of that buffer, without the copy (expert-streaming.md §20.15e). Every core
+// converts what it loads from `src1`; none does arithmetic on `ACT` itself.
+struct f32_as_half {
+    float v;
+    operator half() const device { return half(v); }
+    operator half() const thread { return half(v); }
+};
+struct f32_as_half4 {
+    float4 v;
+    operator float4() const device { return float4(half4(v)); }
+    operator float4() const thread { return float4(half4(v)); }
+};
+// The arithmetic two cores apply to a loaded element directly, as a loaded
+// `half` takes part in it: widened to float (`half` is not a built-in
+// arithmetic candidate, so the conversion alone would be ambiguous).
+inline float operator/(const device f32_as_half & a, float b) { return float(half(a)) / b; }
+inline thread float & operator+=(thread float & a, const device f32_as_half & b) {
+    return a += float(half(b));
+}
+// The four-wide load of an `ACT` activation (the IQ4 cores'): `vec<ACT, 4>`
+// for a scalar type, its rounding view for `f32_as_half`.
+template<typename ACT> struct act4 { typedef vec<ACT, 4> type; };
+template<> struct act4<f32_as_half> { typedef f32_as_half4 type; };
+
 //Note: This is a template, but strictly speaking it only applies to
 //      quantizations where the block size is 32. It also does not
 //      guard against the number of rows not being divisible by
@@ -6762,7 +6790,7 @@ void kernel_mul_mv_iq4_nl_impl(
 
     for (int ib = ix; ib < nb; ib += 16) {
 
-        device const vec<ACT, 4> * y4 = (device const vec<ACT, 4> *)yb;
+        device const typename act4<ACT>::type * y4 = (device const typename act4<ACT>::type *)yb;
         yl[0] = float4(y4[0]); yl[1] = float4(y4[4]); yl[2] = float4(y4[1]); yl[3] = float4(y4[5]);
 
         for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
@@ -6880,7 +6908,7 @@ void kernel_mul_mv_iq4_xs_impl(
 
     for (int ibl = ix; ibl < nb; ibl += 2) {
 
-        device const vec<ACT, 4> * y4 = (device const vec<ACT, 4> *)yb;
+        device const typename act4<ACT>::type * y4 = (device const typename act4<ACT>::type *)yb;
         yl[0] = float4(y4[0]); yl[1] = float4(y4[4]); yl[2] = float4(y4[1]); yl[3] = float4(y4[5]);
 
         for (int row = 0; row < 2; ++row) {
@@ -8652,14 +8680,17 @@ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_q2_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_0_f32_impl>>;
 
 // ---- issue #748 (#750 item B): the (f16, f32, f16) ROUTED arm ----
-// The routed kernel over the genericized cores at `<half, half>`: f16
-// activations read, f32 accumulate inside every core, f16 store. The `_f32`
-// routed instantiations above are untouched; these are the same wrapper shape
-// (`kernel_mul_mv_id`'s plane decode) typed on the store leg, so the f16 arm is
+// The routed kernel over the genericized cores at `<A, half>`: activations read
+// as `A`, f32 accumulate inside every core, f16 store. `A = half` is the f16
+// arm; `A = f32_as_half` reads an f32 activation as the half it rounds to, the
+// f16 arm without the cast launch in front of it. The `_f32` routed
+// instantiations above are untouched; these are the same wrapper shape
+// (`kernel_mul_mv_id`'s plane decode) typed on the store leg, so each arm is
 // one more instantiation of each core, not a second kernel.
-typedef void (kernel_mul_mv2_impl_f16_t)(
+template<typename A> struct mv2_half_store {
+    typedef void (fn_t)(
         device const  void * src0,
-        device const  half * src1,
+        device const     A * src1,
         device        half * dst,
                    int64_t   ne00,
                    int64_t   ne01,
@@ -8674,9 +8705,10 @@ typedef void (kernel_mul_mv2_impl_f16_t)(
                    uint3     tgpig,
                    uint      tiisg,
                    uint      sgitg);
+};
 
-template<kernel_mul_mv2_impl_f16_t impl_fn>
-void mmv_fn_f16(
+template<typename A, typename mv2_half_store<A>::fn_t impl_fn>
+void mmv_fn_h(
         device const    char * src0,
         device const    char * src1,
         device          half * dst,
@@ -8703,10 +8735,10 @@ void mmv_fn_f16(
         uint                   tiitg,
         uint                   tiisg,
         uint                   sgitg) {
-    impl_fn(src0,(const device half *)src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shared_values,tgpig,tiisg,sgitg);
+    impl_fn(src0,(const device A *)src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,shared_values,tgpig,tiisg,sgitg);
 }
 
-typedef decltype(mmv_fn_f16<kernel_mul_mv_q8_0_impl<half, half>>) mul_mv_impl_fn_f16_t;
+typedef decltype(mmv_fn_h<half, kernel_mul_mv_q8_0_impl<half, half>>) mul_mv_impl_fn_f16_t;
 
 template<mul_mv_impl_fn_f16_t impl_fn>
 kernel void kernel_mul_mv_id_f16(
@@ -8784,28 +8816,49 @@ kernel void kernel_mul_mv_id_f16(
         sgitg);
 }
 
-typedef decltype(kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q8_0_impl<half, half>>>) kernel_mul_mv_id_f16_t;
+typedef decltype(kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q8_0_impl<half, half>>>) kernel_mul_mv_id_f16_t;
 
-template [[host_name("kernel_mul_mv_id_q4_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id_q4_1_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id_q5_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id_q5_1_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id_q8_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q8_0_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q2_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q2_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q3_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q3_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q4_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q4_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q5_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q5_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q6_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q6_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq1_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq1_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq1_m_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq1_m_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq2_xxs_f16_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq2_xxs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq2_xs_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq2_xs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq3_xxs_f16_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq3_xxs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq3_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq3_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq2_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq2_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq4_nl_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq4_nl_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_iq4_xs_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_iq4_xs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id_q2_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_f16<kernel_mul_mv_q2_0_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q4_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id_q4_1_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_1_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id_q8_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q8_0_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q2_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q2_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q3_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q3_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q4_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q4_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q5_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q6_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq1_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq1_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq1_m_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq1_m_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xxs_f16_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq2_xxs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xs_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq2_xs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq3_xxs_f16_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq3_xxs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq3_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq3_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_s_f16_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq2_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq4_nl_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq4_nl_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq4_xs_f16_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_iq4_xs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id_q2_0_f16_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<half, kernel_mul_mv_q2_0_impl<half, half>>>;
+
+template [[host_name("kernel_mul_mv_id_q4_0_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q4_1_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_0_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_1_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q8_0_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q8_0_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q2_K_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q2_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q3_K_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q3_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q4_K_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q4_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q5_K_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q5_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q6_K_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q6_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq1_s_f32h_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq1_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq1_m_f32h_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq1_m_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xxs_f32h_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_xxs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xs_f32h_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_xs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq3_xxs_f32h_f16")]] kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq3_xxs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq3_s_f32h_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq3_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq2_s_f32h_f16")]]   kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq4_nl_f32h_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq4_nl_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_iq4_xs_f32h_f16")]]  kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_iq4_xs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id_q2_0_f32h_f16")]]    kernel kernel_mul_mv_id_f16_t kernel_mul_mv_id_f16<mmv_fn_h<f32_as_half, kernel_mul_mv_q2_0_impl<f32_as_half, half>>>;
 
 // ---- gate and up in ONE routed launch, at either store width ----
 // `kernel_mul_mv_id`'s plane decode over TWO stacked weights of one kind and
@@ -8815,7 +8868,7 @@ template [[host_name("kernel_mul_mv_id_q2_0_f16_f16")]]    kernel kernel_mul_mv_
 // is byte-identical to two launches of the same triple; what changes is the
 // grid — twice the threadgroups in flight per launch, half the launches. `D`
 // is the triple's store leg: `float` wraps the cores' f32 aliases through
-// `mmv_fn`, `half` the `<half, half>` cores through `mmv_fn_f16` (§8.1.4).
+// `mmv_fn`, `half` the `<A, half>` cores through `mmv_fn_h` (§8.1.4).
 //
 // Where the half sits in the grid (`PAIR_ORDER_FC`, set by the host from
 // `LLOOM_MOE_PAIR_ORDER`; expert-streaming.md §20.15e):
@@ -8928,7 +8981,7 @@ kernel void kernel_mul_mv_id2(
 }
 
 typedef decltype(kernel_mul_mv_id2<float, mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>) kernel_mul_mv_id2_t;
-typedef decltype(kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q8_0_impl<half, half>>>) kernel_mul_mv_id2_f16_t;
+typedef decltype(kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q8_0_impl<half, half>>>) kernel_mul_mv_id2_f16_t;
 
 template [[host_name("kernel_mul_mv_id2_f32_f32")]]     kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<float, mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>;
 template [[host_name("kernel_mul_mv_id2_f16_f32")]]     kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<float, mmv_fn<kernel_mul_mv_impl<half, half4, float, float4>>>;
@@ -8953,26 +9006,47 @@ template [[host_name("kernel_mul_mv_id2_iq4_nl_f32")]]  kernel kernel_mul_mv_id2
 template [[host_name("kernel_mul_mv_id2_iq4_xs_f32")]]  kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<float, mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>;
 template [[host_name("kernel_mul_mv_id2_q2_0_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<float, mmv_fn<kernel_mul_mv_q2_0_f32_impl>>;
 
-template [[host_name("kernel_mul_mv_id2_q4_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q4_1_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q5_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q5_1_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q8_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q8_0_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q2_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q2_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q3_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q3_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q4_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q4_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q5_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q5_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q6_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q6_K_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq1_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq1_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq1_m_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq1_m_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq2_xxs_f16_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq2_xxs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq2_xs_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq2_xs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq3_xxs_f16_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq3_xxs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq3_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq3_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq2_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq2_s_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq4_nl_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq4_nl_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_iq4_xs_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_iq4_xs_impl<half, half>>>;
-template [[host_name("kernel_mul_mv_id2_q2_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_f16<kernel_mul_mv_q2_0_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q4_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q4_1_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_1_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q8_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q8_0_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q2_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q2_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q3_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q3_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q4_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q4_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q5_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q6_K_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q6_K_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq1_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq1_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq1_m_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq1_m_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xxs_f16_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq2_xxs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xs_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq2_xs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq3_xxs_f16_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq3_xxs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq3_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq3_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_s_f16_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq2_s_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq4_nl_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq4_nl_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq4_xs_f16_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_iq4_xs_impl<half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q2_0_f16_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<half, kernel_mul_mv_q2_0_impl<half, half>>>;
+
+template [[host_name("kernel_mul_mv_id2_q4_0_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q4_1_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_0_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_1_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q8_0_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q8_0_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q2_K_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q2_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q3_K_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q3_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q4_K_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q4_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q5_K_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q5_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q6_K_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q6_K_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq1_s_f32h_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq1_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq1_m_f32h_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq1_m_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xxs_f32h_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_xxs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xs_f32h_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_xs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq3_xxs_f32h_f16")]] kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq3_xxs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq3_s_f32h_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq3_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq2_s_f32h_f16")]]   kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq2_s_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq4_nl_f32h_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq4_nl_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_iq4_xs_f32h_f16")]]  kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_iq4_xs_impl<f32_as_half, half>>>;
+template [[host_name("kernel_mul_mv_id2_q2_0_f32h_f16")]]    kernel kernel_mul_mv_id2_f16_t kernel_mul_mv_id2<half, mmv_fn_h<f32_as_half, kernel_mul_mv_q2_0_impl<f32_as_half, half>>>;
 
 kernel void kernel_pool_2d_max_f32(
         device  const float * src0,

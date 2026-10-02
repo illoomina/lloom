@@ -1173,10 +1173,25 @@ impl QTensor {
         ids: &Tensor,
         arm: MoeArm,
     ) -> Result<(Tensor, Tensor)> {
-        self.indexed_moe_forward_pair_in(up, x, ids, arm, PairOrder::configured())
+        self.indexed_moe_forward_pair_as(up, x, ids, arm, x.dtype())
     }
 
-    /// [`Self::indexed_moe_forward_pair_with`] with the one launch's grid in
+    /// [`Self::indexed_moe_forward_pair_with`] computed in `act`: each half is
+    /// [`Self::indexed_moe_forward_as`]'s for it. An f32 `x` computed in f16
+    /// is the pair of the f16 launches over `x` cast to f16, bit for bit,
+    /// without the cast (on Metal the rounding is in the launch's load).
+    pub fn indexed_moe_forward_pair_as(
+        &self,
+        up: &QTensor,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        self.indexed_moe_forward_pair_in(up, x, ids, arm, act, PairOrder::configured())
+    }
+
+    /// [`Self::indexed_moe_forward_pair_as`] with the one launch's grid in
     /// `order` rather than `LLOOM_MOE_PAIR_ORDER`'s. The halves are the same
     /// bits in every order.
     pub fn indexed_moe_forward_pair_in(
@@ -1185,6 +1200,7 @@ impl QTensor {
         x: &Tensor,
         ids: &Tensor,
         arm: MoeArm,
+        act: DType,
         order: PairOrder,
     ) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "metal")]
@@ -1192,7 +1208,10 @@ impl QTensor {
             && moe_pair_on()
             && self.dtype() == up.dtype()
             && self.shape() == up.shape()
-            && matches!(x.dtype(), DType::F32 | DType::F16)
+            && matches!(
+                (x.dtype(), act),
+                (DType::F32, DType::F32) | (DType::F16, DType::F16) | (DType::F32, DType::F16)
+            )
         {
             if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
                 let (xs, is) = (x.storage(), ids.storage());
@@ -1205,6 +1224,7 @@ impl QTensor {
                         is,
                         ids.layout(),
                         order,
+                        act,
                     )?;
                     let tensor = |s, shape| {
                         crate::tensor::from_storage(
@@ -1230,8 +1250,8 @@ impl QTensor {
         #[cfg(not(feature = "metal"))]
         let _ = order;
         Ok((
-            self.indexed_moe_forward_with(x, ids, arm)?,
-            up.indexed_moe_forward_with(x, ids, arm)?,
+            self.indexed_moe_forward_as(x, ids, arm, act)?,
+            up.indexed_moe_forward_as(x, ids, arm, act)?,
         ))
     }
 
@@ -1255,6 +1275,25 @@ impl QTensor {
         ids: &Tensor,
         arm: MoeArm,
     ) -> Result<Tensor> {
+        self.indexed_moe_forward_as(x, ids, arm, x.dtype())
+    }
+
+    /// [`Self::indexed_moe_forward_with`] computed in `act`: what it computes
+    /// for `x` cast to `act`, bit for bit. On Metal an f32 `x` computed in f16
+    /// takes the f16 launch with the rounding in its load (no cast launch);
+    /// elsewhere `x` is cast first.
+    pub fn indexed_moe_forward_as(
+        &self,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+        act: DType,
+    ) -> Result<Tensor> {
+        let folds = matches!(self.storage, QStorage::Metal(_))
+            && (x.dtype(), act) == (DType::F32, DType::F16);
+        if act != x.dtype() && !folds {
+            return self.indexed_moe_forward_as(&x.to_dtype(act)?, ids, arm, act);
+        }
         let none = crate::op::BackpropOp::none();
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
@@ -1284,6 +1323,7 @@ impl QTensor {
                         ids_storage,
                         ids.layout(),
                         arm,
+                        act,
                     )?;
                     Ok(crate::tensor::from_storage(
                         Storage::Metal(storage),

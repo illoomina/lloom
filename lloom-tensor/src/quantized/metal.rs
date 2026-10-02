@@ -823,7 +823,10 @@ impl QMetalStorage {
     /// result is `[2, batch, topk, n]` in the activation's triple's store
     /// dtype — plane set 0 this weight's, plane set 1 `other`'s, each what
     /// [`Self::indexed_moe_forward`]'s matmul-vec computes for it on the same
-    /// activations.
+    /// activations — and `None`, laid out in its grid as `order` says. On
+    /// [`super::PairOrder::Split`] the pair's kernel runs once a half into a
+    /// buffer each: this weight's `[batch, topk, n]` and `Some` of `other`'s.
+    #[allow(clippy::too_many_arguments)]
     pub fn indexed_moe_forward_pair(
         &self,
         other: &Self,
@@ -832,7 +835,8 @@ impl QMetalStorage {
         input_l: &Layout,
         ids: &MetalStorage,
         ids_l: &Layout,
-    ) -> Result<(MetalStorage, Shape)> {
+        order: super::PairOrder,
+    ) -> Result<(MetalStorage, Option<MetalStorage>, Shape)> {
         use crate::MetalError;
         let (n_experts, n, k) = self_shape.dims3()?;
         if !input_l.is_contiguous() || !ids_l.is_contiguous() {
@@ -869,33 +873,56 @@ impl QMetalStorage {
                 self_shape
             )
         }
+        use super::PairOrder;
+        use crate::kernels::PairGrid;
         let device = self.device.clone();
-        let dst_shape = Shape::from((2, batch, topk, n));
-        let dst = device
-            .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), store_dtype)
-            .with_label("qmatmul_id2")
-            .build()?;
-        let encoder = device.command_encoder()?;
-        crate::kernels::call_quantized_matmul_mv_id2_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            ggml_dtype,
-            triple,
-            (n_experts, n, k),
-            (batch, topk, in_dim1),
-            &self.buffer,
-            &other.buffer,
-            input.buffer(),
-            input_l.start_offset() * input.dtype().size_in_bytes(),
-            ids.buffer(),
-            ids_l.start_offset() * DType::U32.size_in_bytes(),
-            &dst,
-        )
-        .map_err(MetalError::from)?;
-        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
-        Ok((out, dst_shape))
+        let launch =
+            |grid: PairGrid, a: &Buffer, b: &Buffer, shape: &Shape| -> Result<MetalStorage> {
+                let dst = device
+                    .new_buffer_builder()
+                    .with_size_for(shape.elem_count(), store_dtype)
+                    .with_label("qmatmul_id2")
+                    .build()?;
+                let encoder = device.command_encoder()?;
+                crate::kernels::call_quantized_matmul_mv_id2_t(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    ggml_dtype,
+                    triple,
+                    grid,
+                    (n_experts, n, k),
+                    (batch, topk, in_dim1),
+                    a,
+                    b,
+                    input.buffer(),
+                    input_l.start_offset() * input.dtype().size_in_bytes(),
+                    ids.buffer(),
+                    ids_l.start_offset() * DType::U32.size_in_bytes(),
+                    &dst,
+                )
+                .map_err(MetalError::from)?;
+                Ok(MetalStorage::new(
+                    dst,
+                    device.clone(),
+                    shape.elem_count(),
+                    store_dtype,
+                ))
+            };
+        let grid = match order {
+            PairOrder::Half => PairGrid::HalfSlowest,
+            PairOrder::Expert => PairGrid::HalfByPlane,
+            PairOrder::Tile => PairGrid::HalfFastest,
+            PairOrder::Split => {
+                let shape = Shape::from((batch, topk, n));
+                let g = launch(PairGrid::OneHalf, &self.buffer, &self.buffer, &shape)?;
+                let u = launch(PairGrid::OneHalf, &other.buffer, &other.buffer, &shape)?;
+                return Ok((g, Some(u), shape));
+            }
+        };
+        let shape = Shape::from((2, batch, topk, n));
+        let both = launch(grid, &self.buffer, &other.buffer, &shape)?;
+        Ok((both, None, shape))
     }
 
     /// The routed launches' `(activation, f32, store)` triple for an `act`

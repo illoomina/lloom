@@ -8809,14 +8809,28 @@ template [[host_name("kernel_mul_mv_id_q2_0_f16_f16")]]    kernel kernel_mul_mv_
 
 // ---- gate and up in ONE routed launch, at either store width ----
 // `kernel_mul_mv_id`'s plane decode over TWO stacked weights of one kind and
-// geometry: planes `[0, nei0·nei1)` read `src0a` into `dst[0]`, planes
-// `[nei0·nei1, 2·nei0·nei1)` read `src0b` into `dst[1]` (`dst` is
-// `[2, batch, topk, ne0]` of the store type `D`). Each plane's arithmetic is
-// the single launch's core, so the pair is byte-identical to two launches of
-// the same triple; what changes is the grid — twice the threadgroups in
-// flight per launch, half the launches and their barriers. `D` is the
-// triple's store leg: `float` wraps the cores' f32 aliases through `mmv_fn`,
-// `half` the `<half, half>` cores through `mmv_fn_f16` (§8.1.4).
+// geometry: the planes of half 0 read `src0a` into `dst[0]`, those of half 1
+// read `src0b` into `dst[1]` (`dst` is `[2, batch, topk, ne0]` of the store
+// type `D`). Each plane's arithmetic is the single launch's core, so the pair
+// is byte-identical to two launches of the same triple; what changes is the
+// grid — twice the threadgroups in flight per launch, half the launches. `D`
+// is the triple's store leg: `float` wraps the cores' f32 aliases through
+// `mmv_fn`, `half` the `<half, half>` cores through `mmv_fn_f16` (§8.1.4).
+//
+// Where the half sits in the grid (`PAIR_ORDER_FC`, set by the host from
+// `LLOOM_MOE_PAIR_ORDER`; expert-streaming.md §20.15e):
+//   0  the slowest axis: z = half·planes + plane — gate's planes, then up's;
+//   1  next to the plane: y = half, z = plane — one expert's gate and up
+//      adjacent, each a full row of threadgroups (the host's grid is two
+//      high and half as deep);
+//   2  the fastest axis: x = 2·tile + half — one row tile's gate and up
+//      adjacent (the host doubles the grid's width and halves its depth).
+// The order moves which threadgroup computes a plane's rows, never how. Each
+// order has its own grid shape, so a host and a kernel that disagree on it
+// compute the wrong planes rather than the same ones in another order.
+constant ulong PAIR_ORDER_FC [[function_constant(916)]];
+constant ulong PAIR_ORDER = is_function_constant_defined(PAIR_ORDER_FC) ? PAIR_ORDER_FC : 0;
+
 template<typename D> struct mmv_store;
 template<> struct mmv_store<float> { typedef mul_mv_impl_fn_t fn_t; };
 template<> struct mmv_store<half>  { typedef mul_mv_impl_fn_f16_t fn_t; };
@@ -8853,8 +8867,20 @@ kernel void kernel_mul_mv_id2(
         uint                   tiisg[[thread_index_in_simdgroup]],
         uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
     const int planes = nei0 * nei1;
-    const int hf = tgpig.z / planes;          // 0: src0a -> dst[0]; 1: src0b -> dst[1]
-    const int z = tgpig.z - hf * planes;
+    int hf;                                   // 0: src0a -> dst[0]; 1: src0b -> dst[1]
+    int z;                                    // the plane, (row, slot)
+    if (PAIR_ORDER == 2) {
+        hf = tgpig.x & 1;
+        tgpig.x >>= 1;
+        z = tgpig.z;
+    } else if (PAIR_ORDER == 1) {
+        hf = tgpig.y;
+        tgpig.y = 0;
+        z = tgpig.z;
+    } else {
+        hf = tgpig.z / planes;
+        z = tgpig.z - hf * planes;
+    }
     const int iid1 = z/nei0;
     const int idx = z%nei0;
 

@@ -346,17 +346,31 @@ pub(crate) fn q5k_nr0() -> Option<usize> {
 /// the simdgroup count for the IQ2_XS / IQ4_NL cores, the rows a simdgroup
 /// for Q6_K, none elsewhere.
 fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
+    mv_constant(dtype).map(|c| ConstantValues::new(vec![c]))
+}
+
+fn mv_constant(dtype: GgmlDType) -> Option<(usize, Value)> {
     match dtype {
-        GgmlDType::IQ2XS => Some(ConstantValues::new(vec![(910, Value::USize(iq_nsg(dtype)))])),
-        GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
-        GgmlDType::Q6K => Some(ConstantValues::new(vec![(912, Value::USize(q6k_nr0()))])),
-        GgmlDType::IQ2S => Some(ConstantValues::new(vec![(913, Value::USize(iq_nsg(dtype)))])),
+        GgmlDType::IQ2XS => Some((910, Value::USize(iq_nsg(dtype)))),
+        GgmlDType::IQ4NL => Some((911, Value::USize(iq_nsg(dtype)))),
+        GgmlDType::Q6K => Some((912, Value::USize(q6k_nr0()))),
+        GgmlDType::IQ2S => Some((913, Value::USize(iq_nsg(dtype)))),
         // Always supplied (a function naming a constant must be specialised
         // to build a pipeline); 0 selects the incumbent geometry.
-        GgmlDType::Q4K => Some(ConstantValues::new(vec![(914, Value::USize(q4k_nr0().unwrap_or(0)))])),
-        GgmlDType::Q5K => Some(ConstantValues::new(vec![(915, Value::USize(q5k_nr0().unwrap_or(0)))])),
+        GgmlDType::Q4K => Some((914, Value::USize(q4k_nr0().unwrap_or(0)))),
+        GgmlDType::Q5K => Some((915, Value::USize(q5k_nr0().unwrap_or(0)))),
         _ => None,
     }
+}
+
+/// [`mv_constants`] plus the pair's grid order, which every
+/// `kernel_mul_mv_id2` names and so is always supplied.
+fn mv_id2_constants(dtype: GgmlDType, grid: PairGrid) -> ConstantValues {
+    let order = (916, Value::USize(grid.order()));
+    ConstantValues::new(match mv_constant(dtype) {
+        Some(c) => vec![c, order],
+        None => vec![order],
+    })
 }
 
 /// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
@@ -1289,10 +1303,39 @@ fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
 
+/// Where the gate|up pair's half sits in its launch's grid
+/// (`kernel_mul_mv_id2`'s `PAIR_ORDER_FC`). Every grid computes each plane
+/// with the same core, so none moves a bit; they differ in which
+/// threadgroups run next to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairGrid {
+    /// Both halves, the half the slowest axis: gate's planes, then up's.
+    HalfSlowest,
+    /// Both halves, one expert's gate and up planes adjacent.
+    HalfByPlane,
+    /// Both halves, one row tile's gate and up threadgroups adjacent.
+    HalfFastest,
+    /// One half alone, on the grid of a single routed launch: `src0a` is
+    /// its weight and `dst` its `[batch, topk, n]`.
+    OneHalf,
+}
+
+impl PairGrid {
+    /// The kernel's `PAIR_ORDER_FC`.
+    fn order(self) -> usize {
+        match self {
+            PairGrid::HalfSlowest | PairGrid::OneHalf => 0,
+            PairGrid::HalfByPlane => 1,
+            PairGrid::HalfFastest => 2,
+        }
+    }
+}
+
 /// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2_<q>_<triple>`):
 /// `src0a` and `src0b` are two stacked weights of the same kind and
 /// `[n_experts, n, k]`; `dst` is `[2, batch, topk, n]` in the triple's store
-/// leg (plane set 0 from `src0a`, 1 from `src0b`). `triple` is
+/// leg (plane set 0 from `src0a`, 1 from `src0b`), laid out as `grid` says
+/// ([`PairGrid::OneHalf`]: `[batch, topk, n]` from `src0a` alone). `triple` is
 /// [`call_quantized_matmul_mv_id_t`]'s, with the same reach — the f16 arm on
 /// quantized weight rows only — and each plane computes exactly what that
 /// launch computes for it under the same triple.
@@ -1303,6 +1346,7 @@ pub fn call_quantized_matmul_mv_id2_t(
     kernels: &Kernels,
     dtype: GgmlDType,
     triple: GemvTriple,
+    grid: PairGrid,
     (n_experts, n, k): (usize, usize, usize),
     (batch, topk, in_dim1): (usize, usize, usize),
     src0a: &Buffer,
@@ -1351,10 +1395,17 @@ pub fn call_quantized_matmul_mv_id2_t(
     let nb1 = n as u64 * store_size;
 
     let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let (tiles, planes) = (divide(n, align), batch * topk);
+    let (width, height, depth) = match grid {
+        PairGrid::HalfSlowest => (tiles, 1, 2 * planes),
+        PairGrid::HalfByPlane => (tiles, 2, planes),
+        PairGrid::HalfFastest => (2 * tiles, 1, planes),
+        PairGrid::OneHalf => (tiles, 1, planes),
+    };
     let thread_groups_count = MTLSize {
-        width: divide(n, align),
-        height: 1,
-        depth: 2 * batch * topk,
+        width,
+        height,
+        depth,
     };
     let threads_per_threadgroup = MTLSize {
         width: nth0,
@@ -1362,7 +1413,12 @@ pub fn call_quantized_matmul_mv_id2_t(
         depth: 1,
     };
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Quantized,
+        name.clone(),
+        Some(mv_id2_constants(dtype, grid)),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -1371,7 +1427,7 @@ pub fn call_quantized_matmul_mv_id2_t(
     }
     debug_group!(
         encoder,
-        "qmm_mv_id2 {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+        "qmm_mv_id2 {name} {grid:?} E={n_experts} B={batch} topk={topk} K={k} N={n}"
     );
 
     set_params!(

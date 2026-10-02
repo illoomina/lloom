@@ -14,7 +14,7 @@
 use half::f16;
 use lloom_tensor::quantized::{
     iq_quants::{BlockIQ4nl, BlockQ2_0},
-    GgmlDType, QStorage, QTensor,
+    GgmlDType, MoeArm, PairOrder, QStorage, QTensor,
 };
 use lloom_tensor::{DType, Device, Result, Tensor, D};
 use std::borrow::Cow;
@@ -540,10 +540,19 @@ fn bits(t: &Tensor) -> Result<Vec<u32>> {
 /// The gate|up pair launch (`kernel_mul_mv_id2`, lloom #749 P31 (3)): each
 /// half is its own `indexed_moe_forward` bit for bit, the halves are not
 /// interchangeable (the pair the other way round is the outputs swapped — the
-/// buffer select), and two launches agree bit for bit.
+/// buffer select), and two launches agree bit for bit — in every grid order
+/// the pair can take (`PairOrder`), each its own launch.
 fn routed_pair_is_the_two_launches(dtype: GgmlDType, in_dim1_is_topk: bool) -> Result<()> {
+    routed_pair_is_the_two_launches_n(dtype, in_dim1_is_topk, 64)
+}
+
+fn routed_pair_is_the_two_launches_n(
+    dtype: GgmlDType,
+    in_dim1_is_topk: bool,
+    n: usize,
+) -> Result<()> {
     let dev = Device::new_metal(0)?;
-    let (e, n, k) = (6usize, 64usize, 256usize);
+    let (e, k) = (6usize, 256usize);
     let (batch, topk) = (2usize, 3usize);
     let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
     let (g, _) = stacked_weight(dtype, (e, n, k), 17, &dev)?;
@@ -552,18 +561,62 @@ fn routed_pair_is_the_two_launches(dtype: GgmlDType, in_dim1_is_topk: bool) -> R
     let ids_t = Tensor::from_vec(vec![5u32, 0, 5, 2, 4, 5], (batch, topk), &dev)?;
     let want_g = bits(&g.indexed_moe_forward(&x, &ids_t)?)?;
     let want_u = bits(&u.indexed_moe_forward(&x, &ids_t)?)?;
-    assert_ne!(want_g, want_u, "the two weights must differ for the select to be testable");
-    let (got_g, got_u) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
-    assert_eq!(got_g.dims(), &[batch, topk, n]);
-    assert_eq!(got_u.dims(), &[batch, topk, n]);
-    assert_eq!(bits(&got_g)?, want_g, "{dtype:?}: the pair's gate half is not the gate launch");
-    assert_eq!(bits(&got_u)?, want_u, "{dtype:?}: the pair's up half is not the up launch");
-    let (sw_u, sw_g) = u.indexed_moe_forward_pair(&g, &x, &ids_t)?;
-    assert_eq!(bits(&sw_u)?, want_u, "{dtype:?}: the pair the other way round: first half");
-    assert_eq!(bits(&sw_g)?, want_g, "{dtype:?}: the pair the other way round: second half");
-    let (g2, u2) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
-    assert_eq!(bits(&g2)?, want_g, "{dtype:?}: the pair is not bit-stable (gate)");
-    assert_eq!(bits(&u2)?, want_u, "{dtype:?}: the pair is not bit-stable (up)");
+    assert_ne!(
+        want_g, want_u,
+        "the two weights must differ for the select to be testable"
+    );
+    for order in PairOrder::ALL {
+        let pair = |a: &QTensor, b: &QTensor| {
+            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, order)
+        };
+        let (got_g, got_u) = pair(&g, &u)?;
+        assert_eq!(got_g.dims(), &[batch, topk, n]);
+        assert_eq!(got_u.dims(), &[batch, topk, n]);
+        assert_eq!(
+            bits(&got_g)?,
+            want_g,
+            "{dtype:?} n={n} {order:?}: the pair's gate half is not the gate launch"
+        );
+        assert_eq!(
+            bits(&got_u)?,
+            want_u,
+            "{dtype:?} n={n} {order:?}: the pair's up half is not the up launch"
+        );
+        let (sw_u, sw_g) = pair(&u, &g)?;
+        assert_eq!(
+            bits(&sw_u)?,
+            want_u,
+            "{dtype:?} {order:?}: the pair the other way round: first half"
+        );
+        assert_eq!(
+            bits(&sw_g)?,
+            want_g,
+            "{dtype:?} {order:?}: the pair the other way round: second half"
+        );
+        let (g2, u2) = pair(&g, &u)?;
+        assert_eq!(
+            bits(&g2)?,
+            want_g,
+            "{dtype:?} {order:?}: the pair is not bit-stable (gate)"
+        );
+        assert_eq!(
+            bits(&u2)?,
+            want_u,
+            "{dtype:?} {order:?}: the pair is not bit-stable (up)"
+        );
+    }
+    Ok(())
+}
+
+/// The f32 pair in every grid order at every kind the f16 pair is held at,
+/// with a row count off every kind's tile (37), so a half whose last tile
+/// spilled would land on the other half's first plane, which this compares.
+#[test]
+fn routed_pair_f32_every_kind_every_order() -> Result<()> {
+    for dtype in F16_PAIR_KINDS {
+        routed_pair_is_the_two_launches_n(dtype, false, 64)?;
+        routed_pair_is_the_two_launches_n(dtype, false, 37)?;
+    }
     Ok(())
 }
 
@@ -626,51 +679,56 @@ fn routed_pair_f16_is_the_two_f16_launches(
         want_g, want_u,
         "the two weights must differ for the select to be testable"
     );
-    let (got_g, got_u) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
-    for (half_name, t) in [("gate", &got_g), ("up", &got_u)] {
+    for order in PairOrder::ALL {
+        let pair = |a: &QTensor, b: &QTensor| {
+            a.indexed_moe_forward_pair_in(b, &x, &ids_t, MoeArm::MatVec, order)
+        };
+        let (got_g, got_u) = pair(&g, &u)?;
+        for (half_name, t) in [("gate", &got_g), ("up", &got_u)] {
+            assert_eq!(
+                t.dims(),
+                &[batch, topk, n],
+                "{dtype:?} {order:?}: the pair's {half_name} half's shape"
+            );
+            assert_eq!(
+                t.dtype(),
+                DType::F16,
+                "{dtype:?} {order:?}: the f16 pair must store f16 ({half_name})"
+            );
+        }
         assert_eq!(
-            t.dims(),
-            &[batch, topk, n],
-            "{dtype:?}: the pair's {half_name} half's shape"
+            bits16(&got_g)?,
+            want_g,
+            "{dtype:?} in_dim1={in_dim1} n={n} {order:?}: the f16 pair's gate half is not the f16 gate launch"
         );
         assert_eq!(
-            t.dtype(),
-            DType::F16,
-            "{dtype:?}: the f16 pair must store f16 ({half_name})"
+            bits16(&got_u)?,
+            want_u,
+            "{dtype:?} in_dim1={in_dim1} n={n} {order:?}: the f16 pair's up half is not the f16 up launch"
+        );
+        let (sw_u, sw_g) = pair(&u, &g)?;
+        assert_eq!(
+            bits16(&sw_u)?,
+            want_u,
+            "{dtype:?} {order:?}: the f16 pair the other way round: first half"
+        );
+        assert_eq!(
+            bits16(&sw_g)?,
+            want_g,
+            "{dtype:?} {order:?}: the f16 pair the other way round: second half"
+        );
+        let (g2, u2) = pair(&g, &u)?;
+        assert_eq!(
+            bits16(&g2)?,
+            want_g,
+            "{dtype:?} {order:?}: the f16 pair is not bit-stable (gate)"
+        );
+        assert_eq!(
+            bits16(&u2)?,
+            want_u,
+            "{dtype:?} {order:?}: the f16 pair is not bit-stable (up)"
         );
     }
-    assert_eq!(
-        bits16(&got_g)?,
-        want_g,
-        "{dtype:?} in_dim1={in_dim1} n={n}: the f16 pair's gate half is not the f16 gate launch"
-    );
-    assert_eq!(
-        bits16(&got_u)?,
-        want_u,
-        "{dtype:?} in_dim1={in_dim1} n={n}: the f16 pair's up half is not the f16 up launch"
-    );
-    let (sw_u, sw_g) = u.indexed_moe_forward_pair(&g, &x, &ids_t)?;
-    assert_eq!(
-        bits16(&sw_u)?,
-        want_u,
-        "{dtype:?}: the f16 pair the other way round: first half"
-    );
-    assert_eq!(
-        bits16(&sw_g)?,
-        want_g,
-        "{dtype:?}: the f16 pair the other way round: second half"
-    );
-    let (g2, u2) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
-    assert_eq!(
-        bits16(&g2)?,
-        want_g,
-        "{dtype:?}: the f16 pair is not bit-stable (gate)"
-    );
-    assert_eq!(
-        bits16(&u2)?,
-        want_u,
-        "{dtype:?}: the f16 pair is not bit-stable (up)"
-    );
     Ok(())
 }
 

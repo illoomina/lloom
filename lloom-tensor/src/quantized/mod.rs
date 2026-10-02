@@ -1173,6 +1173,20 @@ impl QTensor {
         ids: &Tensor,
         arm: MoeArm,
     ) -> Result<(Tensor, Tensor)> {
+        self.indexed_moe_forward_pair_in(up, x, ids, arm, PairOrder::configured())
+    }
+
+    /// [`Self::indexed_moe_forward_pair_with`] with the one launch's grid in
+    /// `order` rather than `LLOOM_MOE_PAIR_ORDER`'s. The halves are the same
+    /// bits in every order.
+    pub fn indexed_moe_forward_pair_in(
+        &self,
+        up: &QTensor,
+        x: &Tensor,
+        ids: &Tensor,
+        arm: MoeArm,
+        order: PairOrder,
+    ) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "metal")]
         if arm == MoeArm::MatVec
             && moe_pair_on()
@@ -1183,20 +1197,38 @@ impl QTensor {
             if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
                 let (xs, is) = (x.storage(), ids.storage());
                 if let (Storage::Metal(xs), Storage::Metal(is)) = (&*xs, &*is) {
-                    let (storage, shape) =
-                        a.indexed_moe_forward_pair(b, self.shape(), xs, x.layout(), is, ids.layout())?;
-                    let both = crate::tensor::from_storage(
-                        Storage::Metal(storage),
-                        shape,
-                        crate::op::BackpropOp::none(),
-                        false,
-                    );
-                    let g = both.narrow(0, 0, 1)?.squeeze(0)?;
-                    let u = both.narrow(0, 1, 1)?.squeeze(0)?;
-                    return Ok((g, u));
+                    let (gs, us, shape) = a.indexed_moe_forward_pair(
+                        b,
+                        self.shape(),
+                        xs,
+                        x.layout(),
+                        is,
+                        ids.layout(),
+                        order,
+                    )?;
+                    let tensor = |s, shape| {
+                        crate::tensor::from_storage(
+                            Storage::Metal(s),
+                            shape,
+                            crate::op::BackpropOp::none(),
+                            false,
+                        )
+                    };
+                    return Ok(match us {
+                        None => {
+                            let both = tensor(gs, shape);
+                            (
+                                both.narrow(0, 0, 1)?.squeeze(0)?,
+                                both.narrow(0, 1, 1)?.squeeze(0)?,
+                            )
+                        }
+                        Some(us) => (tensor(gs, shape.clone()), tensor(us, shape)),
+                    });
                 }
             }
         }
+        #[cfg(not(feature = "metal"))]
+        let _ = order;
         Ok((
             self.indexed_moe_forward_with(x, ids, arm)?,
             up.indexed_moe_forward_with(x, ids, arm)?,
@@ -1644,6 +1676,62 @@ impl MoeArm {
         } else {
             MoeArm::MatVec
         }
+    }
+}
+
+/// How the routed gate|up pair lays its two halves out on Metal
+/// (`LLOOM_MOE_PAIR_ORDER`): one launch with the half on the grid's slowest
+/// axis, next to the plane, or on its fastest axis; or the pair's kernel
+/// launched once a half. Every order computes each plane with the same core,
+/// so the bits never depend on it (`docs/expert-streaming.md` §20.15e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairOrder {
+    /// Gate's planes, then up's: the incumbent.
+    Half,
+    /// One expert's gate and up planes adjacent.
+    Expert,
+    /// One row tile's gate and up threadgroups adjacent.
+    Tile,
+    /// The pair's kernel launched twice, one half each.
+    Split,
+}
+
+impl PairOrder {
+    pub const ALL: [PairOrder; 4] = [
+        PairOrder::Half,
+        PairOrder::Expert,
+        PairOrder::Tile,
+        PairOrder::Split,
+    ];
+
+    pub fn parse(v: &str) -> std::result::Result<PairOrder, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "half" => Ok(PairOrder::Half),
+            "expert" => Ok(PairOrder::Expert),
+            "tile" => Ok(PairOrder::Tile),
+            "split" => Ok(PairOrder::Split),
+            other => Err(format!(
+                "moe pair order: `{other}` is not one of half, expert, tile, split"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PairOrder::Half => "half",
+            PairOrder::Expert => "expert",
+            PairOrder::Tile => "tile",
+            PairOrder::Split => "split",
+        }
+    }
+
+    /// The process's order (`LLOOM_MOE_PAIR_ORDER`, read once).
+    pub fn configured() -> PairOrder {
+        static ORDER: std::sync::OnceLock<PairOrder> = std::sync::OnceLock::new();
+        *ORDER.get_or_init(|| {
+            PairOrder::parse(&crate::tuning::tuning().moe.pair_order)
+                .expect("the parser accepted it")
+        })
     }
 }
 

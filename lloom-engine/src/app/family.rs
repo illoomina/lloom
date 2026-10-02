@@ -260,7 +260,9 @@ fn qwen_kv_precision(
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
-    if !cap.speculation.contains(&s.speculative.method.as_str()) && s.speculative.method != "none" {
+    if !cap.speculation.contains(&s.speculative.method.as_str())
+        && !matches!(s.speculative.method.as_str(), "none" | "auto")
+    {
         anyhow::bail!(
             "speculative.method = {} is not {}'s (its methods: [{}])",
             s.speculative.method,
@@ -477,6 +479,41 @@ fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<Strin
     rides.then(|| format!("eos_gate is off on {}: {}", cap.family, cap.eos_gate_missing))
 }
 
+/// `speculative.method = auto` resolved for `family`: LFM2's DSpark when
+/// `speculative.drafter` names a checkpoint or the HF cache holds one;
+/// Qwen4-exp's MTP when it names the head's sidecar or
+/// `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, at `--batch 1` (the head
+/// speculates at one row); else `none`. The note names the choice, so a run
+/// records which arm it took.
+fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
+    if shape.speculative.method != "auto" {
+        return None;
+    }
+    let batch = shape.batch;
+    let spec = &mut shape.speculative;
+    let chosen = match family {
+        "lfm2" => (spec.drafter.is_some()
+            || super::common::newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").is_some())
+        .then_some("dspark"),
+        "qwen4exp" => {
+            if spec.drafter.is_none() {
+                spec.drafter = std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".cache/lloom/qwen4exp-mtp-q8.gguf"))
+                    .filter(|p| p.is_file());
+            }
+            (spec.drafter.is_some() && batch <= 1).then_some("mtp")
+        }
+        _ => None,
+    };
+    spec.method = chosen.unwrap_or("none").into();
+    Some(match (&spec.drafter, chosen) {
+        (Some(d), Some(m)) => format!("auto -> {m} (drafter {})", d.display()),
+        (_, Some(m)) => format!("auto -> {m} (the HF cache's drafter)"),
+        _ => format!("auto -> none (no {family} drafter at hand, or --batch {batch})"),
+    })
+}
+
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
 pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     let path = match &model.model {
@@ -486,6 +523,9 @@ pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf
     };
     let (family, checkpoint) = detect(&path)?;
     let mut shape = shape;
+    if let Some(note) = resolve_auto_speculation(family.name(), &mut shape) {
+        eprintln!("[speculate: {note}]");
+    }
     let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");

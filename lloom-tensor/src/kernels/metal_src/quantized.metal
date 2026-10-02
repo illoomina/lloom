@@ -8550,6 +8550,52 @@ void mmv_fn(
 
 typedef decltype(mmv_fn<kernel_mul_mv_impl<half, half4, half, half4>>) mul_mv_impl_fn_t;
 
+// The union form of the routed matvec wrappers (`MV_ID_UNION`, function
+// constant 917, `LLOOM_QMV_ID_UNION`; the host sets it only for a launch of two
+// or more rows). The threadgroup of the first plane, in plane order, that names
+// a slot runs every plane naming that slot, one after another, through the core
+// call the incumbent makes for each; the threadgroups of the later planes exit.
+// A slot two rows share is read from memory once and from cache after, and
+// every plane's arithmetic is the incumbent's. A pair launch keeps the
+// incumbent plane order (the half in `tgpig.z / planes`).
+constant bool MV_ID_UNION_FC [[function_constant(917)]];
+constant bool MV_ID_UNION = is_function_constant_defined(MV_ID_UNION_FC) && MV_ID_UNION_FC;
+
+static inline int32_t mv_id_slot(device const char * ids, uint64_t nbi1, int64_t nei0, int z) {
+    return ((device const int32_t *) (ids + (z / nei0) * nbi1))[z % nei0];
+}
+
+#define MV_ID_UNION_BODY(D, SRC0A, SRC0B, HALVES)                                       \
+    {                                                                                  \
+        const int planes = nei0 * nei1;                                                \
+        const int hf = (HALVES) > 1 ? (int)(tgpig.z / planes) : 0;                     \
+        const int z0 = tgpig.z - hf * planes;                                          \
+        const int32_t slot = mv_id_slot(ids, nbi1, nei0, z0);                          \
+        for (int p = 0; p < z0; ++p) {                                                 \
+            if (mv_id_slot(ids, nbi1, nei0, p) == slot) {                              \
+                return;                                                                \
+            }                                                                          \
+        }                                                                              \
+        tgpig.z = 0;                                                                   \
+        device const char * src0_cur = (hf ? (SRC0B) : (SRC0A)) + slot*nb02;           \
+        for (int z = z0; z < planes; ++z) {                                            \
+            if (z != z0) {                                                             \
+                if (mv_id_slot(ids, nbi1, nei0, z) != slot) {                          \
+                    continue;                                                          \
+                }                                                                      \
+                threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+            }                                                                          \
+            const int64_t iid1 = z / nei0;                                             \
+            const int64_t idx = z % nei0;                                              \
+            device const char * src1_cur = src1 + (idx % ne11)*nb11 + iid1*nb12;       \
+            device D * dst_cur = dst + hf*nei1*ne1*ne0 + idx*ne0 + iid1*ne1*ne0;       \
+            impl_fn(src0_cur, src1_cur, dst_cur, ne00, ne01, 1, nb00, nb01, nb02,      \
+                    ne10, 1, 1, 1, nb10, nb11, nb12, ne0, 1, nb1, 1, 1,                 \
+                    shared_values, tgpig, tiitg, tiisg, sgitg);                        \
+        }                                                                              \
+        return;                                                                        \
+    }
+
 template<mul_mv_impl_fn_t impl_fn>
 kernel void kernel_mul_mv_id(
         device const    char * src0s,
@@ -8580,6 +8626,8 @@ kernel void kernel_mul_mv_id(
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
         uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (MV_ID_UNION) MV_ID_UNION_BODY(float, src0s, src0s, 1)
+
     const int iid1 = tgpig.z/nei0;
     const int idx = tgpig.z%nei0;
 
@@ -8738,6 +8786,8 @@ kernel void kernel_mul_mv_id_f16(
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
         uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (MV_ID_UNION) MV_ID_UNION_BODY(half, src0s, src0s, 1)
+
     const int iid1 = tgpig.z/nei0;
     const int idx = tgpig.z%nei0;
 
@@ -8852,6 +8902,8 @@ kernel void kernel_mul_mv_id2(
         uint                   tiitg[[thread_index_in_threadgroup]],
         uint                   tiisg[[thread_index_in_simdgroup]],
         uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (MV_ID_UNION) MV_ID_UNION_BODY(D, src0a, src0b, 2)
+
     const int planes = nei0 * nei1;
     const int hf = tgpig.z / planes;          // 0: src0a -> dst[0]; 1: src0b -> dst[1]
     const int z = tgpig.z - hf * planes;

@@ -351,6 +351,9 @@ pub struct VerifyPass {
     h: Option<Tensor>,
     /// A host-planned window that loaded for its draft rows too.
     drafts_loaded: bool,
+    /// The MTP head run over every window row inside the pass
+    /// (`QWEN4EXP_MTP_FOLD`), its per-row drafts read back with the argmax.
+    pub(crate) fold: Option<super::mtp::Folded>,
 }
 
 /// What a settled verify window is worth (`Qwen4Exp::verify_window_settle`).
@@ -1283,6 +1286,45 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         });
         let block = ratio.is_some_and(|r| (pos + 1).is_multiple_of(r));
         block as u32 | (device_plan as u32) << 1
+    }
+
+    /// Which of this model's verify-window sequences a window of `t`
+    /// positions at `cache.pos` runs, as its pass key's variant: bits
+    /// `0..16`, the rows that complete an indexer block (the block's
+    /// pooling, norm, rope and append); bit 16, the device plan (its
+    /// records read back with the argmax) rather than a readback per layer;
+    /// bit 17, the drafts' loads beside row 0 on the host plan; bits 18–19,
+    /// the window inside / crossing / past the QSA dense range
+    /// ([`Self::prefill_variant`]); and when a drafter handed the MTP head's
+    /// lane to the window (`QWEN4EXP_MTP_FOLD`), the head's own: bits
+    /// `20..28` its rows that complete a block, bit 28 its device plan,
+    /// bits 29–30 its dense-range kind. Each is decided here as
+    /// [`Self::verify_window_run`] decides it, before the pass.
+    pub(crate) fn verify_variant(&self, cache: &Cache, t: usize) -> u32 {
+        let ratio = self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
+            Mixer::Linear(_) => None,
+        });
+        let blocks = |pos: usize, n: usize| match ratio {
+            Some(r) => (0..t.min(n))
+                .filter(|row| (pos + row + 1).is_multiple_of(r))
+                .fold(0u32, |m, row| m | 1 << row),
+            None => 0,
+        };
+        let pos = cache.pos;
+        let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let drafts = !planned && cache.window_loads_drafts();
+        let target = blocks(pos, 16)
+            | (planned as u32) << 16
+            | (drafts as u32) << 17
+            | self.prefill_variant(pos, t) << 18;
+        let head = self.mtp.as_ref().and_then(|h| {
+            h.pending_lane().map(|(hpos, armed)| {
+                let device = h.layer().moe().experts().plans_on_device() && armed;
+                blocks(hpos, 8) << 20 | (device as u32) << 28 | self.prefill_variant(hpos, t) << 29
+            })
+        });
+        target | head.unwrap_or(0)
     }
 
     /// The plan-cache key of a pass shape this model prepares or opens — a
@@ -3193,6 +3235,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 tokens: tokens.to_vec(),
                 h: None,
                 drafts_loaded: drafts,
+                fold: None,
             });
         }
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
@@ -3208,9 +3251,15 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 loaded_rows: if drafts { t } else { 1 },
             }
         };
-        let (logits, plans) = self.verify_pass(&h, cache, kind)?;
+        let (logits, plans, carries) = self.verify_pass(&h, cache, kind)?;
         let argmax = logits.argmax(D::Minus1)?; // [T]
-        let (argmax, records) = self.window_read(argmax, plans, t)?;
+        let run = self.fold_head(&carries, &argmax, t)?;
+        let extras: Vec<&Tensor> = run.as_ref().map_or_else(Vec::new, |r| r.read_tensors());
+        let (argmax, records, read) = self.window_read(argmax, plans, t, &extras)?;
+        let fold = match run {
+            Some(r) => Some(r.read(read, self.mtp_topk())?),
+            None => None,
+        };
         Ok(VerifyPass {
             argmax,
             records,
@@ -3219,6 +3268,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             tokens: tokens.to_vec(),
             h: Some(h),
             drafts_loaded: drafts,
+            fold,
         })
     }
 
@@ -3226,12 +3276,15 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// readback (their `cat`, through the model's own destination): the
     /// round's one wait on the pass. A host plan's records are on the
     /// host already.
+    /// `extras` are further `u32` tensors read in the same readback, each
+    /// returned flat after the records.
     fn window_read(
         &self,
         argmax: Tensor,
         plans: Vec<(usize, WindowPlan)>,
         rows: usize,
-    ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
+        extras: &[&Tensor],
+    ) -> Result<WindowRead> {
         let topk = self.cfg.n_experts_per_tok;
         let mut device: Vec<(usize, Tensor)> = Vec::new();
         let mut out: Vec<(usize, WindowRecord)> = Vec::with_capacity(plans.len());
@@ -3241,11 +3294,16 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 WindowPlan::Device(t) => device.push((l, t.flatten_all()?)),
             }
         }
-        if device.is_empty() {
-            return Ok((argmax.to_vec1::<u32>()?, out));
+        if device.is_empty() && extras.is_empty() {
+            return Ok((argmax.to_vec1::<u32>()?, out, Vec::new()));
         }
+        let extras: Vec<Tensor> = extras
+            .iter()
+            .map(|t| t.flatten_all())
+            .collect::<Result<_>>()?;
         let mut refs: Vec<&Tensor> = device.iter().map(|(_, t)| t).collect();
         refs.push(&argmax);
+        refs.extend(extras.iter());
         let all = self.read_records(&Tensor::cat(&refs, 0)?)?;
         let mut at = 0usize;
         for (l, t) in &device {
@@ -3267,8 +3325,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 at + rows
             ))
         })?;
+        at += rows;
+        let mut read = Vec::with_capacity(extras.len());
+        for t in &extras {
+            let n = t.elem_count();
+            let slice = all.get(at..at + n).ok_or_else(|| {
+                lloom_tensor::Error::Msg(format!(
+                    "window read: the cat is {} long, an extra needs {at}..{}",
+                    all.len(),
+                    at + n
+                ))
+            })?;
+            read.push(slice.to_vec());
+            at += n;
+        }
         out.sort_by_key(|(l, _)| *l);
-        Ok((am.to_vec(), out))
+        Ok((am.to_vec(), out, read))
     }
 
     /// Settle [`Self::verify_window_run`]'s pass once `accept` has read its
@@ -3304,6 +3376,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             tokens,
             h,
             drafts_loaded,
+            fold: _,
         } = pass;
         let mut drafts_loaded = drafts_loaded;
         let t = tokens.len();
@@ -3350,8 +3423,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         real_rows: if truncate { 1 } else { t },
                         loaded_rows: if all_loaded { t } else { 1 },
                     };
-                    let (logits, plans) = self.verify_pass(h, cache, kind)?;
-                    self.window_read(logits.argmax(D::Minus1)?, plans, t)?
+                    let (logits, plans, _) = self.verify_pass(h, cache, kind)?;
+                    let (am, recs, _) =
+                        self.window_read(logits.argmax(D::Minus1)?, plans, t, &[])?;
+                    (am, recs)
                 }
                 None => self.verify_rows_reference(&tokens, cache, !truncate, all_loaded)?,
             };
@@ -3481,15 +3556,15 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok((argmax, records))
     }
 
-    /// The layer stack over the window's `T` positions → logits `[T, vocab]`
-    /// and the layers' plan records; the KV lengths after each position
-    /// recorded in the window.
+    /// The layer stack over the window's `T` positions → logits `[T, vocab]`,
+    /// the layers' plan records and the pre-mixer carries `[T, 1, n·d]`; the
+    /// KV lengths after each position recorded in the window.
     fn verify_pass(
         &self,
         h: &Tensor,
         cache: &mut Cache,
         kind: WindowPlanKind,
-    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
+    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>, Tensor)> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let t = h.dim(0)?;
@@ -3541,9 +3616,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let logits = logits
             .reshape((t, self.cfg.vocab_size))?
             .to_dtype(lloom_tensor::DType::F32)?;
-        Ok((logits, records))
+        Ok((logits, records, res_hc))
     }
 }
+
+/// [`Qwen4Exp::window_read`]: the argmax, the records, and the extras.
+type WindowRead = (Vec<u32>, Vec<(usize, WindowRecord)>, Vec<Vec<u32>>);
 
 impl<R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<R> {
     fn forward_rows(

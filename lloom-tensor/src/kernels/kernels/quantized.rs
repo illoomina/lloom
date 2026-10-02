@@ -359,6 +359,53 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
     }
 }
 
+/// [`mv_constants`] for a routed launch (`kernel_mul_mv_id*`) of `batch`
+/// rows: with the union form (`MV_ID_UNION`, function constant 917) on when
+/// `LLOOM_QMV_ID_UNION` is and two or more rows share the launch. The
+/// wrappers name the constant, so every routed load supplies it.
+fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
+    let mut values = mv_constants(dtype).map_or_else(Vec::new, ConstantValues::into_values);
+    let union = batch > 1 && id_union_on();
+    if union {
+        ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    values.push((917, Value::Bool(union)));
+    ConstantValues::new(values)
+}
+
+/// Routed matvec launches specialised to the union form, since process
+/// start: the arm's engagement count.
+static ID_UNION_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`ID_UNION_LAUNCHES`] now.
+pub fn qmv_id_union_launches() -> u64 {
+    ID_UNION_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `LLOOM_QMV_ID_UNION=on` (read once, or [`set_qmv_id_union`]): the routed
+/// matvec's union form.
+fn id_union_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ID_UNION.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qmv.id_union;
+            ID_UNION.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 off, 2 on.
+static ID_UNION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select the routed matvec's union form for this process (a test runs both
+/// forms; `LLOOM_QMV_ID_UNION` otherwise). The two are separate pipelines.
+pub fn set_qmv_id_union(on: bool) {
+    ID_UNION.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
 /// activation rows per weight read (`kernel_mul_mv_*_rows_impl`). Off by
 /// default, and not taken by the `fast` contract either: a row's bits
@@ -722,7 +769,12 @@ pub fn call_quantized_matmul_mv_id_t(
         depth: 1,
     };
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Quantized,
+        name.clone(),
+        Some(mv_id_constants(dtype, batch)),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -1362,7 +1414,12 @@ pub fn call_quantized_matmul_mv_id2_t(
         depth: 1,
     };
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Quantized,
+        name.clone(),
+        Some(mv_id_constants(dtype, batch)),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

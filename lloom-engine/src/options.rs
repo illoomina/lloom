@@ -1002,12 +1002,13 @@ impl SamplingConfig {
 
 // ---- speculation ----------------------------------------------------------------
 
-fn parse_method(v: &str) -> Result<String, String> {
+pub(crate) fn parse_method(v: &str) -> Result<String, String> {
     match v.trim() {
         "none" | "off" => Ok("none".into()),
         "dspark" => Ok("dspark".into()),
         "mtp" => Ok("mtp".into()),
-        other => Err(format!("`{other}` is not a speculation method (none, dspark, mtp)")),
+        "auto" => Ok("auto".into()),
+        other => Err(format!("`{other}` is not a speculation method (none, dspark, mtp, auto)")),
     }
 }
 
@@ -1022,8 +1023,8 @@ fn parse_method(v: &str) -> Result<String, String> {
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct SpeculativeConfig {
-    /// `none`, `dspark` (LFM2) or `mtp` (Qwen4-exp).
-    #[opt(flag = "spec-method", parser = "parse_method", variants = ["none", "dspark", "mtp"])]
+    /// `none`, `dspark` (LFM2), `mtp` (Qwen4-exp), or `auto`: the family's own drafter when one is at hand (DSpark when `drafter` names one or the HF cache holds one; MTP when `drafter` names the sidecar or `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, at `--batch 1`), else none.
+    #[opt(flag = "spec-method", parser = "parse_method", variants = ["none", "dspark", "mtp", "auto"])]
     pub method: String,
     /// Tokens the drafter proposes per round (none = the drafter's own: DSpark's block of 9, MTP 1).
     #[opt(flag = "spec-k")]

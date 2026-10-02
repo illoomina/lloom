@@ -3211,6 +3211,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // sequence's passes inside this one's, which is exactly the drift
         // the key exists to refuse.
         let k = (spec.max_draft() + 1).min(u16::MAX as usize);
+        s.model.prepare_verify(&mut s.seq.cache, k)?;
         begin_pass(device, PassShape::Verify { k })?;
         let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache);
         end_pass(device)?;

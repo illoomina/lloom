@@ -1453,6 +1453,11 @@ impl QsaAttention {
             lloom_tensor::bail!("qsa decode_seq: x {:?} (positions on dim 0)", x.shape())
         }
         let mut lens = Vec::with_capacity(t);
+        if t > 1 && window_batched() {
+            if let Some(out) = self.decode_seq_batched(x, kv, &mut lens)? {
+                return Ok((out, lens));
+            }
+        }
         if let Some(out) = self.decode_seq_fused(x, kv, &mut lens)? {
             return Ok((out, lens));
         }
@@ -1557,6 +1562,161 @@ impl QsaAttention {
         } else {
             Tensor::cat(&gated_rows, 0)?
         };
+        Ok(Some(self.wo.forward(&gated)?.reshape((t, 1, hidden))?))
+    }
+
+    /// [`Self::decode_seq_fused`] with the window's positions in one launch
+    /// per kernel (`QWEN4EXP_QSA_WINDOW=batched`): `kernels::QsaPrepBatch`
+    /// at each row's position, one append of the window's k / v, the
+    /// indexer's key projection once with each block completed at the row
+    /// that completes it, and the rows within the dense range through one
+    /// `kernels::SdpaVectorPaged` over the slab (its whole capacity one
+    /// page) — per row the per-row path's arithmetic. A row past the dense
+    /// range selects and attends as the per-row path does. Metal, f32, the
+    /// dense f32 slab; `None` elsewhere.
+    fn decode_seq_batched(
+        &self,
+        x: &Tensor,
+        kv: &mut KvCache,
+        lens: &mut Vec<(usize, usize)>,
+    ) -> Result<Option<Tensor>> {
+        use super::kernels::{fused_off, sigmoid_mul, QsaPrepBatch};
+        let (t, _, hidden) = x.dims3()?;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let f32 = DType::F32;
+        let slab_f32 =
+            matches!(&kv.kv, KvBacking::Slab(_)) && kv.precision.dense_dtype() == Some(f32);
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != f32
+            || !slab_f32
+            || !lloom_tensor::shape_req!(sdpa_head_dim, matches!(hd, 32 | 64 | 96 | 128 | 256); hd)
+            || nh % nkv != 0
+        {
+            return Ok(None);
+        }
+        let dev = x.device();
+        let xb = x.reshape((t, hidden))?;
+        let (nq, nk) = (nh * 2 * hd, nkv * hd);
+        let (qg_all, k_all_rows, v_all_rows) = match &self.stem_cat {
+            Some(cat) => {
+                let all = cat.forward(&xb)?.to_dtype(f32)?.reshape((t, nq + 2 * nk))?;
+                (
+                    all.narrow(1, 0, nq)?.contiguous()?,
+                    all.narrow(1, nq, nk)?.contiguous()?,
+                    all.narrow(1, nq + nk, nk)?.contiguous()?,
+                )
+            }
+            None => (
+                self.wq.forward(&xb)?.to_dtype(f32)?.reshape((t, nq))?,
+                self.wk.forward(&xb)?.to_dtype(f32)?.reshape((t, nk))?,
+                self.wv.forward(&xb)?.to_dtype(f32)?.reshape((t, nk))?,
+            ),
+        };
+        let pos0 = kv.len();
+        let pos: Vec<u32> = (pos0..pos0 + t).map(|p| p as u32).collect();
+        let prep = qg_all.reshape((t, nh, 2 * hd))?.apply_op3_no_bwd(
+            &k_all_rows.reshape((t, nkv, hd))?,
+            &Tensor::from_vec(pos, t, dev)?,
+            &QsaPrepBatch {
+                hd,
+                n_rot: self.n_rot,
+                nh,
+                nkv,
+                theta: self.rope_theta as f32,
+                eps: self.q_norm.eps() as f32,
+                q_gamma: self.q_norm.weight().to_dtype(f32)?,
+                k_gamma: self.k_norm.weight().to_dtype(f32)?,
+            },
+        )?; // flat: q [t, nh, hd] | gate [t, nh, hd] | k [t, nkv, hd]
+        let q = prep.narrow(0, 0, t * nh * hd)?.reshape((t, nh, hd))?;
+        let gate = prep
+            .narrow(0, t * nh * hd, t * nh * hd)?
+            .reshape((t, nh * hd))?;
+        let k_new = prep
+            .narrow(0, 2 * t * nh * hd, t * nkv * hd)?
+            .reshape((t, nkv, hd))?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let v_new = v_all_rows
+            .reshape((t, nkv, hd))?
+            .transpose(0, 1)?
+            .contiguous()?;
+        kv.append(&k_new, &v_new)?;
+        // The indexer's keys: one projection, then each block completed at
+        // the row that completes it, as the per-row path's observe does.
+        let ratio = self.indexer.as_ref().map(|ix| ix.ratio);
+        if let Some(ix) = &self.indexer {
+            let k_raw = ix.k_proj.forward(&xb)?;
+            let mut start = 0;
+            for r in 0..t {
+                if (pos0 + r + 1).is_multiple_of(ix.ratio) || r + 1 == t {
+                    ix.observe_keys(&k_raw.narrow(0, start, r + 1 - start)?, kv)?;
+                    start = r + 1;
+                }
+            }
+        }
+        for r in 0..t {
+            let blocks = match ratio {
+                Some(ratio) => (pos0 + r + 1) / ratio,
+                None => kv.n_blocks(),
+            };
+            lens.push((pos0 + r + 1, blocks));
+        }
+        let scale = (1.0 / (hd as f64).sqrt()) as f32;
+        // The rows within the dense range are a prefix of the window.
+        let d = (0..t)
+            .take_while(|&r| match &self.indexer {
+                Some(ix) => pos0 + r + 1 <= ix.dense_limit(),
+                None => true,
+            })
+            .count();
+        let mut parts = Vec::with_capacity(1 + t - d);
+        if d > 0 {
+            let KvBacking::Slab(s) = &kv.kv else {
+                unreachable!("checked above")
+            };
+            let (pk, pv) = match (s.k_cache().all_data(), s.v_cache().all_data()) {
+                (Some(k), Some(v)) => (k.clone(), v.clone()),
+                _ => lloom_tensor::bail!("qsa window: the slab is empty after its append"),
+            };
+            let cap = pk.dim(1)?;
+            let n_keys: Vec<u32> = (0..d).map(|r| (pos0 + r + 1) as u32).collect();
+            let ctx = self.sdpa_paged_rows(
+                &q.narrow(0, 0, d)?.contiguous()?,
+                &pk,
+                &pv,
+                cap,
+                &vec![vec![0u32]; d],
+                &n_keys,
+                scale,
+            )?;
+            parts.push(ctx.reshape((d, nh * hd))?);
+        }
+        for r in d..t {
+            let ix = self.indexer.as_ref().expect("a row past the dense range");
+            let pos = pos0 + r;
+            let sel = ix.select(&xb.narrow(0, r, 1)?, pos, kv)?;
+            if let Some(sel) = &sel {
+                check_sel(sel, pos, kv)?;
+            }
+            let qr = q.narrow(0, r, 1)?.reshape((1, nh, 1, hd))?;
+            // Past the dense range the row reads its selection, every cell of
+            // which lies at or before it.
+            parts.push(kv.attend(&qr, sel.as_ref(), scale)?.reshape((1, nh * hd))?);
+        }
+        let ctx = if parts.len() == 1 {
+            parts.pop().expect("one part")
+        } else {
+            Tensor::cat(&parts, 0)?
+        };
+        let gated = match sigmoid_mul(&gate, &ctx) {
+            Some(g) => g?,
+            None => (ctx * ops::sigmoid(&gate)?)?,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+        WINDOW_BATCHED.fetch_add(1, Relaxed);
+        WINDOW_SPARSE_ROWS.fetch_add((t - d) as u64, Relaxed);
         Ok(Some(self.wo.forward(&gated)?.reshape((t, 1, hidden))?))
     }
 
@@ -2405,6 +2565,45 @@ impl QsaAttention {
         };
         Ok(Some(self.wo.forward(&gated)?.reshape((1, seq, hidden))?))
     }
+}
+
+/// `QWEN4EXP_QSA_WINDOW` (read once): `batched` runs a verify window's
+/// positions in one launch per kernel ([`QsaAttention::decode_seq_batched`]);
+/// `rows` (the default) one position after another.
+fn window_batched() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match WINDOW_ARM.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qwen4exp.qsa_window == "batched";
+            WINDOW_ARM.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 `rows`, 2 `batched`.
+static WINDOW_ARM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Layer windows the batched arm ran, and their rows past the dense range.
+static WINDOW_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WINDOW_SPARSE_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(layer windows, rows past the dense range)` the batched arm has run
+/// since process start: its engagement.
+pub fn qsa_window_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        WINDOW_BATCHED.load(Relaxed),
+        WINDOW_SPARSE_ROWS.load(Relaxed),
+    )
+}
+
+/// Select the verify window's QSA arm for this process (a test runs both;
+/// `QWEN4EXP_QSA_WINDOW` otherwise).
+pub fn set_qsa_window_batched(on: bool) {
+    WINDOW_ARM.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A/B instrument (`QWEN4EXP_SCORE_NO_MATMUL`, read once): the block score

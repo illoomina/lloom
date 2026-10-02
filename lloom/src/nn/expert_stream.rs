@@ -201,6 +201,18 @@ pub trait ExpertResidency {
     /// `[rows, topk, hidden]`, on the tile's `arm` as [`Self::gate_up`].
     fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor>;
 
+    /// The elastic surface (`profiles-and-memory-design.md` §4.2): slots in
+    /// service, and shrinking / growing them. A resident tier has none.
+    fn active_slots(&self) -> usize {
+        0
+    }
+    fn shrink_slots(&self, _active: usize, _floor: usize) -> Result<usize> {
+        Ok(0)
+    }
+    fn grow_slots(&self, _active: usize) -> usize {
+        0
+    }
+
     /// Whether [`Self::plan_device`] can answer: the strategy keeps a
     /// residency table on the device. `Resident` never needs to.
     fn plans_on_device(&self) -> bool {
@@ -749,6 +761,38 @@ impl ResidencyMap {
         self.cache.plan_epoch()
     }
 
+    /// Slots in service ([`SlotCache::active`]).
+    fn active(&self) -> usize {
+        self.cache.active()
+    }
+
+    /// [`SlotCache::shrink_to`]: the experts to evict from the slots
+    /// leaving service.
+    fn shrink_to(&mut self, active: usize, floor: usize) -> Vec<u32> {
+        self.cache
+            .shrink_to(active, floor)
+            .into_iter()
+            .map(|e| e.0)
+            .collect()
+    }
+
+    /// [`SlotCache::grow_to`]: the slots brought back into service.
+    fn grow_to(&mut self, active: usize) -> Vec<SlotId> {
+        self.cache.grow_to(active)
+    }
+
+    /// [`SlotCache::settled_past_active`].
+    fn settled_past_active(&self) -> bool {
+        self.cache.settled_past_active()
+    }
+
+    /// Evict the expert in `slot` ([`SlotCache::evict`]).
+    fn evict(&mut self, slot: usize, epoch: Epoch, plan_open: bool) -> Option<u32> {
+        self.cache
+            .evict(SlotId(slot as u32), epoch, plan_open)
+            .map(|e| e.0)
+    }
+
     fn install(&mut self, slot: usize, e: usize) {
         self.cache.install(SlotId(slot as u32), ExpertId(e as u32))
     }
@@ -854,6 +898,10 @@ pub struct StreamCounters {
     /// H3: live-table writes deferred while a device plan was open,
     /// published at its settle.
     pub h3_deferred_writes: AtomicU64,
+    /// Reallocations of the slot pools under the arbiter's yield (§4.2):
+    /// shrinks and grows, and the bytes the shrinks released.
+    pub slot_reallocations: AtomicU64,
+    pub slot_bytes_released: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -902,6 +950,8 @@ pub struct StreamStats {
     pub h1_restamps: u64,
     pub h2_refusals: u64,
     pub h3_deferred_writes: u64,
+    pub slot_reallocations: u64,
+    pub slot_bytes_released: u64,
 }
 
 impl StreamCounters {
@@ -936,6 +986,8 @@ impl StreamCounters {
             h1_restamps: self.h1_restamps.load(Ordering::Relaxed),
             h2_refusals: self.h2_refusals.load(Ordering::Relaxed),
             h3_deferred_writes: self.h3_deferred_writes.load(Ordering::Relaxed),
+            slot_reallocations: self.slot_reallocations.load(Ordering::Relaxed),
+            slot_bytes_released: self.slot_bytes_released.load(Ordering::Relaxed),
         }
     }
 }
@@ -965,6 +1017,8 @@ impl std::ops::AddAssign for StreamStats {
         self.h1_restamps += o.h1_restamps;
         self.h2_refusals += o.h2_refusals;
         self.h3_deferred_writes += o.h3_deferred_writes;
+        self.slot_reallocations += o.slot_reallocations;
+        self.slot_bytes_released += o.slot_bytes_released;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -1286,6 +1340,62 @@ impl LiveTable {
 }
 
 impl Inner {
+    /// Allocate the three plane pools at `active` slots and carry the
+    /// first `keep` slots' planes over (a blit on Metal; on the CPU the
+    /// pools come back empty and the caller evicts everything). The old
+    /// pools drop here: their handles' reservations leave the ledger at
+    /// once, the residency set forgets them at the next cut. Returns the
+    /// pools' bytes before and after.
+    fn reallocate_pools(&mut self, active: usize, keep: usize) -> Result<(usize, usize)> {
+        let before: usize = self
+            .pools
+            .iter()
+            .map(|p| p.qt.storage_size_in_bytes())
+            .sum();
+        let mut fresh = Vec::with_capacity(3);
+        for (i, src) in self.sources.iter().enumerate() {
+            let (n, k) = src.dims();
+            let qt = QTensor::zeros_persistent_with(
+                (active, n, k),
+                src.dtype(),
+                &self.device,
+                self.direct,
+            )?;
+            #[cfg(not(feature = "metal"))]
+            let _ = keep;
+            #[cfg(feature = "metal")]
+            if let Device::Metal(m) = &self.device {
+                let bytes = keep * self.pools[i].plane_bytes;
+                if bytes > 0 {
+                    let (old, new) = (self.pools[i].qt.metal_buffer()?, qt.metal_buffer()?);
+                    let mut blit = m.blit_command_encoder()?;
+                    blit.set_label("slot pools reallocated");
+                    blit.copy_from_buffer(old, 0, new, 0, bytes);
+                }
+            }
+            fresh.push(SlotPool {
+                qt,
+                plane_bytes: self.pools[i].plane_bytes,
+            });
+        }
+        // The copies are encoded on the queue, which retains the old pools
+        // until they run; the handles may drop now (their reservations
+        // leave the ledger at once, the residency set forgets them at the
+        // next cut). No wait here: the tier never drains the device
+        // (`qwen4exp_eviction_no_drain`); the yield's one host wait is the
+        // admission's, before it asks (`Qwen4Exp::apply_expert_grant`).
+        let fresh: [SlotPool; 3] = fresh
+            .try_into()
+            .map_err(|_| lloom_tensor::Error::Msg("three slot pools".into()))?;
+        self.pools = fresh;
+        let after: usize = self
+            .pools
+            .iter()
+            .map(|p| p.qt.storage_size_in_bytes())
+            .sum();
+        Ok((before, after))
+    }
+
     /// Store the landed entries whose copies' epochs have completed (and
     /// whose expert is still in that slot).
     fn store_landed(&mut self) {
@@ -1589,6 +1699,11 @@ impl Streamed {
     /// Slots kept free (0: the in-place arm).
     pub fn spare_slots(&self) -> usize {
         self.inner.lock().map.spare()
+    }
+
+    /// Bytes of the three planes per slot.
+    pub fn bytes_per_slot(&self) -> usize {
+        self.inner.lock().pools.iter().map(|p| p.plane_bytes).sum()
     }
 
     /// Slots evicted and not yet reusable.
@@ -2585,8 +2700,13 @@ impl Streamed {
             let pinned: Vec<bool> = (0..self.n_experts)
                 .map(|e| inner.map.slot_of(e).is_some_and(|s| inner.map.is_pinned(s)))
                 .collect();
-            let capacity = self
-                .n_slots
+            // The slots in service (`active`, not the pool's size): after a
+            // shrink a group planned at the old width cannot be served
+            // (measured: the first yield run refused a 316-wide prefill
+            // group in a pool shrunk below it, #892 A5).
+            let capacity = inner
+                .map
+                .active()
                 .saturating_sub(inner.map.pinned_count() + inner.map.spare())
                 .max(1);
             (capacity, pinned)
@@ -3021,6 +3141,123 @@ impl Streamed {
 }
 
 impl ExpertResidency for Streamed {
+    /// Slots in service (`profiles-and-memory-design.md` §4.2, the expert
+    /// pool as an elastic tenant): `0..active` of the pool's `n_slots`.
+    fn active_slots(&self) -> usize {
+        self.inner.lock().map.active()
+    }
+
+    /// Shrink the slots in service to `active` (never below `floor`): the
+    /// experts in the slots leaving service are evicted at their last
+    /// reader's epoch, which the clock must already show complete — the
+    /// caller waits the queue out first, on the refusal path alone
+    /// (§21.13; the tier itself never drains the device,
+    /// `qwen4exp_eviction_no_drain`) — and the three plane pools are
+    /// reallocated at `active` slots with the kept slots' planes carried
+    /// over: the old pools' reservations leave the ledger. The cached pass
+    /// plans, which bound the old pools, are dropped. Returns the bytes
+    /// released. Refused while a device plan is open, a load is in flight,
+    /// or a slot leaving service still has a reader the clock has not
+    /// completed.
+    fn shrink_slots(&self, active: usize, floor: usize) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        if inner.plans_open > 0 {
+            lloom_tensor::bail!("shrink_slots while a device plan is open")
+        }
+        if inner.map.inflight_count() > 0 {
+            lloom_tensor::bail!(
+                "shrink_slots with {} loads in flight",
+                inner.map.inflight_count()
+            )
+        }
+        let was = inner.map.active();
+        let evict: Vec<u32> = inner.map.shrink_to(active, floor);
+        let active = inner.map.active();
+        if active >= was {
+            return Ok(0);
+        }
+        for e in evict {
+            if let Some(s) = inner.map.slot_of(e as usize) {
+                let epoch = inner.map.reader_epoch(s);
+                inner.map.evict(s, epoch, false);
+                inner.table_set(e, NONE);
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let completed = inner.completed_epochs();
+        inner.map.recycle(completed);
+        let epoch = inner.current_epoch();
+        if !matches!(inner.device, Device::Metal(_)) {
+            // The CPU pools come back empty (no blit): every resident
+            // expert goes.
+            let all: Vec<u32> = inner.map.resident();
+            for e in all {
+                if let Some(s) = inner.map.slot_of(e as usize) {
+                    inner.map.evict(s, epoch, false);
+                    inner.table_set(e, NONE);
+                    self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            inner.map.recycle(Completed::ALL);
+        }
+        if !inner.map.settled_past_active() {
+            // Undone: the slots come back into service with their experts
+            // gone (they are in the quarantine and recycle as usual).
+            inner.map.grow_to(was);
+            lloom_tensor::bail!(
+                "shrink_slots: a slot leaving service still has a reader the clock has not \
+                 completed; wait the queue out first"
+            )
+        }
+        let (before, after) = inner.reallocate_pools(active, active)?;
+        inner.table_stale = true;
+        inner.table = None;
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &inner.device {
+            m.drop_pass_plans();
+        }
+        self.counters
+            .slot_reallocations
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .slot_bytes_released
+            .fetch_add(before.saturating_sub(after) as u64, Ordering::Relaxed);
+        Ok(before.saturating_sub(after))
+    }
+
+    /// Grow the slots in service to `active`: the pools are reallocated
+    /// at `active` slots with every slot in service carried over; the
+    /// slots brought back are empty. Returns the bytes taken.
+    fn grow_slots(&self, active: usize) -> usize {
+        let mut inner = self.inner.lock();
+        let was = inner.map.active();
+        let back = inner.map.grow_to(active);
+        let active = inner.map.active();
+        if active <= was || back.is_empty() && active == was {
+            return 0;
+        }
+        let keep = if matches!(inner.device, Device::Metal(_)) {
+            was
+        } else {
+            0
+        };
+        let realloc = inner.reallocate_pools(active, keep);
+        let taken = match realloc {
+            Ok((before, after)) => after.saturating_sub(before),
+            Err(_) => 0,
+        };
+        inner.table_stale = true;
+        inner.table = None;
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &inner.device {
+            m.drop_pass_plans();
+        }
+        self.counters
+            .slot_reallocations
+            .fetch_add(1, Ordering::Relaxed);
+        taken
+    }
+
     fn plans_on_device(&self) -> bool {
         true
     }
@@ -3044,7 +3281,7 @@ impl ExpertResidency for Streamed {
             // staged expert can only land by evicting one landed in the same
             // pass (measured on an empty pool: 512 asked, 327 slots, the
             // rest read for nothing — issue #749 P19).
-            missing.truncate(self.n_slots.saturating_sub(inner.map.pinned_count()));
+            missing.truncate(inner.map.active().saturating_sub(inner.map.pinned_count()));
             let planes = [
                 inner.sources[0].plane_source(),
                 inner.sources[1].plane_source(),
@@ -3113,7 +3350,7 @@ impl ExpertResidency for Streamed {
             // The named experts first; the usage profile fills what the
             // pool could still take (a 512-token tile needs most of what
             // the router did not name either, P20).
-            let bound = self.n_slots.saturating_sub(inner.map.pinned_count());
+            let bound = inner.map.active().saturating_sub(inner.map.pinned_count());
             if missing.len() < bound {
                 let mut rest: Vec<u32> = (0..self.n_experts as u32)
                     .filter(|&e| {
@@ -3791,6 +4028,208 @@ mod tests {
         assert!(inner.map.slot_of(7).is_some() && inner.map.slot_of(8).is_some());
         drop(inner);
         assert!(streamed.stats().evictions > 0);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The elastic surface (§4.2): a shrink takes the top slots out of
+    /// service — their experts evicted, later loads and victims confined to
+    /// the slots in service — and a grow brings them back; the floor holds.
+    #[test]
+    fn a_shrink_parks_the_top_slots_and_a_grow_brings_them_back() {
+        let (e, ff, d, topk) = (10usize, 32usize, 32usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        for spare in [0usize, 1] {
+            let mut streamed = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &Device::Cpu,
+            )
+            .unwrap();
+            streamed.set_spare_slots(spare).unwrap();
+            let warm: &[u32] = if spare == 0 {
+                &[0, 1, 2, 3]
+            } else {
+                &[0, 1, 2]
+            };
+            assert_eq!(streamed.warm(warm).unwrap(), warm.len());
+            assert_eq!(streamed.active_slots(), 4);
+            // Shrink to two slots (a floor of one): the experts in slots 2..
+            // are evicted and the pools are reallocated at two slots — on
+            // the CPU they come back empty (no blit), so every resident
+            // expert goes; two slots' bytes are released.
+            let per_slot = streamed.bytes_per_slot();
+            let released = streamed.shrink_slots(2, 1).unwrap();
+            assert_eq!(released, 2 * per_slot, "spare {spare}");
+            assert_eq!(streamed.active_slots(), 2);
+            let resident = streamed.inner.lock().map.resident();
+            assert!(resident.is_empty(), "spare {spare}: {resident:?}");
+            let evictions = streamed.stats().evictions;
+            assert!(evictions >= 2, "spare {spare}: {evictions}");
+            // Loads now live in the two slots in service.
+            for t in 0..4 {
+                let id = ids(1, topk, 10, 7 + t);
+                let xs = x(1, d, 0.0);
+                let _ = run(&streamed, &xs, &id);
+            }
+            {
+                let inner = streamed.inner.lock();
+                for e in 0..e {
+                    if let Some(s) = inner.map.slot_of(e) {
+                        assert!(s < 2, "spare {spare}: expert {e} landed in parked slot {s}");
+                    }
+                }
+            }
+            // Never below the floor (`topk + 1 = 3`): a shrink to 1 stops at 3
+            // — which is a grow from 2.
+            assert_eq!(streamed.shrink_slots(1, topk + 1).unwrap(), 0);
+            assert_eq!(streamed.active_slots(), 2, "a shrink never grows");
+            assert_eq!(
+                streamed.grow_slots(4),
+                2 * per_slot,
+                "two slots' bytes taken"
+            );
+            assert_eq!(streamed.active_slots(), 4);
+            assert_eq!(streamed.stats().slot_reallocations, 2);
+            for t in 0..4 {
+                let id = ids(1, topk, 10, 11 + t);
+                let xs = x(1, d, 0.0);
+                let _ = run(&streamed, &xs, &id);
+            }
+            let used: std::collections::BTreeSet<usize> = {
+                let inner = streamed.inner.lock();
+                (0..e).filter_map(|x| inner.map.slot_of(x)).collect()
+            };
+            assert!(
+                used.iter().any(|&s| s >= 2),
+                "spare {spare}: the slots brought back are never used: {used:?}"
+            );
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: a shrink reallocates the plane pools at the smaller slot
+    /// count with the kept slots' planes carried over — the routed output
+    /// of the resident experts is the same bits before and after — and
+    /// the ledger's committed bytes fall by the slots released; a grow
+    /// takes them back.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_shrink_reallocates_the_pools_and_the_ledger_falls_by_the_slots_released() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let (e, ff, d, topk) = (8usize, 32usize, 64usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let per_slot = streamed.bytes_per_slot();
+        assert_eq!(streamed.warm(&[0, 1, 2]).unwrap(), 3);
+        let xs = x(1, d, 0.25).to_device(&dev).unwrap();
+        let id = Tensor::from_vec(vec![0u32, 2], (1, topk), &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let before = run(&streamed, &xs, &id);
+        // The caller's drain (the admission's, on the refusal path): the
+        // tier itself never waits for the device, so the test commits and
+        // completes what is open the way the open-plan test does — a
+        // readback, then the pool clock caught up. (The readback's own
+        // buffer stays on the ledger in the free list: the figure is read
+        // after it.)
+        let clock = m.gpu_clock();
+        Tensor::zeros(1, lloom_tensor::DType::F32, &dev)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        while clock.completed_count().0 < clock.current_epoch().0 {
+            std::thread::yield_now();
+        }
+        let committed = m.ledger().committed();
+        let released = streamed.shrink_slots(3, 1).unwrap();
+        assert_eq!(released, per_slot, "one slot's planes released");
+        assert_eq!(
+            m.ledger().committed() + per_slot,
+            committed,
+            "the old pools' reservations left the ledger"
+        );
+        assert_eq!(streamed.active_slots(), 3);
+        // Experts 0..3 are still resident in slots 0..3: the planes came
+        // over, the output is the same bits.
+        assert_eq!(streamed.inner.lock().map.resident().len(), 3);
+        let after = run(&streamed, &xs, &id);
+        assert_eq!(after, before, "the kept slots' planes moved bit for bit");
+        let stats = streamed.stats();
+        assert_eq!(
+            (stats.slot_reallocations, stats.slot_bytes_released),
+            (1, per_slot as u64)
+        );
+        // A grow takes the slot back; a fourth expert lands in it.
+        assert_eq!(streamed.grow_slots(4), per_slot);
+        assert_eq!(m.ledger().committed(), committed);
+        let id4 = Tensor::from_vec(vec![3u32, 1], (1, topk), &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let _ = run(&streamed, &xs, &id4);
+        assert_eq!(streamed.inner.lock().map.slot_of(3), Some(3));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// After a shrink the host plan groups rows to the slots in service:
+    /// a tile whose rows together name more experts than the shrunk pool
+    /// holds is split into groups that fit, never refused (the first
+    /// yield run on the real model refused a prefill group planned at the
+    /// pool's old width).
+    #[test]
+    fn a_shrunk_pool_plans_its_groups_to_the_slots_in_service() {
+        let (e, ff, d, topk) = (10usize, 32usize, 32usize, 1usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        // Six rows, six distinct experts: one group in a 6-slot pool.
+        let ids = Tensor::from_vec((0..6u32).collect::<Vec<_>>(), (6, topk), &Device::Cpu).unwrap();
+        assert_eq!(streamed.plan(&ids).unwrap().len(), 1);
+        streamed.shrink_slots(2, 1).unwrap();
+        let groups = streamed.plan(&ids).unwrap();
+        assert_eq!(
+            groups.len(),
+            3,
+            "two slots in service: three groups of two rows"
+        );
+        let xs = x(6, d, 0.5);
+        for g in &groups {
+            let slots = streamed.ensure(g).unwrap();
+            assert_eq!(slots.dims(), &[g.rows.len(), topk]);
+        }
+        let _ = xs;
         std::fs::remove_file(path).ok();
     }
 

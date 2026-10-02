@@ -957,6 +957,64 @@ pub struct Ple {
 }
 
 /// The assembled model.
+/// The streamed expert pool as the ledger's elastic tenant
+/// (`profiles-and-memory-design.md` §4.2, class `Cache`): its claim is
+/// `topk + 1` slots as the floor, every expert as the want, one slot as
+/// the unit; `resize` records the grant as the slots wanted in service and
+/// reports the pledge, which the model applies to its layers' tiers
+/// (`Qwen4Exp::apply_expert_grant`) — the tiers evict through their
+/// quarantine and give the parked slots' pages back.
+#[derive(Debug)]
+pub struct ExpertTenant {
+    bytes_per_slot: usize,
+    n_slots: usize,
+    floor_slots: usize,
+    n_experts: usize,
+    wanted: std::sync::atomic::AtomicUsize,
+}
+
+impl ExpertTenant {
+    pub fn new(bytes_per_slot: usize, slots: usize, floor_slots: usize, n_experts: usize) -> Self {
+        Self {
+            bytes_per_slot,
+            n_slots: slots,
+            floor_slots: floor_slots.min(slots),
+            n_experts,
+            wanted: std::sync::atomic::AtomicUsize::new(slots),
+        }
+    }
+
+    /// Slots wanted in service (the last grant, in slots).
+    pub fn wanted_slots(&self) -> usize {
+        self.wanted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "metal")]
+impl lloom_tensor::kernels::metal::ledger::Tenant for ExpertTenant {
+    fn name(&self) -> String {
+        "qwen4exp-experts".into()
+    }
+    fn claim(&self) -> lloom_tensor::kernels::metal::ledger::Claim {
+        use lloom_tensor::kernels::metal::ledger::{Claim, Class};
+        Claim {
+            floor: self.floor_slots * self.bytes_per_slot,
+            want: self.n_experts * self.bytes_per_slot,
+            unit: self.bytes_per_slot,
+            class: Class::Cache,
+        }
+    }
+    fn held(&self) -> usize {
+        self.wanted_slots() * self.bytes_per_slot
+    }
+    fn resize(&self, grant: usize) -> usize {
+        let slots = (grant / self.bytes_per_slot.max(1)).clamp(self.floor_slots, self.n_slots);
+        self.wanted
+            .store(slots, std::sync::atomic::Ordering::Relaxed);
+        slots * self.bytes_per_slot
+    }
+}
+
 #[derive(Debug)]
 pub struct Qwen4Exp<R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
@@ -992,7 +1050,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// The expert tier's row on the device's ledger (`ledger.rs`), set by
     /// the streamed loader; dropped with the model.
     #[cfg(feature = "metal")]
-    ledger_gauge: Option<std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
+    ledger_gauge: Option<std::sync::Arc<ExpertTenant>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1307,23 +1365,61 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     ) {
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = device {
-            use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
-            let gauge = Gauge::new(
-                "qwen4exp-experts",
-                Claim {
-                    floor: (topk + 1) * bytes_per_slot,
-                    want: n_experts * bytes_per_slot,
-                    unit: bytes_per_slot,
-                    class: Class::Cache,
-                },
-                slots * bytes_per_slot,
-            );
-            let tenant: std::sync::Arc<dyn Tenant> = gauge.clone();
-            m.ledger().register(&tenant);
-            self.ledger_gauge = Some(gauge);
+            use lloom_tensor::kernels::metal::ledger::Tenant;
+            let tenant = std::sync::Arc::new(ExpertTenant::new(
+                bytes_per_slot,
+                slots,
+                topk + 1,
+                n_experts,
+            ));
+            let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
+            m.ledger().register(&dyn_tenant);
+            self.ledger_gauge = Some(tenant);
         }
         #[cfg(not(feature = "metal"))]
         let _ = (device, bytes_per_slot, slots, n_experts, topk);
+    }
+
+    /// Apply the expert tenant's grant to every layer's tier: shrink the
+    /// slots in service (their pages parked, the ledger told) or grow them
+    /// back. Returns the bytes parked (positive) or brought back (as a
+    /// negative is not needed: the ledger's `parked` says). Nothing to do
+    /// when the grant equals the slots in service.
+    #[cfg(not(feature = "metal"))]
+    pub fn apply_expert_grant(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn apply_expert_grant(&self) -> Result<usize> {
+        let Some(t) = &self.ledger_gauge else {
+            return Ok(0);
+        };
+        let wanted = t.wanted_slots();
+        let mut parked = 0usize;
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = self.device() {
+            if self
+                .layers
+                .iter()
+                .any(|l| wanted < l.moe.experts().active_slots())
+            {
+                // The one host wait of the yield, on the refusal path alone
+                // (§21.13): the slots leaving service must have no reader
+                // the clock has not completed. The tier never drains.
+                m.wait_until_completed()?;
+            }
+        }
+        for layer in &self.layers {
+            let tier = layer.moe.experts();
+            let active = tier.active_slots();
+            if wanted < active {
+                parked += tier.shrink_slots(wanted, t.floor_slots)?;
+            } else if wanted > active {
+                tier.grow_slots(wanted);
+            }
+        }
+        Ok(parked)
     }
 
     pub fn memory_fraction(&self) -> f64 {
@@ -1463,7 +1559,17 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             // Read with the free lists given back first when the first
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.
-            let a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+            let mut a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+            if !a.fits && a.pledged > 0 {
+                // The tenants pledged a yield (the expert tier's slots):
+                // apply it — park the slots, their pages given back — and
+                // ask again on the figure after.
+                let parked = self.apply_expert_grant()?;
+                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+                a.pledged = pledged;
+                a.reclaimed += reclaimed + parked;
+            }
             let (allocated, fits) = (a.committed, a.fits);
             debug_assert_eq!(
                 fits,

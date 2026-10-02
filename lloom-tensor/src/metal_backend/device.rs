@@ -221,6 +221,11 @@ impl Drop for DeviceTeardown {
 pub struct PassAdmission {
     pub committed: usize,
     pub reclaimed: usize,
+    /// Bytes the ledger's yielding tenants pledged to give back (the
+    /// arbiter's third rung, §4.2) when the pass did not fit after the
+    /// reclaim: the owner of those tenants applies the pledge (an elastic
+    /// expert tier parks slots) and asks again.
+    pub pledged: usize,
     pub fits: bool,
 }
 
@@ -884,6 +889,7 @@ impl MetalDevice {
             return PassAdmission {
                 committed,
                 reclaimed: 0,
+                pledged: 0,
                 fits: true,
             };
         }
@@ -901,10 +907,21 @@ impl MetalDevice {
                 committed = self.ledger.committed();
             }
         }
+        let mut pledged = 0;
+        if committed.saturating_add(need) > budget {
+            // The third rung (§4.2, caches yield): the tenants that can
+            // shrink pledge units — the expert tier's slots — until the
+            // shortfall is covered or none can give more. The pledge is
+            // applied by the tenants' owner, which asks again.
+            let short = committed.saturating_add(need) - budget;
+            pledged = self.ledger.yield_for(short);
+            committed = self.ledger.committed();
+        }
         self.ledger.note_reclaim(reclaimed);
         PassAdmission {
             committed,
             reclaimed,
+            pledged,
             fits: committed.saturating_add(need) <= budget,
         }
     }
@@ -1942,6 +1959,31 @@ impl MetalDevice {
     /// Whether a plan for `key` is cached: the pass will be served from the
     /// base, allocating none of its activations (its admission owes no
     /// transient).
+    /// Drop every cached pass plan and its arena, keeping the base: a
+    /// buffer the plans bound was reallocated (an elastic tenant's slot
+    /// pools, `profiles-and-memory-design.md` §4.2), so a replay would bind
+    /// the old one. The next pass of each key records again. Returns how
+    /// many plans were dropped; a no-op while a pass is open.
+    pub fn drop_pass_plans(&self) -> usize {
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            return 0;
+        };
+        if pp.current.is_some() {
+            return 0;
+        }
+        let n = pp.plans.len();
+        pp.plans.clear();
+        pp.arenas.clear();
+        pp.arena_generation.clear();
+        pp.escapes.clear();
+        pp.ragged_order.clear();
+        pp.pending = None;
+        pp.base_generation += 1;
+        pp.counters.evicted += n as u64;
+        n
+    }
+
     pub fn pass_plan_cached(&self, key: &PassKey) -> bool {
         self.pass_plans
             .lock()

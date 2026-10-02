@@ -3913,6 +3913,136 @@ mod issue_336_to_cpu {
         heaps.release(&first);
     }
 
+    /// §4.3's owed measurement (`profiles-and-memory-design.md`, #892 A5):
+    /// does a large Private placement heap wire its pages at creation, or
+    /// only as its sub-buffers are touched? Run by hand; prints the
+    /// process's resident / virtual size (`proc_pidinfo`) and the device's
+    /// allocated bytes around a heap chunk of `LLOOM_HEAP_PROBE_GB` GB
+    /// (default 4):
+    ///
+    ///   cargo test -p lloom-tensor --features metal --lib --release -- \
+    ///     heap_wiring_probe --ignored --nocapture
+    #[test]
+    #[ignore = "a measurement, not a check: prints the footprint around a large heap"]
+    fn heap_wiring_probe() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let gb: usize = std::env::var("LLOOM_HEAP_PROBE_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let bytes = gb << 30;
+        // The process's physical footprint (`ri_phys_footprint`: what the
+        // kernel charges this task — the figure memory pressure and the
+        // §9.5a panic are about) beside its resident size, and the
+        // machine's wired and free pages (`vm_stat`).
+        let footprint = || -> (u64, u64, u64, u64) {
+            let mut ru: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    std::process::id() as i32,
+                    libc::RUSAGE_INFO_V4,
+                    &mut ru as *mut _ as *mut libc::rusage_info_t,
+                )
+            };
+            assert_eq!(rc, 0, "proc_pid_rusage failed");
+            let vm = std::process::Command::new("/usr/bin/vm_stat")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let pages = |key: &str| -> u64 {
+                vm.lines()
+                    .find(|l| l.starts_with(key))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 16384
+            };
+            (
+                ru.ri_phys_footprint,
+                ru.ri_resident_size,
+                pages("Pages wired down"),
+                pages("Pages free"),
+            )
+        };
+        let gbf = |b: u64| b as f64 / 1e9;
+        let line = |what: &str, heap: Option<&crate::kernels::metal::HeapChunks>| {
+            let (f, r, w, free) = footprint();
+            eprintln!(
+                "HEAPPROBE {what}: footprint={:.3} GB resident={:.3} GB wired={:.3} GB free={:.3} GB device_allocated={:.3} GB{}",
+                gbf(f),
+                gbf(r),
+                gbf(w),
+                gbf(free),
+                gbf(m.device().current_allocated_size() as u64),
+                heap.map(|h| format!(" heap={:?}", h.stats())).unwrap_or_default()
+            );
+        };
+        line("before", None);
+        let heap = crate::kernels::metal::HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            bytes,
+            None,
+        );
+        let first = heap.alloc(1 << 20).unwrap();
+        line(
+            &format!("created a {gb} GB chunk + a 1 MiB sub-buffer"),
+            Some(&heap),
+        );
+        // Touch the whole chunk from the GPU: one sub-buffer per 256 MiB,
+        // filled.
+        let mut subs = vec![first];
+        while heap.stats().used + (256 << 20) <= bytes {
+            subs.push(heap.alloc(256 << 20).unwrap());
+        }
+        {
+            let mut blit = m.blit_command_encoder().unwrap();
+            blit.set_label("heap probe fill");
+            for b in &subs {
+                blit.fill_buffer(b, (0, b.length()), 0xA5);
+            }
+        }
+        m.wait_until_completed().unwrap();
+        line(
+            &format!("filled {} sub-buffers from the GPU", subs.len()),
+            Some(&heap),
+        );
+        for b in subs.drain(..) {
+            heap.release(&b);
+        }
+        drop(heap);
+        line("dropped", None);
+        // The second question (A5's yield): can a Shared persistent buffer
+        // give a range of its pages back without being freed —
+        // `munlock` + `madvise(MADV_FREE_REUSABLE)` on the range — and is
+        // the range usable again after?
+        let shared = m.new_persistent_shared(bytes).unwrap();
+        line(&format!("a {gb} GB Shared persistent buffer (wired)"), None);
+        unsafe { std::ptr::write_bytes(shared.contents(), 0x5A, bytes) };
+        line("host-touched every page", None);
+        let half = bytes / 2;
+        let ptr = shared.contents() as *mut libc::c_void;
+        let rc = unsafe { libc::munlock(ptr, half) };
+        assert_eq!(rc, 0, "munlock: {}", std::io::Error::last_os_error());
+        let rc = unsafe { libc::madvise(ptr, half, libc::MADV_FREE_REUSABLE) };
+        assert_eq!(rc, 0, "madvise: {}", std::io::Error::last_os_error());
+        line("munlock + MADV_FREE_REUSABLE on the first half", None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        line("… 500 ms later", None);
+        let rc = unsafe { libc::madvise(ptr, half, libc::MADV_FREE_REUSE) };
+        assert_eq!(rc, 0, "madvise reuse: {}", std::io::Error::last_os_error());
+        unsafe { std::ptr::write_bytes(shared.contents(), 0x3C, half) };
+        let back = unsafe { *(shared.contents() as *const u8).add(half - 1) };
+        assert_eq!(back, 0x3C, "the range is not writable after the reuse");
+        line("MADV_FREE_REUSE + host-touched the first half again", None);
+        drop(shared);
+        line("dropped the Shared buffer", None);
+    }
+
     /// The L0 seam (`profiles-and-memory-design.md` §4.1): a heap backing
     /// takes its sub-buffer's range back on `reclaim` and a whole-buffer
     /// backing does not (its buffer frees on drop; the residency entry is

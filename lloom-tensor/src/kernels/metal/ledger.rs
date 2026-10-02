@@ -64,6 +64,12 @@ pub trait Tenant: Send + Sync {
     fn claim(&self) -> Claim;
     /// Bytes held now.
     fn held(&self) -> usize;
+    /// Cold path: grow by refilling, shrink by evict + retire
+    /// (`profiles-and-memory-design.md` §4.2). Returns what the tenant
+    /// holds after. A fixed tenant (the default) holds what it holds.
+    fn resize(&self, _grant: usize) -> usize {
+        self.held()
+    }
 }
 
 /// A tenant whose claim and holding its owner sets: the plain shape for a
@@ -238,6 +244,69 @@ impl Ledger {
         self.committed.load(Ordering::Acquire)
     }
 
+    fn live_tenants(&self) -> Vec<(TenantId, Arc<dyn Tenant>)> {
+        let t = self.tenants.lock();
+        t.iter()
+            .filter_map(|(id, w)| w.upgrade().map(|t| (*id, t)))
+            .collect()
+    }
+
+    /// The arbiter (§4.2) over the registered tenants' claims: refuse on
+    /// the floors, grant every want that fits, else fill upward by class;
+    /// then resize the tenants whose grant differs from what they hold.
+    /// Returns the arbitration and what each resized tenant holds after.
+    pub fn arbitrate(&self) -> (Arbitration, Vec<(TenantId, usize)>) {
+        let snap = self.snapshot();
+        let a = arbitrate(snap.quota, &snap.tenants);
+        let mut resized = Vec::new();
+        if let Arbitration::Granted(grants) = &a {
+            let tenants = self.live_tenants();
+            for g in grants {
+                if let Some((_, t)) = tenants.iter().find(|(id, _)| *id == g.id) {
+                    if t.held() != g.bytes {
+                        let after = t.resize(g.bytes);
+                        resized.push((g.id, after));
+                    }
+                }
+            }
+        }
+        (a, resized)
+    }
+
+    /// Ask the tenants that yield — `Scratch` first, then `Cache`, never a
+    /// `Capability` — to shrink by units until `bytes` are pledged or none
+    /// can give more. A pledge is what a tenant reports holding less after
+    /// `resize`; a tenant that frees at once (drops reservations) moves
+    /// `committed` here, one whose owner applies the grant later (the
+    /// expert tier reallocating its pools) moves it then. Returns the
+    /// bytes pledged.
+    pub fn yield_for(&self, bytes: usize) -> usize {
+        let mut pledged = 0usize;
+        let tenants = self.live_tenants();
+        for class in [Class::Scratch, Class::Cache] {
+            for (_, t) in tenants.iter().filter(|(_, t)| t.claim().class == class) {
+                loop {
+                    if pledged >= bytes {
+                        return pledged;
+                    }
+                    let claim = t.claim();
+                    let held = t.held();
+                    let unit = claim.unit.max(1);
+                    if held <= claim.floor || held < unit {
+                        break;
+                    }
+                    let target = (held - unit).max(claim.floor);
+                    let after = t.resize(target);
+                    if after >= held {
+                        break;
+                    }
+                    pledged += held - after;
+                }
+            }
+        }
+        pledged
+    }
+
     /// A pass-level admission gave the free lists back: count it.
     pub fn note_reclaim(&self, bytes: usize) {
         self.reclaims.fetch_add(1, Ordering::Relaxed);
@@ -312,9 +381,288 @@ impl Ledger {
     }
 }
 
+/// One tenant's grant from an arbitration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grant {
+    pub id: TenantId,
+    pub bytes: usize,
+}
+
+/// What the arbiter decided (`profiles-and-memory-design.md` §4.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arbitration {
+    /// Every tenant's grant: at least its floor, at most its want.
+    Granted(Vec<Grant>),
+    /// The floors alone exceed the quota: the arithmetic, for the refusal's
+    /// message (§9.5g's shape). Only a `Capability` floor can cause this.
+    Refused { floors: usize, quota: usize },
+}
+
+/// The arbiter's arithmetic, over a snapshot of the tenants' claims:
+/// 1. floors first — if Σ floors > quota, refuse with the arithmetic;
+/// 2. if Σ wants ≤ quota, grant every want (nothing shrinks);
+/// 3. else fill upward from the floors, a unit at a time, to the tenant
+///    whose next unit is worth most — by class order (`Capability`, then
+///    `Cache`, then `Scratch`), the tenants of a class in registration
+///    order; a tenant whose next unit would pass its want, or the quota,
+///    is skipped. (`marginal_value` is §14 Q2's later hook.)
+///
+/// Pure: no tenant is resized here; the ledger's [`Ledger::arbitrate`]
+/// applies the grants that moved. Deterministic in the snapshot's order.
+pub fn arbitrate(quota: usize, tenants: &[TenantRow]) -> Arbitration {
+    let floors: usize = tenants.iter().map(|t| t.claim.floor).sum();
+    if floors > quota {
+        return Arbitration::Refused { floors, quota };
+    }
+    let wants: usize = tenants
+        .iter()
+        .map(|t| t.claim.want.max(t.claim.floor))
+        .sum();
+    if wants <= quota {
+        return Arbitration::Granted(
+            tenants
+                .iter()
+                .map(|t| Grant {
+                    id: t.id,
+                    bytes: t.claim.want.max(t.claim.floor),
+                })
+                .collect(),
+        );
+    }
+    let mut grants: Vec<Grant> = tenants
+        .iter()
+        .map(|t| Grant {
+            id: t.id,
+            bytes: t.claim.floor,
+        })
+        .collect();
+    let mut left = quota - floors;
+    // Class order, registration order within a class.
+    let mut order: Vec<usize> = (0..tenants.len()).collect();
+    order.sort_by_key(|&i| match tenants[i].claim.class {
+        Class::Capability => 0u8,
+        Class::Cache => 1,
+        Class::Scratch => 2,
+    });
+    // Each unit to the first tenant in class order with room for it: the
+    // capability fills to its want before the cache takes a unit, the
+    // cache before the scratch.
+    loop {
+        let next = order.iter().copied().find(|&i| {
+            let t = &tenants[i];
+            let unit = t.claim.unit.max(1);
+            let want = t.claim.want.max(t.claim.floor);
+            grants[i].bytes + unit <= want && unit <= left
+        });
+        let Some(i) = next else {
+            break;
+        };
+        let unit = tenants[i].claim.unit.max(1);
+        grants[i].bytes += unit;
+        left -= unit;
+    }
+    Arbitration::Granted(grants)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: u32, class: Class, floor: usize, want: usize, unit: usize) -> TenantRow {
+        TenantRow {
+            id: TenantId(id),
+            name: format!("t{id}"),
+            claim: Claim {
+                floor,
+                want,
+                unit,
+                class,
+            },
+            held: 0,
+        }
+    }
+
+    #[test]
+    fn the_arbiter_refuses_on_the_floors_grants_every_want_that_fits_and_fills_by_class() {
+        let mib = 1usize << 20;
+        let kv = row(1, Class::Capability, 64 * mib, 136 * mib, 4 * mib);
+        let experts = row(2, Class::Cache, 80 * mib, 400 * mib, 8 * mib);
+        let scratch = row(3, Class::Scratch, 0, 32 * mib, 1 * mib);
+        // 1. The floors alone exceed the quota: refused with the arithmetic.
+        assert_eq!(
+            arbitrate(100 * mib, &[kv.clone(), experts.clone()]),
+            Arbitration::Refused {
+                floors: 144 * mib,
+                quota: 100 * mib
+            }
+        );
+        // 2. Every want fits: every want granted, nothing shrinks.
+        assert_eq!(
+            arbitrate(1000 * mib, &[kv.clone(), experts.clone(), scratch.clone()]),
+            Arbitration::Granted(vec![
+                Grant {
+                    id: TenantId(1),
+                    bytes: 136 * mib
+                },
+                Grant {
+                    id: TenantId(2),
+                    bytes: 400 * mib
+                },
+                Grant {
+                    id: TenantId(3),
+                    bytes: 32 * mib
+                },
+            ])
+        );
+        // 3. Between: the floors, then units upward by class — the
+        // capability fills first, the cache next, the scratch last; a
+        // tenant at its want is skipped; the sum never passes the quota.
+        let quota = 144 * mib + 100 * mib;
+        let Arbitration::Granted(g) =
+            arbitrate(quota, &[scratch.clone(), experts.clone(), kv.clone()])
+        else {
+            panic!("fits above the floors")
+        };
+        let by = |id: u32| g.iter().find(|x| x.id == TenantId(id)).unwrap().bytes;
+        assert_eq!(by(1), 136 * mib, "the capability reached its want");
+        assert!(
+            by(2) >= 80 * mib && by(2) < 400 * mib,
+            "the cache got the rest: {}",
+            by(2)
+        );
+        assert!(by(3) < 32 * mib, "the scratch got what was left: {}", by(3));
+        let total: usize = g.iter().map(|x| x.bytes).sum();
+        assert!(
+            total <= quota && total > quota - 8 * mib,
+            "{total} vs {quota}"
+        );
+        assert_eq!(by(1) + by(2) + by(3), total);
+        // Registration order within a class decides between equals.
+        let a = row(4, Class::Cache, 0, 10 * mib, 10 * mib);
+        let b = row(5, Class::Cache, 0, 10 * mib, 10 * mib);
+        assert_eq!(
+            arbitrate(10 * mib, &[a, b]),
+            Arbitration::Granted(vec![
+                Grant {
+                    id: TenantId(4),
+                    bytes: 10 * mib
+                },
+                Grant {
+                    id: TenantId(5),
+                    bytes: 0
+                },
+            ])
+        );
+    }
+
+    /// A tenant that yields: its `resize` drops a unit's reservation at
+    /// once and reports the pledge; a fixed tenant (a `Gauge`) holds what
+    /// it holds.
+    struct Elastic {
+        ledger: Arc<Ledger>,
+        unit: usize,
+        floor: usize,
+        class: Class,
+        held: AtomicUsize,
+        units: parking_lot::Mutex<Vec<Reservation>>,
+    }
+
+    impl Tenant for Elastic {
+        fn name(&self) -> String {
+            "elastic".into()
+        }
+        fn claim(&self) -> Claim {
+            Claim {
+                floor: self.floor,
+                want: 10 * self.unit,
+                unit: self.unit,
+                class: self.class,
+            }
+        }
+        fn held(&self) -> usize {
+            self.held.load(Ordering::Relaxed)
+        }
+        fn resize(&self, grant: usize) -> usize {
+            let before = self.held();
+            let after = grant.max(self.floor);
+            let mut units = self.units.lock();
+            while units.len() * self.unit > after {
+                units.pop();
+            }
+            while units.len() * self.unit < after {
+                units.push(self.ledger.reserve(self.unit));
+            }
+            let _ = before;
+            self.held.store(units.len() * self.unit, Ordering::Relaxed);
+            self.held()
+        }
+    }
+
+    #[test]
+    fn a_yield_asks_the_caches_by_units_down_to_their_floor_and_never_a_capability() {
+        let ledger = Ledger::new();
+        let mib = 1usize << 20;
+        let _fixed_bytes = ledger.reserve(60 * mib);
+        let elastic = Arc::new(Elastic {
+            ledger: Arc::clone(&ledger),
+            unit: 4 * mib,
+            floor: 8 * mib,
+            class: Class::Cache,
+            held: AtomicUsize::new(40 * mib),
+            units: parking_lot::Mutex::new((0..10).map(|_| ledger.reserve(4 * mib)).collect()),
+        });
+        // A capability that COULD shrink if asked: the yield must never ask.
+        let able = Arc::new(Elastic {
+            ledger: Arc::clone(&ledger),
+            unit: 4 * mib,
+            floor: 8 * mib,
+            class: Class::Capability,
+            held: AtomicUsize::new(40 * mib),
+            units: parking_lot::Mutex::new((0..10).map(|_| ledger.reserve(4 * mib)).collect()),
+        });
+        let c: Arc<dyn Tenant> = able.clone();
+        ledger.register(&c);
+        let fixed = Gauge::new(
+            "kv",
+            Claim {
+                floor: 50 * mib,
+                want: 50 * mib,
+                unit: mib,
+                class: Class::Capability,
+            },
+            50 * mib,
+        );
+        let e: Arc<dyn Tenant> = elastic.clone();
+        let f: Arc<dyn Tenant> = fixed.clone();
+        ledger.register(&e);
+        ledger.register(&f);
+        assert_eq!(ledger.committed(), 140 * mib);
+        // Short by 10 MiB: three units of 4 MiB are pledged, no more.
+        assert_eq!(ledger.yield_for(10 * mib), 12 * mib);
+        assert_eq!(elastic.held(), 28 * mib);
+        assert_eq!(
+            ledger.committed(),
+            128 * mib,
+            "the units' reservations dropped"
+        );
+        // Short by more than it can give: down to the floor; the fixed
+        // capability untouched, and the capability that could shrink never
+        // asked.
+        assert_eq!(ledger.yield_for(100 * mib), 20 * mib);
+        assert_eq!(elastic.held(), 8 * mib);
+        assert_eq!(fixed.held(), 50 * mib);
+        assert_eq!(able.held(), 40 * mib, "a capability was asked to yield");
+        assert_eq!(ledger.committed(), 108 * mib);
+        // Growing back: the arbiter grants every want that fits, and the
+        // tenant whose grant moved is resized.
+        ledger.set_quota(200 * mib);
+        let (a, resized) = ledger.arbitrate();
+        assert!(matches!(a, Arbitration::Granted(_)));
+        assert_eq!(resized.len(), 1, "{resized:?}");
+        assert_eq!(elastic.held(), 40 * mib, "the cache's want");
+        assert_eq!(able.held(), 40 * mib);
+        assert_eq!(ledger.committed(), 140 * mib);
+    }
 
     #[test]
     fn a_reservation_is_committed_for_its_life_and_released_on_drop() {

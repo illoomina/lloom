@@ -246,6 +246,16 @@ pub struct SlotCache<K, I: KeyIndex<K>, E: Evict> {
     /// settles (`release_deferred`).
     deferred: Vec<SlotId>,
     recycled: Vec<SlotId>,
+    /// Slots in service: `0..active`. A slot at or past `active` is parked
+    /// — never a victim, never taken; when its last reader completes it
+    /// goes to `parked`, not to `free` (an elastic tenant's shrink,
+    /// `profiles-and-memory-design.md` §4.2: the owner frees the storage
+    /// past `active` once every parked slot's reader has completed, and
+    /// allocates it again on a grow).
+    active: usize,
+    /// Parked slots whose last reader has completed (the quarantined arm's
+    /// free entries past `active` go here at once).
+    parked: Vec<SlotId>,
 }
 
 /// The expert tier's cache: dense ids, the tick policy.
@@ -268,11 +278,80 @@ impl<K: Copy + Eq, I: KeyIndex<K>, E: Evict> SlotCache<K, I, E> {
             quarantine: Retire::new(),
             deferred: Vec::new(),
             recycled: Vec::new(),
+            active: n_slots,
+            parked: Vec::new(),
         }
     }
 
     pub fn n_slots(&self) -> usize {
         self.key_in.len()
+    }
+
+    /// Slots in service (`0..active`).
+    pub fn active(&self) -> usize {
+        self.active
+    }
+
+    /// Take slots `active..` out of service. Returns the resident keys in
+    /// them (the caller evicts those, through its liveness); the empty ones
+    /// among them are parked at once, the evicted ones when their last
+    /// reader completes (`recycle`; `settled` says when every slot past
+    /// `active` has). `active` never drops below `floor`.
+    pub fn shrink_to(&mut self, active: usize, floor: usize) -> Vec<K> {
+        let active = active.max(floor).min(self.n_slots());
+        if active >= self.active {
+            return Vec::new();
+        }
+        self.active = active;
+        // Free-list entries past `active` are parked, not taken.
+        let (keep, park): (Vec<SlotId>, Vec<SlotId>) =
+            self.free.drain(..).partition(|s| s.index() < active);
+        self.free = keep;
+        self.parked.extend(park);
+        let mut evict = Vec::new();
+        for s in active..self.n_slots() {
+            match self.key_in[s] {
+                Some(k) => evict.push(k),
+                None if !self.parked.contains(&SlotId(s as u32))
+                    && !self.quarantine.iter().any(|q| q.index() == s)
+                    && !self.deferred.contains(&SlotId(s as u32)) =>
+                {
+                    self.parked.push(SlotId(s as u32))
+                }
+                None => {}
+            }
+        }
+        evict
+    }
+
+    /// Put slots `..active` back in service: parked slots below `active`
+    /// are free again (the quarantined arm's list; the in-place arm takes
+    /// an empty slot by scan). Returns the slots brought back.
+    pub fn grow_to(&mut self, active: usize) -> Vec<SlotId> {
+        let active = active.min(self.n_slots());
+        if active <= self.active {
+            return Vec::new();
+        }
+        self.active = active;
+        let (mut back, stay): (Vec<SlotId>, Vec<SlotId>) =
+            self.parked.drain(..).partition(|s| s.index() < active);
+        self.parked = stay;
+        // Descending, as `set_spare` lists them: pops fill from the low end.
+        back.sort_by(|a, b| b.cmp(a));
+        if self.quarantined() {
+            self.free.extend(back.iter().copied());
+        }
+        back
+    }
+
+    /// Whether every slot past `active` is settled: none resident, none in
+    /// the quarantine or deferred — their storage may be freed.
+    pub fn settled_past_active(&self) -> bool {
+        (self.active..self.n_slots()).all(|s| {
+            self.key_in[s].is_none()
+                && !self.quarantine.iter().any(|q| q.index() == s)
+                && !self.deferred.contains(&SlotId(s as u32))
+        })
     }
 
     /// Select the arm: `spare` slots kept free (0: in place). Only on an
@@ -316,7 +395,13 @@ impl<K: Copy + Eq, I: KeyIndex<K>, E: Evict> SlotCache<K, I, E> {
     pub fn recycle(&mut self, completed: Completed) -> usize {
         self.quarantine.drain_into(completed, &mut self.recycled);
         let n = self.recycled.len();
-        self.free.append(&mut self.recycled);
+        for s in self.recycled.drain(..) {
+            if s.index() < self.active {
+                self.free.push(s);
+            } else {
+                self.parked.push(s);
+            }
+        }
         n
     }
 
@@ -387,7 +472,10 @@ impl<K: Copy + Eq, I: KeyIndex<K>, E: Evict> SlotCache<K, I, E> {
         if self.quarantined() {
             return self.free.len();
         }
-        self.key_in.iter().filter(|k| k.is_none()).count()
+        self.key_in[..self.active]
+            .iter()
+            .filter(|k| k.is_none())
+            .count()
     }
 }
 
@@ -418,7 +506,7 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
     pub fn lru_resident(&self, tick: Tick) -> Option<SlotId> {
         let p = &self.policy;
         let mut best: Option<(usize, Tick)> = None;
-        for s in 0..self.key_in.len() {
+        for s in 0..self.active {
             if self.key_in[s].is_none()
                 || p.pinned[s]
                 || p.last_use[s] == tick
@@ -462,7 +550,7 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
     ) -> Option<(SlotId, bool)> {
         let p = &self.policy;
         let mut best: Option<(usize, Tick)> = None;
-        for s in 0..self.key_in.len() {
+        for s in 0..self.active {
             if p.pinned[s]
                 || p.last_use[s] == tick
                 || (skip_inflight && p.inflight[s] != 0)
@@ -616,6 +704,51 @@ mod tests {
             "slot 0 pinned, slot 1 used this tick: slot 2 is the LRU"
         );
         assert_eq!(c.resident(), vec![ExpertId(5), ExpertId(2), ExpertId(3)]);
+    }
+
+    #[test]
+    fn a_shrink_parks_the_top_slots_and_a_grow_brings_them_back() {
+        let mut c = ExpertSlots::new(8, 4);
+        c.set_spare(1);
+        let t = c.begin();
+        for (s, e) in [(0u32, 5u32), (1, 6), (2, 7)] {
+            let got = c.take_free().unwrap();
+            assert_eq!(got, SlotId(s));
+            c.install(got, ExpertId(e));
+        }
+        c.touch(SlotId(2), t);
+        // Shrink to two slots: 7 (slot 2) and nothing in slot 3 (free)
+        // leave service; slot 3 is parked at once, slot 2 once evicted.
+        let evict = c.shrink_to(2, 1);
+        assert_eq!(evict, vec![ExpertId(7)]);
+        assert_eq!(c.active(), 2);
+        assert_eq!(c.free_len(), 0, "the free slot past `active` was parked");
+        c.evict(SlotId(2), Epoch(4), false);
+        assert!(!c.settled_past_active(), "slot 2 is in the quarantine");
+        assert_eq!(c.recycle(Completed(5)), 1);
+        assert!(c.settled_past_active(), "recycled past `active`: parked");
+        assert_eq!(c.free_len(), 0);
+        let t = c.begin();
+        assert_eq!(
+            c.lru_resident(t),
+            Some(SlotId(0)),
+            "victims come from the active slots"
+        );
+        assert!(c.victim_in(t, true, Completed::ALL).unwrap().0.index() < 2);
+        // Grow back to four: both parked slots return to the free list,
+        // low slot first on pop.
+        let back = c.grow_to(4);
+        assert_eq!(back.len(), 2);
+        assert_eq!(c.take_free(), Some(SlotId(2)));
+        assert_eq!(c.take_free(), Some(SlotId(3)));
+        // Never below the floor: a shrink to 0 with a floor of 1 keeps slot
+        // 0 (expert 5) in service and evicts slot 1's.
+        assert_eq!(
+            c.shrink_to(0, 1),
+            vec![ExpertId(6)],
+            "never below the floor"
+        );
+        assert_eq!(c.active(), 1);
     }
 
     #[test]

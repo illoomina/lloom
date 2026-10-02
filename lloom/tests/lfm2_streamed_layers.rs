@@ -138,7 +138,26 @@ fn run(
     let mut tok = argmax(&first);
     out.push(first);
     let mut pos = PROMPT.len();
+    // `LLOOM_TEST_GPU_BUSY=1`: a slow kernel ahead of every step's layers,
+    // so the GPU reaches a stage's slot long after the host asked for the
+    // load that evicts it — the race a loader that does not wait for the
+    // slot's reader loses deterministically (the harness's M-F).
+    let busy = std::env::var("LLOOM_TEST_GPU_BUSY").is_ok();
+    let heavy = if busy && dev.is_metal() {
+        Some(Tensor::ones((2048, 2048), DType::F32, dev)?)
+    } else {
+        None
+    };
     for _ in 0..steps {
+        if let Some(h) = &heavy {
+            let mut acc = h.clone();
+            for _ in 0..6 {
+                acc = acc.matmul(h)?.affine(1e-3, 0.0)?;
+            }
+            // Keep it on the device, ordered before the layers: a readback
+            // here would make the host wait and hide the race.
+            std::hint::black_box(acc);
+        }
         let input = Tensor::new(&[tok], dev)?.unsqueeze(0)?;
         let logits = model
             .forward(&input, pos, &mut cache)?

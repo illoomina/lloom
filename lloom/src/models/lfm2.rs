@@ -8210,7 +8210,8 @@ impl DecoderLayer {
             });
         };
         let mut tier = st.tier.lock();
-        let (_slot, moved) = tier.ensure(st.group, st.source.as_ref())?;
+        let (_slot, moved, wait) = tier.ensure(st.group, st.source.as_ref())?;
+        tier.cut_after_ensure()?;
         let part = |i: usize| -> Result<Cow<'static, Linear>> {
             Ok(Cow::Owned(Linear::from_weights(
                 tier.tensor(st.group, i)?,
@@ -8235,6 +8236,12 @@ impl DecoderLayer {
             }),
         };
         tier.prefetch(st.depth, st.source.as_ref())?;
+        // The group's bytes may still be landing (the loader's thread):
+        // every kernel of this layer waits on the device for them — and
+        // nothing is encoded when they have landed (R1).
+        if let Some(ticket) = wait {
+            tier.encode_wait(ticket)?;
+        }
         drop(tier);
         #[cfg(feature = "metal")]
         if moved {
@@ -8755,10 +8762,15 @@ impl Model {
                 // SAFETY: the checkpoint files are mapped read-only for the
                 // model's life, as `VarBuilder` maps them.
                 let source = unsafe { SafetensorsGroups::open(&plan.files, names, vb.device())? };
+                let source = std::sync::Arc::new(source)
+                    as std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>;
+                // The non-blocking loader (§4.8): on when the device is
+                // Metal and the checkpoint writes the tier's dtype; else the
+                // tier loads as it is asked, on the calling thread.
+                tier.start_loader(std::sync::Arc::clone(&source))?;
                 Some((
                     std::sync::Arc::new(parking_lot::Mutex::new(tier)),
-                    std::sync::Arc::new(source)
-                        as std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>,
+                    source,
                     plan.depth,
                 ))
             }

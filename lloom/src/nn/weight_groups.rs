@@ -207,6 +207,7 @@ pub struct GroupCounters {
     pub evictions: std::sync::atomic::AtomicU64,
     pub bytes_loaded: std::sync::atomic::AtomicU64,
     pub waits: std::sync::atomic::AtomicU64,
+    pub device_waits: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,17 +216,20 @@ pub struct GroupStats {
     pub misses: u64,
     pub evictions: u64,
     pub bytes_loaded: u64,
-    /// Loads that found no slot whose last reader the clock covered and
-    /// took one anyway (an encoder copy ordered behind the reader, never a
-    /// host wait; counted because a tight ring is a sign the depth is
-    /// short).
+    /// Loads that waited for the slot's last reader to complete — on the
+    /// loader's thread when the loader is on, the host's otherwise.
+    /// Counted because a tight ring is a sign the depth is short.
     pub waits: u64,
+    /// Device waits encoded for a group whose bytes had not landed at
+    /// encode time (R1: zero when every group is resident; the loader's
+    /// lag otherwise).
+    pub device_waits: u64,
 }
 
 /// The dense weight-group tier.
 #[derive(Debug)]
 pub struct WeightGroups {
-    groups: Vec<GroupSpec>,
+    groups: std::sync::Arc<Vec<GroupSpec>>,
     cache: SlotCache<WeightGroupId, Dense, Belady>,
     /// `[slots, slot_elems]` of the groups' dtype.
     backing: Tensor,
@@ -245,8 +249,24 @@ pub struct WeightGroups {
     current: Option<SlotId>,
     #[cfg(feature = "metal")]
     clock: Option<std::sync::Arc<lloom_tensor::kernels::metal::GpuClock>>,
-    counters: GroupCounters,
+    counters: std::sync::Arc<GroupCounters>,
     site: &'static str,
+    /// The non-blocking loader (§4.8 "the loader never blocks either
+    /// side"), Metal only: a thread that writes the slots and raises a
+    /// shared event per load; the stage's dispatch waits on the device.
+    #[cfg(feature = "metal")]
+    loader: Option<loader::Handle>,
+    /// Per slot, the value of the load in flight into it (0: none pending).
+    #[cfg(feature = "metal")]
+    pending: Vec<u64>,
+    /// Per slot, the epoch of its last reader as stamped here — `None` for
+    /// a slot nothing has read. What a load request carries to the loader
+    /// (captured BEFORE the slot is stamped for its new group: the loader
+    /// waits for the old reader, never the new one).
+    #[cfg(feature = "metal")]
+    readers: Vec<Option<Epoch>>,
+    #[cfg(feature = "metal")]
+    next_ticket: u64,
     /// The tier's row on the ledger (§4.8 "as a tenant": class `Cache`,
     /// floor the ring — three slots — want every group, unit a slot); the
     /// owner applies a grant with `resize_slots`.
@@ -331,7 +351,7 @@ impl WeightGroups {
             cache: SlotCache::with(Dense::new(groups.len()), slots),
             last_slot: vec![None; groups.len()],
             current: None,
-            groups,
+            groups: std::sync::Arc::new(groups),
             backing,
             slot_elems,
             dtype,
@@ -340,8 +360,16 @@ impl WeightGroups {
             pos: 0,
             #[cfg(feature = "metal")]
             clock,
-            counters: GroupCounters::default(),
+            counters: std::sync::Arc::new(GroupCounters::default()),
             site,
+            #[cfg(feature = "metal")]
+            loader: None,
+            #[cfg(feature = "metal")]
+            pending: vec![0; slots],
+            #[cfg(feature = "metal")]
+            readers: vec![None; slots],
+            #[cfg(feature = "metal")]
+            next_ticket: 0,
             #[cfg(feature = "metal")]
             gauge,
         })
@@ -362,6 +390,11 @@ impl WeightGroups {
         if slots == was {
             return Ok(was);
         }
+        // The loader's writes land before the copy below reads the slots;
+        // the loader itself restarts over the new backing.
+        self.drain()?;
+        #[cfg(feature = "metal")]
+        let source = self.stop_loader();
         // Evict the groups in slots past the new count (a shrink); their
         // readers must have completed — a cold path, the owner's wait.
         if slots < was {
@@ -413,6 +446,18 @@ impl WeightGroups {
         #[cfg(feature = "metal")]
         if let Some(g) = &self.gauge {
             g.set_held(slots * self.slot_bytes());
+        }
+        #[cfg(feature = "metal")]
+        {
+            self.pending = vec![0; slots];
+            let mut readers = vec![None; slots];
+            for (s, r) in readers.iter_mut().enumerate().take(keep) {
+                *r = self.readers[s];
+            }
+            self.readers = readers;
+            if let Some(source) = source {
+                self.start_loader(source)?;
+            }
         }
         Ok(slots)
     }
@@ -501,7 +546,16 @@ impl WeightGroups {
     /// advance the plan past this use. Returns the slot and whether it
     /// differs from the slot `g` was served from at its last use (a
     /// recorded plan bound that one).
-    pub fn ensure(&mut self, g: WeightGroupId, source: &dyn GroupSource) -> Result<(SlotId, bool)> {
+    ///
+    /// The third field: with the loader on, the load's event value when the
+    /// bytes had not landed when this returned — the caller encodes the
+    /// device wait (`encode_wait`) before the stage's first reader; `None`
+    /// when the group was resident and landed (R1: nothing encoded).
+    pub fn ensure(
+        &mut self,
+        g: WeightGroupId,
+        source: &dyn GroupSource,
+    ) -> Result<(SlotId, bool, Option<u64>)> {
         use std::sync::atomic::Ordering::Relaxed;
         // The previous stage's slot may be a victim again: its kernels are
         // encoded by now — in the epoch open at *this* instant at the
@@ -511,10 +565,11 @@ impl WeightGroups {
         if let Some(prev) = self.current.take() {
             let now = self.epoch();
             if now > self.cache.reader_epoch(prev) {
-                self.cache.stamp(prev, now);
+                self.stamp_reader(prev, now);
             }
             self.cache.set_pinned(prev, false);
         }
+        self.check_loader()?;
         let slot = match self.cache.slot_of(g) {
             Some(s) => {
                 self.counters.hits.fetch_add(1, Relaxed);
@@ -522,33 +577,14 @@ impl WeightGroups {
             }
             None => {
                 self.counters.misses.fetch_add(1, Relaxed);
-                let (s, evicted) = match self.cache.victim(self.completed()) {
-                    Some(v) => v,
-                    None => {
-                        // Every slot's last reader is still open: take the
-                        // Belady victim anyway — the copy is ordered behind
-                        // the reader on the queue.
-                        self.counters.waits.fetch_add(1, Relaxed);
-                        self.cache.victim(Completed::ALL).ok_or_else(|| {
-                            lloom_tensor::Error::Msg(format!(
-                                "weight groups: no slot of {} for group {}",
-                                self.cache.n_slots(),
-                                g.0
-                            ))
-                        })?
-                    }
-                };
-                if evicted {
-                    self.counters.evictions.fetch_add(1, Relaxed);
-                    let epoch = self.cache.reader_epoch(s);
-                    self.cache.evict(s, epoch, false);
-                }
-                self.load(s, g, source)?;
-                self.cache.install(s, g);
+                let s = self.take_victim(g)?;
+                self.request_load(s, g, source)?;
                 s
             }
         };
-        self.cache.stamp(slot, self.epoch());
+        let wait = self.pending_wait(slot);
+        let now = self.epoch();
+        self.stamp_reader(slot, now);
         self.cache.set_pinned(slot, true);
         self.current = Some(slot);
         let moved = self.last_slot[g.index()].is_some_and(|s| s != slot);
@@ -567,7 +603,326 @@ impl WeightGroups {
                 self.restamp_next_uses();
             }
         }
-        Ok((slot, moved))
+        Ok((slot, moved, wait))
+    }
+
+    /// The slot a missing group loads into: Belady's victim. With the loader
+    /// on, the optimal one whatever its reader's state — the loader waits
+    /// for the reader on its own thread, the compute side never. Without
+    /// it, the furthest *settled* slot, and the optimal one with a host
+    /// wait when none is settled (the first form; `memory.md` §9.7 has
+    /// what that costs on a GPU a step behind the host).
+    fn take_victim(&mut self, g: WeightGroupId) -> Result<SlotId> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (s, evicted) = match self.cache.victim(self.victim_settled()) {
+            Some(v) => v,
+            None => {
+                // Every slot's last reader is still open: take the Belady
+                // victim anyway — the copy waits for the reader.
+                self.counters.waits.fetch_add(1, Relaxed);
+                self.cache.victim(Completed::ALL).ok_or_else(|| {
+                    lloom_tensor::Error::Msg(format!(
+                        "weight groups: no slot of {} for group {}",
+                        self.cache.n_slots(),
+                        g.0
+                    ))
+                })?
+            }
+        };
+        if evicted {
+            self.counters.evictions.fetch_add(1, Relaxed);
+            let epoch = self.cache.reader_epoch(s);
+            self.cache.evict(s, epoch, false);
+        }
+        Ok(s)
+    }
+
+    /// What a victim's last reader must be covered by: everything (the
+    /// loader orders the write behind the reader itself) or the clock.
+    fn victim_settled(&self) -> Completed {
+        #[cfg(feature = "metal")]
+        if self.loader.is_some() {
+            return Completed::ALL;
+        }
+        self.completed()
+    }
+
+    /// Load `g` into `s` and install it: on the loader's thread when the
+    /// loader is on (the slot pinned until the bytes land, so no victim
+    /// choice takes a slot whose load is in flight), else here and now.
+    fn request_load(
+        &mut self,
+        s: SlotId,
+        g: WeightGroupId,
+        source: &dyn GroupSource,
+    ) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(l) = &self.loader {
+            // The deadlock order (P26's lesson, `io_queue.rs`): the loader
+            // waits for the slot's last reader to COMPLETE, and the stage's
+            // device wait for this load goes into the OPEN command buffer.
+            // If that reader is in the open buffer too, neither can finish
+            // before the other. Cut the buffer first: the reader's commits
+            // and completes on its own, the wait lands in the next one.
+            // What the load waits for: the slot's last reader, as stamped —
+            // at its stage's `ensure`, and again at the next `ensure` with
+            // the epoch open then (H1's shape: a cut between the stamp and
+            // the stage's kernels puts them an epoch later; the restamp is
+            // the latest they can be in, and the slot is pinned until that
+            // restamp, so no request precedes it). Not the open epoch: that
+            // would be the stage just encoded as well, and waiting for it
+            // serializes the loader behind the GPU's current stage (one
+            // run of that form sits between two of this one on a loaded
+            // machine — unresolved at that noise, kept on the argument;
+            // `memory.md` §9.7). When the reader is in the OPEN buffer, that
+            // buffer is cut so it commits and completes on its own, the wait
+            // for this load landing in the next (P26's order, `io_queue.rs`).
+            let reader = self.readers[s.index()];
+            let mut cut = false;
+            if let Device::Metal(m) = &self.device {
+                if reader.is_some_and(|e| e >= self.epoch()) {
+                    m.flush_marker()?;
+                    cut = true;
+                }
+            }
+            self.next_ticket += 1;
+            let ticket = self.next_ticket;
+            if trace() {
+                eprintln!(
+                    "[wg] request slot={} group={} ticket={ticket} reader={reader:?} epoch={:?} cut={cut} signaled={}",
+                    s.index(),
+                    g.0,
+                    self.epoch(),
+                    l.shared.event.signaled()
+                );
+            }
+            self.pending[s.index()] = ticket;
+            self.cache.install(s, g);
+            self.cache.set_pinned(s, true);
+            l.tx.send(loader::Msg::Load {
+                slot: s,
+                group: g,
+                ticket,
+                reader,
+            })
+            .map_err(|_| lloom_tensor::Error::Msg("weight groups: the loader is gone".into()))?;
+            if std::env::var("LLOOM_WG_SYNC").is_ok() {
+                self.drain()?;
+            }
+            return Ok(());
+        }
+        self.load(s, g, source)?;
+        self.cache.install(s, g);
+        Ok(())
+    }
+
+    /// The load in flight into `slot`, if its bytes have not landed.
+    fn pending_wait(&self, slot: SlotId) -> Option<u64> {
+        #[cfg(feature = "metal")]
+        if let Some(l) = &self.loader {
+            let t = self.pending[slot.index()];
+            if t != 0 && t > l.shared.event.signaled() {
+                return Some(t);
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = slot;
+        None
+    }
+
+    /// Stamp `slot`'s reader epoch — in the cache and in `readers`, what a
+    /// later load of the slot will wait for.
+    fn stamp_reader(&mut self, slot: SlotId, epoch: Epoch) {
+        self.cache.stamp(slot, epoch);
+        #[cfg(feature = "metal")]
+        {
+            self.readers[slot.index()] = Some(epoch);
+        }
+    }
+
+    /// Slots whose pending load has landed are evictable again (they were
+    /// pinned at the request); the slot in use stays pinned.
+    #[cfg(feature = "metal")]
+    fn unpin_landed(&mut self) {
+        let Some(l) = &self.loader else { return };
+        let signaled = l.shared.event.signaled();
+        for s in 0..self.pending.len() {
+            let t = self.pending[s];
+            if t != 0 && t <= signaled && self.current != Some(SlotId(s as u32)) {
+                self.pending[s] = 0;
+                self.cache.set_pinned(SlotId(s as u32), false);
+            }
+        }
+    }
+
+    /// `LLOOM_WG_CUT_AFTER_ENSURE=1`: cut the open command buffer after
+    /// every `ensure`, so the stage's kernels land an epoch after its
+    /// stamp — H1's shape on demand (the harness's M-A arm: without the
+    /// restamp at the next `ensure`, the loader waits for the wrong epoch
+    /// and writes under the stage's kernels). A diagnosis knob.
+    pub fn cut_after_ensure(&self) -> Result<()> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("LLOOM_WG_CUT_AFTER_ENSURE").is_ok()) {
+            return Ok(());
+        }
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &self.device {
+            m.flush_marker()?;
+        }
+        Ok(())
+    }
+
+    /// Encode the device wait for a load (`ensure`'s third field): every
+    /// command after it on the device's stream waits for the bytes. Not
+    /// encoded when the host has raised the event since — R1's conditional
+    /// wait.
+    pub fn encode_wait(&self, ticket: u64) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(l) = &self.loader {
+            if trace() {
+                eprintln!(
+                    "[wg] encode_wait ticket={ticket} signaled={} epoch={:?}",
+                    l.shared.event.signaled(),
+                    self.epoch()
+                );
+            }
+            if ticket > l.shared.event.signaled() {
+                self.counters
+                    .device_waits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                l.shared.event.encode_wait(ticket)?;
+            }
+            return Ok(());
+        }
+        let _ = ticket;
+        Ok(())
+    }
+
+    /// Start the non-blocking loader over `source` (Metal, a host-mapped
+    /// backing, a source that writes the tier's dtype — probed on the first
+    /// group's first part; `Ok(false)` when any of those is not so, and
+    /// the tier loads synchronously as before).
+    pub fn start_loader(&mut self, source: std::sync::Arc<dyn GroupSource>) -> Result<bool> {
+        #[cfg(feature = "metal")]
+        {
+            let Device::Metal(m) = &self.device else {
+                return Ok(false);
+            };
+            if self.loader.is_some() {
+                return Ok(true);
+            }
+            // `LLOOM_WG_NO_LOADER=1`: the blocking path on purpose (the
+            // harness's arms for its own hazards; a diagnosis arm).
+            if std::env::var("LLOOM_WG_NO_LOADER").is_ok() {
+                return Ok(false);
+            }
+            let Some(base) = self.slot_host_ptr(SlotId(0)) else {
+                return Ok(false);
+            };
+            let Some(clock) = self.clock.clone() else {
+                return Ok(false);
+            };
+            let Some(first) = self.groups.first() else {
+                return Ok(false);
+            };
+            let mut probe = vec![0u8; first.parts[0].elems() * self.dtype.size_in_bytes()];
+            if !source.write(first.id, 0, self.dtype, &mut probe)? {
+                return Ok(false);
+            }
+            let slow = std::env::var("LLOOM_WG_SLOW_LOADER_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_millis);
+            let shared = std::sync::Arc::new(loader::Shared {
+                event: lloom_tensor::metal_backend::HostEvent::new(m)?,
+                clock,
+                base: base as usize,
+                slot_bytes: self.slot_bytes(),
+                dtype: self.dtype,
+                groups: std::sync::Arc::clone(&self.groups),
+                source,
+                counters: std::sync::Arc::clone(&self.counters),
+                failed: parking_lot::Mutex::new(None),
+                slow,
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            let sh = std::sync::Arc::clone(&shared);
+            let thread = std::thread::Builder::new()
+                .name(format!("{}.loader", self.site))
+                .spawn(move || loader::run(rx, sh))
+                .map_err(|e| {
+                    lloom_tensor::Error::Msg(format!("weight groups: loader thread: {e}"))
+                })?;
+            self.loader = Some(loader::Handle {
+                tx,
+                thread: Some(thread),
+                shared,
+            });
+            Ok(true)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = source;
+            Ok(false)
+        }
+    }
+
+    /// Whether the loader is on.
+    pub fn loader_on(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            self.loader.is_some()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    }
+
+    /// Wait until every load requested so far has landed (the owner's
+    /// cold paths: a resize, an audit, the end).
+    pub fn drain(&self) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(l) = &self.loader {
+            // The loader waits on the clock; the open command buffer holds
+            // readers it waits for. Commit and wait the queue out first (a
+            // cold path), so no load pends on a buffer never committed.
+            if let Device::Metal(m) = &self.device {
+                m.wait_until_completed()?;
+            }
+            while l.shared.event.signaled() < self.next_ticket {
+                if l.shared.failed.lock().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            self.check_loader()?;
+        }
+        Ok(())
+    }
+
+    /// The loader's failure, if it had one (a source that stopped writing).
+    fn check_loader(&self) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(l) = &self.loader {
+            if let Some(e) = l.shared.failed.lock().as_ref() {
+                lloom_tensor::bail!("weight groups: the loader failed: {e}")
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn stop_loader(&mut self) -> Option<std::sync::Arc<dyn GroupSource>> {
+        let l = self.loader.take()?;
+        let _ = l.tx.send(loader::Msg::Stop);
+        if let Some(t) = l.thread {
+            let _ = t.join();
+        }
+        for p in self.pending.iter_mut() {
+            *p = 0;
+        }
+        Some(std::sync::Arc::clone(&l.shared.source))
     }
 
     /// Load the next `depth` groups of the plan not yet resident (the
@@ -578,12 +933,15 @@ impl WeightGroups {
         }
         let n = self.plan.len() as u64;
         let mut loaded = 0;
+        #[cfg(feature = "metal")]
+        self.unpin_landed();
+        self.check_loader()?;
         for k in 0..depth as u64 {
             let g = self.plan[((self.pos + k) % n) as usize];
             if self.cache.slot_of(g).is_some() {
                 continue;
             }
-            let Some((s, evicted)) = self.cache.victim(self.completed()) else {
+            let Some((s, evicted)) = self.cache.victim(self.victim_settled()) else {
                 break;
             };
             if evicted {
@@ -598,8 +956,7 @@ impl WeightGroups {
                 let epoch = self.cache.reader_epoch(s);
                 self.cache.evict(s, epoch, false);
             }
-            self.load(s, g, source)?;
-            self.cache.install(s, g);
+            self.request_load(s, g, source)?;
             let at = self.next_use(g, self.pos.saturating_sub(1));
             self.cache.set_next_use(s, at);
             loaded += 1;
@@ -708,6 +1065,7 @@ impl WeightGroups {
     /// host, after the queue is waited out) differ from `source`'s. Empty
     /// when the slots hold what they should.
     pub fn audit(&self, source: &dyn GroupSource) -> Result<Vec<(WeightGroupId, usize)>> {
+        self.drain()?;
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &self.device {
             m.wait_until_completed()?;
@@ -741,11 +1099,169 @@ impl WeightGroups {
             evictions: self.counters.evictions.load(Relaxed),
             bytes_loaded: self.counters.bytes_loaded.load(Relaxed),
             waits: self.counters.waits.load(Relaxed),
+            device_waits: self.counters.device_waits.load(Relaxed),
         }
     }
 
     pub fn resident(&self) -> Vec<WeightGroupId> {
         self.cache.resident()
+    }
+}
+
+impl Drop for WeightGroups {
+    fn drop(&mut self) {
+        #[cfg(feature = "metal")]
+        {
+            // The loader's writes land before the backing goes; a wait
+            // left encoded for a value never raised would hang the queue.
+            let _ = self.drain();
+            if let Some(l) = &self.loader {
+                l.shared.event.signal(u64::MAX / 2);
+            }
+            self.stop_loader();
+        }
+    }
+}
+
+/// `LLOOM_WG_TRACE=1` (read once): the tier and its loader narrate every
+/// request, wait and write on stderr. A diagnosis knob.
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LLOOM_WG_TRACE").is_ok())
+}
+
+/// The non-blocking loader (§4.8): one thread, one shared event. A request
+/// names a slot, a group, a value and the slot's last reader; the thread
+/// waits for that reader on the clock, then
+/// writes the group's parts into the slot through `GroupSource::write`
+/// (bf16 → f16 on the way) and raises the event to the value. The encoding
+/// thread never waits: a stage whose group has not landed carries a device
+/// wait for its value (`WeightGroups::encode_wait`), and a stage whose
+/// group has encodes nothing (R1). Requests are served in order, so the
+/// values the thread raises are monotone, which a shared event requires.
+#[cfg(feature = "metal")]
+mod loader {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    pub(super) enum Msg {
+        Load {
+            slot: SlotId,
+            group: WeightGroupId,
+            ticket: u64,
+            /// The slot's last reader as stamped (`None`: nothing has read
+            /// the slot), captured when the request was made. The clock
+            /// covers an epoch only once its buffer completed, and a fresh
+            /// slot's `Epoch::ZERO` is not that — the first form of this
+            /// waited on it while the GPU waited on the load; the second
+            /// read a mirror the tier had already stamped with the NEW
+            /// group's reader; a fourth waited for the open epoch, the
+            /// stage just encoded included, and lost the overlap.
+            reader: Option<Epoch>,
+        },
+        Stop,
+    }
+
+    pub(super) struct Shared {
+        pub event: lloom_tensor::metal_backend::HostEvent,
+        pub clock: std::sync::Arc<lloom_tensor::kernels::metal::GpuClock>,
+        /// The backing's host mapping (a persistent Shared buffer, alive
+        /// for the tier's life; the thread is stopped before it goes).
+        pub base: usize,
+        pub slot_bytes: usize,
+        pub dtype: DType,
+        pub groups: std::sync::Arc<Vec<GroupSpec>>,
+        pub source: std::sync::Arc<dyn GroupSource>,
+        pub counters: std::sync::Arc<GroupCounters>,
+        /// A write the source declined or failed: the tier reports it on
+        /// the next call; the value is raised regardless so no wait hangs.
+        pub failed: parking_lot::Mutex<Option<String>>,
+        /// `LLOOM_WG_SLOW_LOADER_MS`: a sleep before each load (a test's
+        /// way to make the device wait matter, and a diagnosis knob).
+        pub slow: Option<std::time::Duration>,
+    }
+
+    pub(super) struct Handle {
+        pub tx: std::sync::mpsc::Sender<Msg>,
+        pub thread: Option<std::thread::JoinHandle<()>>,
+        pub shared: std::sync::Arc<Shared>,
+    }
+
+    impl std::fmt::Debug for Handle {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Loader")
+                .field("event", &self.shared.event)
+                .finish()
+        }
+    }
+
+    pub(super) fn run(rx: std::sync::mpsc::Receiver<Msg>, sh: std::sync::Arc<Shared>) {
+        while let Ok(msg) = rx.recv() {
+            let (slot, group, ticket, reader) = match msg {
+                Msg::Stop => break,
+                Msg::Load {
+                    slot,
+                    group,
+                    ticket,
+                    reader,
+                } => (slot, group, ticket, reader),
+            };
+            // The slot's last reader must have completed before the bytes
+            // change under it (H1–H3's rule, on this thread rather than the
+            // encoding one).
+            if let Some(epoch) = reader {
+                if !sh.clock.completed_count().covers(epoch) {
+                    sh.counters.waits.fetch_add(1, Relaxed);
+                    if trace() {
+                        eprintln!(
+                            "[wg-loader] ticket={ticket} slot={} waits for epoch {:?}, completed {}",
+                            slot.index(),
+                            epoch,
+                            sh.clock.completed_count()
+                        );
+                    }
+                    while !sh.clock.completed_count().covers(epoch) {
+                        std::thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                }
+            }
+            if trace() {
+                eprintln!(
+                    "[wg-loader] ticket={ticket} slot={} writing group {}",
+                    slot.index(),
+                    group.0
+                );
+            }
+            if let Some(d) = sh.slow {
+                std::thread::sleep(d);
+            }
+            let spec = &sh.groups[group.index()];
+            let elem = sh.dtype.size_in_bytes();
+            let mut bytes = 0usize;
+            for (i, part) in spec.parts.iter().enumerate() {
+                let len = part.elems() * elem;
+                let at = sh.base + slot.index() * sh.slot_bytes + part.offset * elem;
+                // SAFETY: `at .. at + len` is inside slot `slot` of the
+                // Shared backing, alive while this thread runs; its last
+                // GPU reader has completed (above) and the tier reads no
+                // slot on the host.
+                let dst = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) };
+                match sh.source.write(group, i, sh.dtype, dst) {
+                    Ok(true) => bytes += len,
+                    Ok(false) => {
+                        *sh.failed.lock() = Some(format!(
+                            "the source has no {:?} bytes for group {} part {} ({})",
+                            sh.dtype, group.0, i, part.name
+                        ));
+                    }
+                    Err(e) => {
+                        *sh.failed.lock() = Some(format!("group {} part {}: {e}", group.0, i));
+                    }
+                }
+            }
+            sh.counters.bytes_loaded.fetch_add(bytes as u64, Relaxed);
+            sh.event.signal(ticket);
+        }
     }
 }
 
@@ -854,7 +1370,7 @@ mod tests {
         for round in 0..3 {
             for g in 0..n as u32 {
                 let g = WeightGroupId(g);
-                let (slot, moved) = tier.ensure(g, &src).unwrap();
+                let (slot, moved, _) = tier.ensure(g, &src).unwrap();
                 assert_eq!(tier.slot_of(g), Some(slot));
                 // A resident group is served from the slot it had: `moved`
                 // only ever reports a load into another slot (Belady's
@@ -919,7 +1435,7 @@ mod tests {
         // Grow to four: the three stay, a fourth slot is free.
         assert_eq!(tier.resize_slots(4).unwrap(), 4);
         assert_eq!(tier.resident().len(), 3);
-        let (slot, _) = tier.ensure(WeightGroupId(3), &src).unwrap();
+        let (slot, _, _) = tier.ensure(WeightGroupId(3), &src).unwrap();
         assert_eq!(slot, SlotId(3), "the new slot is empty and taken first");
     }
 
@@ -939,11 +1455,11 @@ mod tests {
         // Using them is a hit; the third group is a miss loaded on use.
         assert_eq!(
             tier.ensure(WeightGroupId(0), &src).unwrap(),
-            (SlotId(0), false)
+            (SlotId(0), false, None)
         );
         assert_eq!(
             tier.ensure(WeightGroupId(1), &src).unwrap(),
-            (SlotId(1), false)
+            (SlotId(1), false, None)
         );
         let st = tier.stats();
         assert_eq!((st.hits, st.misses), (2, 0));

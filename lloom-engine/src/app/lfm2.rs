@@ -2104,13 +2104,14 @@ impl Engine {
         if let Some((slots, groups, slot_bytes, g)) = self.core.model.streamed_layers_stats() {
             out.push(format!(
                 "[groups: slots={slots} groups={groups} slot_bytes={:.1} MiB hits={} misses={} \
-                 evictions={} loaded={:.2} GB waits={}]",
+                 evictions={} loaded={:.2} GB loader_waits={} device_waits={}]",
                 slot_bytes as f64 / (1024.0 * 1024.0),
                 g.hits,
                 g.misses,
                 g.evictions,
                 g.bytes_loaded as f64 / 1e9,
-                g.waits
+                g.waits,
+                g.device_waits
             ));
         }
         if let Some(line) = lloom::nn::memory::ledger_line(&self.core.device) {

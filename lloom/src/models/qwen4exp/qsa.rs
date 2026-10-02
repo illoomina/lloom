@@ -1808,7 +1808,7 @@ impl QsaAttention {
         let s = q.dim(0)?;
         let table = store.rows_of(&sel.table)?;
         let dev = q.device();
-        let long = |t: usize| sel.n_keys[t] as usize >= ops::SDPA_TWO_PASS_K_THRESHOLD;
+        let long = |t: usize| ops::sdpa_vector_two_pass(sel.n_keys[t] as usize, hd, q.dtype());
         let groups: [Vec<usize>; 2] = [
             (0..s).filter(|&t| !long(t)).collect(),
             (0..s).filter(|&t| long(t)).collect(),
@@ -2091,10 +2091,10 @@ impl QsaAttention {
 
     /// The paged attention of `q [nd, nh, hd]` over the layer's pool for
     /// `nd` rows (row `j`'s pages `tables[j]`, its live count `n_keys[j]`),
-    /// → `[nd, nh, hd]`. The rows split at `ops::SDPA_TWO_PASS_K_THRESHOLD`
-    /// keys — the single-pass rows in one launch, the 2-pass rows in one
-    /// pair — so every row runs the kernel the per-row `ops::sdpa` runs at
-    /// its length: bit-identical per row.
+    /// → `[nd, nh, hd]`. The rows split by `ops::sdpa_vector_two_pass` at
+    /// their key counts — the single-pass rows in one launch, the 2-pass
+    /// rows in one pair — so every row runs the kernel the per-row
+    /// `ops::sdpa` runs at its length: bit-identical per row.
     #[allow(clippy::too_many_arguments)]
     fn sdpa_paged_rows(
         &self,
@@ -2110,7 +2110,7 @@ impl QsaAttention {
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let nd = n_keys.len();
         let dev = q.device();
-        let long = |j: usize| n_keys[j] as usize >= ops::SDPA_TWO_PASS_K_THRESHOLD;
+        let long = |j: usize| ops::sdpa_vector_two_pass(n_keys[j] as usize, hd, q.dtype());
         let groups: [Vec<usize>; 2] = [
             (0..nd).filter(|&j| !long(j)).collect(),
             (0..nd).filter(|&j| long(j)).collect(),

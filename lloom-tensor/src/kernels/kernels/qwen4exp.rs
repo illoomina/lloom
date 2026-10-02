@@ -6,7 +6,7 @@
 
 use crate::kernels::utils::{dispatch_groups, dispatch_groups_2d, head_width, EncoderProvider};
 use crate::kernels::{
-    debug_group, set_params, Buffer, BufferOffset, ComputeCommandEncoder, Device, Kernels,
+    debug_group, set_params, Buffer, BufferOffset, ComputeCommandEncoder, DType, Device, Kernels,
     MetalKernelError, Output, Source,
 };
 
@@ -267,17 +267,39 @@ pub fn call_moe_topk(
     Ok(())
 }
 
-/// `silu_mul_f32`: `out = silu(g) · u` over `n` elements.
+/// The `_f32` / `_f16` instantiation of a Qwen4-exp kernel templated on one
+/// float type; any other dtype is refused.
+fn float_kernel(
+    f32_name: &'static str,
+    f16_name: &'static str,
+    dtype: DType,
+) -> Result<&'static str, MetalKernelError> {
+    let other = match dtype {
+        DType::F32 => return Ok(f32_name),
+        DType::F16 => return Ok(f16_name),
+        DType::BF16 => "bf16",
+        DType::I64 => "i64",
+        DType::U32 => "u32",
+        DType::U8 => "u8",
+    };
+    Err(MetalKernelError::UnsupportedDTypeForOp(other, f32_name))
+}
+
+/// `silu_mul_<dtype>`: `out = silu(g) · u` over `n` elements, all three of
+/// `dtype` (f32 or f16).
+#[allow(clippy::too_many_arguments)]
 pub fn call_silu_mul(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
+    dtype: DType,
     n: usize,
     g: BufferOffset,
     u: BufferOffset,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "silu_mul_f32")?;
+    let name = float_kernel("silu_mul_f32", "silu_mul_f16", dtype)?;
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -288,12 +310,14 @@ pub fn call_silu_mul(
     Ok(())
 }
 
-/// `moe_combine_f32`: `out [rows, d] = Σ_k w · y + shared · sigmoid(gate)`.
+/// `moe_combine_<y_dtype>`: `out [rows, d] = Σ_k w · y + shared ·
+/// sigmoid(gate)`, f32 except `y`, which is `y_dtype` (f32 or f16).
 #[allow(clippy::too_many_arguments)]
 pub fn call_moe_combine(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
+    y_dtype: DType,
     rows: usize,
     k: usize,
     d: usize,
@@ -303,7 +327,8 @@ pub fn call_moe_combine(
     gate: BufferOffset,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "moe_combine_f32")?;
+    let name = float_kernel("moe_combine_f32", "moe_combine_f16", y_dtype)?;
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

@@ -98,6 +98,10 @@ pub struct MoeLayer<R: ExpertResidency> {
     /// `F16` the `(f16, f32, f16)` arm (issue #748). The combine over slots
     /// stays f32 either way.
     routed_act: DType,
+    /// Whether an f16 routed step runs its SwiGLU as one launch and its
+    /// combine on the f16 routed output, as the f32 step does
+    /// (`qwen4exp.f16_fuse`); off, `silu` + multiply and a cast to f32.
+    f16_fuse: bool,
 }
 
 impl<R: ExpertResidency> MoeLayer<R> {
@@ -120,6 +124,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
             sh_router,
             n_experts_per_tok: cfg.n_experts_per_tok,
             routed_act: DType::F32,
+            f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
             probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -138,6 +143,12 @@ impl<R: ExpertResidency> MoeLayer<R> {
 
     pub fn routed_act(&self) -> DType {
         self.routed_act
+    }
+
+    /// Select whether the f16 routed step fuses its SwiGLU and its combine's
+    /// read (see the field); the tuning's `qwen4exp.f16_fuse` by default.
+    pub fn set_f16_fuse(&mut self, on: bool) {
+        self.f16_fuse = on;
     }
 
     /// The activation dtype a tile of `rows` rows routes in. The routed
@@ -418,10 +429,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
         let (g, u) = self.experts.gate_up(x3, slot_ids, arm)?;
-        let h = match super::kernels::silu_mul(&g, &u) {
-            Some(h) => h?,
-            None => (ops::silu(&g)? * u)?,
-        };
+        let h = self.routed_swiglu(&g, &u)?;
         self.experts.down(&h, slot_ids, arm)
     }
 
@@ -454,10 +462,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
             let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm)?; // [rows, topk, n_ff] each
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);
-            let h = match super::kernels::silu_mul(&g, &u) {
-                Some(h) => h?,
-                None => (ops::silu(&g)? * u)?,
-            };
+            let h = self.routed_swiglu(&g, &u)?;
             ys.push(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
         }
         if ys.len() == 1 {
@@ -465,6 +470,17 @@ impl<R: ExpertResidency> MoeLayer<R> {
         } else {
             Tensor::cat(&ys, 0)
         }
+    }
+
+    /// `silu(g) · u` over the routed experts' gate|up: one launch at f32,
+    /// and at f16 while `f16_fuse` holds; the composed pair otherwise.
+    fn routed_swiglu(&self, g: &Tensor, u: &Tensor) -> Result<Tensor> {
+        if g.dtype() != DType::F16 || self.f16_fuse {
+            if let Some(h) = super::kernels::silu_mul(g, u) {
+                return h;
+            }
+        }
+        ops::silu(g)? * u
     }
 
     /// The shared expert and the combine over the routed output `y [seq,
@@ -497,10 +513,17 @@ impl<R: ExpertResidency> MoeLayer<R> {
 
         // The routed combine over the top-k plus the gated shared expert: one
         // launch on Metal (`kernels::MoeCombine`), the composed five elsewhere.
-        let y32 = y.to_dtype(DType::F32)?;
-        let out = match super::kernels::moe_combine(&y32, w, shared, sh_logit, topk, hidden) {
+        // The launch reads an f16 routed output as it is, unless `f16_fuse`
+        // is off.
+        let y_in = if y.dtype() == DType::F16 && !self.f16_fuse {
+            y.to_dtype(DType::F32)?
+        } else {
+            y.clone()
+        };
+        let out = match super::kernels::moe_combine(&y_in, w, shared, sh_logit, topk, hidden) {
             Some(o) => o?.to_dtype(x1.dtype())?,
             None => {
+                let y32 = y_in.to_dtype(DType::F32)?;
                 let routed = y32
                     .broadcast_mul(&w.reshape((seq, topk, 1))?)?
                     .sum(1)?

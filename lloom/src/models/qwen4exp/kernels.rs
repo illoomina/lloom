@@ -115,10 +115,29 @@ pub(crate) fn fused_off() -> bool {
 /// A fused op serves a carry-shaped f32 tensor on Metal when it is
 /// contiguous; the composed path takes everything else.
 fn fused_applies(t: &Tensor) -> bool {
+    fused_applies_float(t) && t.dtype() == lloom_tensor::DType::F32
+}
+
+/// [`fused_applies`] for an op instantiated at f32 and f16 (`silu_mul`, the
+/// routed output `moe_combine` reads): either float dtype.
+fn fused_applies_float(t: &Tensor) -> bool {
     !fused_off()
         && t.device().is_metal()
-        && t.dtype() == lloom_tensor::DType::F32
+        && matches!(
+            t.dtype(),
+            lloom_tensor::DType::F32 | lloom_tensor::DType::F16
+        )
         && t.is_contiguous()
+}
+
+/// The kernels' float type of a tensor dtype a `fused_applies_float` op took.
+#[cfg(feature = "metal")]
+fn kernel_float(dt: lloom_tensor::DType) -> Result<lloom_tensor::kernels::DType> {
+    match dt {
+        lloom_tensor::DType::F32 => Ok(lloom_tensor::kernels::DType::F32),
+        lloom_tensor::DType::F16 => Ok(lloom_tensor::kernels::DType::F16),
+        other => lloom_tensor::bail!("qwen4exp fused op: no {other:?} instantiation"),
+    }
 }
 
 /// The grouped RMS norm `x [.., n·d] · rsqrt(mean_d(x²) + eps) · γ[n·d]`.
@@ -840,19 +859,24 @@ impl lloom_tensor::CustomOp2 for SiluMul {
         if l1.shape() != l2.shape() || !l1.is_contiguous() || !l2.is_contiguous() {
             lloom_tensor::bail!("silu_mul: same-shape contiguous inputs only")
         }
+        if s1.dtype() != s2.dtype() {
+            lloom_tensor::bail!("silu_mul: g {:?} and u {:?} differ", s1.dtype(), s2.dtype())
+        }
+        let dtype = kernel_float(s1.dtype())?;
         let device = s1.device();
         let encoder = device.command_encoder()?;
         encoder.set_label("silu_mul");
         let elem_count = l1.shape().elem_count();
         let output = device
             .new_buffer_builder()
-            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_size_for(elem_count, s1.dtype())
             .with_label("silu_mul")
             .build()?;
         lloom_tensor::kernels::call_silu_mul(
             device.metal_device(),
             &encoder,
             device.kernels(),
+            dtype,
             elem_count,
             metal_bo(s1, l1),
             metal_bo(s2, l2),
@@ -925,6 +949,7 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
         if gl.shape().elem_count() != rows || !gl.is_contiguous() {
             lloom_tensor::bail!("moe_combine: gate must be a contiguous [rows]")
         }
+        let y_dtype = kernel_float(s1.dtype())?;
         let device = s1.device();
         let encoder = device.command_encoder()?;
         encoder.set_label("moe_combine");
@@ -938,6 +963,7 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
             device.metal_device(),
             &encoder,
             device.kernels(),
+            y_dtype,
             rows,
             self.k,
             self.d,
@@ -949,7 +975,12 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new(
+                output,
+                device.clone(),
+                elem_count,
+                lloom_tensor::DType::F32,
+            ),
             l3.shape().clone(),
         ))
     }
@@ -996,11 +1027,19 @@ pub(crate) fn moe_topk_into(
     })())
 }
 
+/// `silu(g) · u` as one launch, at f32 or f16 (`g` and `u` of one dtype);
+/// `None` where the composed `silu` and multiply apply.
 pub(crate) fn silu_mul(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
-    (fused_applies(g) && fused_applies(u) && g.shape() == u.shape())
-        .then(|| g.apply_op2_no_bwd(u, &SiluMul))
+    (fused_applies_float(g)
+        && fused_applies_float(u)
+        && g.dtype() == u.dtype()
+        && g.shape() == u.shape())
+    .then(|| g.apply_op2_no_bwd(u, &SiluMul))
 }
 
+/// The routed combine plus the gated shared expert as one launch, into f32:
+/// `y` f32 or f16 (the routed store, read without a cast), the rest f32;
+/// `None` where the composed path applies.
 pub(crate) fn moe_combine(
     y: &Tensor,
     w: &Tensor,
@@ -1009,8 +1048,8 @@ pub(crate) fn moe_combine(
     k: usize,
     d: usize,
 ) -> Option<Result<Tensor>> {
-    (fused_applies(y) && fused_applies(w) && fused_applies(shared) && fused_applies(gate)).then(
-        || {
+    (fused_applies_float(y) && fused_applies(w) && fused_applies(shared) && fused_applies(gate))
+        .then(|| {
             y.apply_op3_no_bwd(
                 w,
                 shared,
@@ -1020,8 +1059,7 @@ pub(crate) fn moe_combine(
                     gate: gate.clone(),
                 },
             )
-        },
-    )
+        })
 }
 
 #[cfg(all(test, feature = "metal"))]
@@ -1202,6 +1240,99 @@ mod tests {
         let composed =
             (routed + shared.broadcast_mul(&ops::sigmoid(&gate).unwrap()).unwrap()).unwrap();
         close("moe_combine", &fused, &composed, 1e-5);
+    }
+
+    fn bits16(t: &Tensor) -> Vec<u16> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<half::f16>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    fn bits32(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// The f16 SwiGLU in one launch is `silu_f16` then `bmul_f16` bit for
+    /// bit — the two launches the f16 routed step ran — over every finite
+    /// f16 and both infinities as `g`, each against several `u`.
+    #[test]
+    fn silu_mul_f16_is_silu_then_mul_bit_for_bit() {
+        let dev = Device::new_metal(0).unwrap();
+        let gs: Vec<half::f16> = (0..=u16::MAX)
+            .map(half::f16::from_bits)
+            .filter(|v| !v.is_nan())
+            .collect();
+        let us = [1.0f32, -0.75, 3.1e-2, 6.5e4, 1.0e-5, -2.4];
+        let n = gs.len() * us.len();
+        let g: Vec<half::f16> = (0..n).map(|i| gs[i % gs.len()]).collect();
+        let u: Vec<half::f16> = (0..n)
+            .map(|i| half::f16::from_f32(us[i / gs.len()]))
+            .collect();
+        let g = Tensor::from_vec(g, (us.len(), gs.len()), &dev).unwrap();
+        let u = Tensor::from_vec(u, (us.len(), gs.len()), &dev).unwrap();
+        let fused = silu_mul(&g, &u).expect("metal f16").unwrap();
+        assert_eq!(fused.dtype(), lloom_tensor::DType::F16);
+        let composed = (ops::silu(&g).unwrap() * &u).unwrap();
+        let (a, b) = (bits16(&fused), bits16(&composed));
+        let differ: Vec<usize> = (0..n).filter(|&i| a[i] != b[i]).collect();
+        assert!(
+            differ.is_empty(),
+            "silu_mul_f16 differs from silu_f16 · bmul_f16 at {} of {n}, first at g={:?} u={:?}: {:#06x} vs {:#06x}",
+            differ.len(),
+            gs[differ[0] % gs.len()],
+            us[differ[0] / gs.len()],
+            a[differ[0]],
+            b[differ[0]]
+        );
+        // The real step's shape, `[rows, topk, n_ff]`, through the same check.
+        let g = Tensor::from_vec(vals(10 * 640, 1.0, 6.0), (1, 10, 640), &dev)
+            .unwrap()
+            .to_dtype(lloom_tensor::DType::F16)
+            .unwrap();
+        let u = Tensor::from_vec(vals(10 * 640, 2.0, 1.5), (1, 10, 640), &dev)
+            .unwrap()
+            .to_dtype(lloom_tensor::DType::F16)
+            .unwrap();
+        let fused = silu_mul(&g, &u).expect("metal f16").unwrap();
+        let composed = (ops::silu(&g).unwrap() * &u).unwrap();
+        assert_eq!(bits16(&fused), bits16(&composed));
+        assert!(silu_mul(&g, &u.to_dtype(lloom_tensor::DType::F32).unwrap()).is_none());
+    }
+
+    /// The combine reading an f16 routed output is the combine of that output
+    /// cast to f32 bit for bit (the cast launch it replaces), its own output
+    /// f32.
+    #[test]
+    fn moe_combine_reads_an_f16_y_as_its_f32_cast() {
+        let dev = Device::new_metal(0).unwrap();
+        let (rows, k, d) = (3usize, 10usize, 2560usize);
+        let y16 = Tensor::from_vec(vals(rows * k * d, 3.0, 40.0), (rows, k, d), &dev)
+            .unwrap()
+            .to_dtype(lloom_tensor::DType::F16)
+            .unwrap();
+        let y32 = y16.to_dtype(lloom_tensor::DType::F32).unwrap();
+        let w = Tensor::from_vec(vals(rows * k, 4.0, 0.3), (rows, k), &dev).unwrap();
+        let shared = Tensor::from_vec(vals(rows * d, 5.0, 0.8), (rows, d), &dev).unwrap();
+        let gate = Tensor::from_vec(vals(rows, 6.0, 2.0), (rows, 1), &dev).unwrap();
+        let from16 = moe_combine(&y16, &w, &shared, &gate, k, d)
+            .expect("metal f16 y")
+            .unwrap();
+        assert_eq!(from16.dtype(), lloom_tensor::DType::F32);
+        let from32 = moe_combine(&y32, &w, &shared, &gate, k, d)
+            .expect("metal f32 y")
+            .unwrap();
+        assert_eq!(bits32(&from16), bits32(&from32));
+        assert!(bits32(&from32).iter().any(|&b| b != 0));
     }
 
     /// The Step-0 trap "the DeltaNet output gate is SIGMOID, not silu", pinned

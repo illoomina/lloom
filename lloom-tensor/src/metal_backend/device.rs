@@ -265,6 +265,12 @@ pub struct MetalDevice {
     /// Residency set registered on the command queue.
     pub(crate) residency_set: Arc<ResidencySet>,
 
+    /// The memory ledger (`ledger.rs`): every persistent allocation's bytes
+    /// under a reservation, the tenants' claims, the quota the binary sets.
+    pub(crate) ledger: Arc<crate::kernels::metal::ledger::Ledger>,
+    /// The installed arena's base, on the ledger for the arena's life.
+    pub(crate) arena_reservation: Arc<Mutex<Option<crate::kernels::metal::ledger::Reservation>>>,
+
     /// The activation arena, when one is installed.
     ///
     /// `None` is the default and is the classical path: every allocation goes
@@ -372,6 +378,8 @@ pub struct PassPlans {
     /// base grow (an `Arena` holds views of the base it was built on).
     arenas: HashMap<PassKey, Arena>,
     base: Option<Buffer>,
+    /// The base's bytes on the ledger, replaced with the base.
+    base_reservation: Option<crate::kernels::metal::ledger::Reservation>,
     base_generation: u64,
     arena_generation: HashMap<PassKey, u64>,
     /// A key recorded on its first sight, whose plan awaits the next pass.
@@ -528,6 +536,7 @@ impl PassPlans {
             plans: HashMap::new(),
             arenas: HashMap::new(),
             base: None,
+            base_reservation: None,
             base_generation: 0,
             arena_generation: HashMap::new(),
             pending: None,
@@ -1370,6 +1379,12 @@ impl MetalDevice {
         self.commands.clock()
     }
 
+    /// The memory ledger: committed bytes beside `currentAllocatedSize`, the
+    /// tenants' claims, the quota (`profiles-and-memory-design.md` §4.2).
+    pub fn ledger(&self) -> &Arc<crate::kernels::metal::ledger::Ledger> {
+        &self.ledger
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }
@@ -1529,6 +1544,7 @@ impl MetalDevice {
             .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&base);
+        *self.arena_reservation.lock() = Some(self.ledger.reserve(bytes));
         let arena = Arena::new(base, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         {
@@ -1653,6 +1669,7 @@ impl MetalDevice {
             self.residency_set.remove(arena.base());
         }
         *slot = None;
+        *self.arena_reservation.lock() = None;
         drop(slot);
         if !self.pass_plans_enabled()
             && self.arena_recorder.lock().is_none()
@@ -2232,6 +2249,7 @@ impl MetalDevice {
                 self.residency_set.remove(&previous);
             }
             pp.base = Some(base);
+            pp.base_reservation = Some(self.ledger.reserve(needed));
             pp.base_generation += 1;
             pp.arenas.clear();
             pp.counters.base_grows += 1;
@@ -2644,11 +2662,10 @@ impl MetalDevice {
             .new_buffer(size.max(1), RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+            .reserved(self.ledger.reserve(size)),
+        ))
     }
 
     /// A Private buffer of `size` bytes that lives as long as its handle —
@@ -2670,11 +2687,10 @@ impl MetalDevice {
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
         // not. Pin them.
         wire_pages(buffer.contents(), size);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+            .reserved(self.ledger.reserve(size)),
+        ))
     }
 
     pub fn new_persistent_private(&self, size: usize) -> Result<BufferHandle> {
@@ -2683,11 +2699,10 @@ impl MetalDevice {
             .new_buffer(size.max(1), PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+        PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
+            .reserved(self.ledger.reserve(size)),
+        ))
     }
 
     /// Pin a Shared buffer's pages (`mlock`) so the kernel cannot compress
@@ -2759,11 +2774,10 @@ impl MetalDevice {
         // And it leaves the residency set on drop: the set retains what it
         // holds, so an unpooled upload that stayed in it was never freed at
         // all — neither these staging buffers nor a per-round `Tensor::new`.
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            new_buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+        PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
+            .reserved(self.ledger.reserve(size)),
+        ))
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<BufferHandle> {

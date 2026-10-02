@@ -920,7 +920,8 @@ impl Qwen4Exp<Streamed> {
         // A fixed count is admitted like any load; `Auto` sized itself to
         // the budget and passes by construction (or sits at the pool's
         // `topk + 1` floor, which is then refused with the arithmetic).
-        admit_load(&plan_load(&gg, device, opts.fraction(), Some(slots)))?;
+        let plan = plan_load(&gg, device, opts.fraction(), Some(slots));
+        admit_load(&plan)?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -965,7 +966,7 @@ impl Qwen4Exp<Streamed> {
             }
             _ => None,
         };
-        build(&mut gg, device, opts, |gg, l| {
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             let src = |gg: &Gguf<'_, File>, name: String| -> Result<ExpertSource> {
                 let (content, path) = gg.locate(&name)?;
@@ -992,7 +993,15 @@ impl Qwen4Exp<Streamed> {
                 tier.set_io_hints(stream.io_hints);
             }
             Ok(tier)
-        })
+        })?;
+        model.register_expert_ledger(
+            device,
+            plan.expert_bytes_per_slot,
+            slots,
+            cfg0.n_experts,
+            cfg0.n_experts_per_tok,
+        );
+        Ok(model)
     }
 }
 

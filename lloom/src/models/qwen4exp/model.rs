@@ -983,6 +983,10 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// fraction of `recommendedMaxWorkingSetSize` a pass may take the
     /// process to, and whether a pass over it is refused or reported.
     memory_fraction: f64,
+    /// The expert tier's row on the device's ledger (`ledger.rs`), set by
+    /// the streamed loader; dropped with the model.
+    #[cfg(feature = "metal")]
+    ledger_gauge: Option<std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1118,6 +1122,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             device_plan,
             hint_recall: parking_lot::Mutex::new([(0, 0); 4]),
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
+            #[cfg(feature = "metal")]
+            ledger_gauge: None,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
@@ -1280,6 +1286,38 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// memory_fraction`) by default. 0 turns the per-pass check off.
     pub fn set_memory_fraction(&mut self, fraction: f64) {
         self.memory_fraction = fraction.max(0.0);
+    }
+
+    /// Register the expert tier on the device's ledger as a cache tenant:
+    /// `topk + 1` slots as its floor, every expert resident as its want, one
+    /// slot as its unit, the pool's slots as what it holds (§4.2, §4.8).
+    pub fn register_expert_ledger(
+        &mut self,
+        device: &lloom_tensor::Device,
+        bytes_per_slot: usize,
+        slots: usize,
+        n_experts: usize,
+        topk: usize,
+    ) {
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = device {
+            use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+            let gauge = Gauge::new(
+                "qwen4exp-experts",
+                Claim {
+                    floor: (topk + 1) * bytes_per_slot,
+                    want: n_experts * bytes_per_slot,
+                    unit: bytes_per_slot,
+                    class: Class::Cache,
+                },
+                slots * bytes_per_slot,
+            );
+            let tenant: std::sync::Arc<dyn Tenant> = gauge.clone();
+            m.ledger().register(&tenant);
+            self.ledger_gauge = Some(gauge);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = (device, bytes_per_slot, slots, n_experts, topk);
     }
 
     pub fn memory_fraction(&self) -> f64 {

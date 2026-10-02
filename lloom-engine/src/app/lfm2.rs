@@ -578,6 +578,13 @@ impl Engine {
             }
             config.memory_budget = Some(budget);
         }
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            // The ledger's quota: the same fraction of the working set the
+            // admission and the KV grow read against (§9.5c).
+            let ws = m.device().recommended_max_working_set_size() as f64;
+            m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+        }
 
         let files = weight_files(&model_dir)?;
         // SAFETY: the checkpoint is not modified while mapped
@@ -1986,6 +1993,9 @@ impl Engine {
                 kv.grows,
                 mib(kv.bytes)
             ));
+        }
+        if let Some(line) = lloom::nn::memory::ledger_line(&self.core.device) {
+            out.push(line);
         }
         out
     }

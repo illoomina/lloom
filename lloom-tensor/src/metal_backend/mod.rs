@@ -3066,18 +3066,21 @@ impl BackendDevice for MetalDevice {
         // the only thing that advances it.
         let buffers = BufferPool::with_clock(commands.clock());
         let private_buffers = BufferPool::with_clock(commands.clock());
+        let ledger = crate::kernels::metal::ledger::Ledger::new();
         let transient_heaps = Arc::new((
             HeapChunks::new(
                 &device,
                 Arc::clone(&residency_set),
                 RESOURCE_OPTIONS,
                 heap_chunk_bytes(),
+                Some(Arc::clone(&ledger)),
             ),
             HeapChunks::new(
                 &device,
                 Arc::clone(&residency_set),
                 PRIVATE_RESOURCE_OPTIONS,
                 heap_chunk_bytes(),
+                Some(Arc::clone(&ledger)),
             ),
         ));
         // The pools do not subscribe to command-buffer completion. The handler
@@ -3127,6 +3130,8 @@ impl BackendDevice for MetalDevice {
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
             residency_set,
+            ledger,
+            arena_reservation: Arc::new(parking_lot::Mutex::new(None)),
             // No arena until one is installed: the classical path is the
             // default, and the cost of the seam is one `Option` test per
             // allocation (`DESIGN.md` §9.2a, §11.1).
@@ -3853,6 +3858,7 @@ mod issue_336_to_cpu {
             m.residency_set_handle(),
             super::PRIVATE_RESOURCE_OPTIONS,
             1 << 20,
+            None,
         );
         let first = heaps.alloc(128).unwrap();
         let placed = heaps.alloc(128).unwrap();

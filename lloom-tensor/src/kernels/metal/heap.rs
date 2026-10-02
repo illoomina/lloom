@@ -75,6 +75,9 @@ struct Chunk {
     size: usize,
     free: Vec<(usize, usize)>,
     used: usize,
+    /// The chunk's bytes on the ledger, for its life.
+    #[allow(dead_code)]
+    reservation: Option<super::ledger::Reservation>,
 }
 
 impl Chunk {
@@ -156,6 +159,8 @@ struct State {
 pub struct HeapChunks {
     device: super::Device,
     residency_set: Arc<ResidencySet>,
+    /// Where a chunk's bytes are committed (`None` in a bare test).
+    ledger: Option<Arc<super::ledger::Ledger>>,
     options: MTLResourceOptions,
     storage: MTLStorageMode,
     chunk_bytes: usize,
@@ -185,12 +190,14 @@ impl HeapChunks {
         residency_set: Arc<ResidencySet>,
         options: MTLResourceOptions,
         chunk_bytes: usize,
+        ledger: Option<Arc<super::ledger::Ledger>>,
     ) -> Self {
         // The storage mode is bits 4..8 of the resource options.
         let storage = MTLStorageMode((options.0 >> 4) & 0xF);
         Self {
             device: device.clone(),
             residency_set,
+            ledger,
             options,
             storage,
             chunk_bytes: chunk_bytes.max(1 << 20),
@@ -252,11 +259,13 @@ impl HeapChunks {
                     Retained::as_ptr(&heap) as usize,
                 );
                 let size_actual = heap.size();
+                let reservation = self.ledger.as_ref().map(|l| l.reserve(size_actual));
                 st.chunks.push(Chunk {
                     heap,
                     size: size_actual,
                     free: vec![(0, size_actual)],
                     used: 0,
+                    reservation,
                 });
                 let i = st.chunks.len() - 1;
                 let off = st.chunks[i].take(size, align).ok_or_else(|| {

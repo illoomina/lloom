@@ -3138,6 +3138,11 @@ pub struct Cache {
     /// The grow granularity in tokens — [`DEFAULT_KV_BUCKET`] unless
     /// [`Cache::with_kv_bucket`] said otherwise.
     kv_bucket: usize,
+    /// This cache's row on the device's ledger (`ledger.rs`): the slab as
+    /// its floor, the ceiling as its want, a bucket as its unit, the KV
+    /// bytes held. Dropped with the cache; a clone shares it.
+    #[cfg(feature = "metal")]
+    ledger: Option<Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
     /// Tokens the slab (or the pool, per sequence) is sized for now. Every
     /// slot, plane and pool is at this width; only `prepare_pass` moves it.
     kv_slab: usize,
@@ -3642,6 +3647,26 @@ impl Cache {
         } else {
             None
         };
+        #[cfg(feature = "metal")]
+        let ledger = match device {
+            Device::Metal(m) if use_kv_cache => {
+                use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+                let gauge = Gauge::new(
+                    "lfm2-kv",
+                    Claim {
+                        floor: slab * kv_bytes_per_token,
+                        want: kv_capacity * kv_bytes_per_token,
+                        unit: DEFAULT_KV_BUCKET.min(kv_capacity) * kv_bytes_per_token,
+                        class: Class::Capability,
+                    },
+                    0,
+                );
+                let tenant: Arc<dyn Tenant> = gauge.clone();
+                m.ledger().register(&tenant);
+                Some(gauge)
+            }
+            _ => None,
+        };
         Ok(Self {
             masks: HashMap::new(),
             use_kv_cache,
@@ -3666,6 +3691,8 @@ impl Cache {
             kv_quant: config.kv_quant,
             kv_capacity,
             kv_bucket: DEFAULT_KV_BUCKET,
+            #[cfg(feature = "metal")]
+            ledger,
             kv_slab: slab,
             kv_grows: 0,
             kv_grow_fraction,
@@ -4405,6 +4432,7 @@ impl Cache {
         }
         self.kv_slab = slab;
         self.kv_grows += 1;
+        self.ledger_note();
         Ok(())
     }
 
@@ -4434,6 +4462,23 @@ impl Cache {
             slab = b.pool.inner.lock().kv.slab;
         }
         self.kv_slab = slab;
+        self.ledger_note();
+    }
+
+    /// Tell the ledger what this cache holds and needs now: the planes' bytes
+    /// as held, the slab's as the floor. At a grow and a clear, never per token.
+    fn ledger_note(&self) {
+        #[cfg(feature = "metal")]
+        if let Some(g) = &self.ledger {
+            use lloom_tensor::kernels::metal::ledger::{Claim, Class};
+            g.set_held(self.kv_report().bytes);
+            g.set_claim(Claim {
+                floor: self.kv_slab * self.kv_bytes_per_token,
+                want: self.kv_capacity * self.kv_bytes_per_token,
+                unit: self.kv_bucket.min(self.kv_capacity) * self.kv_bytes_per_token,
+                class: Class::Capability,
+            });
+        }
     }
 
     /// Bytes widening the slab to `slab` tokens will allocate, read from an

@@ -262,6 +262,11 @@ pub struct PooledBuffer {
     /// `Weak` so a leaked buffer cannot keep the whole device alive, and so a
     /// buffer outliving its pool drops cleanly instead of resurrecting it.
     pool: Weak<PoolInner>,
+
+    /// The ledger's record of an unpooled buffer's bytes, released with it
+    /// (`ledger.rs`). `None` for a pooled buffer: the pool's bytes are the
+    /// occupancy snapshot's, elastic, not committed.
+    reservation: Option<super::ledger::Reservation>,
 }
 
 impl PooledBuffer {
@@ -276,6 +281,7 @@ impl PooledBuffer {
             size,
             pool: Weak::new(),
             residency: None,
+            reservation: None,
         }
     }
 
@@ -291,7 +297,14 @@ impl PooledBuffer {
             size,
             pool: Weak::new(),
             residency: Some(residency),
+            reservation: None,
         }
+    }
+
+    /// The same buffer, its bytes committed on the ledger until it drops.
+    pub fn reserved(mut self, reservation: super::ledger::Reservation) -> Self {
+        self.reservation = Some(reservation);
+        self
     }
 
     pub fn size(&self) -> usize {
@@ -594,6 +607,7 @@ impl FreeNode {
             buffer: Some(buffer),
             size,
             residency: None,
+            reservation: None,
             pool,
         });
         let node = handle.node;
@@ -2215,6 +2229,7 @@ impl BufferPool {
             size,
             pool: Arc::downgrade(&self.inner),
             residency: None,
+            reservation: None,
         })
     }
 

@@ -27,6 +27,10 @@ pub struct MemSnapshot {
     pub pool_pending: u64,
     pub phys_footprint: u64,
     pub working_set: u64,
+    /// The ledger's quota and committed bytes (`ledger.rs`): what the
+    /// process holds under reservations, beside what the device reports.
+    pub ledger_quota: u64,
+    pub ledger_committed: u64,
 }
 
 impl MemSnapshot {
@@ -41,6 +45,8 @@ impl MemSnapshot {
                 pool_pending: (shared.pending_bytes + private.pending_bytes) as u64,
                 phys_footprint: proc_footprint().map(|(p, _)| p).unwrap_or(0),
                 working_set: m.device().recommended_max_working_set_size() as u64,
+                ledger_quota: m.ledger().quota() as u64,
+                ledger_committed: m.ledger().committed() as u64,
             };
         }
         let _ = device;
@@ -55,6 +61,8 @@ impl MemSnapshot {
             "pool_pending_bytes": self.pool_pending,
             "phys_footprint_bytes": self.phys_footprint,
             "recommended_max_working_set_bytes": self.working_set,
+            "ledger_quota_bytes": self.ledger_quota,
+            "ledger_committed_bytes": self.ledger_committed,
         })
     }
 }
@@ -99,14 +107,34 @@ impl MemReport {
                 self.samples
             ),
             None => format!(
-                "mem: device {:.2} -> {:.2} GB, phys {:.2} -> {:.2} GB",
+                "mem: device {:.2} -> {:.2} GB, phys {:.2} -> {:.2} GB, ledger committed {:.2} -> {:.2} GB of quota {:.2} GB",
                 gb(self.before.device_allocated),
                 gb(self.after.device_allocated),
                 gb(self.before.phys_footprint),
-                gb(self.after.phys_footprint)
+                gb(self.after.phys_footprint),
+                gb(self.before.ledger_committed),
+                gb(self.after.ledger_committed),
+                gb(self.after.ledger_quota)
             ),
         }
     }
+}
+
+/// The ledger's line for a report: the quota, the committed bytes and every
+/// tenant's claim and holding, beside the device's own figure. `None` off
+/// Metal.
+pub fn ledger_line(device: &Device) -> Option<String> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        let gb = |b: usize| b as f64 / 1e9;
+        return Some(format!(
+            "[ledger: {} device_allocated={:.2} GB]",
+            m.ledger().snapshot().line(),
+            gb(m.device().current_allocated_size())
+        ));
+    }
+    let _ = device;
+    None
 }
 
 /// The 10 ms sampler's stop flag and thread, joined for `(peak, samples)`.
@@ -137,6 +165,8 @@ impl MemGauge {
                     peak.pool_pending = peak.pool_pending.max(s.pool_pending);
                     peak.phys_footprint = peak.phys_footprint.max(s.phys_footprint);
                     peak.working_set = s.working_set;
+                    peak.ledger_quota = s.ledger_quota;
+                    peak.ledger_committed = peak.ledger_committed.max(s.ledger_committed);
                     samples += 1;
                     if flag.load(Ordering::Acquire) {
                         break;

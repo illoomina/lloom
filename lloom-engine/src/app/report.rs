@@ -850,6 +850,11 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
         clock.current_epoch(),
         clock.completed_count()
     );
+    eprintln!(
+        "[ledger: {} device_allocated={:.2} GB]",
+        m.ledger().snapshot().line(),
+        m.device().current_allocated_size() as f64 / 1e9
+    );
 }
 
 /// The dispatch recorder's view of the run (`CANDLE_METAL_PROFILE=1`): GPU

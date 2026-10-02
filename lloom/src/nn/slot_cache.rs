@@ -496,6 +496,11 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         self.policy.plan_epoch = self.policy.plan_epoch.max(epoch);
     }
 
+    /// The epoch of the last device plan ([`Self::plan_read_all`]).
+    pub fn plan_epoch(&self) -> Epoch {
+        self.policy.plan_epoch
+    }
+
     pub fn inflight(&self, slot: SlotId) -> u64 {
         self.policy.inflight[slot.index()]
     }

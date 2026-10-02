@@ -3088,6 +3088,7 @@ impl BackendDevice for MetalDevice {
                     Arc::clone(&residency_set),
                     options,
                     Commit::Deferred,
+                    Some(Arc::clone(&ledger)),
                 ))
             }
         };
@@ -3099,18 +3100,21 @@ impl BackendDevice for MetalDevice {
                 Arc::clone(&residency_set),
                 RESOURCE_OPTIONS,
                 Commit::Now,
+                Some(Arc::clone(&ledger)),
             ),
             resident_private: DeviceBuffer::new(
                 &device,
                 Arc::clone(&residency_set),
                 PRIVATE_RESOURCE_OPTIONS,
                 Commit::Now,
+                Some(Arc::clone(&ledger)),
             ),
             mapped_shared: Mapped::new(
                 &device,
                 Arc::clone(&residency_set),
                 RESOURCE_OPTIONS,
                 Commit::Now,
+                Some(Arc::clone(&ledger)),
             ),
         });
         // The pools do not subscribe to command-buffer completion. The handler
@@ -3916,7 +3920,9 @@ mod issue_336_to_cpu {
     /// its second, reclaiming through whichever placed the buffer.
     #[test]
     fn a_backing_reclaims_what_it_placed_and_a_fallback_serves_from_the_first_that_can() {
-        use crate::kernels::metal::{Backing, Buffer, Commit, DeviceBuffer, Fallback, HeapChunks};
+        use crate::kernels::metal::{
+            Allocation, Backing, Buffer, Commit, DeviceBuffer, Fallback, HeapChunks,
+        };
         let Some(dev) = metal() else { return };
         let Device::Metal(m) = &dev else {
             unreachable!()
@@ -3933,9 +3939,30 @@ mod issue_336_to_cpu {
             m.residency_set_handle(),
             super::PRIVATE_RESOURCE_OPTIONS,
             Commit::Now,
+            Some(std::sync::Arc::clone(m.ledger())),
         );
+        let before = m.ledger().committed();
         let sub = Backing::alloc(&heap, 4096).unwrap();
+        assert!(
+            sub.reservation.is_none(),
+            "a heap sub-buffer carries no reservation"
+        );
+        let sub = sub.buffer;
         let whole = device.alloc(4096).unwrap();
+        assert_eq!(
+            m.ledger().committed(),
+            before + 4096,
+            "a whole buffer is committed for its life"
+        );
+        let whole = {
+            let Allocation {
+                buffer,
+                reservation,
+            } = whole;
+            drop(reservation);
+            assert_eq!(m.ledger().committed(), before);
+            buffer
+        };
         assert_eq!(Backing::stats(&heap).live, 1);
         assert!(!heap.reclaim(&whole), "a heap reclaims only its own ranges");
         assert!(
@@ -3951,7 +3978,7 @@ mod issue_336_to_cpu {
         #[derive(Debug)]
         struct Refusing;
         impl Backing for Refusing {
-            fn alloc(&self, bytes: usize) -> Result<Buffer, crate::kernels::MetalKernelError> {
+            fn alloc(&self, bytes: usize) -> Result<Allocation, crate::kernels::MetalKernelError> {
                 Err(crate::kernels::MetalKernelError::FailedToCreateResource(
                     format!("refused {bytes}"),
                 ))
@@ -3973,7 +4000,7 @@ mod issue_336_to_cpu {
                 None,
             ),
         };
-        let b = fb.alloc(512).unwrap();
+        let b = fb.alloc(512).unwrap().buffer;
         assert_eq!(fb.stats().live, 1, "served by the second backing");
         assert!(
             fb.reclaim(&b),
@@ -3990,7 +4017,7 @@ mod issue_336_to_cpu {
             ),
             then: Refusing,
         };
-        let b = fb2.alloc(512).unwrap();
+        let b = fb2.alloc(512).unwrap().buffer;
         assert_eq!(fb2.first.stats().live, 1, "served by the first backing");
         assert!(fb2.reclaim(&b));
         assert!(

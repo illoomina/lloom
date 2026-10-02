@@ -20,11 +20,21 @@
 //!
 //! What stays the holder's: the residency *removal* of a whole-buffer
 //! allocation (`remove` now, `remove_deferred`, or `retire_batch` — the
-//! cadence #166 measured, chosen per site), and the ledger reservation. A
-//! backing hands out resident bytes; it does not decide when the set
-//! forgets them.
+//! cadence #166 measured, chosen per site). A backing hands out resident
+//! bytes; it does not decide when the set forgets them.
+//!
+//! **The ledger (§4.2) sees every byte here.** A whole-buffer backing with a
+//! ledger takes a [`Reservation`] for each buffer it hands out and returns it
+//! with the buffer ([`Allocation`]); the holder keeps it for the buffer's
+//! life — a pool keeps it on the buffer's node through every free / acquire
+//! cycle and drops it when the node is destroyed — so the ledger's
+//! `committed` is what the process holds through its backings, pools' free
+//! and pending lists included, and a pass admission is arithmetic on it
+//! rather than a read of `currentAllocatedSize`. A heap's chunks reserve at
+//! chunk granularity ([`HeapChunks::new`]); its sub-buffers carry none.
 
 use super::heap::{HeapChunks, HeapStats};
+use super::ledger::{Ledger, Reservation};
 use super::{Buffer, Device, ResidencySet};
 use crate::kernels::MetalKernelError;
 use objc2_metal::MTLResourceOptions;
@@ -34,10 +44,27 @@ use std::sync::Arc;
 /// reports zeros: nothing is sub-allocated).
 pub type BackingStats = HeapStats;
 
+/// A buffer and, when the backing reserves per buffer, its reservation.
+#[derive(Debug)]
+pub struct Allocation {
+    pub buffer: Buffer,
+    pub reservation: Option<Reservation>,
+}
+
+/// A bare buffer, reserved by nobody (a test's, a probe's).
+impl From<Buffer> for Allocation {
+    fn from(buffer: Buffer) -> Self {
+        Self {
+            buffer,
+            reservation: None,
+        }
+    }
+}
+
 /// Where bytes come from.
 pub trait Backing: Send + Sync + std::fmt::Debug {
     /// `bytes` resident bytes of this backing's storage mode.
-    fn alloc(&self, bytes: usize) -> Result<Buffer, MetalKernelError>;
+    fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError>;
     /// Take `buffer`'s range back, if it is this backing's sub-allocation;
     /// `false` for a buffer that is not (or is a whole allocation, which
     /// frees when its last handle drops — its residency entry is the
@@ -71,6 +98,8 @@ pub struct DeviceBuffer {
     residency: Arc<ResidencySet>,
     options: MTLResourceOptions,
     commit: Commit,
+    /// Where each buffer's bytes are committed (`None` in a bare test).
+    ledger: Option<Arc<Ledger>>,
 }
 
 impl DeviceBuffer {
@@ -79,12 +108,14 @@ impl DeviceBuffer {
         residency: Arc<ResidencySet>,
         options: MTLResourceOptions,
         commit: Commit,
+        ledger: Option<Arc<Ledger>>,
     ) -> Self {
         Self {
             device: device.clone(),
             residency,
             options,
             commit,
+            ledger,
         }
     }
 }
@@ -99,13 +130,17 @@ impl std::fmt::Debug for DeviceBuffer {
 }
 
 impl Backing for DeviceBuffer {
-    fn alloc(&self, bytes: usize) -> Result<Buffer, MetalKernelError> {
+    fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let buffer = self.device.new_buffer(bytes.max(1), self.options)?;
         match self.commit {
             Commit::Deferred => self.residency.add(&buffer),
             Commit::Now => self.residency.insert(&buffer),
         };
-        Ok(buffer)
+        let reservation = self.ledger.as_ref().map(|l| l.reserve(bytes.max(1)));
+        Ok(Allocation {
+            buffer,
+            reservation,
+        })
     }
 
     fn reclaim(&self, _buffer: &Buffer) -> bool {
@@ -121,8 +156,12 @@ impl Backing for DeviceBuffer {
 pub type Heap = HeapChunks;
 
 impl Backing for HeapChunks {
-    fn alloc(&self, bytes: usize) -> Result<Buffer, MetalKernelError> {
-        HeapChunks::alloc(self, bytes)
+    /// The chunk holds the reservation; the sub-buffer carries none.
+    fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
+        Ok(Allocation {
+            buffer: HeapChunks::alloc(self, bytes)?,
+            reservation: None,
+        })
     }
 
     fn reclaim(&self, buffer: &Buffer) -> bool {
@@ -147,9 +186,10 @@ impl Mapped {
         residency: Arc<ResidencySet>,
         options: MTLResourceOptions,
         commit: Commit,
+        ledger: Option<Arc<Ledger>>,
     ) -> Self {
         Self {
-            inner: DeviceBuffer::new(device, residency, options, commit),
+            inner: DeviceBuffer::new(device, residency, options, commit, ledger),
         }
     }
 }
@@ -163,10 +203,10 @@ impl std::fmt::Debug for Mapped {
 }
 
 impl Backing for Mapped {
-    fn alloc(&self, bytes: usize) -> Result<Buffer, MetalKernelError> {
-        let buffer = self.inner.alloc(bytes)?;
-        wire_pages(buffer.contents(), bytes);
-        Ok(buffer)
+    fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
+        let a = self.inner.alloc(bytes)?;
+        wire_pages(a.buffer.contents(), bytes);
+        Ok(a)
     }
 
     fn reclaim(&self, buffer: &Buffer) -> bool {
@@ -186,7 +226,7 @@ pub struct Fallback<A, B> {
 }
 
 impl<A: Backing, B: Backing> Backing for Fallback<A, B> {
-    fn alloc(&self, bytes: usize) -> Result<Buffer, MetalKernelError> {
+    fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         match self.first.alloc(bytes) {
             Ok(b) => Ok(b),
             Err(_) => self.then.alloc(bytes),

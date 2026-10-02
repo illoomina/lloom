@@ -744,6 +744,11 @@ impl ResidencyMap {
         self.cache.plan_read_all(epoch)
     }
 
+    /// The epoch of the last device plan.
+    fn plan_epoch(&self) -> Epoch {
+        self.cache.plan_epoch()
+    }
+
     fn install(&mut self, slot: usize, e: usize) {
         self.cache.install(SlotId(slot as u32), ExpertId(e as u32))
     }
@@ -839,6 +844,16 @@ pub struct StreamCounters {
     pub inplace_takes: AtomicU64,
     pub quarantined: AtomicU64,
     pub recycled: AtomicU64,
+    /// H1 (`profiles-and-memory-design.md` §4.7): routed kernels of a
+    /// device-planned pass encoded in a later command buffer than the plan's
+    /// — the slots' reader epoch moved up to the kernel's.
+    pub h1_restamps: AtomicU64,
+    /// H2: a load on the in-place arm that would have evicted a resident
+    /// slot while a device plan was open, refused.
+    pub h2_refusals: AtomicU64,
+    /// H3: live-table writes deferred while a device plan was open,
+    /// published at its settle.
+    pub h3_deferred_writes: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -884,6 +899,9 @@ pub struct StreamStats {
     pub inplace_takes: u64,
     pub quarantined: u64,
     pub recycled: u64,
+    pub h1_restamps: u64,
+    pub h2_refusals: u64,
+    pub h3_deferred_writes: u64,
 }
 
 impl StreamCounters {
@@ -915,6 +933,9 @@ impl StreamCounters {
             inplace_takes: self.inplace_takes.load(Ordering::Relaxed),
             quarantined: self.quarantined.load(Ordering::Relaxed),
             recycled: self.recycled.load(Ordering::Relaxed),
+            h1_restamps: self.h1_restamps.load(Ordering::Relaxed),
+            h2_refusals: self.h2_refusals.load(Ordering::Relaxed),
+            h3_deferred_writes: self.h3_deferred_writes.load(Ordering::Relaxed),
         }
     }
 }
@@ -941,6 +962,9 @@ impl std::ops::AddAssign for StreamStats {
         self.inplace_takes += o.inplace_takes;
         self.quarantined += o.quarantined;
         self.recycled += o.recycled;
+        self.h1_restamps += o.h1_restamps;
+        self.h2_refusals += o.h2_refusals;
+        self.h3_deferred_writes += o.h3_deferred_writes;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -1031,6 +1055,10 @@ struct Inner {
     /// the device-side plan; rebuilt after a settle that loaded.
     table: Option<Tensor>,
     table_stale: bool,
+    /// H3: live-table writes made while a device plan was open, published
+    /// when the last one settles — a plan in flight reads the table it was
+    /// built on.
+    live_pending: Vec<(u32, u32)>,
     /// The `pread` arm's staging ring on Metal (reused once its copy's
     /// command buffer completes; never a pool bucket, never a wait) — one
     /// ring shared by every layer of the tier when built by the loader.
@@ -1280,9 +1308,36 @@ impl Inner {
     /// live, else by marking it for a rebuild.
     fn table_set(&mut self, e: u32, slot: u32) {
         match &self.live {
-            Some(t) => t.store(e as usize, slot),
+            Some(_) if self.plans_open > 0 => {
+                // H3: a device plan in flight reads this table on the GPU;
+                // the write waits for its settle.
+                self.live_pending.push((e, slot));
+            }
+            Some(t) => {
+                debug_assert_eq!(
+                    self.plans_open, 0,
+                    "H3: a live-table write under an open plan"
+                );
+                t.store(e as usize, slot)
+            }
             None => self.table_stale = true,
         }
+    }
+
+    /// Every device plan has settled: deferred evictions retire at this
+    /// epoch (H2) and the live-table writes made under the plans are
+    /// published (H3). Returns the writes published.
+    fn plans_settled(&mut self) -> u64 {
+        let epoch = self.current_epoch();
+        self.map.release_deferred(epoch);
+        let n = self.live_pending.len() as u64;
+        if let Some(t) = &self.live {
+            for &(e, slot) in &self.live_pending {
+                t.store(e as usize, slot);
+            }
+        }
+        self.live_pending.clear();
+        n
     }
 }
 
@@ -1479,6 +1534,7 @@ impl Streamed {
                 staging,
                 table: None,
                 table_stale: true,
+                live_pending: Vec::new(),
                 open_epoch: None,
                 open_slots: Vec::new(),
                 #[cfg(feature = "metal")]
@@ -1826,6 +1882,7 @@ impl Streamed {
                         // A resident slot is written only while no device
                         // plan is open: an open plan's pass may map any.
                         None if inner.map.quarantined() && inner.plans_open > 0 => {
+                            self.counters.h2_refusals.fetch_add(1, Ordering::Relaxed);
                             lloom_tensor::bail!(
                                 "no free slot of {} ({} held) for a load while a device plan is open",
                                 self.n_slots,
@@ -1849,6 +1906,18 @@ impl Streamed {
                             ),
                         },
                         None => match inner.map.victim_settled(tick, settled_before) {
+                            // H2: a device plan in flight may read any slot;
+                            // the in-place arm cannot defer the overwrite, so
+                            // it refuses, as the quarantined arm does above.
+                            Some((s, true)) if inner.plans_open > 0 => {
+                                self.counters.h2_refusals.fetch_add(1, Ordering::Relaxed);
+                                lloom_tensor::bail!(
+                                    "no empty slot of {} for a load while a device plan is open \
+                                     (slot {s} holds expert {}, which the plan may read)",
+                                    self.n_slots,
+                                    inner.map.expert_in(s)
+                                )
+                            }
                             Some(v) => v,
                             None => lloom_tensor::bail!(
                                 "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
@@ -1860,6 +1929,7 @@ impl Streamed {
                     };
                     if evicted {
                         // The victim's entry goes before its slot is written.
+                        debug_assert_eq!(inner.plans_open, 0, "H2: an eviction under an open plan");
                         let old = inner.map.expert_in(s);
                         inner.table_set(old, NONE);
                     }
@@ -2454,8 +2524,10 @@ impl Streamed {
             // so a slot evicted while it was open outlives the current epoch.
             inner.plans_open = inner.plans_open.saturating_sub(1);
             if inner.plans_open == 0 {
-                let epoch = inner.current_epoch();
-                inner.map.release_deferred(epoch);
+                let n = inner.plans_settled();
+                self.counters
+                    .h3_deferred_writes
+                    .fetch_add(n, Ordering::Relaxed);
             }
         }
         let accepted = accepted.min(rec.rows);
@@ -2811,8 +2883,10 @@ impl Streamed {
         // so a slot evicted while it was open outlives the current epoch.
         inner.plans_open = inner.plans_open.saturating_sub(1);
         if inner.plans_open == 0 {
-            let epoch = inner.current_epoch();
-            inner.map.release_deferred(epoch);
+            let n = inner.plans_settled();
+            self.counters
+                .h3_deferred_writes
+                .fetch_add(n, Ordering::Relaxed);
         }
         let mut distinct = std::mem::take(&mut inner.scratch_ids);
         let mut missing = std::mem::take(&mut inner.scratch_missing);
@@ -2922,6 +2996,27 @@ impl Streamed {
             inner.table_stale = false;
         }
         Ok(inner.table.as_ref().expect("built above").clone())
+    }
+}
+
+impl Streamed {
+    /// H1: a device-planned pass's routed kernels read slots the host does
+    /// not know; the plan stamped every slot with the plan's epoch, and a
+    /// kernel encoded after a command-buffer cut reads in a later one. The
+    /// kernel stamps its own.
+    fn stamp_device_plan_readers(&self, inner: &mut Inner) {
+        if inner.plans_open == 0 {
+            return;
+        }
+        let epoch = inner.current_epoch();
+        if epoch > inner.map.plan_epoch() {
+            self.counters.h1_restamps.fetch_add(1, Ordering::Relaxed);
+            inner.map.plan_read_all(epoch);
+        }
+        debug_assert!(
+            inner.map.plan_epoch() >= epoch,
+            "H1: a routed kernel outran its stamp"
+        );
     }
 }
 
@@ -3351,11 +3446,16 @@ impl ExpertResidency for Streamed {
     }
 
     fn gate_up(&self, x: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<(Tensor, Tensor)> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
-        inner.pools[0]
-            .qt
-            .indexed_moe_forward_pair_with(&inner.pools[1].qt, x, slot_ids, arm)
+        let out = inner.pools[0].qt.indexed_moe_forward_pair_with(
+            &inner.pools[1].qt,
+            x,
+            slot_ids,
+            arm,
+        )?;
+        self.stamp_device_plan_readers(&mut inner);
+        Ok(out)
     }
 
     fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
@@ -3363,6 +3463,7 @@ impl ExpertResidency for Streamed {
         let y = inner.pools[2]
             .qt
             .indexed_moe_forward_with(h, slot_ids, arm)?;
+        self.stamp_device_plan_readers(&mut inner);
         // The group's last dispatch is encoded: its slots may be given away
         // — to a direct read once this command buffer has run.
         inner.open_epoch = None;
@@ -4093,12 +4194,17 @@ mod tests {
     /// between a device plan's slot map and its routed dispatch. The pass P
     /// maps experts a and b and its map has run; the host then loads c and
     /// d before P's experts are encoded. On the in-place arm the second load
-    /// writes d into a slot P maps — P computes on d's bytes and its record
-    /// shows no miss: the corruption is silent (the arm this plants against,
-    /// and the test's non-vacuity). On the quarantined arm c takes the free
-    /// slot, the eviction that refills the spare waits for P's settle, and
-    /// d — with no free slot left and a plan open — is refused: P's output
-    /// is the clean pass's bit for bit.
+    /// would write d into a slot P maps — P would compute on d's bytes and
+    /// its record show no miss, a silent corruption (the hazard H2 names,
+    /// `profiles-and-memory-design.md` §4.7; before #892 this arm did it,
+    /// and this test read the corrupted output as its non-vacuity) — and is
+    /// refused, counted (`h2_refusals`): P's output is the clean pass's bit
+    /// for bit; so is c's, the pool being full. On the quarantined arm c
+    /// takes the free slot, the eviction that refills the spare waits for
+    /// P's settle — and so does its live-table write (H3): the table P's map
+    /// read still holds the evicted expert until the settle publishes the
+    /// write — and d, with no free slot left and a plan open, is refused
+    /// the same way.
     #[cfg(feature = "metal")]
     #[test]
     fn a_load_never_writes_a_slot_an_open_device_plan_maps() {
@@ -4186,36 +4292,110 @@ mod tests {
             let mapped: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
             drain();
             let g = t.plan(&one(c)).unwrap();
-            t.ensure(&g[0]).unwrap();
+            let c_load = t.ensure(&g[0]);
+            // H3, the quarantined arm: c's landing refilled the spare by
+            // evicting a or b under the open plan; the host map says so, the
+            // live table P reads does not — yet.
+            let evicted_entry = (spare == 1).then(|| {
+                let inner = t.inner.lock();
+                let old = [a, b]
+                    .into_iter()
+                    .find(|&x| inner.map.slot_of(x as usize).is_none())
+                    .expect("the replenish evicted a or b");
+                let live = inner
+                    .live
+                    .as_ref()
+                    .expect("the quarantined arm keeps a live table");
+                let v = unsafe {
+                    (live.buf.contents() as *const u32)
+                        .add(old as usize)
+                        .read_volatile()
+                };
+                (old, v)
+            });
             drain();
             let g = t.plan(&one(dd)).unwrap();
             let d_load = t.ensure(&g[0]);
+            // H1: P's routed kernels are encoded now, after the drains' cuts
+            // — in a later command buffer than its slot map; the slots they
+            // read must carry the kernels' epoch, not the plan's.
+            let kernel_epoch = clock.current_epoch();
             let got = routed(&t, &slots);
+            {
+                let inner = t.inner.lock();
+                for &s in &mapped {
+                    assert!(
+                        inner.map.reader_epoch(s as usize) >= kernel_epoch,
+                        "H1: slot {s} is stamped {} under a kernel encoded in {kernel_epoch}",
+                        inner.map.reader_epoch(s as usize)
+                    );
+                }
+                assert!(t.stats().h1_restamps >= 1, "{:?}", t.stats());
+            }
             let flagged = rec.to_vec1::<u32>().unwrap()[2 * topk..]
                 .iter()
                 .any(|&f| f != 0);
             assert!(!flagged, "spare {spare}: P's map ran before any eviction");
             if spare == 0 {
-                assert!(d_load.is_ok(), "the in-place arm loads d");
-                let s_d = t.inner.lock().map.slot_of(dd as usize).unwrap() as u32;
+                // H2 on the in-place arm: every slot is resident, so c and d
+                // could only take a slot by evicting under the open plan, and
+                // the overwrite cannot be deferred in place — refused.
+                for (name, load) in [("c", c_load), ("d", d_load)] {
+                    let err = load
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the in-place arm loaded {name} into a slot under the open plan P"
+                            )
+                        })
+                        .to_string();
+                    assert!(
+                        err.contains("while a device plan is open"),
+                        "the refusal names the open plan: {err}"
+                    );
+                }
+                let inner = t.inner.lock();
+                assert!(inner.map.slot_of(c as usize).is_none());
+                assert!(inner.map.slot_of(dd as usize).is_none());
+                drop(inner);
                 assert!(
-                    mapped.contains(&s_d),
-                    "the plant missed: d landed in slot {s_d}, P maps {mapped:?}"
+                    mapped.iter().all(|s| *s < 3),
+                    "P maps {mapped:?} in a 3-slot pool"
                 );
-                assert_ne!(
-                    got, want,
-                    "d was written into a slot P maps and P computed the clean result: the plant is not a WAR"
-                );
+                assert_eq!(got, want, "a load wrote a slot the open plan P maps");
+                assert_eq!(t.stats().h2_refusals, 2, "{:?}", t.stats());
+                assert!(!t.settle(&rec).unwrap());
             } else {
+                c_load.expect("the quarantined arm loads c into its free slot");
+                let (old, v) = evicted_entry.unwrap();
+                let old_slot = mapped[[a, b].iter().position(|&x| x == old).unwrap()];
+                assert_eq!(
+                    v, old_slot,
+                    "H3: the live table lost expert {old} while P was open"
+                );
                 assert!(
                     d_load.is_err(),
                     "a load with no free slot under an open plan was not refused"
                 );
                 assert_eq!(got, want, "a load wrote a slot the open plan P maps");
                 assert!(!t.settle(&rec).unwrap());
+                // The settle published the deferred write.
+                let v = {
+                    let inner = t.inner.lock();
+                    let live = inner.live.as_ref().unwrap();
+                    unsafe {
+                        (live.buf.contents() as *const u32)
+                            .add(old as usize)
+                            .read_volatile()
+                    }
+                };
+                assert_eq!(v, NONE, "H3: the settle did not publish the eviction");
                 // The warm's a and b, and c: every landing took a free slot.
                 let st = t.stats();
                 assert_eq!((st.free_takes, st.inplace_takes), (3, 0), "{st:?}");
+                // Two writes waited for the settle: the eviction's NONE and
+                // c's own entry.
+                assert_eq!((st.h2_refusals, st.h3_deferred_writes), (1, 2), "{st:?}");
             }
         }
         std::fs::remove_file(path).ok();

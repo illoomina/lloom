@@ -1407,7 +1407,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if let Some(g) = &cache.ledger {
                 use lloom_tensor::kernels::metal::ledger::Tenant;
                 let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
-                let held: usize = cache.kv.iter().map(|k| k.bytes_held(nkv, hd)).sum::<usize>()
+                let held: usize = cache
+                    .kv
+                    .iter()
+                    .map(|k| k.bytes_held(nkv, hd))
+                    .sum::<usize>()
                     + plan.kv_grow;
                 let mut claim = g.claim();
                 claim.floor = held;
@@ -1460,14 +1464,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.
             let a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-            let (allocated, fits) = (a.allocated, a.fits);
+            let (allocated, fits) = (a.committed, a.fits);
             debug_assert_eq!(
                 fits,
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB allocated={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),

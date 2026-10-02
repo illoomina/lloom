@@ -148,7 +148,9 @@ pub use encoder::*;
 pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
-pub use backing::{Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped};
+pub use backing::{
+    Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
+};
 pub use heap::*;
 pub use kv_pages::*;
 pub use library::*;

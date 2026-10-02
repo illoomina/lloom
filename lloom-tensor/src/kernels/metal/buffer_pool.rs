@@ -307,6 +307,13 @@ impl PooledBuffer {
         self
     }
 
+    /// [`Self::reserved`] with what a backing returned (`None` from a heap,
+    /// whose chunk holds the reservation).
+    pub fn with_reservation(mut self, reservation: Option<super::ledger::Reservation>) -> Self {
+        self.reservation = reservation;
+        self
+    }
+
     pub fn size(&self) -> usize {
         self.size
     }
@@ -359,7 +366,11 @@ impl Drop for PooledBuffer {
         // Pool gone: the buffer drops here and Metal frees it. Correct, and the
         // reason the back-reference is `Weak`.
         if let Some(pool) = self.pool.upgrade() {
-            pool.release(buffer, self.size, self.pool.clone());
+            // The reservation goes back with the buffer: a free buffer is
+            // still the process's bytes, and the ledger counts it until the
+            // node is destroyed.
+            let reservation = self.reservation.take();
+            pool.release(buffer, self.size, self.pool.clone(), reservation);
         } else {
             // Destroyed rather than returned, so any mark must come off before
             // the allocation does (#475).
@@ -602,12 +613,17 @@ unsafe impl Send for FreeNode {}
 impl FreeNode {
     /// A free node for `buffer`, for a release whose handle could not go back
     /// with it.
-    fn new(buffer: Buffer, size: usize, pool: Weak<PoolInner>) -> Self {
+    fn new(
+        buffer: Buffer,
+        size: usize,
+        pool: Weak<PoolInner>,
+        reservation: Option<super::ledger::Reservation>,
+    ) -> Self {
         let handle = BufferHandle::new(PooledBuffer {
             buffer: Some(buffer),
             size,
             residency: None,
-            reservation: None,
+            reservation,
             pool,
         });
         let node = handle.node;
@@ -1406,8 +1422,14 @@ impl PoolInner {
     ///
     /// Lookup is untouched. This is a change to *when* a buffer is offered, not
     /// to how one is found.
-    fn release(&self, buffer: Buffer, size: usize, pool: Weak<PoolInner>) {
-        self.release_node(FreeNode::new(buffer, size, pool));
+    fn release(
+        &self,
+        buffer: Buffer,
+        size: usize,
+        pool: Weak<PoolInner>,
+        reservation: Option<super::ledger::Reservation>,
+    ) {
+        self.release_node(FreeNode::new(buffer, size, pool, reservation));
     }
 
     /// Hands a buffer back in the node its handles shared, so the next
@@ -2193,6 +2215,19 @@ impl BufferPool {
     /// programming error rather than a resource one, where §9.5e's argument
     /// against panicking deep inside a forward pass applies.
     pub fn adopt(&self, buffer: Buffer, size: usize) -> BufferHandle {
+        self.adopt_reserved(buffer, size, None)
+    }
+
+    /// [`Self::adopt`] with the buffer's ledger reservation, kept on its node
+    /// through every free / acquire cycle and dropped when the node is
+    /// destroyed (an eviction, a trim): the ledger counts the buffer for as
+    /// long as it exists, live or free.
+    pub fn adopt_reserved(
+        &self,
+        buffer: Buffer,
+        size: usize,
+        reservation: Option<super::ledger::Reservation>,
+    ) -> BufferHandle {
         debug_assert!(
             !buffer.is_view(),
             "BufferPool::adopt was given a VIEW ({} bytes at offset {} of a \
@@ -2244,7 +2279,7 @@ impl BufferPool {
             size,
             pool: Arc::downgrade(&self.inner),
             residency: None,
-            reservation: None,
+            reservation,
         })
     }
 
@@ -2271,7 +2306,7 @@ impl BufferPool {
     /// handed to `newBufferWithLength` and what the bucket is keyed on.
     pub fn adopt_requesting(
         &self,
-        buffer: Buffer,
+        allocation: impl Into<super::backing::Allocation>,
         requested: usize,
         allocated: usize,
     ) -> BufferHandle {
@@ -2282,7 +2317,8 @@ impl BufferPool {
              request means the two arguments were passed in the wrong order \
              and the overhang would underflow (DESIGN.md §9.2)."
         );
-        let handle = self.adopt(buffer, allocated);
+        let allocation = allocation.into();
+        let handle = self.adopt_reserved(allocation.buffer, allocated, allocation.reservation);
         {
             let mut state = self.inner.state.lock(Side::Host);
             state.counters.requested_bytes += requested as u64;

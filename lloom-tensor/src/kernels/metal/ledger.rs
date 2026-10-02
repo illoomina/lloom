@@ -446,11 +446,13 @@ mod admit_tests {
         let clock = m.gpu_clock();
         let e = clock.commit_epoch();
         clock.mark_completed(e);
-        let allocated = m.device().current_allocated_size();
+        // The ledger's figure: a pool buffer's reservation rides its node,
+        // live or free, so the 32 free MiB are in it.
+        let committed = m.ledger().committed();
         // A budget 8 MiB short for `need` on the first figure, and 24 MiB
         // over it once the 32 MiB of free lists are gone.
         let need = 4 * mib;
-        let budget = allocated + need - 8 * mib;
+        let budget = committed + need - 8 * mib;
         let before = m.ledger().reclaims();
         let a = m.admit_bytes(need, budget);
         assert!(
@@ -459,18 +461,23 @@ mod admit_tests {
             a.reclaimed
         );
         assert!(
-            a.allocated + need <= budget,
-            "after the reclaim the pass fits: allocated {} + need {} vs budget {}",
-            a.allocated,
+            a.committed + need <= budget,
+            "after the reclaim the pass fits: committed {} + need {} vs budget {}",
+            a.committed,
             need,
             budget
         );
         assert!(a.fits, "{a:?}");
+        assert!(
+            a.committed + 32 * mib <= committed,
+            "the trim released the free buffers' reservations: {} after, {committed} before",
+            a.committed
+        );
         let after = m.ledger().reclaims();
         assert_eq!(after.0, before.0 + 1, "one reclaim counted");
         assert!(after.1 >= before.1 + 32 * mib);
         // A pass that fits on the first figure reclaims nothing.
-        let a = m.admit_bytes(need, m.device().current_allocated_size() + need);
+        let a = m.admit_bytes(need, m.ledger().committed() + need);
         assert_eq!(a.reclaimed, 0);
         assert!(a.fits);
         assert_eq!(m.ledger().reclaims().0, after.0);
@@ -493,9 +500,11 @@ mod admit_tests {
             .map(|_| crate::Tensor::zeros(mib / 4, crate::DType::F32, &dev).unwrap())
             .collect();
         drop(held);
-        let allocated = m.device().current_allocated_size();
+        // The ledger's figure: a pool buffer's reservation rides its node,
+        // live or free, so the 32 free MiB are in it.
+        let committed = m.ledger().committed();
         let need = 4 * mib;
-        let budget = allocated + need - 8 * mib;
+        let budget = committed + need - 8 * mib;
         let a = m.admit_bytes(need, budget);
         assert!(
             a.reclaimed >= 32 * mib,
@@ -503,5 +512,87 @@ mod admit_tests {
             a.reclaimed
         );
         assert!(a.fits, "{a:?}");
+    }
+
+    /// A pool buffer is committed for as long as it exists, live or free:
+    /// through the node going back to the free list (the common release)
+    /// and through a `PooledBuffer` released from outside its node (a weak
+    /// handle outstanding) alike; the trim that destroys it releases it.
+    #[test]
+    fn a_free_buffer_stays_committed_until_the_pool_destroys_it() {
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let mib = 1usize << 20;
+        let clock = m.gpu_clock();
+        let before = m.ledger().committed();
+        let a = m.allocate_buffer(mib).unwrap();
+        let b = m.allocate_buffer(mib).unwrap();
+        let held = m.ledger().committed();
+        assert!(held >= before + 2 * mib, "{held} < {before} + 2 MiB");
+        // `a`'s node goes back whole; `b`'s value is released from outside
+        // its node, a weak handle keeping the node.
+        let weak = crate::kernels::metal::BufferHandle::downgrade(&b);
+        drop(a);
+        drop(b);
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        assert_eq!(
+            m.ledger().committed(),
+            held,
+            "a free buffer left the ledger before the pool destroyed it"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the released buffer is not a handle"
+        );
+        drop(weak);
+        let freed = m.trim_unused_buffers();
+        assert!(freed >= 2 * mib, "the trim freed {freed}");
+        assert!(
+            m.ledger().committed() + 2 * mib <= held,
+            "the trim did not release the free buffers' reservations: {} vs {held}",
+            m.ledger().committed()
+        );
+    }
+
+    /// The verdict is arithmetic on the ledger, not a read of the device:
+    /// bytes Metal holds that no backing handed out (here a raw buffer made
+    /// beside the backings) do not enter it, where `currentAllocatedSize`
+    /// counts them — so two processes with the same allocation history give
+    /// the same verdict (`profiles-and-memory-design.md` §11).
+    #[test]
+    fn the_verdict_is_the_ledgers_not_the_devices() {
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let mib = 1usize << 20;
+        let need = 4 * mib;
+        // A persistent buffer is on the ledger: it moves the verdict.
+        let committed = m.ledger().committed();
+        let held = m.new_persistent_private(64 * mib).unwrap();
+        assert_eq!(m.ledger().committed(), committed + 64 * mib);
+        let budget = m.ledger().committed() + need + mib;
+        assert!(m.admit_bytes(need, budget).fits);
+        // A raw Metal buffer beside the backings is not: the device's figure
+        // grows by 256 MiB, the ledger's by nothing, and the verdict stands.
+        let raw = m
+            .device()
+            .new_buffer(256 * mib, crate::kernels::RESOURCE_OPTIONS)
+            .unwrap();
+        assert!(
+            m.device().current_allocated_size() >= committed + 64 * mib + 256 * mib,
+            "the device counts the raw buffer"
+        );
+        let a = m.admit_bytes(need, budget);
+        assert_eq!(a.committed, committed + 64 * mib);
+        assert_eq!(
+            a.reclaimed, 0,
+            "nothing to reclaim: the verdict needed no rung"
+        );
+        assert!(a.fits, "{a:?}");
+        drop(raw);
+        drop(held);
+        assert_eq!(m.ledger().committed(), committed);
     }
 }

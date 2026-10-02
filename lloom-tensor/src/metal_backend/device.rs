@@ -208,12 +208,18 @@ impl Drop for DeviceTeardown {
     }
 }
 
-/// What [`MetalDevice::admit_bytes`] read: the device's allocated bytes at
-/// the decision (after a reclaim, when one ran), what the reclaim freed, and
-/// the verdict.
+/// What [`MetalDevice::admit_bytes`] decided on: the ledger's committed bytes
+/// at the decision (after a reclaim, when one ran), what the reclaim freed,
+/// and the verdict. The ledger, not `currentAllocatedSize`: every byte the
+/// process holds through its backings is a reservation on it — pools' free
+/// and pending lists included — so two processes with the same allocation
+/// history read the same figure and give the same verdict
+/// (`profiles-and-memory-design.md` §4.2, §11), where the device figure
+/// also counted Metal's own objects and whatever another thread had just
+/// freed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PassAdmission {
-    pub allocated: usize,
+    pub committed: usize,
     pub reclaimed: usize,
     pub fits: bool,
 }
@@ -873,17 +879,17 @@ impl MetalDevice {
     /// the ledger. Not on the hot path: a decode step inside its slab asks
     /// nothing (§9.5e).
     pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
-        let allocated = self.device.current_allocated_size();
-        if allocated.saturating_add(need) <= budget {
+        let committed = self.ledger.committed();
+        if committed.saturating_add(need) <= budget {
             return PassAdmission {
-                allocated,
+                committed,
                 reclaimed: 0,
                 fits: true,
             };
         }
         let mut reclaimed = self.trim_unused_buffers();
-        let mut allocated = self.device.current_allocated_size();
-        if allocated.saturating_add(need) > budget {
+        let mut committed = self.ledger.committed();
+        if committed.saturating_add(need) > budget {
             // The second rung: what the host released and the GPU may still
             // read sits in the pending lists until their epochs complete.
             // Wait the queue out once — the pass would otherwise end the
@@ -892,14 +898,14 @@ impl MetalDevice {
             // meet exhaustion the same way (`BatchPool::begin_rows`).
             if self.wait_until_completed().is_ok() {
                 reclaimed += self.trim_unused_buffers();
-                allocated = self.device.current_allocated_size();
+                committed = self.ledger.committed();
             }
         }
         self.ledger.note_reclaim(reclaimed);
         PassAdmission {
-            allocated,
+            committed,
             reclaimed,
-            fits: allocated.saturating_add(need) <= budget,
+            fits: committed.saturating_add(need) <= budget,
         }
     }
 
@@ -1512,7 +1518,7 @@ impl MetalDevice {
             .resident_private
             .alloc(bytes)
             .map_err(MetalError::from)?;
-        let region = SessionRegion::new(base, plan)
+        let region = SessionRegion::new(base.buffer, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
         {
             let mut slot = self.session_region.write();
@@ -1604,8 +1610,8 @@ impl MetalDevice {
             .resident_private
             .alloc(bytes)
             .map_err(MetalError::from)?;
-        *self.arena_reservation.lock() = Some(self.ledger.reserve(bytes));
-        let arena = Arena::new(base, plan, layout)
+        *self.arena_reservation.lock() = base.reservation;
+        let arena = Arena::new(base.buffer, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         {
             let mut slot = self.arena.write();
@@ -2285,7 +2291,7 @@ impl MetalDevice {
                     let gb = |b: usize| b as f64 / 1e9;
                     return Err(MetalError::Message(format!(
                         "pass plan base grow refused for {:?}: it needs {:.3} GB more, and the \
-                         process already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
+                         ledger already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
                          recommendedMaxWorkingSetSize {:.2} GB) after giving back {:.3} GB of \
                          free lists. Nothing was allocated and no \
                          plan was cached; the pass runs on the pool as it did before \
@@ -2293,7 +2299,7 @@ impl MetalDevice {
                          prefill tile), or bound the run.",
                         closes.kind,
                         gb(grow),
-                        gb(a.allocated),
+                        gb(a.committed),
                         gb(budget),
                         pp.admit_fraction,
                         gb(working_set),
@@ -2310,8 +2316,8 @@ impl MetalDevice {
             if let Some(previous) = pp.base.take() {
                 self.residency_set.remove(&previous);
             }
-            pp.base = Some(base);
-            pp.base_reservation = Some(self.ledger.reserve(needed));
+            pp.base = Some(base.buffer);
+            pp.base_reservation = base.reservation;
             pp.base_generation += 1;
             pp.arenas.clear();
             pp.counters.base_grows += 1;
@@ -2634,7 +2640,7 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<BufferHandle> {
         let size = element_count * dtype.size_in_bytes();
-        let buffer = self
+        let a = self
             .backings
             .resident_private
             .alloc(size)
@@ -2642,7 +2648,9 @@ impl MetalDevice {
         // Deliberately not pooled: this exists for persistent buffers, so it
         // returns a handle with no pool behind it. Dropping it frees the buffer
         // outright rather than offering it for reuse.
-        Ok(BufferHandle::new(PooledBuffer::unpooled(buffer, size)))
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled(a.buffer, size).with_reservation(a.reservation),
+        ))
     }
 
     /// Creates a new buffer from data.
@@ -2701,14 +2709,14 @@ impl MetalDevice {
     /// (lloom #748 / PR #754, which records it as `docs/invariants.md` §15.1m) — a recycled Shared buffer
     /// written by the host while a still-running command buffer reads it.
     pub fn new_unpooled_shared(&self, size: usize) -> Result<BufferHandle> {
-        let buffer = self
+        let a = self
             .backings
             .resident_shared
             .alloc(size)
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
-            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-                .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
         ))
     }
 
@@ -2725,26 +2733,26 @@ impl MetalDevice {
         // says (measured: 28 GB of Shared slot pools un-wired and 7.5 GB
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
         // not. The `Mapped` backing pins them.
-        let buffer = self
+        let a = self
             .backings
             .mapped_shared
             .alloc(size)
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
-            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-                .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
         ))
     }
 
     pub fn new_persistent_private(&self, size: usize) -> Result<BufferHandle> {
-        let buffer = self
+        let a = self
             .backings
             .resident_private
             .alloc(size)
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
-            PooledBuffer::unpooled_resident(buffer, size, Arc::clone(&self.residency_set))
-                .reserved(self.ledger.reserve(size)),
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
         ))
     }
 

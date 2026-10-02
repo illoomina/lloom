@@ -170,14 +170,32 @@ pub struct MtpDrafter<'a, R: ExpertResidency> {
     /// re-applications run under a window on the layer's own cache and are
     /// rewound: only observed rows key it.
     k: usize,
+    /// The head's indexer keys per compressed block: a lane cut back to a
+    /// reused prefix keeps the blocks complete within it.
+    ratio: usize,
     lanes: Vec<MtpLane>,
+    /// `QWEN4EXP_MTP_PROBE` over the generation rows of this drafter's run.
+    probe: GenerationProbe,
 }
+
+/// The drafter's per-sequence state, held across requests by a caller that
+/// keeps its target cache across them (`MtpDrafter::with_lanes`,
+/// `MtpDrafter::into_lanes`): a lane keyed from a prefix the next request
+/// reuses carries that prefix's rows into it.
+pub struct MtpLanes(Vec<MtpLane>);
 
 /// What the drafter keeps for one sequence: the MTP layer's cache and where
 /// the sequence's drafting stands.
 struct MtpLane {
     cache: Cache,
     prompt: Vec<u32>,
+    /// The tokens the cache's rows were keyed from: row `j` pairs the
+    /// target's carry at position `j` with the embedding of `keyed[j + 1]`,
+    /// so `rows_seen + 1` of them once the lane is seeded.
+    keyed: Vec<u32>,
+    /// `begin_at`s that found a reused prefix this lane was not keyed from
+    /// and reset it.
+    resets: u64,
     seeded: bool,
     draft: Option<u32>,
     /// The MTP layer's pre-collapse carry after the last observed row — the
@@ -196,6 +214,8 @@ impl MtpLane {
         Self {
             cache: Cache::with_layers(cfg, 1),
             prompt: Vec::new(),
+            keyed: Vec::new(),
+            resets: 0,
             seeded: false,
             draft: None,
             multi: None,
@@ -235,8 +255,33 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
             lm_head,
             device: device.clone(),
             k: 1,
+            ratio: cfg.indexer_compress_ratio,
             lanes: (0..n.max(1)).map(|_| MtpLane::new(cfg)).collect(),
+            probe: GenerationProbe::default(),
         }
+    }
+
+    /// Draft over `lanes`, a previous drafter's state for as many
+    /// sequences, in place of fresh ones: each lane is kept for the prefix
+    /// its next `begin_at` reuses, or reset there.
+    pub fn with_lanes(mut self, lanes: Option<MtpLanes>) -> Self {
+        if let Some(MtpLanes(l)) = lanes {
+            if l.len() == self.lanes.len() {
+                self.lanes = l;
+            }
+        }
+        self
+    }
+
+    /// The lanes, for the next request's drafter.
+    pub fn into_lanes(mut self) -> MtpLanes {
+        MtpLanes(std::mem::take(&mut self.lanes))
+    }
+
+    /// `begin_at`s over every lane that reset a lane for a reused prefix it
+    /// was not keyed from.
+    pub fn lane_resets(&self) -> u64 {
+        self.lanes.iter().map(|l| l.resets).sum()
     }
 
     /// The observes planned on the head's device plan, on its host plan,
@@ -262,12 +307,12 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
         self.k
     }
 
-    /// Positions the MTP layer has been keyed with, over every sequence.
+    /// Positions the MTP layer's caches hold, over every sequence.
     pub fn rows_seen(&self) -> usize {
         self.lanes.iter().map(|l| l.rows_seen).sum()
     }
 
-    /// Positions sequence `seq`'s MTP cache has been keyed with.
+    /// Positions sequence `seq`'s MTP cache holds.
     pub fn seq_rows_seen(&self, seq: SeqId) -> usize {
         self.lanes.get(seq.0).map_or(0, |l| l.rows_seen)
     }
@@ -349,14 +394,48 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     }
 
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        self.begin_at(seq, prompt, &[])
+    }
+
+    /// The lane is kept for `kept` iff its rows were keyed from exactly
+    /// those tokens and the one after them, `prompt[0]` (row `j` reads the
+    /// embedding of token `j + 1`): it is cut back to `kept.len()` rows and
+    /// `prompt` is keyed after them, at the target's positions. Otherwise it
+    /// is reset and keys `prompt` from its own position 0 — the head's
+    /// attention reads positions only relative to each other (RoPE), so the
+    /// restart costs the reused prefix's context, which the acceptance rate
+    /// pays for, and nothing else.
+    fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        let ratio = self.ratio;
         let lane = self.lane(seq)?;
-        lane.cache.reset();
+        let at = kept.len();
+        let follow = at > 0
+            && lane.rows_seen >= at
+            && lane.keyed.len() > at
+            && lane.keyed[..at] == kept[..]
+            && prompt.first() == Some(&lane.keyed[at]);
+        // A lane left mid-round by a failed run (a window open) is refused
+        // by the cut, and reset.
+        if follow && lane.cache.truncate_attention(at, ratio).is_ok() {
+            lane.keyed.truncate(at + 1);
+            lane.rows_seen = at;
+        } else {
+            lane.cache.reset();
+            lane.keyed.clear();
+            lane.rows_seen = 0;
+            if at > 0 {
+                lane.resets += 1;
+            }
+        }
         lane.prompt = prompt.to_vec();
         lane.seeded = false;
         lane.draft = None;
         lane.multi = None;
-        lane.rows_seen = 0;
         Ok(())
+    }
+
+    fn context_len(&self, seq: SeqId) -> Option<usize> {
+        self.lanes.get(seq.0).map(|l| l.cache.pos)
     }
 
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
@@ -379,7 +458,8 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         let (head, embed, lm_head) = (self.head, self.embed, self.lm_head);
         let device = self.device.clone();
         let lane = self.lane(seq)?;
-        let nexts: Vec<u32> = if !lane.seeded {
+        let seeding = !lane.seeded;
+        let nexts: Vec<u32> = if seeding {
             lane.seeded = true;
             let mut v: Vec<u32> = lane.prompt.iter().skip(1).copied().collect();
             v.extend_from_slice(accepted);
@@ -395,12 +475,11 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                 accepted.len()
             )
         }
-        if mtp_probe() && lane.rows_seen == 0 {
+        if mtp_probe() && seeding {
             self.probe_prefill_rows(seq, probe, &nexts)?;
         }
         let lane = self.lane(seq)?;
-        let rows_seen_before = lane.rows_seen;
-        let toks = Tensor::from_vec(nexts, (1, a), &device)?;
+        let toks = Tensor::from_vec(nexts.clone(), (1, a), &device)?;
         let emb = embed.embedding(&toks)?; // [1, a, d]
                                            // The head's own streamed experts planned on the device when its
                                            // pool held the last round's whole (`QWEN4EXP_MTP_OBSERVE_PLAN`):
@@ -410,7 +489,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         let tier = head.layer().moe().experts();
         // The seeding observe keys the prompt's rows — wider than a round's
         // and, on a streamed head, than its pool: the grouped host plan's.
-        let planned = observe_on_device() && tier.plans_on_device() && rows_seen_before > 0;
+        let planned = observe_on_device() && tier.plans_on_device() && !seeding;
         let kind = planned.then(|| {
             if lane.cache.device_plan_armed {
                 WindowPlanKind::Device
@@ -425,7 +504,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
             lane.cache.open_window()?;
         }
         let misses_before = tier.misses_so_far();
-        let (sample, multi, record) =
+        let (mut sample, multi, record) =
             head.forward_planned(probe, &emb, &mut lane.cache, false, kind)?;
         let last = sample.narrow(1, a - 1, 1)?;
         let logits = lm_head.forward(&last)?; // [1, 1, vocab]
@@ -462,11 +541,12 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                     real_rows: a,
                     loaded_rows: a,
                 };
-                let (sample, m, record) =
+                let (s, m, record) =
                     head.forward_planned(probe, &emb, &mut lane.cache, false, Some(kind))?;
                 if let Some(WindowPlan::Host(r)) = record {
                     R::settle_window(&[(tier, &r)], a)?;
                 }
+                sample = s;
                 let last = sample.narrow(1, a - 1, 1)?;
                 let logits = lm_head.forward(&last)?;
                 next = logits
@@ -487,10 +567,94 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                 lane.observe_host += 1;
             }
         }
+        if lane.keyed.is_empty() {
+            lane.keyed.push(lane.prompt.first().copied().unwrap_or(0));
+        }
+        lane.keyed.extend_from_slice(&nexts);
+        let held = lane.draft.replace(next);
         lane.multi = Some(multi.narrow(1, a - 1, 1)?);
-        lane.draft = Some(next);
         lane.rows_seen += a;
+        if mtp_probe() {
+            let rows = if seeding {
+                None
+            } else {
+                let logits = lm_head.forward(&sample)?; // [1, a, vocab]
+                Some(logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()?)
+            };
+            self.probe
+                .score(held.filter(|_| !seeding), rows.as_deref(), &nexts);
+        }
         Ok(())
+    }
+}
+
+/// `QWEN4EXP_MTP_PROBE` on the generation rows: the head's teacher-forced
+/// hit rate over the rows the rounds key, `hit2` as on the prompt rows (the
+/// row's argmax is the token after its next token). A round's last row is
+/// the one the draft is taken from, and its next token is only known at the
+/// next round's observe, so it is scored there against the draft itself —
+/// at K = 1 its rate is the first draft's acceptance; the rows before it
+/// (an accepted draft's) are scored on the observe that keys them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationProbe {
+    /// Last rows scored, and those whose draft was the next token's next.
+    pub last_rows: u64,
+    pub last_hits: u64,
+    /// Earlier rows of a round scored, and their hits.
+    pub inner_rows: u64,
+    pub inner_hits: u64,
+}
+
+impl GenerationProbe {
+    /// One observe's rows: `draft`, the previous observe's draft (scored
+    /// against this observe's first next token); `arg`, this observe's
+    /// per-row argmax (`None` on the seeding observe, whose rows are the
+    /// prompt probe's).
+    fn score(&mut self, draft: Option<u32>, arg: Option<&[u32]>, nexts: &[u32]) {
+        if let (Some(d), Some(&first)) = (draft, nexts.first()) {
+            self.last_rows += 1;
+            self.last_hits += u64::from(d == first);
+        }
+        if let Some(arg) = arg {
+            for i in 0..arg.len().saturating_sub(1) {
+                self.inner_rows += 1;
+                self.inner_hits += u64::from(arg[i] == nexts[i + 1]);
+            }
+        }
+    }
+
+    fn line(&self) -> String {
+        let rate = |h: u64, n: u64| if n == 0 { 0.0 } else { h as f64 / n as f64 };
+        let (rows, hits) = (
+            self.last_rows + self.inner_rows,
+            self.last_hits + self.inner_hits,
+        );
+        format!(
+            "MTPPROBE generation rows={rows} hit2={hits} ({:.3}) last_rows={} last_hit2={} ({:.3}) inner_rows={} inner_hit2={} ({:.3})",
+            rate(hits, rows),
+            self.last_rows,
+            self.last_hits,
+            rate(self.last_hits, self.last_rows),
+            self.inner_rows,
+            self.inner_hits,
+            rate(self.inner_hits, self.inner_rows),
+        )
+    }
+}
+
+impl<R: ExpertResidency> MtpDrafter<'_, R> {
+    /// The generation-row probe so far (zeros unless `QWEN4EXP_MTP_PROBE`).
+    pub fn generation_probe(&self) -> GenerationProbe {
+        self.probe
+    }
+}
+
+impl<R: ExpertResidency> Drop for MtpDrafter<'_, R> {
+    /// The generation-row probe's summary, once a run.
+    fn drop(&mut self) {
+        if mtp_probe() && self.probe != GenerationProbe::default() {
+            eprintln!("{}", self.probe.line());
+        }
     }
 }
 

@@ -7107,7 +7107,7 @@ void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & re
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 *xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d1 = il ? (xb->d / 16.f) : xb->d;
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
@@ -7122,7 +7122,7 @@ void dequantize_q4_0(device const block_q4_0 *xb, short il, thread type4x4 & reg
 template <typename type4x4>
 void dequantize_q4_1(device const block_q4_1 *xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 2);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d1 = il ? (xb->d / 16.f) : xb->d;
     const float d2 = d1 / 256.f;
     const float  m = xb->m;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
@@ -7261,7 +7261,7 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 & reg
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float d   = il < 2 ? xb->d : xb->d / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];

@@ -114,7 +114,7 @@ fn each_order_dispatches_its_own_grid() {
             let name = format!("kernel_mul_mv_id2_q8_0{suffix}");
             let tiles = 16;
             let want: Vec<(String, (usize, usize, usize))> = match order {
-                PairOrder::Half => vec![(name, (tiles, 1, 2 * planes))],
+                PairOrder::Half | PairOrder::HalfCmp => vec![(name, (tiles, 1, 2 * planes))],
                 PairOrder::Expert => vec![(name, (tiles, 2, planes))],
                 PairOrder::Tile => vec![(name, (2 * tiles, 1, planes))],
                 PairOrder::Split => vec![
@@ -206,4 +206,28 @@ fn the_folded_pair_is_one_launch_and_no_cast() {
         folded[0].1, cast[1].1,
         "the folded launch's grid is the f16 pair's"
     );
+}
+
+/// Each order's grid and the kernel constant it is dispatched with, as
+/// absolute values: `half` and `half-cmp` share a grid and differ only in the
+/// constant (the half by a division or by a compare: the same bits, so
+/// nothing else can tell them apart), and `split` has no one-launch grid.
+#[test]
+fn each_order_names_its_grid_and_constant() {
+    use lloom_tensor::kernels::PairGrid;
+    let got: Vec<(PairOrder, Option<(PairGrid, usize)>)> = PairOrder::ALL
+        .iter()
+        .map(|&o| (o, o.grid().map(|g| (g, g.order()))))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (PairOrder::Half, Some((PairGrid::HalfSlowest, 0))),
+            (PairOrder::HalfCmp, Some((PairGrid::HalfSlowestCmp, 3))),
+            (PairOrder::Expert, Some((PairGrid::HalfByPlane, 1))),
+            (PairOrder::Tile, Some((PairGrid::HalfFastest, 2))),
+            (PairOrder::Split, None),
+        ]
+    );
+    assert_eq!(PairGrid::OneHalf.order(), 0);
 }

@@ -8877,7 +8877,9 @@ template [[host_name("kernel_mul_mv_id_q2_0_f32h_f16")]]    kernel kernel_mul_mv
 //      adjacent, each a full row of threadgroups (the host's grid is two
 //      high and half as deep);
 //   2  the fastest axis: x = 2·tile + half — one row tile's gate and up
-//      adjacent (the host doubles the grid's width and halves its depth).
+//      adjacent (the host doubles the grid's width and halves its depth);
+//   3  order 0's grid, the half read by a compare (z >= planes) instead of
+//      a division by the run-time plane count.
 // The order moves which threadgroup computes a plane's rows, never how. Each
 // order has its own grid shape, so a host and a kernel that disagree on it
 // compute the wrong planes rather than the same ones in another order.
@@ -8926,6 +8928,9 @@ kernel void kernel_mul_mv_id2(
         hf = tgpig.x & 1;
         tgpig.x >>= 1;
         z = tgpig.z;
+    } else if (PAIR_ORDER == 3) {
+        hf = tgpig.z >= (uint)planes ? 1 : 0;
+        z = tgpig.z - hf * planes;
     } else if (PAIR_ORDER == 1) {
         hf = tgpig.y;
         tgpig.y = 0;

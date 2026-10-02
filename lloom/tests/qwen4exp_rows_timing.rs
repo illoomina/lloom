@@ -718,7 +718,8 @@ fn routed_mv_id_census() {
 /// token, ten experts. Where `routed_mv_id_census` issues independent
 /// launches that overlap (throughput), this is the step's latency. The arms
 /// take turns within every round, so drift is shared:
-///   H X T S   the pair in each grid order (`PairOrder`)
+///   H D X T S the pair in each grid order (`PairOrder`; D the incumbent's
+///             grid with the half by a compare, not a division)
 ///   U         gate and up as two single launches
 ///   F         (f16 only) the fold: the f32 activation into the pair, no cast
 /// At f16 (the `fast` step) every arm but F casts the activation first, as
@@ -783,6 +784,7 @@ fn routed_pair_order_chain() {
     let layer = |arm: char, act: DType, l: usize, x: &Tensor| -> Tensor {
         let (g, u, d) = &layers[l];
         let order = match arm {
+            'D' => PairOrder::HalfCmp,
             'X' => PairOrder::Expert,
             'T' => PairOrder::Tile,
             'S' => PairOrder::Split,
@@ -810,7 +812,7 @@ fn routed_pair_order_chain() {
             .unwrap();
         (y.sum_keepdim(1).unwrap().to_dtype(DType::F32).unwrap() * 1e-3).unwrap()
     };
-    for (act, arms) in [(DType::F16, "HXTSUF"), (DType::F32, "HXTSU")] {
+    for (act, arms) in [(DType::F16, "HDXTSUF"), (DType::F32, "HDXTSU")] {
         let arms: Vec<char> = arms.chars().collect();
         let iters = 4 * n_layers;
         let batch = |arm: char| -> f64 {

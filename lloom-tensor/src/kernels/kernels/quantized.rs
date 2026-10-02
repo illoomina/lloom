@@ -1327,6 +1327,9 @@ fn divide(m: usize, b: usize) -> usize {
 pub enum PairGrid {
     /// Both halves, the half the slowest axis: gate's planes, then up's.
     HalfSlowest,
+    /// [`PairGrid::HalfSlowest`]'s grid, the half read by a compare rather
+    /// than a division by the plane count.
+    HalfSlowestCmp,
     /// Both halves, one expert's gate and up planes adjacent.
     HalfByPlane,
     /// Both halves, one row tile's gate and up threadgroups adjacent.
@@ -1338,11 +1341,12 @@ pub enum PairGrid {
 
 impl PairGrid {
     /// The kernel's `PAIR_ORDER_FC`.
-    fn order(self) -> usize {
+    pub fn order(self) -> usize {
         match self {
             PairGrid::HalfSlowest | PairGrid::OneHalf => 0,
             PairGrid::HalfByPlane => 1,
             PairGrid::HalfFastest => 2,
+            PairGrid::HalfSlowestCmp => 3,
         }
     }
 }
@@ -1413,7 +1417,7 @@ pub fn call_quantized_matmul_mv_id2_t(
     let (nth0, nth1, align) = mv_threadgroup(dtype);
     let (tiles, planes) = (divide(n, align), batch * topk);
     let (width, height, depth) = match grid {
-        PairGrid::HalfSlowest => (tiles, 1, 2 * planes),
+        PairGrid::HalfSlowest | PairGrid::HalfSlowestCmp => (tiles, 1, 2 * planes),
         PairGrid::HalfByPlane => (tiles, 2, planes),
         PairGrid::HalfFastest => (2 * tiles, 1, planes),
         PairGrid::OneHalf => (tiles, 1, planes),

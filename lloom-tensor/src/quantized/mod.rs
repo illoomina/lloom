@@ -1728,6 +1728,8 @@ impl MoeArm {
 pub enum PairOrder {
     /// Gate's planes, then up's: the incumbent.
     Half,
+    /// The incumbent's grid, the half read by a compare, not a division.
+    HalfCmp,
     /// One expert's gate and up planes adjacent.
     Expert,
     /// One row tile's gate and up threadgroups adjacent.
@@ -1737,8 +1739,9 @@ pub enum PairOrder {
 }
 
 impl PairOrder {
-    pub const ALL: [PairOrder; 4] = [
+    pub const ALL: [PairOrder; 5] = [
         PairOrder::Half,
+        PairOrder::HalfCmp,
         PairOrder::Expert,
         PairOrder::Tile,
         PairOrder::Split,
@@ -1747,11 +1750,12 @@ impl PairOrder {
     pub fn parse(v: &str) -> std::result::Result<PairOrder, String> {
         match v.trim().to_ascii_lowercase().as_str() {
             "half" => Ok(PairOrder::Half),
+            "half-cmp" => Ok(PairOrder::HalfCmp),
             "expert" => Ok(PairOrder::Expert),
             "tile" => Ok(PairOrder::Tile),
             "split" => Ok(PairOrder::Split),
             other => Err(format!(
-                "moe pair order: `{other}` is not one of half, expert, tile, split"
+                "moe pair order: `{other}` is not one of half, half-cmp, expert, tile, split"
             )),
         }
     }
@@ -1759,6 +1763,7 @@ impl PairOrder {
     pub fn name(self) -> &'static str {
         match self {
             PairOrder::Half => "half",
+            PairOrder::HalfCmp => "half-cmp",
             PairOrder::Expert => "expert",
             PairOrder::Tile => "tile",
             PairOrder::Split => "split",

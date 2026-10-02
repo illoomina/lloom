@@ -912,16 +912,11 @@ impl QMetalStorage {
                     store_dtype,
                 ))
             };
-        let grid = match order {
-            PairOrder::Half => PairGrid::HalfSlowest,
-            PairOrder::Expert => PairGrid::HalfByPlane,
-            PairOrder::Tile => PairGrid::HalfFastest,
-            PairOrder::Split => {
-                let shape = Shape::from((batch, topk, n));
-                let g = launch(PairGrid::OneHalf, &self.buffer, &self.buffer, &shape)?;
-                let u = launch(PairGrid::OneHalf, &other.buffer, &other.buffer, &shape)?;
-                return Ok((g, Some(u), shape));
-            }
+        let Some(grid) = order.grid() else {
+            let shape = Shape::from((batch, topk, n));
+            let g = launch(PairGrid::OneHalf, &self.buffer, &self.buffer, &shape)?;
+            let u = launch(PairGrid::OneHalf, &other.buffer, &other.buffer, &shape)?;
+            return Ok((g, Some(u), shape));
         };
         let shape = Shape::from((2, batch, topk, n));
         let both = launch(grid, &self.buffer, &other.buffer, &shape)?;
@@ -1454,4 +1449,21 @@ fn dequant_scratch(device: &MetalDevice, bytes: usize) -> Result<BufferHandle> {
     let b = device.new_persistent_private(bytes)?;
     g.insert(key, BufferHandle::clone(&b));
     Ok(b)
+}
+
+impl super::PairOrder {
+    /// The one launch's grid this order dispatches, or `None` for
+    /// [`super::PairOrder::Split`], which launches the pair's kernel once a
+    /// half on [`crate::kernels::PairGrid::OneHalf`].
+    pub fn grid(self) -> Option<crate::kernels::PairGrid> {
+        use super::PairOrder;
+        use crate::kernels::PairGrid;
+        match self {
+            PairOrder::Half => Some(PairGrid::HalfSlowest),
+            PairOrder::HalfCmp => Some(PairGrid::HalfSlowestCmp),
+            PairOrder::Expert => Some(PairGrid::HalfByPlane),
+            PairOrder::Tile => Some(PairGrid::HalfFastest),
+            PairOrder::Split => None,
+        }
+    }
 }

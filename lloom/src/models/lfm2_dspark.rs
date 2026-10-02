@@ -680,12 +680,41 @@ impl CtxKv {
     /// §10.4's page size, the one the target's `KvAppend::Paged` ships at.
     pub const DEFAULT_PAGE_SIZE: usize = 256;
 
-    /// `LLOOM_DSPARK_CTX_KV`: `contiguous` (the default when unset) or
-    /// `paged[:page_size]`. Read at construction, never on the hot path. A
-    /// value that parses as neither is an error rather than a fallback, so an
-    /// A/B arm cannot silently measure the other one (§2.4).
-    pub fn from_env() -> Result<Self> {
-        Self::parse(&crate::tuning::tuning().dspark.ctx_kv)
+    /// The tuning spelling that leaves the arm to [`CtxKv::auto`].
+    pub const AUTO: &'static str = "auto";
+
+    /// The arm nothing chose: paged, one pool set per sequence, on Metal —
+    /// the context grows into pages and the draft block is written into
+    /// reserved slots, so a steady-state round allocates nothing (issue #894;
+    /// §10.2z measured it at B=1 as the contiguous arm's equal and at B>1 as
+    /// what keeps the pipelined driver's overlap) — and contiguous on the
+    /// CPU, where the paged kernel does not run.
+    pub fn auto(device: &Device) -> Self {
+        if device.is_metal() {
+            Self::Paged {
+                page_size: Self::DEFAULT_PAGE_SIZE,
+                shared: false,
+            }
+        } else {
+            Self::Contiguous
+        }
+    }
+
+    /// The arm `tuning.dspark.ctx_kv` (`--dspark-ctx`, `LLOOM_DSPARK_CTX_KV`)
+    /// names: `None` for `auto`. Read at construction, never on the hot path.
+    /// A value that parses as neither is an error rather than a fallback, so
+    /// an A/B arm cannot silently measure the other one (§2.4).
+    pub fn from_tuning() -> Result<Option<Self>> {
+        let v = &crate::tuning::tuning().dspark.ctx_kv;
+        if v.trim().eq_ignore_ascii_case(Self::AUTO) {
+            return Ok(None);
+        }
+        Self::parse(v).map(Some)
+    }
+
+    /// [`CtxKv::from_tuning`], the `auto` spelling resolved for `device`.
+    pub fn resolve(device: &Device) -> Result<Self> {
+        Ok(Self::from_tuning()?.unwrap_or_else(|| Self::auto(device)))
     }
 
     /// `contiguous` | `paged[:<page_size>][:shared]`.
@@ -2956,6 +2985,15 @@ struct PerSeq {
     last: u32,
     /// Whether this slot has been `begin`-seeded.
     active: bool,
+    /// The ids at the positions the context has been keyed from, in order —
+    /// the target's token log as this drafter saw it. What `begin_at`
+    /// compares a request's reused prefix against before keeping the context
+    /// for it: a slot that served another sequence holds a well-formed
+    /// context for the wrong tokens, which no gate sees (issue #894).
+    keyed: Vec<u32>,
+    /// The prompt tokens `begin` was given and the seeding observes have not
+    /// yet keyed, in order; they move to `keyed` as their taps arrive.
+    pending: Vec<u32>,
     /// `[1, block_size]` `U32`: the draft block's input ids, the mask ids
     /// written once and slot 0 (the anchor) rewritten per round through the
     /// mapped pointer — where `Tensor::new` per draft was an unpooled driver
@@ -3048,11 +3086,17 @@ pub struct DSparkSpeculator {
     /// Context re-keys taken batched (`observe_rows` over more than one
     /// row), the same gate's other half.
     batched_observes: u64,
+    /// `begin_at` calls on a reused prefix whose context could not be kept —
+    /// the slot held another sequence's, or less of this one than the target
+    /// kept — so the suffix was keyed over a gap. Zero on a chat session that
+    /// kept its drafter; nonzero is where an acceptance rate went.
+    ctx_resets: u64,
 }
 
 impl DSparkSpeculator {
     /// Build a proposer for `n_seq` server slots, the context KV arm read
-    /// from `LLOOM_DSPARK_CTX_KV` ([`CtxKv::from_env`]; contiguous unset).
+    /// from the tuning ([`CtxKv::resolve`]: `auto` unset, paged per sequence
+    /// on Metal).
     ///
     /// `embed` and `lm_head` are the **target's** — cloned here so the drafter
     /// borrows the two shared projections without owning the target
@@ -3064,7 +3108,7 @@ impl DSparkSpeculator {
         lm_head: TracedLinear,
         n_seq: usize,
     ) -> Result<Self> {
-        let ctx_kv = CtxKv::from_env()?;
+        let ctx_kv = CtxKv::resolve(lm_head.weight().device())?;
         Self::new_with_ctx(drafter, embed, lm_head, n_seq, ctx_kv)
     }
 
@@ -3089,6 +3133,8 @@ impl DSparkSpeculator {
                     ctx_offset: 0,
                     last: 0,
                     active: false,
+                    keyed: Vec::new(),
+                    pending: Vec::new(),
                     // Uploads, not `zeros`: a pooled `zeros` is a fill blit that
                     // may still be queued when the first mapped write lands.
                     block_slot: Tensor::new(mask_block.as_slice(), &device)?.unsqueeze(0)?,
@@ -3120,6 +3166,7 @@ impl DSparkSpeculator {
             active_slot,
             batched_drafts: 0,
             batched_observes: 0,
+            ctx_resets: 0,
         })
     }
 
@@ -3129,6 +3176,19 @@ impl DSparkSpeculator {
     }
 
     /// Context re-keys taken over more than one row in one pass.
+    /// Reused-prefix requests whose context had to be reset (`begin_at`).
+    pub fn ctx_resets(&self) -> u64 {
+        self.ctx_resets
+    }
+
+    /// Slot `seq`'s context length, in keyed positions, and the position the
+    /// next key lands at — equal unless the context was reset over a gap.
+    pub fn ctx_state(&self, seq: SeqId) -> Option<(usize, usize)> {
+        self.seqs
+            .get(seq.0)
+            .map(|s| (s.ctx.first().map(|c| c.len()).unwrap_or(0), s.ctx_offset))
+    }
+
     pub fn batched_observes(&self) -> u64 {
         self.batched_observes
     }
@@ -3312,11 +3372,6 @@ impl DSparkSpeculator {
         Ok(out)
     }
 
-    fn seq_mut(&mut self, seq: SeqId) -> Result<&mut PerSeq> {
-        self.seqs
-            .get_mut(seq.0)
-            .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no sequence slot {}", seq.0)))
-    }
 
     /// Draft one block for one already-seeded sequence — the verify example's
     /// per-round draft body, factored behind the seam.
@@ -3391,14 +3446,54 @@ impl Speculator for DSparkSpeculator {
     }
 
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
-        let s = self.seq_mut(seq)?;
-        for c in s.ctx.iter_mut() {
-            c.clear();
+        self.begin_at(seq, prompt, &[])
+    }
+
+    fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        let pos = kept.len();
+        let ctx_resets = &mut self.ctx_resets;
+        let s = self
+            .seqs
+            .get_mut(seq.0)
+            .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
+        // The context is kept for the reused prefix only if it was keyed from
+        // exactly those tokens, at least that far; then it is cut back to
+        // them (a rewind is a length decrement, §10.2z). Otherwise it is
+        // reset and the suffix is keyed at its true positions over a gap —
+        // the positions are the target's either way, the acceptance rate
+        // pays for the gap and nothing else does.
+        let have = s.ctx.first().map(|c| c.len()).unwrap_or(0);
+        let follow = pos > 0
+            && s.keyed.len() >= pos
+            && s.keyed[..pos] == kept[..]
+            && have >= pos
+            && s.ctx_offset >= pos;
+        if follow {
+            if have > pos {
+                for c in s.ctx.iter_mut() {
+                    c.truncate(have - pos)?;
+                }
+            }
+            s.keyed.truncate(pos);
+        } else {
+            for c in s.ctx.iter_mut() {
+                c.clear();
+            }
+            s.keyed.clear();
+            if pos > 0 {
+                *ctx_resets += 1;
+            }
         }
-        s.ctx_offset = 0;
-        s.last = *prompt.last().unwrap_or(&0);
+        s.ctx_offset = pos;
+        s.pending.clear();
+        s.pending.extend_from_slice(prompt);
+        s.last = *prompt.last().or(kept.last()).unwrap_or(&0);
         s.active = true;
         Ok(())
+    }
+
+    fn context_len(&self, seq: SeqId) -> Option<usize> {
+        self.seqs.get(seq.0).map(|s| s.ctx_offset)
     }
 
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
@@ -3440,11 +3535,9 @@ impl Speculator for DSparkSpeculator {
             .seqs
             .get_mut(seq.0)
             .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
+        let rows = probe.first().map(|t| t.dim(1)).transpose()?.unwrap_or(0);
         drafter.update_context(probe, s.ctx_offset, &mut s.ctx)?;
-        s.ctx_offset = s.ctx.first().map(|c| c.len()).unwrap_or(s.ctx_offset);
-        if let Some(&t) = accepted.last() {
-            s.last = t;
-        }
+        s.note_keyed(rows, accepted);
         Ok(())
     }
 
@@ -3477,19 +3570,47 @@ impl Speculator for DSparkSpeculator {
         }
         let taps: Vec<&[Tensor]> = rows.iter().map(|(_, p, _)| p.as_slice()).collect();
         let offsets: Vec<usize> = picked.iter().map(|s| s.ctx_offset).collect();
+        let n_rows: Vec<usize> = rows
+            .iter()
+            .map(|(_, p, _)| {
+                p.first()
+                    .map(|t| t.dim(1))
+                    .transpose()
+                    .map(|n| n.unwrap_or(0))
+            })
+            .collect::<Result<_>>()?;
         {
             let mut caches: Vec<&mut [CtxCache]> =
                 picked.iter_mut().map(|s| s.ctx.as_mut_slice()).collect();
             drafter.update_context_rows(&taps, &offsets, &mut caches)?;
         }
-        for (s, (_, _, accepted)) in picked.iter_mut().zip(rows) {
-            s.ctx_offset = s.ctx.first().map(|c| c.len()).unwrap_or(s.ctx_offset);
-            if let Some(&t) = accepted.last() {
-                s.last = t;
-            }
+        for ((s, (_, _, accepted)), n) in picked.iter_mut().zip(rows).zip(n_rows) {
+            s.note_keyed(n, accepted);
         }
         self.batched_observes += 1;
         Ok(())
+    }
+}
+
+impl PerSeq {
+    /// `rows` positions were just keyed from `rows` taps, after which the
+    /// anchor is `accepted`'s last token. While the prompt is being seeded the
+    /// rows are its tokens; in a round they are the window's input tokens the
+    /// target kept — the anchor the round started from and the accepted
+    /// tokens before the last, which becomes the next anchor.
+    fn note_keyed(&mut self, rows: usize, accepted: &[u32]) {
+        let from_prompt = rows.min(self.pending.len());
+        self.keyed.extend(self.pending.drain(..from_prompt));
+        let in_round = rows - from_prompt;
+        if in_round > 0 {
+            self.keyed.push(self.last);
+            let n = in_round.saturating_sub(1).min(accepted.len());
+            self.keyed.extend_from_slice(&accepted[..n]);
+        }
+        self.ctx_offset += rows;
+        if let Some(&t) = accepted.last() {
+            self.last = t;
+        }
     }
 }
 

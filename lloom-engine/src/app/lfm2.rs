@@ -762,22 +762,16 @@ impl Engine {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
-            // The drafter's context KV: on the pool arms at N > 1 one paged
-            // pool set shared by every sequence — the shape the batched
-            // draft's block attention reads in ONE dispatch (§12.9); a
-            // per-sequence pool or the contiguous arm attends per row. The
-            // static pipelined driver (private) keeps the contiguous default
-            // (§10.2z: a shared pool costs THAT driver its overlap). An
-            // explicit `tuning.dspark.ctx_kv` (`--dspark-ctx`, the
-            // `LLOOM_DSPARK_CTX_KV` alias) wins on every arm; its default
-            // spelling is the contiguous arm, so only a value that names
-            // another arm reads as a choice.
-            let ctx_kv = drafter_ctx_kv(
-                CtxKv::from_env()?,
-                std::env::var_os("LLOOM_DSPARK_CTX_KV").is_some(),
-                pooled,
-                n_seq,
-            );
+            // The drafter's context KV: an explicit `tuning.dspark.ctx_kv`
+            // (`--dspark-ctx`, the `LLOOM_DSPARK_CTX_KV` alias) wins on every
+            // arm; `auto` is one paged pool set shared by every sequence on
+            // the pool arms at N > 1 (the shape the batched draft's block
+            // attention reads in ONE dispatch, §12.9), else paged per
+            // sequence on Metal (§10.2z: the arm whose round allocates
+            // nothing; a per-sequence pool is the pipelined driver's own
+            // buffers, so it keeps its overlap), else contiguous.
+            let ctx_kv =
+                drafter_ctx_kv(CtxKv::from_tuning()?, core.device.is_metal(), pooled, n_seq);
             let mut spec = DSparkSpeculator::new_with_ctx(
                 drafter,
                 core.model.draft_embedding().clone(),
@@ -2286,21 +2280,23 @@ fn conv_carry_needed(
 }
 
 /// The drafter's context KV: the arm `tuning.dspark.ctx_kv` names when it
-/// was chosen — the env alias set, or a value other than its default — else
-/// one paged pool shared by every sequence on the pool arms at `N > 1` (the
-/// shape the batched draft reads in one dispatch, §12.9), else the
-/// contiguous arm (the static pipelined driver's; a shared pool costs it its
-/// overlap, §10.2z).
-fn drafter_ctx_kv(tuned: CtxKv, env_set: bool, pooled: bool, n_seq: usize) -> CtxKv {
-    if env_set || tuned != CtxKv::Contiguous {
-        tuned
-    } else if pooled && n_seq > 1 {
-        CtxKv::Paged {
+/// names one, else one paged pool shared by every sequence on the pool arms
+/// at `N > 1` (the shape the batched draft reads in one dispatch, §12.9),
+/// else paged per sequence on Metal — the round allocates nothing and the
+/// pipelined driver keeps its overlap, since the sequences' buffers are
+/// disjoint (§10.2z) — else contiguous, the CPU's.
+fn drafter_ctx_kv(tuned: Option<CtxKv>, metal: bool, pooled: bool, n_seq: usize) -> CtxKv {
+    match tuned {
+        Some(arm) => arm,
+        None if pooled && n_seq > 1 => CtxKv::Paged {
             page_size: CtxKv::DEFAULT_PAGE_SIZE,
             shared: true,
-        }
-    } else {
-        CtxKv::Contiguous
+        },
+        None if metal => CtxKv::Paged {
+            page_size: CtxKv::DEFAULT_PAGE_SIZE,
+            shared: false,
+        },
+        None => CtxKv::Contiguous,
     }
 }
 
@@ -2520,42 +2516,52 @@ mod tests {
     use lloom::nn::ops::KvQuant;
 
     /// `--dspark-ctx` (the tuning knob) reaches the drafter on every arm;
-    /// only when nothing chose one does the pool arms' shared default apply.
+    /// `auto` is the pool arms' shared pool at N > 1, else per-sequence
+    /// pages on Metal, else contiguous.
     #[test]
     fn the_drafter_context_kv_follows_the_knob() {
-        let paged = CtxKv::Paged {
-            page_size: 256,
+        let per_seq = CtxKv::Paged {
+            page_size: CtxKv::DEFAULT_PAGE_SIZE,
             shared: false,
         };
+        let shared = CtxKv::Paged {
+            page_size: CtxKv::DEFAULT_PAGE_SIZE,
+            shared: true,
+        };
         assert_eq!(
-            drafter_ctx_kv(paged, false, false, 1),
-            paged,
-            "the flag alone, --batch 1"
-        );
-        assert_eq!(
-            drafter_ctx_kv(paged, false, true, 4),
-            paged,
-            "the flag beats the pool default"
-        );
-        assert_eq!(
-            drafter_ctx_kv(CtxKv::Contiguous, true, true, 4),
+            drafter_ctx_kv(Some(CtxKv::Contiguous), true, true, 4),
             CtxKv::Contiguous,
-            "the env alias naming the contiguous arm is a choice"
+            "the knob naming the contiguous arm is a choice on every arm"
         );
         assert_eq!(
-            drafter_ctx_kv(CtxKv::Contiguous, false, true, 4),
-            CtxKv::Paged {
-                page_size: CtxKv::DEFAULT_PAGE_SIZE,
-                shared: true
-            }
+            drafter_ctx_kv(Some(per_seq), true, true, 4),
+            per_seq,
+            "the knob beats the pool default"
         );
         assert_eq!(
-            drafter_ctx_kv(CtxKv::Contiguous, false, true, 1),
-            CtxKv::Contiguous
+            drafter_ctx_kv(None, true, true, 4),
+            shared,
+            "auto, pool, N > 1"
         );
         assert_eq!(
-            drafter_ctx_kv(CtxKv::Contiguous, false, false, 4),
-            CtxKv::Contiguous
+            drafter_ctx_kv(None, true, true, 1),
+            per_seq,
+            "auto, pool, N = 1"
+        );
+        assert_eq!(
+            drafter_ctx_kv(None, true, false, 1),
+            per_seq,
+            "auto, private, Metal"
+        );
+        assert_eq!(
+            drafter_ctx_kv(None, true, false, 4),
+            per_seq,
+            "auto, private, N > 1"
+        );
+        assert_eq!(
+            drafter_ctx_kv(None, false, false, 1),
+            CtxKv::Contiguous,
+            "auto on the CPU"
         );
     }
 

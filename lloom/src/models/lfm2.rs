@@ -3165,6 +3165,18 @@ pub struct Cache {
     /// across `reset`; allocated on a layer's first fused step, outside every
     /// plan.
     conv_spare: Vec<Option<Tensor>>,
+    /// The turn checkpoints: the last [`TURN_CHECKPOINTS`] multi-token
+    /// passes, each the tail of its conv input per conv layer, so the cache
+    /// can be put back at any position within [`TURN_CHECKPOINT_SLACK`] of a
+    /// pass's end ([`Cache::restore`]). A ring: a slot's buffers are reused
+    /// by the pass that takes it over, so a prefill allocates none after the
+    /// first `TURN_CHECKPOINTS` passes.
+    turn_checkpoints: Vec<TurnCheckpoint>,
+    /// The ring slot the pass in flight writes its tails into, `None` on a
+    /// pass that takes no checkpoint (a decode step, a verify, `Cat`).
+    turn_ckpt_cur: Option<usize>,
+    /// The slot the next checkpointing pass takes.
+    turn_ckpt_next: usize,
     /// The ring's rotating write index, in slots.
     ///
     /// **Deliberately here and not in a params struct** (`DESIGN.md` §10.2c,
@@ -3463,6 +3475,74 @@ impl crate::nn::model::CacheShare for Cache {
     }
 }
 
+/// Turn checkpoints a cache keeps: the last passes whose end a request can
+/// be put back to. Two chat turns and a serving slot's recent requests fit;
+/// the slots are a ring, so the count bounds the memory and the next pass
+/// reuses the oldest slot's buffers.
+pub const TURN_CHECKPOINTS: usize = 8;
+
+/// Positions before a checkpointed pass's end the checkpoint can still stand
+/// at: its tail keeps `l_cache + TURN_CHECKPOINT_SLACK` input columns, and a
+/// position `back` before the end needs the `l_cache` columns ending there.
+/// A chat re-render drops one token (the generation prompt's `<think>`), so
+/// one would do; a few more cost a column each and admit a template that
+/// drops a little more.
+pub const TURN_CHECKPOINT_SLACK: usize = 16;
+
+/// The state a multi-token pass left, as far as a restore needs it: the
+/// position it ended at and, per conv layer, the newest `tail_len` columns of
+/// the input it convolved over (`[b, hidden, l_cache + TURN_CHECKPOINT_SLACK]`,
+/// the valid columns at the front). The KV needs nothing kept — a restore is
+/// a length decrement there.
+#[derive(Debug, Clone)]
+struct TurnCheckpoint {
+    pos: usize,
+    tail_len: usize,
+    tails: Vec<Option<Tensor>>,
+    valid: bool,
+}
+
+/// `LLOOM_LFM2_LOGITS_DUMP=<path>`: append every forward's logits to `path` —
+/// a record per forward of `pos: u32, rows: u32, vocab: u32` then `rows ×
+/// vocab` little-endian f32 — so two decode paths' logits at one position can
+/// be compared (issue #894 item 3: the margin at the first divergence). A
+/// readback per forward; an instrument, nothing unless the variable is set.
+fn dump_logits(logits: &Tensor, pos: usize) -> Result<()> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static SINK: OnceLock<Option<parking_lot::Mutex<std::fs::File>>> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        let path = std::env::var_os("LLOOM_LFM2_LOGITS_DUMP")?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(parking_lot::Mutex::new(f))
+    });
+    let Some(sink) = sink else {
+        return Ok(());
+    };
+    let l = logits.to_dtype(DType::F32)?;
+    let (rows, vocab) = match l.dims() {
+        [_, v] => (1usize, *v),
+        [_, r, v] => (*r, *v),
+        d => lloom_tensor::bail!("dump_logits: unexpected logits shape {d:?}"),
+    };
+    let vals = l.flatten_all()?.to_vec1::<f32>()?;
+    let mut buf = Vec::with_capacity(12 + vals.len() * 4);
+    buf.extend_from_slice(&(pos as u32).to_le_bytes());
+    buf.extend_from_slice(&(rows as u32).to_le_bytes());
+    buf.extend_from_slice(&(vocab as u32).to_le_bytes());
+    for v in vals {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut f = sink.lock();
+    f.write_all(&buf)
+        .map_err(|e| lloom_tensor::Error::msg(format!("dump_logits: {e}")))?;
+    Ok(())
+}
+
 impl CacheReset for Cache {
     /// Delegates to [`Cache::clear`] — the tested total reset (kvs, kv/quant
     /// slots, conv states, conv phase and compaction flag). This is what lets
@@ -3699,6 +3779,9 @@ impl Cache {
             kv_bytes_per_token,
             conv_states: vec![None; num_layers],
             conv_spare: vec![None; num_layers],
+            turn_checkpoints: Vec::with_capacity(TURN_CHECKPOINTS),
+            turn_ckpt_cur: None,
+            turn_ckpt_next: 0,
             conv_phase: 0,
             conv_phase_prev: 0,
             conv_history: 0,
@@ -4843,6 +4926,12 @@ impl Cache {
         self.conv_phase_prev = 0;
         self.conv_history = 0;
         self.conv_compact = false;
+        // The checkpoints describe the sequence that was just discarded; the
+        // slots' buffers stay as scratch for the next one.
+        self.turn_checkpoints
+            .iter_mut()
+            .for_each(|c| c.valid = false);
+        self.turn_ckpt_cur = None;
     }
 
     /// The page pool's live tokens, pages in use and pages held in quarantine,
@@ -4913,6 +5002,18 @@ impl Cache {
             };
             lloom_tensor::bail!("lfm2 rewind({n}): horizon is {horizon} — {why}")
         }
+        self.rewind_kv(n)?;
+        let width = self.conv_state.width(self.l_cache);
+        self.conv_phase = (self.conv_phase + width - n) % width;
+        self.conv_history -= n;
+        self.forget_checkpoints_past(self.kv_len());
+        Ok(())
+    }
+
+    /// The KV half of a rewind: every plane's length moved back by `n`
+    /// (`DESIGN.md` §10.2a: discarded rows are unreachable above the length
+    /// and are never cleared). The caller has decided the conv half.
+    fn rewind_kv(&mut self, n: usize) -> Result<()> {
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
             if k_slot.all_data.is_none() {
                 continue;
@@ -4935,9 +5036,198 @@ impl Cache {
         if let Some(b) = &self.batch {
             b.pool.inner.lock().kv.rewind_slot(b.slot(), n)?;
         }
-        let width = self.conv_state.width(self.l_cache);
-        self.conv_phase = (self.conv_phase + width - n) % width;
-        self.conv_history -= n;
+        Ok(())
+    }
+
+    /// A multi-token pass of `seq_len` positions is beginning: take a
+    /// checkpoint slot for it, so its conv layers' writers can leave the tail
+    /// of their input there ([`Cache::turn_checkpoint_tail`]). A pass that
+    /// cannot be returned to takes none: a decode step, a speculative verify
+    /// (`resolve` owns its rollback), a `Cat` KV (no length to move back).
+    fn turn_checkpoint_begin(&mut self, seq_len: usize) {
+        self.turn_ckpt_cur = None;
+        if !self.use_kv_cache || seq_len < 2 || self.speculative || self.kv_append == KvAppend::Cat
+        {
+            return;
+        }
+        let pos = self.kv_len() + seq_len;
+        let layers = self.conv_states.len();
+        let slot = self.turn_ckpt_next % TURN_CHECKPOINTS;
+        if slot < self.turn_checkpoints.len() {
+            let c = &mut self.turn_checkpoints[slot];
+            c.pos = pos;
+            c.tail_len = 0;
+            c.valid = false;
+        } else {
+            self.turn_checkpoints.push(TurnCheckpoint {
+                pos,
+                tail_len: 0,
+                tails: vec![None; layers],
+                valid: false,
+            });
+        }
+        self.turn_ckpt_cur = Some(slot);
+        self.turn_ckpt_next = (slot + 1) % TURN_CHECKPOINTS;
+    }
+
+    /// Conv layer `layer` of the pass in flight convolves over `conv_in`
+    /// (`[b, hidden, ctx + seq]`, the carried left context first): keep its
+    /// newest `l_cache + TURN_CHECKPOINT_SLACK` columns in the pass's
+    /// checkpoint slot, written into the slot's own buffer.
+    fn turn_checkpoint_tail(
+        &mut self,
+        layer: usize,
+        conv_in: &Tensor,
+        l_cache: usize,
+    ) -> Result<()> {
+        let Some(slot) = self.turn_ckpt_cur else {
+            return Ok(());
+        };
+        let (b_sz, hidden, src_len) = conv_in.dims3()?;
+        let want = l_cache + TURN_CHECKPOINT_SLACK;
+        let keep = src_len.min(want);
+        let src = conv_in.narrow(2, src_len - keep, keep)?;
+        let c = &mut self.turn_checkpoints[slot];
+        let buf = match &c.tails[layer] {
+            Some(t)
+                if t.dims() == [b_sz, hidden, want]
+                    && t.dtype() == conv_in.dtype()
+                    && t.is_contiguous() =>
+            {
+                t.clone()
+            }
+            _ => {
+                // Outlives every pass, so no plan serves it; a fresh slot's
+                // buffer, allocated once.
+                #[cfg(feature = "metal")]
+                let _declared = lloom_tensor::EscapeGuard::new();
+                zs::zeros(
+                    zs::LFM2_CONV_STATE,
+                    (b_sz, hidden, want),
+                    conv_in.dtype(),
+                    conv_in.device(),
+                )?
+            }
+        };
+        buf.slice_set(&src.contiguous()?, 2, 0)?;
+        c.tails[layer] = Some(buf);
+        c.tail_len = keep;
+        c.valid = true;
+        Ok(())
+    }
+
+    /// The checkpoint [`Cache::restore`] would take `pos` from: a valid one
+    /// whose pass ended at or after `pos`, within its tail's reach.
+    fn checkpoint_for(&self, pos: usize) -> Option<usize> {
+        self.turn_checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.valid && c.tail_len >= self.l_cache)
+            .filter(|(_, c)| pos <= c.pos && c.pos - pos <= c.tail_len - self.l_cache)
+            .map(|(i, _)| i)
+            .next()
+    }
+
+    /// Checkpoints past `pos` describe positions the cache no longer holds.
+    fn forget_checkpoints_past(&mut self, pos: usize) {
+        for c in self.turn_checkpoints.iter_mut() {
+            if c.pos > pos {
+                c.valid = false;
+            }
+        }
+    }
+
+    /// Whether [`Cache::restore`] can put the cache back at `pos`: the KV has
+    /// a length to move, no speculative window is open, and a checkpoint's
+    /// tail reaches `pos` ([`CacheRewind::can_restore`]).
+    pub fn can_restore(&self, pos: usize) -> bool {
+        self.use_kv_cache
+            && !self.speculative
+            && self.kv_append != KvAppend::Cat
+            && pos <= self.kv_len()
+            && self.checkpoint_for(pos).is_some()
+    }
+
+    /// Put the cache back at `pos` from a turn checkpoint: the KV planes to
+    /// that length, every conv layer's state to what a multi-token pass ending
+    /// at `pos` writes — its newest `l_cache` input columns at the front of
+    /// the state, the ring regions past them as a prefill leaves them, the
+    /// phase at the prefill's seed. The next pass then continues exactly as it
+    /// would after a prefill of the first `pos` tokens.
+    pub fn restore(&mut self, pos: usize) -> Result<()> {
+        if !self.can_restore(pos) {
+            lloom_tensor::bail!(
+                "lfm2 restore({pos}): no turn checkpoint reaches it (kv_len {}, checkpoints at {:?})",
+                self.kv_len(),
+                self.turn_checkpoints
+                    .iter()
+                    .filter(|c| c.valid)
+                    .map(|c| (c.pos, c.tail_len.saturating_sub(self.l_cache)))
+                    .collect::<Vec<_>>()
+            )
+        }
+        let idx = self.checkpoint_for(pos).expect("checked by can_restore");
+        let n = self.kv_len() - pos;
+        self.rewind_kv(n)?;
+        let back = self.turn_checkpoints[idx].pos - pos;
+        let tail_len = self.turn_checkpoints[idx].tail_len;
+        let l_cache = self.l_cache;
+        let width = self.conv_state.width(l_cache);
+        let layers = self.conv_states.len();
+        for layer in 0..layers {
+            let Some(tail) = self.turn_checkpoints[idx].tails[layer].clone() else {
+                continue;
+            };
+            let window = tail
+                .narrow(2, tail_len - back - l_cache, l_cache)?
+                .contiguous()?;
+            let (b_sz, hidden, _) = window.dims3()?;
+            let owned = match &self.conv_states[layer] {
+                Some(prev)
+                    if prev.dims() == [b_sz, hidden, width]
+                        && prev.dtype() == window.dtype()
+                        && prev.is_contiguous() =>
+                {
+                    prev.clone()
+                }
+                _ => {
+                    #[cfg(feature = "metal")]
+                    let _declared = lloom_tensor::EscapeGuard::new();
+                    zs::zeros(
+                        zs::LFM2_CONV_STATE,
+                        (b_sz, hidden, width),
+                        window.dtype(),
+                        window.device(),
+                    )?
+                }
+            };
+            owned.slice_set(&window, 2, 0)?;
+            if width > l_cache {
+                let region = owned.narrow(2, l_cache, width - l_cache)?;
+                match self.conv_state {
+                    ConvState::RotatingRing { .. } => {
+                        zs::zero_region(zs::LFM2_CONV_RING_HISTORY, &region)?
+                    }
+                    _ => zs::poison_region(zs::LFM2_CONV_RING_SLACK, &region)?,
+                }
+            }
+            self.set_conv_state(layer, owned)?;
+        }
+        // The seed a multi-token pass leaves (`advance_conv_phase`'s
+        // multi-token arm): the shuffle's phase never moves, the rings' sits
+        // at the newest column, nothing behind the window is history.
+        if !matches!(self.conv_state, ConvState::Shuffle) {
+            self.conv_phase = l_cache - 1;
+        }
+        self.conv_phase_prev = self.conv_phase;
+        self.conv_history = 0;
+        self.conv_compact = false;
+        self.paged_pass_pending = false;
+        #[cfg(feature = "metal")]
+        if let Some(b) = &mut self.batch {
+            b.pass = None;
+        }
+        self.forget_checkpoints_past(pos);
         Ok(())
     }
 
@@ -5012,6 +5302,7 @@ impl Cache {
             self.conv_phase = (self.conv_phase + width - n) % width;
             self.conv_history -= n;
         }
+        self.forget_checkpoints_past(self.kv_len());
         Ok(())
     }
 
@@ -7553,6 +7844,12 @@ impl ShortConv {
                 Some(ctx) => (Tensor::cat(&[ctx, &bx], 2)?.contiguous()?, 0),
                 None => (bx.clone(), self.l_cache.saturating_sub(1)),
             };
+            // The pass's turn checkpoint keeps this layer's newest input
+            // columns, so a later request diverging just before this pass's
+            // end can be put back there (`Cache::restore`).
+            if cache.use_kv_cache && self.l_cache > 0 {
+                cache.turn_checkpoint_tail(block_idx, &conv_in, self.l_cache)?;
+            }
             // A batch row's piece crossing a page boundary leaves the ring
             // after that page's last token for a sharer (§12.3).
             #[cfg(feature = "metal")]
@@ -8251,6 +8548,7 @@ impl Model {
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
+        dump_logits(&logits, index_pos + seq_len - 1)?;
         logits.to_dtype(DType::F32)
     }
 
@@ -8517,6 +8815,7 @@ impl Model {
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
+        dump_logits(&logits, index_pos + seq_len - 1)?;
         logits.to_dtype(DType::F32)
     }
 
@@ -8580,6 +8879,7 @@ impl Model {
         cache.flush_ring_snapshots();
         let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
+        dump_logits(&logits, index_pos)?;
         logits.to_dtype(DType::F32)
     }
 
@@ -8815,6 +9115,7 @@ impl Model {
         // The page pool allocates this pass's pages at the first attention
         // layer; this is the once-per-pass point that says a new pass began.
         cache.paged_pass_pending = true;
+        cache.turn_checkpoint_begin(seq_len);
         #[cfg(feature = "metal")]
         if cache.batch.is_some() {
             if let Some(b) = &mut cache.batch {
@@ -8886,10 +9187,19 @@ impl Model {
     /// Under greedy decoding a speculative scheme is **output-identical to
     /// non-speculative decoding by construction**: a draft token is accepted iff
     /// it equals what the target would have produced, which is
-    /// `argmax(logits[i])`. So the check is exact rather than statistical, and
-    /// **a scheme that changes the output is a bug, not a tradeoff** — which is
-    /// why the canonical digest pair is this mechanism's test rather than a
-    /// divergence bound. Distribution-preserving sampling is a later,
+    /// `argmax(logits[i])`. So the check is exact rather than statistical.
+    /// What "the target would have produced" means is the contract's
+    /// (`architecture.md` §2.3.5b): the window's row runs on the GEMM and the
+    /// tiled attention where greedy's one-row step runs on the GEMV and
+    /// `sdpa_vector`, and the two reduce in a different order — so under the
+    /// default `fast` contract the streams may part where greedy's own top two
+    /// sit within that reordering (issue #894: one position in 200 on the
+    /// prose prompt, greedy's margin 0.0156 against a max |Δlogit| of 0.023
+    /// between the paths, invariant to fencing and run to run). A divergence
+    /// that moves with the schedule, or one wider than the reordering, is a
+    /// bug, not a tradeoff; the `deterministic` contract owes byte identity
+    /// and does not have it yet (§10.2z-v records the price of each way to
+    /// close the seam). Distribution-preserving sampling is a later,
     /// separately-argued step and is deliberately absent.
     ///
     /// # The window is `k + 1` positions, and the last one is the bonus token
@@ -9384,6 +9694,14 @@ impl crate::nn::model::CacheRewind for Cache {
 
     fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
         Cache::rewind_unwritten(self, n)
+    }
+
+    fn can_restore(&self, pos: usize) -> bool {
+        Cache::can_restore(self, pos)
+    }
+
+    fn restore(&mut self, pos: usize) -> Result<()> {
+        Cache::restore(self, pos)
     }
 }
 

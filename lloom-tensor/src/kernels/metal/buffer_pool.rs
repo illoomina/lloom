@@ -162,7 +162,7 @@ fn trace_allocation(size: usize, why: &str) {
                 .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':')
                 .trim()
         })
-        .take(6)
+        .take(16)
         .collect();
     eprintln!("[pool alloc {size} B; {why}] {}", frames.join(" <- "));
 }
@@ -743,6 +743,12 @@ pub struct PoolCounters {
     /// found a later use, which is the steady state a fixed-shape workload
     /// reaches.
     pub evicted: u64,
+    /// Of `allocations`, those made while a buffer of the SAME size sat in
+    /// the pending list — released, its last reader's epoch not yet complete
+    /// (§6.3b's deferred release). The host ran ahead of the GPU; the size
+    /// was owned. The rest of `allocations` are sizes the pool had never
+    /// seen or had evicted.
+    pub pending_twin_allocations: u64,
 
     /// Bytes callers actually asked for, summed over every served `acquire`.
     ///
@@ -2206,8 +2212,17 @@ impl BufferPool {
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
             state.live_bytes += size;
+            // A miss already pays `newBufferWithLength`; the scan over the
+            // pending list says whether it was the deferred-release window.
+            let pending_same = state
+                .pending
+                .iter()
+                .filter(|n| n.size() == size)
+                .count();
+            if pending_same > 0 {
+                state.counters.pending_twin_allocations += 1;
+            }
             if trace_on() {
-                let pending_same = state.pending.iter().filter(|n| n.size() == size).count();
                 let free_same = state.free.get(&size).map_or(0, |b| b.nodes.len());
                 let head = state.pending.head_epoch();
                 Some(format!(

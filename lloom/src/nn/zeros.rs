@@ -44,6 +44,11 @@ pub const LFM2_KV_QUANT: &str = "lfm2.kv.quant";
 /// The paged KV pools (`PagedKv`): slots no page has written.
 pub const LFM2_KV_PAGES: &str = "lfm2.kv.pages";
 
+/// `nn::kv_cache::Cache`'s slab (the zoo's and Qwen4-exp's KV): never
+/// poisoned, so it is not in `SITES` — its zeros are read as zeros by every
+/// model that takes it, and the LFM2 census above is LFM2's.
+pub const NN_KV_SLAB: &str = "nn.kv_cache.slab";
+
 /// Every site a poison list may name.
 pub const SITES: &[&str] = &[
     LFM2_CONV_RING_SLACK,

@@ -1562,154 +1562,20 @@ impl Default for Config {
 }
 
 /// One attention layer's K or V, pre-allocated once and written at a moving
-/// offset.
-///
-/// `DESIGN.md` §6.2's `Tensor::cat` reallocates and copies the whole cache every
-/// token; this writes only the new token's bytes and hands back a `narrow` of
-/// the buffer. Three consequences, and the third is the one §11.1a.1 is after:
-///
-/// * the `cat` is gone, so the `copy2d` per layer per token drops from 2 to 1;
-/// * the surviving `copy2d` is **constant-size** — one token's `[1, 8, 1, 64]`
-///   — where the `cat` copied `kv_len` tokens and grew by 64 rows per step;
-/// * **the buffer identity stops changing.** `narrow` clones the storage `Arc`
-///   and rewrites only the layout, so every token binds the same `MTLBuffer` at
-///   the same base. That is the property ICB replay needs and the reason this
-///   is worth more than the copy it removes.
-///
-/// The read is a *view*, never a copy. `call_sdpa_vector` takes `k_l.stride()`
-/// and `n = k_shape[2]`, so a narrowed cache is exactly the shape it is written
-/// to consume (`candle-metal-kernels/src/kernels/sdpa.rs`); the generic arm's
-/// `repeat_kv` goes through `Tensor::cat`, which handles a strided source.
-#[derive(Debug, Clone)]
-struct KvSlot {
-    /// `[b_sz, n_kv_heads, capacity, head_dim]`, allocated on first append.
-    ///
-    /// `None` until then, because the batch size is not known at `Cache::new`.
-    /// This mirrors `crate::nn::kv_cache::Cache`, deliberately: that type is the
-    /// same mechanism and was read before this was written (see the note on
-    /// `Cache::new_with` for why it is not reused directly).
-    all_data: Option<Tensor>,
-    /// How many tokens of `all_data` are live. The `narrow` length.
-    len: usize,
-    capacity: usize,
-}
+/// offset: `nn::slab::Slab` along the sequence dim, at the bucket's width,
+/// widened only by `Cache::prepare_pass` before a pass appends
+/// (`Grow::Fixed`). The read is a view, the write one constant-size
+/// `copy2d`, and the buffer identity moves only at a grow (§6.2b); the
+/// rationale is the slab's own.
+type KvSlot = crate::nn::slab::Slab;
 
-impl KvSlot {
-    fn new(capacity: usize) -> Self {
-        Self {
-            all_data: None,
-            len: 0,
-            capacity,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.len = 0;
-        self.all_data = None;
-    }
-
-    /// Discard the last `count` appended positions.
-    ///
-    /// `DESIGN.md` §10.2a's KV half of `resolve`: *"`len += n`; discarded bytes
-    /// **need not be cleared** — unreachable above `len`"*. The read is
-    /// `all_data.narrow(2, 0, self.len)`, so a position above `len` is outside
-    /// every view this slot hands out and no kernel can address it.
-    ///
-    /// **The allocation is deliberately not touched.** Rewinding frees nothing
-    /// and must not: stable buffer identity is the property §6.2b exists to
-    /// preserve (`buf#69` at the same base every token), and dropping the
-    /// buffer on rollback would move it at exactly the moment a speculative
-    /// scheme runs most often. A rewind is a length decrement and nothing else,
-    /// which is what §10.2a's cost column means by *"a length decrement"*.
-    fn rewind(&mut self, count: usize) -> Result<()> {
-        if count > self.len {
-            lloom_tensor::bail!(
-                "lfm2 KV rewind past the start: {count} > len {}. \
-                 `resolve(n)` may only discard positions this speculation appended.",
-                self.len
-            )
-        }
-        self.len -= count;
-        Ok(())
-    }
-
-    /// Bytes the slab holds. Zero before the first append.
-    fn bytes(&self) -> usize {
-        self.all_data
-            .as_ref()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .unwrap_or(0)
-    }
-
-    /// Widen the slab to `capacity` tokens, keeping every position where it is.
-    ///
-    /// Before the first append this is a number: the slab is allocated at the
-    /// new width when the first token arrives. After it, a fresh slab is
-    /// allocated at the new width and the old one is copied into its prefix
-    /// whole — every position, live or rewound, lands at the offset it had, so
-    /// the views this slot hands out afterwards read exactly the bytes the
-    /// views before it did. The copy is `slice_set`'s one `copy2d` per plane;
-    /// the old slab returns to the pool when the last view of it drops.
-    ///
-    /// **The buffer identity moves here, and only here.** §6.2b's property —
-    /// one `MTLBuffer` at one base every token — holds between grows; a grow
-    /// is the one event that re-binds it, paid once per bucket rather than
-    /// once per token. A replay executor sees the step as stale and re-records
-    /// (§11.3y); the arena sees a drift and re-records (§9.2z). Neither is a
-    /// wrong answer, and both are the documented price.
-    ///
-    /// A `capacity` at or below the current one is a no-op, never a shrink:
-    /// the caller decides the width, and this never discards a position.
-    fn grow_to(&mut self, capacity: usize) -> Result<()> {
-        if capacity <= self.capacity {
-            return Ok(());
-        }
-        if let Some(old) = self.all_data.as_ref() {
-            let mut shape = old.dims().to_vec();
-            shape[2] = capacity;
-            let grown = zs::zeros(zs::LFM2_KV_SLAB, shape, old.dtype(), old.device())?;
-            grown.slice_set(old, 2, 0)?;
-            self.all_data = Some(grown);
-        }
-        self.capacity = capacity;
-        Ok(())
-    }
-
-    /// Append `src` along dim 2 and return the live prefix as a view.
-    ///
-    /// Returns `Err` rather than reallocating when the capacity is exhausted:
-    /// the slab is widened by `Cache::prepare_pass` before a pass appends, so
-    /// reaching this means an append ran outside a prepared pass.
-    fn append(&mut self, src: &Tensor) -> Result<Tensor> {
-        let seq_len = src.dim(2)?;
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[2] = self.capacity;
-            self.all_data = Some(zs::zeros(
-                zs::LFM2_KV_SLAB,
-                shape,
-                src.dtype(),
-                src.device(),
-            )?);
-        }
-        let all_data = self.all_data.as_ref().unwrap();
-        if self.len + seq_len > self.capacity {
-            lloom_tensor::bail!(
-                "lfm2 KV cache exhausted: {} + {} > capacity {}. \
-                 A pass widens the slab before it appends (`Cache::prepare_pass`); this \
-                 append ran outside a prepared pass.",
-                self.len,
-                seq_len,
-                self.capacity
-            )
-        }
-        // `slice_set` requires both sides contiguous and writes one `copy2d` of
-        // exactly `src`'s bytes at `offset * block_size` (`tensor_cat.rs`). The
-        // caller has already made `src` contiguous.
-        all_data.slice_set(src, 2, self.len)?;
-        self.len += seq_len;
-        all_data.narrow(2, 0, self.len)
-    }
+fn kv_slot(capacity: usize) -> KvSlot {
+    crate::nn::slab::Slab::new(
+        2,
+        capacity,
+        crate::nn::slab::Grow::Fixed,
+        zs::LFM2_KV_SLAB,
+    )
 }
 
 /// One attention layer's K or V, stored as integer codes plus a (scale, bias)
@@ -1944,11 +1810,11 @@ impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
     }
 
     fn len(&self) -> usize {
-        self.0.len
+        self.0.len()
     }
 
     fn rollback(&mut self, to: usize) -> Result<()> {
-        let len = self.0.len;
+        let len = self.0.len();
         if to > len {
             lloom_tensor::bail!("lfm2 KvSlot rollback to {to} past len {len}")
         }
@@ -3757,7 +3623,7 @@ impl Cache {
             use_kv_cache,
             kvs: vec![None; num_layers],
             kv_slots: (0..num_layers)
-                .map(|_| (KvSlot::new(slab), KvSlot::new(slab)))
+                .map(|_| (kv_slot(slab), kv_slot(slab)))
                 .collect(),
             quant_slots: (0..num_layers)
                 .map(|_| {
@@ -4254,7 +4120,7 @@ impl Cache {
         if bucket == 0 {
             lloom_tensor::bail!("lfm2 kv_bucket must be at least one token")
         }
-        let allocated = self.kv_slots.iter().any(|(k, _)| k.all_data.is_some())
+        let allocated = self.kv_slots.iter().any(|(k, _)| k.is_allocated())
             || self.quant_slots.iter().any(|(k, _)| k.codes.is_some());
         if allocated {
             lloom_tensor::bail!(
@@ -4311,8 +4177,8 @@ impl Cache {
             KvAppend::InPlace => self
                 .kv_slots
                 .iter()
-                .find(|(k, _)| k.all_data.is_some())
-                .map(|(k, _)| k.len)
+                .find(|(k, _)| k.is_allocated())
+                .map(|(k, _)| k.len())
                 .unwrap_or(0),
             KvAppend::Paged => {
                 #[cfg(feature = "metal")]
@@ -4535,8 +4401,8 @@ impl Cache {
     /// it.
     fn set_slab(&mut self, slab: usize) {
         for (k, v) in self.kv_slots.iter_mut() {
-            k.capacity = slab;
-            v.capacity = slab;
+            k.set_capacity(slab);
+            v.set_capacity(slab);
         }
         for (k, v) in self.quant_slots.iter_mut() {
             k.capacity = slab;
@@ -4609,7 +4475,7 @@ impl Cache {
                     .kv_slots
                     .iter()
                     .flat_map(|(k, v)| [k, v])
-                    .filter_map(|s| s.all_data.as_ref())
+                    .filter_map(|s| s.data().as_ref())
                     .map(|t| {
                         let d = t.dims();
                         d[0] * d[1] * d[3] * elem(t)
@@ -5042,7 +4908,7 @@ impl Cache {
     /// and are never cleared). The caller has decided the conv half.
     fn rewind_kv(&mut self, n: usize) -> Result<()> {
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(n)?;
@@ -5305,7 +5171,7 @@ impl Cache {
             );
         }
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(n)?;
@@ -5411,8 +5277,8 @@ impl Cache {
             kv_len: self
                 .kv_slots
                 .iter()
-                .find(|(k_slot, _)| k_slot.all_data.is_some())
-                .map(|(k_slot, _)| k_slot.len),
+                .find(|(k_slot, _)| k_slot.is_allocated())
+                .map(|(k_slot, _)| k_slot.len()),
             conv_phase: self.conv_phase,
         })
     }
@@ -5490,7 +5356,7 @@ impl Cache {
         // rather than tolerating a short rewind is what keeps `rewind`'s bound
         // check meaningful for the slots that *are* live.
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(discard)?;
@@ -5529,10 +5395,10 @@ impl Cache {
             tok.kv_len,
             self.kv_slots
                 .iter()
-                .find(|(k_slot, _)| k_slot.all_data.is_some()),
+                .find(|(k_slot, _)| k_slot.is_allocated()),
         ) {
             debug_assert_eq!(
-                k_slot.len,
+                k_slot.len(),
                 before + n,
                 "resolve must leave exactly the accepted positions live"
             );
@@ -10029,7 +9895,7 @@ pub mod kv_slot_fuzz {
         ops: &[SlotOp],
         dev: &Device,
     ) -> std::result::Result<SlotTransitions, String> {
-        let mut slot = KvSlot::new(capacity);
+        let mut slot = kv_slot(capacity);
         let mut model = SlotModel {
             live: Vec::new(),
             heads: 2,
@@ -10169,15 +10035,15 @@ pub mod kv_slot_fuzz {
                 }
                 SlotOp::Grow { by } => {
                     let to = capacity + by;
-                    if slot.all_data.is_some() {
+                    if slot.is_allocated() {
                         t.grows += 1;
                     }
                     slot.grow_to(to)
                         .map_err(|e| format!("op {i}: grow_to({to}) failed: {e}"))?;
-                    if slot.capacity != to {
+                    if slot.capacity() != to {
                         return Err(format!(
                             "op {i}: grow_to({to}) left the capacity at {}",
-                            slot.capacity
+                            slot.capacity()
                         ));
                     }
                     capacity = to;
@@ -10197,7 +10063,7 @@ pub mod kv_slot_fuzz {
 
             // --- the comparison, after every operation ----------------------
             let want = &model.live;
-            match slot.all_data.as_ref() {
+            match slot.data().as_ref() {
                 None => {
                     if !want.is_empty() {
                         return Err(format!(
@@ -10208,16 +10074,16 @@ pub mod kv_slot_fuzz {
                     }
                 }
                 Some(all) => {
-                    if slot.len != want.len() {
+                    if slot.len() != want.len() {
                         return Err(format!(
-                            "op {i} ({op:?}): slot.len={} model={}",
-                            slot.len,
+                            "op {i} ({op:?}): slot.len()={} model={}",
+                            slot.len(),
                             want.len()
                         ));
                     }
-                    if slot.len > 0 {
+                    if slot.len() > 0 {
                         let view = all
-                            .narrow(2, 0, slot.len)
+                            .narrow(2, 0, slot.len())
                             .map_err(|e| format!("op {i}: narrow failed: {e}"))?;
                         let got = view
                             .flatten_all()
@@ -10246,7 +10112,7 @@ pub mod kv_slot_fuzz {
                                  A length that matches with contents that do not is the \
                                  shape a length-only assertion cannot see (CONTRIBUTING \
                                  §3.1b).",
-                                slot.len,
+                                slot.len(),
                                 &got[..got.len().min(12)],
                                 &expect[..expect.len().min(12)]
                             ));
@@ -10254,10 +10120,10 @@ pub mod kv_slot_fuzz {
                     }
                 }
             }
-            if slot.len > capacity {
+            if slot.len() > capacity {
                 return Err(format!(
                     "op {i} ({op:?}): len {} exceeds capacity {capacity}",
-                    slot.len
+                    slot.len()
                 ));
             }
         }
@@ -10422,7 +10288,7 @@ mod tests {
     fn in_place_append_matches_cat() -> Result<()> {
         let dev = Device::Cpu;
         for steps in 1..=6 {
-            let mut slot = KvSlot::new(8);
+            let mut slot = kv_slot(8);
             let mut got = None;
             for s in 0..steps {
                 got = Some(slot.append(&token(s, &dev)?)?);
@@ -10449,7 +10315,7 @@ mod tests {
     #[test]
     fn in_place_survives_a_multi_token_append_at_a_nonzero_offset() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         // A 3-token "prefill" on top of 2 decoded tokens.
@@ -10484,7 +10350,7 @@ mod tests {
     #[test]
     fn the_read_is_a_view_of_the_preallocated_buffer() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         let first = slot.append(&token(0, &dev)?)?;
         let first_before = first.flatten_all()?.to_vec1::<f32>()?;
         let second = slot.append(&token(1, &dev)?)?;
@@ -10498,7 +10364,7 @@ mod tests {
 
         // Both views must be prefixes of one buffer: read the backing store at
         // full capacity and check each view equals its own leading slice.
-        let backing = slot.all_data.as_ref().unwrap();
+        let backing = slot.data().as_ref().unwrap();
         for (steps, view) in [(1usize, &first), (2usize, &second)] {
             let want = backing
                 .narrow(2, 0, steps)?
@@ -10522,7 +10388,7 @@ mod tests {
     #[test]
     fn exceeding_capacity_fails_loudly() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(2);
+        let mut slot = kv_slot(2);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         let err = slot.append(&token(2, &dev)?).unwrap_err().to_string();
@@ -10541,7 +10407,7 @@ mod tests {
     #[test]
     fn reset_returns_the_slot_to_its_pre_prefill_state() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         slot.reset();
@@ -10560,29 +10426,29 @@ mod tests {
     #[test]
     fn growing_the_slab_keeps_every_position_where_it_was() -> Result<()> {
         let dev = Device::Cpu;
-        let mut grown = KvSlot::new(2);
-        let mut wide = KvSlot::new(5);
+        let mut grown = kv_slot(2);
+        let mut wide = kv_slot(5);
         for i in 0..2 {
             grown.append(&token(i, &dev)?)?;
             wide.append(&token(i, &dev)?)?;
         }
         let before = grown
-            .all_data
+            .data()
             .as_ref()
             .unwrap()
             .narrow(2, 0, 2)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         grown.grow_to(5)?;
-        assert_eq!(grown.capacity, 5);
-        assert_eq!(grown.len, 2, "a grow moves no position");
+        assert_eq!(grown.capacity(), 5);
+        assert_eq!(grown.len(), 2, "a grow moves no position");
         assert_eq!(
-            grown.all_data.as_ref().unwrap().dims()[2],
+            grown.data().as_ref().unwrap().dims()[2],
             5,
             "the slab is five wide after the grow"
         );
         let after = grown
-            .all_data
+            .data()
             .as_ref()
             .unwrap()
             .narrow(2, 0, 2)?
@@ -10599,7 +10465,7 @@ mod tests {
                 i + 1
             );
         }
-        let view = grown.all_data.as_ref().unwrap().narrow(2, 0, 5)?;
+        let view = grown.data().as_ref().unwrap().narrow(2, 0, 5)?;
         assert_eq!(
             view.flatten_all()?.to_vec1::<f32>()?,
             cat_reference(5, &dev)?.flatten_all()?.to_vec1::<f32>()?
@@ -10612,20 +10478,20 @@ mod tests {
     #[test]
     fn a_grow_never_shrinks_and_never_reallocates_needlessly() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(4);
+        let mut slot = kv_slot(4);
         slot.append(&token(0, &dev)?)?;
-        let id = slot.all_data.as_ref().unwrap().id();
+        let id = slot.data().as_ref().unwrap().id();
         slot.grow_to(4)?;
         slot.grow_to(2)?;
-        assert_eq!(slot.capacity, 4);
+        assert_eq!(slot.capacity(), 4);
         assert_eq!(
-            slot.all_data.as_ref().unwrap().id(),
+            slot.data().as_ref().unwrap().id(),
             id,
             "no-op grows keep the buffer"
         );
         slot.grow_to(6)?;
         assert_ne!(
-            slot.all_data.as_ref().unwrap().id(),
+            slot.data().as_ref().unwrap().id(),
             id,
             "a real grow re-binds it"
         );
@@ -10637,13 +10503,13 @@ mod tests {
     #[test]
     fn a_grow_before_the_first_append_sets_the_width_and_allocates_nothing() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(2);
+        let mut slot = kv_slot(2);
         slot.grow_to(6)?;
-        assert!(slot.all_data.is_none());
-        assert_eq!(slot.capacity, 6);
+        assert!(!slot.is_allocated());
+        assert_eq!(slot.capacity(), 6);
         let view = slot.append(&token(0, &dev)?)?;
         assert_eq!(view.dims()[2], 1);
-        assert_eq!(slot.all_data.as_ref().unwrap().dims()[2], 6);
+        assert_eq!(slot.data().as_ref().unwrap().dims()[2], 6);
         Ok(())
     }
 

@@ -52,6 +52,7 @@ pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
 pub mod short_conv;
+pub mod slab;
 pub mod speculator;
 pub mod var_builder;
 pub mod var_map;

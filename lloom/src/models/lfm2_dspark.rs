@@ -963,7 +963,7 @@ impl CtxCache {
 mod paged_ctx {
     use super::{Arc, Device, Mutex, Result, Tensor};
     use lloom_tensor::kernels::metal::{
-        Epoch, GpuClock, KvPagePool, PageError, PageIdx, PageQuarantine,
+        Epoch, GpuClock, PageError, PageIdx,
     };
 
     /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
@@ -974,8 +974,8 @@ mod paged_ctx {
     /// quarantine, and the `[1, H_kv, pool_pages × P, D]` K/V pools, allocated
     /// at the first append at that append's dtype and geometry.
     struct LayerPool {
-        pool: KvPagePool,
-        quarantine: PageQuarantine,
+        /// The allocator with its liveness, over the tier's clock.
+        pool: crate::nn::page_pool::PagePool,
         kv: Option<(Tensor, Tensor)>,
         /// Per sequence: the `reserve` slots past its live length, as the U32
         /// tensor the block scatter takes, and the largest of them.
@@ -1073,8 +1073,13 @@ mod paged_ctx {
                 .map(|_| LayerPool {
                     // A table may reach the whole pool: exhaustion is reported
                     // as the pool's, which names the grow, never as a full table.
-                    pool: KvPagePool::new(page_size, pool_pages, n_seqs.max(1), pool_pages + 1),
-                    quarantine: PageQuarantine::new(),
+                    pool: crate::nn::page_pool::PagePool::with_clock(
+                        page_size,
+                        pool_pages,
+                        n_seqs.max(1),
+                        pool_pages + 1,
+                        Arc::clone(&clock),
+                    ),
                     kv: None,
                     block: vec![None; n_seqs.max(1)],
                     block_all: None,
@@ -1176,12 +1181,10 @@ mod paged_ctx {
             }
             let page_size = self.page_size;
             let reserve = self.reserve;
-            let completed = self.clock.completed_count();
-            {
-                let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain(completed);
-                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-            }
+            self.layers[layer]
+                .pool
+                .recycle_ready()
+                .map_err(lloom_tensor::Error::wrap)?;
             // Room for the append and the block behind it, a bucket at a time.
             loop {
                 let lp = &mut self.layers[layer];
@@ -1250,12 +1253,10 @@ mod paged_ctx {
             }
             let page_size = self.page_size;
             let reserve = self.reserve;
-            let completed = self.clock.completed_count();
-            {
-                let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain(completed);
-                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-            }
+            self.layers[layer]
+                .pool
+                .recycle_ready()
+                .map_err(lloom_tensor::Error::wrap)?;
             let mut slots = std::mem::take(&mut self.scratch_slots);
             slots.clear();
             let mut blocks = std::mem::take(&mut self.scratch_blocks);
@@ -1614,7 +1615,6 @@ mod paged_ctx {
         /// command buffer encoded now belongs to (§10.3h's one non-fence
         /// obligation). Idempotent.
         fn reset(&mut self, layer: usize, seq: usize) {
-            let epoch = self.clock.current_epoch();
             let lp = &mut self.layers[layer];
             if lp
                 .pool
@@ -1624,8 +1624,7 @@ mod paged_ctx {
             {
                 return;
             }
-            let freed = lp.pool.release(seq);
-            lp.quarantine.retire_all(epoch, freed);
+            lp.pool.release(seq);
             lp.block[seq] = None;
         }
     }

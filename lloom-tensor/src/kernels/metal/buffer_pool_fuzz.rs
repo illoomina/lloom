@@ -42,7 +42,7 @@
 
 use super::buffer_pool::{BufferHandle, BufferPool, GpuClock};
 use super::device::Device;
-use crate::retire::{Completed, Epoch};
+use crate::retire::Epoch;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -874,7 +874,7 @@ mod proptests {
         ) {
             let clock = GpuClock::new();
             prop_assert_eq!(clock.current_epoch(), Epoch(0));
-            prop_assert_eq!(clock.completed_count(), Completed(0));
+            prop_assert_eq!(clock.completed_count(), crate::retire::Completed(0));
 
             let mut last_completed = 0u64;
             let mut submitted = 0u64;

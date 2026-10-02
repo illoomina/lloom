@@ -45,6 +45,7 @@ pub mod ngram_memory;
 pub mod observer;
 pub mod ops;
 pub mod optim;
+pub mod page_pool;
 pub mod recurrent;
 pub mod ring;
 pub mod rnn;

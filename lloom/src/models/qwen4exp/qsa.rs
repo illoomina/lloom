@@ -36,7 +36,6 @@ use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
 use lloom_tensor::quantized::QMatMul;
-use lloom_tensor::retire::{Completed, Epoch};
 use lloom_tensor::{DType, Module, Result, Tensor, D};
 
 /// Per-layer growing KV state for one sequence (full-attn layers only). Unlike
@@ -586,13 +585,10 @@ struct KvPoolInner {
     hd: usize,
     dtype: DType,
     device: lloom_tensor::Device,
-    /// A page table per slot, shared by the layers.
-    pages: lloom_tensor::kv_pages::KvPagePool,
-    /// Pages released by a cleared slot, held until the GPU's epoch that
-    /// could read them has completed.
-    quarantine: lloom_tensor::kv_pages::PageQuarantine,
-    #[cfg(feature = "metal")]
-    clock: Option<std::sync::Arc<lloom_tensor::kernels::metal::GpuClock>>,
+    /// A page table per slot, shared by the layers, with its liveness
+    /// (`nn::page_pool::PagePool`): a cleared slot's pages wait for the GPU's
+    /// epoch that could read them.
+    pages: crate::nn::page_pool::PagePool,
     /// Pages every layer's storage holds (the layers grow together).
     storage_pages: usize,
     layers: Vec<LayerStore>,
@@ -616,11 +612,6 @@ impl KvPool {
     ) -> Self {
         let page_size = KV_PAGE_TOKENS;
         let grow_pages = (slots.max(1) * KV_SLAB_TOKENS).div_ceil(page_size).max(1);
-        #[cfg(feature = "metal")]
-        let clock = match device {
-            lloom_tensor::Device::Metal(d) => Some(d.gpu_clock()),
-            _ => None,
-        };
         Self {
             inner: std::sync::Arc::new(parking_lot::Mutex::new(KvPoolInner {
                 slots,
@@ -631,15 +622,13 @@ impl KvPool {
                 hd,
                 dtype,
                 device: device.clone(),
-                pages: lloom_tensor::kv_pages::KvPagePool::new(
+                pages: crate::nn::page_pool::PagePool::new(
                     page_size,
                     0,
                     slots,
                     u32::MAX as usize,
+                    device,
                 ),
-                quarantine: lloom_tensor::kv_pages::PageQuarantine::new(),
-                #[cfg(feature = "metal")]
-                clock,
                 storage_pages: 0,
                 layers: (0..n_layers)
                     .map(|_| LayerStore {
@@ -890,47 +879,14 @@ impl KvPool {
 }
 
 impl KvPoolInner {
-    /// The GPU's current epoch (Metal), the epoch a released page waits for.
-    fn epoch(&self) -> Epoch {
-        #[cfg(feature = "metal")]
-        {
-            self.clock
-                .as_ref()
-                .map(|c| c.current_epoch())
-                .unwrap_or(Epoch::ZERO)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            Epoch::ZERO
-        }
-    }
-
-    /// Epochs the GPU has completed (every one, without a clock).
-    fn completed(&self) -> Completed {
-        #[cfg(feature = "metal")]
-        {
-            self.clock
-                .as_ref()
-                .map(|c| c.completed_count())
-                .unwrap_or(Completed::ALL)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            Completed::ALL
-        }
-    }
-
     fn recycle_quarantined(&mut self) {
-        let ready = self.quarantine.drain(self.completed());
-        if !ready.is_empty() {
-            self.pages.recycle(&ready).expect("quarantined pages are unallocated");
-        }
+        self.pages
+            .recycle_ready()
+            .expect("quarantined pages are unallocated");
     }
 
     fn release_pages(&mut self, slot: usize) {
-        let freed = self.pages.release(slot);
-        let epoch = self.epoch();
-        self.quarantine.retire_all(epoch, freed);
+        self.pages.release(slot);
     }
 
     fn rewind_table(&mut self, slot: usize) {

@@ -17,7 +17,7 @@ use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
-use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageIdx, PageQuarantine};
+use lloom_tensor::kernels::metal::{GpuClock, PageError, PageIdx};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
@@ -1863,8 +1863,9 @@ struct PagedKv {
     /// sequences' tables are not the identity — the fixture §10.3h needs at
     /// the model level, reached through an ordinary allocation history.
     churn_pages: usize,
-    pool: Option<KvPagePool>,
-    quarantine: PageQuarantine,
+    /// The allocator with its liveness (`nn::page_pool::PagePool`): created
+    /// at the first pass, when the batch is known.
+    pool: Option<crate::nn::page_pool::PagePool>,
     clock: Arc<GpuClock>,
     /// Per layer, allocated on the layer's first write.
     pools: Vec<Option<(Tensor, Tensor)>>,
@@ -1921,7 +1922,6 @@ impl PagedKv {
             pool_pages_override: env_usize("LLOOM_148_POOL_PAGES")?,
             churn_pages: env_usize("LLOOM_148_POOL_CHURN")?.unwrap_or(0),
             pool: None,
-            quarantine: PageQuarantine::new(),
             clock,
             pools: vec![None; num_layers],
             n_seqs: 0,
@@ -1986,20 +1986,8 @@ impl PagedKv {
             return 0;
         }
         let n_seqs = self.n_seqs.max(1);
-        let needed: usize = (0..n_seqs)
-            .map(|s| {
-                let (len, held) = pool
-                    .seq(s)
-                    .map(|q| (q.len(), q.pages().len()))
-                    .unwrap_or((0, 0));
-                (len + seq_len)
-                    .div_ceil(self.page_size)
-                    .saturating_sub(held)
-            })
-            .sum();
-        let available =
-            pool.pages_free() + self.quarantine.ready(self.clock.completed_count());
-        needed.saturating_sub(available).div_ceil(n_seqs)
+        pool.pages_short((0..n_seqs).map(|s| (s, seq_len)))
+            .div_ceil(n_seqs)
     }
 
     /// Widen the pool to `slab` tokens per sequence — `KvSlot::grow_to`'s
@@ -2054,14 +2042,22 @@ impl PagedKv {
             // leaves before any real sequence exists; a table one entry longer
             // than the pool, so running out is reported as the pool's
             // exhaustion (which names the knob) and never as a full table.
-            let mut pool = KvPagePool::new(self.page_size, pool_pages, n_seqs + 1, pool_pages + 1);
+            let mut pool = crate::nn::page_pool::PagePool::with_clock(
+                self.page_size,
+                pool_pages,
+                n_seqs + 1,
+                pool_pages + 1,
+                Arc::clone(&self.clock),
+            );
             if self.churn_pages > 0 {
                 // No command buffer has read these pages, so recycling them
                 // without an epoch is safe here and only here.
-                pool.append(n_seqs, self.churn_pages * self.page_size)
+                let pages = pool.pages_mut();
+                pages
+                    .append(n_seqs, self.churn_pages * self.page_size)
                     .map_err(lloom_tensor::Error::wrap)?;
-                let freed = pool.release(n_seqs);
-                pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+                let freed = pages.release(n_seqs);
+                pages.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
             }
             self.pool = Some(pool);
         } else if n_seqs != self.n_seqs {
@@ -2073,10 +2069,10 @@ impl PagedKv {
         }
         // Pages whose last reader has completed come back first, so a long
         // session recycles rather than exhausts.
-        let ready = self.quarantine.drain(self.clock.completed_count());
         let (pool_pages, page_size) = (self.pool_pages(), self.page_size);
         let pool = self.pool.as_mut().expect("created above");
-        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+        pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
+        let pool = pool.pages_mut();
 
         let start = self.len;
         let mut slots = Vec::with_capacity(n_seqs * seq_len);
@@ -2213,7 +2209,7 @@ impl PagedKv {
         n_prev: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let pool = self.pool.as_ref().expect("a pass has begun");
+        let pool = self.pool.as_ref().expect("a pass has begun").pages();
         let (pk, pv) = self.pools[block_idx]
             .as_ref()
             .expect("the layer has a pool");
@@ -2238,12 +2234,9 @@ impl PagedKv {
     /// command buffer encoded now belongs to.
     fn release_all(&mut self) {
         if let Some(pool) = self.pool.as_mut() {
-            let mut freed = Vec::new();
             for s in 0..self.n_seqs {
-                freed.extend(pool.release(s));
+                pool.release(s);
             }
-            self.quarantine
-                .retire_all(self.clock.current_epoch(), freed);
         }
         self.len = 0;
         self.pass_len = 0;
@@ -2264,7 +2257,9 @@ impl PagedKv {
         }
         if let Some(pool) = self.pool.as_mut() {
             for s in 0..self.n_seqs {
-                pool.rewind(s, n).map_err(lloom_tensor::Error::wrap)?;
+                pool.pages_mut()
+                    .rewind(s, n)
+                    .map_err(lloom_tensor::Error::wrap)?;
             }
         }
         self.len -= n;
@@ -2291,12 +2286,20 @@ impl PagedKv {
         let mut kv = Self::new(config, kv_capacity, slab, num_layers, clock)?;
         kv.n_seqs = slots;
         let pool_pages = kv.pool_pages();
-        let mut pool = KvPagePool::new(kv.page_size, pool_pages, slots + 1, pool_pages + 1);
+        let mut pool = crate::nn::page_pool::PagePool::with_clock(
+            kv.page_size,
+            pool_pages,
+            slots + 1,
+            pool_pages + 1,
+            Arc::clone(&kv.clock),
+        );
         if kv.churn_pages > 0 {
-            pool.append(slots, kv.churn_pages * kv.page_size)
+            let pages = pool.pages_mut();
+            pages
+                .append(slots, kv.churn_pages * kv.page_size)
                 .map_err(lloom_tensor::Error::wrap)?;
-            let freed = pool.release(slots);
-            pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+            let freed = pages.release(slots);
+            pages.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
         }
         kv.pool = Some(pool);
         Ok(kv)
@@ -2306,7 +2309,7 @@ impl PagedKv {
     fn row_len(&self, slot: usize) -> usize {
         self.pool
             .as_ref()
-            .and_then(|p| p.seq(slot))
+            .and_then(|p| p.pages().seq(slot))
             .map(|s| s.len())
             .unwrap_or(0)
     }
@@ -2326,15 +2329,12 @@ impl PagedKv {
     /// the tables the read walks. Runs once per pass, at its first attention
     /// layer; every layer of the pass reuses the result.
     fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
-        let ready = self
-            .quarantine
-            .drain(self.clock.completed_count());
         let (pool_pages, page_size, ppc) = (self.pool_pages(), self.page_size, self.pages_per_chunk);
         let pool = self
             .pool
             .as_mut()
             .ok_or_else(|| lloom_tensor::Error::msg("lfm2 paged KV: the shared pool is unset"))?;
-        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+        pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
 
         let mut slots: Vec<u32> = Vec::new();
         let mut prev = Vec::with_capacity(rows.len());
@@ -2347,11 +2347,10 @@ impl PagedKv {
                 // committed since (a reset between requests encodes no
                 // dispatch of its own): wait the GPU out once and recycle
                 // them, rather than refusing a pool that is free in fact.
-                Err(PageError::Exhausted { .. }) if !self.quarantine.is_empty() => {
+                Err(PageError::Exhausted { .. }) if pool.holds_any() => {
                     device.synchronize()?;
-                    let ready = self.quarantine.drain(self.clock.completed_count());
-                    pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-                    pool.append(slot, n)
+                    pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
+                    pool.pages_mut().append(slot, n)
                 }
                 other => other,
             };
@@ -2498,17 +2497,14 @@ impl PagedKv {
         let Some(pool) = self.pool.as_mut() else {
             return Vec::new();
         };
-        let freed = pool.release(slot);
-        self.quarantine
-            .retire_all(self.clock.current_epoch(), freed.clone());
-        freed
+        pool.release(slot)
     }
 
     /// Slot `slot`'s page table.
     fn row_pages(&self, slot: usize) -> Vec<PageIdx> {
         self.pool
             .as_ref()
-            .and_then(|p| p.seq(slot))
+            .and_then(|p| p.pages().seq(slot))
             .map(|s| s.pages().to_vec())
             .unwrap_or_default()
     }
@@ -4834,8 +4830,11 @@ impl Cache {
         self.paged.as_ref().map(|p| {
             (
                 p.len,
-                p.pool.as_ref().map(|pool| pool.pages_in_use()).unwrap_or(0),
-                p.quarantine.held(),
+                p.pool
+                    .as_ref()
+                    .map(|pool| pool.pages().pages_in_use())
+                    .unwrap_or(0),
+                p.pool.as_ref().map(|pool| pool.held()).unwrap_or(0),
             )
         })
     }

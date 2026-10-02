@@ -48,6 +48,8 @@ pub const LFM2_KV_PAGES: &str = "lfm2.kv.pages";
 /// poisoned, so it is not in `SITES` — its zeros are read as zeros by every
 /// model that takes it, and the LFM2 census above is LFM2's.
 pub const NN_KV_SLAB: &str = "nn.kv_cache.slab";
+/// The dense weight-group tier's slots (`nn::weight_groups`, #892 A6a).
+pub const NN_WEIGHT_GROUPS: &str = "nn.weight_groups.slots";
 
 /// Every site a poison list may name.
 pub const SITES: &[&str] = &[

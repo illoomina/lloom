@@ -41,6 +41,18 @@ impl SlotId {
 #[repr(transparent)]
 pub struct ExpertId(pub u32);
 
+/// A weight group's id (`profiles-and-memory-design.md` §4.8): a set of
+/// tensors that load and evict together. Dense in `0..n_groups`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct WeightGroupId(pub u32);
+
+impl WeightGroupId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// A key a [`Dense`] index can index a `Vec` by.
 pub trait DenseKey: Copy + Eq {
     fn index(self) -> usize;
@@ -53,6 +65,15 @@ impl DenseKey for ExpertId {
     }
     fn from_index(i: usize) -> Self {
         ExpertId(i as u32)
+    }
+}
+
+impl DenseKey for WeightGroupId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+    fn from_index(i: usize) -> Self {
+        WeightGroupId(i as u32)
     }
 }
 
@@ -165,6 +186,35 @@ impl Evict for TickLru {
     }
     fn uninstalled(&mut self, slot: SlotId) {
         self.inflight[slot.index()] = 0;
+    }
+}
+
+/// Belady (§4.8): the plan's order of use is known, so the victim is the
+/// resident slot whose key's next use is furthest away — never the one
+/// needed next, which is what LRU evicts on a cyclic order (its hit rate
+/// collapses to 0; this keeps `C − d` groups permanently resident and
+/// streams the rest through a `d`-deep ring). Per slot: the plan position
+/// of its key's next use, and the epoch of its last GPU reader.
+#[derive(Debug, Clone)]
+pub struct Belady {
+    next_use: Vec<u64>,
+    pinned: Vec<bool>,
+    last_epoch: Vec<Epoch>,
+}
+
+impl Evict for Belady {
+    fn new(n_slots: usize) -> Self {
+        Self {
+            next_use: vec![u64::MAX; n_slots],
+            pinned: vec![false; n_slots],
+            last_epoch: vec![Epoch::ZERO; n_slots],
+        }
+    }
+    fn installed(&mut self, slot: SlotId) {
+        self.next_use[slot.index()] = u64::MAX;
+    }
+    fn uninstalled(&mut self, slot: SlotId) {
+        self.next_use[slot.index()] = u64::MAX;
     }
 }
 
@@ -628,6 +678,54 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
     }
 }
 
+impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, Belady> {
+    /// `slot`'s key is next used at plan position `at` (`u64::MAX`: never
+    /// again).
+    pub fn set_next_use(&mut self, slot: SlotId, at: u64) {
+        self.policy.next_use[slot.index()] = at;
+    }
+
+    pub fn next_use(&self, slot: SlotId) -> u64 {
+        self.policy.next_use[slot.index()]
+    }
+
+    pub fn set_pinned(&mut self, slot: SlotId, pinned: bool) {
+        self.policy.pinned[slot.index()] = pinned;
+    }
+
+    /// `slot` was read by a command buffer in `epoch`.
+    pub fn stamp(&mut self, slot: SlotId, epoch: Epoch) {
+        self.policy.last_epoch[slot.index()] = epoch;
+    }
+
+    pub fn reader_epoch(&self, slot: SlotId) -> Epoch {
+        self.policy.last_epoch[slot.index()]
+    }
+
+    /// The slot a load takes: an empty slot in service, else the resident
+    /// unpinned slot whose key's next use is furthest away (ties: the
+    /// lowest slot), and whether it held a key. `settled_before` restricts
+    /// the choice to slots whose last reader it covers; `None` when nothing
+    /// qualifies.
+    pub fn victim(&self, settled_before: Completed) -> Option<(SlotId, bool)> {
+        let p = &self.policy;
+        let mut best: Option<(usize, u64)> = None;
+        for s in 0..self.active {
+            if p.pinned[s] || !settled_before.covers(p.last_epoch[s]) {
+                continue;
+            }
+            if self.key_in[s].is_none() {
+                return Some((SlotId(s as u32), false));
+            }
+            match best {
+                Some((_, far)) if far >= p.next_use[s] => {}
+                _ => best = Some((s, p.next_use[s])),
+            }
+        }
+        best.map(|(s, _)| (SlotId(s as u32), true))
+    }
+}
+
 impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, ListLru> {
     /// `slot` is the most recently used.
     pub fn touch(&mut self, slot: SlotId) {
@@ -766,6 +864,87 @@ mod tests {
         assert_eq!(c.inflight_count(), 1);
         assert_eq!(c.settle_inflight(7), 1);
         assert_eq!(c.inflight(SlotId(1)), 0);
+    }
+
+    /// Belady on a cyclic order (§4.8, and §11's deliberate break): with N
+    /// groups used in a fixed cycle and C < N slots, the victim is always a
+    /// group needed further ahead than the next one, so at least C − 1 of
+    /// every N hit once the cycle is warm — where LRU on the same order
+    /// evicts exactly the group needed next every time and hits nothing.
+    #[test]
+    fn belady_hits_on_a_cyclic_order_where_lru_hits_nothing() {
+        let (n, c) = (6u32, 4usize);
+        let cycle: Vec<WeightGroupId> = (0..n).map(WeightGroupId).collect();
+        let next_use = |g: WeightGroupId, pos: u64| -> u64 {
+            let idx = g.0 as u64;
+            let n = n as u64;
+            let at = (pos / n) * n + idx;
+            if at > pos {
+                at
+            } else {
+                at + n
+            }
+        };
+        let rounds = 5u64;
+        // Belady.
+        let mut cache: SlotCache<WeightGroupId, Dense, Belady> =
+            SlotCache::with(Dense::new(n as usize), c);
+        let (mut hits, mut misses) = (0u64, 0u64);
+        for pos in 0..(rounds * n as u64) {
+            let g = cycle[(pos % n as u64) as usize];
+            match cache.slot_of(g) {
+                Some(s) => {
+                    hits += 1;
+                    cache.set_next_use(s, next_use(g, pos));
+                }
+                None => {
+                    misses += 1;
+                    let (s, evicted) = cache.victim(Completed::ALL).expect("a slot");
+                    if evicted {
+                        // Never the group needed next.
+                        let needed_next = cycle[((pos + 1) % n as u64) as usize];
+                        assert_ne!(cache.key_in(s), Some(needed_next), "evicted the next group");
+                        assert!(cache.next_use(s) > pos + 1, "evicted a group needed next");
+                    }
+                    cache.install(s, g);
+                    cache.set_next_use(s, next_use(g, pos));
+                }
+            }
+        }
+        assert_eq!(hits + misses, rounds * n as u64);
+        assert!(
+            hits >= (rounds - 1) * (c as u64 - 1),
+            "Belady hit {hits} of {} after the first cycle: below the (C − 1) / N bound",
+            rounds * n as u64
+        );
+        assert!(
+            misses >= n as u64 + (rounds - 1),
+            "{misses}: a C-slot cache cannot hit every N"
+        );
+        // LRU on the same order: nothing hits after the first fill.
+        let mut lru = ExpertSlots::new(n as usize, c);
+        let (mut lru_hits, mut lru_misses) = (0u64, 0u64);
+        for pos in 0..(rounds * n as u64) {
+            let g = ExpertId(cycle[(pos % n as u64) as usize].0);
+            let tick = lru.begin();
+            match lru.slot_of(g) {
+                Some(s) => {
+                    lru_hits += 1;
+                    lru.touch(s, tick);
+                }
+                None => {
+                    lru_misses += 1;
+                    let (s, _) = lru.victim_in(tick, false, Completed::ALL).expect("a slot");
+                    lru.install(s, g);
+                    lru.touch(s, tick);
+                }
+            }
+        }
+        assert_eq!(
+            (lru_hits, lru_misses),
+            (0, rounds * n as u64),
+            "LRU on a cycle hits nothing"
+        );
     }
 
     #[test]

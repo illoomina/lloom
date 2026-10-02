@@ -202,6 +202,7 @@ impl Lfm2Config {
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
             memory_budget: None,
+            stream_layers: None,
             // Both GEMV epilogue fusions are off, per §7.1a. #536 and #509 both
             // say the default needs the decode-path number, which is not taken
             // here — this change makes the arm reachable, nothing more.
@@ -1160,6 +1161,79 @@ impl std::fmt::Display for FusionReport {
     }
 }
 
+/// How the layers' weights stream (`Config::stream_layers`): the
+/// checkpoint files the groups read from, the slots the tier holds (one
+/// layer's matrices each, sized for the largest) and how many groups the
+/// loader runs ahead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamLayers {
+    pub files: Vec<std::path::PathBuf>,
+    pub slots: usize,
+    pub depth: usize,
+}
+
+/// One pass's view of the MLP's projections: the resident `Linear`s by
+/// reference, or the slot views a streamed layer took for this pass.
+struct Projections<'a> {
+    gate: std::borrow::Cow<'a, Linear>,
+    up: std::borrow::Cow<'a, Linear>,
+    down: std::borrow::Cow<'a, Linear>,
+}
+
+/// One pass's view of the attention's four projections (the norms stay
+/// resident).
+struct AttnWeights<'a> {
+    q: std::borrow::Cow<'a, Linear>,
+    k: std::borrow::Cow<'a, Linear>,
+    v: std::borrow::Cow<'a, Linear>,
+    o: std::borrow::Cow<'a, Linear>,
+}
+
+/// One pass's view of the short conv's two projections (the taps stay
+/// resident: `hidden x l_cache` elements, not worth a slot).
+struct ConvWeights<'a> {
+    in_proj: std::borrow::Cow<'a, Linear>,
+    out_proj: std::borrow::Cow<'a, Linear>,
+}
+
+enum MixerWeights<'a> {
+    Attn(AttnWeights<'a>),
+    Conv(ConvWeights<'a>),
+}
+
+/// A layer's matrices for one pass — the group §4.8 streams: the mixer's
+/// projections and the MLP's, one slot. A resident layer borrows its
+/// fields; a streamed layer takes its views at the layer's entry, once.
+struct LayerWeights<'a> {
+    mixer: MixerWeights<'a>,
+    mlp: Projections<'a>,
+}
+
+/// The part order inside a layer's group: the MLP's `w1`, `w3`, `w2`, then
+/// the mixer's projections (`q`, `k`, `v`, `out` | `in`, `out`).
+const GROUP_PART_W1: usize = 0;
+const GROUP_PART_W3: usize = 1;
+const GROUP_PART_W2: usize = 2;
+const GROUP_PART_MIXER: usize = 3;
+
+/// One layer on the weight-group tier: its group, the tier (shared by
+/// every layer) and the source its bytes come from.
+#[derive(Clone)]
+struct StreamedLayer {
+    group: crate::nn::slot_cache::WeightGroupId,
+    tier: std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>,
+    source: std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>,
+    depth: usize,
+}
+
+impl std::fmt::Debug for StreamedLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedLayer")
+            .field("group", &self.group)
+            .finish()
+    }
+}
+
 /// The runtime config. The `#[axis]`-tagged fields are the engine's
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
@@ -1301,6 +1375,13 @@ pub struct Config {
     /// per §7.1a's rule that no default is flipped without its own argued
     /// decision. See `Cache::admit_memory_budget`.
     pub memory_budget: Option<MemoryBudget>,
+    /// The decoder layers' matrices (the mixer's projections and the
+    /// MLP's, one group a layer) streamed through `nn::weight_groups`
+    /// (`profiles-and-memory-design.md` §4.8, #892 A6a): `None` — every
+    /// weight resident — unless the loader finds the weights do not fit the
+    /// quota. A model that fits never streams. The embedding, the norms and
+    /// the conv taps stay resident.
+    pub stream_layers: Option<StreamLayers>,
     /// Fuse the SiLU in `Mlp::forward` onto `w1`'s GEMV store (#484's kernel,
     /// wired by #509).
     ///
@@ -1546,6 +1627,7 @@ impl Default for Config {
             kv_quant: KvQuant::default(),
             conv_state: ConvState::default(),
             memory_budget: None,
+            stream_layers: None,
             gemv_silu: false,
             gemv_residual: false,
             gemv_gate: GateFusion::Off,
@@ -4621,20 +4703,22 @@ impl Cache {
         Ok(())
     }
 
+    /// §9.5d's admission arithmetic for this configuration, as a pure
+    /// function of `config`, `budget` and the KV ceiling — the figure
+    /// `admit_memory_budget` refuses on, exposed so a caller deciding
+    /// **before** construction (§4.8's weight streaming, #892 A6a: how many
+    /// MLP slots the quota leaves once the resident rest and its predicted
+    /// peak are in) sizes from the same arithmetic the KV cache will be
+    /// admitted on, rather than from a second figure that can disagree with
+    /// it. The RoPE tables are not in it: `rope_table_bytes` is their cost,
+    /// taken from the residual (see below).
     #[cfg(feature = "metal")]
-    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+    pub fn admission_budget(
+        config: &Config,
+        budget: &MemoryBudget,
+        kv_capacity: usize,
+    ) -> lloom_tensor::metal_backend::admission::Budget {
         use lloom_tensor::metal_backend::admission;
-
-        let Some(budget) = config.memory_budget else {
-            return Ok(());
-        };
-        // Non-Metal device with the metal feature built in: no denominator
-        // exists, so there is nothing to check against. Silent rather than an
-        // error -- a CPU run is a legitimate thing to do and refusing it here
-        // would be an unrelated regression.
-        let Ok(metal) = device.as_metal_device() else {
-            return Ok(());
-        };
 
         let mut b = admission::Budget::new(
             budget.weight_bytes,
@@ -4676,6 +4760,14 @@ impl Cache {
         b.conv_state_bytes = admission::CONV_STATE_BYTES
             * config.conv_state.width(config.conv_l_cache)
             / config.conv_l_cache;
+        b
+    }
+
+    /// The RoPE `cos`/`sin` tables' cost — resident plus the transient peak
+    /// of building them — which admission takes from the residual rather
+    /// than from the five classes (§9.5k). Pure in `config`.
+    #[cfg(feature = "metal")]
+    pub fn rope_table_bytes(config: &Config) -> usize {
         // The RoPE `cos`/`sin` tables (§9.5k's "sixth allocation the five
         // classes do not name"). Two f16 tables of
         // `max_position_embeddings x head_dim/2`, built through the pool in
@@ -4688,7 +4780,26 @@ impl Cache {
         // `idx_theta` plus f32 `cos`/`sin` before the cast, ~49 MB at 128000 --
         // and it is the one that has to fit, since it is live inside this call.
         let rope_transient = 3 * config.max_position_embeddings * (config.head_dim() / 2) * 4;
-        let rope = rope_resident + rope_transient;
+        rope_resident + rope_transient
+    }
+
+    #[cfg(feature = "metal")]
+    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+        use lloom_tensor::metal_backend::admission;
+
+        let Some(budget) = config.memory_budget else {
+            return Ok(());
+        };
+        // Non-Metal device with the metal feature built in: no denominator
+        // exists, so there is nothing to check against. Silent rather than an
+        // error -- a CPU run is a legitimate thing to do and refusing it here
+        // would be an unrelated regression.
+        let Ok(metal) = device.as_metal_device() else {
+            return Ok(());
+        };
+
+        let b = Self::admission_budget(config, &budget, kv_capacity);
+        let rope = Self::rope_table_bytes(config);
 
         let admission = b.admit(metal.device().recommended_max_working_set_size());
         // The RoPE tables come out of the residual rather than being added to
@@ -5506,6 +5617,9 @@ fn gemv_residual_applies(enabled: bool, x: &Tensor, proj: &Linear, residual: &Te
 /// MLP layer with SwiGLU activation.
 #[derive(Debug, Clone)]
 struct Mlp {
+    /// Resident: the three projections, loaded once. Streamed (§4.8): 1×1
+    /// placeholders, never bound — the slot views are taken per pass
+    /// (`DecoderLayer::weights`).
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
@@ -5541,6 +5655,33 @@ impl Mlp {
         })
     }
 
+    /// A layer whose matrices live on the weight-group tier
+    /// (`profiles-and-memory-design.md` §4.8): nothing is loaded here; the
+    /// group's MLP parts are `w1`, `w3`, `w2` in the tier's slot, taken as
+    /// views at each pass (`DecoderLayer::weights`).
+    fn new_placeholder(cfg: &Config, vb: &VarBuilder) -> Result<Self> {
+        Ok(Self {
+            gate_proj: placeholder_linear(vb)?,
+            up_proj: placeholder_linear(vb)?,
+            down_proj: placeholder_linear(vb)?,
+            gemv_silu: cfg.gemv_silu,
+            gemv_residual: cfg.gemv_residual,
+            gemv_gate: cfg.gemv_gate,
+            span: tracing::span!(tracing::Level::TRACE, "mlp"),
+        })
+    }
+
+    /// The resident projections, borrowed (R1: a model that fits never
+    /// streams — nothing else happens).
+    fn resident(&self) -> Projections<'_> {
+        use std::borrow::Cow;
+        Projections {
+            gate: Cow::Borrowed(&self.gate_proj),
+            up: Cow::Borrowed(&self.up_proj),
+            down: Cow::Borrowed(&self.down_proj),
+        }
+    }
+
     /// Whether the fused `w1` + SiLU arm applies to this call.
     ///
     /// Metal, `seq_len == 1`, no bias, and a dtype the GEMV carries. **Every
@@ -5548,87 +5689,86 @@ impl Mlp {
     /// `flash_decoding` this arm has a correct eager equivalent right beside
     /// it and prefill is a GEMM the fusion is not instantiated for. The same
     /// shape as `sdpa_applies` above.
-    fn gemv_silu_applies(&self, x: &Tensor) -> bool {
+    fn gemv_silu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_silu
             && x.device().is_metal()
-            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && x.dims().last() == Some(&p.gate.weight().dims()[1])
             // One row only, for `gemv_residual_applies`'s reason: at `B > 1`
             // the fused GEMV would sweep `w1` once per row.
             && matches!(x.dims(), [1, 1, _] | [1, _])
-            && self.gate_proj.bias().is_none()
+            && p.gate.bias().is_none()
             // See `gemv_residual_applies`: the fused op serves the contiguous
             // layout `Linear::forward` reshapes, not the broadcast one.
             && x.is_contiguous()
-            && self.gate_proj.weight().is_contiguous()
+            && p.gate.weight().is_contiguous()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        self.down_proj.forward(&self.gated(x)?)
+        p.down.forward(&self.gated(x, p)?)
     }
 
     /// `mlp(x) + residual`, fusing the add onto `w2`'s store when the arm is
     /// on (§12.2h). Otherwise **literally `forward(x)? + residual`** — the
     /// unfused branch calls `forward` rather than reimplementing it, so the
     /// two cannot drift and the shipping path has exactly one definition.
-    fn forward_add(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+    fn forward_add(&self, x: &Tensor, residual: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         if self.gemv_residual {
             let _enter = self.span.enter();
-            let gated = self.gated(x)?;
-            if gemv_residual_applies(true, &gated, &self.down_proj, residual) {
-                return crate::nn::ops::gemv_residual(&gated, self.down_proj.weight(), residual);
+            let gated = self.gated(x, p)?;
+            if gemv_residual_applies(true, &gated, &p.down, residual) {
+                return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
             }
-            return self.down_proj.forward(&gated)? + residual;
+            return p.down.forward(&gated)? + residual;
         }
-        self.forward(x)? + residual
+        self.forward(x, p)? + residual
     }
 
     /// `silu(w1(x)) * w3(x)` — the SwiGLU gate, shared by both entry points so
     /// the two cannot drift in what they compute.
-    fn gated(&self, x: &Tensor) -> Result<Tensor> {
+    fn gated(&self, x: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         // Both weights in one kernel: `w1`, `w3`, the SiLU and the product,
         // no barrier between the two sweeps (§12.2 row 5 with row 3b's
         // product, #732). Under it the SiLU arm is moot — `w1` is never
         // dispatched alone — so it is tried first.
-        if self.gemv_swiglu_applies(x) {
-            return crate::nn::ops::gemv_swiglu(x, self.up_proj.weight(), self.gate_proj.weight());
+        if self.gemv_swiglu_applies(x, p) {
+            return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
         }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
-        let gate = if self.gemv_silu_applies(x) {
-            crate::nn::ops::gemv_silu(x, self.gate_proj.weight())?
+        let gate = if self.gemv_silu_applies(x, p) {
+            crate::nn::ops::gemv_silu(x, p.gate.weight())?
         } else {
-            crate::nn::ops::silu(&self.gate_proj.forward(x)?)?
+            crate::nn::ops::silu(&p.gate.forward(x)?)?
         };
         // The product on `w3`'s store, the gate its row-indexed operand: one
         // dispatch for `w3` and the `bmul` (§12.2e row 3b, #732). The same
         // applicability as the residual arm — `w3` has `w1`'s shape, and the
         // gate is exactly `w3`'s output extent, contiguous, as `gemv_silu`
         // and `silu` both store it.
-        if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &self.up_proj, &gate)
-        {
-            return crate::nn::ops::gemv_mul(x, self.up_proj.weight(), &gate);
+        if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &p.up, &gate) {
+            return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
         }
-        let up = self.up_proj.forward(x)?;
+        let up = p.up.forward(x)?;
         gate * up
     }
 
     /// Whether the two-weight kernel serves this call: `gemv_silu_applies`'s
     /// conditions on `w1`, and `w3` the same shape and layout — the kernel
     /// streams both under one leading dimension.
-    fn gemv_swiglu_applies(&self, x: &Tensor) -> bool {
+    fn gemv_swiglu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_gate == GateFusion::Swiglu
             && x.device().is_metal()
-            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && x.dims().last() == Some(&p.gate.weight().dims()[1])
             && matches!(x.dims(), [1, 1, _] | [1, _])
-            && self.gate_proj.bias().is_none()
-            && self.up_proj.bias().is_none()
+            && p.gate.bias().is_none()
+            && p.up.bias().is_none()
             && x.is_contiguous()
-            && self.gate_proj.weight().is_contiguous()
-            && self.up_proj.weight().is_contiguous()
-            && self.gate_proj.weight().dims() == self.up_proj.weight().dims()
+            && p.gate.weight().is_contiguous()
+            && p.up.weight().is_contiguous()
+            && p.gate.weight().dims() == p.up.weight().dims()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 }
@@ -5663,20 +5803,33 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
+    /// `streamed`: the projections live in the weight-group tier (§4.8);
+    /// the fields are placeholders and `LayerWeights` carries the views.
+    fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder, streamed: bool) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let num_attention_heads = cfg.num_attention_heads;
         let num_key_value_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim();
 
-        let q_proj = linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            vb.pp("out_proj"),
-        )?;
+        let (q_proj, k_proj, v_proj, o_proj) = if streamed {
+            (
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+            )
+        } else {
+            (
+                linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
+                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
+                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
+                linear(
+                    num_attention_heads * head_dim,
+                    hidden_size,
+                    vb.pp("out_proj"),
+                )?,
+            )
+        };
 
         let q_norm = RmsNorm::new(head_dim, cfg.norm_eps, vb.pp("q_layernorm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.norm_eps, vb.pp("k_layernorm"))?;
@@ -5752,15 +5905,26 @@ impl Attention {
         crate::nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
     }
 
+    fn resident(&self) -> AttnWeights<'_> {
+        use std::borrow::Cow;
+        AttnWeights {
+            q: Cow::Borrowed(&self.q_proj),
+            k: Cow::Borrowed(&self.k_proj),
+            v: Cow::Borrowed(&self.v_proj),
+            o: Cow::Borrowed(&self.o_proj),
+        }
+    }
+
     fn forward(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
-        let y = self.attend(x, index_pos, block_idx, cache)?;
-        self.o_proj.forward(&y)
+        let y = self.attend(w, x, index_pos, block_idx, cache)?;
+        w.o.forward(&y)
     }
 
     /// `attn(x) + residual`, fusing the add onto `out_proj`'s store when the
@@ -5769,6 +5933,7 @@ impl Attention {
     /// definition and the two cannot drift.
     fn forward_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
@@ -5776,13 +5941,13 @@ impl Attention {
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
-            let y = self.attend(x, index_pos, block_idx, cache)?;
-            if gemv_residual_applies(true, &y, &self.o_proj, residual) {
-                return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+            let y = self.attend(w, x, index_pos, block_idx, cache)?;
+            if gemv_residual_applies(true, &y, &w.o, residual) {
+                return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
             }
-            return self.o_proj.forward(&y)? + residual;
+            return w.o.forward(&y)? + residual;
         }
-        self.forward(x, index_pos, block_idx, cache)? + residual
+        self.forward(w, x, index_pos, block_idx, cache)? + residual
     }
 
     /// [`Self::forward_add`] for one step of `rows.len()` independent
@@ -5792,22 +5957,24 @@ impl Attention {
     /// path exactly.
     fn forward_rows_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let y = self.attend_rows(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
-            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        let y = self.attend_rows(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
+            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
         }
-        self.o_proj.forward(&y)? + residual
+        w.o.forward(&y)? + residual
     }
 
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
     fn attend(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
@@ -5815,7 +5982,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q, k, v, rotated) = self.project(x, Some((index_pos, &*cache)))?;
+        let (q, k, v, rotated) = self.project(w, x, Some((index_pos, &*cache)))?;
         let y = self.attend_projected(&q, &k, v, rotated, index_pos, block_idx, cache)?;
         y.transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
@@ -5828,6 +5995,7 @@ impl Attention {
     /// `[B, heads, 1, head_dim]` is itself a contiguous `[1, heads, 1, head_dim]`.
     fn attend_rows(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
@@ -5835,12 +6003,12 @@ impl Attention {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
         #[cfg(feature = "metal")]
-        if let Some(y) = self.attend_rows_shared(x, block_idx, rows)? {
+        if let Some(y) = self.attend_rows_shared(w, x, block_idx, rows)? {
             return Ok(y);
         }
         // Rows attend at different positions, so the rotation is per row: the
         // projections are normed here and rotated below, on every arm.
-        let (q, k, v, rotated) = self.project(x, None)?;
+        let (q, k, v, rotated) = self.project(w, x, None)?;
         debug_assert!(!rotated);
         let mut ys = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
@@ -5865,16 +6033,17 @@ impl Attention {
     /// row, and takes the residual arm `forward_add` takes.
     fn forward_ragged_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let y = self.attend_ragged(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
-            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        let y = self.attend_ragged(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
+            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
         }
-        self.o_proj.forward(&y)? + residual
+        w.o.forward(&y)? + residual
     }
 
     /// `attend` over a ragged batch: one set of projections and one pair of
@@ -5886,15 +6055,16 @@ impl Attention {
     /// row's takes the transpose copy `project` takes for a prefill.
     fn attend_ragged(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (_, total, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = w.q.forward(x)?;
+        let k = w.k.forward(x)?;
+        let v = w.v.forward(x)?;
         let q = self.q_norm.forward(&q.reshape((
             1,
             total,
@@ -6011,6 +6181,7 @@ impl Attention {
     #[cfg(feature = "metal")]
     fn attend_rows_shared(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
@@ -6023,7 +6194,7 @@ impl Attention {
             return Ok(None);
         }
         let device = x.device().clone();
-        let (q, k, v, rotated) = self.project(x, None)?;
+        let (q, k, v, rotated) = self.project(w, x, None)?;
         debug_assert!(!rotated);
         let q = q.contiguous()?;
         let k = k.contiguous()?;
@@ -6297,14 +6468,15 @@ impl Attention {
     /// in-place append writes from where it lies (`Tensor::slice_set`).
     fn project(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         rope_at: Option<(usize, &Cache)>,
     ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = w.q.forward(x)?;
+        let k = w.k.forward(x)?;
+        let v = w.v.forward(x)?;
 
         // Reshape to (batch, seq, num_heads, head_dim) then transpose to
         // (batch, num_heads, seq, head_dim): a view, contiguous at
@@ -6812,13 +6984,22 @@ fn conv_c_fusion_disabled() -> bool {
 }
 
 impl ShortConv {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    /// `streamed`: the two projections live in the weight-group tier
+    /// (§4.8); the fields are placeholders and `LayerWeights` carries the
+    /// views. The taps are resident either way.
+    fn new(cfg: &Config, vb: VarBuilder, streamed: bool) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let l_cache = cfg.conv_l_cache;
 
         // in_proj projects to 3 * hidden_size for B, C, X components
-        let in_proj = linear(hidden_size, 3 * hidden_size, vb.pp("in_proj"))?;
-        let out_proj = linear(hidden_size, hidden_size, vb.pp("out_proj"))?;
+        let (in_proj, out_proj) = if streamed {
+            (placeholder_linear(&vb)?, placeholder_linear(&vb)?)
+        } else {
+            (
+                linear(hidden_size, 3 * hidden_size, vb.pp("in_proj"))?,
+                linear(hidden_size, hidden_size, vb.pp("out_proj"))?,
+            )
+        };
 
         // Conv weight shape: (hidden_size, 1, l_cache) or (hidden_size, l_cache)
         let conv_weight = vb.get((hidden_size, 1, l_cache), "conv.weight")?;
@@ -7090,9 +7271,23 @@ impl ShortConv {
         }
     }
 
-    fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
-        let conv_out = self.convolve(x, block_idx, cache)?;
-        self.out_proj.forward(&conv_out)
+    fn resident(&self) -> ConvWeights<'_> {
+        use std::borrow::Cow;
+        ConvWeights {
+            in_proj: Cow::Borrowed(&self.in_proj),
+            out_proj: Cow::Borrowed(&self.out_proj),
+        }
+    }
+
+    fn forward(
+        &self,
+        w: &ConvWeights<'_>,
+        x: &Tensor,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let conv_out = self.convolve(w, x, block_idx, cache)?;
+        w.out_proj.forward(&conv_out)
     }
 
     /// `conv(x) + residual`, fusing the add onto `out_proj`'s store when the
@@ -7101,19 +7296,20 @@ impl ShortConv {
     /// definition and the two cannot drift.
     fn forward_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         cache: &mut Cache,
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
-            let conv_out = self.convolve(x, block_idx, cache)?;
-            if gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-                return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+            let conv_out = self.convolve(w, x, block_idx, cache)?;
+            if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+                return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
             }
-            return self.out_proj.forward(&conv_out)? + residual;
+            return w.out_proj.forward(&conv_out)? + residual;
         }
-        self.forward(x, block_idx, cache)? + residual
+        self.forward(w, x, block_idx, cache)? + residual
     }
 
     /// [`Self::forward_add`] for one step of `rows.len()` independent
@@ -7122,24 +7318,31 @@ impl ShortConv {
     /// residual arm is decided as `forward_add` decides it.
     fn forward_rows_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let conv_out = self.convolve_rows(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        let conv_out = self.convolve_rows(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
         }
-        self.out_proj.forward(&conv_out)? + residual
+        w.out_proj.forward(&conv_out)? + residual
     }
 
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
-    fn convolve(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn convolve(
+        &self,
+        w: &ConvWeights<'_>,
+        x: &Tensor,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         // Project input to B, C, X components
-        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let bcx = w.in_proj.forward(x)?.transpose(1, 2)?;
         self.convolve_bcx(&bcx, block_idx, cache)
     }
 
@@ -7149,12 +7352,13 @@ impl ShortConv {
     /// every arm below sees the layout it was written for.
     fn convolve_rows(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let bcx = w.in_proj.forward(x)?.transpose(1, 2)?;
         #[cfg(feature = "metal")]
         if let Some(out) = self.convolve_rows_shared(&bcx, block_idx, rows)? {
             return Ok(out);
@@ -7171,16 +7375,17 @@ impl ShortConv {
     /// own run against its own state.
     fn forward_ragged_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let conv_out = self.convolve_ragged(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        let conv_out = self.convolve_ragged(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
         }
-        self.out_proj.forward(&conv_out)? + residual
+        w.out_proj.forward(&conv_out)? + residual
     }
 
     /// `convolve` over a ragged batch: one `in_proj`, then row `r` takes the
@@ -7191,12 +7396,13 @@ impl ShortConv {
     /// written for.
     fn convolve_ragged(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let bcx = self.in_proj.forward(x)?;
+        let bcx = w.in_proj.forward(x)?;
         #[cfg(feature = "metal")]
         if let Some(out) = self.convolve_ragged_shared(&bcx, block_idx, rows)? {
             return Ok(out);
@@ -7850,17 +8056,112 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     mlp: Mlp,
     kind: LayerKind,
+    /// `Some`: this layer's matrices stream through the tier (§4.8).
+    streamed: Option<StreamedLayer>,
     span: tracing::Span,
 }
 
+/// A 1x1 stand-in for a matrix that lives in the weight-group tier.
+fn placeholder_linear(vb: &VarBuilder) -> Result<Linear> {
+    Ok(Linear::from_weights(
+        Tensor::zeros((1, 1), vb.dtype(), vb.device())?,
+        None,
+    ))
+}
+
+/// The parts of layer `l`'s weight group, in `GROUP_PART_*` order: the
+/// MLP's `w1`, `w3`, `w2`, then the mixer's projections — `q`, `k`, `v`,
+/// `out` for an attention layer, `in`, `out` for a conv layer. The
+/// checkpoint names and shapes, as `nn::weight_groups::GroupSpec` takes them.
+pub fn layer_group_parts(cfg: &Config, l: usize) -> Vec<(String, lloom_tensor::Shape)> {
+    use lloom_tensor::Shape;
+    let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
+    let mut parts = vec![
+        (
+            format!("model.layers.{l}.feed_forward.w1.weight"),
+            Shape::from((i, h)),
+        ),
+        (
+            format!("model.layers.{l}.feed_forward.w3.weight"),
+            Shape::from((i, h)),
+        ),
+        (
+            format!("model.layers.{l}.feed_forward.w2.weight"),
+            Shape::from((h, i)),
+        ),
+    ];
+    let kind = cfg
+        .layer_types
+        .get(l)
+        .copied()
+        .unwrap_or(LayerType::FullAttention);
+    match kind {
+        LayerType::FullAttention => {
+            let (q, kv) = (
+                cfg.num_attention_heads * cfg.head_dim(),
+                cfg.num_key_value_heads * cfg.head_dim(),
+            );
+            parts.push((
+                format!("model.layers.{l}.self_attn.q_proj.weight"),
+                Shape::from((q, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.k_proj.weight"),
+                Shape::from((kv, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.v_proj.weight"),
+                Shape::from((kv, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.out_proj.weight"),
+                Shape::from((h, q)),
+            ));
+        }
+        LayerType::Conv => {
+            parts.push((
+                format!("model.layers.{l}.conv.in_proj.weight"),
+                Shape::from((3 * h, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.conv.out_proj.weight"),
+                Shape::from((h, h)),
+            ));
+        }
+    }
+    parts
+}
+
+/// The bytes of layer `l`'s weight group at `dtype` — what one slot of the
+/// tier holds for it. The loader's arithmetic (how many slots the quota
+/// leaves) reads this rather than its own copy of the shapes.
+pub fn layer_group_bytes(cfg: &Config, l: usize, dtype: DType) -> usize {
+    layer_group_parts(cfg, l)
+        .iter()
+        .map(|(_, s)| s.elem_count())
+        .sum::<usize>()
+        * dtype.size_in_bytes()
+}
+
 impl DecoderLayer {
-    fn new(cfg: &Config, layer_idx: usize, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &Config,
+        layer_idx: usize,
+        route: AttnRoute,
+        vb: VarBuilder,
+        streamed: Option<StreamedLayer>,
+    ) -> Result<Self> {
         // LFM2 uses operator_norm and ffn_norm naming
         let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
         let post_attention_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
-        // LFM2 uses feed_forward naming for MLP
-        let mlp = Mlp::new(cfg, vb.pp("feed_forward"))?;
+        // LFM2 uses feed_forward naming for MLP; on the weight-group tier
+        // (§4.8) the layer's three matrices are its group's parts.
+        let mlp = if streamed.is_some() {
+            Mlp::new_placeholder(cfg, &vb)?
+        } else {
+            Mlp::new(cfg, vb.pp("feed_forward"))?
+        };
 
         let layer_type = cfg
             .layer_types
@@ -7868,10 +8169,15 @@ impl DecoderLayer {
             .copied()
             .unwrap_or(LayerType::FullAttention);
         let kind = match layer_type {
-            LayerType::FullAttention => {
-                LayerKind::Attention(Box::new(Attention::new(cfg, route, vb.pp("self_attn"))?))
+            LayerType::FullAttention => LayerKind::Attention(Box::new(Attention::new(
+                cfg,
+                route,
+                vb.pp("self_attn"),
+                streamed.is_some(),
+            )?)),
+            LayerType::Conv => {
+                LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"), streamed.is_some())?)
             }
-            LayerType::Conv => LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"))?),
         };
 
         Ok(Self {
@@ -7879,8 +8185,66 @@ impl DecoderLayer {
             post_attention_layernorm,
             mlp,
             kind,
+            streamed,
             span: tracing::span!(tracing::Level::TRACE, "layer"),
         })
+    }
+
+    /// This layer's matrices for the pass: borrowed when resident. When
+    /// streamed, the group is made resident in the tier (`ensure`), its
+    /// parts taken as views over the slot, and the next `depth` groups of
+    /// the plan prefetched — once per layer per pass, at the layer's entry,
+    /// before the mixer. A group that moved slots since its last pass
+    /// drops the cached pass plans (R2: a plan binds slots; the old one
+    /// bound another).
+    fn weights(&self) -> Result<LayerWeights<'_>> {
+        use std::borrow::Cow;
+        let Some(st) = &self.streamed else {
+            let mixer = match &self.kind {
+                LayerKind::Attention(a) => MixerWeights::Attn(a.resident()),
+                LayerKind::ShortConv(c) => MixerWeights::Conv(c.resident()),
+            };
+            return Ok(LayerWeights {
+                mixer,
+                mlp: self.mlp.resident(),
+            });
+        };
+        let mut tier = st.tier.lock();
+        let (_slot, moved) = tier.ensure(st.group, st.source.as_ref())?;
+        let part = |i: usize| -> Result<Cow<'static, Linear>> {
+            Ok(Cow::Owned(Linear::from_weights(
+                tier.tensor(st.group, i)?,
+                None,
+            )))
+        };
+        let mlp = Projections {
+            gate: part(GROUP_PART_W1)?,
+            up: part(GROUP_PART_W3)?,
+            down: part(GROUP_PART_W2)?,
+        };
+        let mixer = match &self.kind {
+            LayerKind::Attention(_) => MixerWeights::Attn(AttnWeights {
+                q: part(GROUP_PART_MIXER)?,
+                k: part(GROUP_PART_MIXER + 1)?,
+                v: part(GROUP_PART_MIXER + 2)?,
+                o: part(GROUP_PART_MIXER + 3)?,
+            }),
+            LayerKind::ShortConv(_) => MixerWeights::Conv(ConvWeights {
+                in_proj: part(GROUP_PART_MIXER)?,
+                out_proj: part(GROUP_PART_MIXER + 1)?,
+            }),
+        };
+        tier.prefetch(st.depth, st.source.as_ref())?;
+        drop(tier);
+        #[cfg(feature = "metal")]
+        if moved {
+            if let Device::Metal(m) = mlp.gate.weight().device() {
+                m.drop_pass_plans();
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = moved;
+        Ok(LayerWeights { mixer, mlp })
     }
 
     fn forward(
@@ -7891,6 +8255,7 @@ impl DecoderLayer {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
 
@@ -7898,16 +8263,19 @@ impl DecoderLayer {
         // AND applies, in which case the add happens at the producing GEMV's
         // f32 accumulator instead of in a `badd_f16` over the rounded store
         // (§12.2h). That is a DIFFERENT COMPUTATION and moves the digests.
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => {
-                attn.forward_add(&x, index_pos, block_idx, cache, residual)?
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                attn.forward_add(aw, &x, index_pos, block_idx, cache, residual)?
             }
-            LayerKind::ShortConv(conv) => conv.forward_add(&x, block_idx, cache, residual)?,
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                conv.forward_add(cw, &x, block_idx, cache, residual)?
+            }
+            _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
         };
 
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 
     /// [`Self::forward`] for one step of `rows.len()` independent sequences:
@@ -7920,15 +8288,21 @@ impl DecoderLayer {
         rows: &mut [Row<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => attn.forward_rows_add(&x, block_idx, rows, residual)?,
-            LayerKind::ShortConv(conv) => conv.forward_rows_add(&x, block_idx, rows, residual)?,
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                attn.forward_rows_add(aw, &x, block_idx, rows, residual)?
+            }
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                conv.forward_rows_add(cw, &x, block_idx, rows, residual)?
+            }
+            _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 
     /// [`Self::forward`] over a ragged batch: the norms, the MLP and every
@@ -7941,15 +8315,21 @@ impl DecoderLayer {
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => attn.forward_ragged_add(&x, block_idx, rows, residual)?,
-            LayerKind::ShortConv(conv) => conv.forward_ragged_add(&x, block_idx, rows, residual)?,
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                attn.forward_ragged_add(aw, &x, block_idx, rows, residual)?
+            }
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                conv.forward_ragged_add(cw, &x, block_idx, rows, residual)?
+            }
+            _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 }
 
@@ -8344,10 +8724,59 @@ impl Model {
             load_warnings.push(w);
         }
 
+        // The layers on the weight-group tier when the loader asked for it
+        // (`Config::stream_layers`, §4.8): one group per layer — the MLP's
+        // `w1`, `w3`, `w2` and the mixer's projections end to end in a slot
+        // (`layer_group_parts`) — the plan their order, the source the
+        // checkpoint's mapped files.
+        let streaming = match &cfg.stream_layers {
+            Some(plan) => {
+                use crate::nn::slot_cache::WeightGroupId;
+                use crate::nn::weight_groups::{GroupSpec, SafetensorsGroups, WeightGroups};
+                let specs: Vec<GroupSpec> = (0..cfg.num_hidden_layers)
+                    .map(|l| GroupSpec::new(WeightGroupId(l as u32), layer_group_parts(cfg, l)))
+                    .collect();
+                let names: Vec<Vec<String>> = specs
+                    .iter()
+                    .map(|g| g.parts.iter().map(|p| p.name.clone()).collect())
+                    .collect();
+                let mut tier = WeightGroups::new(
+                    specs,
+                    plan.slots,
+                    vb.dtype(),
+                    vb.device(),
+                    zs::NN_WEIGHT_GROUPS,
+                )?;
+                tier.set_plan(
+                    (0..cfg.num_hidden_layers as u32)
+                        .map(WeightGroupId)
+                        .collect(),
+                );
+                // SAFETY: the checkpoint files are mapped read-only for the
+                // model's life, as `VarBuilder` maps them.
+                let source = unsafe { SafetensorsGroups::open(&plan.files, names, vb.device())? };
+                Some((
+                    std::sync::Arc::new(parking_lot::Mutex::new(tier)),
+                    std::sync::Arc::new(source)
+                        as std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>,
+                    plan.depth,
+                ))
+            }
+            None => None,
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx))?;
+            let streamed = streaming
+                .as_ref()
+                .map(|(tier, source, depth)| StreamedLayer {
+                    group: crate::nn::slot_cache::WeightGroupId(layer_idx as u32),
+                    tier: std::sync::Arc::clone(tier),
+                    source: std::sync::Arc::clone(source),
+                    depth: *depth,
+                });
+            let layer =
+                DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx), streamed)?;
             layers.push(layer);
         }
 
@@ -8393,6 +8822,40 @@ impl Model {
 
     /// The warnings construction printed to stderr, in order: at most one per
     /// load for the attention route ([`AttnRoute::warning`]).
+    /// A diagnosis of the streamed layers (§4.8): the groups whose slot
+    /// bytes differ from the checkpoint's, and the tier's counters; `None`
+    /// when every weight is resident.
+    pub fn streamed_layers_audit(
+        &self,
+    ) -> Result<Option<(Vec<(u32, usize)>, crate::nn::weight_groups::GroupStats)>> {
+        let Some(st) = self.layers.first().and_then(|l| l.streamed.as_ref()) else {
+            return Ok(None);
+        };
+        let tier = st.tier.lock();
+        let wrong = tier
+            .audit(st.source.as_ref())?
+            .into_iter()
+            .map(|(g, p)| (g.0, p))
+            .collect();
+        Ok(Some((wrong, tier.stats())))
+    }
+
+    /// The tier's shape and counters when the layers stream (§4.8):
+    /// `(slots, groups, slot_bytes, stats)`; `None` when every weight is
+    /// resident. Cheap — no audit.
+    pub fn streamed_layers_stats(
+        &self,
+    ) -> Option<(usize, usize, usize, crate::nn::weight_groups::GroupStats)> {
+        let st = self.layers.first().and_then(|l| l.streamed.as_ref())?;
+        let tier = st.tier.lock();
+        Some((
+            tier.n_slots(),
+            tier.n_groups(),
+            tier.slot_bytes(),
+            tier.stats(),
+        ))
+    }
+
     pub fn load_warnings(&self) -> &[crate::load_warning::LoadWarning] {
         &self.load_warnings
     }

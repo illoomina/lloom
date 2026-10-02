@@ -583,7 +583,8 @@ impl Engine {
             // The ledger's quota: the same fraction of the working set the
             // admission and the KV grow read against (§9.5c).
             let ws = m.device().recommended_max_working_set_size() as f64;
-            m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+            m.ledger()
+                .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
         }
 
         let files = weight_files(&model_dir)?;
@@ -600,6 +601,116 @@ impl Engine {
         } else {
             vb
         };
+        // §4.8 (#892 A6a): a model whose weights do not fit the quota streams
+        // its decoder layers — each layer's matrices one group — through the
+        // weight-group tier; one that fits never streams (R1). The quota is
+        // the ledger's; the resident weights are everything but the layers
+        // (the embedding, the norms, the conv taps); the slots are what the
+        // admission leaves after them and the predicted peak, three at least.
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            let quota = m.ledger().quota();
+            let elem = dtype.size_in_bytes();
+            // One group a layer: the mixer's projections and the MLP's
+            // (`lfm2::layer_group_parts`); a slot is sized for the largest.
+            let group_bytes: Vec<usize> = (0..config.num_hidden_layers)
+                .map(|l| lloom::models::lfm2::layer_group_bytes(&config, l, dtype))
+                .collect();
+            let slot_bytes = group_bytes.iter().copied().max().unwrap_or(0);
+            let streamed_bytes: usize = group_bytes.iter().sum();
+            let resident = weight_bytes.saturating_sub(streamed_bytes);
+            let kv_floor = opts.kv_capacity.min(4096)
+                * config
+                    .layer_types
+                    .iter()
+                    .filter(|k| matches!(k, lloom::models::lfm2::LayerType::FullAttention))
+                    .count()
+                * 2
+                * config.num_key_value_heads
+                * config.head_dim()
+                * elem;
+            if quota > 0 && weight_bytes + kv_floor > quota {
+                // The room for slots is what §9.5's admission leaves once the
+                // resident rest and its predicted peak (the KV at capacity,
+                // the conv state, the activations, the scratch) are in — the
+                // same arithmetic the KV cache refuses on — less the RoPE
+                // tables it adds (`Cache::new`). Three slots at least: the
+                // group in use, the previous stage's (its reader still open)
+                // and one loading.
+                let rope = lloom::models::lfm2::Cache::rope_table_bytes(&config);
+                let mut peak = String::from(
+                    "no memory budget declared: the quota less the resident rest and the KV floor",
+                );
+                let room = match config.memory_budget {
+                    Some(mut b) => {
+                        b.weight_bytes = resident;
+                        let a = lloom::models::lfm2::Cache::admission_budget(
+                            &config,
+                            &b,
+                            opts.kv_capacity,
+                        )
+                        .admit(m.device().recommended_max_working_set_size());
+                        // The classes, for the refusal: which one took the room.
+                        let f = &a.footprint;
+                        peak = format!(
+                            "predicted peak {:.2} GB = weights {:.2} + KV {:.2} + conv {:.2} + \
+                             activations {:.2} (a {}-token forward) + scratch {:.2}; RoPE {:.2}",
+                            f.predicted() as f64 / 1e9,
+                            f.weights as f64 / 1e9,
+                            f.kv as f64 / 1e9,
+                            f.conv as f64 / 1e9,
+                            f.activations as f64 / 1e9,
+                            b.max_seq_len,
+                            f.scratch as f64 / 1e9,
+                            rope as f64 / 1e9
+                        );
+                        if a.fits {
+                            a.residual.saturating_sub(rope)
+                        } else {
+                            0
+                        }
+                    }
+                    None => quota.saturating_sub(resident + kv_floor),
+                };
+                let slots = (room / slot_bytes.max(1)).clamp(3, config.num_hidden_layers.max(3));
+                if room < 3 * slot_bytes {
+                    anyhow::bail!(
+                        "the weights do not fit the quota even with the layers streamed: the \
+                         resident rest {:.2} GB with its predicted peak leaves {:.2} GB, three \
+                         layer slots need {:.2} GB; quota {:.2} GB ({} x recommendedMaxWorkingSetSize \
+                         {:.2} GB)\n  {}",
+                        resident as f64 / 1e9,
+                        room as f64 / 1e9,
+                        3.0 * slot_bytes as f64 / 1e9,
+                        quota as f64 / 1e9,
+                        opts.memory_fraction,
+                        m.device().recommended_max_working_set_size() as f64 / 1e9,
+                        peak
+                    );
+                }
+                eprintln!(
+                    "[weights: layers streamed groups={} slots={} slot_bytes={:.1} MiB streamed={:.2} GB resident={:.2} GB room={:.2} GB quota={:.2} GB]",
+                    config.num_hidden_layers,
+                    slots,
+                    slot_bytes as f64 / (1024.0 * 1024.0),
+                    streamed_bytes as f64 / 1e9,
+                    resident as f64 / 1e9,
+                    room as f64 / 1e9,
+                    quota as f64 / 1e9
+                );
+                config.stream_layers = Some(lloom::models::lfm2::StreamLayers {
+                    files: files.clone(),
+                    slots,
+                    depth: 1,
+                });
+                // §9.5's admission (the KV cache's `admit_memory_budget`)
+                // predicts the weights resident: with the MLPs streamed the
+                // weight term is the resident rest plus the slots.
+                if let Some(b) = config.memory_budget.as_mut() {
+                    b.weight_bytes = resident + slots * slot_bytes;
+                }
+            }
+        }
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         load_warnings.splice(0..0, model.load_warnings().iter().cloned());
         let vision = if vl {
@@ -1986,6 +2097,20 @@ impl Engine {
                 kv.bucket,
                 kv.grows,
                 mib(kv.bytes)
+            ));
+        }
+        // §4.8: the weight-group tier's shape and counters, when the layers
+        // stream (nothing at full quota — R1, the tier is not there).
+        if let Some((slots, groups, slot_bytes, g)) = self.core.model.streamed_layers_stats() {
+            out.push(format!(
+                "[groups: slots={slots} groups={groups} slot_bytes={:.1} MiB hits={} misses={} \
+                 evictions={} loaded={:.2} GB waits={}]",
+                slot_bytes as f64 / (1024.0 * 1024.0),
+                g.hits,
+                g.misses,
+                g.evictions,
+                g.bytes_loaded as f64 / 1e9,
+                g.waits
             ));
         }
         if let Some(line) = lloom::nn::memory::ledger_line(&self.core.device) {

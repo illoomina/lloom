@@ -27,6 +27,7 @@
 
 /// A thread's QoS class, as `pthread_get_qos_class_np` reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum QosClass {
     /// Not read: off macOS, or the read failed.
     #[default]
@@ -39,7 +40,103 @@ pub enum QosClass {
     Unspecified,
 }
 
+impl std::str::FromStr for QosClass {
+    type Err = String;
+
+    /// The spellings [`QosClass::as_str`] renders, for a knob that names a
+    /// class; `unknown` and `unspecified` are not classes a thread is put in.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "user-interactive" | "interactive" => Ok(QosClass::UserInteractive),
+            "user-initiated" | "initiated" => Ok(QosClass::UserInitiated),
+            "default" => Ok(QosClass::Default),
+            "utility" => Ok(QosClass::Utility),
+            "background" => Ok(QosClass::Background),
+            other => Err(format!(
+                "qos class {other:?}: expected user-interactive, user-initiated, default, \
+                 utility or background"
+            )),
+        }
+    }
+}
+
+/// The calling thread's class.
+pub fn current() -> QosClass {
+    #[cfg(target_os = "macos")]
+    {
+        macos::class_of(macos::get().0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        QosClass::Unknown
+    }
+}
+
+/// Put the calling thread in `class` for the rest of its life and return the
+/// class it then reads: for a thread the engine spawned and owns, which has
+/// nothing to restore (`docs/invariants.md` §15.2 #10b). `Err(errno)` when
+/// the kernel refuses; off macOS a no-op reading [`QosClass::Unknown`].
+pub fn set_current(class: QosClass) -> Result<QosClass, i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let raw = match class {
+            QosClass::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+            QosClass::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+            QosClass::Default => libc::qos_class_t::QOS_CLASS_DEFAULT,
+            QosClass::Utility => libc::qos_class_t::QOS_CLASS_UTILITY,
+            QosClass::Background => libc::qos_class_t::QOS_CLASS_BACKGROUND,
+            QosClass::Unknown | QosClass::Unspecified => return Err(libc::EINVAL),
+        };
+        macos::set(raw, 0)?;
+        Ok(current())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = class;
+        Ok(QosClass::Unknown)
+    }
+}
+
+/// A spawned thread's class, from a knob: `inherit` leaves the thread as
+/// spawned, any class [`QosClass::from_str`] reads is claimed. Returns the
+/// class the thread then reads and the errno of a refused claim (0 if none).
+pub fn claim_for_spawned(arm: &str) -> (QosClass, i32) {
+    if arm.trim().eq_ignore_ascii_case("inherit") {
+        return (current(), 0);
+    }
+    match arm.parse::<QosClass>() {
+        Ok(class) => match set_current(class) {
+            Ok(after) => (after, 0),
+            Err(e) => (current(), e),
+        },
+        // The knob's parser refuses a name that is not a class.
+        Err(_) => (current(), -1),
+    }
+}
+
+/// The knob's parser: `inherit` or a class [`QosClass::from_str`] reads.
+pub fn parse_spawned_arm(v: &str) -> Result<String, String> {
+    let s = v.trim().to_ascii_lowercase();
+    if s == "inherit" {
+        return Ok(s);
+    }
+    s.parse::<QosClass>().map(|c| c.as_str().to_string())
+}
+
 impl QosClass {
+    /// The inverse of `class as u8`, for a class kept in an atomic.
+    pub fn from_index(i: u8) -> Self {
+        match i {
+            1 => QosClass::UserInteractive,
+            2 => QosClass::UserInitiated,
+            3 => QosClass::Default,
+            4 => QosClass::Utility,
+            5 => QosClass::Background,
+            6 => QosClass::Unspecified,
+            _ => QosClass::Unknown,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             QosClass::Unknown => "unknown",
@@ -258,6 +355,54 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A thread `std` spawns does not take its spawner's class: it reads
+    /// `default` even when spawned from an interactive thread, so an engine
+    /// thread is at `default` unless it claims a class (§15.2 #10b).
+    #[test]
+    fn a_spawned_thread_does_not_inherit_its_spawners_class() {
+        std::thread::spawn(|| {
+            macos::set(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0).unwrap();
+            assert_eq!(current(), QosClass::UserInteractive);
+            let child = std::thread::spawn(current).join().unwrap();
+            assert_eq!(child, QosClass::Default, "the spawned thread's class");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// `claim_for_spawned` claims what the knob names and reports what the
+    /// thread then reads; `inherit` claims nothing.
+    #[test]
+    fn a_spawned_thread_claims_the_class_its_knob_names() {
+        let read = |arm: &'static str| std::thread::spawn(move || claim_for_spawned(arm));
+        assert_eq!(
+            read("user-interactive").join().unwrap(),
+            (QosClass::UserInteractive, 0)
+        );
+        assert_eq!(read("utility").join().unwrap(), (QosClass::Utility, 0));
+        assert_eq!(read("inherit").join().unwrap(), (QosClass::Default, 0));
+        assert!(parse_spawned_arm("unknown").is_err());
+        assert!(parse_spawned_arm("unspecified").is_err());
+        assert_eq!(parse_spawned_arm("Interactive").unwrap(), "user-interactive");
+        assert_eq!(parse_spawned_arm("inherit").unwrap(), "inherit");
+    }
+
+    /// The index a class is kept in an atomic as reads back as the class.
+    #[test]
+    fn a_class_round_trips_through_its_index() {
+        for c in [
+            QosClass::Unknown,
+            QosClass::UserInteractive,
+            QosClass::UserInitiated,
+            QosClass::Default,
+            QosClass::Utility,
+            QosClass::Background,
+            QosClass::Unspecified,
+        ] {
+            assert_eq!(QosClass::from_index(c as u8), c);
+        }
     }
 
     /// A thread already interactive is left alone and the report says so.

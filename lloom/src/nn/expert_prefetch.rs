@@ -902,7 +902,22 @@ enum Target {
     Piece(u64, BufferHandle),
 }
 
+/// The reader threads' scheduling class as the first of them read it after
+/// its claim (`LLOOM_PREFETCH_QOS`), for a run's report: the host-planned pass
+/// waits on these reads, so their class is stated, not inherited unseen
+/// (`docs/invariants.md` §15.2 #10b).
+static WORKER_QOS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The reader threads' class (`Unknown` before any started, or off macOS).
+pub fn worker_qos() -> crate::generation::QosClass {
+    crate::generation::QosClass::from_index(WORKER_QOS.load(Ordering::Relaxed))
+}
+
 fn worker(w: Arc<Shared>) {
+    let (class, _) = crate::generation::hot_thread::claim_for_spawned(
+        &crate::tuning::tuning().stream.prefetch_qos,
+    );
+    WORKER_QOS.store(class as u8, Ordering::Relaxed);
     loop {
         let (req, target) = {
             let mut g = w.state.lock();

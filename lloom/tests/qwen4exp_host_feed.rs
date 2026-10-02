@@ -251,6 +251,40 @@ fn every_ring_arm_fills_the_rows_the_blocking_arm_hashes() -> Result<()> {
     Ok(())
 }
 
+/// The producer waits by sleeping, at its stated class, and says so in the
+/// run's report: a spinning producer costs a host-planned pass ~30 ms a token
+/// of GPU time on the streamed tier (`expert-streaming.md` §20.14a), and a
+/// spawned thread is at `default` unless it claims (`invariants.md` §15.2
+/// #10b). The report carries what the producer used, not what was asked.
+#[test]
+fn the_producer_sleeps_between_tokens_at_its_stated_class() -> Result<()> {
+    let path = temp_gguf("class");
+    let cfg = tiny();
+    write_table(&cfg, 80, &path)?;
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 3, 5];
+    let out = watched("class", move || -> Result<DecodeOut> {
+        let model = model_with_ple(&tiny(), &path)?;
+        let cache = model.new_cache(&tiny(), &metal())?;
+        let out = decode_turns(&model, cache, Arm::Fixed(1), u32::MAX, &prompt, &[], 10)?;
+        std::fs::remove_file(&path).ok();
+        Ok(out.into_iter().next().unwrap())
+    })?;
+    let feed = out.stats.host_feed.expect("the ring run took no host fill");
+    assert_eq!(
+        feed.poll,
+        PollMechanism::Sleep(Duration::from_micros(50)),
+        "the producer's wait: {feed:?}"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        (feed.qos, feed.qos_errno),
+        (lloom::generation::QosClass::UserInteractive, 0),
+        "the producer's class: {feed:?}"
+    );
+    assert_eq!(feed.forwards, 10);
+    Ok(())
+}
+
 /// With the host fill off the ring arm reads its input ids back: the same
 /// stream, no fill — the A/B's second arm.
 #[test]

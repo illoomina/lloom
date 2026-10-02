@@ -306,10 +306,12 @@ pub trait Speculator {
     /// fed `prompt` after them. A family with its own KV (`KvSource::Own`)
     /// must keep its state for `kept` — or rewind to it — rather than reset,
     /// and key `prompt` at position `kept.len()`: a context that restarts at
-    /// zero holds the suffix alone at the wrong positions, and the verify
-    /// hides it as a lower acceptance rate (issue #894). The default is
-    /// [`Self::begin`], right for a family whose state lives in the target's
-    /// cache (MTP, the identity) and for a request with nothing reused.
+    /// zero holds the suffix alone, and the verify hides the lost prefix as
+    /// a lower acceptance rate (`docs/speculation.md` §10.2z-v). The default
+    /// is [`Self::begin`], right only for a family with no state of its own
+    /// (the identity, a drafter sharing the target's KV) and for a request
+    /// with nothing reused. DSpark's context and MTP's head layer keep their
+    /// own KV and override it.
     fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
         let _ = kept;
         self.begin(seq, prompt)

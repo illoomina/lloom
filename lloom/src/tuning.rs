@@ -180,6 +180,9 @@ pub struct StreamTuning {
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
     #[opt(flag = "prefetch-threads", env = "LLOOM_PREFETCH_THREADS", parser = "parse_at_least_one")]
     pub prefetch_threads: usize,
+    /// The prefetcher's reader threads' QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
+    #[opt(flag = "prefetch-qos", env = "LLOOM_PREFETCH_QOS", parser = "parse_spawned_qos")]
+    pub prefetch_qos: String,
     /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
     #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
     pub prefetch_split: usize,
@@ -215,6 +218,7 @@ impl Default for StreamTuning {
             pread_direct: false,
             // `nn::expert_prefetch::DEFAULT_THREADS` (metal-only module): 8.
             prefetch_threads: 8,
+            prefetch_qos: "default".into(),
             prefetch_split: 1,
             prefetch_lead: 2,
             plan: "device".into(),
@@ -335,6 +339,24 @@ pub struct RingTuning {
     /// The decode thread's QoS: `interactive` (claim `USER_INTERACTIVE`), `default`, or `off`.
     #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"])]
     pub hot_thread: String,
+    /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
+    #[opt(flag = "host-feed-qos", env = "LLOOM_HOST_FEED_QOS", parser = "parse_spawned_qos")]
+    pub feed_qos: String,
+    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (spin only while a forward waits on an unfilled value, else sleep µs: a spinning core costs the streamed tier's host-planned pass GPU time), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
+    #[opt(flag = "host-feed-poll", env = "LLOOM_HOST_FEED_POLL", parser = "parse_poll")]
+    pub feed_poll: String,
+    /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
+    #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool)]
+    pub feed_trace: bool,
+}
+
+fn parse_spawned_qos(v: &str) -> Result<String, String> {
+    crate::generation::hot_thread::parse_spawned_arm(v)
+}
+fn parse_poll(v: &str) -> Result<String, String> {
+    v.trim()
+        .parse::<crate::nn::decode::FeedWait>()
+        .map(|w| w.to_string())
 }
 
 impl Default for RingTuning {
@@ -342,6 +364,9 @@ impl Default for RingTuning {
         RingTuning {
             slack_bytes: crate::generation::readback::RING_SLACK_BYTES_DEFAULT,
             hot_thread: "interactive".into(),
+            feed_qos: "user-interactive".into(),
+            feed_poll: "on-demand:50".into(),
+            feed_trace: false,
         }
     }
 }

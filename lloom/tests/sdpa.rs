@@ -428,8 +428,9 @@ mod metal_sdpa_tests {
         let cpu = Device::Cpu;
 
         // 1 and 31 leave simdgroups with no key; 1024 is a multiple of every
-        // block stride and 1100 is not; 1600 is past LFM2's threshold, so the
-        // route takes each kernel at least once.
+        // block stride and 1100 is not; 1600 is past both the default
+        // threshold and the measured arm's, so the route takes each kernel at
+        // least once under either.
         for &(live, capacity) in &[
             (1usize, 64usize),
             (31, 64),

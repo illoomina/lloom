@@ -2324,16 +2324,15 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 }
 
 /// Keys from which the `q_seq == 1` Metal arm of [`sdpa`] takes the 2-pass
-/// vector kernel at a shape no measurement has placed (MLX's constant,
-/// ml-explore/mlx#1597). See [`sdpa_vector_two_pass_from`].
+/// vector kernel by default, at every shape (MLX's constant,
+/// ml-explore/mlx#1597). See [`sdpa_vector_two_pass`].
 pub const SDPA_TWO_PASS_K_THRESHOLD: usize = 1024;
 
-/// Keys from which the `q_seq == 1` Metal arm of [`sdpa`] takes the 2-pass
-/// vector kernel at `head_dim` and `dtype`: where the two kernels' times
-/// cross inside a decode step (`docs/tuning.md` §13.5s). The 2-pass kernel
-/// pays a second dispatch behind a barrier and wins only once the
-/// single-pass kernel's per-key walk outgrows it: past ~1.5k keys at 64 ×
-/// f16 (LFM2); at 256 × f32 (Qwen4-exp) near 900, where MLX's constant
+/// The measured arm's threshold at `head_dim` and `dtype`: where the two
+/// kernels' times cross inside a decode step (`docs/tuning.md` §13.5s). The
+/// 2-pass kernel pays a second dispatch behind a barrier and wins only once
+/// the single-pass kernel's per-key walk outgrows it: past ~1.5k keys at
+/// 64 × f16 (LFM2); at 256 × f32 (Qwen4-exp) near 900, where MLX's constant
 /// stays. A shape no measurement has placed keeps the constant too.
 pub fn sdpa_vector_two_pass_from(head_dim: usize, dtype: DType) -> usize {
     match (head_dim, dtype) {
@@ -2347,8 +2346,9 @@ pub fn sdpa_vector_two_pass_from(head_dim: usize, dtype: DType) -> usize {
 /// single-pass one. The two are different reductions, so anything meant to
 /// be bit-identical to [`sdpa`] per row (`qwen4exp`'s paged rows) must split
 /// its rows by this function. A pure function of the shape for the life of
-/// the process: `LLOOM_SDPA_TWO_PASS_K`, read once, replaces
-/// [`sdpa_vector_two_pass_from`] with one threshold for every shape.
+/// the process: `LLOOM_SDPA_TWO_PASS_K`, read once, is one threshold for
+/// every shape ([`SDPA_TWO_PASS_K_THRESHOLD`] by default), or 0 for
+/// [`sdpa_vector_two_pass_from`]'s measured table.
 pub fn sdpa_vector_two_pass(k_seq: usize, head_dim: usize, dtype: DType) -> bool {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let k = *K.get_or_init(|| crate::tuning::tuning().lfm2.sdpa_two_pass_k);

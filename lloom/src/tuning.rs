@@ -120,7 +120,7 @@ pub struct Lfm2Tuning {
     /// The FlashDecoding partial kernel's block width: 8 or 32 (the kernels differ only in this geometry).
     #[opt(flag = "flash-partial-bn", env = "LLOOM_FLASH_PARTIAL_BN", parser = "parse_flash_bn", variants = ["8", "32"])]
     pub flash_partial_bn: usize,
-    /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim (0 = the measured threshold per head dim and dtype, `nn::ops::sdpa_vector_two_pass_from`); an A/B arm, which moves digests at the lengths it moves.
+    /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves.
     #[opt(flag = "sdpa-two-pass-k", env = "LLOOM_SDPA_TWO_PASS_K")]
     pub sdpa_two_pass_k: usize,
     /// Print every prefix share (pages, snapshots) — an instrument.
@@ -143,7 +143,7 @@ impl Default for Lfm2Tuning {
             skip_conv_c_fusion: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
-            sdpa_two_pass_k: 0,
+            sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
             share_trace: false,
             verify_poll_trace: false,
             poison_zeros: String::new(),

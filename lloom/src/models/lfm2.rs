@@ -4406,6 +4406,11 @@ impl Cache {
             self.admit_grow(plan.bytes, &plan.describe())?;
             self.apply_grow(&plan)?;
         }
+        // The planes allocate at the first append, at the slab's width: the
+        // ledger hears that here, once per sequence, and at every grow after.
+        if seq_len > 0 && self.kv_len() == 0 {
+            self.ledger_set_held(self.kv_slab * self.kv_bytes_per_token);
+        }
         Ok(())
     }
 
@@ -4546,6 +4551,17 @@ impl Cache {
         }
         self.kv_slab = slab;
         self.ledger_note();
+    }
+
+    /// What the ledger reads as held: the planes' bytes once they exist, or
+    /// the width the first pass will allocate them at (`prepare_pass`).
+    fn ledger_set_held(&self, bytes: usize) {
+        #[cfg(feature = "metal")]
+        if let Some(g) = &self.ledger {
+            g.set_held(bytes);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = bytes;
     }
 
     /// Tell the ledger what this cache holds and needs now: the planes' bytes

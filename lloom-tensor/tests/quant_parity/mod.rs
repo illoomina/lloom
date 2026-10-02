@@ -230,11 +230,10 @@ impl Cell {
 
     fn record(&mut self, err: f64, at: &str) {
         self.cases += 1;
-        if err.is_nan() || err > self.worst || self.worst_at.is_empty() {
-            if !self.worst.is_nan() {
-                self.worst = err;
-                self.worst_at = at.to_string();
-            }
+        let worse = err.is_nan() || err > self.worst || self.worst_at.is_empty();
+        if worse && !self.worst.is_nan() {
+            self.worst = err;
+            self.worst_at = at.to_string();
         }
         if err.is_nan() || err > self.tol {
             self.fails
@@ -660,6 +659,10 @@ pub struct Matrix {
 }
 
 type Census = Vec<(String, u64)>;
+
+/// One K or V plane set: codes, scales and biases on the device, then the
+/// same three as the host reads them.
+type KvPlanes = (Tensor, Tensor, Tensor, Vec<u8>, Vec<f32>, Vec<f32>);
 
 impl Matrix {
     pub fn new(dev: Device) -> Result<Self> {
@@ -1250,7 +1253,7 @@ impl Matrix {
         cap: usize,
         dim: usize,
         seed: u32,
-    ) -> Result<(Tensor, Tensor, Tensor, Vec<u8>, Vec<f32>, Vec<f32>)> {
+    ) -> Result<KvPlanes> {
         let mut rng = Lcg::new(seed);
         let codes: Vec<u8> = (0..bits.code_bytes(heads * cap * dim))
             .map(|_| rng.byte())

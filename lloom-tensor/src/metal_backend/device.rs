@@ -877,9 +877,21 @@ impl MetalDevice {
                 fits: true,
             };
         }
-        let reclaimed = self.trim_unused_buffers();
+        let mut reclaimed = self.trim_unused_buffers();
+        let mut allocated = self.device.current_allocated_size();
+        if allocated.saturating_add(need) > budget {
+            // The second rung: what the host released and the GPU may still
+            // read sits in the pending lists until their epochs complete.
+            // Wait the queue out once — the pass would otherwise end the
+            // reply — then give those back too. A host wait, on the refusal
+            // path alone, never on a step (§21.13); the shared pool's rows
+            // meet exhaustion the same way (`BatchPool::begin_rows`).
+            if self.wait_until_completed().is_ok() {
+                reclaimed += self.trim_unused_buffers();
+                allocated = self.device.current_allocated_size();
+            }
+        }
         self.ledger.note_reclaim(reclaimed);
-        let allocated = self.device.current_allocated_size();
         PassAdmission {
             allocated,
             reclaimed,

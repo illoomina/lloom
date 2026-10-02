@@ -462,4 +462,31 @@ mod admit_tests {
         assert!(a.fits);
         assert_eq!(m.ledger().reclaims().0, after.0);
     }
+    /// The second rung: buffers released while their command buffer is still
+    /// open sit in the pending lists, out of the first reclaim's reach; the
+    /// admission waits the queue out once and gives them back too.
+    #[test]
+    fn a_refusal_drains_the_pending_lists_after_one_wait() {
+        let Ok(dev @ Device::Metal(_)) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(m) = &dev else { unreachable!() };
+        let mib = 1usize << 20;
+        // 32 MiB of fills encoded into the open command buffer, then dropped:
+        // pending against an epoch nothing has committed.
+        let held: Vec<_> = (0..32)
+            .map(|_| crate::Tensor::zeros(mib / 4, crate::DType::F32, &dev).unwrap())
+            .collect();
+        drop(held);
+        let allocated = m.device().current_allocated_size();
+        let need = 4 * mib;
+        let budget = allocated + need - 8 * mib;
+        let a = m.admit_bytes(need, budget);
+        assert!(
+            a.reclaimed >= 32 * mib,
+            "the pending lists held 32 MiB behind an open epoch; reclaimed {}",
+            a.reclaimed
+        );
+        assert!(a.fits, "{a:?}");
+    }
 }

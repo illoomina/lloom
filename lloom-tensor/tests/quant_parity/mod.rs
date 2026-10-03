@@ -165,6 +165,9 @@ impl Entry {
 pub enum Act {
     F32,
     F16,
+    /// An f32 activation the routed f16 kernels read as the half it rounds
+    /// to (`kernel_mul_mv_id{,2}_<q>_f32h_f16`): the f16 arm without the cast.
+    F32H,
 }
 
 impl Act {
@@ -172,6 +175,7 @@ impl Act {
         match self {
             Act::F32 => "f32",
             Act::F16 => "f16",
+            Act::F32H => "f32h",
         }
     }
 
@@ -180,14 +184,28 @@ impl Act {
         match self {
             Act::F32 => "f32",
             Act::F16 => "f16_f16",
+            Act::F32H => "f32h_f16",
         }
     }
 
+    /// The activation tensor's dtype.
     fn dtype(self) -> DType {
         match self {
-            Act::F32 => DType::F32,
+            Act::F32 | Act::F32H => DType::F32,
             Act::F16 => DType::F16,
         }
+    }
+
+    /// The dtype the kernel computes in (the routed calls' `act`).
+    fn compute(self) -> DType {
+        match self {
+            Act::F32 => DType::F32,
+            Act::F16 | Act::F32H => DType::F16,
+        }
+    }
+
+    fn stores_f16(self) -> bool {
+        self.compute() == DType::F16
     }
 }
 
@@ -308,6 +326,9 @@ pub struct Instantiated {
 }
 
 fn act_suffix(rest: &str) -> Option<(&str, Act)> {
+    if let Some(s) = rest.strip_suffix("_f32h_f16") {
+        return Some((s, Act::F32H));
+    }
     if let Some(s) = rest.strip_suffix("_f16_f16") {
         return Some((s, Act::F16));
     }
@@ -548,6 +569,11 @@ pub fn activations(
     let v: Vec<f32> = (0..n).map(|_| rng.sym()).collect();
     match act {
         Act::F32 => Ok((Tensor::from_vec(v.clone(), shape, dev)?, v)),
+        // The kernel rounds each element to half as it loads it.
+        Act::F32H => {
+            let r = v.iter().map(|x| f16::from_f32(*x).to_f32()).collect();
+            Ok((Tensor::from_vec(v, shape, dev)?, r))
+        }
         Act::F16 => {
             let h: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
             let r = h.iter().map(|x| x.to_f32()).collect();
@@ -961,7 +987,13 @@ impl Matrix {
                         let plane = |r: usize| ids[r] as usize;
                         if let Some(u) = &u {
                             let ((go, uo), census) = self.census(|| {
-                                g.q.indexed_moe_forward_pair_with(&u.q, &x, &ids_t, MoeArm::MatVec)
+                                g.q.indexed_moe_forward_pair_as(
+                                    &u.q,
+                                    &x,
+                                    &ids_t,
+                                    MoeArm::MatVec,
+                                    act.compute(),
+                                )
                             })?;
                             let expect =
                                 format!("kernel_mul_mv_id2_{}_{}", stem(d), act.mv_suffix());
@@ -979,7 +1011,7 @@ impl Matrix {
                                 batch * topk,
                                 n,
                                 false,
-                                act == Act::F16,
+                                act.stores_f16(),
                             );
                             self.score_rows(
                                 &key,
@@ -992,30 +1024,46 @@ impl Matrix {
                                 batch * topk,
                                 n,
                                 false,
-                                act == Act::F16,
+                                act.stores_f16(),
                             );
                             // The same core in the same order: the pair is the two
                             // single launches bit for bit.
-                            let g1 = g.q.indexed_moe_forward_with(&x, &ids_t, MoeArm::MatVec)?;
-                            let u1 = u.q.indexed_moe_forward_with(&x, &ids_t, MoeArm::MatVec)?;
+                            let g1 = g.q.indexed_moe_forward_as(
+                                &x,
+                                &ids_t,
+                                MoeArm::MatVec,
+                                act.compute(),
+                            )?;
+                            let u1 = u.q.indexed_moe_forward_as(
+                                &x,
+                                &ids_t,
+                                MoeArm::MatVec,
+                                act.compute(),
+                            )?;
                             if bits_of(&go)? != bits_of(&g1)? || bits_of(&uo)? != bits_of(&u1)? {
                                 self.cell(&key).fails.push(format!(
                                     "{at}: the pair is not the two single launches' bits"
                                 ));
                             }
                             if first {
-                                let (g2, _) = g.q.indexed_moe_forward_pair_with(
+                                let (g2, _) = g.q.indexed_moe_forward_pair_as(
                                     &u.q,
                                     &x,
                                     &ids_t,
                                     MoeArm::MatVec,
+                                    act.compute(),
                                 )?;
                                 self.note_repeat(&key, &at, &go, &g2)?;
                                 first = false;
                             }
                         } else {
                             let (out, census) = self.census(|| {
-                                g.q.indexed_moe_forward_with(&x, &ids_t, MoeArm::MatVec)
+                                g.q.indexed_moe_forward_as(
+                                    &x,
+                                    &ids_t,
+                                    MoeArm::MatVec,
+                                    act.compute(),
+                                )
                             })?;
                             let expect =
                                 format!("kernel_mul_mv_id_{}_{}", stem(d), act.mv_suffix());
@@ -1032,14 +1080,18 @@ impl Matrix {
                                 batch * topk,
                                 n,
                                 false,
-                                act == Act::F16,
+                                act.stores_f16(),
                             );
                             self.mv_id_is_mul_mv(
                                 &key, &at, &g, &x, &out, &ids, batch, topk, in1, n, k,
                             )?;
                             if first {
-                                let again =
-                                    g.q.indexed_moe_forward_with(&x, &ids_t, MoeArm::MatVec)?;
+                                let again = g.q.indexed_moe_forward_as(
+                                    &x,
+                                    &ids_t,
+                                    MoeArm::MatVec,
+                                    act.compute(),
+                                )?;
                                 self.note_repeat(&key, &at, &out, &again)?;
                                 first = false;
                             }
@@ -1083,6 +1135,9 @@ impl Matrix {
                     (n, k),
                 )?;
                 let xr = x.get(b)?.get(if in1 == 1 { 0 } else { t })?.unsqueeze(0)?;
+                // The plain matmul-vec has no f32-read-as-half arm: its f16
+                // arm over the activation cast, which the fold claims to be.
+                let xr = xr.to_dtype(key.2.compute())?;
                 let plain = xr.apply_op1_no_bwd(&one)?;
                 if bits_of(&plain)? != bits_of(&out.get(b)?.get(t)?.unsqueeze(0)?)? {
                     differ += 1;
@@ -1272,6 +1327,7 @@ impl Matrix {
                     .collect::<Vec<_>>(),
             ),
             Act::F32 => (sc, bi),
+            Act::F32H => unreachable!("a KV cell's dtype is f32 or f16 (`parse_kv`)"),
         };
         let plane = |v: &[f32]| -> Result<Tensor> {
             Tensor::from_vec(v.to_vec(), v.len(), &self.dev)?.to_dtype(act.dtype())
@@ -1373,6 +1429,9 @@ impl Matrix {
                         let u = match act {
                             Act::F32 => ulps32(g, r),
                             Act::F16 => ulps16(f16::from_f32(g), f16::from_f32(r)),
+                            Act::F32H => {
+                                unreachable!("a KV cell's dtype is f32 or f16 (`parse_kv`)")
+                            }
                         };
                         if u > worst || where_.is_empty() {
                             worst = u;

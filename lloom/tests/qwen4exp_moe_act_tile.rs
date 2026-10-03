@@ -13,8 +13,10 @@
 //! f16 step pays the f32 step's routed launch count. With `f16_fuse` the f16
 //! step's SwiGLU is one `silu_mul_f16` and its combine reads the f16 routed
 //! output (`moe_combine_f16`), so it pays one launch a layer over f32 (the
-//! cast in); without it, three (`silu_f16` + `bmul_f16`, the cast out). The
-//! two compute the same bits.
+//! cast in); without it, three (`silu_f16` + `bmul_f16`, the cast out). With
+//! `f16_fold` as well the cast in is gone too: gate|up read the f32
+//! activation and round it on load (`_f32h_f16`), the f32 step's launch count.
+//! All three f16 steps compute the same bits.
 //!
 //! Its own binary: the census switch and the contract are read once.
 #![cfg(feature = "metal")]
@@ -69,10 +71,16 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
 
     let mut runs = Vec::new();
     let mut steps = Vec::new();
-    for (act, fuse) in [(DType::F32, true), (DType::F16, false), (DType::F16, true)] {
+    for (act, fuse, fold) in [
+        (DType::F32, true, false),
+        (DType::F16, false, false),
+        (DType::F16, true, false),
+        (DType::F16, true, true),
+    ] {
         let mut model = fx.resident(&cfg, &dev, &LoadOptions::default())?;
         model.set_routed_act(act);
         model.set_f16_fuse(fuse);
+        model.set_f16_fold(fold);
         let mut cache: Cache = model.new_cache(&cfg, &dev)?;
         dev.synchronize()?;
         let window = dev
@@ -117,8 +125,9 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
         } else {
             "_f32"
         };
+        let pair_suffix = if fold { "_f32h_f16" } else { suffix };
         let (pair, single) = (
-            launches(&format!("kernel_mul_mv_id2_q8_0{suffix}")),
+            launches(&format!("kernel_mul_mv_id2_q8_0{pair_suffix}")),
             launches(&format!("kernel_mul_mv_id_q8_0{suffix}")),
         );
         let named = |name: &str| -> u64 {
@@ -140,7 +149,7 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
         ]
         .map(|k| (k, named(k)));
         println!(
-            "MOEACT act={act:?} f16_fuse={fuse} prefill_mul_mm_id={gemm} decode_mul_mv_id2={pair} decode_mul_mv_id={single} decode_routed={} {}",
+            "MOEACT act={act:?} f16_fuse={fuse} f16_fold={fold} prefill_mul_mm_id={gemm} decode_mul_mv_id2={pair} decode_mul_mv_id={single} decode_routed={} {}",
             launches("mul_mv_id"),
             swiglu
                 .iter()
@@ -148,7 +157,7 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        steps.push((act, fuse, swiglu));
+        steps.push((act, fuse, fold, swiglu));
         let layers = cfg.n_layers as u64;
         assert_eq!(
             (pair, single, launches("mul_mv_id")),
@@ -162,13 +171,13 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
     let layers = cfg.n_layers as i64;
     let n = |i: usize, k: &str| -> i64 {
         steps[i]
-            .2
+            .3
             .iter()
             .find(|(name, _)| *name == k)
             .expect("a counted kernel")
             .1 as i64
     };
-    let (f32_i, off_i, on_i) = (0, 1, 2);
+    let (f32_i, off_i, on_i, fold_i) = (0, 1, 2, 3);
     for (i, label) in [(off_i, "f16_fuse off"), (on_i, "f16_fuse on")] {
         assert_eq!(
             n(i, "cast_f32_f16"),
@@ -208,12 +217,26 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
         ),
         "f16_fuse on: the f16 step's SwiGLU is not one launch, or its combine still reads a cast"
     );
-    let (f32_run, off_run, f16_run) = (&runs[0], &runs[1], &runs[2]);
+    assert_eq!(
+        n(fold_i, "cast_f32_f16"),
+        n(f32_i, "cast_f32_f16"),
+        "f16_fold on: the routed activation is still cast in a launch of its own"
+    );
+    for k in ["silu_mul_f16", "moe_combine_f16", "cast_f16_f32"] {
+        assert_eq!(n(fold_i, k), n(on_i, k), "f16_fold on: {k} moved");
+    }
+    let (f32_run, off_run, f16_run, fold_run) = (&runs[0], &runs[1], &runs[2], &runs[3]);
     assert_eq!(
         bits(&f16_run.2),
         bits(&off_run.2),
         "the fused f16 step's logits are not the unfused f16 step's"
     );
+    assert_eq!(
+        bits(&fold_run.2),
+        bits(&f16_run.2),
+        "the folded f16 step's logits are not the cast-then-launch step's"
+    );
+    assert_eq!(bits(&fold_run.1), bits(&f16_run.1));
     assert_eq!(bits(&off_run.1), bits(&f16_run.1));
     assert!(f32_run.3 > 0, "the f32 tile did not take the routed GEMM");
     assert_eq!(

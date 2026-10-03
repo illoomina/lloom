@@ -1324,7 +1324,9 @@ pub fn print_trace_census(steps: u64) {
     if !trace::trace_requested() {
         return;
     }
-    let mut census: std::collections::BTreeMap<(String, bool), u64> = Default::default();
+    // Per kernel: dispatches, and how many of them were ordered after their
+    // predecessor (the barrier count that names a launch on the serial chain).
+    let mut census: std::collections::BTreeMap<(String, bool), (u64, u64)> = Default::default();
     // Which GEMVs are ORDERED after their predecessor — a barrier before
     // them, or the first dispatch of an encoder session — and so pay a drain
     // and a fill, against those free to overlap it; keyed by weight bytes
@@ -1353,7 +1355,9 @@ pub fn print_trace_census(steps: u64) {
                 e.1 += 1;
             }
         }
-        *census.entry((d.pipeline, d.by_threadgroups)).or_default() += 1;
+        let c = census.entry((d.pipeline, d.by_threadgroups)).or_default();
+        c.0 += 1;
+        c.1 += u64::from(ordered);
     }
     let per = steps.max(1) as f64;
     eprintln!(
@@ -1371,19 +1375,22 @@ pub fn print_trace_census(steps: u64) {
         );
     }
     eprintln!("]");
-    let total: u64 = census.values().sum();
+    let total: u64 = census.values().map(|c| c.0).sum();
     let threads: u64 = census
         .iter()
         .filter(|((_, tg), _)| !tg)
-        .map(|(_, n)| n)
+        .map(|(_, c)| c.0)
         .sum();
     eprintln!(
         "[trace census: {total} dispatches over {steps} steps (whole run, prefill included), \
          {} kernels, {threads} dispatched by threads]",
         census.len()
     );
-    for ((name, tg), n) in &census {
-        eprintln!("  {n:6} {} {name}", if *tg { "tg " } else { "thr" });
+    for ((name, tg), (n, ordered)) in &census {
+        eprintln!(
+            "  {n:6} {} ordered={ordered:<6} {name}",
+            if *tg { "tg " } else { "thr" }
+        );
     }
     flow.print(steps);
 }

@@ -5584,6 +5584,30 @@ impl Mlp {
         self.forward(x)? + residual
     }
 
+    /// Whether [`Self::forward_add_normed`] serves `x`: both FFN inputs and
+    /// `w2`'s residual through the fused GEMVs.
+    fn norm_gemv_applies(&self, x: &Tensor, norm: &RmsNorm) -> bool {
+        norm_gemv_applies(x, norm, &self.gate_proj)
+            && norm_gemv_applies(x, norm, &self.up_proj)
+            && self.down_proj.bias().is_none()
+            && self.down_proj.weight().is_contiguous()
+            && self.down_proj.weight().dims()[0] == x.dims()[x.rank() - 1]
+    }
+
+    /// `mlp(rmsnorm(x)) + residual` with the norm inside `w1`'s and `w3`'s
+    /// GEMVs (`w1` carrying the SiLU), the product a `bmul` and `w2` the
+    /// residual GEMV. The caller has checked [`Self::norm_gemv_applies`].
+    fn forward_add_normed(&self, x: &Tensor, norm: &RmsNorm, residual: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let gate = norm_gemv(x, norm, &self.gate_proj, true)?;
+        let up = norm_gemv(x, norm, &self.up_proj, false)?;
+        let gated = (gate * up)?;
+        if gemv_residual_applies(true, &gated, &self.down_proj, residual) {
+            return crate::nn::ops::gemv_residual(&gated, self.down_proj.weight(), residual);
+        }
+        self.down_proj.forward(&gated)? + residual
+    }
+
     /// `silu(w1(x)) * w3(x)` — the SwiGLU gate, shared by both entry points so
     /// the two cannot drift in what they compute.
     fn gated(&self, x: &Tensor) -> Result<Tensor> {
@@ -5785,6 +5809,24 @@ impl Attention {
         self.forward(x, index_pos, block_idx, cache)? + residual
     }
 
+    /// [`Self::forward_add`] over the un-normalized `x`, `norm` riding the
+    /// q/k/v projections.
+    fn forward_add_normed(
+        &self,
+        x: &Tensor,
+        norm: &RmsNorm,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let y = self.attend_normed(x, Some(norm), index_pos, block_idx, cache)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
+            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        }
+        self.o_proj.forward(&y)? + residual
+    }
+
     /// [`Self::forward_add`] for one step of `rows.len()` independent
     /// sequences (`BatchedCausalLM`): the projections run once over
     /// `[B, 1, hidden]`, each row attends against its own cache. The residual
@@ -5813,9 +5855,21 @@ impl Attention {
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
+        self.attend_normed(x, None, index_pos, block_idx, cache)
+    }
+
+    /// [`Self::attend`] with the input norm riding the projections.
+    fn attend_normed(
+        &self,
+        x: &Tensor,
+        norm: Option<&RmsNorm>,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q, k, v, rotated) = self.project(x, Some((index_pos, &*cache)))?;
+        let (q, k, v, rotated) = self.project_normed(x, norm, Some((index_pos, &*cache)))?;
         let y = self.attend_projected(&q, &k, v, rotated, index_pos, block_idx, cache)?;
         y.transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
@@ -6300,11 +6354,31 @@ impl Attention {
         x: &Tensor,
         rope_at: Option<(usize, &Cache)>,
     ) -> Result<(Tensor, Tensor, Tensor, bool)> {
+        self.project_normed(x, None, rope_at)
+    }
+
+    /// [`Self::project`]; with `norm`, `x` is the un-normalized input and the
+    /// norm rides each projection's GEMV (`norm_gemv`).
+    fn project_normed(
+        &self,
+        x: &Tensor,
+        norm: Option<&RmsNorm>,
+        rope_at: Option<(usize, &Cache)>,
+    ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let (q, k, v) = match norm {
+            Some(n) => (
+                norm_gemv(x, n, &self.q_proj, false)?,
+                norm_gemv(x, n, &self.k_proj, false)?,
+                norm_gemv(x, n, &self.v_proj, false)?,
+            ),
+            None => (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            ),
+        };
 
         // Reshape to (batch, seq, num_heads, head_dim) then transpose to
         // (batch, num_heads, seq, head_dim): a view, contiguous at
@@ -7116,6 +7190,25 @@ impl ShortConv {
         self.forward(x, block_idx, cache)? + residual
     }
 
+    /// [`Self::forward_add`] over the un-normalized `x`, `norm` riding
+    /// `in_proj`'s GEMV.
+    fn forward_add_normed(
+        &self,
+        x: &Tensor,
+        norm: &RmsNorm,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let bcx = norm_gemv(x, norm, &self.in_proj, false)?.transpose(1, 2)?;
+        let conv_out = self.convolve_bcx(&bcx, block_idx, cache)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        }
+        self.out_proj.forward(&conv_out)? + residual
+    }
+
     /// [`Self::forward_add`] for one step of `rows.len()` independent
     /// sequences (`BatchedCausalLM`): `in_proj` runs once over
     /// `[B, 1, hidden]`, each row convolves against its own state. The
@@ -7853,7 +7946,59 @@ struct DecoderLayer {
     span: tracing::Span,
 }
 
+/// `LLOOM_LFM2_NORM_GEMV`: a decode step's RMSNorm runs inside the GEMVs
+/// that consume it (`nn::ops::gemv_norm`). Read once.
+fn norm_gemv_arm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().lfm2.norm_gemv)
+}
+
+/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the arm,
+/// Metal, one contiguous row, a dtype the kernel carries, and the norm's
+/// weight a contiguous `[k]` of `x`'s dtype.
+fn norm_gemv_applies(x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
+    norm_gemv_arm()
+        && x.device().is_metal()
+        && matches!(x.dims(), [1, 1, _] | [1, _])
+        && x.dims().last() == Some(&proj.weight().dims()[1])
+        && proj.bias().is_none()
+        && x.is_contiguous()
+        && proj.weight().is_contiguous()
+        && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && norm.weight().dtype() == x.dtype()
+        && norm.weight().is_contiguous()
+        && norm.weight().elem_count() == proj.weight().dims()[1]
+}
+
+/// `proj(rmsnorm(x))` (and its SiLU) in one dispatch.
+fn norm_gemv(x: &Tensor, norm: &RmsNorm, proj: &Linear, silu: bool) -> Result<Tensor> {
+    crate::nn::ops::gemv_norm(x, proj.weight(), norm.weight(), norm.eps() as f32, silu)
+}
+
+/// `LLOOM_LFM2_ABLATE` names `norm`: the decode step skips the layers'
+/// RMSNorms (an instrument pricing a fusion's upper bound; the output is
+/// wrong). Read once.
+fn ablate_norms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::tuning::tuning()
+            .lfm2
+            .ablate
+            .split(',')
+            .any(|s| s.trim() == "norm")
+    })
+}
+
 impl DecoderLayer {
+    /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
+    /// one-token step.
+    fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+        if ablate_norms() && x.dim(x.rank() - 2)? == 1 {
+            return Ok(x.clone());
+        }
+        n.forward(x)
+    }
+
     fn new(cfg: &Config, layer_idx: usize, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
         // LFM2 uses operator_norm and ffn_norm naming
         let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
@@ -7892,7 +8037,10 @@ impl DecoderLayer {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
-        let x = self.input_layernorm.forward(x)?;
+        if let Some(y) = self.forward_norm_gemv(x, index_pos, block_idx, cache)? {
+            return Ok(y);
+        }
+        let x = self.norm(&self.input_layernorm, x)?;
 
         // `forward_add` is `forward(..)? + residual` unless the fused arm is on
         // AND applies, in which case the add happens at the producing GEMV's
@@ -7906,8 +8054,40 @@ impl DecoderLayer {
         };
 
         let residual = &x;
-        let x = self.post_attention_layernorm.forward(&x)?;
+        let x = self.norm(&self.post_attention_layernorm, &x)?;
         self.mlp.forward_add(&x, residual)
+    }
+
+    /// [`Self::forward`] under the norm-GEMV arm: both norms ride their
+    /// consumers' GEMVs. `None` when the arm does not serve this call (every
+    /// consumer must take the fused GEMV, or none does).
+    fn forward_norm_gemv(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Option<Tensor>> {
+        let pre = &self.input_layernorm;
+        let applies = match &self.kind {
+            LayerKind::Attention(a) => {
+                norm_gemv_applies(x, pre, &a.q_proj)
+                    && norm_gemv_applies(x, pre, &a.k_proj)
+                    && norm_gemv_applies(x, pre, &a.v_proj)
+            }
+            LayerKind::ShortConv(c) => norm_gemv_applies(x, pre, &c.in_proj),
+        } && self.mlp.norm_gemv_applies(x, &self.post_attention_layernorm);
+        if !applies {
+            return Ok(None);
+        }
+        let h = match &self.kind {
+            LayerKind::Attention(attn) => {
+                attn.forward_add_normed(x, pre, index_pos, block_idx, cache, x)?
+            }
+            LayerKind::ShortConv(conv) => conv.forward_add_normed(x, pre, block_idx, cache, x)?,
+        };
+        let post = &self.post_attention_layernorm;
+        Ok(Some(self.mlp.forward_add_normed(&h, post, &h)?))
     }
 
     /// [`Self::forward`] for one step of `rows.len()` independent sequences:
@@ -8447,6 +8627,11 @@ impl Model {
 
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
+        if seq_len == 1 && norm_gemv_applies(&hidden_states, &self.embedding_norm, &self.lm_head) {
+            let logits = norm_gemv(&hidden_states, &self.embedding_norm, &self.lm_head, false)?;
+            dump_logits(&logits, index_pos)?;
+            return logits.to_dtype(DType::F32);
+        }
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;

@@ -82,8 +82,37 @@ struct GemvDefaultAccT {
 // inlines away entirely.
 template <typename T, typename AccT>
 struct PrologueNone {
+  MLX_MTL_CONST bool kInlineNorm = false;
   METAL_FUNC PrologueNone(const device T*, const device float*) {}
   METAL_FUNC AccT operator()(AccT x, int) const { return x; }
+  METAL_FUNC AccT scale(AccT, int) const { return AccT(1); }
+};
+
+// RMSNorm computed INSIDE the GEMV, reduction included (`DESIGN.md` §12.2
+// row 2, `docs/tuning.md` §13.5t). At the decode tiles (`bn1 sm1 sn32`) each
+// simdgroup's 32 lanes walk the whole of K for the dot product, so the same
+// loaded coefficients give `sum(x^2)` for one more FMA per element and one
+// more shuffle tree, with no extra read: the reduction the separate
+// `rmsnorm` dispatch exists for is already in every simdgroup's registers.
+// `y = (W (x * w)) * rsqrt(mean(x^2) + eps)`: the weight rides the prologue,
+// the 1/rms the store. Not bit-identical to norm-then-GEMV (no f16 rounding
+// of the normalized vector, a different summation tree).
+template <typename T, typename AccT>
+struct PrologueNormInline {
+  MLX_MTL_CONST bool kInlineNorm = true;
+  const device T* w;
+  AccT eps;
+
+  METAL_FUNC PrologueNormInline(const device T* w_, float eps_)
+      : w(w_), eps(static_cast<AccT>(eps_)) {}
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x * static_cast<AccT>(w[i]);
+  }
+
+  METAL_FUNC AccT scale(AccT ssq, int k) const {
+    return metal::precise::rsqrt(ssq / static_cast<AccT>(k) + eps);
+  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -294,6 +323,7 @@ struct EpilogueMul {
 // test uses a non-constant weight.
 template <typename T, typename AccT>
 struct PrologueRmsNorm {
+  MLX_MTL_CONST bool kInlineNorm = false;
   const device T* w;
   AccT inv_rms;
 
@@ -303,6 +333,7 @@ struct PrologueRmsNorm {
   METAL_FUNC AccT operator()(AccT x, int i) const {
     return x * inv_rms * static_cast<AccT>(w[i]);
   }
+  METAL_FUNC AccT scale(AccT, int) const { return AccT(1); }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -345,6 +376,11 @@ struct GEMVKernel {
 
   MLX_MTL_CONST short tgp_mem_size = BN > 1 ? BN * (blockM + TM) : 0;
   MLX_MTL_CONST bool needs_tgp_reduction = BN > 1;
+
+  // The inline norm's reduction is complete in one simdgroup only when the
+  // simdgroup spans K by itself.
+  static_assert(!Prologue::kInlineNorm || (BN == 1 && SN == 32),
+                "the inline norm needs a tile whose simdgroup walks all of K");
 
   template <typename U = T>
   static METAL_FUNC void load_unsafe(
@@ -431,6 +467,7 @@ struct GEMVKernel {
     thread AccT result[TM] = {0};
     thread T inter[TN];
     thread AccT v_coeff[TN];
+    AccT ssq = 0;
 
     const int thrM = SN != 32 ? (int)(simd_lid / SN) : 0;
     const int thrN = SN != 32 ? (int)(simd_lid % SN) : (int)simd_lid;
@@ -460,6 +497,13 @@ struct GEMVKernel {
     for (int i = 0; i < n_iter; ++i) {
       load_vec_unsafe<VT, AccT>(in_vec, v_coeff, bn);
 
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
+
       // The prologue transforms the input vector in registers, so a fused
       // producer's output is never written to memory (issue #266). Under
       // `PrologueNone` this is the identity and inlines away, which is what
@@ -484,6 +528,12 @@ struct GEMVKernel {
 
     if (leftover > 0) {
       load_vec_safe<VT, AccT>(in_vec, v_coeff, bn, in_size);
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
       // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
       // and the prologue must not index its weight out of bounds there. A
       // zero times anything is zero, so skipping the transform on the padding
@@ -509,6 +559,12 @@ struct GEMVKernel {
       MLX_MTL_PRAGMA_UNROLL
       for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
         result[tm] += simd_shuffle_down(result[tm], sn);
+      }
+    }
+    if (Prologue::kInlineNorm) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        ssq += simd_shuffle_down(ssq, sn);
       }
     }
 
@@ -549,6 +605,13 @@ struct GEMVKernel {
     // one way that is arithmetically defensible rather than left to whichever
     // order fell out.
     if (simdN == 0 && thrN == 0) {
+      if (Prologue::kInlineNorm) {
+        const AccT inv_rms = prologue.scale(ssq, in_vec_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          result[tm] *= inv_rms;
+        }
+      }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         const AccT y = epilogue(result[tm], out_row + tm);
@@ -1165,6 +1228,62 @@ void gemv_rmsnorm(
       prologue, epilogue_t(),
       tid, lid, simd_gid, simd_lid);
 }
+
+// `gemv_rmsnorm` without the imported scale: the RMSNorm's reduction is
+// computed in the GEMV (`PrologueNormInline`), so the norm is not its own
+// dispatch. The norm weight at 15 and `eps` at 16; `EPI` the output end.
+#define gemv_norm_wrapper(func, EPI)                                              \
+template <                                                                        \
+    typename T,                                                                   \
+    const int BM, const int BN,                                                   \
+    const int SM, const int SN,                                                   \
+    const int TM, const int TN,                                                   \
+    const bool kDoNCBatch,                                                        \
+    const bool kDoAxpby>                                                          \
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]                       \
+void func(                                                                        \
+    const device T* mat [[buffer(0)]],                                            \
+    const device T* in_vec [[buffer(1)]],                                         \
+    const device T* bias [[buffer(2)]],                                           \
+    device T* out_vec [[buffer(3)]],                                              \
+    const constant int& in_vec_size [[buffer(4)]],                                \
+    const constant int& out_vec_size [[buffer(5)]],                               \
+    const constant int& matrix_ld [[buffer(6)]],                                  \
+    const constant float& alpha [[buffer(7)]],                                    \
+    const constant float& beta [[buffer(8)]],                                     \
+    const constant int& batch_ndim [[buffer(9)]],                                 \
+    const constant int* batch_shape [[buffer(10)]],                               \
+    const constant int64_t* vector_batch_stride [[buffer(11)]],                   \
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],                   \
+    const constant int64_t* bias_batch_stride [[buffer(13)]],                     \
+    const constant int& bias_stride [[buffer(14)]],                               \
+    const device T* norm_weight [[buffer(15)]],                                   \
+    const constant float& norm_eps [[buffer(16)]],                                \
+    uint3 tid [[threadgroup_position_in_grid]],                                   \
+    uint3 lid [[thread_position_in_threadgroup]],                                 \
+    uint simd_gid [[simdgroup_index_in_threadgroup]],                             \
+    uint simd_lid [[thread_index_in_simdgroup]],                                  \
+    EOS_GATE_ARG) {                                                               \
+    EOS_GATE_CHECK                                                                \
+  using acc_t = typename GemvDefaultAccT<T>::type;                                \
+  using prologue_t = PrologueNormInline<T, acc_t>;                                \
+  using epilogue_t = EPI<T, acc_t>;                                               \
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;               \
+  gemv_tgp_memory(kernel_t);                                                      \
+  const prologue_t prologue(norm_weight, norm_eps);                               \
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,          \
+                 epilogue_t>(                                                     \
+      mat, in_vec, bias, out_vec,                                                 \
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,                          \
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,          \
+      bias_batch_stride, bias_stride,                                             \
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,                         \
+      prologue, epilogue_t(),                                                     \
+      tid, lid, simd_gid, simd_lid);                                              \
+}
+
+gemv_norm_wrapper(gemv_norm, EpilogueNone)
+gemv_norm_wrapper(gemv_norm_silu, EpilogueSilu)
 
 // The ICB-expressible sibling: one `device const GemvParams*` in place of the
 // seven `constant &` scalars, everything else unchanged.
@@ -2129,6 +2248,24 @@ instantiate_gemv_rmsnorm_blocks(bfloat16, bfloat)
 
 // The fused-epilogue tiles. `bm8` is the one w1 selects and therefore the only
 // one decode reaches; `bm4` is the fixture's second tile (see the helper).
+// The inline-norm arms (`gemv_norm_wrapper`), at the two decode tiles: the
+// only tiles whose simdgroup walks all of K.
+#define instantiate_gemv_norm_helper(func, nm, itype, bm, suffix)               \
+  template [[host_name(                                                        \
+      "gemv_" #nm "_bm" #bm "_bn1_sm1_sn32_tm4_tn4_nc0_axpby0" suffix)]]        \
+  [[kernel]] decltype(func<itype, bm, 1, 1, 32, 4, 4, false, false>)           \
+             func<itype, bm, 1, 1, 32, 4, 4, false, false>;
+
+#define instantiate_gemv_norm_blocks(nm, itype)                                \
+  instantiate_gemv_norm_helper(gemv_norm, nm, itype, 4, "_norm")               \
+  instantiate_gemv_norm_helper(gemv_norm, nm, itype, 8, "_norm")               \
+  instantiate_gemv_norm_helper(gemv_norm_silu, nm, itype, 4, "_norm_silu")     \
+  instantiate_gemv_norm_helper(gemv_norm_silu, nm, itype, 8, "_norm_silu")
+
+instantiate_gemv_norm_blocks(float32, float)
+instantiate_gemv_norm_blocks(float16, half)
+instantiate_gemv_norm_blocks(bfloat16, bfloat)
+
 #define instantiate_gemv_silu_blocks(nm, itype)              \
   instantiate_gemv_silu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_silu_helper(nm, itype, 8, 1, 1, 32, 4, 4)

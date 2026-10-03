@@ -480,6 +480,23 @@ pub struct GemvRmsNorm<'a> {
     pub scale_offset: usize,
 }
 
+/// RMSNorm computed INSIDE the GEMV (`gemv_norm*`, `docs/tuning.md` §13.5t):
+/// the norm weight `[K]` and `eps`. Unlike [`GemvRmsNorm`] it imports no
+/// scale, so the norm is no dispatch of its own: at the decode tiles each
+/// simdgroup walks all of K and reduces `sum(x^2)` beside the dot product.
+pub struct GemvNormInline<'a> {
+    pub weight: &'a Buffer,
+    pub weight_offset: usize,
+    pub eps: f32,
+}
+
+/// Which input-side transform a GEMV runs.
+enum GemvPrologue<'a> {
+    None,
+    RmsNorm(GemvRmsNorm<'a>),
+    NormInline(GemvNormInline<'a>),
+}
+
 /// The elementwise transform fused onto a GEMV's OUTPUT (issue #484,
 /// `DESIGN.md` §12.2 #3).
 ///
@@ -747,7 +764,7 @@ pub fn call_mlx_gemv_epilogue(
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GemmDType,
-    (b, m, n, k): (usize, usize, usize, usize),
+    mnk: (usize, usize, usize, usize),
     lhs_stride: &[usize],
     lhs_offset: usize,
     lhs_buffer: &Buffer,
@@ -757,6 +774,91 @@ pub fn call_mlx_gemv_epilogue(
     output: &Buffer,
     style: ParamStyle,
     fused_norm: Option<GemvRmsNorm<'_>>,
+    epilogue: GemvEpilogue,
+    epilogue_operand: Option<(&Buffer, usize)>,
+) -> Result<(), MetalKernelError> {
+    let prologue = match fused_norm {
+        Some(norm) => GemvPrologue::RmsNorm(norm),
+        None => GemvPrologue::None,
+    };
+    gemv_dispatch(
+        device,
+        ep,
+        kernels,
+        dtype,
+        mnk,
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+        style,
+        prologue,
+        epilogue,
+        epilogue_operand,
+    )
+}
+
+/// A GEMV with its RMSNorm computed inside it ([`GemvNormInline`]): `out =
+/// epilogue((W (x * norm.w)) * rsqrt(mean(x^2) + eps))`, one dispatch where the
+/// unfused pair is an `rmsnorm` and a GEMV. Only `GemvEpilogue::None` and
+/// `GemvEpilogue::Silu` are instantiated, at the non-transposed `bm4`/`bm8`
+/// decode tiles, `ParamStyle::Split`; anything else is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_norm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    mnk: (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    norm: GemvNormInline<'_>,
+    epilogue: GemvEpilogue,
+) -> Result<(), MetalKernelError> {
+    gemv_dispatch(
+        device,
+        ep,
+        kernels,
+        dtype,
+        mnk,
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+        ParamStyle::Split,
+        GemvPrologue::NormInline(norm),
+        epilogue,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemv_dispatch(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+    prologue: GemvPrologue<'_>,
     epilogue: GemvEpilogue,
     epilogue_operand: Option<(&Buffer, usize)>,
 ) -> Result<(), MetalKernelError> {
@@ -911,7 +1013,28 @@ pub fn call_mlx_gemv_epilogue(
     // else is REFUSED rather than silently falling back to the unfused name:
     // a fused request that ran unfused would compute an un-normalized result,
     // and under `HazardTrackingModeUntracked` (§3.5) nothing would report it.
-    let norm_suffix = if fused_norm.is_some() {
+    let decode_tile = !transpose_mat
+        && bn == 1
+        && sm == 1
+        && sn == 32
+        && tn == 4
+        && tm == 4
+        && (bm == 4 || bm == 8);
+    if let GemvPrologue::NormInline(_) = &prologue {
+        if !decode_tile || style != ParamStyle::Split {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv inline norm is instantiated only at the non-transposed bm4/bm8 decode \
+                 tiles, split params; asked for {kernel_prefix} \
+                 bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn} {style:?} (mnk={m}x{n}x{k})"
+            )));
+        }
+        if !matches!(epilogue, GemvEpilogue::None | GemvEpilogue::Silu) {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv inline norm composes with no epilogue or SiLU only, not {epilogue:?}"
+            )));
+        }
+    }
+    let norm_suffix = if let GemvPrologue::RmsNorm(_) = &prologue {
         let tile_is_instantiated = !transpose_mat
             && bn == 1
             && sm == 1
@@ -936,6 +1059,8 @@ pub fn call_mlx_gemv_epilogue(
             ));
         }
         "_rmsnorm"
+    } else if let GemvPrologue::NormInline(_) = &prologue {
+        "_norm"
     } else {
         ""
     };
@@ -957,7 +1082,7 @@ pub fn call_mlx_gemv_epilogue(
     // combination is missing; `load_pipeline` would only say the name is
     // absent.
     let epilogue_suffix = if epilogue != GemvEpilogue::None {
-        if !norm_suffix.is_empty() {
+        if norm_suffix == "_rmsnorm" {
             return Err(MetalKernelError::LoadFunctionError(
                 "gemv fused prologue and epilogue cannot be combined: no \
                  `_rmsnorm_silu` variant is instantiated (issue #484, \
@@ -1067,9 +1192,16 @@ pub fn call_mlx_gemv_epilogue(
     // written by the reduction dispatch immediately before this one, so the
     // RAW edge between them is exactly what must not be dropped -- and under
     // `HazardTrackingModeUntracked` a missed one is silent corruption (§3.5).
-    if let Some(norm) = fused_norm {
-        encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
-        encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
+    match &prologue {
+        GemvPrologue::RmsNorm(norm) => {
+            encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
+            encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
+        }
+        GemvPrologue::NormInline(norm) => {
+            encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
+            encoder.set_bytes(16, &norm.eps);
+        }
+        GemvPrologue::None => {}
     }
 
     // The fused epilogue's one binding, also at 15 -- the two fused arms are

@@ -123,6 +123,12 @@ pub struct Lfm2Tuning {
     /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves.
     #[opt(flag = "sdpa-two-pass-k", env = "LLOOM_SDPA_TWO_PASS_K")]
     pub sdpa_two_pass_k: usize,
+    /// The decode step's RMSNorms computed inside the projections that consume them (`nn::ops::gemv_norm`: one dispatch where the pair is two; moves digests). An arm, off by default.
+    #[opt(flag = "lfm2-norm-gemv", env = "LLOOM_LFM2_NORM_GEMV", bool)]
+    pub norm_gemv: bool,
+    /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
+    #[opt(flag = "lfm2-ablate", env = "LLOOM_LFM2_ABLATE")]
+    pub ablate: String,
     /// Print every prefix share (pages, snapshots) — an instrument.
     #[opt(flag = "share-trace", env = "LLOOM_148_SHARE_TRACE", bool)]
     pub share_trace: bool,
@@ -144,6 +150,8 @@ impl Default for Lfm2Tuning {
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
+            norm_gemv: false,
+            ablate: String::new(),
             share_trace: false,
             verify_poll_trace: false,
             poison_zeros: String::new(),

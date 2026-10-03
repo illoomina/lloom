@@ -579,6 +579,31 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
             acc_h, acc_p,
             "j={j}: the split (enqueue/complete) arm accepted different tokens"
         );
+        // On Metal the completion waits on the event signalled behind the
+        // round's stamp: every round signalled it, and each was either already
+        // visible or parked until it landed, none timing out
+        // (`expert-streaming.md` §20.14b).
+        #[cfg(feature = "metal")]
+        if dev.is_metal() {
+            for (arm, w) in [
+                ("device", cache_d.verify_waits()),
+                ("split", cache_p.verify_waits()),
+            ] {
+                assert!(
+                    w.signalled > 0,
+                    "j={j}: the {arm} arm signalled no publish event: {w:?}"
+                );
+                assert_eq!(
+                    w.already + w.parked,
+                    w.signalled,
+                    "j={j}: the {arm} arm's completion did not wait on its event: {w:?}"
+                );
+                assert_eq!(
+                    w.fell_back, 0,
+                    "j={j}: the {arm} arm's park timed out: {w:?}"
+                );
+            }
+        }
         assert_eq!(probe_p.len(), 5, "the split arm hands back the five taps");
         for t in &probe_p {
             assert_eq!(

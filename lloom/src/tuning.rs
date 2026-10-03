@@ -342,12 +342,18 @@ pub struct RingTuning {
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
     #[opt(flag = "host-feed-qos", env = "LLOOM_HOST_FEED_QOS", parser = "parse_spawned_qos")]
     pub feed_qos: String,
-    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (spin only while a forward waits on an unfilled value, else sleep µs: a spinning core costs the streamed tier's host-planned pass GPU time), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
+    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (`WFE` while a forward waits on an unfilled value, else a µs sleep: measured fastest), `event[:<µs>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
     #[opt(flag = "host-feed-poll", env = "LLOOM_HOST_FEED_POLL", parser = "parse_poll")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool)]
     pub feed_trace: bool,
+    /// The fixed cadence's EOS wait parks on the ring's publish event instead of polling the stamp (off: the poll; parking measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool)]
+    pub eos_park: bool,
+    /// DSpark's verify completion parks on an event behind the round's stamp instead of polling it (off = the poll, the A/B arm).
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool)]
+    pub verify_park: bool,
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
@@ -367,6 +373,8 @@ impl Default for RingTuning {
             feed_qos: "user-interactive".into(),
             feed_poll: "on-demand:50".into(),
             feed_trace: false,
+            eos_park: false,
+            verify_park: true,
         }
     }
 }

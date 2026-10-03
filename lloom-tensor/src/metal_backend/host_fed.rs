@@ -19,7 +19,7 @@ use crate::kernels::metal::BufferHandle;
 use crate::{DType, Result, Tensor};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice, MTLSharedEvent};
+use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 
 /// A value no wait of a live run reaches: signalled to release every wait a
 /// failed run left encoded (`HostFedRing::release`).
@@ -150,6 +150,134 @@ impl std::fmt::Debug for HostFedRing {
             "HostFedRing {{ slots: {}, len: {}, signalled: {} }}",
             self.slots(),
             self.len,
+            self.event.signaledValue()
+        )
+    }
+}
+
+/// A GPU→host event at a point in the command stream: the command stream
+/// signals it after every command encoded before [`PublishEvent::encode_signal`],
+/// and a host thread parks on the value (`waitUntilSignaledValue:timeoutMS:`)
+/// instead of polling a word for it.
+///
+/// It is how a host waiter learns of the token ring's stamp without spinning
+/// (`design/docs/expert-streaming.md` §20.14b): a compute kernel has no signal
+/// primitive (§3.7b), but the command buffer signals at an encoder boundary,
+/// right behind the stamp's dispatch, and the stamp's writes are visible to the
+/// host once the value is observed. Values are the caller's, monotone.
+pub struct PublishEvent {
+    device: MetalDevice,
+    clock: std::sync::Arc<crate::kernels::metal::GpuClock>,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// Delivers [`Self::notify_at`]'s blocks; held for the event's life, since
+    /// a dropped listener silently stops delivering.
+    listener: Retained<MTLSharedEventListener>,
+    /// The command-buffer epoch the last signal was encoded in.
+    encoded_epoch: std::sync::atomic::AtomicU64,
+}
+
+// SAFETY: as `HostFedRing`'s — an `MTLSharedEvent` is usable from any thread,
+// and the only other state is an atomic.
+unsafe impl Send for PublishEvent {}
+unsafe impl Sync for PublishEvent {}
+
+impl PublishEvent {
+    /// A fresh event at 0 on `device`'s command stream.
+    pub fn new(device: &MetalDevice) -> Result<Self> {
+        let event = device
+            .metal_device()
+            .as_ref()
+            .newSharedEvent()
+            .ok_or_else(|| crate::Error::Msg("newSharedEvent returned nil".into()))?;
+        Ok(Self {
+            device: device.clone(),
+            clock: device.gpu_clock(),
+            event,
+            listener: MTLSharedEventListener::new(),
+            encoded_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
+        })
+    }
+
+    /// Signal `value` once every command encoded so far on the device's
+    /// stream has completed. Ends the open compute encoder.
+    pub fn encode_signal(&self, value: u64) -> Result<()> {
+        let epoch = self.clock.current_epoch();
+        self.device
+            .commands()
+            .encode_signal_event(&self.event, value)
+            .map_err(|e| crate::Error::Msg(format!("PublishEvent signal: {e}")))?;
+        self.encoded_epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether the last signal encoded is in a committed command buffer, so a
+    /// wait for it can be satisfied without the waiter committing.
+    pub fn committed(&self) -> bool {
+        let e = self
+            .encoded_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        e == u64::MAX || self.clock.current_epoch() > e
+    }
+
+    /// The value the GPU has signalled so far.
+    pub fn value(&self) -> u64 {
+        self.event.signaledValue()
+    }
+
+    /// Park until the event reaches `value` or `timeout_ms` passes. `false`
+    /// is a timeout, never completion.
+    ///
+    /// Woken by a listener block rather than by `waitUntilSignaledValue:`,
+    /// which returned ~1 ms after the signal on the decode path
+    /// (`expert-streaming.md` §20.14b).
+    pub fn wait(&self, value: u64, timeout_ms: u64) -> bool {
+        if self.event.signaledValue() >= value {
+            return true;
+        }
+        let slot =
+            std::sync::Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
+        let s = std::sync::Arc::clone(&slot);
+        self.notify_at(value, move || {
+            *s.0.lock() = true;
+            s.1.notify_all();
+        });
+        let mut landed = slot.0.lock();
+        if !*landed {
+            let _ = slot.1.wait_while_for(
+                &mut landed,
+                |l| !*l,
+                std::time::Duration::from_millis(timeout_ms),
+            );
+        }
+        *landed || self.event.signaledValue() >= value
+    }
+
+    /// Run `f` on a dispatch-queue thread once the event reaches `value` (at
+    /// once if it already has): for a waiter that parks on a wake of its own
+    /// and has another reason to wake beside the GPU's.
+    pub fn notify_at<F: Fn() + Send + Sync + 'static>(&self, value: u64, f: F) {
+        let block = block2::RcBlock::new(
+            move |_event: std::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, _seen: u64| f(),
+        );
+        // SAFETY: `block` is valid for the call and Metal copies it, so it may
+        // run after this frame (or this event) is gone; it owns what it
+        // captures.
+        unsafe {
+            self.event.notifyListener_atValue_block(
+                &self.listener,
+                value,
+                &*block as *const _ as *mut _,
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for PublishEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PublishEvent {{ value: {} }}",
             self.event.signaledValue()
         )
     }

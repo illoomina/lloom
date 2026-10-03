@@ -139,14 +139,15 @@ pub enum CompletionWait {
     /// which is the cost issue #559 exists to make optional.
     #[default]
     Synchronize,
-    /// Signal an `MTLSharedEvent` at the command-buffer boundary and poll
-    /// `signaledValue` from the host without blocking.
+    /// Signal an `MTLSharedEvent` at the command-buffer boundary, poll
+    /// `signaledValue` for at most [`SHARED_EVENT_POLL_BOUND`] reads, then park
+    /// until a listener block reports the value.
     ///
-    /// The host never enters the kernel to wait. Between reads it spins: §3.7h
-    /// establishes there is no cheap park on this part (`FEAT_WFxT` reads 0, so
-    /// there is no hardware-bounded wait), and the probe above establishes that
-    /// a hint does not reduce reads on *this* channel because the read is an
-    /// `objc_msgSend` rather than a load from a watched line.
+    /// The poll is for a buffer about to complete; a buffer that does not
+    /// complete inside it is waited for parked. Polling through the whole
+    /// buffer held a core for the wait, and through a host-planned pass that
+    /// keeps the GPU at low clocks: +28…+30 ms a token on Qwen4-exp's miss
+    /// regime (`expert-streaming.md` §20.14a, D5).
     SharedEvent,
     /// As [`Self::SharedEvent`], but `nanosleep` for `micros` between reads.
     ///
@@ -242,6 +243,10 @@ pub enum CompletionWait {
         timeout_ms: u64,
     },
 }
+
+/// Reads of `signaledValue` [`CompletionWait::SharedEvent`] makes before it
+/// parks: ~40 µs at the ~50 000 reads a millisecond measured above.
+pub const SHARED_EVENT_POLL_BOUND: u64 = 2_048;
 
 /// The fail-safe timeout for [`CompletionWait::SharedEventWait`], in
 /// milliseconds.
@@ -407,7 +412,8 @@ impl CompletionWait {
     /// completion blocks will never fire"*, and a block that stops firing reads
     /// exactly like one that never engaged (§2.4).
     pub fn needs_listener(&self) -> bool {
-        self.notifies()
+        // `SharedEvent` parks through a listener once its poll bound is spent.
+        self.notifies() || matches!(self, Self::SharedEvent)
     }
 
     /// Parses `synchronize`, `shared-event`, `shared-event-sleep`,
@@ -560,8 +566,19 @@ impl CompletionWait {
                 let mut polls = 0u64;
                 while ev.signaled_value() < target {
                     polls += 1;
-                    if let Some(d) = sleep {
-                        std::thread::sleep(d);
+                    match sleep {
+                        Some(d) => std::thread::sleep(d),
+                        None if polls >= SHARED_EVENT_POLL_BOUND => {
+                            // Not imminent: park for the rest, woken by the
+                            // listener, with the parking arms' fail-safe.
+                            if ev.notify_then_wait(target, DEFAULT_WAIT_TIMEOUT_MS) == 0
+                                && ev.signaled_value() < target
+                            {
+                                cb.wait_until_completed();
+                            }
+                            break;
+                        }
+                        None => {}
                     }
                 }
                 Ok(WaitOutcome {
@@ -1176,12 +1193,13 @@ mod tests {
         assert!(!CompletionWait::SharedEventSleep { micros: 1 }.notifies());
         assert!(!CompletionWait::SharedEventWait { timeout_ms: 1 }.notifies());
         assert!(CompletionWait::SharedEventListener { timeout_ms: 1 }.notifies());
-        // Only the notified arm allocates a listener, so the incumbent and the
-        // three other async arms create nothing extra.
+        // The notified arm allocates a listener, and the bounded poll parks
+        // through one; the incumbent and the two other async arms create
+        // nothing extra.
         for arm in CompletionWait::ALL_ARMS {
             assert_eq!(
                 arm.needs_listener(),
-                arm.notifies(),
+                arm.notifies() || arm == CompletionWait::SharedEvent,
                 "arm {} disagrees about needing a listener",
                 arm.name()
             );

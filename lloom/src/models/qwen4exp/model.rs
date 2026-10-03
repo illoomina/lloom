@@ -1606,6 +1606,18 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// Select whether every layer's f16 routed step folds its activation
+    /// cast into gate|up (`MoeLayer::set_f16_fold`; `qwen4exp.f16_fold` by
+    /// default).
+    pub fn set_f16_fold(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_f16_fold(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_f16_fold(on);
+        }
+    }
+
     /// The routed experts' activation dtype (the first layer's; every layer
     /// is set together, [`Self::set_routed_act`]).
     pub fn routed_act(&self) -> lloom_tensor::DType {

@@ -980,9 +980,45 @@ pub struct FeedLink {
     released: AtomicBool,
     /// Why the producer stopped, if it failed.
     failure: parking_lot::Mutex<Option<String>>,
+    /// Wakes the producer when a forward demands a value or the run ends.
+    wake: Arc<FeedWake>,
+    demand_wakes: AtomicU64,
     /// Under `LLOOM_HOST_FEED_TRACE`: the host time ([`trace_now_ns`]) each
     /// value's wait was first encoded, for the run's first [`TRACE_CAP`].
     encoded_ns: Option<Box<[AtomicU64]>>,
+}
+
+/// What wakes a parked host-fill producer: a forward demanding a value
+/// ([`FeedLink::encode_read`]), the GPU publishing a token (the ring's publish
+/// event, through a listener block), or the run ending. A counter under a
+/// lock and a condvar: a waker bumps it, a waiter parks only while it is
+/// unchanged since it last looked, so a wake between the look and the park is
+/// never lost.
+#[derive(Debug, Default)]
+pub struct FeedWake {
+    epoch: parking_lot::Mutex<u64>,
+    cv: parking_lot::Condvar,
+}
+
+impl FeedWake {
+    /// Wake every parked waiter.
+    pub fn wake(&self) {
+        *self.epoch.lock() += 1;
+        self.cv.notify_all();
+    }
+
+    /// The wake count now, to park against.
+    pub fn epoch(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    /// Park while the count is still `seen`, for at most `timeout`.
+    pub fn park(&self, seen: u64, timeout: std::time::Duration) {
+        let mut g = self.epoch.lock();
+        if *g == seen {
+            let _ = self.cv.wait_for(&mut g, timeout);
+        }
+    }
 }
 
 /// Values a traced run keeps encode times for; past it nothing is recorded.
@@ -1014,6 +1050,8 @@ impl FeedLink {
             demanded: AtomicU64::new(0),
             released: AtomicBool::new(false),
             failure: parking_lot::Mutex::new(None),
+            wake: Arc::new(FeedWake::default()),
+            demand_wakes: AtomicU64::new(0),
             encoded_ns: crate::tuning::tuning()
                 .ring
                 .feed_trace
@@ -1033,6 +1071,23 @@ impl FeedLink {
     /// Whether this run is traced (`LLOOM_HOST_FEED_TRACE`).
     pub fn traced(&self) -> bool {
         self.encoded_ns.is_some()
+    }
+
+    /// What wakes the run's producer.
+    pub fn wake(&self) -> &Arc<FeedWake> {
+        &self.wake
+    }
+
+    /// Wake the producer for a value a forward now demands, and count it.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    fn wake_for_demand(&self) {
+        self.demand_wakes.fetch_add(1, Ordering::Relaxed);
+        self.wake.wake();
+    }
+
+    /// The demand wakes posted this run.
+    pub fn demand_wakes(&self) -> u64 {
+        self.demand_wakes.load(Ordering::Relaxed)
     }
 
     /// The position of the run's first decode forward.
@@ -1110,6 +1165,9 @@ impl FeedLink {
         {
             let v = self.base + k;
             self.ring.encode_wait(v)?;
+            // The producer may be parked: a forward now waits on value `k`, so
+            // its token is imminent.
+            self.wake_for_demand();
             Ok(self.ring.tensor(v).clone())
         }
         #[cfg(not(feature = "metal"))]
@@ -1123,6 +1181,7 @@ impl FeedLink {
         self.released.store(true, Ordering::Release);
         #[cfg(feature = "metal")]
         self.ring.release(self.base);
+        self.wake.wake();
     }
 
     /// The producer failed with `why`: record it and release every wait.

@@ -170,9 +170,8 @@ impl IoQueue {
         for i in 0..=self.lanes.len() {
             let (ev, next) = self.lane(i);
             let target = next.load(Ordering::Acquire).saturating_sub(1);
-            while ev.signaledValue() < target {
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
+            // Parked on the lane's event; the timeout only re-tests.
+            while !ev.waitUntilSignaledValue_timeoutMS(target, 1_000) {}
         }
     }
 
@@ -303,9 +302,8 @@ impl IoQueue {
     /// for the one-off paths (a pool warm) that bound what they leave
     /// pending; never on a token's path.
     pub fn wait_landed(&self, value: u64) {
-        while self.signaled() < value {
-            std::thread::sleep(std::time::Duration::from_micros(200));
-        }
+        // Parked on the IO event; the timeout only re-tests.
+        while !self.ev_io.waitUntilSignaledValue_timeoutMS(value, 1_000) {}
     }
 
     /// The second half: every command `commands` encodes from here on waits

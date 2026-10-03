@@ -88,7 +88,7 @@ pub use quantized::{
     call_quantized_matmul_mm_id_mapped, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id2_t,
     call_quantized_matmul_mv_id_t,
     call_quantized_matmul_mv_t, mm_id_block_bound, GemvFloat, GemvTriple, GgmlDType,
-    MM_ID_BLOCK_ROWS,
+    PairGrid, MM_ID_BLOCK_ROWS,
 };
 pub use random::*;
 pub use reduce::*;

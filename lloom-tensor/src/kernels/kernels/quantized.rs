@@ -103,6 +103,11 @@ pub enum GemvTriple {
     F32F32F32,
     /// `(f16, f32, f16)` — f16 activations, f32 accumulate, f16 store.
     F16F32F16,
+    /// `(f16, f32, f16)` over an f32 activation buffer: each element rounded
+    /// to half as the core loads it, so the arm computes what `F16F32F16`
+    /// computes from a cast-to-f16 copy of the buffer, without the copy. The
+    /// routed launches only (`kernel_mul_mv_id{,2}_<q>_f32h_f16`).
+    F32AsF16F32F16,
     /// `(i8, i32, i8)` — the M5 native-integer arm: int8 activations and store,
     /// int32 accumulate. **Declared but unimplemented** (issue #750): the triple
     /// is named so the M5 arm is one more instantiation of the generic core rather
@@ -127,7 +132,9 @@ impl GemvTriple {
     pub fn requires(self) -> Features {
         match self {
             GemvTriple::F32F32F32 => Features::empty().with(Feature::F32),
-            GemvTriple::F16F32F16 => Features::empty().with(Feature::F16).with(Feature::F32),
+            GemvTriple::F16F32F16 | GemvTriple::F32AsF16F32F16 => {
+                Features::empty().with(Feature::F16).with(Feature::F32)
+            }
             GemvTriple::I8I32I8 => Features::empty().with(Feature::Int8Mma),
         }
     }
@@ -137,6 +144,7 @@ impl GemvTriple {
         match self {
             GemvTriple::F32F32F32 => "(f32, f32, f32)",
             GemvTriple::F16F32F16 => "(f16, f32, f16)",
+            GemvTriple::F32AsF16F32F16 => "(f32 as f16, f32, f16)",
             GemvTriple::I8I32I8 => "(i8, i32, i8)",
         }
     }
@@ -155,12 +163,13 @@ impl GemvTriple {
         Ok(())
     }
 
-    /// The activation (`src1`) dtype leg, for the two float arms. The native-int
+    /// The activation (`src1`) dtype leg as it sits in memory, for the float
+    /// arms (`F32AsF16F32F16`'s is f32: it rounds on load). The native-int
     /// arm's legs are integer and have no [`GemvFloat`]; it is declared-only, so
     /// callers gate on [`is_implemented`](Self::is_implemented) first.
     pub fn activation(self) -> GemvFloat {
         match self {
-            GemvTriple::F32F32F32 => GemvFloat::F32,
+            GemvTriple::F32F32F32 | GemvTriple::F32AsF16F32F16 => GemvFloat::F32,
             GemvTriple::F16F32F16 => GemvFloat::F16,
             GemvTriple::I8I32I8 => GemvFloat::F32, // unreachable: declared-only
         }
@@ -170,7 +179,7 @@ impl GemvTriple {
     pub fn store(self) -> GemvFloat {
         match self {
             GemvTriple::F32F32F32 => GemvFloat::F32,
-            GemvTriple::F16F32F16 => GemvFloat::F16,
+            GemvTriple::F16F32F16 | GemvTriple::F32AsF16F32F16 => GemvFloat::F16,
             GemvTriple::I8I32I8 => GemvFloat::F32, // unreachable: declared-only
         }
     }
@@ -183,6 +192,7 @@ impl GemvTriple {
     fn name_suffix(self) -> String {
         match self {
             GemvTriple::F32F32F32 => "f32".to_string(),
+            GemvTriple::F32AsF16F32F16 => "f32h_f16".to_string(),
             GemvTriple::I8I32I8 => "i8_i8".to_string(), // no kernel; is_implemented() gates it
             other => format!("{}_{}", other.activation().suffix(), other.store().suffix()),
         }
@@ -346,15 +356,19 @@ pub(crate) fn q5k_nr0() -> Option<usize> {
 /// the simdgroup count for the IQ2_XS / IQ4_NL cores, the rows a simdgroup
 /// for Q6_K, none elsewhere.
 fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
+    mv_constant(dtype).map(|c| ConstantValues::new(vec![c]))
+}
+
+fn mv_constant(dtype: GgmlDType) -> Option<(usize, Value)> {
     match dtype {
-        GgmlDType::IQ2XS => Some(ConstantValues::new(vec![(910, Value::USize(iq_nsg(dtype)))])),
-        GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
-        GgmlDType::Q6K => Some(ConstantValues::new(vec![(912, Value::USize(q6k_nr0()))])),
-        GgmlDType::IQ2S => Some(ConstantValues::new(vec![(913, Value::USize(iq_nsg(dtype)))])),
+        GgmlDType::IQ2XS => Some((910, Value::USize(iq_nsg(dtype)))),
+        GgmlDType::IQ4NL => Some((911, Value::USize(iq_nsg(dtype)))),
+        GgmlDType::Q6K => Some((912, Value::USize(q6k_nr0()))),
+        GgmlDType::IQ2S => Some((913, Value::USize(iq_nsg(dtype)))),
         // Always supplied (a function naming a constant must be specialised
         // to build a pipeline); 0 selects the incumbent geometry.
-        GgmlDType::Q4K => Some(ConstantValues::new(vec![(914, Value::USize(q4k_nr0().unwrap_or(0)))])),
-        GgmlDType::Q5K => Some(ConstantValues::new(vec![(915, Value::USize(q5k_nr0().unwrap_or(0)))])),
+        GgmlDType::Q4K => Some((914, Value::USize(q4k_nr0().unwrap_or(0)))),
+        GgmlDType::Q5K => Some((915, Value::USize(q5k_nr0().unwrap_or(0)))),
         _ => None,
     }
 }
@@ -366,17 +380,37 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
 /// planes a slot gathers are few.
 pub const MV_ID_UNION_MAX_ROWS: usize = 8;
 
-/// [`mv_constants`] for a routed launch (`kernel_mul_mv_id*`) of `batch`
-/// rows: with the union form (`MV_ID_UNION`, function constant 917) on when
-/// `LLOOM_QMV_ID_UNION` is and 2 to [`MV_ID_UNION_MAX_ROWS`] rows share the
-/// launch. The wrappers name the constant, so every routed load supplies it.
-fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
-    let mut values = mv_constants(dtype).map_or_else(Vec::new, ConstantValues::into_values);
-    let union = (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on();
-    if union {
+/// Whether a routed launch of `batch` rows takes the union form
+/// (`MV_ID_UNION`, function constant 917): `LLOOM_QMV_ID_UNION` on and
+/// 2 to [`MV_ID_UNION_MAX_ROWS`] rows sharing the launch. Counted, so a
+/// test can show the arm engaged.
+fn mv_id_union(batch: usize) -> (usize, Value) {
+    let on = (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on();
+    if on {
         ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    values.push((917, Value::Bool(union)));
+    (917, Value::Bool(on))
+}
+
+/// [`mv_constants`] plus the union form, which every `kernel_mul_mv_id` and
+/// `kernel_mul_mv_id_f16` names and so is always supplied.
+fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
+    let union = mv_id_union(batch);
+    ConstantValues::new(match mv_constant(dtype) {
+        Some(c) => vec![c, union],
+        None => vec![union],
+    })
+}
+
+/// [`mv_id_constants`] plus the pair's grid order, which every
+/// `kernel_mul_mv_id2` names and so is always supplied. The union form
+/// decodes order 0's grid (`z = half·planes + plane`), so a pair on any
+/// other order takes the incumbent: each order is its own grid shape, and a
+/// kernel that decoded another's would compute the wrong planes.
+fn mv_id2_constants(dtype: GgmlDType, batch: usize, grid: PairGrid) -> ConstantValues {
+    let union_rows = if grid.order() == 0 { batch } else { 0 };
+    let mut values = mv_id_constants(dtype, union_rows).into_values();
+    values.push((916, Value::USize(grid.order())));
     ConstantValues::new(values)
 }
 
@@ -509,6 +543,12 @@ pub fn call_quantized_matmul_mv_t(
         depth: 1,
     };
     triple.check(device, "quantized matmul-vec")?;
+    if triple == GemvTriple::F32AsF16F32F16 {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "the f32-as-f16 activation leg (routed launches only)",
+            "quantized matmul-vec",
+        ));
+    }
 
     // The weight-dtype stem, e.g. `kernel_mul_mv_q4_0`. The `(activation, store)`
     // triple suffix is appended below. The dense-weight rows (F16/BF16/F32/Q8K)
@@ -1348,10 +1388,43 @@ fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
 
+/// Where the gate|up pair's half sits in its launch's grid
+/// (`kernel_mul_mv_id2`'s `PAIR_ORDER_FC`). Every grid computes each plane
+/// with the same core, so none moves a bit; they differ in which
+/// threadgroups run next to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairGrid {
+    /// Both halves, the half the slowest axis: gate's planes, then up's.
+    HalfSlowest,
+    /// [`PairGrid::HalfSlowest`]'s grid, the half read by a compare rather
+    /// than a division by the plane count.
+    HalfSlowestCmp,
+    /// Both halves, one expert's gate and up planes adjacent.
+    HalfByPlane,
+    /// Both halves, one row tile's gate and up threadgroups adjacent.
+    HalfFastest,
+    /// One half alone, on the grid of a single routed launch: `src0a` is
+    /// its weight and `dst` its `[batch, topk, n]`.
+    OneHalf,
+}
+
+impl PairGrid {
+    /// The kernel's `PAIR_ORDER_FC`.
+    pub fn order(self) -> usize {
+        match self {
+            PairGrid::HalfSlowest | PairGrid::OneHalf => 0,
+            PairGrid::HalfByPlane => 1,
+            PairGrid::HalfFastest => 2,
+            PairGrid::HalfSlowestCmp => 3,
+        }
+    }
+}
+
 /// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2_<q>_<triple>`):
 /// `src0a` and `src0b` are two stacked weights of the same kind and
 /// `[n_experts, n, k]`; `dst` is `[2, batch, topk, n]` in the triple's store
-/// leg (plane set 0 from `src0a`, 1 from `src0b`). `triple` is
+/// leg (plane set 0 from `src0a`, 1 from `src0b`), laid out as `grid` says
+/// ([`PairGrid::OneHalf`]: `[batch, topk, n]` from `src0a` alone). `triple` is
 /// [`call_quantized_matmul_mv_id_t`]'s, with the same reach — the f16 arm on
 /// quantized weight rows only — and each plane computes exactly what that
 /// launch computes for it under the same triple.
@@ -1362,6 +1435,7 @@ pub fn call_quantized_matmul_mv_id2_t(
     kernels: &Kernels,
     dtype: GgmlDType,
     triple: GemvTriple,
+    grid: PairGrid,
     (n_experts, n, k): (usize, usize, usize),
     (batch, topk, in_dim1): (usize, usize, usize),
     src0a: &Buffer,
@@ -1410,10 +1484,17 @@ pub fn call_quantized_matmul_mv_id2_t(
     let nb1 = n as u64 * store_size;
 
     let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let (tiles, planes) = (divide(n, align), batch * topk);
+    let (width, height, depth) = match grid {
+        PairGrid::HalfSlowest | PairGrid::HalfSlowestCmp => (tiles, 1, 2 * planes),
+        PairGrid::HalfByPlane => (tiles, 2, planes),
+        PairGrid::HalfFastest => (2 * tiles, 1, planes),
+        PairGrid::OneHalf => (tiles, 1, planes),
+    };
     let thread_groups_count = MTLSize {
-        width: divide(n, align),
-        height: 1,
-        depth: 2 * batch * topk,
+        width,
+        height,
+        depth,
     };
     let threads_per_threadgroup = MTLSize {
         width: nth0,
@@ -1425,7 +1506,7 @@ pub fn call_quantized_matmul_mv_id2_t(
         device,
         Source::Quantized,
         name.clone(),
-        Some(mv_id_constants(dtype, batch)),
+        Some(mv_id2_constants(dtype, batch, grid)),
     )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -1435,7 +1516,7 @@ pub fn call_quantized_matmul_mv_id2_t(
     }
     debug_group!(
         encoder,
-        "qmm_mv_id2 {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+        "qmm_mv_id2 {name} {grid:?} E={n_experts} B={batch} topk={topk} K={k} N={n}"
     );
 
     set_params!(

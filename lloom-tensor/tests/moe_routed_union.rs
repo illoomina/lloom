@@ -13,7 +13,7 @@
 #![cfg(feature = "metal")]
 
 use half::f16;
-use lloom_tensor::quantized::{GgmlDType, QStorage, QTensor};
+use lloom_tensor::quantized::{GgmlDType, PairOrder, QStorage, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::borrow::Cow;
 
@@ -148,10 +148,21 @@ fn union_is_the_incumbent(dtype: GgmlDType, act: DType) -> Result<()> {
         let (uni_g, uni_u) = wg.indexed_moe_forward_pair(&wu, &xd, &ids)?;
         let launched = lloom_tensor::kernels::qmv_id_union_launches() - before;
         lloom_tensor::kernels::set_qmv_id_union(false);
-        // Non-vacuity: both launches were the union's.
+        // Non-vacuity: the single launch is always the union's, and the
+        // pair's launches are unions iff their grid is order 0's — the only
+        // one the union body decodes. `PairOrder::Split` is TWO launches,
+        // one per half, each on `OneHalf` (order 0); the other orders are
+        // one launch, a union only on `half` / `half-cmp`.
+        let pair_unions = match PairOrder::configured() {
+            PairOrder::Split => 2,
+            o => u64::from(o.grid().is_some_and(|g| g.order() == 0)),
+        };
         assert_eq!(
-            launched, 2,
-            "{dtype:?} {act:?} in_dim1={in_dim1}: {launched} union launches of 2"
+            launched,
+            1 + pair_unions,
+            "{dtype:?} {act:?} in_dim1={in_dim1}: {launched} union launches of {} on the {} grid",
+            1 + pair_unions,
+            PairOrder::configured().name()
         );
         let tag = format!("{dtype:?} {act:?} in_dim1={in_dim1}");
         for (what, a, b) in [

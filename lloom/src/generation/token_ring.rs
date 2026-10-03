@@ -132,6 +132,14 @@ pub struct TokenRing {
     marker_slot: std::cell::Cell<usize>,
     eos: Tensor,
     eos_ids: Tensor,
+    /// The event a host waiter parks on instead of polling the stamp, made on
+    /// first arming and signalled after each stamp with its generation while
+    /// armed ([`Self::arm_publish_event`]). Unarmed, a stamp encodes nothing
+    /// more (`expert-streaming.md` §20.14b).
+    #[cfg(feature = "metal")]
+    publish_event:
+        std::cell::RefCell<Option<std::sync::Arc<lloom_tensor::metal_backend::PublishEvent>>>,
+    publish_armed: std::cell::Cell<bool>,
     /// The published-generation counter, and the reason it exists is #535.
     ///
     /// A **flag** cannot be polled non-blockingly and a **counter** can, which
@@ -307,9 +315,45 @@ impl TokenRing {
             marker_slot: std::cell::Cell::new(0),
             eos,
             eos_ids,
+            #[cfg(feature = "metal")]
+            publish_event: std::cell::RefCell::new(None),
+            publish_armed: std::cell::Cell::new(false),
             step,
             mapped,
         })
+    }
+
+    /// Arm (or disarm) the publish event for the stamps encoded from here on.
+    /// Arming makes it on first use; off Metal there is none and arming does
+    /// nothing.
+    pub fn arm_publish_event(&self, on: bool) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if on {
+            if let lloom_tensor::Device::Metal(m) = self.step.device() {
+                let mut slot = self.publish_event.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(std::sync::Arc::new(
+                        lloom_tensor::metal_backend::PublishEvent::new(m)?,
+                    ));
+                }
+                self.publish_armed.set(true);
+                return Ok(());
+            }
+        }
+        let _ = on;
+        self.publish_armed.set(false);
+        Ok(())
+    }
+
+    /// The publish event, while armed.
+    #[cfg(feature = "metal")]
+    pub fn publish_event(
+        &self,
+    ) -> Option<std::sync::Arc<lloom_tensor::metal_backend::PublishEvent>> {
+        if !self.publish_armed.get() {
+            return None;
+        }
+        self.publish_event.borrow().clone()
     }
 
     /// The mapped addresses, or `None` if either allocation is unmapped.
@@ -461,7 +505,14 @@ impl TokenRing {
         }
         let device = self.step.device();
         if device.is_metal() {
-            return device.ring_stamp(&self.step, generation, certified);
+            device.ring_stamp(&self.step, generation, certified)?;
+            #[cfg(feature = "metal")]
+            if self.publish_armed.get() {
+                if let Some(ev) = &*self.publish_event.borrow() {
+                    ev.encode_signal(generation as u64)?;
+                }
+            }
+            return Ok(());
         }
         // Cycle to a fresh source tile so the stage does not race an in-flight
         // `slice_set` reading the previous one.

@@ -527,6 +527,8 @@ impl DecodeConfig {
             prefill_bulk: bulk,
             prefill_pacer_depth: self.prefill.in_flight,
             stream_via_reader: false,
+            host_feed_wait: None,
+            eos_park: None,
             adaptive_commit: false,
             run_ahead: self.readback.run_ahead,
             stop: None,

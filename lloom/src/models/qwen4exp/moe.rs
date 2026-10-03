@@ -102,6 +102,10 @@ pub struct MoeLayer<R: ExpertResidency> {
     /// combine on the f16 routed output, as the f32 step does
     /// (`qwen4exp.f16_fuse`); off, `silu` + multiply and a cast to f32.
     f16_fuse: bool,
+    /// Whether an f16 routed step reads its f32 activation in gate|up,
+    /// rounded to half on load (`qwen4exp.f16_fold`); off, a cast launch
+    /// first. The same bits either way.
+    f16_fold: bool,
 }
 
 impl<R: ExpertResidency> MoeLayer<R> {
@@ -125,6 +129,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
             n_experts_per_tok: cfg.n_experts_per_tok,
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
+            f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
             probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -151,6 +156,12 @@ impl<R: ExpertResidency> MoeLayer<R> {
         self.f16_fuse = on;
     }
 
+    /// Select whether the f16 routed step folds its activation cast into
+    /// gate|up (see the field); the tuning's `qwen4exp.f16_fold` by default.
+    pub fn set_f16_fold(&mut self, on: bool) {
+        self.f16_fold = on;
+    }
+
     /// The activation dtype a tile of `rows` rows routes in. The routed
     /// GEMM has the f32 activation arm only, so a tile on it keeps f32 and
     /// computes what the f32 default computes; the `F16` choice reaches the
@@ -163,6 +174,12 @@ impl<R: ExpertResidency> MoeLayer<R> {
         } else {
             self.routed_act
         }
+    }
+
+    /// Whether the routed experts read an `x` activation as `act` themselves
+    /// (the f16 step's cast folded into gate|up) rather than a cast copy.
+    fn folds(&self, x: DType, act: DType) -> bool {
+        self.f16_fold && x == DType::F32 && act == DType::F16
     }
 
     /// The residency strategy behind the routed experts.
@@ -370,8 +387,15 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // The selected experts' SwiGLU, one routed dispatch per projection
         // per group, in the routed arm's activation dtype. `Resident` plans
         // one group over the ids as they are; `Streamed` groups the rows to
-        // its slot pool and resolves each group's ids to slots first.
-        let x3 = x1.to_dtype(self.tile_act(seq))?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
+        // its slot pool and resolves each group's ids to slots first. A
+        // folded f16 step hands gate|up the f32 activation, which they round
+        // as they load it.
+        let act = self.tile_act(seq);
+        let x3 = if self.folds(x1.dtype(), act) {
+            x1.reshape((seq, 1, hidden))?
+        } else {
+            x1.to_dtype(act)?.reshape((seq, 1, hidden))?
+        }; // [seq, 1, hidden]
         Ok(PrefillRouted {
             x1,
             x3,
@@ -436,7 +460,8 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// so a pass plan serves them (`DESIGN.md` §9.2aa).
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
-        let (g, u) = self.experts.gate_up(x3, slot_ids, arm)?;
+        let act = self.tile_act(x3.dim(0)?);
+        let (g, u) = self.experts.gate_up(x3, slot_ids, arm, act)?;
         let h = self.routed_swiglu(&g, &u)?;
         self.experts.down(&h, slot_ids, arm)
     }
@@ -448,6 +473,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// (`expert-streaming.md` §20.15).
     fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
         let arm = MoeArm::for_rows(x3.dim(0)?);
+        let act = self.tile_act(x3.dim(0)?);
         // The routed GEMMs' outputs are sized by the plan's groups, which
         // the pool's state decides: not a pass-shape allocation, so
         // declared outside the plan (§9.2aa) and served by the pool. One
@@ -467,7 +493,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
             } else {
                 x3.narrow(0, group.rows.start, group.rows.len())?
             };
-            let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm)?; // [rows, topk, n_ff] each
+            let (g, u) = self.experts.gate_up(&xg, &slot_ids, arm, act)?; // [rows, topk, n_ff] each
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);
             let h = self.routed_swiglu(&g, &u)?;

@@ -70,9 +70,9 @@ pub use conv::{
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, FeedWait, HostFeedReport,
-    HostFeedTrace, IdentityProposer, PassWidths, PrefillOut, RoundStats, StepPhases,
-    FIRST_STEPS_TRACED,
+    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, FeedStep, FeedWait,
+    HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut, RoundStats,
+    StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{

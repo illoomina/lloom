@@ -102,6 +102,7 @@ impl QMetalStorage {
         _: &MetalStorage,
         _: &crate::Layout,
         _: super::MoeArm,
+        _: crate::DType,
     ) -> Result<(MetalStorage, crate::Shape)> {
         Err(Error::NotCompiledWithMetalSupport)
     }

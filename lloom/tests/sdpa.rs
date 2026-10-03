@@ -412,23 +412,34 @@ mod metal_sdpa_tests {
     /// ignored `k_stride` and assumed contiguity would pass all of them and
     /// silently read across head boundaries here.
     ///
-    /// **Both sides of the two-pass threshold.** `Sdpa::metal_fwd` routes to
-    /// `call_sdpa_vector_2pass` at `k_seq >= 1024` (`candle-nn/src/ops.rs`), so
-    /// the single-pass and chunked kernels are different code over the same
-    /// input. The `live` values below straddle it deliberately, and the padding
-    /// past `live` is filled with a large sentinel rather than zeros: zeros
-    /// would contribute `exp(0)` mass that a wrong length might hide, where a
-    /// sentinel makes an over-read dominate the softmax and show up as a gross
-    /// error.
+    /// **Both vector kernels at every length.** `Sdpa::metal_fwd` picks the
+    /// single-pass or the 2-pass kernel by `ops::sdpa_vector_two_pass`, so
+    /// the two are different code over the same input. Each is checked here
+    /// at every `live` through `ops::sdpa_vector_pinned`, whatever the route
+    /// would choose, and the routed result must be bit-identical to the
+    /// kernel the route names. The padding past `live` is filled with a large
+    /// sentinel rather than zeros: zeros would contribute `exp(0)` mass that a
+    /// wrong length might hide, where a sentinel makes an over-read dominate
+    /// the softmax and show up as a gross error.
     #[test]
     fn sdpa_vector_over_a_narrowed_kv_matches_cpu_backend() -> Result<()> {
         let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
         let metal = Device::new_metal(0)?;
         let cpu = Device::Cpu;
 
-        // 137 and 1100 sit either side of the 1024 two-pass threshold; 1024
-        // itself is the boundary case, which is the one an off-by-one moves.
-        for &(live, capacity) in &[(137usize, 512usize), (1024, 2048), (1100, 2048)] {
+        // 1 and 31 leave simdgroups with no key; 1024 is a multiple of every
+        // block stride and 1100 is not; 1600 is past both the default
+        // threshold and the measured arm's, so the route takes each kernel at
+        // least once under either.
+        for &(live, capacity) in &[
+            (1usize, 64usize),
+            (31, 64),
+            (137, 512),
+            (600, 1024),
+            (1024, 2048),
+            (1100, 2048),
+            (1600, 2048),
+        ] {
             let mut rng = rand::rngs::StdRng::seed_from_u64(142_000 + live as u64);
 
             let q = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?;
@@ -454,21 +465,35 @@ mod metal_sdpa_tests {
                 !k.is_contiguous(),
                 "live={live}: the narrow must stay strided"
             );
+            let qm = q.to_device(&metal)?;
 
-            let got =
-                lloom::nn::ops::sdpa(&q.to_device(&metal)?, &k, &v, None, false, scale as f32, 1.)?
-                    .to_device(&cpu)?;
-
-            let err = assert_matches_reference(
-                &got,
-                &want,
-                2e-5,
-                &format!("narrowed kv live={live} cap={capacity}"),
-            )?;
-            println!(
-                "sdpa_vector_over_a_narrowed_kv: live={live} cap={capacity} \
-                 two_pass={} max abs error {err:e}",
-                live >= 1024
+            let mut pinned = Vec::new();
+            for two_pass in [false, true] {
+                let got =
+                    lloom::nn::ops::sdpa_vector_pinned(&qm, &k, &v, scale as f32, 1., two_pass)?
+                        .to_device(&cpu)?;
+                let err = assert_matches_reference(
+                    &got,
+                    &want,
+                    2e-5,
+                    &format!("narrowed kv live={live} cap={capacity} two_pass={two_pass}"),
+                )?;
+                println!(
+                    "sdpa_vector_over_a_narrowed_kv: live={live} cap={capacity} \
+                     two_pass={two_pass} max abs error {err:e}"
+                );
+                pinned.push(got.flatten_all()?.to_vec1::<f32>()?);
+            }
+            let routed = lloom::nn::ops::sdpa(&qm, &k, &v, None, false, scale as f32, 1.)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let route = lloom::nn::ops::sdpa_vector_two_pass(live, LFM2_HEAD_DIM, qm.dtype());
+            let bits = |x: &[f32]| x.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&routed),
+                bits(&pinned[usize::from(route)]),
+                "live={live}: sdpa routed two_pass={route} but its output is not that kernel's"
             );
         }
         Ok(())

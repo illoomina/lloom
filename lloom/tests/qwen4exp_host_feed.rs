@@ -26,7 +26,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::model::{CausalLM, Model};
 use lloom::nn::ngram_memory::{HostFeed, NgramWindow, RowTable};
-use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder};
+use lloom::nn::{DecodeOptions, DecodeOut, FeedWait, IdentityProposer, Session, VarBuilder};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -107,6 +107,9 @@ enum Arm {
     Blocking,
     /// The ring polled for EOS on the fixed cadence, `lookahead` 0 or 1.
     Fixed(usize),
+    /// The ring reading its EOS flag back (`EosRead::Blocking`) on the fixed
+    /// cadence: no host thread but the producer waits on the stamp.
+    Flag(usize),
     /// The ring under the adaptive commit, the drain the loop's at the end.
     Adaptive,
 }
@@ -120,7 +123,7 @@ fn options(arm: Arm, steps: usize) -> Result<DecodeOptions> {
     let mut opts = DecodeOptions::new(steps);
     match arm {
         Arm::Blocking => {}
-        Arm::Fixed(lookahead) => {
+        Arm::Fixed(lookahead) | Arm::Flag(lookahead) => {
             opts.lookahead = lookahead;
             opts.budget = CommitBudget::steps(4)?;
         }
@@ -137,6 +140,7 @@ fn options(arm: Arm, steps: usize) -> Result<DecodeOptions> {
 fn strategy(arm: Arm, eos: u32, dev: &Device) -> Result<Strategy> {
     Ok(match arm {
         Arm::Blocking => Strategy::Blocking(Box::new(Blocking::new(&[eos], dev)?)),
+        Arm::Flag(_) => Strategy::Ring(Box::new(Ring::new(&[eos], dev, 64, EosRead::Blocking)?)),
         Arm::Fixed(_) | Arm::Adaptive => Strategy::Ring(Box::new(
             // A short poll budget: the tiny model's forward is below the
             // command-buffer cut, so a lookahead-1 poll falls back to the
@@ -158,10 +162,28 @@ fn decode_turns<M: CausalLM>(
     follow: &[&[u32]],
     steps: usize,
 ) -> Result<Vec<DecodeOut>> {
+    decode_turns_waiting(model, cache, arm, None, eos, prompt, follow, steps)
+}
+
+/// [`decode_turns`] with the producer's wait chosen for the run.
+#[allow(clippy::too_many_arguments)]
+fn decode_turns_waiting<M: CausalLM>(
+    model: &M,
+    cache: M::Cache,
+    arm: Arm,
+    wait: Option<FeedWait>,
+    eos: u32,
+    prompt: &[u32],
+    follow: &[&[u32]],
+    steps: usize,
+) -> Result<Vec<DecodeOut>> {
     let dev = metal();
     let mut session = Session::new(model, cache);
     let mut spec = IdentityProposer;
-    let opts = options(arm, steps)?;
+    let mut opts = options(arm, steps)?;
+    opts.host_feed_wait = wait;
+    // A run that asks for the parked producer parks the EOS wait too.
+    opts.eos_park = wait.map(|w| matches!(w, FeedWait::Event { .. }));
     let mut outs = Vec::new();
     for turn in std::iter::once(prompt).chain(follow.iter().copied()) {
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -249,6 +271,206 @@ fn every_ring_arm_fills_the_rows_the_blocking_arm_hashes() -> Result<()> {
     }
     std::fs::remove_file(&path).ok();
     Ok(())
+}
+
+/// The producer parks on the ring's publish event, at its stated class, and
+/// says so in the run's report. On the fixed cadence at lookahead 0 a forward
+/// is encoded only after its token is published, so the producer's waits are
+/// parks (a spin only in the instant a token lands) and it never sleeps; the
+/// loop's EOS wait parks on the same event. A spinning core costs the streamed tier's
+/// host-planned pass ~30 ms a token of GPU time (`expert-streaming.md`
+/// §20.14a/b), and a spawned thread is at `default` unless it claims
+/// (`invariants.md` §15.2 #10b). The report carries what the producer did.
+#[test]
+fn the_producer_parks_on_the_publish_event_at_its_stated_class() -> Result<()> {
+    let path = temp_gguf("class");
+    let cfg = tiny();
+    write_table(&cfg, 80, &path)?;
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 3, 5];
+    let want = {
+        let (path, prompt) = (path.clone(), prompt.clone());
+        watched("class-blocking", move || -> Result<Vec<u32>> {
+            let model = model_with_ple(&tiny(), &path)?;
+            let cache = model.new_cache(&tiny(), &metal())?;
+            Ok(
+                decode_turns(&model, cache, Arm::Blocking, u32::MAX, &prompt, &[], 10)?
+                    .remove(0)
+                    .ids,
+            )
+        })?
+    };
+    let out = watched("class", move || -> Result<DecodeOut> {
+        let model = model_with_ple(&tiny(), &path)?;
+        let cache = model.new_cache(&tiny(), &metal())?;
+        let out = decode_turns_waiting(
+            &model,
+            cache,
+            Arm::Fixed(0),
+            Some(FeedWait::Event { idle_us: 50 }),
+            u32::MAX,
+            &prompt,
+            &[],
+            10,
+        )?;
+        std::fs::remove_file(&path).ok();
+        Ok(out.into_iter().next().unwrap())
+    })?;
+    assert_eq!(out.ids, want, "the parked producer moved the stream");
+    let feed = out.stats.host_feed.expect("the ring run took no host fill");
+    assert_eq!(
+        feed.poll,
+        FeedWait::Event { idle_us: 50 },
+        "the producer's wait: {feed:?}"
+    );
+    assert!(feed.parked > 0, "the producer never parked: {feed:?}");
+    assert_eq!(
+        feed.slept, 0,
+        "a producer with an armed event slept: {feed:?}"
+    );
+    assert!(
+        feed.demand_wakes > 0,
+        "no forward woke the producer: {feed:?}"
+    );
+    // The loop's own EOS wait parks on the same event, every step, and never
+    // takes the blocking read.
+    let rb = out.stats.readback;
+    assert!(rb.publish_parks > 0, "the EOS wait never parked: {rb:?}");
+    assert_eq!(rb.poll_fallbacks, 0, "the EOS wait fell back: {rb:?}");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        (feed.qos, feed.qos_errno),
+        (lloom::generation::QosClass::UserInteractive, 0),
+        "the producer's class: {feed:?}"
+    );
+    assert_eq!(feed.forwards, 10);
+    Ok(())
+}
+
+/// The producer's default wait is the one measured fastest end to end
+/// (`expert-streaming.md` §20.14b): `WFE` while a forward waits on a value it
+/// has not filled, a 50 µs sleep otherwise, at its stated class. The report
+/// carries what the producer did.
+#[test]
+fn the_producer_waits_on_demand_by_default_at_its_stated_class() -> Result<()> {
+    let path = temp_gguf("default");
+    let cfg = tiny();
+    write_table(&cfg, 80, &path)?;
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 3, 5];
+    let out = watched("default", move || -> Result<DecodeOut> {
+        let model = model_with_ple(&tiny(), &path)?;
+        let cache = model.new_cache(&tiny(), &metal())?;
+        let out = decode_turns(&model, cache, Arm::Fixed(1), u32::MAX, &prompt, &[], 10)?;
+        std::fs::remove_file(&path).ok();
+        Ok(out.into_iter().next().unwrap())
+    })?;
+    let feed = out.stats.host_feed.expect("the ring run took no host fill");
+    assert_eq!(feed.poll, FeedWait::OnDemand { idle_us: 50 }, "{feed:?}");
+    assert_eq!(feed.parked, 0, "the default wait parked: {feed:?}");
+    assert_eq!(
+        out.stats.readback.publish_parks, 0,
+        "the default EOS wait parked"
+    );
+    assert!(
+        feed.spun + feed.slept > 0,
+        "the producer never waited: {feed:?}"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        (feed.qos, feed.qos_errno),
+        (lloom::generation::QosClass::UserInteractive, 0),
+        "the producer's class: {feed:?}"
+    );
+    Ok(())
+}
+
+/// The event is armed for the producer alone where nothing else waits on the
+/// stamp: the flag-reading ring on the fixed cadence learns EOS by a blocking
+/// read, and the producer still parks.
+#[test]
+fn the_producer_parks_where_it_is_the_only_waiter() -> Result<()> {
+    let path = temp_gguf("only");
+    let cfg = tiny();
+    write_table(&cfg, 80, &path)?;
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 3, 5];
+    let out = watched("only", move || -> Result<DecodeOut> {
+        let model = model_with_ple(&tiny(), &path)?;
+        let cache = model.new_cache(&tiny(), &metal())?;
+        let out = decode_turns_waiting(
+            &model,
+            cache,
+            Arm::Flag(1),
+            Some(FeedWait::Event { idle_us: 50 }),
+            u32::MAX,
+            &prompt,
+            &[],
+            10,
+        )?;
+        std::fs::remove_file(&path).ok();
+        Ok(out.into_iter().next().unwrap())
+    })?;
+    let feed = out
+        .stats
+        .host_feed
+        .expect("the flag ring took no host fill");
+    assert!(feed.parked > 0, "the producer never parked: {feed:?}");
+    assert_eq!(
+        feed.slept, 0,
+        "the producer slept with an event armed: {feed:?}"
+    );
+    assert!(
+        feed.demand_wakes > 0,
+        "no forward woke the producer: {feed:?}"
+    );
+    assert_eq!(out.stats.readback.publish_parks, 0, "the flag read parked");
+    Ok(())
+}
+
+/// The event wait spins only for an imminent token and only for a bounded
+/// number of retirements, parks otherwise, and sleeps only where the run armed
+/// no event; a fixed arm is that arm.
+#[test]
+fn the_event_wait_spins_only_for_an_imminent_token() {
+    use lloom::nn::{FeedStep, FEED_SPIN_BOUND};
+    let w = FeedWait::Event { idle_us: 50 };
+    let sleep = PollMechanism::Sleep(Duration::from_micros(50));
+    let spin = FeedStep::Poll(PollMechanism::DEFAULT);
+    assert_eq!(w.step(5, 4, 0, true), spin, "a forward waits on value 5");
+    assert_eq!(
+        w.step(5, 4, FEED_SPIN_BOUND, true),
+        FeedStep::Park,
+        "the spin is bounded"
+    );
+    assert_eq!(
+        w.step(4, 4, 0, true),
+        FeedStep::Park,
+        "every demanded value is filled"
+    );
+    assert_eq!(
+        w.step(4, 4, 0, false),
+        FeedStep::Poll(sleep),
+        "no event armed"
+    );
+    assert_ne!(spin, FeedStep::Poll(sleep), "the two arms must differ");
+    let od = FeedWait::OnDemand { idle_us: 50 };
+    assert_eq!(od.step(5, 4, 0, true), spin);
+    assert_eq!(
+        od.step(4, 4, 0, true),
+        FeedStep::Poll(sleep),
+        "on-demand never parks"
+    );
+    let fixed = FeedWait::Fixed(sleep);
+    assert_eq!(fixed.step(9, 0, 0, true), FeedStep::Poll(sleep));
+    assert_eq!("event".parse::<FeedWait>().unwrap(), w);
+    assert_eq!(
+        "event:10".parse::<FeedWait>().unwrap(),
+        FeedWait::Event { idle_us: 10 }
+    );
+    assert_eq!("on-demand".parse::<FeedWait>().unwrap(), od);
+    assert_eq!("sleep:50".parse::<FeedWait>().unwrap(), fixed);
+    for x in [w, od, fixed] {
+        assert_eq!(x.to_string().parse::<FeedWait>().unwrap(), x);
+    }
+    assert!("event:".parse::<FeedWait>().is_err());
 }
 
 /// With the host fill off the ring arm reads its input ids back: the same

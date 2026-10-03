@@ -1285,7 +1285,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
                 .join(",")
         );
         println!(
-            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-{} steps={} commits={} host_fill_forwards={} host_fill_fills={} overrun={} config=[{}]",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-{} steps={} commits={} host_fill_forwards={} host_fill_fills={} host_fill_parked={} publish_parks={} poll_fallbacks={} overrun={} config=[{}]",
             prompt_ids.len(),
             out.ids.len(),
             out.eos,
@@ -1295,6 +1295,9 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             out.stats.commits,
             out.stats.host_feed.as_ref().map_or(0, |f| f.forwards),
             out.stats.host_feed.as_ref().map_or(0, |f| f.fills),
+            out.stats.host_feed.as_ref().map_or(0, |f| f.parked),
+            out.stats.readback.publish_parks,
+            out.stats.readback.poll_fallbacks,
             out.stats.overrun,
             model.config().axes_line(),
         );
@@ -1998,8 +2001,9 @@ fn trace_take() -> TraceStep {
 }
 
 /// One decode step's census: the totals, then one line per kernel with its
-/// launches and the shapes it was launched at (threads a dispatch =
-/// grid × threadgroup when dispatched by threadgroups).
+/// launches, how many of them waited at a barrier, and the shapes it was
+/// launched at (threads a dispatch = grid × threadgroup when dispatched by
+/// threadgroups).
 #[cfg(feature = "metal")]
 fn trace_census(run: usize, step: usize, d: &TraceStep) {
     use std::collections::{BTreeMap, BTreeSet};
@@ -2027,8 +2031,8 @@ fn trace_census(run: usize, step: usize, d: &TraceStep) {
     for (k, n) in br {
         println!("TRACE run={run} step={step} break n={n} {k}");
     }
-    // kernel -> (count, shape -> count)
-    let mut by: BTreeMap<&str, (usize, BTreeMap<String, usize>)> = BTreeMap::new();
+    // kernel -> (count, barriered, shape -> count)
+    let mut by: BTreeMap<&str, (usize, usize, BTreeMap<String, usize>)> = BTreeMap::new();
     for x in d {
         let (gw, gh, gd) = x.grid;
         let (tw, th, td) = x.threadgroup;
@@ -2049,11 +2053,12 @@ fn trace_census(run: usize, step: usize, d: &TraceStep) {
         );
         let e = by.entry(x.pipeline.as_str()).or_default();
         e.0 += 1;
-        *e.1.entry(shape).or_default() += 1;
+        e.1 += x.barrier as usize;
+        *e.2.entry(shape).or_default() += 1;
     }
     let mut rows: Vec<_> = by.into_iter().collect();
     rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
-    for (name, (n, shapes)) in rows {
+    for (name, (n, barriered, shapes)) in rows {
         let mut sh: Vec<_> = shapes.into_iter().collect();
         sh.sort_by(|a, b| b.1.cmp(&a.1));
         let shapes = sh
@@ -2061,7 +2066,7 @@ fn trace_census(run: usize, step: usize, d: &TraceStep) {
             .map(|(s, c)| format!("{c}×[{s}]"))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("TRACE run={run} step={step} kernel={name} n={n} {shapes}");
+        println!("TRACE run={run} step={step} kernel={name} n={n} barrier={barriered} {shapes}");
     }
 }
 

@@ -37,7 +37,7 @@ pub use model::{
     PREFILL_TRANSIENT_BYTES_PER_TOKEN,
 };
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
-pub use mtp::{MtpDrafter, MtpHead};
+pub use mtp::{GenerationProbe, MtpDrafter, MtpHead, MtpLanes};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
 pub use qsa::{Indexer, KvCache, KvPool, QsaAttention};
 

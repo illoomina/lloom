@@ -34,7 +34,7 @@ pub use host_slot::HostSlot;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
-pub use host_fed::{HostEvent, HostFedRing};
+pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///

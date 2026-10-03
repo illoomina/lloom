@@ -120,6 +120,9 @@ pub struct Lfm2Tuning {
     /// The FlashDecoding partial kernel's block width: 8 or 32 (the kernels differ only in this geometry).
     #[opt(flag = "flash-partial-bn", env = "LLOOM_FLASH_PARTIAL_BN", parser = "parse_flash_bn", variants = ["8", "32"])]
     pub flash_partial_bn: usize,
+    /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves.
+    #[opt(flag = "sdpa-two-pass-k", env = "LLOOM_SDPA_TWO_PASS_K")]
+    pub sdpa_two_pass_k: usize,
     /// Print every prefix share (pages, snapshots) — an instrument.
     #[opt(flag = "share-trace", env = "LLOOM_148_SHARE_TRACE", bool)]
     pub share_trace: bool,
@@ -140,6 +143,7 @@ impl Default for Lfm2Tuning {
             skip_conv_c_fusion: false,
             rows_arm: "batched".into(),
             flash_partial_bn: 32,
+            sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
             share_trace: false,
             verify_poll_trace: false,
             poison_zeros: String::new(),
@@ -180,6 +184,9 @@ pub struct StreamTuning {
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
     #[opt(flag = "prefetch-threads", env = "LLOOM_PREFETCH_THREADS", parser = "parse_at_least_one")]
     pub prefetch_threads: usize,
+    /// The prefetcher's reader threads' QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
+    #[opt(flag = "prefetch-qos", env = "LLOOM_PREFETCH_QOS", parser = "parse_spawned_qos")]
+    pub prefetch_qos: String,
     /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
     #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
     pub prefetch_split: usize,
@@ -215,6 +222,7 @@ impl Default for StreamTuning {
             pread_direct: false,
             // `nn::expert_prefetch::DEFAULT_THREADS` (metal-only module): 8.
             prefetch_threads: 8,
+            prefetch_qos: "default".into(),
             prefetch_split: 1,
             prefetch_lead: 2,
             plan: "device".into(),
@@ -238,6 +246,12 @@ pub struct Qwen4ExpTuning {
     /// Every fused op declines and the composed path runs (the A/B for the fused kernels).
     #[opt(flag = "fused-off", env = "QWEN4EXP_FUSED_OFF", bool)]
     pub fused_off: bool,
+    /// The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm).
+    #[opt(flag = "qwen-f16-fuse", env = "QWEN4EXP_F16_FUSE", bool)]
+    pub f16_fuse: bool,
+    /// The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way.
+    #[opt(flag = "qwen-f16-fold", env = "QWEN4EXP_F16_FOLD", bool)]
+    pub f16_fold: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
     #[opt(flag = "chunk-scan", env = "QWEN4EXP_CHUNK_SCAN", bool)]
     pub chunk_scan: bool,
@@ -299,6 +313,8 @@ impl Default for Qwen4ExpTuning {
         Qwen4ExpTuning {
             hc_mix: false,
             fused_off: false,
+            f16_fuse: true,
+            f16_fold: false,
             chunk_scan: true,
             delta_reduce: false,
             state_write: "in-place".into(),
@@ -331,6 +347,30 @@ pub struct RingTuning {
     /// The decode thread's QoS: `interactive` (claim `USER_INTERACTIVE`), `default`, or `off`.
     #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"])]
     pub hot_thread: String,
+    /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
+    #[opt(flag = "host-feed-qos", env = "LLOOM_HOST_FEED_QOS", parser = "parse_spawned_qos")]
+    pub feed_qos: String,
+    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (`WFE` while a forward waits on an unfilled value, else a µs sleep: measured fastest), `event[:<µs>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
+    #[opt(flag = "host-feed-poll", env = "LLOOM_HOST_FEED_POLL", parser = "parse_poll")]
+    pub feed_poll: String,
+    /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
+    #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool)]
+    pub feed_trace: bool,
+    /// The fixed cadence's EOS wait parks on the ring's publish event instead of polling the stamp (off: the poll; parking measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool)]
+    pub eos_park: bool,
+    /// DSpark's verify completion parks on an event behind the round's stamp instead of polling it (off = the poll, the A/B arm).
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool)]
+    pub verify_park: bool,
+}
+
+fn parse_spawned_qos(v: &str) -> Result<String, String> {
+    crate::generation::hot_thread::parse_spawned_arm(v)
+}
+fn parse_poll(v: &str) -> Result<String, String> {
+    v.trim()
+        .parse::<crate::nn::decode::FeedWait>()
+        .map(|w| w.to_string())
 }
 
 impl Default for RingTuning {
@@ -338,6 +378,11 @@ impl Default for RingTuning {
         RingTuning {
             slack_bytes: crate::generation::readback::RING_SLACK_BYTES_DEFAULT,
             hot_thread: "interactive".into(),
+            feed_qos: "user-interactive".into(),
+            feed_poll: "on-demand:50".into(),
+            feed_trace: false,
+            eos_park: false,
+            verify_park: true,
         }
     }
 }

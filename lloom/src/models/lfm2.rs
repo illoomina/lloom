@@ -3285,6 +3285,14 @@ struct VerifyWords {
     cap: usize,
     generation: u32,
     host: Vec<u32>,
+    /// Signalled behind each round's stamp, so the completion parks on it
+    /// rather than polling the stamp (`LLOOM_VERIFY_PARK`).
+    #[cfg(feature = "metal")]
+    event: Option<lloom_tensor::metal_backend::PublishEvent>,
+    /// The last value signalled on `event` (monotone; the generation wraps).
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    signalled: u64,
+    waits: VerifyWaits,
 }
 
 /// A verify's published words: where to poll, what to expect, how many.
@@ -3294,6 +3302,20 @@ struct Published {
     step_ptr: usize,
     generation: u32,
     n: usize,
+    /// The publish event's value for this round; 0 when none was signalled.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    signal: u64,
+}
+
+/// What a cache's verify completions did with the publish event: rounds that
+/// signalled it, of those the ones whose stamp was already visible, the ones
+/// that parked until it landed, and the ones whose park timed out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VerifyWaits {
+    pub signalled: u64,
+    pub already: u64,
+    pub parked: u64,
+    pub fell_back: u64,
 }
 
 impl VerifyWords {
@@ -3331,6 +3353,12 @@ impl VerifyWords {
                 let out_ptr = unsafe { out.peek_scalar_ptr::<u32>(0)? } as usize;
                 let step_ptr = unsafe { step.peek_scalar_ptr::<u32>(0)? } as usize;
                 let generation = slot.as_ref().map_or(0, |w| w.generation);
+                let event = match device {
+                    Device::Metal(m) if crate::tuning::tuning().ring.verify_park => {
+                        lloom_tensor::metal_backend::PublishEvent::new(m).ok()
+                    }
+                    _ => None,
+                };
                 *slot = Some(VerifyWords {
                     out,
                     step,
@@ -3339,6 +3367,9 @@ impl VerifyWords {
                     cap,
                     generation,
                     host: Vec::with_capacity(cap),
+                    event,
+                    signalled: 0,
+                    waits: slot.as_ref().map_or(VerifyWaits::default(), |w| w.waits),
                 });
             }
             slot.as_mut()
@@ -3350,6 +3381,14 @@ impl VerifyWords {
     fn publish(&mut self, src: &Tensor, n: usize, device: &Device) -> Result<Published> {
         self.generation = self.generation.wrapping_add(1).max(1);
         device.words_publish(src, n, &self.out, &self.step, self.generation)?;
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut signal = 0;
+        #[cfg(feature = "metal")]
+        if let Some(ev) = &self.event {
+            self.signalled += 1;
+            ev.encode_signal(self.signalled)?;
+            signal = self.signalled;
+        }
         // Committed now, without a wait — what `stage_read` did with its
         // marker: the poll below is on a buffer the GPU has, not on one the
         // host still holds open (that was a `POLL_BUDGET` of spinning on a
@@ -3364,6 +3403,7 @@ impl VerifyWords {
             step_ptr: self.step_ptr,
             generation: self.generation,
             n,
+            signal,
         })
     }
 
@@ -3375,6 +3415,24 @@ impl VerifyWords {
         let t0 = std::time::Instant::now();
         let mut fell_back = false;
         let first = unsafe { std::ptr::read_volatile(step) };
+        // Parked on the event behind the stamp: the round's buffer was
+        // committed at publish, so the signal is on its way. A timeout is not
+        // completion; the blocking wait below covers it.
+        #[cfg(feature = "metal")]
+        if p.signal > 0 {
+            self.waits.signalled += 1;
+            if first == p.generation {
+                self.waits.already += 1;
+            } else if let Some(ev) = &self.event {
+                if ev.wait(p.signal, crate::generation::readback::EOS_PARK_TIMEOUT_MS) {
+                    self.waits.parked += 1;
+                } else {
+                    self.waits.fell_back += 1;
+                    device.synchronize()?;
+                    fell_back = true;
+                }
+            }
+        }
         loop {
             // SAFETY: `step` is the mapped stamp of a tensor this struct holds.
             let seen = unsafe { std::ptr::read_volatile(step) };
@@ -3504,6 +3562,17 @@ impl CacheReset for Cache {
     /// leave the session pre-prefill, so the first real prompt is unaffected.
     fn reset(&mut self) {
         self.clear();
+    }
+}
+
+impl Cache {
+    /// What this cache's verify completions did with the publish event
+    /// (`VerifyWaits`); all zero before the first verify, or off Metal.
+    pub fn verify_waits(&self) -> VerifyWaits {
+        self.verify_words
+            .0
+            .as_ref()
+            .map_or(VerifyWaits::default(), |w| w.waits)
     }
 }
 

@@ -1907,6 +1907,10 @@ struct Sdpa<'a> {
     /// than a strided cache (`DESIGN.md` §10.3c; issue #708). Metal, `q_seq >
     /// 1`, no mask tensor.
     paged: Option<SdpaPagedTable<'a>>,
+    /// The `q_seq == 1` kernel, pinned by the caller: `Some(true)` the 2-pass
+    /// kernel, `Some(false)` the single-pass one, `None` the shape's choice
+    /// ([`sdpa_vector_two_pass`]).
+    two_pass: Option<bool>,
 }
 
 impl lloom_tensor::CustomOp3 for Sdpa<'_> {
@@ -2109,9 +2113,10 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 
         let encoder = q.device().command_encoder()?;
         if supports_sdpa_vector {
-            // Route to the 2 pass fused attention if the k seqlen is large.
-            // https://github.com/ml-explore/mlx/pull/1597
-            if k_seq >= SDPA_TWO_PASS_K_THRESHOLD {
+            let two_pass = self
+                .two_pass
+                .unwrap_or_else(|| sdpa_vector_two_pass(k_seq, q_head, q.dtype()));
+            if two_pass {
                 let mut intermediate_shape = [
                     &out_dims[0..out_dims.len() - 2],
                     &[lloom_tensor::kernels::SDPA_2PASS_BLOCKS],
@@ -2319,10 +2324,41 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 }
 
 /// Keys from which the `q_seq == 1` Metal arm of [`sdpa`] takes the 2-pass
-/// vector kernel (`sdpa_vector_2pass_*`) instead of the single-pass one — a
-/// different reduction, so anything meant to be bit-identical to [`sdpa`]
-/// per row (`qwen4exp`'s paged rows) must split its rows at this count.
+/// vector kernel by default, at every shape (MLX's constant,
+/// ml-explore/mlx#1597). See [`sdpa_vector_two_pass`].
 pub const SDPA_TWO_PASS_K_THRESHOLD: usize = 1024;
+
+/// The measured arm's threshold at `head_dim` and `dtype`: where the two
+/// kernels' times cross inside a decode step (`docs/tuning.md` §13.5s). The
+/// 2-pass kernel pays a second dispatch behind a barrier and wins only once
+/// the single-pass kernel's per-key walk outgrows it: past ~1.5k keys at
+/// 64 × f16 (LFM2); at 256 × f32 (Qwen4-exp) near 900, where MLX's constant
+/// stays. A shape no measurement has placed keeps the constant too.
+pub fn sdpa_vector_two_pass_from(head_dim: usize, dtype: DType) -> usize {
+    match (head_dim, dtype) {
+        (64, DType::F16) => 1536,
+        _ => SDPA_TWO_PASS_K_THRESHOLD,
+    }
+}
+
+/// Whether the `q_seq == 1` Metal arm of [`sdpa`] attends over `k_seq` keys
+/// at `head_dim` and `dtype` with the 2-pass vector kernel rather than the
+/// single-pass one. The two are different reductions, so anything meant to
+/// be bit-identical to [`sdpa`] per row (`qwen4exp`'s paged rows) must split
+/// its rows by this function. A pure function of the shape for the life of
+/// the process: `LLOOM_SDPA_TWO_PASS_K`, read once, is one threshold for
+/// every shape ([`SDPA_TWO_PASS_K_THRESHOLD`] by default), or 0 for
+/// [`sdpa_vector_two_pass_from`]'s measured table.
+pub fn sdpa_vector_two_pass(k_seq: usize, head_dim: usize, dtype: DType) -> bool {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let k = *K.get_or_init(|| crate::tuning::tuning().lfm2.sdpa_two_pass_k);
+    let from = if k == 0 {
+        sdpa_vector_two_pass_from(head_dim, dtype)
+    } else {
+        k
+    };
+    k_seq >= from
+}
 
 /// Scaled dot product attention with a fused kernel.
 ///
@@ -2370,6 +2406,36 @@ pub fn sdpa(
             mask: mask.cloned(),
             do_causal,
             paged: None,
+            two_pass: None,
+        },
+    )
+}
+
+/// [`sdpa`]'s `q_seq == 1` arm with the kernel chosen by the caller rather
+/// than by [`sdpa_vector_two_pass`]: the 2-pass kernel when `two_pass`, the
+/// single-pass one otherwise, at any key count. For a test or a bench that
+/// compares the two kernels at one length; Metal only.
+pub fn sdpa_vector_pinned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    two_pass: bool,
+) -> Result<Tensor> {
+    if q.dim(2)? != 1 {
+        lloom_tensor::bail!("sdpa_vector_pinned: q {:?} is not one query", q.dims())
+    }
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &Sdpa {
+            scale,
+            softcapping,
+            mask: None,
+            do_causal: false,
+            paged: None,
+            two_pass: Some(two_pass),
         },
     )
 }
@@ -2468,6 +2534,7 @@ pub fn sdpa_paged_ragged(
                 page_size,
                 n_keys,
             }),
+            two_pass: None,
         },
     )
 }

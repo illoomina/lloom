@@ -89,9 +89,12 @@ pub const EOS_GATE: &str = include_str!("metal_src/eos_gate.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
 /// The Qwen4-exp model's own kernels (`lloom::models::qwen4exp`): the
 /// HyperConnection brackets, the MoE routing, the QSA preparation — each one
-/// launch. Self-contained like `EOS_INDEX`. The Gated DeltaNet kernels are
-/// [`GDN`]'s.
-pub const QWEN4EXP: &str = include_str!("metal_src/qwen4exp.metal");
+/// launch. A `with_utils!` consumer: its SwiGLU calls the shared `silu<T>`.
+/// The Gated DeltaNet kernels are [`GDN`]'s.
+pub const QWEN4EXP: &str = with_utils!(
+    "#include <metal_stdlib>\nusing namespace metal;",
+    include_str!("metal_src/qwen4exp.metal")
+);
 pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",

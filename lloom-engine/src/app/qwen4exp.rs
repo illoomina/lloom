@@ -33,7 +33,9 @@ use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
 };
 use lloom::models::qwen4exp::model::PrefillMode;
-use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resident, Streamed};
+use lloom::models::qwen4exp::{
+    Cache, ExpertResidency, MtpDrafter, MtpLanes, Qwen4Exp, Resident, Streamed,
+};
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::Sequence;
@@ -154,6 +156,10 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     /// The load's degradations (`Served::load_warnings`).
     load_warnings: Vec<LoadWarning>,
     single: Mutex<Single>,
+    /// The MTP drafter's lanes between requests: the head's own KV follows
+    /// the single sequence's prefix reuse (`Speculator::begin_at`). Taken
+    /// and put back under `single`'s lock.
+    mtp_lanes: Mutex<Option<MtpLanes>>,
     /// `--batch N`: the scheduler and its thread.
     sched: Option<BatchHandle<Qwen4Exp<R>, ()>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -497,6 +503,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 rings: Some(RingPool::new()),
                 decode: opts.decode.clone(),
             }),
+            mtp_lanes: Mutex::new(None),
             batch: opts.batch.max(1),
             sched: None,
             sched_thread: Mutex::new(None),
@@ -601,8 +608,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     }
 
     /// The MTP drafter for one run: the head, the shared embedding and
-    /// `lm_head`, a one-layer cache of its own. Cheap to build per request.
-    fn drafter(&self) -> Result<MtpDrafter<'_, R>> {
+    /// `lm_head`, and `lanes` (a previous run's, else a fresh one-layer
+    /// cache). Cheap to build per request.
+    fn drafter(&self, lanes: Option<MtpLanes>) -> Result<MtpDrafter<'_, R>> {
         let head = self
             .core
             .model
@@ -615,7 +623,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             self.core.model.config(),
             &self.device,
         )
-        .with_k(self.mtp_k))
+        .with_k(self.mtp_k)
+        .with_lanes(lanes))
     }
 
     /// The streamed tier's counters (zeros on the resident tier).
@@ -1008,11 +1017,14 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
                 s.reset();
             }
             if self.mtp {
-                let mut drafter = self.drafter()?;
-                s.decode_speculative_until(&mut drafter, prompt_ids, detok, params, |f| {
-                    on_fragment(f)
-                })
-                .map_err(anyhow::Error::from)
+                let lanes = lock(&self.mtp_lanes).take();
+                let mut drafter = self.drafter(lanes)?;
+                let out =
+                    s.decode_speculative_until(&mut drafter, prompt_ids, detok, params, |f| {
+                        on_fragment(f)
+                    });
+                *lock(&self.mtp_lanes) = Some(drafter.into_lanes());
+                out.map_err(anyhow::Error::from)
             } else {
                 s.decode_until(prompt_ids, detok, params, |f| on_fragment(f))
                     .map_err(anyhow::Error::from)
@@ -1081,7 +1093,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
                     readback,
                     ..DecodeParams::default()
                 };
-                let mut drafter = self.drafter()?;
+                let mut drafter = self.drafter(None)?;
                 super::common::profile_reset();
                 let t = Instant::now();
                 let run =

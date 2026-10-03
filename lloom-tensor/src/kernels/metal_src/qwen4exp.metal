@@ -1,7 +1,3 @@
-#include <metal_stdlib>
-
-using namespace metal;
-
 // Kernels the Qwen4-exp blocks dispatch (`lloom::models::qwen4exp`): the
 // pieces of the decode and prefill paths that were composed from tens of
 // elementwise ops, each written as ONE launch. Every kernel here has a
@@ -421,26 +417,47 @@ kernel void moe_topk_f32(
   }
 }
 
+// One element of `silu(g) · u` at `T`, with `utils.metal`'s `silu<T>`.
+template <typename T>
+METAL_FUNC T silu_times(T g, T u) {
+  return static_cast<T>(silu(g) * u);
+}
+
+// At half the product must round the SiLU `silu_f16` stored: left to
+// reassociate, fast math folds the SiLU's division into the multiply and
+// lands one ulp away on about one element in six.
+template <>
+METAL_FUNC half silu_times(half g, half u) {
+  #pragma clang fp reassociate(off)
+  return static_cast<half>(silu(g) * u);
+}
+
 // `out = silu(g) · u`, elementwise (the routed experts' SwiGLU and the shared
-// expert's): two launches into one.
-kernel void silu_mul_f32(
-    const device float* g [[buffer(0)]],
-    const device float* u [[buffer(1)]],
-    device float* out [[buffer(2)]],
+// expert's): two launches into one, at `T`, so the f16 form is `silu_f16`
+// then `bmul_f16` bit for bit.
+template <typename T>
+kernel void silu_mul(
+    const device T* g [[buffer(0)]],
+    const device T* u [[buffer(1)]],
+    device T* out [[buffer(2)]],
     constant uint& n [[buffer(3)]],
     uint idx [[thread_position_in_grid]]) {
   if (idx >= n) return;
-  const float x = g[idx];
-  out[idx] = (x / (1.0f + metal::exp(-x))) * u[idx];
+  out[idx] = silu_times(g[idx], u[idx]);
 }
+
+template [[host_name("silu_mul_f32")]] [[kernel]] decltype(silu_mul<float>) silu_mul<float>;
+template [[host_name("silu_mul_f16")]] [[kernel]] decltype(silu_mul<half>) silu_mul<half>;
 
 // `out[r, i] = Σ_k w[r, k] · y[r, k, i] + shared[r, i] · sigmoid(gate[r])` —
 // the routed combine over the `k` selected experts plus the gated shared
-// expert (the layer's MoE output). One thread per output element; the
-// composed path was a broadcast multiply, a sum, a sigmoid, a multiply and
-// an add.
-kernel void moe_combine_f32(
-    const device float* y [[buffer(0)]],
+// expert (the layer's MoE output), in f32. `Y` is the routed output's store
+// type: an f16 `y` widens exactly on load, so the sum is the f32 form's over
+// `y` cast to f32. One thread per output element; the composed path was a
+// broadcast multiply, a sum, a sigmoid, a multiply and an add.
+template <typename Y>
+kernel void moe_combine(
+    const device Y* y [[buffer(0)]],
     const device float* w [[buffer(1)]],
     const device float* shared [[buffer(2)]],
     const device float* gate [[buffer(3)]],
@@ -454,12 +471,15 @@ kernel void moe_combine_f32(
   const uint i = idx % d;
   float acc = 0.0f;
   for (uint e = 0; e < k; e++) {
-    acc += w[(size_t)r * k + e] * y[((size_t)r * k + e) * d + i];
+    acc += w[(size_t)r * k + e] * static_cast<float>(y[((size_t)r * k + e) * d + i]);
   }
   const float gz = gate[r];
   const float sg = 1.0f / (1.0f + metal::exp(-gz));
   out[idx] = acc + shared[idx] * sg;
 }
+
+template [[host_name("moe_combine_f32")]] [[kernel]] decltype(moe_combine<float>) moe_combine<float>;
+template [[host_name("moe_combine_f16")]] [[kernel]] decltype(moe_combine<half>) moe_combine<half>;
 
 // ---- QSA (full attention) decode (`qsa.rs`) ------------------------------------
 

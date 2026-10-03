@@ -493,6 +493,8 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // Concurrent collects per-sequence ids for identity checks, not a live
         // per-token stream; the RingReader path is the single-turn streaming arm.
         stream_via_reader: false,
+        host_feed_wait: None,
+        eos_park: None,
         adaptive_commit: false,
         run_ahead: 0,
         stop: None,

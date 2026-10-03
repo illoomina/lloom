@@ -1724,6 +1724,7 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "commits": st.commits,
         "ring_publishes": st.readback.ring_publishes,
         "poll_fallbacks": st.readback.poll_fallbacks,
+        "publish_parks": st.readback.publish_parks,
         "overrun": st.overrun,
         "eos_gate": super::common::eos_gate_name(st.eos_gate),
         "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),

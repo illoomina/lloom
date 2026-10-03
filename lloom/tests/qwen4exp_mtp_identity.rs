@@ -349,7 +349,10 @@ fn mtp_identity_holds_with_a_prompt_past_the_dense_range() -> Result<()> {
             "k = {k}: the head was keyed with {} rows, inside the range of {limit}",
             mtp.rows_seen()
         );
-        println!("MTPPASTDENSE k={k} limit={limit} prompt={} accepted={accepted}", prompt.len());
+        println!(
+            "MTPPASTDENSE k={k} limit={limit} prompt={} accepted={accepted}",
+            prompt.len()
+        );
     }
     Ok(())
 }
@@ -491,5 +494,227 @@ fn mtp_rows_are_each_their_greedy_stream() -> Result<()> {
             (mtp.seq_rows_seen(SeqId(0)), mtp.seq_rows_seen(SeqId(1)))
         );
     }
+    Ok(())
+}
+
+/// A turn's stream, whether it ended on EOS, and `(drafter context, target
+/// position)`.
+type Turn = (Vec<u32>, bool, Option<(usize, usize)>);
+
+/// One turn of the speculative body on a kept session: the stream, whether
+/// it ended on EOS, and the drafter's context against the target's position.
+fn turn(
+    session: &mut Session<'_, Qwen4Exp<Resident>>,
+    spec: &mut MtpDrafter<'_, Resident>,
+    cfg: &Config,
+    prompt: &[u32],
+    max: usize,
+) -> Result<Turn> {
+    let dev = Device::Cpu;
+    let eos = [cfg.eos_token_id];
+    let mut rb = Blocking::new(&eos, &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let out = session.decode_speculative(
+        spec,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        &DecodeOptions::new(max),
+        &eos,
+        &mut |_| Ok(()),
+    )?;
+    Ok((out.ids, out.eos, out.stats.drafter_ctx))
+}
+
+/// The engine's cache: the verify's states in phase rings, carries kept.
+fn engine_cache(model: &Qwen4Exp<Resident>, cfg: &Config) -> Result<Cache> {
+    let mut cache = Cache::in_pools(cfg, &model.spec_pools(1, 1, &Device::Cpu))?;
+    cache.want_nextn = true;
+    Ok(cache)
+}
+
+/// A prompt whose `max`-token stream runs to the length cap (no EOS): its
+/// last id is the anchor the target has not fed, the re-render's next token.
+fn capped_prompt(model: &Qwen4Exp<Resident>, cfg: &Config, max: usize) -> Result<Vec<u32>> {
+    for seed in 0..16u32 {
+        let prompt: Vec<u32> = (0..6).map(|i| (seed * 13 + i * 5 + 2) % 120).collect();
+        let (ids, eos) = greedy(model, cfg, &prompt, max)?;
+        if !eos && ids.len() == max {
+            return Ok(prompt);
+        }
+    }
+    lloom_tensor::bail!("no prompt ran to the length cap")
+}
+
+/// The drafter follows the target's prefix reuse across requests, as the
+/// engine runs them: each request builds a drafter over the previous one's
+/// lanes (`with_lanes` / `into_lanes`), and on a re-rendered turn the target
+/// `Extend`s its cache. The lane is kept for the reused prefix — no reset —
+/// and ends the turn at the target's position; the stream is the fresh
+/// session's greedy one. A lane keyed from another sequence, and one whose
+/// last row was keyed with a token the turn does not continue with, reset
+/// and say so.
+#[test]
+fn the_drafter_follows_the_targets_reuse() -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model(&cfg, &dev);
+    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let drafter = || MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
+    let n = 8;
+    let prompt1 = capped_prompt(&model, &cfg, n)?;
+    let tail = [3u32, 9, 27, 4, 11];
+
+    // Turn 1, then the re-render: history + the unfed anchor + a new message.
+    let mut session = Session::new(&model, engine_cache(&model, &cfg)?);
+    let mut d1 = drafter();
+    let (ids1, eos1, ctx1) = turn(&mut session, &mut d1, &cfg, &prompt1, n)?;
+    assert!(!eos1 && ids1.len() == n, "turn 1 runs to the cap: {ids1:?}");
+    assert_eq!(
+        ctx1,
+        Some((session.pos(), session.pos())),
+        "turn 1: the lane is at the target"
+    );
+    let anchor = *ids1.last().expect("ids");
+    let mut full2 = prompt1.clone();
+    full2.extend_from_slice(&ids1);
+    full2.extend_from_slice(&tail);
+    let prepared = session.prepare(&full2)?;
+    assert_eq!(
+        prepared.action,
+        ReuseAction::Extend,
+        "{:?}",
+        prepared.action
+    );
+    assert_eq!(
+        prepared.suffix[0], anchor,
+        "the suffix opens with the unfed anchor"
+    );
+    let kept = prepared.reused;
+    assert!(kept > prompt1.len(), "turn 2 reuses the reply too: {kept}");
+
+    // Turn 2 on a new drafter over turn 1's lanes, as the engine does.
+    let mut d2 = drafter().with_lanes(Some(d1.into_lanes()));
+    let (ids2, _, ctx2) = turn(&mut session, &mut d2, &cfg, &prepared.suffix, n)?;
+    assert_eq!(
+        d2.lane_resets(),
+        0,
+        "the lane was kept for the reused prefix"
+    );
+    assert_eq!(
+        ctx2,
+        Some((session.pos(), session.pos())),
+        "turn 2: the lane followed the reuse ({kept} kept) and the suffix"
+    );
+    assert_eq!(
+        d2.cache().kv[0].len(),
+        session.pos(),
+        "the head's KV holds every position"
+    );
+    let mut fresh = Session::new(&model, engine_cache(&model, &cfg)?);
+    let want = turn(&mut fresh, &mut drafter(), &cfg, &full2, n)?.0;
+    let (greedy2, _) = greedy(&model, &cfg, &full2, n)?;
+    assert_eq!(want, greedy2, "the reference is greedy's");
+    assert_eq!(
+        ids2, want,
+        "the reused speculative turn is the fresh greedy turn"
+    );
+
+    // A lane keyed from another sequence of the same length: reset.
+    let other: Vec<u32> = prompt1.iter().map(|t| (t + 17) % 120).collect();
+    let mut d_other = drafter();
+    turn(
+        &mut Session::new(&model, engine_cache(&model, &cfg)?),
+        &mut d_other,
+        &cfg,
+        &other,
+        n,
+    )?;
+    let mut s3 = Session::new(&model, engine_cache(&model, &cfg)?);
+    turn(&mut s3, &mut drafter(), &cfg, &prompt1, n)?;
+    let p3 = s3.prepare(&full2)?;
+    assert_eq!(p3.action, ReuseAction::Extend);
+    let mut d3 = drafter().with_lanes(Some(d_other.into_lanes()));
+    let (ids3, _, ctx3) = turn(&mut s3, &mut d3, &cfg, &p3.suffix, n)?;
+    assert_eq!(d3.lane_resets(), 1, "a lane keyed from other tokens resets");
+    let (len, pos) = ctx3.expect("a context");
+    assert_eq!(pos, s3.pos());
+    assert_eq!(
+        len,
+        pos - p3.reused,
+        "the reset lane holds the suffix and the rounds alone"
+    );
+    assert_eq!(ids3, want, "output identity holds whatever the lane");
+
+    // The turn continues with a token other than the one the lane's last
+    // row was keyed with: that row is the new sequence's no longer — reset.
+    let mut s4 = Session::new(&model, engine_cache(&model, &cfg)?);
+    let mut d4 = drafter();
+    turn(&mut s4, &mut d4, &cfg, &prompt1, n)?;
+    let mut full4 = prompt1.clone();
+    full4.extend_from_slice(&ids1[..n - 1]);
+    full4.push((anchor + 1) % 120);
+    full4.extend_from_slice(&tail);
+    let p4 = s4.prepare(&full4)?;
+    assert_eq!(p4.action, ReuseAction::Extend);
+    assert_eq!(p4.reused, kept);
+    let mut d4b = drafter().with_lanes(Some(d4.into_lanes()));
+    turn(&mut s4, &mut d4b, &cfg, &p4.suffix, n)?;
+    assert_eq!(
+        d4b.lane_resets(),
+        1,
+        "a lane whose last kept row read another next token resets"
+    );
+    println!(
+        "MTPREUSE kept={kept} pos={} ctx={ctx2:?} other={ctx3:?}",
+        session.pos()
+    );
+    Ok(())
+}
+
+/// `begin_at` cuts a lane back to a shorter reused prefix — its KV, its
+/// indexer blocks and its position — when the lane was keyed from those
+/// tokens, and resets it for a prefix it was not.
+#[test]
+fn a_lane_is_cut_back_to_a_reused_prefix_it_was_keyed_from() -> Result<()> {
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model(&cfg, &dev);
+    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
+    // Past one indexer block, so the cut drops a compressed block.
+    let prompt: Vec<u32> = (0..13).map(|i| (i * 7 + 3) % 120).collect();
+    let mut cache = engine_cache(&model, &cfg)?;
+    let logits = model.forward(
+        &Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?,
+        0,
+        &mut cache,
+    )?;
+    let probe = model.take_probe(&mut cache)?;
+    let anchor = logits
+        .squeeze(0)?
+        .argmax(lloom_tensor::D::Minus1)?
+        .to_scalar::<u32>()?;
+    mtp.begin(SeqId(0), &prompt)?;
+    mtp.observe(SeqId(0), &probe, &[anchor])?;
+    assert_eq!(mtp.context_len(SeqId(0)), Some(prompt.len()));
+    let ratio = cfg.indexer_compress_ratio;
+    assert_eq!(mtp.cache().kv[0].n_blocks(), prompt.len() / ratio);
+
+    // Kept: the first m positions and the token after them are the lane's.
+    let m = 6;
+    mtp.begin_at(SeqId(0), &prompt[m..m + 2], &prompt[..m])?;
+    assert_eq!(mtp.context_len(SeqId(0)), Some(m));
+    assert_eq!(mtp.cache().kv[0].len(), m);
+    assert_eq!(mtp.cache().kv[0].n_blocks(), m / ratio);
+    assert_eq!(mtp.lane_resets(), 0);
+
+    // Another prefix of the same length: reset.
+    let mut other = prompt[..m].to_vec();
+    other[2] ^= 1;
+    mtp.begin_at(SeqId(0), &prompt[m..m + 2], &other)?;
+    assert_eq!(mtp.context_len(SeqId(0)), Some(0));
+    assert_eq!(mtp.lane_resets(), 1);
     Ok(())
 }

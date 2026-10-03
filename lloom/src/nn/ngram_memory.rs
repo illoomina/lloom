@@ -81,6 +81,16 @@ impl ReadPolicy {
 /// Threads of the read pool: a token's rows, one read each in flight.
 const READ_THREADS: usize = 16;
 
+/// The read pool's scheduling class, stated (`default`) and read back by its
+/// threads at start: the host fill's producer waits on these reads, and the
+/// GPU on the producer (`docs/invariants.md` §15.2 #10b).
+static READ_POOL_QOS: AtomicU8 = AtomicU8::new(0);
+
+/// The read pool's class (`Unknown` before it starts, or off macOS).
+pub fn read_pool_qos() -> crate::generation::QosClass {
+    crate::generation::QosClass::from_index(READ_POOL_QOS.load(Relaxed))
+}
+
 /// The pool cold rows are read on, built on first use.
 #[cfg(unix)]
 fn read_pool() -> &'static rayon::ThreadPool {
@@ -89,6 +99,10 @@ fn read_pool() -> &'static rayon::ThreadPool {
         rayon::ThreadPoolBuilder::new()
             .num_threads(READ_THREADS)
             .thread_name(|i| format!("ngram-read-{i}"))
+            .start_handler(|_| {
+                let (class, _) = crate::generation::hot_thread::claim_for_spawned("default");
+                READ_POOL_QOS.store(class as u8, Relaxed)
+            })
             .build()
             .expect("ngram read pool")
     })
@@ -908,6 +922,59 @@ pub struct FeedLink {
     released: AtomicBool,
     /// Why the producer stopped, if it failed.
     failure: parking_lot::Mutex<Option<String>>,
+    /// Wakes the producer when a forward demands a value or the run ends.
+    wake: Arc<FeedWake>,
+    demand_wakes: AtomicU64,
+    /// Under `LLOOM_HOST_FEED_TRACE`: the host time ([`trace_now_ns`]) each
+    /// value's wait was first encoded, for the run's first [`TRACE_CAP`].
+    encoded_ns: Option<Box<[AtomicU64]>>,
+}
+
+/// What wakes a parked host-fill producer: a forward demanding a value
+/// ([`FeedLink::encode_read`]), the GPU publishing a token (the ring's publish
+/// event, through a listener block), or the run ending. A counter under a
+/// lock and a condvar: a waker bumps it, a waiter parks only while it is
+/// unchanged since it last looked, so a wake between the look and the park is
+/// never lost.
+#[derive(Debug, Default)]
+pub struct FeedWake {
+    epoch: parking_lot::Mutex<u64>,
+    cv: parking_lot::Condvar,
+}
+
+impl FeedWake {
+    /// Wake every parked waiter.
+    pub fn wake(&self) {
+        *self.epoch.lock() += 1;
+        self.cv.notify_all();
+    }
+
+    /// The wake count now, to park against.
+    pub fn epoch(&self) -> u64 {
+        *self.epoch.lock()
+    }
+
+    /// Park while the count is still `seen`, for at most `timeout`.
+    pub fn park(&self, seen: u64, timeout: std::time::Duration) {
+        let mut g = self.epoch.lock();
+        if *g == seen {
+            let _ = self.cv.wait_for(&mut g, timeout);
+        }
+    }
+}
+
+/// Values a traced run keeps encode times for; past it nothing is recorded.
+pub const TRACE_CAP: usize = 1 << 14;
+
+/// Nanoseconds on one clock every thread of a run reads (the host fill's
+/// trace), never 0.
+pub fn trace_now_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+        + 1
 }
 
 impl FeedLink {
@@ -925,7 +992,44 @@ impl FeedLink {
             demanded: AtomicU64::new(0),
             released: AtomicBool::new(false),
             failure: parking_lot::Mutex::new(None),
+            wake: Arc::new(FeedWake::default()),
+            demand_wakes: AtomicU64::new(0),
+            encoded_ns: crate::tuning::tuning()
+                .ring
+                .feed_trace
+                .then(|| (0..TRACE_CAP).map(|_| AtomicU64::new(0)).collect()),
         }
+    }
+
+    /// When value `k`'s wait was first encoded, on a traced run.
+    pub fn encoded_ns(&self, k: u64) -> Option<u64> {
+        let t = self.encoded_ns.as_ref()?;
+        match t.get((k as usize).checked_sub(1)?)?.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    /// Whether this run is traced (`LLOOM_HOST_FEED_TRACE`).
+    pub fn traced(&self) -> bool {
+        self.encoded_ns.is_some()
+    }
+
+    /// What wakes the run's producer.
+    pub fn wake(&self) -> &Arc<FeedWake> {
+        &self.wake
+    }
+
+    /// Wake the producer for a value a forward now demands, and count it.
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    fn wake_for_demand(&self) {
+        self.demand_wakes.fetch_add(1, Ordering::Relaxed);
+        self.wake.wake();
+    }
+
+    /// The demand wakes posted this run.
+    pub fn demand_wakes(&self) -> u64 {
+        self.demand_wakes.load(Ordering::Relaxed)
     }
 
     /// The position of the run's first decode forward.
@@ -996,10 +1100,16 @@ impl FeedLink {
             )
         }
         self.demanded.fetch_max(k, Ordering::AcqRel);
+        if let Some(slot) = self.encoded_ns.as_ref().and_then(|t| t.get(k as usize - 1)) {
+            let _ = slot.compare_exchange(0, trace_now_ns(), Ordering::AcqRel, Ordering::Relaxed);
+        }
         #[cfg(feature = "metal")]
         {
             let v = self.base + k;
             self.ring.encode_wait(v)?;
+            // The producer may be parked: a forward now waits on value `k`, so
+            // its token is imminent.
+            self.wake_for_demand();
             Ok(self.ring.tensor(v).clone())
         }
         #[cfg(not(feature = "metal"))]
@@ -1013,6 +1123,7 @@ impl FeedLink {
         self.released.store(true, Ordering::Release);
         #[cfg(feature = "metal")]
         self.ring.release(self.base);
+        self.wake.wake();
     }
 
     /// The producer failed with `why`: record it and release every wait.

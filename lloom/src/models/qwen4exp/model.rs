@@ -582,9 +582,23 @@ impl Cache {
         self.pending_tokens = w.pending_tokens;
         self.pending_noted = false;
         self.pos = w.pos + a;
-        if self.nextn.len() > a {
-            self.nextn.truncate(a);
+        self.keep_first_rows(a)?;
+        Ok(())
+    }
+
+    /// Cut the retained carries to their first `a` positions.
+    fn keep_first_rows(&mut self, a: usize) -> Result<()> {
+        let mut left = a;
+        let mut kept = Vec::with_capacity(self.nextn.len());
+        for t in std::mem::take(&mut self.nextn) {
+            if left == 0 {
+                break;
+            }
+            let rows = t.dim(1)?;
+            kept.push(if rows <= left { t } else { t.narrow(1, 0, left)? });
+            left -= rows.min(left);
         }
+        self.nextn = kept;
         Ok(())
     }
 
@@ -667,14 +681,15 @@ impl Cache {
         Ok(())
     }
 
-    /// [`Self::keep_nextn`] for a window's `res_hc [rows, 1, n·d]`: one
-    /// carry per row, so an accept by position keeps the first `a`.
+    /// [`Self::keep_nextn`] for a window's `res_hc [rows, 1, n·d]`, kept
+    /// as one `[1, rows, n·d]`: an accept by position keeps a view of its
+    /// first `a` rows, so taking them allocates nothing whatever the accept
+    /// (the verify's pass runs one sequence for every accepted length).
     fn keep_nextn_rows(&mut self, res_hc: &Tensor, rows: usize) -> Result<()> {
         if self.want_nextn {
             let kept = declared_copy(res_hc)?;
-            for p in 0..rows {
-                self.nextn.push(kept.narrow(0, p, 1)?);
-            }
+            let nd = kept.dim(D::Minus1)?;
+            self.nextn.push(kept.reshape((1, rows, nd))?);
         }
         Ok(())
     }
@@ -1258,9 +1273,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// the step completes an indexer block (`(pos + 1) % ratio == 0`), which
     /// adds the block's pooling, norm, rope and append; bit 1, the routing
     /// is resolved on the device (the device plan and its settle) rather
-    /// than read back per layer. Two steps of one variant allocate the same
-    /// ordinals, so each is served its own plan instead of the one recorded
-    /// at the other phase drifting on it.
+    /// than read back per layer; bits 2–3, the step inside or past the QSA
+    /// dense range ([`Self::prefill_variant`] of one position): past it the
+    /// indexer's selection adds its score, sort and cells to the step, so a
+    /// plan recorded inside it is not a step past it shifted. Two steps of
+    /// one variant allocate the same ordinals, so each is served its own
+    /// plan instead of the one recorded at the other phase drifting on it.
     /// Which of this model's prefill sequences a chunk of `w` positions at
     /// `pos` runs, as its pass key's variant: 0 inside the QSA indexer's
     /// dense range (dense attention), 1 crossing it (a dense part, then the
@@ -1285,7 +1303,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             Mixer::Linear(_) => None,
         });
         let block = ratio.is_some_and(|r| (pos + 1).is_multiple_of(r));
-        block as u32 | (device_plan as u32) << 1
+        block as u32 | (device_plan as u32) << 1 | self.prefill_variant(pos, 1) << 2
     }
 
     /// Which of this model's verify-window sequences a window of `t`

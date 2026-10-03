@@ -182,6 +182,52 @@ impl Speculator for Scripted {
     }
 }
 
+/// A drafter's proposals, recorded round by round as it hands them over.
+struct Recording<S> {
+    inner: S,
+    drafts: Vec<Vec<u32>>,
+}
+
+impl<S: Speculator<Probe = NextnHidden>> Speculator for Recording<S> {
+    type Probe = NextnHidden;
+    fn n_seq(&self) -> usize {
+        self.inner.n_seq()
+    }
+    fn kv_source(&self) -> KvSource {
+        self.inner.kv_source()
+    }
+    fn max_draft(&self) -> usize {
+        self.inner.max_draft()
+    }
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        self.inner.begin(seq, prompt)
+    }
+    fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        self.inner.begin_at(seq, prompt, kept)
+    }
+    fn context_len(&self, seq: SeqId) -> Option<usize> {
+        self.inner.context_len(seq)
+    }
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let drafts = self.inner.draft(active)?;
+        for d in &drafts {
+            match &d.tokens {
+                lloom::nn::speculator::DraftTokens::Host(v) => self.drafts.push(v.clone()),
+                lloom::nn::speculator::DraftTokens::Device(t) => {
+                    self.drafts.push(t.flatten_all()?.to_vec1()?)
+                }
+            }
+        }
+        Ok(drafts)
+    }
+    fn want_confidence(&mut self, wanted: bool) {
+        self.inner.want_confidence(wanted)
+    }
+    fn observe(&mut self, seq: SeqId, probe: &Tensor, accepted: &[u32]) -> Result<()> {
+        self.inner.observe(seq, probe, accepted)
+    }
+}
+
 struct Run {
     ids: Vec<u32>,
     accepted: Vec<usize>,
@@ -337,6 +383,12 @@ fn the_folded_observe_drafts_what_the_observe_drafts() -> Result<()> {
     incumbent();
     let cfg = config();
     let max = 20;
+    // The reference is the pool path's greedy stream, for both cache arms.
+    let (prompt, want) = {
+        let dev = Device::new_metal(0)?;
+        let m = model(&cfg, &dev)?;
+        prompt_with_stream(&m, &cfg, &dev, 9, 10, max)?
+    };
     for plans in [false, true] {
         let dev = Device::new_metal(0)?;
         if plans {
@@ -344,14 +396,18 @@ fn the_folded_observe_drafts_what_the_observe_drafts() -> Result<()> {
         }
         let m = model(&cfg, &dev)?;
         let head = m.mtp_head().expect("the model carries the head");
-        let (prompt, want) = prompt_with_stream(&m, &cfg, &dev, 9, 10, max)?;
         for k in [1usize, 2] {
             let mut rounds = Vec::new();
             for fold in [false, true] {
                 lloom::models::qwen4exp::mtp::set_mtp_fold(fold);
                 let mut mtp =
                     MtpDrafter::new(head, m.embed_tokens(), m.lm_head(), &cfg, &dev).with_k(k);
-                let run = speculate(&m, &cfg, &dev, &mut mtp, &prompt, &DecodeOptions::new(max))?;
+                let mut rec = Recording {
+                    inner: &mut mtp,
+                    drafts: Vec::new(),
+                };
+                let run = speculate(&m, &cfg, &dev, &mut rec, &prompt, &DecodeOptions::new(max))?;
+                let drafted = rec.drafts;
                 assert_eq!(
                     run.ids, want,
                     "plans {plans} k = {k} fold = {fold}: not the greedy stream"
@@ -380,8 +436,12 @@ fn the_folded_observe_drafts_what_the_observe_drafts() -> Result<()> {
                 } else {
                     assert_eq!(folded, 0);
                 }
-                rounds.push(run.accepted);
+                rounds.push((run.accepted, drafted));
             }
+            assert_eq!(
+                rounds[0].1, rounds[1].1,
+                "plans {plans} k = {k}: a folded round drafted other tokens than the observe's"
+            );
             assert_eq!(
                 rounds[0], rounds[1],
                 "plans {plans} k = {k}: the folded drafts are not the observe's"
@@ -542,5 +602,47 @@ fn a_prefill_in_units_seeds_the_mtp_lane() -> Result<()> {
         assert_eq!(mtp.cache().pos, mtp.rows_seen());
         assert!(mtp.rows_seen() >= prompt.len() + run.ids.len() - 1);
     }
+    Ok(())
+}
+
+/// The greedy decode across the indexer's dense range under the plan cache
+/// is the pool path's, request after request. A step past the range runs
+/// the selection (its score, sort and cells) that a step inside it does
+/// not, so the two are different sequences under one decode kind; served a
+/// plan recorded inside the range, the first step past it read slots packed
+/// for other values (the stream left the pool path's at its first step past
+/// the range, position 20 here, on `dev` `e8c7cf776`).
+#[test]
+fn the_greedy_decode_past_the_dense_range_under_plans_is_the_pool_paths() -> Result<()> {
+    let _serial = SERIAL.lock();
+    incumbent();
+    let cfg = config();
+    let max = 20;
+    let mut crossed = 0;
+    for seed in 0..4u32 {
+        let prompt: Vec<u32> = (0..9).map(|i| (seed * 11 + i * 7 + 1) % 120).collect();
+        let want = {
+            let dev = Device::new_metal(0)?;
+            greedy(&model(&cfg, &dev)?, &cfg, &dev, &prompt, max)?
+        };
+        // The dense range is 19 positions at the tiny budget.
+        crossed += usize::from(prompt.len() + want.len() > 20);
+        let dev = Device::new_metal(0)?;
+        metal(&dev).enable_pass_plans(ArenaLayout::Packed);
+        let m = model(&cfg, &dev)?;
+        for request in 0..3 {
+            let got = greedy(&m, &cfg, &dev, &prompt, max)?;
+            assert_eq!(
+                got, want,
+                "seed {seed} request {request}: a served decode step moved the stream"
+            );
+        }
+        let c = metal(&dev).pass_plan_counters().expect("on");
+        println!("PASTRANGE seed={seed} len={} {c:?}", want.len());
+    }
+    assert!(
+        crossed >= 2,
+        "only {crossed} streams crossed the dense range"
+    );
     Ok(())
 }

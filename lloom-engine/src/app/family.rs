@@ -619,6 +619,44 @@ mod tests {
         Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap();
     }
 
+    /// `auto` resolves to the family's own drafter when one is named, to
+    /// `none` at `--batch` > 1 on Qwen4-exp and for a family with none, and
+    /// passes `resolve` as a method of every family.
+    #[test]
+    fn auto_speculation_takes_the_familys_drafter_when_one_is_at_hand() {
+        let m = model_args(&[]);
+        let drafter = std::env::temp_dir().join(format!("lloom-auto-{}.gguf", std::process::id()));
+        std::fs::write(&drafter, b"x").unwrap();
+        let auto = |batch: usize, drafter: Option<&Path>| {
+            let mut s = shape();
+            s.batch = batch;
+            s.speculative.method = "auto".into();
+            s.speculative.drafter = drafter.map(Path::to_path_buf);
+            s
+        };
+        let mut s = auto(1, Some(&drafter));
+        let note = resolve_auto_speculation("qwen4exp", &mut s).expect("a note");
+        assert_eq!(s.speculative.method, "mtp", "{note}");
+        let mut s = auto(2, Some(&drafter));
+        resolve_auto_speculation("qwen4exp", &mut s);
+        assert_eq!(s.speculative.method, "none", "the MTP head speculates at one row");
+        let mut s = auto(1, Some(&drafter));
+        resolve_auto_speculation("lfm2", &mut s);
+        assert_eq!(s.speculative.method, "dspark");
+        let mut s = auto(1, Some(&drafter));
+        resolve_auto_speculation("gemma", &mut s);
+        assert_eq!(s.speculative.method, "none");
+        // A named method is left as it is.
+        let mut s = shape();
+        s.speculative.method = "mtp".into();
+        assert!(resolve_auto_speculation("qwen4exp", &mut s).is_none());
+        assert_eq!(s.speculative.method, "mtp");
+        // Unresolved, `auto` is a method every family's `resolve` takes.
+        Lfm2Family.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
+        Qwen4ExpFamily.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
+        std::fs::remove_file(&drafter).ok();
+    }
+
     fn with_kv_quant(value: &str) -> Shape {
         let mut s = shape();
         s.model.set(KV_QUANT_AXIS, value).unwrap();

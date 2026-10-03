@@ -1749,8 +1749,8 @@ pub(crate) struct SdpaVectorPaged {
     pub page_size: usize,
     pub table_stride: usize,
     pub scale: f32,
-    /// The 2-pass kernel (the per-row arm's choice from
-    /// `ops::SDPA_TWO_PASS_K_THRESHOLD` keys; every row of the call takes it).
+    /// The 2-pass kernel (the per-row arm's choice,
+    /// `ops::sdpa_vector_two_pass`; every row of the call takes it).
     pub two_pass: bool,
     /// `u32 [B · table_stride]`.
     pub table: Tensor,

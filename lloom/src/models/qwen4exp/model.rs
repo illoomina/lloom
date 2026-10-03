@@ -654,10 +654,26 @@ impl Cache {
         }
     }
 
-    fn keep_nextn(&mut self, res_hc: &Tensor) {
+    /// Retain a forward's carries `res_hc` when they are wanted. The drafter
+    /// reads them after the pass that produced them, so they are kept as a
+    /// declared escape ([`declared_copy`]).
+    fn keep_nextn(&mut self, res_hc: &Tensor) -> Result<()> {
         if self.want_nextn {
-            self.nextn.push(res_hc.clone());
+            self.nextn.push(declared_copy(res_hc)?);
         }
+        Ok(())
+    }
+
+    /// [`Self::keep_nextn`] for a window's `res_hc [rows, 1, n·d]`: one
+    /// carry per row, so an accept by position keeps the first `a`.
+    fn keep_nextn_rows(&mut self, res_hc: &Tensor, rows: usize) -> Result<()> {
+        if self.want_nextn {
+            let kept = declared_copy(res_hc)?;
+            for p in 0..rows {
+                self.nextn.push(kept.narrow(0, p, 1)?);
+            }
+        }
+        Ok(())
     }
 
     /// Discard whatever is retained, counting it as a dropped probe.
@@ -716,6 +732,39 @@ impl Cache {
         self.pending_tokens = w.pending_tokens;
         self.pending_noted = false;
         self.pos = w.pos;
+        Ok(())
+    }
+
+    /// Cut an attention-only cache (an MTP head's layer) back to its first
+    /// `tokens` positions: every KV, the indexer's blocks complete within
+    /// them (`ratio` keys a block) and the position. Refused while a window
+    /// is open or a recurrent channel holds state, which a length cannot put
+    /// back.
+    pub fn truncate_attention(&mut self, tokens: usize, ratio: usize) -> Result<()> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("qwen4exp cache: truncating under an open window")
+        }
+        let recurrent = (0..self.s_state.n_layers()).any(|l| {
+            self.s_state.get(l).is_some()
+                || self.conv_state.get(l).is_some()
+                || self.ple_conv.get(l).is_some()
+        });
+        if recurrent {
+            lloom_tensor::bail!("qwen4exp cache: a recurrent channel cannot be truncated")
+        }
+        if tokens > self.pos {
+            lloom_tensor::bail!(
+                "qwen4exp cache: truncating {} positions to {tokens}",
+                self.pos
+            )
+        }
+        for k in self.kv.iter_mut().filter(|k| k.len() > tokens) {
+            let blocks = k.n_blocks().min(tokens / ratio.max(1));
+            k.truncate(tokens, blocks);
+        }
+        self.pos = tokens;
+        self.nextn.clear();
+        self.prepared = None;
         Ok(())
     }
 
@@ -817,6 +866,22 @@ impl Cache {
         self.pending_tokens.extend(tokens.iter().copied());
         self.pending_noted = false;
     }
+}
+
+/// `t` in memory no pass plan serves while the device may reuse activations,
+/// `t` itself otherwise. For a value read after the pass that produced it: a
+/// plan ends a value's interval at its last read inside the pass and serves
+/// the slot to the next value, and no recorder sees a read made between
+/// passes, so such a value is a declared escape (`DESIGN.md` §9.2aa).
+fn declared_copy(t: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    if let Ok(m) = t.device().as_metal_device() {
+        if m.activations_may_be_reused() {
+            let _declared = lloom_tensor::EscapeGuard::new();
+            return crate::nn::recurrent::own_copy(t);
+        }
+    }
+    Ok(t.clone())
 }
 
 /// Whether every decode position checks each layer's mixer and MoE output for
@@ -1481,6 +1546,18 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// Select whether every layer's f16 routed step folds its activation
+    /// cast into gate|up (`MoeLayer::set_f16_fold`; `qwen4exp.f16_fold` by
+    /// default).
+    pub fn set_f16_fold(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_f16_fold(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_f16_fold(on);
+        }
+    }
+
     /// The routed experts' activation dtype (the first layer's; every layer
     /// is set together, [`Self::set_routed_act`]).
     pub fn routed_act(&self) -> lloom_tensor::DType {
@@ -2062,7 +2139,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 obs.at::<LayerOutputPoint>(l, &layer.collapsed(&res_hc)?)?;
             }
         }
-        cache.keep_nextn(&res_hc);
+        cache.keep_nextn(&res_hc)?;
 
         // Only the last position feeds the head.
         let last = res_hc.narrow(1, seq - 1, 1)?;
@@ -2186,7 +2263,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
 
         for r in &res {
-            cache.keep_nextn(r);
+            cache.keep_nextn(r)?;
         }
         // Only the last position feeds the head.
         let last_seq = seqs[n_tiles - 1];
@@ -2430,14 +2507,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// copied into memory no plan serves (`DESIGN.md` §9.2aa, escapes are
     /// declared); `h` itself otherwise.
     fn replay_input(h: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "metal")]
-        if let Ok(m) = h.device().as_metal_device() {
-            if m.activations_may_be_reused() {
-                let _declared = lloom_tensor::EscapeGuard::new();
-                return crate::nn::recurrent::own_copy(h);
-            }
-        }
-        Ok(h.clone())
+        declared_copy(h)
     }
 
     /// [`Self::replay_input`] for a one-row decode step, into a buffer the
@@ -2625,7 +2695,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 obs.at::<LayerOutputPoint>(l, &layer.collapsed(&res_hc)?)?;
             }
         }
-        cache.keep_nextn(&res_hc);
+        cache.keep_nextn(&res_hc)?;
         self.close_pass(bracket)?;
         if probe && !predicted.is_empty() {
             let mut tally = self.hint_recall.lock();
@@ -2990,7 +3060,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             res_hc = next;
         }
         for (r, cache) in caches.iter_mut().enumerate() {
-            cache.keep_nextn(&res_hc.narrow(0, r, 1)?);
+            cache.keep_nextn(&res_hc.narrow(0, r, 1)?)?;
             cache.pos += 1;
         }
         let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [B, 1, d]
@@ -3473,9 +3543,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             res_hc = next;
         }
-        for p in 0..t {
-            cache.keep_nextn(&res_hc.narrow(0, p, 1)?);
-        }
+        cache.keep_nextn_rows(&res_hc, t)?;
         cache.pos += t;
         if let Some(w) = &mut cache.window {
             w.kv_after = kv_after;

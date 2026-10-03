@@ -3125,7 +3125,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let prefill_start = std::time::Instant::now();
             let (l, probe, prefill_units) =
                 s.prefill_streamed(spec, SeqId(i), prompts[i], opts.prefill_ubatch(), device)?;
-            logits.push((l, probe));
+            // Read after the other sequences' prefills: held outside them.
+            logits.push((s.hold_logits(l)?, probe));
             lanes.push(Lane {
                 anchor_tok: 0,
                 produced: 0,

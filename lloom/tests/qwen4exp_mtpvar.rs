@@ -573,6 +573,76 @@ fn a_folded_observe_over_a_streamed_head_is_greedy() -> Result<()> {
     Ok(())
 }
 
+/// A verify window's routing on the host plan under the plan cache with f16
+/// routed activations (the `fast` contract's `moe-act-f16`): the window's
+/// ids are read on the host by the tier's plan after the pass has cast the
+/// activations to f16, and a served plan that ended the ids' interval at
+/// the top-k gave their memory to that cast — `lloom chat --mtp` under
+/// `fast` stopped with "expert N out of 512" on `dev` `e8c7cf776`, the ids
+/// read back as f16 bytes. Three requests served from the plans, every
+/// stream and carry the pool path's.
+#[test]
+fn a_planned_verify_under_f16_routing_reads_its_routing() -> Result<()> {
+    use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+    use lloom::models::qwen4exp::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
+    use lloom::testing::fixture::Fixture;
+    use lloom::testing::tiny::Weights;
+    let _serial = SERIAL.lock();
+    incumbent();
+    let Some(fx) = Fixture::<Qwen4ExpTiny>::new("qwen4exp_mtpvar_f16", Config::tiny())? else {
+        return Ok(());
+    };
+    // Q8_0 experts: an f32 expert has no f16 activation arm.
+    let fx = fx.with_weights(Weights {
+        experts: GgmlDType::Q8_0,
+        ..Weights::default()
+    });
+    if fx.at_scale() {
+        return Ok(());
+    }
+    let cfg = fx.config(|c| {
+        c.moe_intermediate_size = 32;
+        c.eos_token_id = 127;
+    });
+    let stream = StreamOptions {
+        slots: SlotBudget::Fixed(cfg.n_experts),
+        loader: StreamLoader::Pread,
+        prefetch: false,
+        io_hints: false,
+    };
+    // Every window host-planned: its ids read back at each layer.
+    let build = |dev: &Device| -> Result<Qwen4Exp<Streamed>> {
+        let mut m = fx.streamed(&cfg, dev, &LoadOptions::default(), &stream)?;
+        m.set_routed_act(lloom_tensor::DType::F16);
+        m.set_device_plan(false);
+        Ok(m)
+    };
+    let max = 16;
+    let dev = Device::new_metal(0)?;
+    let m = build(&dev)?;
+    let (prompt, want) = prompt_with_stream(&m, &cfg, &dev, 7, 8, max)?;
+    let mut pool = Scripted::new(&want, 1, 2);
+    let pool_run = speculate(&m, &cfg, &dev, &mut pool, &prompt, &DecodeOptions::new(max))?;
+    assert_eq!(pool_run.ids, want, "the pool path's speculative stream");
+    drop(m);
+    let dev = Device::new_metal(0)?;
+    metal(&dev).enable_pass_plans(ArenaLayout::Packed);
+    let m = build(&dev)?;
+    for request in 0..3 {
+        let mut spec = Scripted::new(&want, 1, 2);
+        let run = speculate(&m, &cfg, &dev, &mut spec, &prompt, &DecodeOptions::new(max))?;
+        assert_eq!(run.ids, want, "request {request}: the stream moved");
+        assert_eq!(
+            spec.carries, pool.carries,
+            "request {request}: a carry moved"
+        );
+    }
+    let c = metal(&dev).pass_plan_counters().expect("on");
+    println!("F16VERIFY {c:?}");
+    assert!(c.served > 0, "no pass was served: {c:?}");
+    Ok(())
+}
+
 /// A prefill in units seeds the MTP lane unit by unit: the stream is
 /// greedy's and the lane holds every prompt row, as the one-unit prefill's.
 #[test]

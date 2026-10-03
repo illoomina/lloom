@@ -359,13 +359,20 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
     }
 }
 
+/// The most rows a routed launch takes the union form for. Its threadgroup
+/// of a slot runs every plane naming the slot one after another, so over
+/// many rows sharing experts — a prefill tile's — it serialises what the
+/// incumbent runs side by side; over a verify window or a few rows the
+/// planes a slot gathers are few.
+pub const MV_ID_UNION_MAX_ROWS: usize = 8;
+
 /// [`mv_constants`] for a routed launch (`kernel_mul_mv_id*`) of `batch`
 /// rows: with the union form (`MV_ID_UNION`, function constant 917) on when
-/// `LLOOM_QMV_ID_UNION` is and two or more rows share the launch. The
-/// wrappers name the constant, so every routed load supplies it.
+/// `LLOOM_QMV_ID_UNION` is and 2 to [`MV_ID_UNION_MAX_ROWS`] rows share the
+/// launch. The wrappers name the constant, so every routed load supplies it.
 fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
     let mut values = mv_constants(dtype).map_or_else(Vec::new, ConstantValues::into_values);
-    let union = batch > 1 && id_union_on();
+    let union = (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on();
     if union {
         ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

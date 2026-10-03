@@ -209,6 +209,39 @@ fn a_one_row_launch_is_the_incumbents() -> Result<()> {
     Ok(())
 }
 
+/// Past `MV_ID_UNION_MAX_ROWS` rows a launch is the incumbent's: over a
+/// prefill tile's rows a slot's threadgroup would run most of the planes
+/// one after another.
+#[test]
+fn a_launch_past_the_union_cap_is_the_incumbents() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (w, _) = stacked(GgmlDType::Q4K, SHAPE, 3, &dev)?;
+    let rows = lloom_tensor::kernels::MV_ID_UNION_MAX_ROWS + 1;
+    let ids: Vec<u32> = (0..rows * 3).map(|i| (i % 6) as u32).collect();
+    let ids = Tensor::from_vec(ids, (rows, 3), &Device::Cpu)?.to_device(&dev)?;
+    let x = activations((rows, 1, SHAPE.2), 0.1)?.to_device(&dev)?;
+    lloom_tensor::kernels::set_qmv_id_union(true);
+    let before = lloom_tensor::kernels::qmv_id_union_launches();
+    w.indexed_moe_forward(&x, &ids)?;
+    let at_cap = {
+        let ids = ids.narrow(0, 0, rows - 1)?;
+        let x = x.narrow(0, 0, rows - 1)?.contiguous()?;
+        let b = lloom_tensor::kernels::qmv_id_union_launches();
+        w.indexed_moe_forward(&x, &ids)?;
+        lloom_tensor::kernels::qmv_id_union_launches() - b
+    };
+    let past = lloom_tensor::kernels::qmv_id_union_launches() - before - at_cap;
+    lloom_tensor::kernels::set_qmv_id_union(false);
+    assert_eq!(past, 0, "a launch of {rows} rows took the union form");
+    assert_eq!(
+        at_cap,
+        1,
+        "a launch of {} rows did not take the union form",
+        rows - 1
+    );
+    Ok(())
+}
+
 #[test]
 fn union_q4k() -> Result<()> {
     union_is_the_incumbent(GgmlDType::Q4K, DType::F32)?;

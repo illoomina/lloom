@@ -8561,32 +8561,34 @@ typedef decltype(mmv_fn<kernel_mul_mv_impl<half, half4, half, half4>>) mul_mv_im
 constant bool MV_ID_UNION_FC [[function_constant(917)]];
 constant bool MV_ID_UNION = is_function_constant_defined(MV_ID_UNION_FC) && MV_ID_UNION_FC;
 
-static inline int32_t mv_id_slot(device const char * ids, uint64_t nbi1, int64_t nei0, int z) {
-    return ((device const int32_t *) (ids + (z / nei0) * nbi1))[z % nei0];
+static inline int32_t mv_id_slot(device const char * ids, uint nbi1, uint nei0, uint z) {
+    return *((device const int32_t *) (ids + (z / nei0) * nbi1) + z % nei0);
 }
 
 #define MV_ID_UNION_BODY(D, SRC0A, SRC0B, HALVES)                                       \
     {                                                                                  \
-        const int planes = nei0 * nei1;                                                \
-        const int hf = (HALVES) > 1 ? (int)(tgpig.z / planes) : 0;                     \
-        const int z0 = tgpig.z - hf * planes;                                          \
-        const int32_t slot = mv_id_slot(ids, nbi1, nei0, z0);                          \
-        for (int p = 0; p < z0; ++p) {                                                 \
-            if (mv_id_slot(ids, nbi1, nei0, p) == slot) {                              \
+        const uint ni0 = (uint) nei0;                                                  \
+        const uint nbi = (uint) nbi1;                                                  \
+        const uint planes = ni0 * (uint) nei1;                                         \
+        const uint hf = (HALVES) > 1 ? tgpig.z / planes : 0;                           \
+        const uint z0 = tgpig.z - hf * planes;                                         \
+        const int32_t slot = mv_id_slot(ids, nbi, ni0, z0);                            \
+        for (uint p = 0; p < z0; ++p) {                                                \
+            if (mv_id_slot(ids, nbi, ni0, p) == slot) {                                \
                 return;                                                                \
             }                                                                          \
         }                                                                              \
         tgpig.z = 0;                                                                   \
         device const char * src0_cur = (hf ? (SRC0B) : (SRC0A)) + slot*nb02;           \
-        for (int z = z0; z < planes; ++z) {                                            \
+        for (uint z = z0; z < planes; ++z) {                                           \
             if (z != z0) {                                                             \
-                if (mv_id_slot(ids, nbi1, nei0, z) != slot) {                          \
+                if (mv_id_slot(ids, nbi, ni0, z) != slot) {                            \
                     continue;                                                          \
                 }                                                                      \
                 threadgroup_barrier(mem_flags::mem_threadgroup);                       \
             }                                                                          \
-            const int64_t iid1 = z / nei0;                                             \
-            const int64_t idx = z % nei0;                                              \
+            const int64_t iid1 = z / ni0;                                              \
+            const int64_t idx = z % ni0;                                               \
             device const char * src1_cur = src1 + (idx % ne11)*nb11 + iid1*nb12;       \
             device D * dst_cur = dst + hf*nei1*ne1*ne0 + idx*ne0 + iid1*ne1*ne0;       \
             impl_fn(src0_cur, src1_cur, dst_cur, ne00, ne01, 1, nb00, nb01, nb02,      \

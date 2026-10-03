@@ -1667,7 +1667,7 @@ impl QsaAttention {
         // The rows within the dense range are a prefix of the window.
         let d = (0..t)
             .take_while(|&r| match &self.indexer {
-                Some(ix) => pos0 + r + 1 <= ix.dense_limit(),
+                Some(ix) => pos0 + r < ix.dense_limit(),
                 None => true,
             })
             .count();

@@ -534,6 +534,13 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
         self.lanes.get(seq.0).map_or(0, |l| l.rows_seen)
     }
 
+    /// The tokens sequence `seq`'s lane was keyed from: row `j` pairs the
+    /// target's carry at position `j` with the embedding of `keyed[j + 1]`
+    /// (what [`Speculator::begin_at`] matches a reused prefix against).
+    pub fn seq_keyed(&self, seq: SeqId) -> &[u32] {
+        self.lanes.get(seq.0).map_or(&[], |l| l.keyed.as_slice())
+    }
+
     /// Sequence 0's MTP-layer cache (its KV), for a probe.
     pub fn cache(&self) -> &Cache {
         &self.lanes[0].cache

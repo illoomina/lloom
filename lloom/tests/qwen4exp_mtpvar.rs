@@ -655,6 +655,7 @@ fn a_prefill_in_units_seeds_the_mtp_lane() -> Result<()> {
     let head = m.mtp_head().expect("the head");
     let max = 12;
     let (prompt, want) = prompt_with_stream(&m, &cfg, &dev, 9, 6, max)?;
+    let mut keyed = Vec::new();
     for ubatch in [0usize, 4] {
         let mut mtp = MtpDrafter::new(head, m.embed_tokens(), m.lm_head(), &cfg, &dev);
         let opts = DecodeOptions {
@@ -662,16 +663,34 @@ fn a_prefill_in_units_seeds_the_mtp_lane() -> Result<()> {
             ..DecodeOptions::new(max)
         };
         let run = speculate(&m, &cfg, &dev, &mut mtp, &prompt, &opts)?;
+        let seq_keyed = mtp.seq_keyed(SeqId(0)).to_vec();
         println!(
-            "UBATCH ubatch={ubatch} rows_seen={} pos={} rounds={}",
+            "UBATCH ubatch={ubatch} rows_seen={} pos={} rounds={} keyed={}",
             mtp.rows_seen(),
             mtp.cache().pos,
-            run.accepted.len()
+            run.accepted.len(),
+            seq_keyed.len()
         );
         assert_eq!(run.ids, want, "ubatch = {ubatch}: not the greedy stream");
         assert_eq!(mtp.cache().pos, mtp.rows_seen());
         assert!(mtp.rows_seen() >= prompt.len() + run.ids.len() - 1);
+        // Row `j` reads the embedding of `keyed[j + 1]`, so the prompt's
+        // own rows key `prompt ++ stream` whatever the unit count: a unit
+        // keyed at the wrong offset pairs its rows with other tokens, which
+        // the greedy stream (the verify corrects every draft) and the row
+        // count both survive.
+        let want_keyed: Vec<u32> = prompt.iter().chain(&run.ids).copied().collect();
+        assert_eq!(
+            seq_keyed,
+            want_keyed[..seq_keyed.len().min(want_keyed.len())],
+            "ubatch = {ubatch}: the lane's rows were keyed from other tokens"
+        );
+        keyed.push(seq_keyed);
     }
+    assert_eq!(
+        keyed[0], keyed[1],
+        "the prefill's unit count changed what the lane was keyed from"
+    );
     Ok(())
 }
 

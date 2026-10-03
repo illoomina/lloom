@@ -3582,7 +3582,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         h: &Tensor,
         cache: &mut Cache,
         kind: WindowPlanKind,
-    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>, Tensor)> {
+    ) -> Result<VerifyPassOut> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let t = h.dim(0)?;
@@ -3640,6 +3640,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
 /// [`Qwen4Exp::window_read`]: the argmax, the records, and the extras.
 type WindowRead = (Vec<u32>, Vec<(usize, WindowRecord)>, Vec<Vec<u32>>);
+
+/// `Qwen4Exp::verify_pass`: the logits, the layers' plan records, the carries.
+type VerifyPassOut = (Tensor, Vec<(usize, WindowPlan)>, Tensor);
 
 impl<R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<R> {
     fn forward_rows(

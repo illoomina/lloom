@@ -270,8 +270,10 @@ pub struct WeightGroups {
     /// The tier's row on the ledger (§4.8 "as a tenant": class `Cache`,
     /// floor the ring — three slots — want every group, unit a slot); the
     /// owner applies a grant with `resize_slots`.
+    /// The tier as the ledger's tenant (§4.8 "As a tenant"; one type with
+    /// the expert tier's, `nn::group_tenant`).
     #[cfg(feature = "metal")]
-    gauge: Option<std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
+    tenant: Option<std::sync::Arc<crate::nn::group_tenant::GroupTenant>>,
 }
 
 /// The tier's storage: `[slots, slot_elems]` of `dtype`. On Metal a
@@ -328,22 +330,22 @@ impl WeightGroups {
         };
         let slot_bytes = slot_elems * dtype.size_in_bytes();
         #[cfg(feature = "metal")]
-        let gauge = match device {
+        let tenant = match device {
             Device::Metal(m) => {
-                use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
-                let gauge = Gauge::new(
+                use lloom_tensor::kernels::metal::ledger::Tenant;
+                // Floor: the ring (three slots — in use, the previous
+                // stage's, loading); want: every group; unit: a slot.
+                let tenant = std::sync::Arc::new(crate::nn::group_tenant::GroupTenant::new(
                     site,
-                    Claim {
-                        floor: 3 * slot_bytes,
-                        want: groups.len().max(1) * slot_bytes,
-                        unit: slot_bytes,
-                        class: Class::Cache,
-                    },
-                    slots * slot_bytes,
-                );
-                let tenant: std::sync::Arc<dyn Tenant> = gauge.clone();
-                m.ledger().register(&tenant);
-                Some(gauge)
+                    slot_bytes,
+                    slots,
+                    3,
+                    groups.len().max(1),
+                    groups.len().max(1),
+                ));
+                let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
+                m.ledger().register(&dyn_tenant);
+                Some(tenant)
             }
             _ => None,
         };
@@ -371,7 +373,7 @@ impl WeightGroups {
             #[cfg(feature = "metal")]
             next_ticket: 0,
             #[cfg(feature = "metal")]
-            gauge,
+            tenant,
         })
     }
 
@@ -444,10 +446,6 @@ impl WeightGroups {
             }
         }
         #[cfg(feature = "metal")]
-        if let Some(g) = &self.gauge {
-            g.set_held(slots * self.slot_bytes());
-        }
-        #[cfg(feature = "metal")]
         {
             self.pending = vec![0; slots];
             let mut readers = vec![None; slots];
@@ -464,6 +462,28 @@ impl WeightGroups {
 
     pub fn n_slots(&self) -> usize {
         self.cache.n_slots()
+    }
+
+    /// The tier's row in the ledger (Metal).
+    #[cfg(feature = "metal")]
+    pub fn tenant(&self) -> Option<std::sync::Arc<crate::nn::group_tenant::GroupTenant>> {
+        self.tenant.clone()
+    }
+
+    /// Apply the arbiter's grant, if it moved: the slots resized to what
+    /// the tenant was granted (`resize_slots` — a cold path that drains
+    /// the loader and the queue). `Some(slots)` when a resize happened.
+    /// Called at a pass boundary, never inside one.
+    pub fn apply_grant(&mut self) -> Result<Option<usize>> {
+        #[cfg(feature = "metal")]
+        if let Some(t) = self.tenant.clone() {
+            let wanted = t.wanted_units();
+            if wanted != self.cache.n_slots() {
+                let slots = self.resize_slots(wanted)?;
+                return Ok(Some(slots));
+            }
+        }
+        Ok(None)
     }
 
     pub fn n_groups(&self) -> usize {

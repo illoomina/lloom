@@ -958,62 +958,14 @@ pub struct Ple {
 
 /// The assembled model.
 /// The streamed expert pool as the ledger's elastic tenant
-/// (`profiles-and-memory-design.md` §4.2, class `Cache`): its claim is
-/// `topk + 1` slots as the floor, every expert as the want, one slot as
-/// the unit; `resize` records the grant as the slots wanted in service and
-/// reports the pledge, which the model applies to its layers' tiers
-/// (`Qwen4Exp::apply_expert_grant`) — the tiers evict through their
+/// (`profiles-and-memory-design.md` §4.2, class `Cache`): `topk + 1` slots
+/// as the floor, every expert as the want, one slot as the unit — the one
+/// tenant type every weight-group tier is (`nn::group_tenant`, #892 A6b;
+/// the dense layers' tier claims the same way). `resize` records the grant
+/// as the slots wanted in service; the model applies it to its layers'
+/// tiers (`Qwen4Exp::apply_expert_grant`) — the tiers evict through their
 /// quarantine and give the parked slots' pages back.
-#[derive(Debug)]
-pub struct ExpertTenant {
-    bytes_per_slot: usize,
-    n_slots: usize,
-    floor_slots: usize,
-    n_experts: usize,
-    wanted: std::sync::atomic::AtomicUsize,
-}
-
-impl ExpertTenant {
-    pub fn new(bytes_per_slot: usize, slots: usize, floor_slots: usize, n_experts: usize) -> Self {
-        Self {
-            bytes_per_slot,
-            n_slots: slots,
-            floor_slots: floor_slots.min(slots),
-            n_experts,
-            wanted: std::sync::atomic::AtomicUsize::new(slots),
-        }
-    }
-
-    /// Slots wanted in service (the last grant, in slots).
-    pub fn wanted_slots(&self) -> usize {
-        self.wanted.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-#[cfg(feature = "metal")]
-impl lloom_tensor::kernels::metal::ledger::Tenant for ExpertTenant {
-    fn name(&self) -> String {
-        "qwen4exp-experts".into()
-    }
-    fn claim(&self) -> lloom_tensor::kernels::metal::ledger::Claim {
-        use lloom_tensor::kernels::metal::ledger::{Claim, Class};
-        Claim {
-            floor: self.floor_slots * self.bytes_per_slot,
-            want: self.n_experts * self.bytes_per_slot,
-            unit: self.bytes_per_slot,
-            class: Class::Cache,
-        }
-    }
-    fn held(&self) -> usize {
-        self.wanted_slots() * self.bytes_per_slot
-    }
-    fn resize(&self, grant: usize) -> usize {
-        let slots = (grant / self.bytes_per_slot.max(1)).clamp(self.floor_slots, self.n_slots);
-        self.wanted
-            .store(slots, std::sync::atomic::Ordering::Relaxed);
-        slots * self.bytes_per_slot
-    }
-}
+pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
 
 #[derive(Debug)]
 pub struct Qwen4Exp<R: ExpertResidency> {
@@ -1367,10 +1319,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if let lloom_tensor::Device::Metal(m) = device {
             use lloom_tensor::kernels::metal::ledger::Tenant;
             let tenant = std::sync::Arc::new(ExpertTenant::new(
+                "qwen4exp-experts",
                 bytes_per_slot,
                 slots,
                 topk + 1,
                 n_experts,
+                slots,
             ));
             let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
             m.ledger().register(&dyn_tenant);
@@ -1395,7 +1349,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let Some(t) = &self.ledger_gauge else {
             return Ok(0);
         };
-        let wanted = t.wanted_slots();
+        let wanted = t.wanted_units();
         let mut parked = 0usize;
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = self.device() {
@@ -1414,7 +1368,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let tier = layer.moe.experts();
             let active = tier.active_slots();
             if wanted < active {
-                parked += tier.shrink_slots(wanted, t.floor_slots)?;
+                parked += tier.shrink_slots(wanted, t.floor_units())?;
             } else if wanted > active {
                 tier.grow_slots(wanted);
             }

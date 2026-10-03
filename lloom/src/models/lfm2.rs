@@ -3122,6 +3122,11 @@ pub struct Cache {
     /// sequence of the same geometry writes over it), so no pass allocates a
     /// tail (`nn::ring::Ring`).
     turn_ring: Option<crate::nn::ring::Ring>,
+    /// The model's weight-group tier, when its layers stream (§4.8) —
+    /// attached by the model at each pass's entry, so the KV grow's
+    /// admission can apply the arbiter's pledge (the tier's yield) and
+    /// ask again, as Qwen4-exp's `prepare_pass_as` does with its experts.
+    layer_tier: Option<std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>>,
     /// The ring slot the pass in flight writes its tails into, `None` on a
     /// pass that takes no checkpoint (a decode step, a verify, `Cat`).
     turn_ckpt_cur: Option<usize>,
@@ -3730,6 +3735,7 @@ impl Cache {
             conv_spare: vec![None; num_layers],
             turn_checkpoints: Vec::with_capacity(TURN_CHECKPOINTS),
             turn_ring: None,
+            layer_tier: None,
             turn_ckpt_cur: None,
             turn_ckpt_next: 0,
             conv_phase: 0,
@@ -4351,7 +4357,27 @@ impl Cache {
     /// layer 5 — leaves the planes it widened widened and the rest as they
     /// were; every plane is self-describing, nothing was written, and the next
     /// call widens the remainder. Idempotent by construction.
+    /// The model's tier, for the admission below (once; cheap after).
+    pub(crate) fn attach_layer_tier(
+        &mut self,
+        tier: &std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>,
+    ) {
+        if self.layer_tier.is_none() {
+            self.layer_tier = Some(std::sync::Arc::clone(tier));
+        }
+    }
+
+    /// Apply the arbiter's grant to the tier at this pass boundary, if it
+    /// moved (A6b: the dense tier yields as the expert tier does).
+    pub(crate) fn apply_layer_grant(&self) -> Result<Option<usize>> {
+        match &self.layer_tier {
+            Some(t) => t.lock().apply_grant(),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn prepare_pass(&mut self, seq_len: usize) -> Result<()> {
+        self.apply_layer_grant()?;
         if let Some(plan) = self.plan_pass(seq_len)? {
             self.admit_grow(plan.bytes, &plan.describe())?;
             self.apply_grow(&plan)?;
@@ -4633,7 +4659,18 @@ impl Cache {
         let working_set = dev.recommended_max_working_set_size();
         // The free lists are given back before a refusal stands
         // (`MetalDevice::admit_bytes`); the arithmetic is `kv_grow_fits`'.
-        let a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+        let mut a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+        if !a.fits && a.pledged > 0 {
+            // The tenants pledged a yield (the layers' slots): apply it —
+            // the tier resized to its grant — and ask again on the figure
+            // after (the expert tier's shape, `prepare_pass_as`).
+            if self.apply_layer_grant()?.is_some() {
+                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+                a.pledged = pledged;
+                a.reclaimed += reclaimed;
+            }
+        }
         if a.fits {
             debug_assert!(kv_grow_fits(
                 a.committed,
@@ -8852,6 +8889,14 @@ impl Model {
         Ok(Some((wrong, tier.stats())))
     }
 
+    /// Hand the cache the tier's handle (once), so its admission can apply
+    /// the arbiter's pledge to the slots and ask again.
+    fn attach_layer_tier(&self, cache: &mut Cache) {
+        if let Some(st) = self.layers.first().and_then(|l| l.streamed.as_ref()) {
+            cache.attach_layer_tier(&st.tier);
+        }
+    }
+
     /// The tier's shape and counters when the layers stream (§4.8):
     /// `(slots, groups, slot_bytes, stats)`; `None` when every weight is
     /// resident. Cheap — no audit.
@@ -8879,6 +8924,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        self.attach_layer_tier(cache);
         // Room for this pass, or a refusal that leaves everything as it was —
         // BEFORE the conv phase advances below (`Cache::prepare_pass`).
         cache.prepare_pass(seq_len)?;
@@ -8987,6 +9033,7 @@ impl Model {
         // the same grow: admitted once.
         let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
+            self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
                 &format!("for a batched step over {} rows", rows.len()),
@@ -9089,6 +9136,7 @@ impl Model {
         }
         let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
+            self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
                 &format!("for a ragged batched pass over {} rows", rows.len()),
@@ -9176,6 +9224,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len, _) = embeds.dims3()?;
+        self.attach_layer_tier(cache);
         cache.prepare_pass(seq_len)?;
         self.advance_conv_phase(seq_len, cache);
 

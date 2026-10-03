@@ -55,6 +55,7 @@ pub mod sequential;
 pub mod short_conv;
 pub mod slab;
 pub mod slot_cache;
+pub mod group_tenant;
 pub mod weight_groups;
 pub mod speculator;
 pub mod var_builder;

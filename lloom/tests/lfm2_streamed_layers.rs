@@ -202,8 +202,15 @@ fn the_streamed_layers_decode_the_same_bits_as_the_resident_ones() -> Result<()>
             slots,
             depth: 1,
         });
+        let t0 = std::time::Instant::now();
         let streamed = build(&streamed_cfg, dtype, &dev, &path)?;
+        let t1 = std::time::Instant::now();
         let got = run(&streamed, &streamed_cfg, dtype, &dev, 6)?;
+        eprintln!(
+            "[test] slots {slots}: build {:.0} ms, run {:.0} ms",
+            (t1 - t0).as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3
+        );
         assert_eq!(got.len(), want.len());
         for (step, (g, w)) in got.iter().zip(want.iter()).enumerate() {
             if g != w {

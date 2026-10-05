@@ -35,9 +35,11 @@ fn model(dev: &Device) -> Qwen4Exp<Resident> {
     testing::resident_model(&config(), dev)
 }
 
-/// Two decode steps from an empty cache; the second step's logits and its
-/// census, every label with its count.
-fn step(m: &Qwen4Exp<Resident>, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> {
+/// A step's logits and its census, every label with its count.
+type Step = (Vec<f32>, Vec<(String, u64)>);
+
+/// Two decode steps from an empty cache; the second step's [`Step`].
+fn step(m: &Qwen4Exp<Resident>, dev: &Device) -> Result<Step> {
     let cfg = config();
     let mut cache = m.new_cache(&cfg, dev)?;
     let first = Tensor::new(&[[3u32]], dev)?;

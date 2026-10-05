@@ -12,8 +12,6 @@ use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
     Row, Speculative, VarBuilder,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use crate::optimizer::Visit as _;
 use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its

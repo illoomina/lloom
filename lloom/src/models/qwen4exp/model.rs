@@ -20,8 +20,6 @@ use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::optimizer::Visit as _;
 #[cfg(feature = "metal")]
 use lloom_tensor::metal_backend::{PassKey, PassKind, PassOpener};
 use lloom_tensor::quantized::QMatMul;

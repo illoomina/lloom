@@ -1,16 +1,16 @@
-//! The one walker (`optimizer::walk`) against what it replaces: the IR a
-//! model's blocks emit when walked, built through the model's own
-//! constructor over ghost weights at the real checkpoint's geometry, diffed
-//! against the per-model emitter's (`lfm2_ir::decode_step`) up to a
-//! dependency-preserving permutation. Identical, or the first edge that
-//! differs is named.
+//! The one walker (`optimizer::walk`): the IR a model's blocks emit when
+//! walked, built through the model's own constructor over ghost weights at
+//! the real checkpoint's geometry (`testing::ghost`), held to the listing
+//! committed for it — the IR-diff gate (`profiles-and-memory-design.md` §11
+//! item 1). The walk replaced the per-model emitters after diffing equal to
+//! LFM2's on every arm it described and reconciling with a fresh trace of
+//! Qwen4-exp's step (`design/measurements/issue-732-walker.md`).
 //!
-//! On Metal: the attention kernel a layer takes is the route its
-//! construction resolved on the device (`AttnRoute`), which is what a walk
-//! reads; the emitter named it from the requested arm.
+//! On Metal the attention kernel a layer takes is the route its
+//! construction resolved on the device, which is what a walk reads.
 
 use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
-use lloom::optimizer::{diff, walk, Graph};
+use lloom::optimizer::{walk, Graph};
 use lloom::testing::ghost;
 use lloom_tensor::{DType, Device};
 
@@ -35,138 +35,30 @@ fn lfm2_2_6b() -> Config {
     }
 }
 
-/// The emitter's graph and the walk's, for one configuration.
-fn both(cfg: &Config, dev: &Device) -> (Graph, Graph) {
-    let emitted = lloom::models::lfm2_ir::decode_step(cfg, DType::F16);
-    let model = ghost::lfm2(cfg, DType::F16, dev).expect("ghost build");
-    (emitted, walk(&model))
-}
-
-/// Every arm the emitter describes, one axis at a time from the traced
-/// configuration (`Shuffle × Sdpa × InPlace × Contiguous`), plus the fused
-/// conv on every state arm.
-fn arms() -> Vec<(String, Config)> {
-    let mut out = Vec::new();
-    let base = {
-        let mut c = lfm2_2_6b();
-        c.attn_impl = AttnImpl::Sdpa;
-        c.kv_append = KvAppend::InPlace;
-        c.conv_state = ConvState::Shuffle;
-        c.qkv_layout = QkvLayout::Contiguous;
-        c
-    };
-    out.push(("traced".to_string(), base.clone()));
-    for (name, s) in [
-        ("rotating", ConvState::RotatingRing { k: 16 }),
-        ("sliding", ConvState::SlidingRing { k: 4, slack: 16 }),
-        ("shuffle", ConvState::Shuffle),
-    ] {
-        for fused in [false, true] {
-            let mut c = base.clone();
-            c.conv_state = s;
-            c.conv_fused = fused;
-            out.push((format!("{name} fused={fused}"), c));
-        }
-    }
-    for q in [QkvLayout::Strided, QkvLayout::Fused] {
-        let mut c = base.clone();
-        c.qkv_layout = q;
-        out.push((format!("{q:?}"), c));
-    }
-    for k in [KvAppend::Cat, KvAppend::Paged] {
-        let mut c = base.clone();
-        c.kv_append = k;
-        out.push((format!("{k:?}"), c));
-    }
-    for a in [AttnImpl::FlashDecoding, AttnImpl::Generic] {
-        let mut c = base.clone();
-        c.attn_impl = a;
-        out.push((format!("{a:?}"), c));
-    }
-    // The fusion flags select arms the forward runs, not what it computes:
-    // the walk is the unfused chain under any of them, as the emitter was.
-    let mut c = base.clone();
-    c.gemv_silu = true;
-    c.gemv_residual = true;
-    out.push(("flags on".to_string(), c));
-    out
-}
-
-#[cfg(feature = "metal")]
-#[test]
-fn the_lfm2_walk_is_the_emitters_ir_on_every_arm() {
-    let dev = Device::new_metal(0).expect("metal");
-    let mut failures = Vec::new();
-    for (name, cfg) in arms() {
-        let (emitted, walked) = both(&cfg, &dev);
-        let d = diff(&emitted, &walked);
-        eprintln!(
-            "WALK lfm2 {name}: emitter {} dispatches, walk {} — {d}",
-            emitted.dispatches(),
-            walked.dispatches()
-        );
-        if !d.is_empty() {
-            failures.push(format!("{name}: {d}"));
-        }
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
+/// The configuration of the committed trace (`issue-727-raw/pass-plan/
+/// runs/trace-arena-shuffle.txt`): `Shuffle × Sdpa × InPlace × Contiguous`.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+fn traced() -> Config {
+    let mut c = lfm2_2_6b();
+    c.attn_impl = AttnImpl::Sdpa;
+    c.kv_append = KvAppend::InPlace;
+    c.conv_state = ConvState::Shuffle;
+    c.qkv_layout = QkvLayout::Contiguous;
+    c
 }
 
 /// Off Metal every attention arm resolves to the composed attention at
-/// construction, and the walk says so where the emitter named the requested
-/// kernel: the one family that moves, eight nodes, nothing else.
+/// construction, and the walk says so: the eight attention layers take
+/// `attention_generic`, whatever was requested — the route the model took,
+/// not the arm the config named.
 #[test]
 fn off_metal_the_walk_reads_the_route_the_model_took() {
     let mut cfg = lfm2_2_6b();
     cfg.attn_impl = AttnImpl::Sdpa;
-    let (emitted, walked) = both(&cfg, &Device::Cpu);
-    let d = diff(&emitted, &walked);
-    assert_eq!(walked.census().get("attention_generic"), Some(&8), "{d}");
+    let walked = walk(&ghost::lfm2(&cfg, DType::F16, &Device::Cpu).expect("ghost build"));
+    assert_eq!(walked.census().get("attention_generic"), Some(&8));
     assert_eq!(walked.census().get("sdpa_vector"), None);
-    assert_eq!(emitted.census().get("sdpa_vector"), Some(&8));
-    let (l, r) = d.first();
-    assert!(l.unwrap().describe.starts_with("sdpa_vector"), "{d}");
-    assert!(r.unwrap().describe.starts_with("attention_generic"), "{d}");
-    assert_eq!(walked.dispatches(), emitted.dispatches());
-}
-
-/// Qwen4-exp: the walk of the committed checkpoint's model (the loader's own
-/// assembly over ghost weights) against the emitter it replaces, and both
-/// derived. Printed for the record; the walk's own reconciliation with a
-/// trace of today's step is `qwen4exp_walk.rs`.
-#[test]
-fn the_qwen4exp_walk_against_its_emitter() {
-    use lloom::models::qwen4exp::{testing::ghost_model, Config};
-    use lloom::optimizer::{derive, Policy};
-    let model = ghost_model(&Device::Cpu).expect("ghost build");
-    let walked = walk(&model);
-    let emitted = lloom::models::qwen4exp_ir::decode_step(&Config::flash_next());
-    let d = diff(&emitted, &walked);
-    eprintln!(
-        "WALK qwen4exp source: emitter {} dispatches, walk {} — {d}",
-        emitted.dispatches(),
-        walked.dispatches()
-    );
-    for u in d.only_left.iter().take(40) {
-        eprintln!(
-            "WALK qwen4exp only-emitter L{} x{} {}",
-            u.level, u.count, u.describe
-        );
-    }
-    for u in d.only_right.iter().take(40) {
-        eprintln!(
-            "WALK qwen4exp only-walk L{} x{} {}",
-            u.level, u.count, u.describe
-        );
-    }
-    let derived = derive(&walked, &Policy::default()).expect("derive").graph;
-    eprintln!(
-        "WALK qwen4exp derived: {} dispatches, emitter census {:?}",
-        derived.dispatches(),
-        emitted.census()
-    );
-    eprintln!("WALK qwen4exp derived census {:?}", derived.census());
-    eprintln!("WALK qwen4exp source census {:?}", walked.census());
+    assert_eq!(walked.dispatches(), 538);
 }
 
 /// The IR-diff gate (`profiles-and-memory-design.md` §11 item 1): today's
@@ -217,7 +109,6 @@ fn the_qwen4exp_walk_matches_its_committed_listing() {
 #[test]
 fn the_lfm2_walk_matches_its_committed_listing() {
     let dev = Device::new_metal(0).expect("metal");
-    let (_, cfg) = arms().into_iter().next().expect("the traced arm");
-    let model = ghost::lfm2(&cfg, DType::F16, &dev).expect("ghost build");
+    let model = ghost::lfm2(&traced(), DType::F16, &dev).expect("ghost build");
     listing_gate("lfm2-2.6b-traced", &walk(&model));
 }

@@ -61,6 +61,8 @@ pub enum Semantics {
     /// GEMV's own shape, streamed beside it; the block sees two accumulators
     /// for its row and stores their product.
     SwigluGate,
+    /// `y = sigmoid(x)`.
+    Sigmoid,
 }
 
 /// Which second operand an [`Operand`] type binds, as a value the optimizer

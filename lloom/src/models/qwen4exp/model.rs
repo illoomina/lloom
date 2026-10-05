@@ -2454,6 +2454,15 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             return Ok(logits);
         }
+        // The arm (`QWEN4EXP_PREDICT=hotlist`): before a device-planned
+        // token, every layer's tier stages the hotlist's experts not
+        // resident; its plan lands them before it maps the pool (#849's D
+        // with the prediction the hotlist gives).
+        if cache.device_plan_armed && predict_hot() {
+            for layer in &self.layers {
+                layer.moe().experts().prefetch_hot()?;
+            }
+        }
         // The cold phase: a pool that missed on the last pass runs the host
         // plan — one token and its loads, no replay — until a pass completes
         // with every expert resident; then the device plan, until it misses.
@@ -2512,6 +2521,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 cache.redos += 1;
                 cache.device_replays += 1;
                 cache.open_window()?;
+                if predict_hot() {
+                    for layer in &self.layers {
+                        layer.moe().experts().prefetch_hot()?;
+                    }
+                }
                 h = self.replay_input_owned(&h)?;
                 let (logits, records) = self.decode_embed_pass(&h, cache, obs, RowPlan::Device)?;
                 self.replay_read_encoded(&h);
@@ -3816,6 +3830,14 @@ impl super::moe::PlanHook for JoinHook {
 fn replay_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
+}
+
+/// `QWEN4EXP_PREDICT=hotlist` (read once): before a device-planned token
+/// the tiers stage the hotlist's experts not resident and the plan lands
+/// them (#849's D with the hotlist's prediction); off by default.
+fn predict_hot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist"))
 }
 
 /// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.

@@ -41,6 +41,45 @@ pub trait PlanHook {
 
 impl PlanHook for () {}
 
+/// `QWEN4EXP_MASK=1` (read once): on a device-planned pass a plane whose
+/// expert the plan found missing contributes nothing to the combine (the
+/// record's flag — #842's C, the mask for an unpredicted miss): the pass
+/// without that expert, defined and finite, instead of slot 0's expert
+/// under its weight. The token is settled and replayed as without it.
+/// Off by default: the combine kernel is the plain one.
+pub fn mask_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_MASK").is_ok_and(|v| v == "1"))
+}
+
+/// `QWEN4EXP_READY_FIRST=1` (read once): a host-planned tile's groups run
+/// in readiness order — the group with the fewest experts to load first —
+/// so the later groups' loads overlap the earlier groups' compute the
+/// longest (`profiles-and-memory-design.md` §4.8 "the schedule covers the
+/// load", §10 A6c, on the routed stage: a dense chain has one order). Each
+/// row's arithmetic is the tile's whatever the order (the arm is the
+/// tile's, §20.15), and the outputs are placed by row. Off, the plan's
+/// order: the rows'.
+pub fn ready_first_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_READY_FIRST").is_ok_and(|v| v == "1"))
+}
+
+/// Tiles whose groups ran in an order other than the rows' (the arm's
+/// engagement, for its tests).
+static READY_REORDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ready_reorders() -> u64 {
+    READY_REORDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Combines run with the mask bound (the arm's engagement, for its tests).
+static MASKED_COMBINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn masked_combines() -> u64 {
+    MASKED_COMBINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How a speculative window's routed experts are planned
 /// ([`MoeLayer::decode_window`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +276,11 @@ impl<R: ExpertResidency> MoeLayer<R> {
         let y = self.routed_one_group(&r.x3, &slot_ids)?;
         let (shared, sh_logit) = self.shared_expert(&r)?;
         hook.at_join()?;
-        Ok((self.combine(&r, &y, &shared, &sh_logit)?, Some(rec)))
+        let flags = self.mask_flags(&r, &rec)?;
+        Ok((
+            self.combine(&r, &y, &shared, &sh_logit, flags.as_ref())?,
+            Some(rec),
+        ))
     }
 
     /// A speculative window's `T` positions through the MoE (`x [T, 1,
@@ -259,7 +302,11 @@ impl<R: ExpertResidency> MoeLayer<R> {
             WindowPlanKind::Device => {
                 if let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? {
                     let y = self.routed_one_group(&r.x3, &slot_ids)?;
-                    return Ok((self.finish(&r, &y)?, Some(WindowPlan::Device(rec))));
+                    let flags = self.mask_flags(&r, &rec)?;
+                    return Ok((
+                        self.finish_with(&r, &y, flags.as_ref())?,
+                        Some(WindowPlan::Device(rec)),
+                    ));
                 }
             }
             WindowPlanKind::Host {
@@ -473,12 +520,40 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // whatever the pool holds, and a plan serves it.
         let one_row = groups.len() == 1 && groups[0].rows.len() == 1;
         let _escape = if one_row { None } else { escape_guard() };
-        let mut ys = Vec::with_capacity(groups.len());
-        for (gi, group) in groups.iter().enumerate() {
+        // The order the groups run in: the rows', or under the arm the
+        // readiness order (`ready_first_on`): fewest experts to load first,
+        // ties in row order.
+        let reordered: Option<Vec<usize>> = if groups.len() > 1 && ready_first_on() {
+            let misses: Vec<usize> = groups
+                .iter()
+                .map(|g| self.experts.group_misses(g))
+                .collect();
+            let mut order: Vec<usize> = (0..groups.len()).collect();
+            order.sort_by_key(|&i| misses[i]);
+            if order.iter().enumerate().any(|(k, &i)| k != i) {
+                READY_REORDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(order)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut ys: Vec<Option<Tensor>> = vec![None; groups.len()];
+        for k in 0..groups.len() {
+            let gi = reordered.as_ref().map_or(k, |o| o[k]);
+            let group = &groups[gi];
             let slot_ids = self.experts.ensure(group)?;
             // The later groups' misses read while this group runs.
-            if gi + 1 < groups.len() {
-                self.experts.prefetch_groups(&groups[gi + 1..])?;
+            if k + 1 < groups.len() {
+                match &reordered {
+                    None => self.experts.prefetch_groups(&groups[k + 1..])?,
+                    Some(o) => {
+                        let later: Vec<RoutedGroup> =
+                            o[k + 1..].iter().map(|&j| groups[j].clone()).collect();
+                        self.experts.prefetch_groups(&later)?
+                    }
+                }
             }
             let xg = if groups.len() == 1 {
                 x3.clone()
@@ -489,8 +564,12 @@ impl<R: ExpertResidency> MoeLayer<R> {
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);
             let h = self.routed_swiglu(&g, &u)?;
-            ys.push(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
+            ys[gi] = Some(self.experts.down(&h, &slot_ids, arm)?); // [rows, topk, hidden]
         }
+        let mut ys: Vec<Tensor> = ys
+            .into_iter()
+            .map(|y| y.expect("every group ran"))
+            .collect();
         if ys.len() == 1 {
             Ok(ys.pop().expect("one group"))
         } else {
@@ -512,9 +591,27 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// The shared expert and the combine over the routed output `y [seq,
     /// topk, hidden]` → `[b, seq, hidden]`.
     fn finish(&self, r: &PrefillRouted, y: &Tensor) -> Result<Tensor> {
+        self.finish_with(r, y, None)
+    }
+
+    /// [`Self::finish`] with the mask arm's flags (a device plan's).
+    fn finish_with(&self, r: &PrefillRouted, y: &Tensor, flags: Option<&Tensor>) -> Result<Tensor> {
         super::trace("moe.y", usize::MAX, y);
         let (shared, sh_logit) = self.shared_expert(r)?;
-        self.combine(r, y, &shared, &sh_logit)
+        self.combine(r, y, &shared, &sh_logit, flags)
+    }
+
+    /// The mask arm's flags from a device plan's record `[3·n]` (slot ids
+    /// | ids | a miss flag per plane): `[seq, topk]` u32; `None` with the
+    /// arm off.
+    fn mask_flags(&self, r: &PrefillRouted, rec: &Tensor) -> Result<Option<Tensor>> {
+        if !mask_on() {
+            return Ok(None);
+        }
+        let n = r.seq * r.topk;
+        let flags = rec.narrow(0, 2 * n, n)?.reshape((r.seq, r.topk))?;
+        MASKED_COMBINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(flags))
     }
 
     /// The shared expert — SwiGLU, gated by `sigmoid(sh_router·x)`, always
@@ -534,6 +631,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
         y: &Tensor,
         shared: &Tensor,
         sh_logit: &Tensor,
+        flags: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (x1, w, seq, hidden, topk) = (&r.x1, &r.w, r.seq, r.hidden, r.topk);
 
@@ -546,10 +644,16 @@ impl<R: ExpertResidency> MoeLayer<R> {
         } else {
             y.clone()
         };
-        let out = match super::kernels::moe_combine(&y_in, w, shared, sh_logit, topk, hidden) {
+        let out = match super::kernels::moe_combine(&y_in, w, shared, sh_logit, topk, hidden, flags)
+        {
             Some(o) => o?.to_dtype(x1.dtype())?,
             None => {
                 let y32 = y_in.to_dtype(DType::F32)?;
+                // The mask: a flagged plane's weight is zero (`1 − flag`).
+                let w = match flags {
+                    Some(f) => (w * (f.to_dtype(DType::F32)?.neg()? + 1.0)?)?,
+                    None => w.clone(),
+                };
                 let routed = y32
                     .broadcast_mul(&w.reshape((seq, topk, 1))?)?
                     .sum(1)?

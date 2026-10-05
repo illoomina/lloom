@@ -1104,7 +1104,7 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
 ) {
     let s = model.stream_stats();
     println!(
-        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} device_replays={} replay_fallbacks={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={} h1_restamps={} h2_refusals={} h3_deferred_writes={} slot_reallocations={} slot_bytes_released={}",
+        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} device_replays={} replay_fallbacks={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} io_inflight_planned={} plan_waits={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={} h1_restamps={} h2_refusals={} h3_deferred_writes={} slot_reallocations={} slot_bytes_released={} predict_landed={} predict_wasted={} ready_reorders={} masked_combines={}",
         args.loader,
         model.slots_per_layer(),
         s.plans,
@@ -1129,6 +1129,8 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
         s.io_inflight_hits,
         s.io_inflight_wasted,
         s.io_inflight_landed,
+        s.io_inflight_planned,
+        s.plan_waits,
         s.direct_loads,
         s.direct_wait_ns as f64 / 1e6,
         s.settle_loads,
@@ -1146,6 +1148,10 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
         s.h3_deferred_writes,
         s.slot_reallocations,
         s.slot_bytes_released,
+        s.predict_landed,
+        s.predict_wasted,
+        lloom::models::qwen4exp::moe::ready_reorders(),
+        lloom::models::qwen4exp::moe::masked_combines(),
     );
 }
 

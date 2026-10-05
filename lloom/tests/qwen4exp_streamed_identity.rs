@@ -163,6 +163,17 @@ fn streamed_model_is_byte_identical_to_resident() -> Result<()> {
         "{stats:?}"
     );
     assert!(stats.bytes_loaded > 0);
+    // The arm, when this binary runs under it: the chunk's groups ran in
+    // readiness order at least once (a count at 0 says the arm did not
+    // fire, and the identity above was vacuous for it).
+    if std::env::var("QWEN4EXP_READY_FIRST").is_ok_and(|v| v == "1") {
+        let n = lloom::models::qwen4exp::moe::ready_reorders();
+        assert!(
+            n > 0,
+            "QWEN4EXP_READY_FIRST=1: no tile's groups were reordered"
+        );
+        println!("READY-FIRST reorders={n}");
+    }
     std::fs::remove_file(&path).ok();
     Ok(())
 }

@@ -25,11 +25,11 @@ use lloom::nn::model::CausalLM;
 use lloom::testing::fixture::{Backend, Fixture};
 use lloom_tensor::{Device, Result, Tensor};
 
-fn stream(slots: usize) -> StreamOptions {
+fn stream(slots: usize, prefetch: bool) -> StreamOptions {
     StreamOptions {
         slots: SlotBudget::Fixed(slots),
         loader: StreamLoader::Pread,
-        prefetch: false,
+        prefetch,
         io_hints: false,
     }
 }
@@ -65,7 +65,7 @@ fn decode<R: ExpertResidency>(
     Ok((ids, rows, cache))
 }
 
-fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str) -> Result<()> {
+fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str, prefetch: bool) -> Result<()> {
     let cfg = fx.config(|_| {});
     let opts = LoadOptions::default();
     // At scale a 192-token prompt, in blocks of distinct ids: a prefill that
@@ -78,7 +78,7 @@ fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str) -> Result<()> {
     // The reference: every expert resident, or at scale the tier at twice
     // the pool. Dropped before the subject loads.
     let (want_ids, want_rows) = if fx.at_scale() {
-        let wide = fx.streamed(&cfg, dev, &opts, &stream(256))?;
+        let wide = fx.streamed(&cfg, dev, &opts, &stream(256, prefetch))?;
         let (ids, rows, _) = decode(&wide, &cfg, dev, &prompt, steps)?;
         (ids, rows)
     } else {
@@ -88,7 +88,7 @@ fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str) -> Result<()> {
     };
     // Tiny: 6 slots for 8 experts at top-2. At scale: 128 for 512 at
     // top-10. Tokens miss, settles load, passes replay.
-    let streamed = fx.streamed(&cfg, dev, &opts, &stream(fx.pick(6, 128)))?;
+    let streamed = fx.streamed(&cfg, dev, &opts, &stream(fx.pick(6, 128), prefetch))?;
     let (ids, rows, cache) = decode(&streamed, &cfg, dev, &prompt, steps)?;
     assert_eq!(ids, want_ids, "{tag}: the device-planned ids differ");
     for (t, (a, b)) in rows.iter().zip(&want_rows).enumerate() {
@@ -118,6 +118,37 @@ fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str) -> Result<()> {
         "{tag}: no token was replayed — the pool never missed: {st:?} redos {}",
         cache.redos
     );
+    // The arms, when this binary runs under them: each must have fired —
+    // a counter at 0 says the arm was not exercised, and the identity
+    // above was vacuous for it.
+    if std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device") {
+        assert!(
+            cache.device_replays > 0,
+            "{tag}: QWEN4EXP_REPLAY=device: no device-planned replay (redos {}, fallbacks {})",
+            cache.redos,
+            cache.replay_fallbacks
+        );
+    }
+    if prefetch && std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist") {
+        assert!(
+            st.predict_landed + st.predict_wasted > 0,
+            "{tag}: QWEN4EXP_PREDICT=hotlist: nothing was staged for a device plan: {st:?}"
+        );
+    }
+    if std::env::var("QWEN4EXP_MASK").is_ok_and(|v| v == "1") {
+        assert!(
+            lloom::models::qwen4exp::moe::masked_combines() > 0,
+            "{tag}: QWEN4EXP_MASK=1: no combine ran masked"
+        );
+    }
+    println!(
+        "DEVICEPLAN-ARMS {tag} device_replays={} replay_fallbacks={} predict_landed={} predict_wasted={} masked_combines={}",
+        cache.device_replays,
+        cache.replay_fallbacks,
+        st.predict_landed,
+        st.predict_wasted,
+        lloom::models::qwen4exp::moe::masked_combines()
+    );
     Ok(())
 }
 
@@ -131,7 +162,7 @@ fn device_plan_decodes_the_resident_stream_cpu() -> Result<()> {
     let Some(fx) = Fixture::<Qwen4ExpTiny>::new("qwen4exp_device_plan_cpu", Config::tiny())? else {
         return Ok(());
     };
-    check_on(&fx, &Device::Cpu, "cpu")
+    check_on(&fx, &Device::Cpu, "cpu", false)
 }
 
 #[cfg(feature = "metal")]
@@ -144,5 +175,24 @@ fn device_plan_decodes_the_resident_stream_metal() -> Result<()> {
     else {
         return Ok(());
     };
-    check_on(&fx, &dev, "metal")
+    check_on(&fx, &dev, "metal", false)
+}
+
+/// Metal, the tier with its prefetcher (the `pread` arm's reader
+/// threads): the device plan lands what was staged for it before it maps
+/// the pool (`QWEN4EXP_PREDICT=hotlist` stages the hotlist's experts for
+/// a device-planned token; the leftovers of a host plan's hint otherwise)
+/// and the stream is the resident model's still.
+#[cfg(feature = "metal")]
+#[test]
+fn device_plan_with_the_prefetcher_decodes_the_resident_stream_metal() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let Some(fx) =
+        Fixture::<Qwen4ExpTiny>::new("qwen4exp_device_plan_prefetch_metal", Config::tiny())?
+    else {
+        return Ok(());
+    };
+    check_on(&fx, &dev, "metal-prefetch", true)
 }

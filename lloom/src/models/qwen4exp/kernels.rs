@@ -896,6 +896,9 @@ pub(crate) struct MoeCombine {
     pub k: usize,
     pub d: usize,
     pub gate: Tensor,
+    /// The mask arm's flags `[.., k]` u32 (captured): a flagged plane
+    /// contributes nothing. `None`, the plain kernel.
+    pub flags: Option<Tensor>,
 }
 
 impl lloom_tensor::CustomOp3 for MoeCombine {
@@ -949,6 +952,27 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
         if gl.shape().elem_count() != rows || !gl.is_contiguous() {
             lloom_tensor::bail!("moe_combine: gate must be a contiguous [rows]")
         }
+        let fl = self.flags.as_ref().map(|f| f.storage_and_layout());
+        let flags = match &fl {
+            Some((fs, fl)) => {
+                let fs = match &**fs {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!("moe_combine: the flags must be on the metal device"),
+                };
+                if fl.shape().elem_count() != rows * self.k
+                    || !fl.is_contiguous()
+                    || fs.dtype() != lloom_tensor::DType::U32
+                {
+                    lloom_tensor::bail!(
+                        "moe_combine: flags must be a contiguous [rows, k] u32, got {:?} {:?}",
+                        fl.shape(),
+                        fs.dtype()
+                    )
+                }
+                Some(metal_bo(fs, fl))
+            }
+            None => None,
+        };
         let y_dtype = kernel_float(s1.dtype())?;
         let device = s1.device();
         let encoder = device.command_encoder()?;
@@ -972,6 +996,7 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
             metal_bo(s3, l3),
             metal_bo(gs, gl),
             &output,
+            flags,
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
@@ -1047,19 +1072,27 @@ pub(crate) fn moe_combine(
     gate: &Tensor,
     k: usize,
     d: usize,
+    flags: Option<&Tensor>,
 ) -> Option<Result<Tensor>> {
-    (fused_applies_float(y) && fused_applies(w) && fused_applies(shared) && fused_applies(gate))
-        .then(|| {
-            y.apply_op3_no_bwd(
-                w,
-                shared,
-                &MoeCombine {
-                    k,
-                    d,
-                    gate: gate.clone(),
-                },
-            )
-        })
+    (fused_applies_float(y)
+        && fused_applies(w)
+        && fused_applies(shared)
+        && fused_applies(gate)
+        && flags.map_or(true, |f| {
+            f.device().is_metal() && f.is_contiguous() && f.dtype() == lloom_tensor::DType::U32
+        }))
+    .then(|| {
+        y.apply_op3_no_bwd(
+            w,
+            shared,
+            &MoeCombine {
+                k,
+                d,
+                gate: gate.clone(),
+                flags: flags.cloned(),
+            },
+        )
+    })
 }
 
 #[cfg(all(test, feature = "metal"))]
@@ -1229,7 +1262,7 @@ mod tests {
         let w = Tensor::from_vec(vals(rows * k, 4.0, 0.3), (rows, k), &dev).unwrap();
         let shared = Tensor::from_vec(vals(rows * d, 5.0, 0.8), (rows, d), &dev).unwrap();
         let gate = Tensor::from_vec(vals(rows, 6.0, 2.0), (rows, 1), &dev).unwrap();
-        let fused = moe_combine(&y, &w, &shared, &gate, k, d)
+        let fused = moe_combine(&y, &w, &shared, &gate, k, d, None)
             .expect("metal f32")
             .unwrap();
         let routed = y
@@ -1240,6 +1273,53 @@ mod tests {
         let composed =
             (routed + shared.broadcast_mul(&ops::sigmoid(&gate).unwrap()).unwrap()).unwrap();
         close("moe_combine", &fused, &composed, 1e-5);
+    }
+
+    /// The mask arm: a flagged plane contributes nothing — the kernel with
+    /// flags equals the composed combine with those planes' weights
+    /// zeroed, and differs from the plain kernel (the flags are read, not
+    /// bound and ignored).
+    #[test]
+    fn a_flagged_plane_contributes_nothing_to_the_combine() {
+        let dev = Device::new_metal(0).unwrap();
+        let (rows, k, d) = (3usize, 10usize, 2560usize);
+        let y = Tensor::from_vec(vals(rows * k * d, 3.0, 1.0), (rows, k, d), &dev).unwrap();
+        let w = Tensor::from_vec(vals(rows * k, 4.0, 0.3), (rows, k), &dev).unwrap();
+        let shared = Tensor::from_vec(vals(rows * d, 5.0, 0.8), (rows, d), &dev).unwrap();
+        let gate = Tensor::from_vec(vals(rows, 6.0, 2.0), (rows, 1), &dev).unwrap();
+        let flags: Vec<u32> = (0..rows * k).map(|i| (i % 7 == 2) as u32).collect();
+        let flags_t = Tensor::from_vec(flags.clone(), (rows, k), &dev).unwrap();
+        let masked = moe_combine(&y, &w, &shared, &gate, k, d, Some(&flags_t))
+            .expect("metal f32")
+            .unwrap();
+        let keep: Vec<f32> = flags.iter().map(|&f| 1.0 - f as f32).collect();
+        let keep = Tensor::from_vec(keep, (rows, k), &dev).unwrap();
+        let w_masked = (&w * &keep).unwrap();
+        let routed = y
+            .broadcast_mul(&w_masked.reshape((rows, k, 1)).unwrap())
+            .unwrap()
+            .sum(1)
+            .unwrap();
+        let composed =
+            (routed + shared.broadcast_mul(&ops::sigmoid(&gate).unwrap()).unwrap()).unwrap();
+        close("moe_combine masked", &masked, &composed, 1e-5);
+        let plain = moe_combine(&y, &w, &shared, &gate, k, d, None)
+            .expect("metal f32")
+            .unwrap();
+        let diff = (&masked - &plain)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff > 1e-3,
+            "the flags were not read: max |masked - plain| = {diff}"
+        );
     }
 
     fn bits16(t: &Tensor) -> Vec<u16> {
@@ -1324,11 +1404,11 @@ mod tests {
         let w = Tensor::from_vec(vals(rows * k, 4.0, 0.3), (rows, k), &dev).unwrap();
         let shared = Tensor::from_vec(vals(rows * d, 5.0, 0.8), (rows, d), &dev).unwrap();
         let gate = Tensor::from_vec(vals(rows, 6.0, 2.0), (rows, 1), &dev).unwrap();
-        let from16 = moe_combine(&y16, &w, &shared, &gate, k, d)
+        let from16 = moe_combine(&y16, &w, &shared, &gate, k, d, None)
             .expect("metal f16 y")
             .unwrap();
         assert_eq!(from16.dtype(), lloom_tensor::DType::F32);
-        let from32 = moe_combine(&y32, &w, &shared, &gate, k, d)
+        let from32 = moe_combine(&y32, &w, &shared, &gate, k, d, None)
             .expect("metal f32 y")
             .unwrap();
         assert_eq!(bits32(&from16), bits32(&from32));

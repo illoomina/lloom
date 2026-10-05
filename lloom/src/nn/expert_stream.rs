@@ -247,6 +247,12 @@ pub trait ExpertResidency {
         Ok(None)
     }
 
+    /// How many of a host-planned group's experts are not resident now —
+    /// what `ensure` would load. 0 for a strategy with no pool.
+    fn group_misses(&self, _group: &RoutedGroup) -> usize {
+        0
+    }
+
     /// Experts loaded so far (the miss counter), 0 when nothing streams —
     /// a pass that leaves it unchanged found everything resident.
     fn misses_so_far(&self) -> u64 {
@@ -382,6 +388,16 @@ pub trait ExpertResidency {
     }
 
     fn prefetch_ids(&self, _ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stage the hotlist's experts not resident — the usage profile's
+    /// top, up to the pool — ahead of a device-planned token, so
+    /// `plan_device` can land them before the plan maps the pool (#849's
+    /// D on the device plan, the prediction the hotlist gives; the
+    /// residual-speculation hint is the host plan's today). `Resident`
+    /// has nothing to stage.
+    fn prefetch_hot(&self) -> Result<()> {
         Ok(())
     }
 
@@ -825,6 +841,11 @@ impl ResidencyMap {
         self.cache.set_inflight(SlotId(slot as u32), value)
     }
 
+    /// The largest in-flight value over the slots (0: none in flight).
+    fn inflight_max(&self) -> u64 {
+        self.cache.inflight_max()
+    }
+
     /// Slots whose expert is in flight (an `io` hint not yet waited for).
     pub fn inflight_count(&self) -> usize {
         self.cache.inflight_count()
@@ -890,6 +911,11 @@ pub struct StreamCounters {
     /// In-flight entries the host saw landed before any use waited for
     /// them (residents from then on, their use a plain hit).
     pub io_inflight_landed: AtomicU64,
+    /// The `io` arm's in-flight entries a device plan waited for on the
+    /// queue (the plan may map any of them), and the waits it encoded —
+    /// one per plan with a load pending at encode time, none otherwise.
+    pub io_inflight_planned: AtomicU64,
+    pub plan_waits: AtomicU64,
     /// Misses read straight into their slots (`pread_direct_on`), and the
     /// reader threads' time waiting for the slots' last readers' epochs.
     pub direct_loads: AtomicU64,
@@ -922,6 +948,11 @@ pub struct StreamCounters {
     /// shrinks and grows, and the bytes the shrinks released.
     pub slot_reallocations: AtomicU64,
     pub slot_bytes_released: AtomicU64,
+    /// Experts the prefetcher staged on the hotlist's prediction and a
+    /// device plan landed before mapping the pool, and those taken back
+    /// (already resident, or no slot) — `QWEN4EXP_PREDICT=hotlist`.
+    pub predict_landed: AtomicU64,
+    pub predict_wasted: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -958,6 +989,8 @@ pub struct StreamStats {
     pub io_inflight_hits: u64,
     pub io_inflight_wasted: u64,
     pub io_inflight_landed: u64,
+    pub io_inflight_planned: u64,
+    pub plan_waits: u64,
     pub direct_loads: u64,
     pub direct_wait_ns: u64,
     pub settle_loads: u64,
@@ -972,6 +1005,8 @@ pub struct StreamStats {
     pub h3_deferred_writes: u64,
     pub slot_reallocations: u64,
     pub slot_bytes_released: u64,
+    pub predict_landed: u64,
+    pub predict_wasted: u64,
 }
 
 impl StreamCounters {
@@ -994,6 +1029,8 @@ impl StreamCounters {
             io_inflight_hits: self.io_inflight_hits.load(Ordering::Relaxed),
             io_inflight_wasted: self.io_inflight_wasted.load(Ordering::Relaxed),
             io_inflight_landed: self.io_inflight_landed.load(Ordering::Relaxed),
+            io_inflight_planned: self.io_inflight_planned.load(Ordering::Relaxed),
+            plan_waits: self.plan_waits.load(Ordering::Relaxed),
             direct_loads: self.direct_loads.load(Ordering::Relaxed),
             direct_wait_ns: self.direct_wait_ns.load(Ordering::Relaxed),
             settle_loads: self.settle_loads.load(Ordering::Relaxed),
@@ -1008,6 +1045,8 @@ impl StreamCounters {
             h3_deferred_writes: self.h3_deferred_writes.load(Ordering::Relaxed),
             slot_reallocations: self.slot_reallocations.load(Ordering::Relaxed),
             slot_bytes_released: self.slot_bytes_released.load(Ordering::Relaxed),
+            predict_landed: self.predict_landed.load(Ordering::Relaxed),
+            predict_wasted: self.predict_wasted.load(Ordering::Relaxed),
         }
     }
 }
@@ -1025,6 +1064,8 @@ impl std::ops::AddAssign for StreamStats {
         self.io_inflight_hits += o.io_inflight_hits;
         self.io_inflight_wasted += o.io_inflight_wasted;
         self.io_inflight_landed += o.io_inflight_landed;
+        self.io_inflight_planned += o.io_inflight_planned;
+        self.plan_waits += o.plan_waits;
         self.direct_loads += o.direct_loads;
         self.direct_wait_ns += o.direct_wait_ns;
         self.settle_loads += o.settle_loads;
@@ -1039,6 +1080,8 @@ impl std::ops::AddAssign for StreamStats {
         self.h3_deferred_writes += o.h3_deferred_writes;
         self.slot_reallocations += o.slot_reallocations;
         self.slot_bytes_released += o.slot_bytes_released;
+        self.predict_landed += o.predict_landed;
+        self.predict_wasted += o.predict_wasted;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -2487,6 +2530,132 @@ impl Streamed {
         Ok(())
     }
 
+    /// Before a device plan on the `io` arm: the hinted loads in flight
+    /// (`issue_hint`) whose slots the plan may map. The entries landed by
+    /// now (the event past their value) need no wait; for the rest the
+    /// pass's commands wait once on the queue, for the largest value (the
+    /// queue is in order), encoded only when one is pending at encode
+    /// time (R1) — never a host wait (#849's D on the `io` arm).
+    #[cfg(feature = "metal")]
+    fn await_plan_inflight(&self, inner: &mut Inner) -> Result<()> {
+        if inner.map.inflight_count() == 0 {
+            return Ok(());
+        }
+        if let LoaderArm::Io(q) = &inner.loader {
+            let done = q.signaled();
+            let n = inner.map.settle_inflight(done);
+            self.counters
+                .io_inflight_landed
+                .fetch_add(n, Ordering::Relaxed);
+        }
+        let pending = inner.map.inflight_max();
+        if pending == 0 {
+            return Ok(());
+        }
+        self.await_inflight(inner, pending)?;
+        let n = inner.map.settle_inflight(pending);
+        self.counters
+            .io_inflight_planned
+            .fetch_add(n, Ordering::Relaxed);
+        self.counters.plan_waits.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Before a device plan: land every expert the prefetcher staged for
+    /// this tier and the pool has room for — a free slot under the
+    /// quarantine, else the LRU victim whose last reader has run, never a
+    /// slot in flight — the copies encoded here, ahead of the plan's
+    /// readers; the table told at once (no plan is open at this instant).
+    /// Staged experts already resident, or without a slot, go back to the
+    /// ring (`predict_wasted`). An arm (`QWEN4EXP_PREDICT=hotlist`): off,
+    /// nothing is staged for a device-planned token and this lands nothing.
+    #[cfg(feature = "metal")]
+    fn land_predicted(&self, inner: &mut Inner) -> Result<()> {
+        let Some(p) = &self.prefetch else {
+            return Ok(());
+        };
+        let staged = p.take(self.key);
+        if staged.is_empty() {
+            return Ok(());
+        }
+        // H2: a plan still open on this tier may map any resident slot;
+        // nothing is evicted under it (a window's plan settles after its
+        // accept) — what was staged waits in the ring for the next plan.
+        if inner.plans_open > 0 {
+            self.counters
+                .predict_wasted
+                .fetch_add(staged.len() as u64, Ordering::Relaxed);
+            p.release(staged);
+            return Ok(());
+        }
+        let tick = inner.map.tick();
+        let mut landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)> = Vec::new();
+        let mut back = Vec::new();
+        let mut installed: Vec<(u32, u32)> = Vec::new();
+        for st in staged {
+            let e = st.expert as usize;
+            if e >= self.n_experts || inner.map.slot_of(e).is_some() {
+                back.push(st);
+                continue;
+            }
+            let free = if inner.map.quarantined() {
+                inner.map.take_free()
+            } else {
+                None
+            };
+            // A free slot, an empty one, else the LRU resident — evicted
+            // only for an expert the usage profile ranks above it (the
+            // hotlist's prediction is a swap of a colder resident for a
+            // hotter one, never a displacement of what the pool holds for
+            // what it may need: the `io` hint's finding, `issue_hint`).
+            // The copy is encoded in the pass's own stream, ordered after
+            // every reader encoded before it, so the victim's last reader
+            // need not have completed.
+            let s = match free {
+                Some(s) => s,
+                None => match inner.map.victim_in(tick, true, Completed::ALL) {
+                    Some((s, evicted)) => {
+                        if evicted {
+                            let old = inner.map.expert_in(s);
+                            if inner.map.usage[old as usize] >= inner.map.usage[e] {
+                                back.push(st);
+                                continue;
+                            }
+                            debug_assert_eq!(
+                                inner.plans_open, 0,
+                                "H2: an eviction under an open plan"
+                            );
+                            inner.table_set(old, NONE);
+                            self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                        }
+                        s
+                    }
+                    None => {
+                        back.push(st);
+                        continue;
+                    }
+                },
+            };
+            inner.map.install(s, e);
+            inner.map.touch(s, tick);
+            installed.push((e as u32, s as u32));
+            landed.push((e, s, st));
+        }
+        let n = landed.len() as u64;
+        if !landed.is_empty() {
+            self.land_staged(inner, landed)?;
+            self.publish(inner, &installed, &[]);
+        }
+        self.counters.predict_landed.fetch_add(n, Ordering::Relaxed);
+        self.counters
+            .predict_wasted
+            .fetch_add(back.len() as u64, Ordering::Relaxed);
+        if !back.is_empty() {
+            p.release(back);
+        }
+        Ok(())
+    }
+
     /// Land staged experts `(expert, slot, staged)` in all three pools: the
     /// copy from each ring buffer into its slot, encoded here on the compute
     /// encoder (`QTensor::write_staged`), the ring entries stamped by it.
@@ -3386,6 +3555,11 @@ impl ExpertResidency for Streamed {
     }
 
     #[cfg(feature = "metal")]
+    fn prefetch_hot(&self) -> Result<()> {
+        self.prefetch_ids(&[])
+    }
+
+    #[cfg(feature = "metal")]
     fn prefetch_ids(&self, ids: &[u32]) -> Result<()> {
         if self.prefetch.is_none() && !self.io_hints {
             return Ok(());
@@ -3433,6 +3607,20 @@ impl ExpertResidency for Streamed {
             .as_ref()
             .map(|p| p.stats())
             .unwrap_or_default()
+    }
+
+    fn group_misses(&self, group: &RoutedGroup) -> usize {
+        let GroupIds::Host { ids, .. } = &group.ids else {
+            return 0;
+        };
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let inner = self.inner.lock();
+        distinct
+            .iter()
+            .filter(|&&e| (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none())
+            .count()
     }
 
     fn misses_so_far(&self) -> u64 {
@@ -3493,6 +3681,14 @@ impl ExpertResidency for Streamed {
             // The table outlives the pass: the tier's, rebuilt when stale.
             let _escape = escape_guard();
             let mut inner = self.inner.lock();
+            // What the prefetcher staged for this tier (the hotlist's
+            // prediction, `prefetch_hot`) lands now — the copies encoded
+            // ahead of this plan's readers on the one queue, the table
+            // told — so the pass finds them resident (#849's D).
+            #[cfg(feature = "metal")]
+            self.land_predicted(&mut inner)?;
+            #[cfg(feature = "metal")]
+            self.await_plan_inflight(&mut inner)?;
             // The pass may read any resident slot (a direct read into one
             // waits for it).
             let epoch = inner.current_epoch();
@@ -4509,6 +4705,202 @@ mod tests {
         let pf2 = pre.prefetch_stats();
         assert_eq!(pf2.issued - pf.issued, (e as u64 - resident).min(n));
         assert_eq!((pf2.used - pf2.now) + pf2.wasted, n, "{pf2:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal, the predict arm's landing (`land_predicted`, #849's D with
+    /// the hotlist's prediction): an expert the prefetcher staged for the
+    /// tier and the usage profile ranks above the LRU resident lands
+    /// before the plan maps the pool — the plan finds it resident (no
+    /// flag), the pass computes its bytes (the resident tier's output
+    /// for the token, bit for bit); a staged expert the profile ranks
+    /// below every resident one goes back to the ring, nothing evicted
+    /// for it.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_predicted_expert_lands_before_the_plan_maps_the_pool() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let mut pre = Streamed::with_staging(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Pread,
+            &dev,
+            Some(Arc::clone(&ring)),
+        )
+        .unwrap();
+        pre.set_prefetcher(Arc::new(Prefetcher::new(&m, Arc::clone(&ring))));
+        let plain = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        // The pool warm with 0..6 on the host plan — two tokens run through
+        // (usage 1 each; 3, 4, 5 used in the latest tick, so never the LRU
+        // victim; each token's slots released by its `down`).
+        let xw = x(1, d, 0.25).to_device(&dev).unwrap();
+        let _ = run(&pre, &xw, &Tensor::new(&[[0u32, 1, 2]], &dev).unwrap());
+        let _ = run(&pre, &xw, &Tensor::new(&[[3u32, 4, 5]], &dev).unwrap());
+        // The profile: expert 9 the hottest; every other missing one cold.
+        pre.inner.lock().map.usage[9] = 50;
+        // The hint stages the six missing (the pool's width); `staged`
+        // counts the warm's reads through the threads too, so from here.
+        let staged0 = pre.prefetch_stats().staged;
+        pre.prefetch_hot().unwrap();
+        let t0 = std::time::Instant::now();
+        while pre.prefetch_stats().staged < staged0 + 6 {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(20),
+                "the prefetcher staged {} of 6",
+                pre.prefetch_stats().staged - staged0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // A token wanting 9 (staged, hot) with 4 and 5 (resident): the plan
+        // lands 9 over one of 0, 1, 2 and maps every expert; the five cold
+        // staged go back.
+        let tok = Tensor::new(&[[9u32, 4, 5]], &dev).unwrap();
+        let (slots, rec) = pre.plan_device(&tok).unwrap().expect("a device plan");
+        let s = pre.stats();
+        assert_eq!((s.predict_landed, s.predict_wasted), (1, 5), "{s:?}");
+        let resident = pre.resident();
+        assert_eq!(resident.len(), 6, "{resident:?}");
+        assert!(resident.iter().any(|&r| r as usize == 9), "{resident:?}");
+        let r: Vec<u32> = rec.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(&r[3..6], &[9, 4, 5], "the record's ids: {r:?}");
+        assert_eq!(&r[6..9], &[0, 0, 0], "a landed expert is no miss: {r:?}");
+        let xs = x(1, d, 0.5).to_device(&dev).unwrap();
+        let arm = MoeArm::for_rows(1);
+        let (gt, u) = pre.gate_up(&xs, &slots, arm, xs.dtype()).unwrap();
+        let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
+        let y = pre
+            .down(&h, &slots, arm)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(!pre.settle(&rec).unwrap(), "nothing to settle");
+        assert_eq!(
+            y,
+            run(&plain, &xs, &tok),
+            "the landed expert's bytes differ from the resident tier's"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal, the `io` arm under a device plan (#849's D on that arm): a
+    /// hint's loads in flight when the plan is made are waited for once on
+    /// the queue — a wait encoded for the largest value, every entry
+    /// settled by it (`plan_waits`, `io_inflight_planned`) — and the pass
+    /// computes the landed bytes (the resident tier's output, bit for bit).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_device_plan_waits_once_for_the_io_arms_loads_in_flight() {
+        use lloom_tensor::kernels::metal::io_queue::IoQueue;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let queue = Arc::new(IoQueue::new(m.device()).unwrap());
+        let mut io = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Io(Arc::clone(&queue)),
+            &dev,
+        )
+        .unwrap();
+        io.set_io_hints(true);
+        let plain = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        // The GPU held busy ahead of the hint: the IO loads are ordered after
+        // the compute encoded so far (`IoQueue::issue`), so they are pending
+        // when the plan is made — the wait is required, and a plan without
+        // it reads the slots before the bytes land.
+        let a = Tensor::ones((2048, 2048), DType::F32, &dev).unwrap();
+        let mut busy = a.clone();
+        for _ in 0..6 {
+            busy = busy.matmul(&a).unwrap();
+        }
+        // The hint, named (no fill from the profile): 9 and 10 take empty
+        // slots and load on the IO queue; in flight until a use waits.
+        io.prefetch_named(&[9, 10]).unwrap();
+        assert_eq!(io.inflight_count(), 2, "{:?}", io.stats());
+        // The device plan for a token wanting 9 and 10: the wait encoded
+        // once, both entries settled by it, no miss flagged.
+        let tok = Tensor::new(&[[9u32, 10, 9]], &dev).unwrap();
+        let (slots, rec) = io.plan_device(&tok).unwrap().expect("a device plan");
+        let s = io.stats();
+        assert_eq!(io.inflight_count(), 0, "{s:?}");
+        assert_eq!(s.io_inflight_planned + s.io_inflight_landed, 2, "{s:?}");
+        assert_eq!(
+            s.plan_waits,
+            (s.io_inflight_planned > 0) as u64,
+            "a wait iff a load was pending: {s:?}"
+        );
+        assert!(
+            s.io_inflight_planned > 0,
+            "the loads landed before the plan was made (the GPU was not held busy): {s:?}"
+        );
+        drop(busy);
+        let r: Vec<u32> = rec.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(&r[6..9], &[0, 0, 0], "a hinted expert is no miss: {r:?}");
+        let xs = x(1, d, 0.5).to_device(&dev).unwrap();
+        let arm = MoeArm::for_rows(1);
+        let (gt, u) = io.gate_up(&xs, &slots, arm, xs.dtype()).unwrap();
+        let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
+        let y = io
+            .down(&h, &slots, arm)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(!io.settle(&rec).unwrap(), "nothing to settle");
+        assert_eq!(
+            y,
+            run(&plain, &xs, &tok),
+            "the hinted experts' bytes differ from the resident tier's"
+        );
+        // A second plan with nothing in flight encodes no wait (R1).
+        let tok2 = Tensor::new(&[[9u32, 10, 10]], &dev).unwrap();
+        let (_, rec2) = io.plan_device(&tok2).unwrap().expect("a device plan");
+        assert_eq!(io.stats().plan_waits, 1, "{:?}", io.stats());
+        assert!(!io.settle(&rec2).unwrap());
         std::fs::remove_file(path).ok();
     }
 

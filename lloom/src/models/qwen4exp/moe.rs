@@ -91,6 +91,10 @@ pub struct MoeLayer<R: ExpertResidency> {
     /// Shared-expert gate `hidden -> 1` (`ffn_gate_inp_shexp`).
     sh_router: QMatMul,
     n_experts_per_tok: usize,
+    /// The routed experts' count and intermediate width, which the residency
+    /// does not expose (the walk reads them here).
+    n_experts: usize,
+    moe_intermediate_size: usize,
     /// The last routing's ids, under the hint-recall probe (see `probe_ids`).
     probe_ids: std::sync::Arc<parking_lot::Mutex<Option<Tensor>>>,
     /// The activation dtype of the routed dispatch — its `(activation, f32,
@@ -127,6 +131,8 @@ impl<R: ExpertResidency> MoeLayer<R> {
             sh_down,
             sh_router,
             n_experts_per_tok: cfg.n_experts_per_tok,
+            n_experts: cfg.n_experts,
+            moe_intermediate_size: cfg.moe_intermediate_size,
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
             f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
@@ -602,6 +608,92 @@ pub struct PrefillRouted {
 }
 
 /// SwiGLU: `down( silu(gate(x)) * up(x) )`.
+/// One position's MoE at a decode step ([`MoeLayer::decode_planned_with`]):
+/// the router, the fused top-k, the device plan's slot map when the
+/// residency plans on the device (and the pass's plan is armed: a cold
+/// pass's host plan reads the ids back instead), gate|up in one routed
+/// launch, the routed
+/// SwiGLU, the routed down, the shared expert (its two stems, its SwiGLU,
+/// its down, its gate's logit), the combine. `In` is the bracket's output.
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
+    type In = crate::optimizer::NodeId;
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, x: Self::In) -> Self::Out {
+        use crate::optimizer::{Dim, Shape};
+        let f32 = DType::F32;
+        let h = match w.node(x).shape.last() {
+            Some(Dim::Const(h)) => h,
+            _ => unreachable!("a decode step's input has a constant width"),
+        };
+        let topk = self.n_experts_per_tok;
+        let (e, mi) = (self.n_experts, self.moe_intermediate_size);
+        let x1 = w.view("reshape", x, Shape::of(&[1, h]));
+        let logits = w.project_qmat("ffn_gate_inp.weight", &self.router, x1);
+        // The ids and their weights, one launch.
+        let route = w.opaque("moe_topk", &[logits], Shape::of(&[1, topk]), f32);
+        let act = self.tile_act(1);
+        let x3 = if act != f32 && !self.folds(f32, act) {
+            w.opaque("cast_f32_f16", &[x1], Shape::of(&[1, h]), act)
+        } else {
+            x1
+        };
+        let x3 = w.view("reshape", x3, Shape::of(&[1, 1, h]));
+        // The device plan's slot map writes its record into the tier's
+        // host-read slot in place (`Streamed::plan_device`): one launch.
+        let slots = if self.experts.plans_on_device() {
+            let plan = w.opaque("moe_slot_map", &[route], Shape::of(&[3 * topk]), DType::U32);
+            w.view("narrow", plan, Shape::of(&[1, topk]))
+        } else {
+            route
+        };
+        let wg = w.weight("ffn_gate_exps.weight", Shape::of(&[e, mi, h]), DType::U8);
+        let wu = w.weight("ffn_up_exps.weight", Shape::of(&[e, mi, h]), DType::U8);
+        let wd = w.weight("ffn_down_exps.weight", Shape::of(&[e, h, mi]), DType::U8);
+        let gu = w.opaque(
+            "mul_mv_id2",
+            &[wg, wu, x3, slots],
+            Shape::of(&[2, 1, topk, mi]),
+            act,
+        );
+        let g = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
+        let u = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
+        let hmid = if act != DType::F16 || self.f16_fuse {
+            w.opaque("silu_mul", &[g, u], Shape::of(&[1, topk, mi]), act)
+        } else {
+            let s = w.silu(g);
+            w.mul(s, u)
+        };
+        let y = w.opaque(
+            "mul_mv_id",
+            &[wd, hmid, slots],
+            Shape::of(&[1, topk, h]),
+            act,
+        );
+        let y = if act == DType::F16 && !self.f16_fuse {
+            w.opaque("cast_f16_f32", &[y], Shape::of(&[1, topk, h]), f32)
+        } else {
+            y
+        };
+        let sg = w.project_qmat("ffn_gate_shexp.weight", &self.sh_gate, x1);
+        let su = w.project_qmat("ffn_up_shexp.weight", &self.sh_up, x1);
+        let si = match w.node(sg).shape.last() {
+            Some(Dim::Const(n)) => n,
+            _ => unreachable!(),
+        };
+        let sm = w.opaque("silu_mul", &[sg, su], Shape::of(&[1, si]), f32);
+        let shared = w.project_qmat("ffn_down_shexp.weight", &self.sh_down, sm);
+        let sh_logit = w.project_qmat("ffn_gate_inp_shexp.weight", &self.sh_router, x1);
+        let out = w.opaque(
+            "moe_combine",
+            &[y, route, shared, sh_logit],
+            Shape::of(&[1, h]),
+            f32,
+        );
+        w.view("reshape", out, Shape::of(&[1, 1, h]))
+    }
+}
+
 fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul) -> Result<Tensor> {
     let g = gate.forward(x)?;
     let u = up.forward(x)?;

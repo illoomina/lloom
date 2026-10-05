@@ -20,6 +20,8 @@ use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::optimizer::Visit as _;
 #[cfg(feature = "metal")]
 use lloom_tensor::metal_backend::{PassKey, PassKind, PassOpener};
 use lloom_tensor::quantized::QMatMul;
@@ -305,6 +307,33 @@ impl<R: ExpertResidency> Layer<R> {
     ) -> Result<Tensor> {
         trace("moe", l, moe_out);
         self.hc_ffn.combine(res_hc, moe_out, inject)
+    }
+}
+
+/// One layer's decode step ([`Layer::decode_parts_rows_with`]): the attn
+/// bracket's prologue, the mixer, its combine; the ffn bracket's prologue,
+/// the MoE, its combine. `In` is the carry, the layer and the KV store's
+/// precision.
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> crate::optimizer::Visit for Layer<R> {
+    type In = (crate::optimizer::NodeId, usize, crate::nn::ops::KvPrecision);
+    type Out = crate::optimizer::NodeId;
+    fn visit(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        (carry, l, precision): Self::In,
+    ) -> Self::Out {
+        let (cur, inject) = self.hc_attn.visit(w, (carry, "hc_attn", true));
+        let inject = inject.expect("the injection was asked for");
+        let mixed = match &self.mixer {
+            Mixer::Linear(dn) => dn.visit(w, (cur, l)),
+            Mixer::Full(qsa) => qsa.visit(w, (cur, l, precision)),
+        };
+        let carry = self.hc_attn.visit_combine(w, carry, mixed, inject);
+        let (cur, inject) = self.hc_ffn.visit(w, (carry, "hc_ffn", true));
+        let moe = self.moe.visit(w, cur);
+        let inject = inject.expect("the injection was asked for");
+        self.hc_ffn.visit_combine(w, carry, moe, inject)
     }
 }
 
@@ -1101,6 +1130,8 @@ pub struct Qwen4Exp<R: ExpertResidency> {
             Option<lloom_tensor::kernels::metal::Epoch>,
         )>,
     >,
+    /// What `qwen4exp.fusion = derived` decided at load (`derive_fusion`).
+    fusion_report: Option<String>,
     cfg: Config,
 }
 
@@ -1137,12 +1168,14 @@ impl MemCheck {
     /// (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`, DESIGN §7.1a).
     pub fn from_env() -> Self {
         static ARM: std::sync::OnceLock<MemCheck> = std::sync::OnceLock::new();
-        *ARM.get_or_init(|| match crate::tuning::tuning().qwen4exp.mem_check.as_str() {
-            "off" => MemCheck::Off,
-            "report" => MemCheck::Report,
-            // `refuse`; the parser (`tuning.rs`) refused anything else.
-            _ => MemCheck::Refuse,
-        })
+        *ARM.get_or_init(
+            || match crate::tuning::tuning().qwen4exp.mem_check.as_str() {
+                "off" => MemCheck::Off,
+                "report" => MemCheck::Report,
+                // `refuse`; the parser (`tuning.rs`) refused anything else.
+                _ => MemCheck::Refuse,
+            },
+        )
     }
 }
 
@@ -1215,8 +1248,103 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             replay_h: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
             ple_rows: parking_lot::Mutex::new(None),
+            fusion_report: None,
             cfg,
         }
+    }
+
+    /// `qwen4exp.fusion = derived`: the optimizer's plan over the walk of the
+    /// model as built (`optimizer::walk`), set on the brackets it decides —
+    /// whether each bracket's down and up projections carry their activation
+    /// at the store. Once, at load; the forward reads the bracket's flags as
+    /// it did. Returns the report line.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn derive_fusion(&mut self) -> Result<String> {
+        self.derive_fusion_with(&crate::optimizer::Policy::default())
+    }
+
+    /// [`Self::derive_fusion`] under `policy` (a test's exclusions).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn derive_fusion_with(&mut self, policy: &crate::optimizer::Policy) -> Result<String> {
+        if super::kernels::hc_mix_on() {
+            lloom_tensor::bail!(
+                "qwen4exp fusion=derived with qwen4exp.hc_mix: the pair kernels replace the \
+                 brackets' projections, and the walk describes the brackets"
+            )
+        }
+        if super::kernels::fused_off() {
+            lloom_tensor::bail!(
+                "qwen4exp fusion=derived with qwen4exp.fused_off: the walk describes the fused \
+                 launches, not the composed step"
+            )
+        }
+        let graph = crate::optimizer::walk(&*self);
+        let d = crate::optimizer::derive(&graph, policy)?;
+        let sites = &d.plan.sites;
+        for (site, fragment) in sites {
+            let known = (fragment == "mixed_silu" && site.ends_with("_down.weight"))
+                || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"));
+            if !known {
+                lloom_tensor::bail!(
+                    "qwen4exp fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site \
+                     no bracket flag selects; plan: {}",
+                    d.plan
+                )
+            }
+        }
+        let fused =
+            |site: &str, fragment: &str| sites.get(site).map(String::as_str) == Some(fragment);
+        let set = |hc: &mut HyperConnection, p: &str| {
+            hc.set_epilogues(
+                fused(&format!("{p}_down.weight"), "mixed_silu"),
+                fused(&format!("{p}_up.weight"), "mixed_sigmoid"),
+            )
+        };
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            set(&mut layer.hc_attn, &format!("blk.{l}.hc_attn"));
+            set(&mut layer.hc_ffn, &format!("blk.{l}.hc_ffn"));
+        }
+        set(&mut self.hc_head, "output_hc");
+        let refused: Vec<String> = d
+            .refused
+            .iter()
+            .map(|(f, why)| format!("{f}: {why}"))
+            .collect();
+        let unvalidated: Vec<String> = policy
+            .unvalidated_in(&graph)
+            .into_iter()
+            .map(|(f, why)| format!("{f}: {why}"))
+            .collect();
+        let line = format!(
+            "qwen4exp fusion=derived: {} ({} refused{}{}; {} unvalidated{}{})",
+            d.plan,
+            refused.len(),
+            if refused.is_empty() { "" } else { ": " },
+            refused.join("; "),
+            unvalidated.len(),
+            if unvalidated.is_empty() { "" } else { ": " },
+            unvalidated.join("; "),
+        );
+        self.fusion_report = Some(line.clone());
+        Ok(line)
+    }
+
+    /// What `qwen4exp.fusion = derived` decided at load; `None` under `manual`.
+    pub fn fusion_report(&self) -> Option<&str> {
+        self.fusion_report.as_deref()
+    }
+
+    /// Every bracket's `(down, up)` epilogue arms
+    /// ([`HyperConnection::epilogues`]): each layer's attn and ffn brackets in
+    /// order, then the head's.
+    pub fn bracket_epilogues(&self) -> Vec<(bool, bool)> {
+        let mut out: Vec<(bool, bool)> = self
+            .layers
+            .iter()
+            .flat_map(|l| [l.hc_attn.epilogues(), l.hc_ffn.epilogues()])
+            .collect();
+        out.push(self.hc_head.epilogues());
+        out
     }
 
     /// Select the prefill prefetch hint (see the `spec_ahead` field).
@@ -2883,6 +3011,47 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     #[allow(dead_code)]
     fn _uses_d() -> D {
         D::Minus1
+    }
+}
+
+/// The decode step's IR (`optimizer::walk`): the token's row gather, the
+/// carry's expansion over the streams, the N-gram PLE at its layer, every
+/// layer, the head bracket's collapse and `lm_head` — what one position of
+/// [`Qwen4Exp::decode_embed`] dispatches on Metal, with the device plan
+/// armed where the residency plans on the device. The decode loop's argmax
+/// is the driver's, not the model's.
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> crate::optimizer::Visit for Qwen4Exp<R> {
+    type In = ();
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
+        use crate::optimizer::Shape;
+        use lloom_tensor::DType;
+        let (n, d, vocab) = (self.cfg.hc_count, self.cfg.hidden_size, self.cfg.vocab_size);
+        let ids = w.input("input_ids", Shape::of(&[1, 1]), DType::U32);
+        let (_, table, dt) = crate::optimizer::walk::qmat_operand(&self.embed_tokens);
+        let table = w.weight("token_embd.weight", table, dt);
+        let h = w.opaque("get_rows", &[table, ids], Shape::of(&[1, 1, d]), DType::F32);
+        // `broadcast_as((1, 1, n, d)).reshape(..)`: one strided copy.
+        let mut carry = w.opaque(
+            "copy_f32_strided",
+            &[h],
+            Shape::of(&[1, 1, n * d]),
+            DType::F32,
+        );
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(ple) = self.ple.as_ref().filter(|p| p.layer == l) {
+                let delta = w.scoped(format!("blk.{l}"), |w| ple.block.visit(w, (carry, l)));
+                carry = w.add(carry, delta);
+            }
+            let precision = self.cfg.kv_precision;
+            carry = w.scoped(format!("blk.{l}"), |w| {
+                layer.visit(w, (carry, l, precision))
+            });
+        }
+        let (collapsed, _) = self.hc_head.visit(w, (carry, "output_hc", false));
+        let logits = w.project_qmat("output.weight", &self.lm_head, collapsed);
+        w.view("reshape", logits, Shape::of(&[1, vocab]))
     }
 }
 

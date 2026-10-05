@@ -1720,7 +1720,11 @@ impl QsaAttention {
                 )?
                 .reshape((1, 1, n, n_kv))?
                 .broadcast_as((1, nh, n, n_kv))?;
-            let q_t = q.narrow(0, t0, n)?.transpose(0, 1)?.contiguous()?.unsqueeze(0)?; // [1, nh, n, hd]
+            let q_t = q
+                .narrow(0, t0, n)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .unsqueeze(0)?; // [1, nh, n, hd]
             let ctx = ops::sdpa(
                 &q_t,
                 &k_all.unsqueeze(0)?,
@@ -2612,6 +2616,145 @@ fn causal_mask(
         }
     }
     Tensor::from_vec(m, (seq, kv_len), dev)
+}
+
+/// A full-attention layer's decode step ([`QsaAttention::decode_rows`]'s
+/// launches at one row, inside the indexer's dense range, no block
+/// completing): the input stems as the loader stacked them, the prologue
+/// (norms and partial rope), the append at the store's precision, the
+/// indexer's key projection and its append, the attention, the output gate,
+/// the output projection. The cache, the appends and the attention over
+/// `kv_len` are layer `l`'s KV recurrence. `In` is the bracket's output, the
+/// layer, and the KV store's precision (the cache's, which the model knows).
+///
+/// Not walked: the step that completes an indexer block (every `ratio`-th
+/// position: the pooled keys' norm, rope and append), the step past the
+/// dense range (the selection), and the two-pass attention past
+/// `sdpa_vector`'s single-pass length — each adds launches at a position.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for QsaAttention {
+    type In = (crate::optimizer::NodeId, usize, KvPrecision);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (x, l, precision): Self::In) -> Self::Out {
+        use crate::optimizer::{Dim, Region, Shape};
+        let f32 = DType::F32;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let h = match w.node(x).shape.last() {
+            Some(Dim::Const(h)) => h,
+            _ => unreachable!("a decode step's input has a constant width"),
+        };
+        let (nq, nk) = (nh * 2 * hd, nkv * hd);
+        let xb = w.view("reshape", x, Shape::of(&[1, h]));
+        let (qg, k, v) = match &self.stem_cat {
+            Some(cat) => {
+                let all = w.project_qmat("attn_q.weight+attn_k.weight+attn_v.weight", cat, xb);
+                (
+                    w.view("narrow", all, Shape::of(&[1, nq])),
+                    w.view("narrow", all, Shape::of(&[1, nk])),
+                    w.view("narrow", all, Shape::of(&[1, nk])),
+                )
+            }
+            None => (
+                w.project_qmat("attn_q.weight", &self.wq, xb),
+                w.project_qmat("attn_k.weight", &self.wk, xb),
+                w.project_qmat("attn_v.weight", &self.wv, xb),
+            ),
+        };
+        let qg = w.view("reshape", qg, Shape::of(&[nh, 2 * hd]));
+        let k = w.view("reshape", k, Shape::of(&[nkv, hd]));
+        let v = w.view("reshape", v, Shape::of(&[nkv, 1, hd]));
+        let qn = self.q_norm.weight();
+        let kn = self.k_norm.weight();
+        let qn = w.weight("attn_q_norm.weight", Shape::of(qn.dims()), qn.dtype());
+        let kn = w.weight("attn_k_norm.weight", Shape::of(kn.dims()), kn.dtype());
+        let prep = w.opaque(
+            "qsa_prep",
+            &[qg, k, qn, kn],
+            Shape::of(&[2 * nh + nkv, hd]),
+            f32,
+        );
+        let q = w.view("narrow", prep, Shape::of(&[nh, hd]));
+        let gate = w.view("narrow", prep, Shape::of(&[nh, hd]));
+        let k_step = w.view("narrow", prep, Shape::of(&[nkv, 1, hd]));
+        let cache = || Shape(vec![Dim::Const(nkv), Dim::Sym("kv_len"), Dim::Const(hd)]);
+        let mut ring = Vec::new();
+        let (k_all, v_all) = match precision.dense_dtype() {
+            Some(dt) => {
+                let shape = cache();
+                let kc = w.input(&format!("qsa.k@{l}"), shape.clone(), dt);
+                let vc = w.input(&format!("qsa.v@{l}"), shape.clone(), dt);
+                let (copy, cast_in, cast_out) = if dt == f32 {
+                    ("copy2d_f32", None, None)
+                } else {
+                    ("copy2d_f16", Some("cast_f32_f16"), Some("cast_f16_f32"))
+                };
+                let (mut ks, mut vs) = (k_step, v);
+                if let Some(c) = cast_in {
+                    ks = w.opaque(c, &[ks], Shape::of(&[nkv, 1, hd]), dt);
+                    vs = w.opaque(c, &[vs], Shape::of(&[nkv, 1, hd]), dt);
+                    ring.extend([ks, vs]);
+                }
+                let mut ka = w.opaque(copy, &[ks, kc], shape.clone(), dt);
+                let mut va = w.opaque(copy, &[vs, vc], shape.clone(), dt);
+                ring.extend([kc, vc, ka, va]);
+                if let Some(c) = cast_out {
+                    ka = w.opaque(c, &[ka], shape.clone(), f32);
+                    va = w.opaque(c, &[va], shape, f32);
+                    ring.extend([ka, va]);
+                }
+                (ka, va)
+            }
+            // A quantized store's append and its read are its own kernels,
+            // named here from the arm and reconciled against no trace.
+            None => {
+                let shape = cache();
+                let store = w.input(&format!("qsa.kv@{l}"), shape.clone(), DType::U8);
+                let appended = w.opaque("kv_quant_append", &[k_step, v, store], shape, DType::U8);
+                ring.extend([store, appended]);
+                (appended, appended)
+            }
+        };
+        if let Some(ix) = &self.indexer {
+            let k_raw = w.project_qmat("indexer.k_proj.weight", &ix.k_proj, xb);
+            let k_raw = w.view("reshape", k_raw, Shape::of(&[1, 1, ix.head_dim]));
+            let raw = w.input(
+                &format!("qsa.indexer_keys@{l}"),
+                Shape(vec![
+                    Dim::Const(1),
+                    Dim::Sym("kv_len"),
+                    Dim::Const(ix.head_dim),
+                ]),
+                f32,
+            );
+            let appended = w.opaque(
+                "copy2d_f32",
+                &[k_raw, raw],
+                Shape(vec![
+                    Dim::Const(1),
+                    Dim::Sym("kv_len"),
+                    Dim::Const(ix.head_dim),
+                ]),
+                f32,
+            );
+            // Read by a later step's selection, not by this one.
+            w.state_out(appended);
+            ring.extend([raw, appended]);
+        }
+        let qv = w.view("reshape", q, Shape::of(&[1, nh, 1, hd]));
+        let kernel = if precision.dense_dtype().is_some() {
+            "sdpa_vector"
+        } else {
+            "sdpa_quant"
+        };
+        let ctx = w.opaque(kernel, &[qv, k_all, v_all], Shape::of(&[1, nh, 1, hd]), f32);
+        ring.push(ctx);
+        w.mark(&ring, Region::Kv(l));
+        let ctx = w.view("reshape", ctx, Shape::of(&[1, nh * hd]));
+        let gate = w.view("reshape", gate, Shape::of(&[1, nh * hd]));
+        let gated = w.opaque("sigmoid_mul", &[gate, ctx], Shape::of(&[1, nh * hd]), f32);
+        let out = w.project_qmat("attn_output.weight", &self.wo, gated);
+        w.view("reshape", out, Shape::of(&[1, 1, h]))
+    }
 }
 
 #[cfg(test)]

@@ -201,6 +201,9 @@ struct Gguf<'a, R: Read + Seek> {
     /// Keep float matrices f32 (`QMatMul::Tensor`) rather than f16 stems:
     /// the CPU reference's precision ([`Qwen4Exp::from_gguf_reference`]).
     dense_f32: bool,
+    /// Read no data: every tensor a ghost of its header's kind and shape
+    /// ([`Qwen4Exp::ghost_of_manifest`]), a model to walk, never to run.
+    ghost: bool,
     /// Every tensor read, for the schema's debug check (`build`).
     #[cfg(debug_assertions)]
     read: std::cell::RefCell<std::collections::BTreeSet<String>>,
@@ -221,6 +224,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             index,
             device: device.clone(),
             dense_f32: false,
+            ghost: false,
             #[cfg(debug_assertions)]
             read: Default::default(),
         })
@@ -240,7 +244,18 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
         self.read.borrow_mut().insert(name.to_string());
         let device = self.device.clone();
         let s = &mut self.shards[i];
+        if self.ghost {
+            // One block of storage under the header's kind and shape.
+            let ti = &s.content.tensor_infos[name];
+            return QTensor::ghost(ti.shape.clone(), ti.ggml_dtype, &device);
+        }
         s.content.tensor(s.reader, name, &device)
+    }
+
+    /// A ghost dense matrix at `dtype` of the header's shape.
+    fn ghost_dense(&mut self, name: &str, dtype: lloom_tensor::DType) -> Result<Tensor> {
+        let shape = self.qtensor(name)?.shape().clone();
+        crate::testing::ghost::tensor(shape, dtype, &self.device)
     }
     /// Every tensor of every shard, `(name, shape)`.
     fn table(&self) -> impl Iterator<Item = (&str, &[usize])> {
@@ -276,6 +291,18 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     /// A matrix as the matmul operand: quantized types stay packed; BF16/F16/
     /// F32 become f16 tensors (dense f16 GEMV, f32 accumulate — §8.1.4).
     fn qmat(&mut self, name: &str) -> Result<QMatMul> {
+        if self.ghost {
+            let dtype = self.shards[self.shard_of(name)?].content.tensor_infos[name].ggml_dtype;
+            return match dtype {
+                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 if self.dense_f32 => Ok(
+                    QMatMul::Tensor(self.ghost_dense(name, lloom_tensor::DType::F32)?),
+                ),
+                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => Ok(QMatMul::TensorF16(
+                    self.ghost_dense(name, lloom_tensor::DType::F16)?,
+                )),
+                _ => Ok(QMatMul::QTensor(Arc::new(self.qtensor(name)?))),
+            };
+        }
         let qt = self.qtensor(name)?;
         match qt.dtype() {
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 if self.dense_f32 => {
@@ -333,6 +360,9 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     /// An f32 vector/tensor (norm weights, conv, SSM scalars).
     fn f32(&mut self, name: &str) -> Result<Tensor> {
+        if self.ghost {
+            return self.ghost_dense(name, lloom_tensor::DType::F32);
+        }
         let qt = self.qtensor(name)?;
         qt.dequantize(&self.device)
     }
@@ -966,6 +996,69 @@ impl Qwen4Exp<Resident> {
     }
 }
 
+impl<R: ExpertResidency> Qwen4Exp<R> {
+    /// The model a checkpoint's headers describe, built by the loader's own
+    /// assembly with every tensor a ghost (`testing::ghost`): the stacks,
+    /// the brackets, the PLE, the kinds each stem is stored as — the
+    /// structure a walk reads — and none of the values. `experts(l)` is
+    /// layer `l`'s residency. Walked, never run.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ghost_of_manifest(
+        manifest: &crate::testing::scale::ShapeManifest,
+        device: &Device,
+        opts: &LoadOptions,
+        mut experts: impl FnMut(usize) -> R,
+    ) -> Result<Self> {
+        use lloom_tensor::quantized::gguf_file::{TensorInfo, VersionedMagic};
+        let contents: Vec<Content> = manifest
+            .shards
+            .iter()
+            .map(|s| Content {
+                magic: VersionedMagic::GgufV3,
+                metadata: s.metadata.iter().cloned().collect(),
+                tensor_infos: s
+                    .tensors
+                    .iter()
+                    .map(|t| {
+                        (
+                            t.name.clone(),
+                            TensorInfo {
+                                ggml_dtype: t.dtype,
+                                shape: lloom_tensor::Shape::from(t.dims.clone()),
+                                offset: t.offset,
+                            },
+                        )
+                    })
+                    .collect(),
+                tensor_data_offset: 0,
+            })
+            .collect();
+        let mut readers: Vec<std::io::Cursor<Vec<u8>>> = contents
+            .iter()
+            .map(|_| std::io::Cursor::new(Vec::new()))
+            .collect();
+        let shards = contents
+            .into_iter()
+            .zip(readers.iter_mut())
+            .map(|(content, reader)| Shard {
+                content,
+                reader,
+                path: None,
+            })
+            .collect();
+        let mut gg = Gguf::new(shards, device)?;
+        gg.ghost = true;
+        build(&mut gg, device, opts, |gg, l| {
+            // The stacks are the residency's to hold; read as the loader's
+            // paths read them, so the schema's check sees every tensor.
+            for part in ["gate", "up", "down"] {
+                gg.packed(&format!("blk.{l}.ffn_{part}_exps.weight"))?;
+            }
+            Ok(experts(l))
+        })
+    }
+}
+
 impl Qwen4Exp<Streamed> {
     /// Load from a sharded checkpoint with the routed experts streamed from the
     /// shards into a per-layer slot pool (`stream.slots` experts per
@@ -1209,21 +1302,27 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
             cfg.ple_ngram_size,
             eps,
         )?;
-        let table_path: PathBuf = match &opts.ple_shard {
-            Some(p) => p.clone(),
-            None => gg.locate("per_layer_token_embd.weight")?.1.to_path_buf(),
-        };
-        let table = MmapPleTable::open(&table_path)?;
-        if table.rows() < hash.total_rows() as usize {
-            lloom_tensor::bail!(
-                "ple table has {} rows, the hash needs {}",
-                table.rows(),
-                hash.total_rows()
+        let table = if gg.ghost {
+            PleTable::Dense(
+                gg.ghost_dense("per_layer_token_embd.weight", lloom_tensor::DType::F32)?,
             )
-        }
-        let table = match opts.ple_cache_rows {
-            Some(rows) => PleTable::Cached(CachedPleTable::new(table, rows)?),
-            None => PleTable::Mmap(table),
+        } else {
+            let table_path: PathBuf = match &opts.ple_shard {
+                Some(p) => p.clone(),
+                None => gg.locate("per_layer_token_embd.weight")?.1.to_path_buf(),
+            };
+            let table = MmapPleTable::open(&table_path)?;
+            if table.rows() < hash.total_rows() as usize {
+                lloom_tensor::bail!(
+                    "ple table has {} rows, the hash needs {}",
+                    table.rows(),
+                    hash.total_rows()
+                )
+            }
+            match opts.ple_cache_rows {
+                Some(rows) => PleTable::Cached(CachedPleTable::new(table, rows)?),
+                None => PleTable::Mmap(table),
+            }
         };
         model.set_ple(l, hash, table, block)?;
     }
@@ -1234,6 +1333,13 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
             "the tensor schema lists `{}`, which the loader never read",
             t.name
         );
+    }
+    // The optimizer decides the brackets' epilogues over the model as
+    // built, once (`qwen4exp.fusion = derived`); `manual` leaves them on.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::tuning::tuning().qwen4exp.fusion == "derived" {
+        let line = model.derive_fusion()?;
+        eprintln!("{line}");
     }
     Ok(model)
 }

@@ -382,7 +382,11 @@ impl lloom_tensor::CustomOp1 for HcMixB {
         }
         let rows = total / per_row;
         if self.w_up.dims2()? != (nd, self.lr) {
-            lloom_tensor::bail!("hc_mix_b: w_up {:?} vs [{nd}, {}]", self.w_up.shape(), self.lr)
+            lloom_tensor::bail!(
+                "hc_mix_b: w_up {:?} vs [{nd}, {}]",
+                self.w_up.shape(),
+                self.lr
+            )
         }
         let (us, ul) = metal_weight(&self.w_up, "hc_mix_b")?;
         let device = s.device();
@@ -422,7 +426,7 @@ impl lloom_tensor::CustomOp1 for HcMixB {
 /// runs the bracket's 13 MB near bandwidth and the fused dots do not
 /// (306 / 340 GB/s against 520 in the bench). Kept as the arm the next
 /// kernel cut is measured against.
-fn hc_mix_on() -> bool {
+pub(crate) fn hc_mix_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.hc_mix)
 }
@@ -522,7 +526,10 @@ pub(crate) fn hc_mix_pair(
     {
         return None;
     }
-    if !gamma.is_contiguous() || gamma.elem_count() != nd || gamma.dtype() != lloom_tensor::DType::F32 {
+    if !gamma.is_contiguous()
+        || gamma.elem_count() != nd
+        || gamma.dtype() != lloom_tensor::DType::F32
+    {
         return None;
     }
     Some((|| {
@@ -786,7 +793,9 @@ impl lloom_tensor::CustomOp1 for MoeTopk {
                 let (is, il) = t.storage_and_layout();
                 let is = match &*is {
                     lloom_tensor::Storage::Metal(m) => m,
-                    _ => lloom_tensor::bail!("moe_topk: the ids output must be on the metal device"),
+                    _ => {
+                        lloom_tensor::bail!("moe_topk: the ids output must be on the metal device")
+                    }
                 };
                 if il.shape().elem_count() != elem_count
                     || !il.is_contiguous()
@@ -1017,7 +1026,8 @@ pub(crate) fn moe_topk_into(
         // SAFETY: every element is written by the kernel before any read;
         // the Metal arm refuses a `w` that is not a fresh contiguous
         // `[rows, k]`, and the CPU arm never takes this path.
-        let w = unsafe { Tensor::empty(dims.as_slice(), lloom_tensor::DType::F32, logits.device())? };
+        let w =
+            unsafe { Tensor::empty(dims.as_slice(), lloom_tensor::DType::F32, logits.device())? };
         let ids = logits.apply_op1_no_bwd(&MoeTopk {
             k,
             w: w.clone(),

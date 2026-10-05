@@ -1029,6 +1029,18 @@ impl QTensor {
         Self::new(storage, shape)
     }
 
+    /// A tensor of `shape` and `dtype` over ONE block of storage: what a
+    /// model's structure says about a weight (its kind and extents) with
+    /// none of its bytes — `lloom::testing::ghost`, a model built to be
+    /// walked. No kernel may read it: a dispatch would read past its block.
+    #[doc(hidden)]
+    pub fn ghost<S: Into<Shape>>(shape: S, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        check_shape(&shape, dtype.block_size())?;
+        let storage = device.qzeros(dtype.block_size(), dtype)?;
+        Self::new(storage, shape)
+    }
+
     /// [`Self::zeros`] in storage that is not a pool bucket — a persistent
     /// Private allocation on Metal (`QMetalStorage::persistent`), the CPU
     /// storage as it is. The slot pool of a streamed weight tier.

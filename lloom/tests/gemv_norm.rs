@@ -47,8 +47,21 @@ fn reference(x: &[f32], g: &[f32], w: &[f32], n: usize, k: usize, silu: bool) ->
 /// `gemv_norm` at `(n, k)` and `dtype`, the largest error relative to the
 /// largest reference magnitude.
 fn rel_err(n: usize, k: usize, dtype: DType, silu: bool, seed: u64) -> Result<f32> {
+    rel_err_at(n, k, dtype, silu, seed, 3.0)
+}
+
+/// [`rel_err`] with the input's magnitude `x_scale`: at 1e-3, `mean(x^2)` is
+/// below `eps` and the epsilon decides the result.
+fn rel_err_at(
+    n: usize,
+    k: usize,
+    dtype: DType,
+    silu: bool,
+    seed: u64,
+    x_scale: f32,
+) -> Result<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let x = round(&rand_vec(&mut rng, k, 3.0), dtype)?;
+    let x = round(&rand_vec(&mut rng, k, x_scale), dtype)?;
     let g = round(&rand_vec(&mut rng, k, 1.5), dtype)?;
     let w = round(&rand_vec(&mut rng, n * k, 0.05), dtype)?;
     let want = reference(&x, &g, &w, n, k, silu);
@@ -96,6 +109,13 @@ fn gemv_norm_matches_the_pair_reference() -> Result<()> {
             }
         }
     }
+    // A small input, where `eps` is most of the denominator.
+    let e = rel_err_at(2048, 2048, DType::F32, false, 99, 1e-3)?;
+    println!("gemv_norm n=2048 k=2048 F32 |x|~1e-3 rel_err={e:.3e}");
+    assert!(
+        e <= 1e-5,
+        "gemv_norm at |x|~1e-3 (eps-dominated): rel_err {e}"
+    );
     Ok(())
 }
 

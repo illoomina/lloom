@@ -224,3 +224,68 @@ fn quantized_planes_grown_by_buckets_match_planes_sized_upfront() -> Result<()> 
     }
     Ok(())
 }
+
+/// A pass of `len` tokens from position 0, as a turn's prefill.
+fn prefill(model: &Model, cache: &mut Cache, len: usize, dev: &Device) -> Result<Vec<f32>> {
+    let ids: Vec<u32> = (0..len as u32).map(|i| (i * 7 + 3) % 48).collect();
+    let input = Tensor::new(ids.as_slice(), dev)?.unsqueeze(0)?;
+    model.forward(&input, 0, cache)?.i(0)?.to_vec1::<f32>()
+}
+
+/// A cleared paged cache refilled before the GPU released the previous turn's
+/// pages grows the pool rather than refusing (lloom #892 A1, #859 finding 3).
+///
+/// `Cache::clear` quarantines the turn's pages until the epoch open at the
+/// clear completes, and nothing commits between a chat's turns: the next
+/// turn's first pass finds them held. A pool sized by positions alone (two
+/// pages, one turn's worth) refuses that pass with "pool exhausted" although
+/// the sequence is empty. The plan has to count the pages the pass can take
+/// — free, or drainable — and widen the pool by the shortfall.
+///
+/// The reference is a fresh cache on the same model (a second mechanism, not
+/// the grown pool against itself): the refilled turn's logits must equal a
+/// first turn's, so the grow moved bytes and not math. Non-vacuity: the pages
+/// are asserted held at the refill, and the refill is asserted to have grown.
+#[test]
+fn a_cleared_paged_pool_refilled_under_quarantine_grows_instead_of_refusing() -> Result<()> {
+    let Some(dev) = device() else { return Ok(()) };
+    let cfg = config(KvAppend::Paged, AttnImpl::FlashDecoding, KvQuant::Off);
+    let model = build(&cfg, DType::F32, &dev)?;
+    // Two pages of 256: one turn of 300 positions holds both.
+    let turn = 300;
+    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
+    let first = prefill(&model, &mut cache, turn, &dev)?;
+    let (_, in_use, _) = cache.paged_stats().expect("the paged arm");
+    assert_eq!(in_use, 2, "300 positions take both pages of 256");
+    cache.clear();
+    let (len, _, held) = cache.paged_stats().expect("the paged arm");
+    assert_eq!(len, 0, "cleared");
+    assert_eq!(
+        held, 2,
+        "the turn's pages are quarantined until the open epoch completes; nothing has \
+         committed since the clear, so the refill finds them held (the premise of this test)"
+    );
+    let second = prefill(&model, &mut cache, turn, &dev).map_err(|e| {
+        lloom_tensor::Error::msg(format!("the refill after a clear was refused: {e}"))
+    })?;
+    let mut fresh = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
+    let reference = prefill(&model, &mut fresh, turn, &dev)?;
+    assert!(
+        first == reference,
+        "two first turns on fresh caches disagree: the model is not deterministic here"
+    );
+    assert!(
+        second == reference,
+        "the refilled turn's logits differ from a fresh cache's (first differing index {:?})",
+        second.iter().zip(&reference).position(|(p, q)| p != q)
+    );
+    let r = cache.kv_report();
+    assert_eq!(
+        r.grows, 1,
+        "the refill grew the pool once, by the pages the quarantine held"
+    );
+    assert_eq!(r.kv_len, turn);
+    let (_, in_use, _) = cache.paged_stats().expect("the paged arm");
+    assert_eq!(in_use, 2, "the refilled turn holds two pages");
+    Ok(())
+}

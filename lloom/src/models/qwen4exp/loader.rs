@@ -353,16 +353,17 @@ pub enum StreamLoader {
 pub enum SlotBudget {
     /// A fixed count.
     Fixed(usize),
-    /// Sized from the device: `fraction` of `recommendedMaxWorkingSetSize`,
-    /// minus the resident tier (every non-expert tensor, from the headers),
-    /// minus the SESSION RESERVE ([`session_reserve_bytes`]: the KV of
-    /// `rows` rows to `kv_tokens`, two prefill tiles' transients, the pool's
-    /// free list), divided across the layers' three expert planes; clamped
-    /// to `[topk + 1, n_experts]`. ds4's byte-budget planner, without a
-    /// policy beyond "what fits" (§20.4a) — and the reserve is what keeps
-    /// "what fits" from being the whole budget: without it the pool sized
-    /// itself to `fraction × working_set` exactly and the first pass read
-    /// over budget (issue #749 P18, `p18-stream-short.txt`).
+    /// Sized from the device: the expert pool's grant from the arbiter
+    /// (`profiles-and-memory-design.md` §4.2; #892 A5) over `fraction` of
+    /// `recommendedMaxWorkingSetSize`, with the resident tier (every
+    /// non-expert tensor, from the headers) and the session's claims
+    /// ([`session_claims`]: the KV of `rows` rows to `kv_tokens`, the
+    /// prefill transient, the loader's staging) as the other tenants;
+    /// clamped to `[topk + 1, n_experts]`. The pool takes what the claims
+    /// leave and yields under pressure (the admission's third rung parks
+    /// slots) — the old session reserve's free-list and pass-retention
+    /// constants, which kept "what fits" from being the whole budget
+    /// (#749 P18) without being a policy, are gone.
     Auto {
         fraction: f64,
         /// Rows the session state is reserved for (1, or `--batch N`).
@@ -391,10 +392,6 @@ impl SlotBudget {
 /// KV positions per row `SlotBudget::auto` reserves for.
 pub const DEFAULT_KV_RESERVE_TOKENS: usize = 4096;
 
-/// Bytes of the pool's free list a streamed load reserves beside the KV and
-/// the transients (`buffer_pool`'s 256 MiB default free budget).
-pub const POOL_FREE_RESERVE_BYTES: usize = 256 * 1024 * 1024;
-
 /// One position's KV over every full-attention layer at the config's store
 /// (`Config::kv_precision`: f32 or f16 elements, or the codes with their
 /// (scale, bias) planes counted — §10.7a's 0.531× argument, at this
@@ -415,28 +412,28 @@ pub fn kv_bytes_per_token(cfg: &Config) -> usize {
     full * (kv + indexer + blocks)
 }
 
-/// What a streamed load keeps beside its weights: `rows` rows' KV to
-/// `kv_tokens` positions, the prefill's transient at
-/// [`super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN`] (measured with the
-/// pacer's two tiles in flight, so one factor of the tile), what a pass
-/// retains, and the pool's free list. The slot plan subtracts it from the budget so
-/// a pass has what it needs by construction, not by luck.
-pub fn session_reserve_bytes(
+/// The session's claims beside the expert pool, for the load-time
+/// arbitration (`profiles-and-memory-design.md` §4.2; #892 A5): the KV of
+/// `rows` rows to `kv_tokens` (a capability — the caller chose the
+/// context), the prefill transient of one tile and the further tiles in
+/// flight (scratch), and the loader's staging (a capability of the loader).
+/// What the old session reserve also held — a free-list reserve and a
+/// pass-retention reserve, two constants in place of a policy — is the
+/// expert pool's to yield now: the admission's third rung parks slots when
+/// a pass is short (`Qwen4Exp::apply_expert_grant`).
+pub fn session_claims(
     cfg: &Config,
     rows: usize,
     kv_tokens: usize,
     prefill_tile: usize,
-) -> usize {
+    loader: &StreamLoader,
+    prefetch: bool,
+) -> Vec<SessionClaim> {
     let tile = if prefill_tile == 0 {
         super::model::PREFILL_CHUNK
     } else {
         prefill_tile
     };
-    // One tile's worth: `PREFILL_TRANSIENT_BYTES_PER_TOKEN` is the peak
-    // measured WITH the pacer's two tiles in flight (1.34 GB over a 512
-    // tile), so a second factor of two counted the same bytes twice — 1.5
-    // GB, ~18 slots, on this machine (P26). A pipelined pass of more than
-    // two tiles holds each further tile's half of that on top (P27).
     let tile_bytes = tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
     let tiles = if super::model::prefill_pair_on() {
         super::model::prefill_tiles()
@@ -444,19 +441,43 @@ pub fn session_reserve_bytes(
         2
     };
     let further = tile_bytes.saturating_mul(tiles.saturating_sub(2)) / 2;
-    rows.max(1) * kv_tokens * kv_bytes_per_token(cfg)
-        + tile_bytes
-        + further
-        + POOL_FREE_RESERVE_BYTES
-        + PASS_RETENTION_BYTES
+    let per = kv_bytes_per_token(cfg);
+    vec![
+        SessionClaim {
+            name: "qwen4exp-kv",
+            bytes: rows.max(1) * kv_tokens * per,
+            unit: per,
+            capability: true,
+        },
+        SessionClaim {
+            name: "qwen4exp-transient",
+            bytes: tile_bytes + further,
+            unit: tile_bytes,
+            capability: false,
+        },
+        SessionClaim {
+            name: "qwen4exp-staging",
+            bytes: staging_reserve_bytes(loader, prefetch),
+            unit: 1 << 20,
+            capability: true,
+        },
+    ]
 }
 
-/// What the device holds after a prefill tile beyond the KV and the free
-/// list — the pool's `pending` at the tile's end and the buckets it keeps:
-/// measured +1.0–1.1 GB over the load after one 512-tile (P18/P21). Without
-/// it the `io` arm (no staging ring in its reserve) was refused its second
-/// tile by 0.07 GB (`p21-io-cold.txt`).
-pub const PASS_RETENTION_BYTES: usize = 1 << 30;
+/// One of the session's fixed claims (`floor == want`): a capability
+/// (never reduced) or scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionClaim {
+    pub name: &'static str,
+    pub bytes: usize,
+    pub unit: usize,
+    pub capability: bool,
+}
+
+/// The session's claims summed: what the plan leaves out of the pool.
+pub fn session_floor_bytes(claims: &[SessionClaim]) -> usize {
+    claims.iter().map(|c| c.bytes).sum()
+}
 
 /// The staging ring's cap on the `pread` arm: `staging::DEFAULT_CAP_BYTES`
 /// (1 GiB), or [`PREFETCH_RING_BYTES`] with a prefetcher — its reader
@@ -519,7 +540,8 @@ pub struct SlotPlan {
     pub working_set: usize,
     pub resident_bytes: usize,
     pub expert_bytes_per_slot: usize,
-    /// The session reserve the plan left out of the pool.
+    /// The session's claims the plan left out of the pool (the KV, the
+    /// transient, the staging: `session_claims`).
     pub reserve_bytes: usize,
 }
 
@@ -572,24 +594,100 @@ fn working_set_of(device: &Device) -> usize {
     0
 }
 
-/// The slot pool `SlotBudget::Auto` resolves to: what the budget leaves
-/// after the resident tier, divided by a slot, clamped to `[topk + 1,
-/// n_experts]`.
+/// The slot pool `SlotBudget::Auto` resolves to: the expert pool's grant
+/// from the arbiter (`ledger::arbitrate`, §4.2) over the budget, with the
+/// resident tier and the session's claims as the other tenants — the
+/// resident tier and the capabilities at their floors, the pool a cache
+/// claiming `topk + 1` slots as its floor, every expert as its want and a
+/// slot as its unit — in slots; `[topk + 1, n_experts]`. A budget the
+/// floors alone exceed refuses the load with the arithmetic.
 fn plan_slots<Rd: Read + Seek>(
     gg: &Gguf<'_, Rd>,
     cfg: &Config,
     device: &Device,
     fraction: f64,
-    reserve_bytes: usize,
+    claims: &[SessionClaim],
 ) -> Result<SlotPlan> {
     let plan = plan_load(gg, device, fraction, None);
-    let slots = plan
-        .budget()
-        .saturating_sub(plan.resident_bytes)
-        .saturating_sub(reserve_bytes)
-        .checked_div(plan.expert_bytes_per_slot)
-        .unwrap_or(0)
-        .clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
+    let per_slot = plan.expert_bytes_per_slot.max(1);
+    let reserve_bytes = session_floor_bytes(claims);
+    #[cfg(not(feature = "metal"))]
+    let slots = {
+        let _ = (per_slot, reserve_bytes);
+        0usize
+    };
+    #[cfg(feature = "metal")]
+    let slots = {
+        use lloom_tensor::kernels::metal::ledger::{
+            arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
+        };
+        let fixed = |id: u32, name: &str, bytes: usize, unit: usize, class: Class| TenantRow {
+            id: TenantId(id),
+            name: name.to_string(),
+            claim: Claim {
+                floor: bytes,
+                want: bytes,
+                unit: unit.max(1),
+                class,
+            },
+            held: 0,
+        };
+        let mut rows = vec![fixed(
+            1,
+            "qwen4exp-resident",
+            plan.resident_bytes,
+            1 << 20,
+            Class::Capability,
+        )];
+        for (i, c) in claims.iter().enumerate() {
+            let class = if c.capability {
+                Class::Capability
+            } else {
+                Class::Scratch
+            };
+            rows.push(fixed(2 + i as u32, c.name, c.bytes, c.unit, class));
+        }
+        let experts = TenantId(100);
+        rows.push(TenantRow {
+            id: experts,
+            name: "qwen4exp-experts".to_string(),
+            claim: Claim {
+                floor: (cfg.n_experts_per_tok + 1) * per_slot,
+                want: cfg.n_experts * per_slot,
+                unit: per_slot,
+                class: Class::Cache,
+            },
+            held: 0,
+        });
+        if plan.working_set == 0 {
+            0
+        } else {
+            match arbitrate(plan.budget(), &rows) {
+                Arbitration::Granted(grants) => grants
+                    .iter()
+                    .find(|g| g.id == experts)
+                    .map_or(0, |g| g.bytes / per_slot),
+                Arbitration::Refused { floors, quota } => {
+                    let gb = |b: usize| b as f64 / 1e9;
+                    lloom_tensor::bail!(
+                        "the streamed load does not fit: the floors alone — the resident tier \
+                     {:.2} GB, the session's claims {:.2} GB, the pool's {} slots {:.2} GB — \
+                     are {:.2} GB against a budget of {:.2} GB ({fraction} x \
+                     recommendedMaxWorkingSetSize {:.2} GB): a smaller context, a smaller \
+                     tile, or a larger fraction",
+                        gb(plan.resident_bytes),
+                        gb(reserve_bytes),
+                        cfg.n_experts_per_tok + 1,
+                        gb((cfg.n_experts_per_tok + 1) * per_slot),
+                        gb(floors),
+                        gb(quota),
+                        gb(plan.working_set),
+                    )
+                }
+            }
+        }
+    };
+    let slots = slots.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
     Ok(SlotPlan {
         slots,
         working_set: plan.working_set,
@@ -902,9 +1000,15 @@ impl Qwen4Exp<Streamed> {
                 kv_tokens,
                 prefill_tile,
             } => {
-                let reserve = session_reserve_bytes(&cfg0, rows, kv_tokens, prefill_tile)
-                    + staging_reserve_bytes(&stream.loader, stream.prefetch);
-                let plan = plan_slots(&gg, &cfg0, device, fraction, reserve)?;
+                let claims = session_claims(
+                    &cfg0,
+                    rows,
+                    kv_tokens,
+                    prefill_tile,
+                    &stream.loader,
+                    stream.prefetch,
+                );
+                let plan = plan_slots(&gg, &cfg0, device, fraction, &claims)?;
                 if plan.working_set == 0 {
                     lloom_tensor::bail!(
                         "SlotBudget::Auto needs a Metal device (recommendedMaxWorkingSetSize)"
@@ -920,7 +1024,8 @@ impl Qwen4Exp<Streamed> {
         // A fixed count is admitted like any load; `Auto` sized itself to
         // the budget and passes by construction (or sits at the pool's
         // `topk + 1` floor, which is then refused with the arithmetic).
-        admit_load(&plan_load(&gg, device, opts.fraction(), Some(slots)))?;
+        let plan = plan_load(&gg, device, opts.fraction(), Some(slots));
+        admit_load(&plan)?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -965,7 +1070,7 @@ impl Qwen4Exp<Streamed> {
             }
             _ => None,
         };
-        build(&mut gg, device, opts, |gg, l| {
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             let src = |gg: &Gguf<'_, File>, name: String| -> Result<ExpertSource> {
                 let (content, path) = gg.locate(&name)?;
@@ -992,7 +1097,15 @@ impl Qwen4Exp<Streamed> {
                 tier.set_io_hints(stream.io_hints);
             }
             Ok(tier)
-        })
+        })?;
+        model.register_expert_ledger(
+            device,
+            plan.expert_bytes_per_slot,
+            slots,
+            cfg0.n_experts,
+            cfg0.n_experts_per_tok,
+        );
+        Ok(model)
     }
 }
 
@@ -1323,18 +1436,30 @@ mod tests {
             full * ((2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * 4
                 + cfg.indexer_head_dim)
         );
-        let r1 = session_reserve_bytes(&cfg, 1, 4096, 512);
-        let r4 = session_reserve_bytes(&cfg, 4, 4096, 512);
+        let claims = |rows, tile| {
+            session_floor_bytes(&session_claims(
+                &cfg,
+                rows,
+                4096,
+                tile,
+                &StreamLoader::Io,
+                false,
+            ))
+        };
+        let r1 = claims(1, 512);
+        let r4 = claims(4, 512);
         assert_eq!(r4 - r1, 3 * 4096 * per);
+        // The KV, the transient and the loader's staging — and nothing in
+        // place of a policy: the free-list and pass-retention reserves the
+        // old session reserve carried are the pool's to yield (#892 A5).
         assert_eq!(
             r1,
             4096 * per
                 + 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
-                + POOL_FREE_RESERVE_BYTES
-                + PASS_RETENTION_BYTES
+                + IO_INFLIGHT_RESERVE_BYTES
         );
         // A zero tile reserves one PREFILL_CHUNK's worth.
-        assert_eq!(session_reserve_bytes(&cfg, 1, 4096, 0), r1);
+        assert_eq!(claims(1, 0), r1);
     }
 
     /// A position's bytes on this model's geometry, per KV store, against

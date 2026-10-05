@@ -397,6 +397,10 @@ pub struct Cache {
     /// first; set by [`CausalLM::forward`], empty when the caller only had
     /// embeddings (an image), in which case the hash uses the image stand-in.
     pub pending_tokens: std::collections::VecDeque<u32>,
+    /// This cache's KV row on the device's ledger (`ledger.rs`), registered
+    /// by `new_cache`; a clone shares it, a drop removes it.
+    #[cfg(feature = "metal")]
+    pub(crate) ledger: Option<std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
     /// `pending_tokens` was filled by the driver (`CausalLM::note_input_ids`)
     /// for the NEXT forward, which consumes the note instead of reading its
     /// input ids back from the device. Cleared by that forward.
@@ -600,6 +604,8 @@ impl Cache {
             ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
+            #[cfg(feature = "metal")]
+            ledger: None,
             pending_noted: false,
             host: HostFill::default(),
             pos: 0,
@@ -1016,6 +1022,16 @@ pub struct Ple {
 }
 
 /// The assembled model.
+/// The streamed expert pool as the ledger's elastic tenant
+/// (`profiles-and-memory-design.md` §4.2, class `Cache`): `topk + 1` slots
+/// as the floor, every expert as the want, one slot as the unit — the one
+/// tenant type every weight-group tier is (`nn::group_tenant`, #892 A6b;
+/// the dense layers' tier claims the same way). `resize` records the grant
+/// as the slots wanted in service; the model applies it to its layers'
+/// tiers (`Qwen4Exp::apply_expert_grant`) — the tiers evict through their
+/// quarantine and give the parked slots' pages back.
+pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
+
 #[derive(Debug)]
 pub struct Qwen4Exp<R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
@@ -1048,6 +1064,10 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// fraction of `recommendedMaxWorkingSetSize` a pass may take the
     /// process to, and whether a pass over it is refused or reported.
     memory_fraction: f64,
+    /// The expert tier's row on the device's ledger (`ledger.rs`), set by
+    /// the streamed loader; dropped with the model.
+    #[cfg(feature = "metal")]
+    ledger_gauge: Option<std::sync::Arc<ExpertTenant>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1069,7 +1089,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// than a pool buffer per step (`replay_input_owned`), and the epoch of
     /// the command buffer its last reader was encoded into.
     #[cfg(feature = "metal")]
-    replay_h: parking_lot::Mutex<Option<(Tensor, Option<u64>)>>,
+    replay_h: parking_lot::Mutex<Option<(Tensor, Option<lloom_tensor::kernels::metal::Epoch>)>>,
     /// A one-position step's PLE rows, gathered on the host into a Shared
     /// buffer the model keeps rather than uploaded per step
     /// (`ple_rows_owned`), and the epoch of its last reader.
@@ -1078,7 +1098,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
         Option<(
             lloom_tensor::kernels::metal::BufferHandle,
             Tensor,
-            Option<u64>,
+            Option<lloom_tensor::kernels::metal::Epoch>,
         )>,
     >,
     cfg: Config,
@@ -1183,6 +1203,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             device_plan,
             hint_recall: parking_lot::Mutex::new([(0, 0); 4]),
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
+            #[cfg(feature = "metal")]
+            ledger_gauge: None,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
@@ -1347,6 +1369,78 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.memory_fraction = fraction.max(0.0);
     }
 
+    /// Register the expert tier on the device's ledger as a cache tenant:
+    /// `topk + 1` slots as its floor, every expert resident as its want, one
+    /// slot as its unit, the pool's slots as what it holds (§4.2, §4.8).
+    pub fn register_expert_ledger(
+        &mut self,
+        device: &lloom_tensor::Device,
+        bytes_per_slot: usize,
+        slots: usize,
+        n_experts: usize,
+        topk: usize,
+    ) {
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = device {
+            use lloom_tensor::kernels::metal::ledger::Tenant;
+            let tenant = std::sync::Arc::new(ExpertTenant::new(
+                "qwen4exp-experts",
+                bytes_per_slot,
+                slots,
+                topk + 1,
+                n_experts,
+                slots,
+            ));
+            let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
+            m.ledger().register(&dyn_tenant);
+            self.ledger_gauge = Some(tenant);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = (device, bytes_per_slot, slots, n_experts, topk);
+    }
+
+    /// Apply the expert tenant's grant to every layer's tier: shrink the
+    /// slots in service (their pages parked, the ledger told) or grow them
+    /// back. Returns the bytes parked (positive) or brought back (as a
+    /// negative is not needed: the ledger's `parked` says). Nothing to do
+    /// when the grant equals the slots in service.
+    #[cfg(not(feature = "metal"))]
+    pub fn apply_expert_grant(&self) -> Result<usize> {
+        Ok(0)
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn apply_expert_grant(&self) -> Result<usize> {
+        let Some(t) = &self.ledger_gauge else {
+            return Ok(0);
+        };
+        let wanted = t.wanted_units();
+        let mut parked = 0usize;
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = self.device() {
+            if self
+                .layers
+                .iter()
+                .any(|l| wanted < l.moe.experts().active_slots())
+            {
+                // The one host wait of the yield, on the refusal path alone
+                // (§21.13): the slots leaving service must have no reader
+                // the clock has not completed. The tier never drains.
+                m.wait_until_completed()?;
+            }
+        }
+        for layer in &self.layers {
+            let tier = layer.moe.experts();
+            let active = tier.active_slots();
+            if wanted < active {
+                parked += tier.shrink_slots(wanted, t.floor_units())?;
+            } else if wanted > active {
+                tier.grow_slots(wanted);
+            }
+        }
+        Ok(parked)
+    }
+
     pub fn memory_fraction(&self) -> f64 {
         self.memory_fraction
     }
@@ -1421,6 +1515,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         let mut plan = self.plan_pass(cache, seq);
         cache.prepared = Some((cache.pos, seq));
+        // The ledger hears the KV row at the passes that allocate — a grow,
+        // or a sequence's first — never on a decode step inside its slab.
+        #[cfg(feature = "metal")]
+        if plan.kv_grow > 0 || cache.pos == 0 {
+            if let Some(g) = &cache.ledger {
+                use lloom_tensor::kernels::metal::ledger::Tenant;
+                let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
+                let held: usize = cache
+                    .kv
+                    .iter()
+                    .map(|k| k.bytes_held(nkv, hd))
+                    .sum::<usize>()
+                    + plan.kv_grow;
+                let mut claim = g.claim();
+                claim.floor = held;
+                claim.want = held;
+                g.set_claim(claim);
+                g.set_held(held);
+            }
+        }
         // A pass a cached plan serves allocates its activations from the
         // base, which is already allocated and counted: it owes no transient.
         #[cfg(feature = "metal")]
@@ -1454,18 +1568,35 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if let Ok(m) = self.device().as_metal_device() {
             use crate::models::lfm2::{kv_grow_budget, kv_grow_fits};
             let dev = m.device();
-            let allocated = dev.current_allocated_size();
             let working_set = dev.recommended_max_working_set_size();
             // The transients come from the heap chunks first (§6.3k), whose
-            // whole size `allocated` already counts: what the chunks have
-            // free is transient the pass will NOT allocate.
+            // whole size the allocated figure already counts: what the chunks
+            // have free is transient the pass will NOT allocate.
             let (hs, hp) = m.heap_stats();
             let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
             let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
-            let fits = kv_grow_fits(allocated, working_set, self.memory_fraction, need);
+            // Read with the free lists given back first when the first
+            // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
+            // is `kv_grow_fits`'.
+            let mut a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+            if !a.fits && a.pledged > 0 {
+                // The tenants pledged a yield (the expert tier's slots):
+                // apply it — park the slots, their pages given back — and
+                // ask again on the figure after.
+                let parked = self.apply_expert_grant()?;
+                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
+                a.pledged = pledged;
+                a.reclaimed += reclaimed + parked;
+            }
+            let (allocated, fits) = (a.committed, a.fits);
+            debug_assert_eq!(
+                fits,
+                kv_grow_fits(allocated, working_set, self.memory_fraction, need)
+            );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB allocated={:.2} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
@@ -1473,6 +1604,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 gb(heap_free),
                 gb(need),
                 gb(allocated),
+                gb(a.reclaimed),
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,
                 gb(working_set),
@@ -2768,8 +2900,30 @@ impl<R: ExpertResidency> ModelTrait for Qwen4Exp<R> {
 impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     type Cache = Cache;
 
-    fn new_cache(&self, cfg: &Self::Config, _dev: &lloom_tensor::Device) -> Result<Self::Cache> {
-        Ok(Cache::new(cfg))
+    fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut cache = Cache::new(cfg);
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = dev {
+            use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+            // The slabs grow a slab at a time with no ceiling of their own:
+            // the row's floor is what it holds, its unit one slab across the
+            // full-attention layers; `prepare_pass` keeps it current.
+            let gauge = Gauge::new(
+                "qwen4exp-kv",
+                Claim {
+                    floor: 0,
+                    want: 0,
+                    unit: super::qsa::KV_SLAB_TOKENS * super::loader::kv_bytes_per_token(cfg),
+                    class: Class::Capability,
+                },
+                0,
+            );
+            let tenant: std::sync::Arc<dyn Tenant> = gauge.clone();
+            m.ledger().register(&tenant);
+            cache.ledger = Some(gauge);
+        }
+        Ok(cache)
     }
 
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {

@@ -25,6 +25,67 @@ use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 /// failed run left encoded (`HostFedRing::release`).
 const RELEASE_SPAN: u64 = 1 << 40;
 
+/// A shared event a host thread raises and the command stream waits on —
+/// [`HostFedRing`]'s protocol without the ring: the caller owns the buffers
+/// (a weight-group tier's slots, `lloom::nn::weight_groups`) and the
+/// values (one per load, monotone). The loader thread writes a slot, then
+/// `signal`s the load's value; the encoding thread `encode_wait`s that value
+/// before the slot's first reader, and only when the host has not raised it
+/// yet (`signaled`) — a wait is an encoder split whether or not it waits
+/// (`profiles-and-memory-design.md` §4.8 R1).
+pub struct HostEvent {
+    device: MetalDevice,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+// SAFETY: an `MTLSharedEvent` is usable from any thread; it is what it is for.
+unsafe impl Send for HostEvent {}
+unsafe impl Sync for HostEvent {}
+
+impl HostEvent {
+    pub fn new(device: &MetalDevice) -> Result<Self> {
+        let event = device
+            .metal_device()
+            .as_ref()
+            .newSharedEvent()
+            .ok_or_else(|| crate::Error::Msg("newSharedEvent returned nil".into()))?;
+        Ok(Self {
+            device: device.clone(),
+            event,
+        })
+    }
+
+    /// The value the host has raised the event to.
+    pub fn signaled(&self) -> u64 {
+        self.event.signaledValue()
+    }
+
+    /// Raise the event to `v`; the host writes before this call are visible
+    /// to the commands after a wait for `v`.
+    pub fn signal(&self, v: u64) {
+        self.event.setSignaledValue(v);
+    }
+
+    /// Every command encoded after this on the device's stream waits for the
+    /// event to reach `v`. Ends the open compute encoder.
+    pub fn encode_wait(&self, v: u64) -> Result<()> {
+        self.device
+            .commands()
+            .encode_wait_for_event(&self.event, v)
+            .map_err(|e| crate::Error::Msg(format!("HostEvent wait: {e}")))
+    }
+}
+
+impl std::fmt::Debug for HostEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HostEvent {{ signalled: {} }}",
+            self.event.signaledValue()
+        )
+    }
+}
+
 pub struct HostFedRing {
     device: MetalDevice,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -207,7 +268,7 @@ impl PublishEvent {
             .encode_signal_event(&self.event, value)
             .map_err(|e| crate::Error::Msg(format!("PublishEvent signal: {e}")))?;
         self.encoded_epoch
-            .store(epoch, std::sync::atomic::Ordering::Release);
+            .store(epoch.0, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -217,7 +278,7 @@ impl PublishEvent {
         let e = self
             .encoded_epoch
             .load(std::sync::atomic::Ordering::Acquire);
-        e == u64::MAX || self.clock.current_epoch() > e
+        e == u64::MAX || self.clock.current_epoch().0 > e
     }
 
     /// The value the GPU has signalled so far.

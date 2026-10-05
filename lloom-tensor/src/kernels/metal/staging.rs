@@ -23,19 +23,20 @@
 //! is not complete no later one is.
 
 use super::buffer_pool::{BufferHandle, GpuClock};
+use crate::retire::Epoch;
 use crate::{MetalDevice, Result};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// An entry acquired and not yet stamped: no epoch completes it.
-const IN_USE: u64 = u64::MAX;
+const IN_USE: Epoch = Epoch(u64::MAX);
 
 struct Entry {
     buf: BufferHandle,
     /// The epoch of the command buffer the last copy from this entry was
     /// encoded into (0 once released unused); reusable once the clock shows
     /// it complete.
-    epoch: u64,
+    epoch: Epoch,
     /// Bumped on every change of `epoch`: a ticket for an older state is
     /// stale and is dropped, never honoured.
     gen: u64,
@@ -110,7 +111,7 @@ pub struct StagingRing {
     classes: Vec<Class>,
     /// Stamped one-shots past the cap, in stamp order, freed once their
     /// epoch completes.
-    overflow: VecDeque<(BufferHandle, u64)>,
+    overflow: VecDeque<(BufferHandle, Epoch)>,
     /// Bytes of `entries`.
     bytes: usize,
     cap_bytes: usize,
@@ -217,7 +218,7 @@ impl StagingRing {
     /// Stamps are expected in non-decreasing epoch order (the clock's current
     /// epoch, read under the ring's lock); an older epoch stamped behind a
     /// newer one is reused no earlier than the newer one, never early.
-    pub fn stamp(&mut self, entry: Option<usize>, buf: &BufferHandle, epoch: u64) {
+    pub fn stamp(&mut self, entry: Option<usize>, buf: &BufferHandle, epoch: Epoch) {
         match entry {
             Some(i) => {
                 let e = &mut self.entries[i];
@@ -241,7 +242,7 @@ impl StagingRing {
     pub fn release(&mut self, entry: Option<usize>, _buf: &BufferHandle) {
         if let Some(i) = entry {
             let e = &mut self.entries[i];
-            e.epoch = 0;
+            e.epoch = Epoch::ZERO;
             e.gen += 1;
             let t = Ticket { idx: i, gen: e.gen };
             self.classes[e.class].released.push(t);
@@ -427,8 +428,8 @@ mod tests {
         let key = |b: &BufferHandle| BufferHandle::as_ptr(b) as usize;
         let mut held: Vec<(Option<usize>, BufferHandle)> = Vec::new();
         // Buffer -> the epoch a reuse must wait for (0 once released).
-        let mut last_stamp: HashMap<usize, u64> = HashMap::new();
-        let mut one_shots: Vec<(crate::kernels::metal::buffer_pool::WeakBufferHandle, u64)> =
+        let mut last_stamp: HashMap<usize, Epoch> = HashMap::new();
+        let mut one_shots: Vec<(crate::kernels::metal::buffer_pool::WeakBufferHandle, Epoch)> =
             Vec::new();
         let (mut reused_early, mut reused_ok) = (0, 0);
         for _ in 0..4000 {
@@ -466,7 +467,7 @@ mod tests {
                     let (entry, buf) = held.swap_remove(next(held.len() as u64) as usize);
                     ring.release(entry, &buf);
                     if entry.is_some() {
-                        last_stamp.insert(key(&buf), 0);
+                        last_stamp.insert(key(&buf), Epoch::ZERO);
                     }
                 }
                 7..=8 => {
@@ -474,8 +475,8 @@ mod tests {
                 }
                 _ => {
                     let (done, open) = (clock.completed_count(), clock.current_epoch());
-                    if done < open {
-                        clock.mark_completed(done + next(open - done));
+                    if done.0 < open.0 {
+                        clock.mark_completed(Epoch(done.0 + next(open.0 - done.0)));
                     }
                 }
             }
@@ -509,7 +510,7 @@ mod tests {
             ring.stamp(entry, &buf, clock.current_epoch());
         }
         clock.commit_epoch();
-        clock.mark_completed(clock.current_epoch() - 1);
+        clock.mark_completed(Epoch(clock.current_epoch().0 - 1));
         for len in [4096, 3000, 8192] {
             let (entry, buf) = ring.acquire(&dev, len).unwrap();
             assert!(entry.is_some());
@@ -538,7 +539,7 @@ mod tests {
             "nothing has completed: epoch 0 is pending"
         );
         clock.commit_epoch();
-        clock.mark_completed(0);
+        clock.mark_completed(Epoch(0));
         let (ic, c) = ring.acquire(&dev, 4096).unwrap();
         assert!(
             BufferHandle::ptr_eq(&a, &c) && ic == ia,
@@ -569,7 +570,7 @@ mod tests {
         );
         ring.stamp(entry, &buf, clock.current_epoch());
         clock.commit_epoch();
-        clock.mark_completed(clock.current_epoch() - 1);
+        clock.mark_completed(Epoch(clock.current_epoch().0 - 1));
         let before = ring.probes;
         let (entry, _) = ring.acquire(&dev, 4096).unwrap();
         assert_eq!(entry, Some(0), "the oldest stamp of the class is reused");

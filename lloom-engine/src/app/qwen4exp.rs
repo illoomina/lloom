@@ -314,6 +314,11 @@ impl Engine<Resident> {
                         .context("loading Qwen4-exp (resident experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
+                #[cfg(feature = "metal")]
+                if let Device::Metal(m) = &device {
+                    let ws = m.device().recommended_max_working_set_size() as f64;
+                    m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+                }
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
                 Engine::<Resident>::finish(model, device, opts, tier, installed)
             }
@@ -343,6 +348,11 @@ impl Engine<Resident> {
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
+                #[cfg(feature = "metal")]
+                if let Device::Metal(m) = &device {
+                    let ws = m.device().recommended_max_working_set_size() as f64;
+                    m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+                }
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
                     if path.exists() {

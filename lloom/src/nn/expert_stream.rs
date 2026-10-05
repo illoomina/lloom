@@ -22,8 +22,10 @@
 //! file straight into the slot, ordered by shared events on both queues. On
 //! neither arm does an eviction wait on the GPU.
 
+use crate::nn::slot_cache::{ExpertId, ExpertSlots, SlotId};
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::{GgmlDType, MoeArm, QTensor};
+use lloom_tensor::retire::{Completed, Epoch, Retire, Tick};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::fs::File;
 use std::ops::Range;
@@ -205,6 +207,18 @@ pub trait ExpertResidency {
     /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
     /// `[rows, topk, hidden]`, on the tile's `arm` as [`Self::gate_up`].
     fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor>;
+
+    /// The elastic surface (`profiles-and-memory-design.md` §4.2): slots in
+    /// service, and shrinking / growing them. A resident tier has none.
+    fn active_slots(&self) -> usize {
+        0
+    }
+    fn shrink_slots(&self, _active: usize, _floor: usize) -> Result<usize> {
+        Ok(0)
+    }
+    fn grow_slots(&self, _active: usize) -> usize {
+        0
+    }
 
     /// Whether [`Self::plan_device`] can answer: the strategy keeps a
     /// residency table on the device. `Resident` never needs to.
@@ -599,313 +613,239 @@ impl LoaderArm {
     }
 }
 
-/// Expert id → slot, slot → expert, an LRU tick per slot and pin flags. The
-/// query is one indexed load; the victim search is over the (small) slot
-/// count and runs only on a miss.
-///
-/// Two arms for where a miss lands. **In place** (`spare == 0`): the LRU
-/// victim's slot, written by a copy the encoder orders after the slot's
-/// earlier readers. **Quarantined** (`spare > 0`): a FREE slot — one whose
-/// last reader has completed — while `spare` slots are kept free by evicting
-/// the LRU expert into an epoch quarantine (`kv_pages::EpochQuarantine`,
-/// the KV pool's liveness rule), recycled once the pool clock shows its
-/// epoch complete. A slot is then never written while anything may read
-/// it, whatever the landing path, which is what a load that runs beside the
-/// pass needs (§20.4a).
+/// Which expert is in which slot, with the liveness and the policy: a
+/// `SlotCache<ExpertId>` (`nn::slot_cache`) plus the per-expert use count
+/// the hotlist reads (§20.3 R2). The tier's own vocabulary stays `usize` /
+/// `u32` at this boundary; the cache's ids are the newtypes.
 #[derive(Debug, Clone)]
 pub struct ResidencyMap {
-    slot_of: Vec<u32>,
-    /// Uses per expert (a hit or a miss each time a pass needs it): the
-    /// frequency profile the hotlist is (§20.3 R2).
+    cache: ExpertSlots,
+    /// Uses per expert (a hit or a miss each time a pass needs it).
     usage: Vec<u32>,
-    expert_in: Vec<u32>,
-    last_use: Vec<u64>,
-    pinned: Vec<bool>,
-    /// Per slot, the `io` arm's event value its expert lands on — an
-    /// in-flight entry (a hint issued, the DMA not yet waited for); 0 when
-    /// the slot holds a landed expert or nothing (§20.4a, DS4's
-    /// `inflight_seq`). The victim search skips in-flight slots while any
-    /// other is available; `install` clears it.
-    inflight: Vec<u64>,
-    /// Per slot, the GPU epoch (the pool clock's) of the last command
-    /// buffer that read or wrote it: a direct read into the slot waits for
-    /// it to complete before the bytes land (`Prefetcher::read_direct`).
-    /// Read through [`Self::reader_epoch`].
-    last_epoch: Vec<u64>,
-    /// The epoch of the last device plan: that pass may read ANY slot, so
-    /// every slot's last reader is at least this recent. One store per plan
-    /// instead of a stamp per slot.
-    plan_epoch: u64,
-    tick: u64,
-    /// Slots the quarantined arm keeps free (0: the in-place arm).
-    spare: usize,
-    /// Slots holding nothing whose last reader has completed.
-    free: Vec<u32>,
-    /// Slots evicted and not yet safe to write, with the epoch they outlive.
-    quarantine: lloom_tensor::kv_pages::EpochQuarantine<u32>,
-    /// Slots evicted while a device plan was open: that plan's readers are
-    /// not all encoded yet, so the epoch they must outlive is known only
-    /// once it settles (`release_deferred`).
-    deferred: Vec<u32>,
-    /// Scratch for a recycle.
-    recycled: Vec<u32>,
 }
 
-const NONE: u32 = u32::MAX;
+const NONE: u32 = crate::nn::slot_cache::NONE;
 
 impl ResidencyMap {
     pub fn new(n_experts: usize, n_slots: usize) -> Self {
         Self {
-            slot_of: vec![NONE; n_experts],
+            cache: ExpertSlots::new(n_experts, n_slots),
             usage: vec![0; n_experts],
-            expert_in: vec![NONE; n_slots],
-            last_use: vec![0; n_slots],
-            pinned: vec![false; n_slots],
-            inflight: vec![0; n_slots],
-            last_epoch: vec![0; n_slots],
-            plan_epoch: 0,
-            tick: 0,
-            spare: 0,
-            free: Vec::new(),
-            quarantine: lloom_tensor::kv_pages::EpochQuarantine::new(),
-            deferred: Vec::new(),
-            recycled: Vec::new(),
         }
     }
 
     /// Select the arm: `spare` slots kept free (0: in place). Only on an
     /// empty map (a pool that has loaded nothing).
     pub fn set_spare(&mut self, spare: usize) {
-        assert!(
-            self.expert_in.iter().all(|&e| e == NONE),
-            "set_spare on a map that already holds experts"
-        );
-        self.spare = spare.min(self.n_slots().saturating_sub(1));
-        self.free.clear();
-        if self.spare > 0 {
-            // Descending, so the pops fill slot 0, 1, 2, … — the order the
-            // in-place arm fills an empty pool in.
-            self.free.extend((0..self.n_slots() as u32).rev());
-        }
+        self.cache.set_spare(spare)
     }
 
     /// Whether misses land in free slots (the quarantined arm).
     pub fn quarantined(&self) -> bool {
-        self.spare > 0
+        self.cache.quarantined()
     }
 
     /// Slots the quarantined arm keeps free (0: the in-place arm).
     pub fn spare(&self) -> usize {
-        self.spare
+        self.cache.spare()
     }
 
     /// Slots evicted and not yet reusable (quarantined or deferred).
     pub fn held(&self) -> usize {
-        self.quarantine.held() + self.deferred.len()
+        self.cache.held()
+    }
+
+    /// Free slots on the quarantined arm's list.
+    fn free_len(&self) -> usize {
+        self.cache.free_len()
+    }
+
+    /// Whether any slot holds an expert.
+    fn any_resident(&self) -> bool {
+        self.cache.any_resident()
     }
 
     /// Move every quarantined slot whose epoch has completed to the free
     /// list; how many.
-    fn recycle(&mut self, completed: u64) -> usize {
-        self.quarantine
-            .drain_completed_into(completed, &mut self.recycled);
-        let n = self.recycled.len();
-        self.free.append(&mut self.recycled);
-        n
+    fn recycle(&mut self, completed: Completed) -> usize {
+        self.cache.recycle(completed)
     }
 
     /// A free slot, if any.
     fn take_free(&mut self) -> Option<usize> {
-        self.free.pop().map(|s| s as usize)
+        self.cache.take_free().map(SlotId::index)
     }
 
     /// The least-recently-used RESIDENT unpinned slot not used in `tick` and
     /// not in flight.
-    fn lru_resident(&self, tick: u64) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
-        for s in 0..self.expert_in.len() {
-            if self.expert_in[s] == NONE
-                || self.pinned[s]
-                || self.last_use[s] == tick
-                || self.inflight[s] != 0
-            {
-                continue;
-            }
-            match best {
-                Some((_, t)) if t <= self.last_use[s] => {}
-                _ => best = Some((s, self.last_use[s])),
-            }
-        }
-        best.map(|(s, _)| s)
+    fn lru_resident(&self, tick: Tick) -> Option<usize> {
+        self.cache.lru_resident(tick).map(SlotId::index)
     }
 
-    /// Evict the LRU expert (not used in `tick`) out of the map. Its slot
-    /// is quarantined at `epoch` — every reader encoded so far is in an
-    /// epoch at most `epoch` — or deferred while a device plan is open.
+    /// Evict the LRU expert (not used in `tick`) out of the map; its slot
+    /// quarantined at `epoch`, or deferred while a device plan is open.
     /// Returns the expert evicted.
-    fn evict_lru(&mut self, tick: u64, epoch: u64, plan_open: bool) -> Option<u32> {
-        let s = self.lru_resident(tick)?;
-        let e = self.uninstall(s);
-        if plan_open {
-            self.deferred.push(s as u32);
-        } else {
-            self.quarantine.quarantine_one(epoch, s as u32);
-        }
-        Some(e)
+    fn evict_lru(&mut self, tick: Tick, epoch: Epoch, plan_open: bool) -> Option<u32> {
+        self.cache.evict_lru(tick, epoch, plan_open).map(|e| e.0)
     }
 
     /// The device plans are settled: every reader of a slot evicted while
     /// one was open is encoded now, in an epoch at most `epoch`.
-    fn release_deferred(&mut self, epoch: u64) {
-        for s in self.deferred.drain(..) {
-            self.quarantine.quarantine_one(epoch, s);
-        }
-    }
-
-    /// Empty slot `slot`, returning the expert it held.
-    fn uninstall(&mut self, slot: usize) -> u32 {
-        let old = self.expert_in[slot];
-        if old != NONE {
-            self.slot_of[old as usize] = NONE;
-        }
-        self.expert_in[slot] = NONE;
-        self.inflight[slot] = 0;
-        old
+    fn release_deferred(&mut self, epoch: Epoch) {
+        self.cache.release_deferred(epoch)
     }
 
     pub fn n_slots(&self) -> usize {
-        self.expert_in.len()
+        self.cache.n_slots()
     }
 
     /// The slot holding expert `e`, if resident.
     pub fn slot_of(&self, e: usize) -> Option<usize> {
-        match self.slot_of[e] {
-            NONE => None,
-            s => Some(s as usize),
-        }
+        self.cache.slot_of(ExpertId(e as u32)).map(SlotId::index)
+    }
+
+    /// The expert in `slot`, or `NONE`.
+    fn expert_in(&self, slot: usize) -> u32 {
+        self.cache
+            .key_in(SlotId(slot as u32))
+            .map(|e| e.0)
+            .unwrap_or(NONE)
     }
 
     /// Resident experts, in slot order.
     pub fn resident(&self) -> Vec<u32> {
-        self.expert_in
-            .iter()
-            .copied()
-            .filter(|&e| e != NONE)
-            .collect()
+        self.cache.resident().into_iter().map(|e| e.0).collect()
+    }
+
+    /// The expert → slot table as the device reads it.
+    fn slot_table(&self) -> &[u32] {
+        self.cache.slot_table()
     }
 
     /// Open a new use epoch (one per `ensure`).
-    fn begin(&mut self) -> u64 {
-        self.tick += 1;
-        self.tick
+    fn begin(&mut self) -> Tick {
+        self.cache.begin()
     }
 
-    fn touch(&mut self, slot: usize, tick: u64) {
-        self.last_use[slot] = tick;
+    fn tick(&self) -> Tick {
+        self.cache.tick()
     }
 
-    /// The least-recently-used unpinned slot not used in epoch `tick`, and
-    /// whether it held an expert (an eviction). An in-flight slot is taken
-    /// only when no other is (the IO queue is in order, so the second load
-    /// lands after the first; the hint's bytes were read for nothing).
-    fn victim(&self, tick: u64) -> Option<(usize, bool)> {
-        self.victim_settled(tick, u64::MAX)
+    fn touch(&mut self, slot: usize, tick: Tick) {
+        self.cache.touch(SlotId(slot as u32), tick)
     }
 
-    /// [`Self::victim`] preferring a slot whose last GPU reader's epoch is
-    /// below `settled_before` (the pool clock's completed count): a direct
-    /// read into it waits for nothing. Falls back to any slot.
-    fn victim_settled(&self, tick: u64, settled_before: u64) -> Option<(usize, bool)> {
-        self.victim_in(tick, true, settled_before)
-            .or_else(|| self.victim_in(tick, true, u64::MAX))
-            .or_else(|| self.victim_in(tick, false, u64::MAX))
+    /// [`SlotCache::victim_settled`].
+    fn victim_settled(&self, tick: Tick, settled_before: Completed) -> Option<(usize, bool)> {
+        self.cache
+            .victim_settled(tick, settled_before)
+            .map(|(s, e)| (s.index(), e))
     }
 
-    /// [`Self::victim`] over the slots not in flight (`skip_inflight`) or
-    /// over all of them, and with a last reader's epoch below
-    /// `settled_before`.
+    /// [`SlotCache::victim_in`].
     fn victim_in(
         &self,
-        tick: u64,
+        tick: Tick,
         skip_inflight: bool,
-        settled_before: u64,
+        settled_before: Completed,
     ) -> Option<(usize, bool)> {
-        let mut best: Option<(usize, u64)> = None;
-        for s in 0..self.expert_in.len() {
-            if self.pinned[s]
-                || self.last_use[s] == tick
-                || (skip_inflight && self.inflight[s] != 0)
-                || self.reader_epoch(s) >= settled_before
-            {
-                continue;
-            }
-            // An empty slot wins outright.
-            if self.expert_in[s] == NONE {
-                return Some((s, false));
-            }
-            match best {
-                Some((_, t)) if t <= self.last_use[s] => {}
-                _ => best = Some((s, self.last_use[s])),
-            }
-        }
-        best.map(|(s, _)| (s, true))
+        self.cache
+            .victim_in(tick, skip_inflight, settled_before)
+            .map(|(s, e)| (s.index(), e))
     }
 
     /// The epoch of slot `s`'s last GPU reader or writer.
-    fn reader_epoch(&self, s: usize) -> u64 {
-        self.last_epoch[s].max(self.plan_epoch)
+    fn reader_epoch(&self, s: usize) -> Epoch {
+        self.cache.reader_epoch(SlotId(s as u32))
+    }
+
+    /// Slot `s` was read or written by a command buffer in `epoch`.
+    fn stamp(&mut self, s: usize, epoch: Epoch) {
+        self.cache.stamp(SlotId(s as u32), epoch)
     }
 
     /// A device plan in epoch `epoch` may read every slot.
-    fn plan_read_all(&mut self, epoch: u64) {
-        self.plan_epoch = self.plan_epoch.max(epoch);
+    fn plan_read_all(&mut self, epoch: Epoch) {
+        self.cache.plan_read_all(epoch)
+    }
+
+    /// The epoch of the last device plan.
+    fn plan_epoch(&self) -> Epoch {
+        self.cache.plan_epoch()
+    }
+
+    /// Slots in service ([`SlotCache::active`]).
+    fn active(&self) -> usize {
+        self.cache.active()
+    }
+
+    /// [`SlotCache::shrink_to`]: the experts to evict from the slots
+    /// leaving service.
+    fn shrink_to(&mut self, active: usize, floor: usize) -> Vec<u32> {
+        self.cache
+            .shrink_to(active, floor)
+            .into_iter()
+            .map(|e| e.0)
+            .collect()
+    }
+
+    /// [`SlotCache::grow_to`]: the slots brought back into service.
+    fn grow_to(&mut self, active: usize) -> Vec<SlotId> {
+        self.cache.grow_to(active)
+    }
+
+    /// [`SlotCache::settled_past_active`].
+    fn settled_past_active(&self) -> bool {
+        self.cache.settled_past_active()
+    }
+
+    /// Evict the expert in `slot` ([`SlotCache::evict`]).
+    fn evict(&mut self, slot: usize, epoch: Epoch, plan_open: bool) -> Option<u32> {
+        self.cache
+            .evict(SlotId(slot as u32), epoch, plan_open)
+            .map(|e| e.0)
     }
 
     fn install(&mut self, slot: usize, e: usize) {
-        let old = self.expert_in[slot];
-        if old != NONE {
-            self.slot_of[old as usize] = NONE;
-        }
-        self.expert_in[slot] = e as u32;
-        self.slot_of[e] = slot as u32;
-        self.inflight[slot] = 0;
+        self.cache.install(SlotId(slot as u32), ExpertId(e as u32))
+    }
+
+    fn inflight(&self, slot: usize) -> u64 {
+        self.cache.inflight(SlotId(slot as u32))
+    }
+
+    fn set_inflight(&mut self, slot: usize, value: u64) {
+        self.cache.set_inflight(SlotId(slot as u32), value)
     }
 
     /// Slots whose expert is in flight (an `io` hint not yet waited for).
     pub fn inflight_count(&self) -> usize {
-        self.inflight.iter().filter(|&&v| v != 0).count()
+        self.cache.inflight_count()
     }
 
     /// Forget the in-flight state of every slot whose loads landed (event
     /// value ≤ `done`): a landed expert is a resident like any other.
     /// Returns how many.
     fn settle_inflight(&mut self, done: u64) -> u64 {
-        let mut n = 0;
-        for v in self.inflight.iter_mut() {
-            if *v != 0 && *v <= done {
-                *v = 0;
-                n += 1;
-            }
-        }
-        n
+        self.cache.settle_inflight(done)
     }
 
     fn set_pinned(&mut self, slot: usize, pinned: bool) {
-        self.pinned[slot] = pinned;
+        self.cache.set_pinned(SlotId(slot as u32), pinned)
+    }
+
+    fn is_pinned(&self, slot: usize) -> bool {
+        self.cache.is_pinned(SlotId(slot as u32))
     }
 
     pub fn pinned_count(&self) -> usize {
-        self.pinned.iter().filter(|&&p| p).count()
+        self.cache.pinned_count()
     }
 
-    /// Slots a load can take without evicting: holding no expert (the
-    /// in-place arm), or free with its last reader complete (the
-    /// quarantined arm — an evicted slot still quarantined is not).
+    /// Slots a load can take without evicting (the arm's rule,
+    /// [`SlotCache::free_slots`]).
     pub fn free_slots(&self) -> usize {
-        if self.quarantined() {
-            return self.free.len();
-        }
-        self.expert_in.iter().filter(|&&e| e == NONE).count()
+        self.cache.free_slots()
     }
 }
 
@@ -961,6 +901,20 @@ pub struct StreamCounters {
     pub inplace_takes: AtomicU64,
     pub quarantined: AtomicU64,
     pub recycled: AtomicU64,
+    /// H1 (`profiles-and-memory-design.md` §4.7): routed kernels of a
+    /// device-planned pass encoded in a later command buffer than the plan's
+    /// — the slots' reader epoch moved up to the kernel's.
+    pub h1_restamps: AtomicU64,
+    /// H2: a load on the in-place arm that would have evicted a resident
+    /// slot while a device plan was open, refused.
+    pub h2_refusals: AtomicU64,
+    /// H3: live-table writes deferred while a device plan was open,
+    /// published at its settle.
+    pub h3_deferred_writes: AtomicU64,
+    /// Reallocations of the slot pools under the arbiter's yield (§4.2):
+    /// shrinks and grows, and the bytes the shrinks released.
+    pub slot_reallocations: AtomicU64,
+    pub slot_bytes_released: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -1006,6 +960,11 @@ pub struct StreamStats {
     pub inplace_takes: u64,
     pub quarantined: u64,
     pub recycled: u64,
+    pub h1_restamps: u64,
+    pub h2_refusals: u64,
+    pub h3_deferred_writes: u64,
+    pub slot_reallocations: u64,
+    pub slot_bytes_released: u64,
 }
 
 impl StreamCounters {
@@ -1037,6 +996,11 @@ impl StreamCounters {
             inplace_takes: self.inplace_takes.load(Ordering::Relaxed),
             quarantined: self.quarantined.load(Ordering::Relaxed),
             recycled: self.recycled.load(Ordering::Relaxed),
+            h1_restamps: self.h1_restamps.load(Ordering::Relaxed),
+            h2_refusals: self.h2_refusals.load(Ordering::Relaxed),
+            h3_deferred_writes: self.h3_deferred_writes.load(Ordering::Relaxed),
+            slot_reallocations: self.slot_reallocations.load(Ordering::Relaxed),
+            slot_bytes_released: self.slot_bytes_released.load(Ordering::Relaxed),
         }
     }
 }
@@ -1063,6 +1027,11 @@ impl std::ops::AddAssign for StreamStats {
         self.inplace_takes += o.inplace_takes;
         self.quarantined += o.quarantined;
         self.recycled += o.recycled;
+        self.h1_restamps += o.h1_restamps;
+        self.h2_refusals += o.h2_refusals;
+        self.h3_deferred_writes += o.h3_deferred_writes;
+        self.slot_reallocations += o.slot_reallocations;
+        self.slot_bytes_released += o.slot_bytes_released;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -1153,6 +1122,10 @@ struct Inner {
     /// the device-side plan; rebuilt after a settle that loaded.
     table: Option<Tensor>,
     table_stale: bool,
+    /// H3: live-table writes made while a device plan was open, published
+    /// when the last one settles — a plan in flight reads the table it was
+    /// built on.
+    live_pending: Vec<(u32, u32)>,
     /// The `pread` arm's staging ring on Metal (reused once its copy's
     /// command buffer completes; never a pool bucket, never a wait) — one
     /// ring shared by every layer of the tier when built by the loader.
@@ -1162,7 +1135,7 @@ struct Inner {
     /// dispatches are not all encoded yet (`down` closes it): the `io` arm's
     /// hint between the two must not give its slots away — the load is
     /// ordered after what IS encoded, nothing orders it after what is not.
-    open_epoch: Option<u64>,
+    open_epoch: Option<Tick>,
     /// That group's slots: stamped with the GPU epoch at `down` (their last
     /// reader's command buffer), for the direct read's wait.
     open_slots: Vec<usize>,
@@ -1187,7 +1160,7 @@ struct Inner {
     live: Option<LiveTable>,
     /// Entries whose bytes land by a copy encoded while a device plan was
     /// open: stored once the copy's epoch is complete.
-    landing: lloom_tensor::kv_pages::EpochQuarantine<(u32, u32)>,
+    landing: Retire<(u32, u32)>,
     landed_scratch: Vec<(u32, u32)>,
     /// A one-row host plan's buffers (Metal), kept for the tier's life so a
     /// decode step asks no pool for them (`DESIGN.md` §9.2aa): the routing
@@ -1213,12 +1186,12 @@ struct DecodeIo {
     slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
     /// The epoch of the command buffer the slot ids' last readers were
     /// encoded into (`down` stamps it), or `BUSY` from the write until then.
-    slots_read_at: Option<u64>,
+    slots_read_at: Option<Epoch>,
 }
 
 /// [`DecodeIo::slots_read_at`] between a write and its group's `down`.
 #[cfg(feature = "metal")]
-const BUSY: u64 = u64::MAX;
+const BUSY: Epoch = Epoch(u64::MAX);
 
 #[cfg(feature = "metal")]
 impl Inner {
@@ -1380,6 +1353,62 @@ impl LiveTable {
 }
 
 impl Inner {
+    /// Allocate the three plane pools at `active` slots and carry the
+    /// first `keep` slots' planes over (a blit on Metal; on the CPU the
+    /// pools come back empty and the caller evicts everything). The old
+    /// pools drop here: their handles' reservations leave the ledger at
+    /// once, the residency set forgets them at the next cut. Returns the
+    /// pools' bytes before and after.
+    fn reallocate_pools(&mut self, active: usize, keep: usize) -> Result<(usize, usize)> {
+        let before: usize = self
+            .pools
+            .iter()
+            .map(|p| p.qt.storage_size_in_bytes())
+            .sum();
+        let mut fresh = Vec::with_capacity(3);
+        for (i, src) in self.sources.iter().enumerate() {
+            let (n, k) = src.dims();
+            let qt = QTensor::zeros_persistent_with(
+                (active, n, k),
+                src.dtype(),
+                &self.device,
+                self.direct,
+            )?;
+            #[cfg(not(feature = "metal"))]
+            let _ = keep;
+            #[cfg(feature = "metal")]
+            if let Device::Metal(m) = &self.device {
+                let bytes = keep * self.pools[i].plane_bytes;
+                if bytes > 0 {
+                    let (old, new) = (self.pools[i].qt.metal_buffer()?, qt.metal_buffer()?);
+                    let mut blit = m.blit_command_encoder()?;
+                    blit.set_label("slot pools reallocated");
+                    blit.copy_from_buffer(old, 0, new, 0, bytes);
+                }
+            }
+            fresh.push(SlotPool {
+                qt,
+                plane_bytes: self.pools[i].plane_bytes,
+            });
+        }
+        // The copies are encoded on the queue, which retains the old pools
+        // until they run; the handles may drop now (their reservations
+        // leave the ledger at once, the residency set forgets them at the
+        // next cut). No wait here: the tier never drains the device
+        // (`qwen4exp_eviction_no_drain`); the yield's one host wait is the
+        // admission's, before it asks (`Qwen4Exp::apply_expert_grant`).
+        let fresh: [SlotPool; 3] = fresh
+            .try_into()
+            .map_err(|_| lloom_tensor::Error::Msg("three slot pools".into()))?;
+        self.pools = fresh;
+        let after: usize = self
+            .pools
+            .iter()
+            .map(|p| p.qt.storage_size_in_bytes())
+            .sum();
+        Ok((before, after))
+    }
+
     /// Store the landed entries whose copies' epochs have completed (and
     /// whose expert is still in that slot).
     fn store_landed(&mut self) {
@@ -1388,7 +1417,7 @@ impl Inner {
         }
         let done = self.completed_epochs();
         let mut ready = std::mem::take(&mut self.landed_scratch);
-        self.landing.drain_completed_into(done, &mut ready);
+        self.landing.drain_into(done, &mut ready);
         for &(e, slot) in &ready {
             if self.map.slot_of(e as usize) == Some(slot as usize) {
                 self.table_set(e, slot);
@@ -1402,9 +1431,36 @@ impl Inner {
     /// live, else by marking it for a rebuild.
     fn table_set(&mut self, e: u32, slot: u32) {
         match &self.live {
-            Some(t) => t.store(e as usize, slot),
+            Some(_) if self.plans_open > 0 => {
+                // H3: a device plan in flight reads this table on the GPU;
+                // the write waits for its settle.
+                self.live_pending.push((e, slot));
+            }
+            Some(t) => {
+                debug_assert_eq!(
+                    self.plans_open, 0,
+                    "H3: a live-table write under an open plan"
+                );
+                t.store(e as usize, slot)
+            }
             None => self.table_stale = true,
         }
+    }
+
+    /// Every device plan has settled: deferred evictions retire at this
+    /// epoch (H2) and the live-table writes made under the plans are
+    /// published (H3). Returns the writes published.
+    fn plans_settled(&mut self) -> u64 {
+        let epoch = self.current_epoch();
+        self.map.release_deferred(epoch);
+        let n = self.live_pending.len() as u64;
+        if let Some(t) = &self.live {
+            for &(e, slot) in &self.live_pending {
+                t.store(e as usize, slot);
+            }
+        }
+        self.live_pending.clear();
+        n
     }
 }
 
@@ -1589,7 +1645,7 @@ impl Streamed {
         // still pending would zero what the read landed.
         let mut map = ResidencyMap::new(n_experts, n_slots);
         #[cfg(feature = "metal")]
-        map.plan_read_all(clock.as_ref().map_or(0, |c| c.current_epoch()));
+        map.plan_read_all(clock.as_ref().map_or(Epoch::ZERO, |c| c.current_epoch()));
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 pools,
@@ -1601,6 +1657,7 @@ impl Streamed {
                 staging,
                 table: None,
                 table_stale: true,
+                live_pending: Vec::new(),
                 open_epoch: None,
                 open_slots: Vec::new(),
                 #[cfg(feature = "metal")]
@@ -1610,7 +1667,7 @@ impl Streamed {
                 scratch_missing: Vec::new(),
                 plans_open: 0,
                 live: None,
-                landing: lloom_tensor::kv_pages::EpochQuarantine::new(),
+                landing: Retire::new(),
                 landed_scratch: Vec::new(),
                 #[cfg(feature = "metal")]
                 decode_io: DecodeIo::default(),
@@ -1636,7 +1693,7 @@ impl Streamed {
     /// on Metal's `pread` loader. Only on a pool that has loaded nothing.
     pub fn set_spare_slots(&mut self, k: usize) -> Result<()> {
         let inner = self.inner.get_mut();
-        if inner.map.expert_in.iter().any(|&e| e != NONE) {
+        if inner.map.any_resident() {
             lloom_tensor::bail!("set_spare_slots on a pool that already holds experts")
         }
         inner.map.set_spare(k);
@@ -1655,6 +1712,11 @@ impl Streamed {
     /// Slots kept free (0: the in-place arm).
     pub fn spare_slots(&self) -> usize {
         self.inner.lock().map.spare()
+    }
+
+    /// Bytes of the three planes per slot.
+    pub fn bytes_per_slot(&self) -> usize {
+        self.inner.lock().pools.iter().map(|p| p.plane_bytes).sum()
     }
 
     /// Slots evicted and not yet reusable.
@@ -1843,7 +1905,7 @@ impl Streamed {
 
     /// Make every expert of `experts` resident within epoch `tick`, loading
     /// the misses; returns each one's slot.
-    fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
+    fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: Tick) -> Result<Vec<usize>> {
         let pending = self.resolve_begin(inner, experts, tick, true)?;
         self.resolve_finish(inner, pending)
     }
@@ -1861,7 +1923,7 @@ impl Streamed {
         &self,
         inner: &mut Inner,
         experts: &[u32],
-        tick: u64,
+        tick: Tick,
         replenish: bool,
     ) -> Result<Pending> {
         let mut slots = Vec::with_capacity(experts.len());
@@ -1925,9 +1987,9 @@ impl Streamed {
                 Some(s) => {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "metal")]
-                    if inner.map.inflight[s] != 0 {
-                        wait_value = wait_value.max(inner.map.inflight[s]);
-                        inner.map.inflight[s] = 0;
+                    if inner.map.inflight(s) != 0 {
+                        wait_value = wait_value.max(inner.map.inflight(s));
+                        inner.map.set_inflight(s, 0);
                         self.counters
                             .io_inflight_hits
                             .fetch_add(1, Ordering::Relaxed);
@@ -1948,6 +2010,7 @@ impl Streamed {
                         // A resident slot is written only while no device
                         // plan is open: an open plan's pass may map any.
                         None if inner.map.quarantined() && inner.plans_open > 0 => {
+                            self.counters.h2_refusals.fetch_add(1, Ordering::Relaxed);
                             lloom_tensor::bail!(
                                 "no free slot of {} ({} held) for a load while a device plan is open",
                                 self.n_slots,
@@ -1971,6 +2034,18 @@ impl Streamed {
                             ),
                         },
                         None => match inner.map.victim_settled(tick, settled_before) {
+                            // H2: a device plan in flight may read any slot;
+                            // the in-place arm cannot defer the overwrite, so
+                            // it refuses, as the quarantined arm does above.
+                            Some((s, true)) if inner.plans_open > 0 => {
+                                self.counters.h2_refusals.fetch_add(1, Ordering::Relaxed);
+                                lloom_tensor::bail!(
+                                    "no empty slot of {} for a load while a device plan is open \
+                                     (slot {s} holds expert {}, which the plan may read)",
+                                    self.n_slots,
+                                    inner.map.expert_in(s)
+                                )
+                            }
                             Some(v) => v,
                             None => lloom_tensor::bail!(
                                 "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
@@ -1982,11 +2057,12 @@ impl Streamed {
                     };
                     if evicted {
                         // The victim's entry goes before its slot is written.
-                        let old = inner.map.expert_in[s];
+                        debug_assert_eq!(inner.plans_open, 0, "H2: an eviction under an open plan");
+                        let old = inner.map.expert_in(s);
                         inner.table_set(old, NONE);
                     }
                     installed.push((e as u32, s as u32));
-                    if inner.map.inflight[s] != 0 {
+                    if inner.map.inflight(s) != 0 {
                         self.counters
                             .io_inflight_wasted
                             .fetch_add(1, Ordering::Relaxed);
@@ -2013,7 +2089,7 @@ impl Streamed {
         if replenish && inner.map.quarantined() && !installed.is_empty() {
             let epoch = inner.current_epoch();
             let open = inner.plans_open > 0;
-            while inner.map.free.len() + inner.map.held() < inner.map.spare() {
+            while inner.map.free_len() + inner.map.held() < inner.map.spare() {
                 let Some(old) = inner.map.evict_lru(tick, epoch, open) else {
                     break;
                 };
@@ -2062,7 +2138,7 @@ impl Streamed {
                     let (now, later): (Vec<_>, Vec<_>) = misses
                         .iter()
                         .copied()
-                        .partition(|&(_, s)| inner.map.reader_epoch(s) < settled);
+                        .partition(|&(_, s)| settled.covers(inner.map.reader_epoch(s)));
                     misses = later;
                     let mut jobs = Vec::with_capacity(now.len());
                     let mut bytes = 0u64;
@@ -2229,7 +2305,7 @@ impl Streamed {
             if inner.plans_open == 0 || direct_landed.contains(&e) {
                 inner.table_set(e, slot);
             } else {
-                inner.landing.quarantine_one(epoch, (e, slot));
+                inner.landing.retire(epoch, (e, slot));
             }
         }
     }
@@ -2282,8 +2358,8 @@ impl Streamed {
         // for the later groups runs between the two) is protected: its
         // slots are never victims. Any other epoch's dispatches are encoded
         // and the load is ordered after them.
-        let tick = inner.map.tick;
-        let protect = inner.open_epoch.unwrap_or(u64::MAX);
+        let tick = inner.map.tick();
+        let protect = inner.open_epoch.unwrap_or(Tick::NEVER);
         let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(experts.len());
         for &e in experts {
             let e = e as usize;
@@ -2304,7 +2380,7 @@ impl Streamed {
                     None => break,
                 }
             } else {
-                let Some((s, false)) = inner.map.victim_in(protect, true, u64::MAX) else {
+                let Some((s, false)) = inner.map.victim_in(protect, true, Completed::ALL) else {
                     break;
                 };
                 s
@@ -2312,7 +2388,7 @@ impl Streamed {
             inner.map.install(s, e);
             // In flight from here (the value below once issued), so the
             // next pick of this loop skips it.
-            inner.map.inflight[s] = u64::MAX;
+            inner.map.set_inflight(s, u64::MAX);
             inner.map.touch(s, tick);
             chosen.push((e, s));
         }
@@ -2345,7 +2421,7 @@ impl Streamed {
                 .map_err(lloom_tensor::Error::wrap)?
         };
         for &(_, s) in &chosen {
-            inner.map.inflight[s] = value;
+            inner.map.set_inflight(s, value);
         }
         inner.table_stale = true;
         self.counters
@@ -2403,7 +2479,10 @@ impl Streamed {
         let mut ring = ring.lock();
         let n = landed.len() as u64;
         let mut bytes = 0u64;
-        let epoch = clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
+        let epoch = clock
+            .as_ref()
+            .map(|c| c.current_epoch())
+            .unwrap_or(Epoch::ZERO);
         for (_, s, st) in landed {
             for (i, pool) in pools.iter_mut().enumerate() {
                 let plane = pool.plane_bytes;
@@ -2413,7 +2492,7 @@ impl Streamed {
                 bytes += plane as u64;
             }
             // The copy writes the slot in this command buffer.
-            map.last_epoch[s] = epoch;
+            map.stamp(s, epoch);
         }
         drop(ring);
         self.counters
@@ -2432,7 +2511,7 @@ impl Streamed {
         // buffer (the copy, or the IO load ordered into it).
         let epoch = inner.current_epoch();
         for &(_, s) in misses {
-            inner.map.last_epoch[s] = epoch;
+            inner.map.stamp(s, epoch);
         }
         match inner.loader.clone() {
             LoaderArm::Pread => {
@@ -2573,8 +2652,10 @@ impl Streamed {
             // so a slot evicted while it was open outlives the current epoch.
             inner.plans_open = inner.plans_open.saturating_sub(1);
             if inner.plans_open == 0 {
-                let epoch = inner.current_epoch();
-                inner.map.release_deferred(epoch);
+                let n = inner.plans_settled();
+                self.counters
+                    .h3_deferred_writes
+                    .fetch_add(n, Ordering::Relaxed);
             }
         }
         let accepted = accepted.min(rec.rows);
@@ -2630,10 +2711,15 @@ impl Streamed {
         let (capacity, pinned) = {
             let inner = self.inner.lock();
             let pinned: Vec<bool> = (0..self.n_experts)
-                .map(|e| inner.map.slot_of(e).is_some_and(|s| inner.map.pinned[s]))
+                .map(|e| inner.map.slot_of(e).is_some_and(|s| inner.map.is_pinned(s)))
                 .collect();
-            let capacity = self
-                .n_slots
+            // The slots in service (`active`, not the pool's size): after a
+            // shrink a group planned at the old width cannot be served
+            // (measured: the first yield run refused a 316-wide prefill
+            // group in a pool shrunk below it, #892 A5).
+            let capacity = inner
+                .map
+                .active()
                 .saturating_sub(inner.map.pinned_count() + inner.map.spare())
                 .max(1);
             (capacity, pinned)
@@ -2699,29 +2785,32 @@ fn escape_guard() -> Option<()> {
 impl Inner {
     /// Epochs the pool clock shows complete (`u64::MAX` off Metal: nothing
     /// to wait for).
-    fn completed_epochs(&self) -> u64 {
+    fn completed_epochs(&self) -> Completed {
         #[cfg(feature = "metal")]
         {
             self.clock
                 .as_ref()
                 .map(|c| c.completed_count())
-                .unwrap_or(u64::MAX)
+                .unwrap_or(Completed::ALL)
         }
         #[cfg(not(feature = "metal"))]
         {
-            u64::MAX
+            Completed::ALL
         }
     }
 
     /// The pool clock's current epoch (0 off Metal).
-    fn current_epoch(&self) -> u64 {
+    fn current_epoch(&self) -> Epoch {
         #[cfg(feature = "metal")]
         {
-            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
+            self.clock
+                .as_ref()
+                .map(|c| c.current_epoch())
+                .unwrap_or(Epoch::ZERO)
         }
         #[cfg(not(feature = "metal"))]
         {
-            0
+            Epoch::ZERO
         }
     }
 }
@@ -2927,8 +3016,10 @@ impl Streamed {
         // so a slot evicted while it was open outlives the current epoch.
         inner.plans_open = inner.plans_open.saturating_sub(1);
         if inner.plans_open == 0 {
-            let epoch = inner.current_epoch();
-            inner.map.release_deferred(epoch);
+            let n = inner.plans_settled();
+            self.counters
+                .h3_deferred_writes
+                .fetch_add(n, Ordering::Relaxed);
         }
         let mut distinct = std::mem::take(&mut inner.scratch_ids);
         let mut missing = std::mem::take(&mut inner.scratch_missing);
@@ -2993,7 +3084,7 @@ impl Streamed {
                 t0: std::time::Instant::now(),
             }));
         }
-        if inner.completed_epochs() < inner.current_epoch() {
+        if inner.completed_epochs().0 < inner.current_epoch().0 {
             self.counters
                 .settle_clock_lag
                 .fetch_add(1, Ordering::Relaxed);
@@ -3029,7 +3120,11 @@ impl Streamed {
             return Ok(t.tensor.clone());
         }
         if inner.table_stale || inner.table.is_none() {
-            let t = Tensor::from_vec(inner.map.slot_of.clone(), self.n_experts, &inner.device)?;
+            let t = Tensor::from_vec(
+                inner.map.slot_table().to_vec(),
+                self.n_experts,
+                &inner.device,
+            )?;
             inner.table = Some(t);
             inner.table_stale = false;
         }
@@ -3037,7 +3132,145 @@ impl Streamed {
     }
 }
 
+impl Streamed {
+    /// H1: a device-planned pass's routed kernels read slots the host does
+    /// not know; the plan stamped every slot with the plan's epoch, and a
+    /// kernel encoded after a command-buffer cut reads in a later one. The
+    /// kernel stamps its own.
+    fn stamp_device_plan_readers(&self, inner: &mut Inner) {
+        if inner.plans_open == 0 {
+            return;
+        }
+        let epoch = inner.current_epoch();
+        if epoch > inner.map.plan_epoch() {
+            self.counters.h1_restamps.fetch_add(1, Ordering::Relaxed);
+            inner.map.plan_read_all(epoch);
+        }
+        debug_assert!(
+            inner.map.plan_epoch() >= epoch,
+            "H1: a routed kernel outran its stamp"
+        );
+    }
+}
+
 impl ExpertResidency for Streamed {
+    /// Slots in service (`profiles-and-memory-design.md` §4.2, the expert
+    /// pool as an elastic tenant): `0..active` of the pool's `n_slots`.
+    fn active_slots(&self) -> usize {
+        self.inner.lock().map.active()
+    }
+
+    /// Shrink the slots in service to `active` (never below `floor`): the
+    /// experts in the slots leaving service are evicted at their last
+    /// reader's epoch, which the clock must already show complete — the
+    /// caller waits the queue out first, on the refusal path alone
+    /// (§21.13; the tier itself never drains the device,
+    /// `qwen4exp_eviction_no_drain`) — and the three plane pools are
+    /// reallocated at `active` slots with the kept slots' planes carried
+    /// over: the old pools' reservations leave the ledger. The cached pass
+    /// plans, which bound the old pools, are dropped. Returns the bytes
+    /// released. Refused while a device plan is open, a load is in flight,
+    /// or a slot leaving service still has a reader the clock has not
+    /// completed.
+    fn shrink_slots(&self, active: usize, floor: usize) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        if inner.plans_open > 0 {
+            lloom_tensor::bail!("shrink_slots while a device plan is open")
+        }
+        if inner.map.inflight_count() > 0 {
+            lloom_tensor::bail!(
+                "shrink_slots with {} loads in flight",
+                inner.map.inflight_count()
+            )
+        }
+        let was = inner.map.active();
+        let evict: Vec<u32> = inner.map.shrink_to(active, floor);
+        let active = inner.map.active();
+        if active >= was {
+            return Ok(0);
+        }
+        for e in evict {
+            if let Some(s) = inner.map.slot_of(e as usize) {
+                let epoch = inner.map.reader_epoch(s);
+                inner.map.evict(s, epoch, false);
+                inner.table_set(e, NONE);
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let completed = inner.completed_epochs();
+        inner.map.recycle(completed);
+        let epoch = inner.current_epoch();
+        if !matches!(inner.device, Device::Metal(_)) {
+            // The CPU pools come back empty (no blit): every resident
+            // expert goes.
+            let all: Vec<u32> = inner.map.resident();
+            for e in all {
+                if let Some(s) = inner.map.slot_of(e as usize) {
+                    inner.map.evict(s, epoch, false);
+                    inner.table_set(e, NONE);
+                    self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            inner.map.recycle(Completed::ALL);
+        }
+        if !inner.map.settled_past_active() {
+            // Undone: the slots come back into service with their experts
+            // gone (they are in the quarantine and recycle as usual).
+            inner.map.grow_to(was);
+            lloom_tensor::bail!(
+                "shrink_slots: a slot leaving service still has a reader the clock has not \
+                 completed; wait the queue out first"
+            )
+        }
+        let (before, after) = inner.reallocate_pools(active, active)?;
+        inner.table_stale = true;
+        inner.table = None;
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &inner.device {
+            m.drop_pass_plans();
+        }
+        self.counters
+            .slot_reallocations
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .slot_bytes_released
+            .fetch_add(before.saturating_sub(after) as u64, Ordering::Relaxed);
+        Ok(before.saturating_sub(after))
+    }
+
+    /// Grow the slots in service to `active`: the pools are reallocated
+    /// at `active` slots with every slot in service carried over; the
+    /// slots brought back are empty. Returns the bytes taken.
+    fn grow_slots(&self, active: usize) -> usize {
+        let mut inner = self.inner.lock();
+        let was = inner.map.active();
+        let back = inner.map.grow_to(active);
+        let active = inner.map.active();
+        if active <= was || back.is_empty() && active == was {
+            return 0;
+        }
+        let keep = if matches!(inner.device, Device::Metal(_)) {
+            was
+        } else {
+            0
+        };
+        let realloc = inner.reallocate_pools(active, keep);
+        let taken = match realloc {
+            Ok((before, after)) => after.saturating_sub(before),
+            Err(_) => 0,
+        };
+        inner.table_stale = true;
+        inner.table = None;
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &inner.device {
+            m.drop_pass_plans();
+        }
+        self.counters
+            .slot_reallocations
+            .fetch_add(1, Ordering::Relaxed);
+        taken
+    }
+
     fn plans_on_device(&self) -> bool {
         true
     }
@@ -3061,7 +3294,7 @@ impl ExpertResidency for Streamed {
             // staged expert can only land by evicting one landed in the same
             // pass (measured on an empty pool: 512 asked, 327 slots, the
             // rest read for nothing — issue #749 P19).
-            missing.truncate(self.n_slots.saturating_sub(inner.map.pinned_count()));
+            missing.truncate(inner.map.active().saturating_sub(inner.map.pinned_count()));
             let planes = [
                 inner.sources[0].plane_source(),
                 inner.sources[1].plane_source(),
@@ -3130,7 +3363,7 @@ impl ExpertResidency for Streamed {
             // The named experts first; the usage profile fills what the
             // pool could still take (a 512-token tile needs most of what
             // the router did not name either, P20).
-            let bound = self.n_slots.saturating_sub(inner.map.pinned_count());
+            let bound = inner.map.active().saturating_sub(inner.map.pinned_count());
             if missing.len() < bound {
                 let mut rest: Vec<u32> = (0..self.n_experts as u32)
                     .filter(|&e| {
@@ -3469,11 +3702,19 @@ impl ExpertResidency for Streamed {
         arm: MoeArm,
         act: DType,
     ) -> Result<(Tensor, Tensor)> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         // One launch for the pair on the matmul-vec arm on Metal; two elsewhere.
-        inner.pools[0]
-            .qt
-            .indexed_moe_forward_pair_as(&inner.pools[1].qt, x, slot_ids, arm, act)
+        let out = inner.pools[0].qt.indexed_moe_forward_pair_as(
+            &inner.pools[1].qt,
+            x,
+            slot_ids,
+            arm,
+            act,
+        )?;
+        // H1 (§4.7): the slots this plan reads are stamped with the open
+        // epoch at the dispatch, so a load never writes one under it.
+        self.stamp_device_plan_readers(&mut inner);
+        Ok(out)
     }
 
     fn down(&self, h: &Tensor, slot_ids: &Tensor, arm: MoeArm) -> Result<Tensor> {
@@ -3481,13 +3722,14 @@ impl ExpertResidency for Streamed {
         let y = inner.pools[2]
             .qt
             .indexed_moe_forward_with(h, slot_ids, arm)?;
+        self.stamp_device_plan_readers(&mut inner);
         // The group's last dispatch is encoded: its slots may be given away
         // — to a direct read once this command buffer has run.
         inner.open_epoch = None;
         let epoch = inner.current_epoch();
         let slots = std::mem::take(&mut inner.open_slots);
         for s in slots {
-            inner.map.last_epoch[s] = epoch;
+            inner.map.stamp(s, epoch);
         }
         // The group's slot ids, if they were the tier's own buffer: its last
         // reader is encoded into this epoch's command buffer.
@@ -3812,6 +4054,208 @@ mod tests {
         assert!(inner.map.slot_of(7).is_some() && inner.map.slot_of(8).is_some());
         drop(inner);
         assert!(streamed.stats().evictions > 0);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The elastic surface (§4.2): a shrink takes the top slots out of
+    /// service — their experts evicted, later loads and victims confined to
+    /// the slots in service — and a grow brings them back; the floor holds.
+    #[test]
+    fn a_shrink_parks_the_top_slots_and_a_grow_brings_them_back() {
+        let (e, ff, d, topk) = (10usize, 32usize, 32usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        for spare in [0usize, 1] {
+            let mut streamed = Streamed::new(
+                open(&path, "g"),
+                open(&path, "u"),
+                open(&path, "d"),
+                4,
+                LoaderArm::Pread,
+                &Device::Cpu,
+            )
+            .unwrap();
+            streamed.set_spare_slots(spare).unwrap();
+            let warm: &[u32] = if spare == 0 {
+                &[0, 1, 2, 3]
+            } else {
+                &[0, 1, 2]
+            };
+            assert_eq!(streamed.warm(warm).unwrap(), warm.len());
+            assert_eq!(streamed.active_slots(), 4);
+            // Shrink to two slots (a floor of one): the experts in slots 2..
+            // are evicted and the pools are reallocated at two slots — on
+            // the CPU they come back empty (no blit), so every resident
+            // expert goes; two slots' bytes are released.
+            let per_slot = streamed.bytes_per_slot();
+            let released = streamed.shrink_slots(2, 1).unwrap();
+            assert_eq!(released, 2 * per_slot, "spare {spare}");
+            assert_eq!(streamed.active_slots(), 2);
+            let resident = streamed.inner.lock().map.resident();
+            assert!(resident.is_empty(), "spare {spare}: {resident:?}");
+            let evictions = streamed.stats().evictions;
+            assert!(evictions >= 2, "spare {spare}: {evictions}");
+            // Loads now live in the two slots in service.
+            for t in 0..4 {
+                let id = ids(1, topk, 10, 7 + t);
+                let xs = x(1, d, 0.0);
+                let _ = run(&streamed, &xs, &id);
+            }
+            {
+                let inner = streamed.inner.lock();
+                for e in 0..e {
+                    if let Some(s) = inner.map.slot_of(e) {
+                        assert!(s < 2, "spare {spare}: expert {e} landed in parked slot {s}");
+                    }
+                }
+            }
+            // Never below the floor (`topk + 1 = 3`): a shrink to 1 stops at 3
+            // — which is a grow from 2.
+            assert_eq!(streamed.shrink_slots(1, topk + 1).unwrap(), 0);
+            assert_eq!(streamed.active_slots(), 2, "a shrink never grows");
+            assert_eq!(
+                streamed.grow_slots(4),
+                2 * per_slot,
+                "two slots' bytes taken"
+            );
+            assert_eq!(streamed.active_slots(), 4);
+            assert_eq!(streamed.stats().slot_reallocations, 2);
+            for t in 0..4 {
+                let id = ids(1, topk, 10, 11 + t);
+                let xs = x(1, d, 0.0);
+                let _ = run(&streamed, &xs, &id);
+            }
+            let used: std::collections::BTreeSet<usize> = {
+                let inner = streamed.inner.lock();
+                (0..e).filter_map(|x| inner.map.slot_of(x)).collect()
+            };
+            assert!(
+                used.iter().any(|&s| s >= 2),
+                "spare {spare}: the slots brought back are never used: {used:?}"
+            );
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: a shrink reallocates the plane pools at the smaller slot
+    /// count with the kept slots' planes carried over — the routed output
+    /// of the resident experts is the same bits before and after — and
+    /// the ledger's committed bytes fall by the slots released; a grow
+    /// takes them back.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_shrink_reallocates_the_pools_and_the_ledger_falls_by_the_slots_released() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let (e, ff, d, topk) = (8usize, 32usize, 64usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let per_slot = streamed.bytes_per_slot();
+        assert_eq!(streamed.warm(&[0, 1, 2]).unwrap(), 3);
+        let xs = x(1, d, 0.25).to_device(&dev).unwrap();
+        let id = Tensor::from_vec(vec![0u32, 2], (1, topk), &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let before = run(&streamed, &xs, &id);
+        // The caller's drain (the admission's, on the refusal path): the
+        // tier itself never waits for the device, so the test commits and
+        // completes what is open the way the open-plan test does — a
+        // readback, then the pool clock caught up. (The readback's own
+        // buffer stays on the ledger in the free list: the figure is read
+        // after it.)
+        let clock = m.gpu_clock();
+        Tensor::zeros(1, lloom_tensor::DType::F32, &dev)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        while clock.completed_count().0 < clock.current_epoch().0 {
+            std::thread::yield_now();
+        }
+        let committed = m.ledger().committed();
+        let released = streamed.shrink_slots(3, 1).unwrap();
+        assert_eq!(released, per_slot, "one slot's planes released");
+        assert_eq!(
+            m.ledger().committed() + per_slot,
+            committed,
+            "the old pools' reservations left the ledger"
+        );
+        assert_eq!(streamed.active_slots(), 3);
+        // Experts 0..3 are still resident in slots 0..3: the planes came
+        // over, the output is the same bits.
+        assert_eq!(streamed.inner.lock().map.resident().len(), 3);
+        let after = run(&streamed, &xs, &id);
+        assert_eq!(after, before, "the kept slots' planes moved bit for bit");
+        let stats = streamed.stats();
+        assert_eq!(
+            (stats.slot_reallocations, stats.slot_bytes_released),
+            (1, per_slot as u64)
+        );
+        // A grow takes the slot back; a fourth expert lands in it.
+        assert_eq!(streamed.grow_slots(4), per_slot);
+        assert_eq!(m.ledger().committed(), committed);
+        let id4 = Tensor::from_vec(vec![3u32, 1], (1, topk), &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let _ = run(&streamed, &xs, &id4);
+        assert_eq!(streamed.inner.lock().map.slot_of(3), Some(3));
+        std::fs::remove_file(path).ok();
+    }
+
+    /// After a shrink the host plan groups rows to the slots in service:
+    /// a tile whose rows together name more experts than the shrunk pool
+    /// holds is split into groups that fit, never refused (the first
+    /// yield run on the real model refused a prefill group planned at the
+    /// pool's old width).
+    #[test]
+    fn a_shrunk_pool_plans_its_groups_to_the_slots_in_service() {
+        let (e, ff, d, topk) = (10usize, 32usize, 32usize, 1usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            6,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        // Six rows, six distinct experts: one group in a 6-slot pool.
+        let ids = Tensor::from_vec((0..6u32).collect::<Vec<_>>(), (6, topk), &Device::Cpu).unwrap();
+        assert_eq!(streamed.plan(&ids).unwrap().len(), 1);
+        streamed.shrink_slots(2, 1).unwrap();
+        let groups = streamed.plan(&ids).unwrap();
+        assert_eq!(
+            groups.len(),
+            3,
+            "two slots in service: three groups of two rows"
+        );
+        let xs = x(6, d, 0.5);
+        for g in &groups {
+            let slots = streamed.ensure(g).unwrap();
+            assert_eq!(slots.dims(), &[g.rows.len(), topk]);
+        }
+        let _ = xs;
         std::fs::remove_file(path).ok();
     }
 
@@ -4185,31 +4629,31 @@ mod tests {
         m.install(3, 1);
         m.touch(3, t);
         // Refill the spare: the LRU expert out, its slot held at epoch 10.
-        assert_eq!(m.evict_lru(t, 10, false), Some(5));
+        assert_eq!(m.evict_lru(t, Epoch(10), false), Some(5));
         assert_eq!(m.slot_of(5), None);
         assert_eq!((m.held(), m.free_slots()), (1, 0));
         assert_eq!(
-            m.recycle(10),
+            m.recycle(Completed(10)),
             0,
             "epoch 10 is not finished at a count of 10"
         );
         assert_eq!(m.take_free(), None);
-        assert_eq!(m.recycle(11), 1);
+        assert_eq!(m.recycle(Completed(11)), 1);
         assert_eq!(m.take_free(), Some(0), "the recycled slot");
         // A plan open: the eviction is deferred, not quarantined.
         let t = m.begin();
         m.install(0, 2);
         m.touch(0, t);
-        assert_eq!(m.evict_lru(t, 12, true), Some(6));
+        assert_eq!(m.evict_lru(t, Epoch(12), true), Some(6));
         assert_eq!(m.held(), 1);
         assert_eq!(
-            m.recycle(u64::MAX),
+            m.recycle(Completed::ALL),
             0,
             "a slot evicted under an open plan was recycled before the plan settled"
         );
-        m.release_deferred(20);
-        assert_eq!(m.recycle(20), 0);
-        assert_eq!(m.recycle(21), 1);
+        m.release_deferred(Epoch(20));
+        assert_eq!(m.recycle(Completed(20)), 0);
+        assert_eq!(m.recycle(Completed(21)), 1);
         assert_eq!(m.take_free(), Some(1));
     }
 
@@ -4217,12 +4661,17 @@ mod tests {
     /// between a device plan's slot map and its routed dispatch. The pass P
     /// maps experts a and b and its map has run; the host then loads c and
     /// d before P's experts are encoded. On the in-place arm the second load
-    /// writes d into a slot P maps — P computes on d's bytes and its record
-    /// shows no miss: the corruption is silent (the arm this plants against,
-    /// and the test's non-vacuity). On the quarantined arm c takes the free
-    /// slot, the eviction that refills the spare waits for P's settle, and
-    /// d — with no free slot left and a plan open — is refused: P's output
-    /// is the clean pass's bit for bit.
+    /// would write d into a slot P maps — P would compute on d's bytes and
+    /// its record show no miss, a silent corruption (the hazard H2 names,
+    /// `profiles-and-memory-design.md` §4.7; before #892 this arm did it,
+    /// and this test read the corrupted output as its non-vacuity) — and is
+    /// refused, counted (`h2_refusals`): P's output is the clean pass's bit
+    /// for bit; so is c's, the pool being full. On the quarantined arm c
+    /// takes the free slot, the eviction that refills the spare waits for
+    /// P's settle — and so does its live-table write (H3): the table P's map
+    /// read still holds the evicted expert until the settle publishes the
+    /// write — and d, with no free slot left and a plan open, is refused
+    /// the same way.
     #[cfg(feature = "metal")]
     #[test]
     fn a_load_never_writes_a_slot_an_open_device_plan_maps() {
@@ -4287,7 +4736,7 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            while clock.completed_count() < clock.current_epoch() {
+            while clock.completed_count().0 < clock.current_epoch().0 {
                 std::thread::yield_now();
             }
         };
@@ -4310,36 +4759,110 @@ mod tests {
             let mapped: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
             drain();
             let g = t.plan(&one(c)).unwrap();
-            t.ensure(&g[0]).unwrap();
+            let c_load = t.ensure(&g[0]);
+            // H3, the quarantined arm: c's landing refilled the spare by
+            // evicting a or b under the open plan; the host map says so, the
+            // live table P reads does not — yet.
+            let evicted_entry = (spare == 1).then(|| {
+                let inner = t.inner.lock();
+                let old = [a, b]
+                    .into_iter()
+                    .find(|&x| inner.map.slot_of(x as usize).is_none())
+                    .expect("the replenish evicted a or b");
+                let live = inner
+                    .live
+                    .as_ref()
+                    .expect("the quarantined arm keeps a live table");
+                let v = unsafe {
+                    (live.buf.contents() as *const u32)
+                        .add(old as usize)
+                        .read_volatile()
+                };
+                (old, v)
+            });
             drain();
             let g = t.plan(&one(dd)).unwrap();
             let d_load = t.ensure(&g[0]);
+            // H1: P's routed kernels are encoded now, after the drains' cuts
+            // — in a later command buffer than its slot map; the slots they
+            // read must carry the kernels' epoch, not the plan's.
+            let kernel_epoch = clock.current_epoch();
             let got = routed(&t, &slots);
+            {
+                let inner = t.inner.lock();
+                for &s in &mapped {
+                    assert!(
+                        inner.map.reader_epoch(s as usize) >= kernel_epoch,
+                        "H1: slot {s} is stamped {} under a kernel encoded in {kernel_epoch}",
+                        inner.map.reader_epoch(s as usize)
+                    );
+                }
+                assert!(t.stats().h1_restamps >= 1, "{:?}", t.stats());
+            }
             let flagged = rec.to_vec1::<u32>().unwrap()[2 * topk..]
                 .iter()
                 .any(|&f| f != 0);
             assert!(!flagged, "spare {spare}: P's map ran before any eviction");
             if spare == 0 {
-                assert!(d_load.is_ok(), "the in-place arm loads d");
-                let s_d = t.inner.lock().map.slot_of(dd as usize).unwrap() as u32;
+                // H2 on the in-place arm: every slot is resident, so c and d
+                // could only take a slot by evicting under the open plan, and
+                // the overwrite cannot be deferred in place — refused.
+                for (name, load) in [("c", c_load), ("d", d_load)] {
+                    let err = load
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the in-place arm loaded {name} into a slot under the open plan P"
+                            )
+                        })
+                        .to_string();
+                    assert!(
+                        err.contains("while a device plan is open"),
+                        "the refusal names the open plan: {err}"
+                    );
+                }
+                let inner = t.inner.lock();
+                assert!(inner.map.slot_of(c as usize).is_none());
+                assert!(inner.map.slot_of(dd as usize).is_none());
+                drop(inner);
                 assert!(
-                    mapped.contains(&s_d),
-                    "the plant missed: d landed in slot {s_d}, P maps {mapped:?}"
+                    mapped.iter().all(|s| *s < 3),
+                    "P maps {mapped:?} in a 3-slot pool"
                 );
-                assert_ne!(
-                    got, want,
-                    "d was written into a slot P maps and P computed the clean result: the plant is not a WAR"
-                );
+                assert_eq!(got, want, "a load wrote a slot the open plan P maps");
+                assert_eq!(t.stats().h2_refusals, 2, "{:?}", t.stats());
+                assert!(!t.settle(&rec).unwrap());
             } else {
+                c_load.expect("the quarantined arm loads c into its free slot");
+                let (old, v) = evicted_entry.unwrap();
+                let old_slot = mapped[[a, b].iter().position(|&x| x == old).unwrap()];
+                assert_eq!(
+                    v, old_slot,
+                    "H3: the live table lost expert {old} while P was open"
+                );
                 assert!(
                     d_load.is_err(),
                     "a load with no free slot under an open plan was not refused"
                 );
                 assert_eq!(got, want, "a load wrote a slot the open plan P maps");
                 assert!(!t.settle(&rec).unwrap());
+                // The settle published the deferred write.
+                let v = {
+                    let inner = t.inner.lock();
+                    let live = inner.live.as_ref().unwrap();
+                    unsafe {
+                        (live.buf.contents() as *const u32)
+                            .add(old as usize)
+                            .read_volatile()
+                    }
+                };
+                assert_eq!(v, NONE, "H3: the settle did not publish the eviction");
                 // The warm's a and b, and c: every landing took a free slot.
                 let st = t.stats();
                 assert_eq!((st.free_takes, st.inplace_takes), (3, 0), "{st:?}");
+                // Two writes waited for the settle: the eviction's NONE and
+                // c's own entry.
+                assert_eq!((st.h2_refusals, st.h3_deferred_writes), (1, 2), "{st:?}");
             }
         }
         std::fs::remove_file(path).ok();

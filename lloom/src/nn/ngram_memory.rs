@@ -34,6 +34,7 @@
 //! fails, or a run that ends early, releases every wait it left
 //! ([`FeedLink::release`]) rather than leaving the queue parked.
 
+use crate::nn::slot_cache::{Hashed, ListLru, SlotCache};
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::{GgmlDType, GgmlType};
 use lloom_tensor::{Device, Result, Tensor};
@@ -191,102 +192,43 @@ pub struct CachedRows {
     misses: AtomicU64,
 }
 
-/// Packed rows in `capacity` slots with an intrusive LRU list over the slots
-/// (`prev`/`next` by slot index; `head` most recent, `tail` least).
+/// Packed rows in `capacity` slots: a [`SlotCache`] keyed by the row id
+/// (hashed, the ids are sparse) with the exact-LRU list policy, over the
+/// rows' bytes.
 #[derive(Debug)]
 struct RowLru {
     row_bytes: usize,
-    capacity: usize,
-    slot_of: std::collections::HashMap<i64, u32>,
-    id_in: Vec<i64>,
+    slots: SlotCache<i64, Hashed<i64>, ListLru>,
     bytes: Vec<u8>,
-    prev: Vec<u32>,
-    next: Vec<u32>,
-    head: u32,
-    tail: u32,
-    len: usize,
 }
-
-const NO_SLOT: u32 = u32::MAX;
 
 impl RowLru {
     fn new(row_bytes: usize, capacity: usize) -> Self {
         Self {
             row_bytes,
-            capacity,
-            slot_of: std::collections::HashMap::with_capacity(capacity),
-            id_in: vec![-1; capacity],
+            slots: SlotCache::with(Hashed::with_capacity(capacity), capacity),
             bytes: vec![0; capacity * row_bytes],
-            prev: vec![NO_SLOT; capacity],
-            next: vec![NO_SLOT; capacity],
-            head: NO_SLOT,
-            tail: NO_SLOT,
-            len: 0,
-        }
-    }
-
-    fn unlink(&mut self, s: u32) {
-        let (p, n) = (self.prev[s as usize], self.next[s as usize]);
-        if p == NO_SLOT {
-            self.head = n;
-        } else {
-            self.next[p as usize] = n;
-        }
-        if n == NO_SLOT {
-            self.tail = p;
-        } else {
-            self.prev[n as usize] = p;
-        }
-        self.prev[s as usize] = NO_SLOT;
-        self.next[s as usize] = NO_SLOT;
-    }
-
-    fn push_front(&mut self, s: u32) {
-        self.prev[s as usize] = NO_SLOT;
-        self.next[s as usize] = self.head;
-        if self.head != NO_SLOT {
-            self.prev[self.head as usize] = s;
-        }
-        self.head = s;
-        if self.tail == NO_SLOT {
-            self.tail = s;
         }
     }
 
     fn contains(&self, id: i64) -> bool {
-        self.slot_of.contains_key(&id)
+        self.slots.slot_of(id).is_some()
     }
 
     /// The row's bytes if cached, moved to most-recent.
     fn get(&mut self, id: i64) -> Option<&[u8]> {
-        let s = *self.slot_of.get(&id)?;
-        if self.head != s {
-            self.unlink(s);
-            self.push_front(s);
-        }
-        let start = s as usize * self.row_bytes;
+        let s = self.slots.lookup(id)?;
+        let start = s.index() * self.row_bytes;
         Some(&self.bytes[start..start + self.row_bytes])
     }
 
     /// Insert `row` for `id` (not present), evicting the least recent when
     /// full.
     fn insert(&mut self, id: i64, row: &[u8]) {
-        let s = if self.len < self.capacity {
-            let s = self.len as u32;
-            self.len += 1;
-            s
-        } else {
-            let s = self.tail;
-            self.unlink(s);
-            let old = self.id_in[s as usize];
-            self.slot_of.remove(&old);
-            s
-        };
-        self.id_in[s as usize] = id;
-        self.slot_of.insert(id, s);
-        let start = s as usize * self.row_bytes;
+        let (s, _displaced) = self.slots.claim();
+        let start = s.index() * self.row_bytes;
         self.bytes[start..start + self.row_bytes].copy_from_slice(row);
-        self.push_front(s);
+        self.slots.install(s, id);
     }
 }
 
@@ -1422,8 +1364,13 @@ mod tests {
                 }
                 order.push_front(id);
             }
+            // After each call, not only at the end: the two calls' totals
+            // coincide between LRU and MRU — (0, 7) + (4, 1) and (1, 6) +
+            // (3, 2) both sum to (4, 8) — so a sum-only check cannot tell
+            // the policies apart (found by a displace-the-most-recent
+            // mutant, #892).
+            assert_eq!(cached.stats(), (ref_hits, ref_misses), "after {ids:?}");
         }
-        assert_eq!(cached.stats(), (ref_hits, ref_misses));
         std::fs::remove_file(&path).ok();
     }
 }

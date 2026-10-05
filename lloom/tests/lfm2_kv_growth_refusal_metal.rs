@@ -5,17 +5,24 @@
 //! succeeds once the memory is back and produces the stream an unrefused run
 //! does.
 //!
-//! The refusal is forced honestly rather than by a stub: a raw 256 MiB device
+//! The refusal is forced honestly rather than by a stub: a 256 MiB persistent
 //! buffer is held across the pass while the fraction is set so the budget lies
-//! between the process's allocation with and without it. That is the case the
-//! check exists for — something the cache cannot see ate the memory — and the
-//! control (the same pass with nothing held) is what shows the refusal was the
-//! hog's and not the arithmetic's. The buffer is a raw device allocation, not
-//! a pooled one, because the pool retains what it frees and the process's
-//! allocation would not fall when the hog is dropped.
+//! between the process's committed bytes with and without it. That is the case
+//! the check exists for — something the cache did not allocate ate the memory
+//! — and the control (the same pass with nothing held) is what shows the
+//! refusal was the hog's and not the arithmetic's. The buffer is a persistent
+//! allocation, not a pooled one, because the pool retains what it frees (its
+//! reservation rides the free node) and the committed figure would not fall
+//! when the hog is dropped.
 //!
-//! Own test binary: `currentAllocatedSize` is process-wide, and a sibling test
-//! allocating in another thread would move the figure this reads.
+//! The figure is the ledger's (`profiles-and-memory-design.md` §4.2, #892 A4):
+//! every byte through a backing is a reservation on it, and the admission
+//! decides on `committed`, never on `currentAllocatedSize` — a raw
+//! `Device::new_buffer` beside the backings would not move the verdict
+//! (`ledger::admit_tests::the_verdict_is_the_ledgers_not_the_devices`).
+//!
+//! Own test binary: the ledger is process-wide, and a sibling test allocating
+//! in another thread would move the figure this reads.
 
 #![cfg(feature = "metal")]
 
@@ -149,7 +156,7 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     // The budget: halfway between the process's allocation now and that plus
     // the hog. A grow of this model is a few hundred bytes, so the hog decides.
     let working_set = raw.recommended_max_working_set_size();
-    let baseline = raw.current_allocated_size();
+    let baseline = metal.ledger().committed();
     let fraction = (baseline + HOG_BYTES / 2) as f64 / working_set as f64;
     let budget = kv_grow_budget(working_set, fraction);
     assert!(budget > baseline && budget < baseline + HOG_BYTES);
@@ -177,13 +184,11 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     let phase = cache.conv_phase();
 
     // Step 2 needs a grow (7 > 6). Hold the memory and ask.
-    let hog = raw
-        .new_buffer(HOG_BYTES, lloom_tensor::kernels::RESOURCE_OPTIONS)
-        .map_err(lloom_tensor::Error::wrap)?;
-    let held = raw.current_allocated_size();
+    let hog = metal.new_persistent_private(HOG_BYTES)?;
+    let held = metal.ledger().committed();
     assert!(
         held >= baseline + HOG_BYTES,
-        "the device does not account the hog: {held} < {baseline} + {HOG_BYTES}"
+        "the ledger does not account the hog: {held} < {baseline} + {HOG_BYTES}"
     );
     let err = step(&model, &mut cache, next2, pos, &dev)
         .err()
@@ -210,7 +215,7 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
 
     // Free the memory: the same call is admitted, and the slab is 8.
     drop(hog);
-    let released = raw.current_allocated_size();
+    let released = metal.ledger().committed();
     assert!(
         released < budget,
         "the hog did not release: {released} against a budget of {budget}"

@@ -68,6 +68,7 @@
 use super::cache_pad::CachePadded;
 use super::contention::{Access, Censused, Contention, Side};
 use super::Buffer;
+use crate::retire::{Completed, Epoch, Retire};
 use std::collections::BTreeMap;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -201,15 +202,15 @@ impl GpuClock {
     }
 
     /// The epoch a buffer dropped right now must outlive.
-    pub fn current_epoch(&self) -> u64 {
-        self.submitted.load(Ordering::Acquire)
+    pub fn current_epoch(&self) -> Epoch {
+        Epoch(self.submitted.load(Ordering::Acquire))
     }
 
     /// Opens a new epoch, because the command buffer holding the old one has
     /// been committed. Returns the epoch just closed -- the one whose
     /// completion handler should report back to [`Self::mark_completed`].
-    pub fn commit_epoch(&self) -> u64 {
-        self.submitted.fetch_add(1, Ordering::AcqRel)
+    pub fn commit_epoch(&self) -> Epoch {
+        Epoch(self.submitted.fetch_add(1, Ordering::AcqRel))
     }
 
     /// Records that the GPU has finished epoch `epoch`.
@@ -222,18 +223,18 @@ impl GpuClock {
     /// different command buffers may be delivered on different threads;
     /// in-order execution guarantees the ordering of the *work*, not of the
     /// notification.
-    pub fn mark_completed(&self, epoch: u64) {
-        self.completed.fetch_max(epoch + 1, Ordering::AcqRel);
+    pub fn mark_completed(&self, epoch: Epoch) {
+        self.completed.fetch_max(epoch.0 + 1, Ordering::AcqRel);
     }
 
     /// How many epochs have finished. Zero means none have.
-    pub fn completed_count(&self) -> u64 {
-        self.completed.load(Ordering::Acquire)
+    pub fn completed_count(&self) -> Completed {
+        Completed(self.completed.load(Ordering::Acquire))
     }
 
     /// Whether work encoded in `epoch` is known to have finished.
-    pub fn is_complete(&self, epoch: u64) -> bool {
-        self.completed_count() > epoch
+    pub fn is_complete(&self, epoch: Epoch) -> bool {
+        self.completed_count().covers(epoch)
     }
 }
 
@@ -261,6 +262,11 @@ pub struct PooledBuffer {
     /// `Weak` so a leaked buffer cannot keep the whole device alive, and so a
     /// buffer outliving its pool drops cleanly instead of resurrecting it.
     pool: Weak<PoolInner>,
+
+    /// The ledger's record of an unpooled buffer's bytes, released with it
+    /// (`ledger.rs`). `None` for a pooled buffer: the pool's bytes are the
+    /// occupancy snapshot's, elastic, not committed.
+    reservation: Option<super::ledger::Reservation>,
 }
 
 impl PooledBuffer {
@@ -275,6 +281,7 @@ impl PooledBuffer {
             size,
             pool: Weak::new(),
             residency: None,
+            reservation: None,
         }
     }
 
@@ -290,7 +297,21 @@ impl PooledBuffer {
             size,
             pool: Weak::new(),
             residency: Some(residency),
+            reservation: None,
         }
+    }
+
+    /// The same buffer, its bytes committed on the ledger until it drops.
+    pub fn reserved(mut self, reservation: super::ledger::Reservation) -> Self {
+        self.reservation = Some(reservation);
+        self
+    }
+
+    /// [`Self::reserved`] with what a backing returned (`None` from a heap,
+    /// whose chunk holds the reservation).
+    pub fn with_reservation(mut self, reservation: Option<super::ledger::Reservation>) -> Self {
+        self.reservation = reservation;
+        self
     }
 
     pub fn size(&self) -> usize {
@@ -345,7 +366,11 @@ impl Drop for PooledBuffer {
         // Pool gone: the buffer drops here and Metal frees it. Correct, and the
         // reason the back-reference is `Weak`.
         if let Some(pool) = self.pool.upgrade() {
-            pool.release(buffer, self.size, self.pool.clone());
+            // The reservation goes back with the buffer: a free buffer is
+            // still the process's bytes, and the ledger counts it until the
+            // node is destroyed.
+            let reservation = self.reservation.take();
+            pool.release(buffer, self.size, self.pool.clone(), reservation);
         } else {
             // Destroyed rather than returned, so any mark must come off before
             // the allocation does (#475).
@@ -588,11 +613,17 @@ unsafe impl Send for FreeNode {}
 impl FreeNode {
     /// A free node for `buffer`, for a release whose handle could not go back
     /// with it.
-    fn new(buffer: Buffer, size: usize, pool: Weak<PoolInner>) -> Self {
+    fn new(
+        buffer: Buffer,
+        size: usize,
+        pool: Weak<PoolInner>,
+        reservation: Option<super::ledger::Reservation>,
+    ) -> Self {
         let handle = BufferHandle::new(PooledBuffer {
             buffer: Some(buffer),
             size,
             residency: None,
+            reservation,
             pool,
         });
         let node = handle.node;
@@ -1117,7 +1148,7 @@ struct PoolState {
     /// outstanding, never a scan of the whole list. Epochs are assigned from a
     /// monotone counter at push time, so the list is sorted by construction and
     /// nothing has to sort it.
-    pending: std::collections::VecDeque<PendingBuffer>,
+    pending: Retire<FreeNode>,
 
     /// Bytes currently sitting in `free`, maintained incrementally so the
     /// budget check never has to walk the buckets.
@@ -1263,11 +1294,6 @@ impl std::error::Error for ResidualExceeded {}
 
 /// A buffer waiting for the GPU to finish with it, in the node its handles
 /// shared (the node's `size` is the bucket it returns to).
-struct PendingBuffer {
-    node: FreeNode,
-    /// The epoch this must outlive before it can be handed out again.
-    epoch: u64,
-}
 
 /// The free buffers of one size, newest last.
 #[derive(Default)]
@@ -1358,7 +1384,7 @@ impl PoolInner {
                 free_buffers: 0,
                 live_buffers: 0,
                 live_bytes: 0,
-                pending: std::collections::VecDeque::new(),
+                pending: Retire::new(),
                 free_bytes: 0,
                 free_order: std::collections::VecDeque::new(),
                 free_budget: DEFAULT_FREE_BUDGET_BYTES,
@@ -1396,8 +1422,14 @@ impl PoolInner {
     ///
     /// Lookup is untouched. This is a change to *when* a buffer is offered, not
     /// to how one is found.
-    fn release(&self, buffer: Buffer, size: usize, pool: Weak<PoolInner>) {
-        self.release_node(FreeNode::new(buffer, size, pool));
+    fn release(
+        &self,
+        buffer: Buffer,
+        size: usize,
+        pool: Weak<PoolInner>,
+        reservation: Option<super::ledger::Reservation>,
+    ) {
+        self.release_node(FreeNode::new(buffer, size, pool, reservation));
     }
 
     /// Hands a buffer back in the node its handles shared, so the next
@@ -1422,7 +1454,7 @@ impl PoolInner {
         // branch would not have bought anything measurable either.
         state.counters.deferred += 1;
         super::late_bind::on_release(node.buffer(), epoch);
-        state.pending.push_back(PendingBuffer { node, epoch });
+        state.pending.retire(epoch, node);
         // No gauge to update: how many buffers are parked is `state.pending`
         // itself, which `occupancy()` reports (issue #507). Mirroring it into
         // `PoolCounters` is what let `reset_counters` zero it.
@@ -1452,17 +1484,14 @@ impl PoolInner {
     #[must_use]
     fn drain_locked(&self, state: &mut PoolState) -> Vec<Buffer> {
         let mut drained = 0u64;
-        while let Some(front) = state.pending.front() {
-            // `LLOOM_POOL_QUARANTINE=K` (A/B instrument, #748): a released
-            // buffer waits K further command buffers past its own before it
-            // can be reused. K=0 ships.
-            if !self.clock.is_complete(front.epoch + pool_quarantine()) {
-                break;
-            }
-            let entry = state
-                .pending
-                .pop_front()
-                .expect("front() just returned Some");
+        // `LLOOM_POOL_QUARANTINE=K` (A/B instrument, #748): a released buffer
+        // waits K further command buffers past its own before it can be
+        // reused. K=0 ships.
+        let quarantine = pool_quarantine();
+        while let Some(node) = state
+            .pending
+            .pop_ready(|epoch| self.clock.is_complete(epoch.plus(quarantine)))
+        {
             // The buffer is now in the free list: no caller holds it and the
             // GPU epoch it was released in has completed, so *nothing* may
             // touch it until `acquire` hands it out again. Until #475 that was
@@ -1474,7 +1503,7 @@ impl PoolInner {
             // claim -- the last handle dropped (`PooledBuffer::drop` is what
             // put it in `pending`) AND `is_complete` just said the GPU is done
             // with it. Inert without the `asan-poison` feature.
-            unsafe { super::poison::poison_buffer(entry.node.buffer()) };
+            unsafe { super::poison::poison_buffer(node.buffer()) };
             // The device-visible half of the same claim (#706): overwrite the
             // memory itself, so a command buffer that is STILL reading it --
             // which `is_complete` has just said cannot exist -- reads the
@@ -1483,7 +1512,7 @@ impl PoolInner {
             #[cfg(feature = "fuzzing")]
             {
                 let poison = self.free_poison.load(std::sync::atomic::Ordering::Relaxed);
-                let buffer = entry.node.buffer();
+                let buffer = node.buffer();
                 if poison & 0x100 != 0 && !buffer.is_view() {
                     // SAFETY: no handle exists (the last drop parked it) and
                     // the GPU epoch it was released in is complete; the write
@@ -1493,10 +1522,10 @@ impl PoolInner {
                     }
                 }
             }
-            let size = entry.node.size();
+            let size = node.size();
             state.free_bytes += size;
             state.free_order.push_back(size);
-            state.put_free(size, entry.node);
+            state.put_free(size, node);
             drained += 1;
         }
         if drained == 0 {
@@ -1574,11 +1603,11 @@ impl Drop for PoolInner {
                 unsafe { super::poison::unpoison_buffer(node.buffer()) };
             }
         }
-        for entry in &state.pending {
+        for node in state.pending.iter() {
             // Pending buffers are not poisoned today (they are marked only on
             // entering the free list), but clearing is idempotent and this is
             // the site that must not be re-derived if that changes.
-            unsafe { super::poison::unpoison_buffer(entry.node.buffer()) };
+            unsafe { super::poison::unpoison_buffer(node.buffer()) };
         }
     }
 }
@@ -1766,7 +1795,7 @@ impl PoolState {
             + self
                 .pending
                 .iter()
-                .map(|p| p.node.buffer().length())
+                .map(|n| n.buffer().length())
                 .sum::<usize>();
         held.saturating_sub(cap.planned)
     }
@@ -2186,6 +2215,19 @@ impl BufferPool {
     /// programming error rather than a resource one, where §9.5e's argument
     /// against panicking deep inside a forward pass applies.
     pub fn adopt(&self, buffer: Buffer, size: usize) -> BufferHandle {
+        self.adopt_reserved(buffer, size, None)
+    }
+
+    /// [`Self::adopt`] with the buffer's ledger reservation, kept on its node
+    /// through every free / acquire cycle and dropped when the node is
+    /// destroyed (an eviction, a trim): the ledger counts the buffer for as
+    /// long as it exists, live or free.
+    pub fn adopt_reserved(
+        &self,
+        buffer: Buffer,
+        size: usize,
+        reservation: Option<super::ledger::Reservation>,
+    ) -> BufferHandle {
         debug_assert!(
             !buffer.is_view(),
             "BufferPool::adopt was given a VIEW ({} bytes at offset {} of a \
@@ -2210,18 +2252,18 @@ impl BufferPool {
             let pending_same = state
                 .pending
                 .iter()
-                .filter(|p| p.node.size() == size)
+                .filter(|n| n.size() == size)
                 .count();
             if pending_same > 0 {
                 state.counters.pending_twin_allocations += 1;
             }
             if trace_on() {
                 let free_same = state.free.get(&size).map_or(0, |b| b.nodes.len());
-                let head = state.pending.front().map(|p| p.epoch);
+                let head = state.pending.head_epoch();
                 Some(format!(
                     "free_same={free_same} pending_same={pending_same} pending={} head_epoch={head:?} \
                      completed={} current={}",
-                    state.pending.len(),
+                    state.pending.held(),
                     self.inner.clock.completed_count(),
                     self.inner.clock.current_epoch()
                 ))
@@ -2237,6 +2279,7 @@ impl BufferPool {
             size,
             pool: Arc::downgrade(&self.inner),
             residency: None,
+            reservation,
         })
     }
 
@@ -2263,7 +2306,7 @@ impl BufferPool {
     /// handed to `newBufferWithLength` and what the bucket is keyed on.
     pub fn adopt_requesting(
         &self,
-        buffer: Buffer,
+        allocation: impl Into<super::backing::Allocation>,
         requested: usize,
         allocated: usize,
     ) -> BufferHandle {
@@ -2274,7 +2317,8 @@ impl BufferPool {
              request means the two arguments were passed in the wrong order \
              and the overhang would underflow (DESIGN.md §9.2)."
         );
-        let handle = self.adopt(buffer, allocated);
+        let allocation = allocation.into();
+        let handle = self.adopt_reserved(allocation.buffer, allocated, allocation.reservation);
         {
             let mut state = self.inner.state.lock(Side::Host);
             state.counters.requested_bytes += requested as u64;
@@ -2391,8 +2435,8 @@ impl BufferPool {
             // let the two disagree silently.
             free_bytes: state.free_bytes,
             free_buckets: state.free.len(),
-            pending_buffers: state.pending.len(),
-            pending_bytes: state.pending.iter().map(|p| p.node.buffer().length()).sum(),
+            pending_buffers: state.pending.held(),
+            pending_bytes: state.pending.iter().map(|n| n.buffer().length()).sum(),
         }
     }
 }
@@ -4089,15 +4133,15 @@ mod tests {
     #[test]
     fn a_fresh_clock_has_completed_nothing() {
         let clock = GpuClock::new();
-        assert_eq!(clock.current_epoch(), 0);
-        assert_eq!(clock.completed_count(), 0);
+        assert_eq!(clock.current_epoch(), Epoch(0));
+        assert_eq!(clock.completed_count(), Completed(0));
         assert!(
-            !clock.is_complete(0),
+            !clock.is_complete(Epoch(0)),
             "epoch 0 reported finished before anything ran"
         );
 
-        clock.mark_completed(0);
-        assert!(clock.is_complete(0));
+        clock.mark_completed(Epoch(0));
+        assert!(clock.is_complete(Epoch(0)));
     }
 
     /// The two counters are written by **different threads concurrently** --
@@ -4142,14 +4186,14 @@ mod tests {
     #[test]
     fn completion_never_goes_backwards() {
         let clock = GpuClock::new();
-        clock.mark_completed(5);
-        clock.mark_completed(2);
+        clock.mark_completed(Epoch(5));
+        clock.mark_completed(Epoch(2));
         assert_eq!(
             clock.completed_count(),
-            6,
+            Completed(6),
             "a late report moved the clock back"
         );
-        assert!(clock.is_complete(5));
+        assert!(clock.is_complete(Epoch(5)));
     }
 
     /// The overhang counts BOTH sources, with an absolute reference for each.

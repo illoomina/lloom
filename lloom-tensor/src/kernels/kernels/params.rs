@@ -50,6 +50,7 @@
 
 use crate::kernels::metal::{Buffer, ComputeCommandEncoder, Device};
 use crate::kernels::{MetalKernelError, RESOURCE_OPTIONS};
+use crate::retire::Epoch;
 
 /// Scalars bound by the reduce and arg-reduce entry points.
 ///
@@ -2111,7 +2112,7 @@ struct Slot {
     buf: Buffer,
     /// The epoch that was open the last time this slot was handed to a dispatch:
     /// the newest GPU work that may read it.
-    epoch: u64,
+    epoch: Epoch,
     /// The clock `epoch` is on. The pool serves one queue; a slot last read
     /// under another clock (a queue since torn down -- one test's `Commands`
     /// after another's) is treated as idle and re-tagged, because epochs of two
@@ -2185,7 +2186,7 @@ impl ConstantsPool {
         let index = inner.cursor;
         inner.cursor += 1;
         // The epoch this dispatch will execute in: the one open on its queue.
-        let epoch = clock.map_or(0, |c| c.current_epoch());
+        let epoch = clock.map_or(Epoch::ZERO, |c| c.current_epoch());
         let clock_id = clock.map_or(0, |c| c.id());
         if index == inner.slots.len() {
             let buf = device.new_buffer(CONSTANTS_SLOT_BYTES, RESOURCE_OPTIONS)?;

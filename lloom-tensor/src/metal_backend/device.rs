@@ -6,10 +6,10 @@ use crate::kernels::metal::ComputePipeline;
 use crate::kernels::{
     metal::{
         session_region::{RegionCounters, RegionPlan},
-        transient_heaps_on, Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout,
-        ArenaOffsets, ArenaRecorder, BlitCommandsGuard, Buffer, BufferHandle, BufferPool, Commands,
-        CommandsGuard, Device, FreeSummary, HeapChunks, HeapStats, MTLResourceOptions, PassKey,
-        PassKind, PassOpener, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
+        Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
+        Backing, Backings, BlitCommandsGuard, Buffer, BufferHandle, BufferPool, Commands,
+        CommandsGuard, Device, FreeSummary, HeapStats, MTLResourceOptions, PassKey, PassKind,
+        PassOpener, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
         ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
@@ -81,19 +81,16 @@ pub(crate) struct DeviceTeardown {
 /// round-trip on the hot path (§6.3h's rule for a host-side removal).
 pub(crate) struct ResidencyEvictionObserver {
     residency_set: Arc<ResidencySet>,
-    /// The transient chunks (§6.3k): an evicted sub-buffer's range goes
-    /// back to its chunk instead of out of the residency set.
-    heaps: Arc<(HeapChunks, HeapChunks)>,
+    /// The transient backings (§6.3k): an evicted heap sub-buffer's range
+    /// goes back to its chunk instead of out of the residency set.
+    backings: Arc<Backings>,
 }
 
 impl ResidencyEvictionObserver {
-    pub(crate) fn new(
-        residency_set: Arc<ResidencySet>,
-        heaps: Arc<(HeapChunks, HeapChunks)>,
-    ) -> Self {
+    pub(crate) fn new(residency_set: Arc<ResidencySet>, backings: Arc<Backings>) -> Self {
         Self {
             residency_set,
-            heaps,
+            backings,
         }
     }
 }
@@ -113,7 +110,10 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
         // its chunk, and only the rest go through the set.
         let rest: Vec<&Buffer> = buffers
             .iter()
-            .filter(|b| !(self.heaps.0.release(b) || self.heaps.1.release(b)))
+            .filter(|b| {
+                !(self.backings.transient_shared.reclaim(b)
+                    || self.backings.transient_private.reclaim(b))
+            })
             .collect();
         if rest.is_empty() {
             return;
@@ -208,6 +208,27 @@ impl Drop for DeviceTeardown {
     }
 }
 
+/// What [`MetalDevice::admit_bytes`] decided on: the ledger's committed bytes
+/// at the decision (after a reclaim, when one ran), what the reclaim freed,
+/// and the verdict. The ledger, not `currentAllocatedSize`: every byte the
+/// process holds through its backings is a reservation on it — pools' free
+/// and pending lists included — so two processes with the same allocation
+/// history read the same figure and give the same verdict
+/// (`profiles-and-memory-design.md` §4.2, §11), where the device figure
+/// also counted Metal's own objects and whatever another thread had just
+/// freed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassAdmission {
+    pub committed: usize,
+    pub reclaimed: usize,
+    /// Bytes the ledger's yielding tenants pledged to give back (the
+    /// arbiter's third rung, §4.2) when the pass did not fit after the
+    /// reclaim: the owner of those tenants applies the pledge (an elastic
+    /// expert tier parks slots) and asks again.
+    pub pledged: usize,
+    pub fits: bool,
+}
+
 #[derive(Clone)]
 pub struct MetalDevice {
     /// Argument blocks and small tables keyed by their bytes, so a value a
@@ -250,10 +271,14 @@ pub struct MetalDevice {
     /// lookup. Reclaimability separates them, not pool identity.
     pub(crate) private_buffers: BufferPool,
 
-    /// Where a pool miss's bytes come from when `transient_heaps_on()`: heap
-    /// chunks in the residency set once (`DESIGN.md` §6.3k), one list per
-    /// storage mode (the Shared pool's, the Private pool's).
-    pub(crate) transient_heaps: Arc<(HeapChunks, HeapChunks)>,
+    /// Where bytes come from (`profiles-and-memory-design.md` §4.1, L0):
+    /// the transient pair a pool miss takes from — placement heap chunks in
+    /// the residency set once (`DESIGN.md` §6.3k) when
+    /// `transient_heaps_on()`, else one `MTLBuffer` per miss with its
+    /// residency committed at the next cut — one per storage mode (the
+    /// Shared pool's, the Private pool's); and the resident backings a
+    /// persistent allocation takes from.
+    pub(crate) backings: Arc<Backings>,
 
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`crate::kernels`]
@@ -264,6 +289,12 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
     /// Residency set registered on the command queue.
     pub(crate) residency_set: Arc<ResidencySet>,
+
+    /// The memory ledger (`ledger.rs`): every persistent allocation's bytes
+    /// under a reservation, the tenants' claims, the quota the binary sets.
+    pub(crate) ledger: Arc<crate::kernels::metal::ledger::Ledger>,
+    /// The installed arena's base, on the ledger for the arena's life.
+    pub(crate) arena_reservation: Arc<Mutex<Option<crate::kernels::metal::ledger::Reservation>>>,
 
     /// The activation arena, when one is installed.
     ///
@@ -372,6 +403,8 @@ pub struct PassPlans {
     /// base grow (an `Arena` holds views of the base it was built on).
     arenas: HashMap<PassKey, Arena>,
     base: Option<Buffer>,
+    /// The base's bytes on the ledger, replaced with the base.
+    base_reservation: Option<crate::kernels::metal::ledger::Reservation>,
     base_generation: u64,
     arena_generation: HashMap<PassKey, u64>,
     /// A key recorded on its first sight, whose plan awaits the next pass.
@@ -528,6 +561,7 @@ impl PassPlans {
             plans: HashMap::new(),
             arenas: HashMap::new(),
             base: None,
+            base_reservation: None,
             base_generation: 0,
             arena_generation: HashMap::new(),
             pending: None,
@@ -821,16 +855,74 @@ impl MetalDevice {
     ///
     /// Now a free buffer is already known to be free, so this exists only to
     /// hand memory back under pressure. Nothing calls it on the hot path.
-    pub fn trim_unused_buffers(&self) {
+    /// Returns the bytes given back.
+    pub fn trim_unused_buffers(&self) -> usize {
+        let mut freed = 0usize;
         for buffer in self.buffers.trim() {
-            if !self.transient_heaps.0.release(&buffer) {
+            freed += buffer.length();
+            if !self.backings.transient_shared.reclaim(&buffer) {
                 self.residency_set.remove(&buffer);
             }
         }
         for buffer in self.private_buffers.trim() {
-            if !self.transient_heaps.1.release(&buffer) {
+            freed += buffer.length();
+            if !self.backings.transient_private.reclaim(&buffer) {
                 self.residency_set.remove(&buffer);
             }
+        }
+        freed
+    }
+
+    /// A pass-level admission against the device: whether `need` more bytes
+    /// fit under `budget` beside what the process holds — and, when they do
+    /// not at first, after the pools' free lists are given back (the simplest
+    /// cache yielding before a capability is refused,
+    /// `profiles-and-memory-design.md` §2 principle 5). The free lists are
+    /// elastic by definition and `currentAllocatedSize` counts them, so a
+    /// refusal read on the first figure refuses a pass the process had room
+    /// for. The caller decides on the figure returned; a reclaim is counted on
+    /// the ledger. Not on the hot path: a decode step inside its slab asks
+    /// nothing (§9.5e).
+    pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
+        let committed = self.ledger.committed();
+        if committed.saturating_add(need) <= budget {
+            return PassAdmission {
+                committed,
+                reclaimed: 0,
+                pledged: 0,
+                fits: true,
+            };
+        }
+        let mut reclaimed = self.trim_unused_buffers();
+        let mut committed = self.ledger.committed();
+        if committed.saturating_add(need) > budget {
+            // The second rung: what the host released and the GPU may still
+            // read sits in the pending lists until their epochs complete.
+            // Wait the queue out once — the pass would otherwise end the
+            // reply — then give those back too. A host wait, on the refusal
+            // path alone, never on a step (§21.13); the shared pool's rows
+            // meet exhaustion the same way (`BatchPool::begin_rows`).
+            if self.wait_until_completed().is_ok() {
+                reclaimed += self.trim_unused_buffers();
+                committed = self.ledger.committed();
+            }
+        }
+        let mut pledged = 0;
+        if committed.saturating_add(need) > budget {
+            // The third rung (§4.2, caches yield): the tenants that can
+            // shrink pledge units — the expert tier's slots — until the
+            // shortfall is covered or none can give more. The pledge is
+            // applied by the tenants' owner, which asks again.
+            let short = committed.saturating_add(need) - budget;
+            pledged = self.ledger.yield_for(short);
+            committed = self.ledger.committed();
+        }
+        self.ledger.note_reclaim(reclaimed);
+        PassAdmission {
+            committed,
+            reclaimed,
+            pledged,
+            fits: committed.saturating_add(need) <= budget,
         }
     }
 
@@ -880,8 +972,8 @@ impl MetalDevice {
     /// The transient heap chunks' `(shared, private)` stats (§6.3k).
     pub fn heap_stats(&self) -> (HeapStats, HeapStats) {
         (
-            self.transient_heaps.0.stats(),
-            self.transient_heaps.1.stats(),
+            self.backings.transient_shared.stats(),
+            self.backings.transient_private.stats(),
         )
     }
 
@@ -1370,6 +1462,12 @@ impl MetalDevice {
         self.commands.clock()
     }
 
+    /// The memory ledger: committed bytes beside `currentAllocatedSize`, the
+    /// tenants' claims, the quota (`profiles-and-memory-design.md` §4.2).
+    pub fn ledger(&self) -> &Arc<crate::kernels::metal::ledger::Ledger> {
+        &self.ledger
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }
@@ -1433,11 +1531,11 @@ impl MetalDevice {
         let plan = RegionPlan::reserve(reservations);
         let bytes = plan.bytes().max(1);
         let base = self
-            .device
-            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .backings
+            .resident_private
+            .alloc(bytes)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&base);
-        let region = SessionRegion::new(base, plan)
+        let region = SessionRegion::new(base.buffer, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
         {
             let mut slot = self.session_region.write();
@@ -1525,11 +1623,12 @@ impl MetalDevice {
         // silent loss of coverage rather than an error.
         let bytes = plan.bump_capacity().max(plan.arena_bytes()).max(1);
         let base = self
-            .device
-            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .backings
+            .resident_private
+            .alloc(bytes)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&base);
-        let arena = Arena::new(base, plan, layout)
+        *self.arena_reservation.lock() = base.reservation;
+        let arena = Arena::new(base.buffer, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         {
             let mut slot = self.arena.write();
@@ -1653,6 +1752,7 @@ impl MetalDevice {
             self.residency_set.remove(arena.base());
         }
         *slot = None;
+        *self.arena_reservation.lock() = None;
         drop(slot);
         if !self.pass_plans_enabled()
             && self.arena_recorder.lock().is_none()
@@ -1859,6 +1959,31 @@ impl MetalDevice {
     /// Whether a plan for `key` is cached: the pass will be served from the
     /// base, allocating none of its activations (its admission owes no
     /// transient).
+    /// Drop every cached pass plan and its arena, keeping the base: a
+    /// buffer the plans bound was reallocated (an elastic tenant's slot
+    /// pools, `profiles-and-memory-design.md` §4.2), so a replay would bind
+    /// the old one. The next pass of each key records again. Returns how
+    /// many plans were dropped; a no-op while a pass is open.
+    pub fn drop_pass_plans(&self) -> usize {
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            return 0;
+        };
+        if pp.current.is_some() {
+            return 0;
+        }
+        let n = pp.plans.len();
+        pp.plans.clear();
+        pp.arenas.clear();
+        pp.arena_generation.clear();
+        pp.escapes.clear();
+        pp.ragged_order.clear();
+        pp.pending = None;
+        pp.base_generation += 1;
+        pp.counters.evicted += n as u64;
+        n
+    }
+
     pub fn pass_plan_cached(&self, key: &PassKey) -> bool {
         self.pass_plans
             .lock()
@@ -2201,37 +2326,40 @@ impl MetalDevice {
             // actually rises by.
             if pp.admit_fraction > 0.0 {
                 let grow = needed.saturating_sub(have);
-                let allocated = self.device.current_allocated_size();
                 let working_set = self.device.recommended_max_working_set_size();
                 let budget = (working_set as f64 * pp.admit_fraction) as usize;
-                if allocated.saturating_add(grow) > budget {
+                let a = self.admit_bytes(grow, budget);
+                if !a.fits {
                     let gb = |b: usize| b as f64 / 1e9;
                     return Err(MetalError::Message(format!(
                         "pass plan base grow refused for {:?}: it needs {:.3} GB more, and the \
-                         process already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
-                         recommendedMaxWorkingSetSize {:.2} GB). Nothing was allocated and no \
+                         ledger already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
+                         recommendedMaxWorkingSetSize {:.2} GB) after giving back {:.3} GB of \
+                         free lists. Nothing was allocated and no \
                          plan was cached; the pass runs on the pool as it did before \
                          (DESIGN.md 9.5, 3.5). Raise the fraction, narrow the pass (a smaller \
                          prefill tile), or bound the run.",
                         closes.kind,
                         gb(grow),
-                        gb(allocated),
+                        gb(a.committed),
                         gb(budget),
                         pp.admit_fraction,
                         gb(working_set),
+                        gb(a.reclaimed),
                     ))
                     .into());
                 }
             }
             let base = self
-                .device
-                .new_buffer(needed, PRIVATE_RESOURCE_OPTIONS)
+                .backings
+                .resident_private
+                .alloc(needed)
                 .map_err(MetalError::from)?;
-            self.residency_set.insert(&base);
             if let Some(previous) = pp.base.take() {
                 self.residency_set.remove(&previous);
             }
-            pp.base = Some(base);
+            pp.base = Some(base.buffer);
+            pp.base_reservation = base.reservation;
             pp.base_generation += 1;
             pp.arenas.clear();
             pp.counters.base_grows += 1;
@@ -2483,29 +2611,11 @@ impl MetalDevice {
                 self.private_buffers
                     .check_residual(alloc)
                     .map_err(|e| MetalError::Message(e.to_string()))?;
-                let new_buffer = if transient_heaps_on() {
-                    // From a heap chunk: resident with the chunk, no residency
-                    // call here and none at the cut (§6.3k).
-                    self.transient_heaps
-                        .1
-                        .alloc(alloc)
-                        .map_err(MetalError::from)?
-                } else {
-                    let b = self
-                        .device
-                        .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
-                        .map_err(MetalError::from)?;
-                    // `add`, not `insert`: stage the allocation (one `addAllocation`)
-                    // and let the next command-buffer cut commit the residency set
-                    // once, rather than committing per missed buffer. A cold-pool
-                    // prefill misses ~a hundred buffers; §6.3b prices each residency
-                    // commit at ~0.087 ms, so batching them to one commit is the
-                    // whole of the first-forward residency cost (`commit_swap_locked`
-                    // calls `commit_pending` before it commits, so the buffer is
-                    // resident before any dispatch that binds it executes, §3.7).
-                    self.residency_set.add(&b);
-                    b
-                };
+                let new_buffer = self
+                    .backings
+                    .transient_private
+                    .alloc(alloc)
+                    .map_err(MetalError::from)?;
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -2572,15 +2682,17 @@ impl MetalDevice {
         _name: &str,
     ) -> Result<BufferHandle> {
         let size = element_count * dtype.size_in_bytes();
-        let buffer = self
-            .device
-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+        let a = self
+            .backings
+            .resident_private
+            .alloc(size)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&buffer);
         // Deliberately not pooled: this exists for persistent buffers, so it
         // returns a handle with no pool behind it. Dropping it frees the buffer
         // outright rather than offering it for reuse.
-        Ok(BufferHandle::new(PooledBuffer::unpooled(buffer, size)))
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled(a.buffer, size).with_reservation(a.reservation),
+        ))
     }
 
     /// Creates a new buffer from data.
@@ -2639,16 +2751,15 @@ impl MetalDevice {
     /// (lloom #748 / PR #754, which records it as `docs/invariants.md` §15.1m) — a recycled Shared buffer
     /// written by the host while a still-running command buffer reads it.
     pub fn new_unpooled_shared(&self, size: usize) -> Result<BufferHandle> {
-        let buffer = self
-            .device
-            .new_buffer(size.max(1), RESOURCE_OPTIONS)
+        let a = self
+            .backings
+            .resident_shared
+            .alloc(size)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&buffer);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
+        ))
     }
 
     /// A Private buffer of `size` bytes that lives as long as its handle —
@@ -2659,35 +2770,32 @@ impl MetalDevice {
     /// CPU writes into place (the streamed tier's slot pools under the
     /// direct read, `DESIGN.md` §20.4a).
     pub fn new_persistent_shared(&self, size: usize) -> Result<BufferHandle> {
-        let buffer = self
-            .device
-            .new_buffer(size.max(1), RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        self.residency_set.insert(&buffer);
         // A Shared buffer's pages are the process's, and under memory
         // pressure the kernel compresses them whatever the residency set
         // says (measured: 28 GB of Shared slot pools un-wired and 7.5 GB
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
-        // not. Pin them.
-        wire_pages(buffer.contents(), size);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        // not. The `Mapped` backing pins them.
+        let a = self
+            .backings
+            .mapped_shared
+            .alloc(size)
+            .map_err(MetalError::from)?;
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
+        ))
     }
 
     pub fn new_persistent_private(&self, size: usize) -> Result<BufferHandle> {
-        let buffer = self
-            .device
-            .new_buffer(size.max(1), PRIVATE_RESOURCE_OPTIONS)
+        let a = self
+            .backings
+            .resident_private
+            .alloc(size)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&buffer);
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                .with_reservation(a.reservation),
+        ))
     }
 
     /// Pin a Shared buffer's pages (`mlock`) so the kernel cannot compress
@@ -2695,7 +2803,7 @@ impl MetalDevice {
     /// (Private storage: its pages are not the process's to compress).
     pub fn wire_buffer(&self, buffer: &PooledBuffer) {
         // `contents()` is null for a Private buffer (`Buffer::new`).
-        wire_pages(buffer.contents(), buffer.size());
+        crate::kernels::metal::backing::wire_pages(buffer.contents(), buffer.size());
     }
 
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<BufferHandle> {
@@ -2759,11 +2867,10 @@ impl MetalDevice {
         // And it leaves the residency set on drop: the set retains what it
         // holds, so an unpooled upload that stayed in it was never freed at
         // all — neither these staging buffers nor a per-round `Tensor::new`.
-        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
-            new_buffer,
-            size,
-            Arc::clone(&self.residency_set),
-        )))
+        Ok(BufferHandle::new(
+            PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
+                .reserved(self.ledger.reserve(size)),
+        ))
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<BufferHandle> {
@@ -2808,33 +2915,11 @@ impl MetalDevice {
         self.buffers
             .check_residual(size)
             .map_err(|e| MetalError::Message(e.to_string()))?;
-        let new_buffer = if transient_heaps_on() {
-            // From a heap chunk: resident with the chunk (§6.3k).
-            self.transient_heaps
-                .0
-                .alloc(size)
-                .map_err(MetalError::from)?
-        } else {
-            let b = self
-                .device
-                .new_buffer(size, RESOURCE_OPTIONS)
-                .map_err(MetalError::from)?;
-            // `add`, not `insert`: the deferred-commit batching the private pool's
-            // miss already uses (§6.3b). Stage the allocation (one `addAllocation`)
-            // and let the next command-buffer cut commit the residency set once via
-            // `commit_pending`, rather than one `commit` per missed buffer. This is
-            // the Shared pool (`self.buffers`) that serves the KV reserve
-            // (`KvSlot::append` -> `Tensor::zeros` -> here); the earlier
-            // residency-batching fix converted only the private pool and left this
-            // path committing per miss, so a cold-pool prefill still paid a residency
-            // commit for every Shared miss (§6.3b prices each commit at ~0.087 ms and
-            // a cold prefill misses on the order of a hundred buffers).
-            // `commit_pending` (`Commands::commit_swap_locked`) publishes the staged
-            // buffers before any dispatch that binds them executes (§3.7), so the
-            // residency invariant holds and the result is byte-identical.
-            self.residency_set.add(&b);
-            b
-        };
+        let new_buffer = self
+            .backings
+            .transient_shared
+            .alloc(size)
+            .map_err(MetalError::from)?;
         Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
     }
 
@@ -3160,22 +3245,6 @@ mod tests {
         // reason for it.
         assert_eq!(MIN_BUFFER_ALIGNMENT, 16);
         assert_eq!(MIN_BUFFER_ALIGNMENT, std::mem::size_of::<f32>() * 4);
-    }
-}
-
-/// `mlock` `size` bytes at `ptr` (a Shared buffer's own mapping); a failure
-/// is reported, not fatal — the buffer works unwired, only slower under
-/// pressure.
-fn wire_pages(ptr: *mut u8, size: usize) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: `ptr..ptr+size` is the buffer's own mapping, alive for as
-    // long as the buffer; `munlock` is implicit at unmap.
-    let rc = unsafe { libc::mlock(ptr as *const libc::c_void, size.max(1)) };
-    if rc != 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("mlock of a {size}-byte Shared buffer failed: {e}");
     }
 }
 

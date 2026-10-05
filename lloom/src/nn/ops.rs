@@ -4420,6 +4420,146 @@ impl lloom_tensor::CustomOp3 for GemvFused {
     }
 }
 
+/// A decode GEMV with its RMSNorm computed inside it (`GemvNormInline`,
+/// `docs/tuning.md` §13.5t): `x` is the un-normalized `[.., 1, k]` input,
+/// `norm_weight` the norm's `[k]` weight. `silu` puts SiLU on the store.
+// The fields are read by the Metal arm only, as `GemvFused`'s are.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+struct GemvNorm {
+    eps: f32,
+    silu: bool,
+}
+
+impl lloom_tensor::CustomOp3 for GemvNorm {
+    fn name(&self) -> &'static str {
+        "metal-gemv-norm"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("no cpu support for metal-gemv-norm")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        x: &lloom_tensor::MetalStorage,
+        x_l: &Layout,
+        w: &lloom_tensor::MetalStorage,
+        w_l: &Layout,
+        g: &lloom_tensor::MetalStorage,
+        g_l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::kernels::{GemmDType, GemvEpilogue, GemvNormInline};
+
+        let (b, n, k) = GemvFused::checked_dims(x_l, w_l)?;
+        if x.dtype() != w.dtype() || g.dtype() != x.dtype() {
+            lloom_tensor::bail!(
+                "gemv-norm: x {:?}, weight {:?} and norm weight {:?} must share a dtype",
+                x.dtype(),
+                w.dtype(),
+                g.dtype()
+            );
+        }
+        if g_l.shape().elem_count() != k || !g_l.is_contiguous() {
+            lloom_tensor::bail!(
+                "gemv-norm: the norm weight {:?} must be a contiguous [{k}]",
+                g_l.dims()
+            );
+        }
+        if !x_l.is_contiguous() || !w_l.is_contiguous() {
+            lloom_tensor::bail!("gemv-norm: x and the weight must be contiguous");
+        }
+        let dtype = match x.dtype() {
+            DType::F32 => GemmDType::F32,
+            DType::F16 => GemmDType::F16,
+            DType::BF16 => GemmDType::BF16,
+            other => lloom_tensor::bail!("gemv-norm does not support {other:?}"),
+        };
+        let device = x.device();
+        let out_shape = match *x_l.dims() {
+            [b, m, _] => Shape::from_dims(&[b, m, n]),
+            _ => Shape::from_dims(&[1, n]),
+        };
+        let elem_count = b * n;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, x.dtype())
+            .with_label("gemv_norm")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gemv_norm");
+        lloom_tensor::kernels::call_mlx_gemv_norm(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            dtype,
+            (b, 1, n, k),
+            x_l.stride(),
+            x_l.start_offset() * x.dtype().size_in_bytes(),
+            x.buffer(),
+            &[1usize, k],
+            w_l.start_offset() * w.dtype().size_in_bytes(),
+            w.buffer(),
+            &output,
+            GemvNormInline {
+                weight: g.buffer(),
+                weight_offset: g_l.start_offset() * g.dtype().size_in_bytes(),
+                eps: self.eps,
+            },
+            if self.silu {
+                GemvEpilogue::Silu
+            } else {
+                GemvEpilogue::None
+            },
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        let newstorage =
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, x.dtype());
+        Ok((newstorage, out_shape))
+    }
+}
+
+/// `rmsnorm(x, norm_weight, eps) @ weight.t()` — and its SiLU when `silu` —
+/// in ONE dispatch: the norm's reduction rides the GEMV's own walk over K
+/// (`docs/tuning.md` §13.5t). `x` `[.., 1, k]`, `weight` `[n, k]`,
+/// `norm_weight` `[k]`. Metal, one row, the bm4/bm8 decode tiles; anything
+/// else is an error. Not bit-identical to the pair: the normalized vector is
+/// never rounded to `x`'s dtype and the sum of squares is a different tree.
+pub fn gemv_norm(
+    x: &Tensor,
+    weight: &Tensor,
+    norm_weight: &Tensor,
+    eps: f32,
+    silu: bool,
+) -> Result<Tensor> {
+    x.apply_op3_no_bwd(weight, norm_weight, &GemvNorm { eps, silu })
+}
+
+/// Whether [`gemv_norm`] serves a weight `[n, k]`: the GEMV's tile at that
+/// shape is one the inline norm is instantiated at. A caller with an unfused
+/// path checks this and takes that path where it is false. Always false
+/// without Metal.
+pub fn gemv_norm_serves(n: usize, k: usize) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        lloom_tensor::kernels::gemv_norm_serves(n, k)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (n, k);
+        false
+    }
+}
+
 /// Dispatch the runtime fused GEMV: `x @ weight.t()` with the epilogue named by
 /// `fusion` riding the f32 accumulator, binding `residual` when the arm reads a
 /// second operand.

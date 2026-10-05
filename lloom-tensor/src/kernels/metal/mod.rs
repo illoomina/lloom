@@ -77,7 +77,9 @@ mod flash_decoding_tests;
 /// unconditionally and compiles to nothing when the feature is off --
 /// `run_telemetry`'s shape, for its reasons.
 pub mod hazard_audit;
+pub mod backing;
 pub mod heap;
+pub mod ledger;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
@@ -91,6 +93,7 @@ pub mod io_queue;
 /// and an allocation history — no device, no buffer, no dispatch — which is the
 /// half §10.3i says to build **before** the page-walking kernel.
 pub use crate::kv_pages;
+pub use crate::retire::{self, Completed, Epoch, Retire, Tick};
 #[cfg(test)]
 mod kv_pages_tests;
 pub mod library;
@@ -145,6 +148,9 @@ pub use encoder::*;
 pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
+pub use backing::{
+    Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
+};
 pub use heap::*;
 pub use kv_pages::*;
 pub use library::*;

@@ -1104,7 +1104,7 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
 ) {
     let s = model.stream_stats();
     println!(
-        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={}",
+        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={} h1_restamps={} h2_refusals={} h3_deferred_writes={} slot_reallocations={} slot_bytes_released={}",
         args.loader,
         model.slots_per_layer(),
         s.plans,
@@ -1139,6 +1139,11 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
         s.inplace_takes,
         s.quarantined,
         s.recycled,
+        s.h1_restamps,
+        s.h2_refusals,
+        s.h3_deferred_writes,
+        s.slot_reallocations,
+        s.slot_bytes_released,
     );
 }
 

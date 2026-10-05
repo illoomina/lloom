@@ -81,6 +81,8 @@
 use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as TracedLinear};
 use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Speculator};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
+#[cfg(feature = "metal")]
+use lloom_tensor::kernels::metal::Epoch;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
 #[cfg(feature = "metal")]
 use parking_lot::Mutex;
@@ -470,7 +472,7 @@ pub struct DSparkRotary {
     /// context pool's slot tensors (`paged_ctx::SeqSlots`). Behind a mutex
     /// because the forward takes `&self`; one short section per draft.
     #[cfg(feature = "metal")]
-    positions: Mutex<(Vec<u32>, Option<Tensor>, u64)>,
+    positions: Mutex<(Vec<u32>, Option<Tensor>, Epoch)>,
 }
 
 impl Clone for DSparkRotary {
@@ -480,7 +482,7 @@ impl Clone for DSparkRotary {
             sin: self.sin.clone(),
             interleaved: self.interleaved,
             #[cfg(feature = "metal")]
-            positions: Mutex::new((Vec::new(), None, 0)),
+            positions: Mutex::new((Vec::new(), None, Epoch::ZERO)),
         }
     }
 }
@@ -503,7 +505,7 @@ impl DSparkRotary {
             sin: freqs.sin()?.to_dtype(dtype)?,
             interleaved: !cfg.rope_is_neox_style,
             #[cfg(feature = "metal")]
-            positions: Mutex::new((Vec::new(), None, 0)),
+            positions: Mutex::new((Vec::new(), None, Epoch::ZERO)),
         })
     }
 
@@ -960,7 +962,9 @@ impl CtxCache {
 #[cfg(feature = "metal")]
 mod paged_ctx {
     use super::{Arc, Device, Mutex, Result, Tensor};
-    use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
+    use lloom_tensor::kernels::metal::{
+        Epoch, GpuClock, PageError, PageIdx,
+    };
 
     /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
     /// so a drafter and its target widen at the same cadence.
@@ -970,8 +974,8 @@ mod paged_ctx {
     /// quarantine, and the `[1, H_kv, pool_pages × P, D]` K/V pools, allocated
     /// at the first append at that append's dtype and geometry.
     struct LayerPool {
-        pool: KvPagePool,
-        quarantine: PageQuarantine,
+        /// The allocator with its liveness, over the tier's clock.
+        pool: crate::nn::page_pool::PagePool,
         kv: Option<(Tensor, Tensor)>,
         /// Per sequence: the `reserve` slots past its live length, as the U32
         /// tensor the block scatter takes, and the largest of them.
@@ -988,7 +992,7 @@ mod paged_ctx {
         block_host: Vec<u32>,
         /// The epoch of the last dispatch that read or wrote `block_all`; an
         /// in-place write waits for it to be complete, else a fresh tensor.
-        block_epoch: u64,
+        block_epoch: Epoch,
     }
 
     /// The slot tensor one sequence's layers share within a round.
@@ -1018,7 +1022,7 @@ mod paged_ctx {
     struct SeqSlots {
         slots: Vec<u32>,
         slots_t: Option<Tensor>,
-        epoch: u64,
+        epoch: Epoch,
     }
 
     /// Every layer's pool, one clock. Behind a `Mutex` because the forward
@@ -1069,13 +1073,18 @@ mod paged_ctx {
                 .map(|_| LayerPool {
                     // A table may reach the whole pool: exhaustion is reported
                     // as the pool's, which names the grow, never as a full table.
-                    pool: KvPagePool::new(page_size, pool_pages, n_seqs.max(1), pool_pages + 1),
-                    quarantine: PageQuarantine::new(),
+                    pool: crate::nn::page_pool::PagePool::with_clock(
+                        page_size,
+                        pool_pages,
+                        n_seqs.max(1),
+                        pool_pages + 1,
+                        Arc::clone(&clock),
+                    ),
                     kv: None,
                     block: vec![None; n_seqs.max(1)],
                     block_all: None,
                     block_host: Vec::new(),
-                    block_epoch: 0,
+                    block_epoch: Epoch::ZERO,
                 })
                 .collect();
             Self {
@@ -1158,8 +1167,8 @@ mod paged_ctx {
         }
 
         /// The token slot of position `t` in `pages`.
-        fn slot(pages: &[u32], t: usize, page_size: usize) -> u32 {
-            pages[t / page_size] * page_size as u32 + (t % page_size) as u32
+        fn slot(pages: &[PageIdx], t: usize, page_size: usize) -> u32 {
+            pages[t / page_size].0 * page_size as u32 + (t % page_size) as u32
         }
 
         /// Append `[1, H_kv, n, D]` `k`/`v` to `(layer, seq)`: the context
@@ -1172,12 +1181,10 @@ mod paged_ctx {
             }
             let page_size = self.page_size;
             let reserve = self.reserve;
-            let completed = self.clock.completed_count();
-            {
-                let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain_completed(completed);
-                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-            }
+            self.layers[layer]
+                .pool
+                .recycle_ready()
+                .map_err(lloom_tensor::Error::wrap)?;
             // Room for the append and the block behind it, a bucket at a time.
             loop {
                 let lp = &mut self.layers[layer];
@@ -1246,12 +1253,10 @@ mod paged_ctx {
             }
             let page_size = self.page_size;
             let reserve = self.reserve;
-            let completed = self.clock.completed_count();
-            {
-                let lp = &mut self.layers[layer];
-                let ready = lp.quarantine.drain_completed(completed);
-                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-            }
+            self.layers[layer]
+                .pool
+                .recycle_ready()
+                .map_err(lloom_tensor::Error::wrap)?;
             let mut slots = std::mem::take(&mut self.scratch_slots);
             slots.clear();
             let mut blocks = std::mem::take(&mut self.scratch_blocks);
@@ -1455,7 +1460,7 @@ mod paged_ctx {
             k.kv_scatter_into(pk, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             let s = lp.pool.seq(seq).expect("seq within n_seqs");
-            let table = s.pages();
+            let table = PageIdx::as_u32s(s.pages());
             crate::nn::ops::sdpa_paged(
                 q,
                 pk,
@@ -1553,7 +1558,7 @@ mod paged_ctx {
             for &s in seqs {
                 let sp = lp.pool.seq(s).expect("seq within n_seqs");
                 let p = sp.pages();
-                tables.extend_from_slice(p);
+                tables.extend_from_slice(PageIdx::as_u32s(p));
                 tables.extend(std::iter::repeat_n(0, stride - p.len()));
                 n_keys.push((sp.len() + width) as u32);
             }
@@ -1610,7 +1615,6 @@ mod paged_ctx {
         /// command buffer encoded now belongs to (§10.3h's one non-fence
         /// obligation). Idempotent.
         fn reset(&mut self, layer: usize, seq: usize) {
-            let epoch = self.clock.current_epoch();
             let lp = &mut self.layers[layer];
             if lp
                 .pool
@@ -1620,8 +1624,7 @@ mod paged_ctx {
             {
                 return;
             }
-            let freed = lp.pool.release(seq);
-            lp.quarantine.quarantine(epoch, freed);
+            lp.pool.release(seq);
             lp.block[seq] = None;
         }
     }
@@ -1808,7 +1811,7 @@ mod paged_ctx {
             g.layers[self.layer]
                 .pool
                 .seq(self.seq)
-                .map(|s| s.pages().to_vec())
+                .map(|s| PageIdx::as_u32s(s.pages()).to_vec())
                 .unwrap_or_default()
         }
     }

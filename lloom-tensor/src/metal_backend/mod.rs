@@ -9,7 +9,8 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
     metal::{
-        heap_chunk_bytes, Buffer, BufferHandle, BufferPool, Commands, Device, HeapChunks,
+        heap_chunk_bytes, transient_heaps_on, Backing, Backings, Buffer, BufferHandle, BufferPool,
+        Commands, Commit, Device, DeviceBuffer, HeapChunks, MTLResourceOptions, Mapped,
         ResidencySet,
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
@@ -33,7 +34,7 @@ pub use host_slot::HostSlot;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
-pub use host_fed::{HostFedRing, PublishEvent};
+pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///
@@ -3078,20 +3079,56 @@ impl BackendDevice for MetalDevice {
         // the only thing that advances it.
         let buffers = BufferPool::with_clock(commands.clock());
         let private_buffers = BufferPool::with_clock(commands.clock());
-        let transient_heaps = Arc::new((
-            HeapChunks::new(
+        let ledger = crate::kernels::metal::ledger::Ledger::new();
+        // The backings (`profiles-and-memory-design.md` §4.1, L0). A pool
+        // miss takes from placement heap chunks when `transient_heaps_on()`,
+        // else from one `MTLBuffer` per miss with its residency committed at
+        // the next cut; a persistent allocation takes from a resident
+        // backing, wired when it is Shared.
+        let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
+            if transient_heaps_on() {
+                Arc::new(HeapChunks::new(
+                    &device,
+                    Arc::clone(&residency_set),
+                    options,
+                    heap_chunk_bytes(),
+                    Some(Arc::clone(&ledger)),
+                ))
+            } else {
+                Arc::new(DeviceBuffer::new(
+                    &device,
+                    Arc::clone(&residency_set),
+                    options,
+                    Commit::Deferred,
+                    Some(Arc::clone(&ledger)),
+                ))
+            }
+        };
+        let backings = Arc::new(Backings {
+            transient_shared: transient(RESOURCE_OPTIONS),
+            transient_private: transient(PRIVATE_RESOURCE_OPTIONS),
+            resident_shared: DeviceBuffer::new(
                 &device,
                 Arc::clone(&residency_set),
                 RESOURCE_OPTIONS,
-                heap_chunk_bytes(),
+                Commit::Now,
+                Some(Arc::clone(&ledger)),
             ),
-            HeapChunks::new(
+            resident_private: DeviceBuffer::new(
                 &device,
                 Arc::clone(&residency_set),
                 PRIVATE_RESOURCE_OPTIONS,
-                heap_chunk_bytes(),
+                Commit::Now,
+                Some(Arc::clone(&ledger)),
             ),
-        ));
+            mapped_shared: Mapped::new(
+                &device,
+                Arc::clone(&residency_set),
+                RESOURCE_OPTIONS,
+                Commit::Now,
+                Some(Arc::clone(&ledger)),
+            ),
+        });
         // The pools do not subscribe to command-buffer completion. The handler
         // advances the clock, and each pool drains what it made reusable at
         // its next `acquire`, on the host: a handler that took the pool's lock
@@ -3106,7 +3143,7 @@ impl BackendDevice for MetalDevice {
             // (`DESIGN.md` §6.3c).
             let observer = Arc::new(ResidencyEvictionObserver::new(
                 Arc::clone(&residency_set),
-                Arc::clone(&transient_heaps),
+                Arc::clone(&backings),
             ));
             buffers.set_eviction_observer(observer.clone());
             private_buffers.set_eviction_observer(observer);
@@ -3134,11 +3171,13 @@ impl BackendDevice for MetalDevice {
             commands,
             buffers,
             private_buffers,
-            transient_heaps,
+            backings,
             kernels,
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
             residency_set,
+            ledger,
+            arena_reservation: Arc::new(parking_lot::Mutex::new(None)),
             // No arena until one is installed: the classical path is the
             // default, and the cost of the seam is one `Option` test per
             // allocation (`DESIGN.md` §9.2a, §11.1).
@@ -3865,6 +3904,7 @@ mod issue_336_to_cpu {
             m.residency_set_handle(),
             super::PRIVATE_RESOURCE_OPTIONS,
             1 << 20,
+            None,
         );
         let first = heaps.alloc(128).unwrap();
         let placed = heaps.alloc(128).unwrap();
@@ -3883,6 +3923,250 @@ mod issue_336_to_cpu {
         );
         heaps.release(&placed);
         heaps.release(&first);
+    }
+
+    /// §4.3's owed measurement (`profiles-and-memory-design.md`, #892 A5):
+    /// does a large Private placement heap wire its pages at creation, or
+    /// only as its sub-buffers are touched? Run by hand; prints the
+    /// process's resident / virtual size (`proc_pidinfo`) and the device's
+    /// allocated bytes around a heap chunk of `LLOOM_HEAP_PROBE_GB` GB
+    /// (default 4):
+    ///
+    ///   cargo test -p lloom-tensor --features metal --lib --release -- \
+    ///     heap_wiring_probe --ignored --nocapture
+    #[test]
+    #[ignore = "a measurement, not a check: prints the footprint around a large heap"]
+    fn heap_wiring_probe() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let gb: usize = std::env::var("LLOOM_HEAP_PROBE_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let bytes = gb << 30;
+        // The process's physical footprint (`ri_phys_footprint`: what the
+        // kernel charges this task — the figure memory pressure and the
+        // §9.5a panic are about) beside its resident size, and the
+        // machine's wired and free pages (`vm_stat`).
+        let footprint = || -> (u64, u64, u64, u64) {
+            let mut ru: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    std::process::id() as i32,
+                    libc::RUSAGE_INFO_V4,
+                    &mut ru as *mut _ as *mut libc::rusage_info_t,
+                )
+            };
+            assert_eq!(rc, 0, "proc_pid_rusage failed");
+            let vm = std::process::Command::new("/usr/bin/vm_stat")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            let pages = |key: &str| -> u64 {
+                vm.lines()
+                    .find(|l| l.starts_with(key))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 16384
+            };
+            (
+                ru.ri_phys_footprint,
+                ru.ri_resident_size,
+                pages("Pages wired down"),
+                pages("Pages free"),
+            )
+        };
+        let gbf = |b: u64| b as f64 / 1e9;
+        let line = |what: &str, heap: Option<&crate::kernels::metal::HeapChunks>| {
+            let (f, r, w, free) = footprint();
+            eprintln!(
+                "HEAPPROBE {what}: footprint={:.3} GB resident={:.3} GB wired={:.3} GB free={:.3} GB device_allocated={:.3} GB{}",
+                gbf(f),
+                gbf(r),
+                gbf(w),
+                gbf(free),
+                gbf(m.device().current_allocated_size() as u64),
+                heap.map(|h| format!(" heap={:?}", h.stats())).unwrap_or_default()
+            );
+        };
+        line("before", None);
+        let heap = crate::kernels::metal::HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            bytes,
+            None,
+        );
+        let first = heap.alloc(1 << 20).unwrap();
+        line(
+            &format!("created a {gb} GB chunk + a 1 MiB sub-buffer"),
+            Some(&heap),
+        );
+        // Touch the whole chunk from the GPU: one sub-buffer per 256 MiB,
+        // filled.
+        let mut subs = vec![first];
+        while heap.stats().used + (256 << 20) <= bytes {
+            subs.push(heap.alloc(256 << 20).unwrap());
+        }
+        {
+            let mut blit = m.blit_command_encoder().unwrap();
+            blit.set_label("heap probe fill");
+            for b in &subs {
+                blit.fill_buffer(b, (0, b.length()), 0xA5);
+            }
+        }
+        m.wait_until_completed().unwrap();
+        line(
+            &format!("filled {} sub-buffers from the GPU", subs.len()),
+            Some(&heap),
+        );
+        for b in subs.drain(..) {
+            heap.release(&b);
+        }
+        drop(heap);
+        line("dropped", None);
+        // The second question (A5's yield): can a Shared persistent buffer
+        // give a range of its pages back without being freed —
+        // `munlock` + `madvise(MADV_FREE_REUSABLE)` on the range — and is
+        // the range usable again after?
+        let shared = m.new_persistent_shared(bytes).unwrap();
+        line(&format!("a {gb} GB Shared persistent buffer (wired)"), None);
+        unsafe { std::ptr::write_bytes(shared.contents(), 0x5A, bytes) };
+        line("host-touched every page", None);
+        let half = bytes / 2;
+        let ptr = shared.contents() as *mut libc::c_void;
+        let rc = unsafe { libc::munlock(ptr, half) };
+        assert_eq!(rc, 0, "munlock: {}", std::io::Error::last_os_error());
+        let rc = unsafe { libc::madvise(ptr, half, libc::MADV_FREE_REUSABLE) };
+        assert_eq!(rc, 0, "madvise: {}", std::io::Error::last_os_error());
+        line("munlock + MADV_FREE_REUSABLE on the first half", None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        line("… 500 ms later", None);
+        let rc = unsafe { libc::madvise(ptr, half, libc::MADV_FREE_REUSE) };
+        assert_eq!(rc, 0, "madvise reuse: {}", std::io::Error::last_os_error());
+        unsafe { std::ptr::write_bytes(shared.contents(), 0x3C, half) };
+        let back = unsafe { *(shared.contents() as *const u8).add(half - 1) };
+        assert_eq!(back, 0x3C, "the range is not writable after the reuse");
+        line("MADV_FREE_REUSE + host-touched the first half again", None);
+        drop(shared);
+        line("dropped the Shared buffer", None);
+    }
+
+    /// The L0 seam (`profiles-and-memory-design.md` §4.1): a heap backing
+    /// takes its sub-buffer's range back on `reclaim` and a whole-buffer
+    /// backing does not (its buffer frees on drop; the residency entry is
+    /// the holder's), and `Fallback` serves from its first backing, else
+    /// its second, reclaiming through whichever placed the buffer.
+    #[test]
+    fn a_backing_reclaims_what_it_placed_and_a_fallback_serves_from_the_first_that_can() {
+        use crate::kernels::metal::{
+            Allocation, Backing, Buffer, Commit, DeviceBuffer, Fallback, HeapChunks,
+        };
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let heap = HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            1 << 20,
+            None,
+        );
+        let device = DeviceBuffer::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            Commit::Now,
+            Some(std::sync::Arc::clone(m.ledger())),
+        );
+        let before = m.ledger().committed();
+        let sub = Backing::alloc(&heap, 4096).unwrap();
+        assert!(
+            sub.reservation.is_none(),
+            "a heap sub-buffer carries no reservation"
+        );
+        let sub = sub.buffer;
+        let whole = device.alloc(4096).unwrap();
+        assert_eq!(
+            m.ledger().committed(),
+            before + 4096,
+            "a whole buffer is committed for its life"
+        );
+        let whole = {
+            let Allocation {
+                buffer,
+                reservation,
+            } = whole;
+            drop(reservation);
+            assert_eq!(m.ledger().committed(), before);
+            buffer
+        };
+        assert_eq!(Backing::stats(&heap).live, 1);
+        assert!(!heap.reclaim(&whole), "a heap reclaims only its own ranges");
+        assert!(
+            !device.reclaim(&whole),
+            "a whole buffer frees on drop, not by reclaim"
+        );
+        assert!(heap.reclaim(&sub));
+        assert_eq!(Backing::stats(&heap).live, 0);
+        assert!(!heap.reclaim(&sub), "reclaimed once");
+        m.residency_set_handle().remove(&whole);
+
+        /// A backing that refuses everything.
+        #[derive(Debug)]
+        struct Refusing;
+        impl Backing for Refusing {
+            fn alloc(&self, bytes: usize) -> Result<Allocation, crate::kernels::MetalKernelError> {
+                Err(crate::kernels::MetalKernelError::FailedToCreateResource(
+                    format!("refused {bytes}"),
+                ))
+            }
+            fn reclaim(&self, _: &Buffer) -> bool {
+                false
+            }
+            fn stats(&self) -> crate::kernels::metal::BackingStats {
+                Default::default()
+            }
+        }
+        let fb = Fallback {
+            first: Refusing,
+            then: HeapChunks::new(
+                m.device(),
+                m.residency_set_handle(),
+                super::PRIVATE_RESOURCE_OPTIONS,
+                1 << 20,
+                None,
+            ),
+        };
+        let b = fb.alloc(512).unwrap().buffer;
+        assert_eq!(fb.stats().live, 1, "served by the second backing");
+        assert!(
+            fb.reclaim(&b),
+            "reclaimed through the backing that placed it"
+        );
+        assert_eq!(fb.stats().live, 0);
+        let fb2 = Fallback {
+            first: HeapChunks::new(
+                m.device(),
+                m.residency_set_handle(),
+                super::PRIVATE_RESOURCE_OPTIONS,
+                1 << 20,
+                None,
+            ),
+            then: Refusing,
+        };
+        let b = fb2.alloc(512).unwrap().buffer;
+        assert_eq!(fb2.first.stats().live, 1, "served by the first backing");
+        assert!(fb2.reclaim(&b));
+        assert!(
+            fb2.alloc(0).is_ok(),
+            "the first serves; the second is never asked"
+        );
+        assert!(Refusing.alloc(1).is_err());
     }
 
     /// The env switch resolves, and it defaults to the fast path.

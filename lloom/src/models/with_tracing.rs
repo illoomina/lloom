@@ -207,6 +207,14 @@ impl RmsNorm {
         self.inner.forward_diff(x)
     }
 
+    pub fn weight(&self) -> &Tensor {
+        self.inner.weight()
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.inner.eps()
+    }
+
     /// The fused kernel over `x` whatever its layout (a strided view is read
     /// where it lies).
     pub fn forward_view(&self, x: &Tensor) -> Result<Tensor> {

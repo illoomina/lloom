@@ -252,6 +252,21 @@ impl KvCache {
         }
     }
 
+    /// Bytes this row's k / v planes hold on the device now: the slab at
+    /// its capacity once allocated, the quantized planes' bytes; a pooled
+    /// row's are the pool's (its own tenant, not this row's).
+    pub fn bytes_held(&self, nkv: usize, hd: usize) -> usize {
+        let per_token = self.precision.bytes_per_token(nkv, hd, DType::F32);
+        match &self.kv {
+            KvBacking::Slab(s) if s.k_cache().all_data().is_some() => {
+                s.k_cache().max_seq_len() * per_token
+            }
+            KvBacking::Slab(_) => 0,
+            KvBacking::Quant(s) => s.bytes(),
+            KvBacking::Pooled { .. } => 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         match &self.kv {
             KvBacking::Slab(s) => s.current_seq_len(),
@@ -570,13 +585,10 @@ struct KvPoolInner {
     hd: usize,
     dtype: DType,
     device: lloom_tensor::Device,
-    /// A page table per slot, shared by the layers.
-    pages: lloom_tensor::kv_pages::KvPagePool,
-    /// Pages released by a cleared slot, held until the GPU's epoch that
-    /// could read them has completed.
-    quarantine: lloom_tensor::kv_pages::PageQuarantine,
-    #[cfg(feature = "metal")]
-    clock: Option<std::sync::Arc<lloom_tensor::kernels::metal::GpuClock>>,
+    /// A page table per slot, shared by the layers, with its liveness
+    /// (`nn::page_pool::PagePool`): a cleared slot's pages wait for the GPU's
+    /// epoch that could read them.
+    pages: crate::nn::page_pool::PagePool,
     /// Pages every layer's storage holds (the layers grow together).
     storage_pages: usize,
     layers: Vec<LayerStore>,
@@ -600,11 +612,6 @@ impl KvPool {
     ) -> Self {
         let page_size = KV_PAGE_TOKENS;
         let grow_pages = (slots.max(1) * KV_SLAB_TOKENS).div_ceil(page_size).max(1);
-        #[cfg(feature = "metal")]
-        let clock = match device {
-            lloom_tensor::Device::Metal(d) => Some(d.gpu_clock()),
-            _ => None,
-        };
         Self {
             inner: std::sync::Arc::new(parking_lot::Mutex::new(KvPoolInner {
                 slots,
@@ -615,15 +622,13 @@ impl KvPool {
                 hd,
                 dtype,
                 device: device.clone(),
-                pages: lloom_tensor::kv_pages::KvPagePool::new(
+                pages: crate::nn::page_pool::PagePool::new(
                     page_size,
                     0,
                     slots,
                     u32::MAX as usize,
+                    device,
                 ),
-                quarantine: lloom_tensor::kv_pages::PageQuarantine::new(),
-                #[cfg(feature = "metal")]
-                clock,
                 storage_pages: 0,
                 layers: (0..n_layers)
                     .map(|_| LayerStore {
@@ -693,7 +698,7 @@ impl KvPool {
             .lock()
             .pages
             .seq(slot)
-            .map(|s| s.pages().to_vec())
+            .map(|s| lloom_tensor::kv_pages::PageIdx::as_u32s(s.pages()).to_vec())
             .unwrap_or_default()
     }
 
@@ -741,7 +746,7 @@ impl KvPool {
         let out: Vec<u32> = {
             let pages = g.pages.seq(slot).expect("a leased slot").pages();
             (start..need)
-                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
                 .collect()
         };
         g.layers[layer].lens[slot] = need;
@@ -826,7 +831,7 @@ impl KvPool {
             let ps = g.page_size;
             let pages = g.pages.seq(slot).expect("a leased slot").pages();
             let ids: Vec<u32> = (0..len)
-                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
                 .collect();
             (pk, pv, ids)
         };
@@ -874,41 +879,14 @@ impl KvPool {
 }
 
 impl KvPoolInner {
-    /// The GPU's current epoch (Metal), the epoch a released page waits for.
-    fn epoch(&self) -> u64 {
-        #[cfg(feature = "metal")]
-        {
-            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            0
-        }
-    }
-
-    /// Epochs the GPU has completed (every one, without a clock).
-    fn completed(&self) -> u64 {
-        #[cfg(feature = "metal")]
-        {
-            self.clock.as_ref().map(|c| c.completed_count()).unwrap_or(u64::MAX)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            u64::MAX
-        }
-    }
-
     fn recycle_quarantined(&mut self) {
-        let ready = self.quarantine.drain_completed(self.completed());
-        if !ready.is_empty() {
-            self.pages.recycle(&ready).expect("quarantined pages are unallocated");
-        }
+        self.pages
+            .recycle_ready()
+            .expect("quarantined pages are unallocated");
     }
 
     fn release_pages(&mut self, slot: usize) {
-        let freed = self.pages.release(slot);
-        let epoch = self.epoch();
-        self.quarantine.quarantine(epoch, freed);
+        self.pages.release(slot);
     }
 
     fn rewind_table(&mut self, slot: usize) {

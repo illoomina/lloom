@@ -57,8 +57,8 @@ pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{
     call_mlx_gemm, call_mlx_gemm_out, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full,
-    call_mlx_gemv_mixed, call_mlx_gemv_with, GemmDType, GemvEpilogue, GemvRmsNorm, MixedEpilogue,
-    SKINNY_TILE_MAX_M,
+    call_mlx_gemv_mixed, call_mlx_gemv_norm, call_mlx_gemv_with, gemv_norm_serves, GemmDType,
+    GemvEpilogue, GemvNormInline, GemvRmsNorm, MixedEpilogue, SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::{
     call_hc_collapse, call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm,

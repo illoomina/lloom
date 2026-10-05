@@ -571,7 +571,7 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
             if let Device::Metal(m) = &self.dev {
                 let clock = m.gpu_clock();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while clock.completed_count() < clock.current_epoch() {
+                while clock.completed_count().0 < clock.current_epoch().0 {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "the GPU clock never completed"

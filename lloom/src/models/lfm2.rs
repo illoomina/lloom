@@ -17,7 +17,7 @@ use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
-use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
+use lloom_tensor::kernels::metal::{GpuClock, PageError, PageIdx};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
@@ -202,6 +202,7 @@ impl Lfm2Config {
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
             memory_budget: None,
+            stream_layers: None,
             // Both GEMV epilogue fusions are off, per §7.1a. #536 and #509 both
             // say the default needs the decode-path number, which is not taken
             // here — this change makes the arm reachable, nothing more.
@@ -1160,6 +1161,79 @@ impl std::fmt::Display for FusionReport {
     }
 }
 
+/// How the layers' weights stream (`Config::stream_layers`): the
+/// checkpoint files the groups read from, the slots the tier holds (one
+/// layer's matrices each, sized for the largest) and how many groups the
+/// loader runs ahead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamLayers {
+    pub files: Vec<std::path::PathBuf>,
+    pub slots: usize,
+    pub depth: usize,
+}
+
+/// One pass's view of the MLP's projections: the resident `Linear`s by
+/// reference, or the slot views a streamed layer took for this pass.
+struct Projections<'a> {
+    gate: std::borrow::Cow<'a, Linear>,
+    up: std::borrow::Cow<'a, Linear>,
+    down: std::borrow::Cow<'a, Linear>,
+}
+
+/// One pass's view of the attention's four projections (the norms stay
+/// resident).
+struct AttnWeights<'a> {
+    q: std::borrow::Cow<'a, Linear>,
+    k: std::borrow::Cow<'a, Linear>,
+    v: std::borrow::Cow<'a, Linear>,
+    o: std::borrow::Cow<'a, Linear>,
+}
+
+/// One pass's view of the short conv's two projections (the taps stay
+/// resident: `hidden x l_cache` elements, not worth a slot).
+struct ConvWeights<'a> {
+    in_proj: std::borrow::Cow<'a, Linear>,
+    out_proj: std::borrow::Cow<'a, Linear>,
+}
+
+enum MixerWeights<'a> {
+    Attn(AttnWeights<'a>),
+    Conv(ConvWeights<'a>),
+}
+
+/// A layer's matrices for one pass — the group §4.8 streams: the mixer's
+/// projections and the MLP's, one slot. A resident layer borrows its
+/// fields; a streamed layer takes its views at the layer's entry, once.
+struct LayerWeights<'a> {
+    mixer: MixerWeights<'a>,
+    mlp: Projections<'a>,
+}
+
+/// The part order inside a layer's group: the MLP's `w1`, `w3`, `w2`, then
+/// the mixer's projections (`q`, `k`, `v`, `out` | `in`, `out`).
+const GROUP_PART_W1: usize = 0;
+const GROUP_PART_W3: usize = 1;
+const GROUP_PART_W2: usize = 2;
+const GROUP_PART_MIXER: usize = 3;
+
+/// One layer on the weight-group tier: its group, the tier (shared by
+/// every layer) and the source its bytes come from.
+#[derive(Clone)]
+struct StreamedLayer {
+    group: crate::nn::slot_cache::WeightGroupId,
+    tier: std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>,
+    source: std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>,
+    depth: usize,
+}
+
+impl std::fmt::Debug for StreamedLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamedLayer")
+            .field("group", &self.group)
+            .finish()
+    }
+}
+
 /// The runtime config. The `#[axis]`-tagged fields are the engine's
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
@@ -1301,6 +1375,13 @@ pub struct Config {
     /// per §7.1a's rule that no default is flipped without its own argued
     /// decision. See `Cache::admit_memory_budget`.
     pub memory_budget: Option<MemoryBudget>,
+    /// The decoder layers' matrices (the mixer's projections and the
+    /// MLP's, one group a layer) streamed through `nn::weight_groups`
+    /// (`profiles-and-memory-design.md` §4.8, #892 A6a): `None` — every
+    /// weight resident — unless the loader finds the weights do not fit the
+    /// quota. A model that fits never streams. The embedding, the norms and
+    /// the conv taps stay resident.
+    pub stream_layers: Option<StreamLayers>,
     /// Fuse the SiLU in `Mlp::forward` onto `w1`'s GEMV store (#484's kernel,
     /// wired by #509).
     ///
@@ -1546,6 +1627,7 @@ impl Default for Config {
             kv_quant: KvQuant::default(),
             conv_state: ConvState::default(),
             memory_budget: None,
+            stream_layers: None,
             gemv_silu: false,
             gemv_residual: false,
             gemv_gate: GateFusion::Off,
@@ -1562,154 +1644,20 @@ impl Default for Config {
 }
 
 /// One attention layer's K or V, pre-allocated once and written at a moving
-/// offset.
-///
-/// `DESIGN.md` §6.2's `Tensor::cat` reallocates and copies the whole cache every
-/// token; this writes only the new token's bytes and hands back a `narrow` of
-/// the buffer. Three consequences, and the third is the one §11.1a.1 is after:
-///
-/// * the `cat` is gone, so the `copy2d` per layer per token drops from 2 to 1;
-/// * the surviving `copy2d` is **constant-size** — one token's `[1, 8, 1, 64]`
-///   — where the `cat` copied `kv_len` tokens and grew by 64 rows per step;
-/// * **the buffer identity stops changing.** `narrow` clones the storage `Arc`
-///   and rewrites only the layout, so every token binds the same `MTLBuffer` at
-///   the same base. That is the property ICB replay needs and the reason this
-///   is worth more than the copy it removes.
-///
-/// The read is a *view*, never a copy. `call_sdpa_vector` takes `k_l.stride()`
-/// and `n = k_shape[2]`, so a narrowed cache is exactly the shape it is written
-/// to consume (`candle-metal-kernels/src/kernels/sdpa.rs`); the generic arm's
-/// `repeat_kv` goes through `Tensor::cat`, which handles a strided source.
-#[derive(Debug, Clone)]
-struct KvSlot {
-    /// `[b_sz, n_kv_heads, capacity, head_dim]`, allocated on first append.
-    ///
-    /// `None` until then, because the batch size is not known at `Cache::new`.
-    /// This mirrors `crate::nn::kv_cache::Cache`, deliberately: that type is the
-    /// same mechanism and was read before this was written (see the note on
-    /// `Cache::new_with` for why it is not reused directly).
-    all_data: Option<Tensor>,
-    /// How many tokens of `all_data` are live. The `narrow` length.
-    len: usize,
-    capacity: usize,
-}
+/// offset: `nn::slab::Slab` along the sequence dim, at the bucket's width,
+/// widened only by `Cache::prepare_pass` before a pass appends
+/// (`Grow::Fixed`). The read is a view, the write one constant-size
+/// `copy2d`, and the buffer identity moves only at a grow (§6.2b); the
+/// rationale is the slab's own.
+type KvSlot = crate::nn::slab::Slab;
 
-impl KvSlot {
-    fn new(capacity: usize) -> Self {
-        Self {
-            all_data: None,
-            len: 0,
-            capacity,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.len = 0;
-        self.all_data = None;
-    }
-
-    /// Discard the last `count` appended positions.
-    ///
-    /// `DESIGN.md` §10.2a's KV half of `resolve`: *"`len += n`; discarded bytes
-    /// **need not be cleared** — unreachable above `len`"*. The read is
-    /// `all_data.narrow(2, 0, self.len)`, so a position above `len` is outside
-    /// every view this slot hands out and no kernel can address it.
-    ///
-    /// **The allocation is deliberately not touched.** Rewinding frees nothing
-    /// and must not: stable buffer identity is the property §6.2b exists to
-    /// preserve (`buf#69` at the same base every token), and dropping the
-    /// buffer on rollback would move it at exactly the moment a speculative
-    /// scheme runs most often. A rewind is a length decrement and nothing else,
-    /// which is what §10.2a's cost column means by *"a length decrement"*.
-    fn rewind(&mut self, count: usize) -> Result<()> {
-        if count > self.len {
-            lloom_tensor::bail!(
-                "lfm2 KV rewind past the start: {count} > len {}. \
-                 `resolve(n)` may only discard positions this speculation appended.",
-                self.len
-            )
-        }
-        self.len -= count;
-        Ok(())
-    }
-
-    /// Bytes the slab holds. Zero before the first append.
-    fn bytes(&self) -> usize {
-        self.all_data
-            .as_ref()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .unwrap_or(0)
-    }
-
-    /// Widen the slab to `capacity` tokens, keeping every position where it is.
-    ///
-    /// Before the first append this is a number: the slab is allocated at the
-    /// new width when the first token arrives. After it, a fresh slab is
-    /// allocated at the new width and the old one is copied into its prefix
-    /// whole — every position, live or rewound, lands at the offset it had, so
-    /// the views this slot hands out afterwards read exactly the bytes the
-    /// views before it did. The copy is `slice_set`'s one `copy2d` per plane;
-    /// the old slab returns to the pool when the last view of it drops.
-    ///
-    /// **The buffer identity moves here, and only here.** §6.2b's property —
-    /// one `MTLBuffer` at one base every token — holds between grows; a grow
-    /// is the one event that re-binds it, paid once per bucket rather than
-    /// once per token. A replay executor sees the step as stale and re-records
-    /// (§11.3y); the arena sees a drift and re-records (§9.2z). Neither is a
-    /// wrong answer, and both are the documented price.
-    ///
-    /// A `capacity` at or below the current one is a no-op, never a shrink:
-    /// the caller decides the width, and this never discards a position.
-    fn grow_to(&mut self, capacity: usize) -> Result<()> {
-        if capacity <= self.capacity {
-            return Ok(());
-        }
-        if let Some(old) = self.all_data.as_ref() {
-            let mut shape = old.dims().to_vec();
-            shape[2] = capacity;
-            let grown = zs::zeros(zs::LFM2_KV_SLAB, shape, old.dtype(), old.device())?;
-            grown.slice_set(old, 2, 0)?;
-            self.all_data = Some(grown);
-        }
-        self.capacity = capacity;
-        Ok(())
-    }
-
-    /// Append `src` along dim 2 and return the live prefix as a view.
-    ///
-    /// Returns `Err` rather than reallocating when the capacity is exhausted:
-    /// the slab is widened by `Cache::prepare_pass` before a pass appends, so
-    /// reaching this means an append ran outside a prepared pass.
-    fn append(&mut self, src: &Tensor) -> Result<Tensor> {
-        let seq_len = src.dim(2)?;
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[2] = self.capacity;
-            self.all_data = Some(zs::zeros(
-                zs::LFM2_KV_SLAB,
-                shape,
-                src.dtype(),
-                src.device(),
-            )?);
-        }
-        let all_data = self.all_data.as_ref().unwrap();
-        if self.len + seq_len > self.capacity {
-            lloom_tensor::bail!(
-                "lfm2 KV cache exhausted: {} + {} > capacity {}. \
-                 A pass widens the slab before it appends (`Cache::prepare_pass`); this \
-                 append ran outside a prepared pass.",
-                self.len,
-                seq_len,
-                self.capacity
-            )
-        }
-        // `slice_set` requires both sides contiguous and writes one `copy2d` of
-        // exactly `src`'s bytes at `offset * block_size` (`tensor_cat.rs`). The
-        // caller has already made `src` contiguous.
-        all_data.slice_set(src, 2, self.len)?;
-        self.len += seq_len;
-        all_data.narrow(2, 0, self.len)
-    }
+fn kv_slot(capacity: usize) -> KvSlot {
+    crate::nn::slab::Slab::new(
+        2,
+        capacity,
+        crate::nn::slab::Grow::Fixed,
+        zs::LFM2_KV_SLAB,
+    )
 }
 
 /// One attention layer's K or V, stored as integer codes plus a (scale, bias)
@@ -1944,11 +1892,11 @@ impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
     }
 
     fn len(&self) -> usize {
-        self.0.len
+        self.0.len()
     }
 
     fn rollback(&mut self, to: usize) -> Result<()> {
-        let len = self.0.len;
+        let len = self.0.len();
         if to > len {
             lloom_tensor::bail!("lfm2 KvSlot rollback to {to} past len {len}")
         }
@@ -1997,8 +1945,9 @@ struct PagedKv {
     /// sequences' tables are not the identity — the fixture §10.3h needs at
     /// the model level, reached through an ordinary allocation history.
     churn_pages: usize,
-    pool: Option<KvPagePool>,
-    quarantine: PageQuarantine,
+    /// The allocator with its liveness (`nn::page_pool::PagePool`): created
+    /// at the first pass, when the batch is known.
+    pool: Option<crate::nn::page_pool::PagePool>,
     clock: Arc<GpuClock>,
     /// Per layer, allocated on the layer's first write.
     pools: Vec<Option<(Tensor, Tensor)>>,
@@ -2055,7 +2004,6 @@ impl PagedKv {
             pool_pages_override: env_usize("LLOOM_148_POOL_PAGES")?,
             churn_pages: env_usize("LLOOM_148_POOL_CHURN")?.unwrap_or(0),
             pool: None,
-            quarantine: PageQuarantine::new(),
             clock,
             pools: vec![None; num_layers],
             n_seqs: 0,
@@ -2100,6 +2048,30 @@ impl PagedKv {
         }
     }
 
+    /// Pages per sequence a pass of `seq_len` tokens would fail to take from
+    /// the pool as it stands: the pages every sequence's append pops, less the
+    /// free list and what the quarantine releases at the pass's drain. Zero
+    /// before the pool exists (it is created sized for the slab) and under a
+    /// pinned pool (exhaustion at it stays loud).
+    ///
+    /// Positions alone under-size the pool after a `clear`: the cleared
+    /// sequence's pages are held until the epoch open at the clear completes,
+    /// and nothing commits between a chat's turns, so the next turn's first
+    /// pass finds every one of them held. Sized by positions, a pool of one
+    /// turn refuses the refill of an empty sequence; this is the term that
+    /// widens it instead (§10.3h's liveness kept, never a wait on the GPU).
+    fn pages_short(&self, seq_len: usize) -> usize {
+        let Some(pool) = self.pool.as_ref() else {
+            return 0;
+        };
+        if self.pool_pages_override.is_some() || seq_len == 0 {
+            return 0;
+        }
+        let n_seqs = self.n_seqs.max(1);
+        pool.pages_short((0..n_seqs).map(|s| (s, seq_len)))
+            .div_ceil(n_seqs)
+    }
+
     /// Widen the pool to `slab` tokens per sequence — `KvSlot::grow_to`'s
     /// contract on a pool.
     ///
@@ -2111,8 +2083,11 @@ impl PagedKv {
     /// handed out before a fresh one — the order a pool this wide from the
     /// start would have taken. Under `LLOOM_148_POOL_PAGES` the pool is pinned
     /// and exhaustion at it stays loud.
+    ///
+    /// The ceiling bounds positions, not the pool: `Cache::plan_pass` refuses
+    /// a pass past `kv_capacity`, and may size the pool past it by the pages a
+    /// quarantine still holds (`pages_short`), so `slab` is taken as planned.
     fn grow_to(&mut self, slab: usize) -> Result<()> {
-        let slab = slab.min(self.kv_capacity);
         if slab <= self.slab {
             return Ok(());
         }
@@ -2149,14 +2124,22 @@ impl PagedKv {
             // leaves before any real sequence exists; a table one entry longer
             // than the pool, so running out is reported as the pool's
             // exhaustion (which names the knob) and never as a full table.
-            let mut pool = KvPagePool::new(self.page_size, pool_pages, n_seqs + 1, pool_pages + 1);
+            let mut pool = crate::nn::page_pool::PagePool::with_clock(
+                self.page_size,
+                pool_pages,
+                n_seqs + 1,
+                pool_pages + 1,
+                Arc::clone(&self.clock),
+            );
             if self.churn_pages > 0 {
                 // No command buffer has read these pages, so recycling them
                 // without an epoch is safe here and only here.
-                pool.append(n_seqs, self.churn_pages * self.page_size)
+                let pages = pool.pages_mut();
+                pages
+                    .append(n_seqs, self.churn_pages * self.page_size)
                     .map_err(lloom_tensor::Error::wrap)?;
-                let freed = pool.release(n_seqs);
-                pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+                let freed = pages.release(n_seqs);
+                pages.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
             }
             self.pool = Some(pool);
         } else if n_seqs != self.n_seqs {
@@ -2168,12 +2151,10 @@ impl PagedKv {
         }
         // Pages whose last reader has completed come back first, so a long
         // session recycles rather than exhausts.
-        let ready = self
-            .quarantine
-            .drain_completed(self.clock.completed_count());
         let (pool_pages, page_size) = (self.pool_pages(), self.page_size);
         let pool = self.pool.as_mut().expect("created above");
-        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+        pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
+        let pool = pool.pages_mut();
 
         let start = self.len;
         let mut slots = Vec::with_capacity(n_seqs * seq_len);
@@ -2188,7 +2169,7 @@ impl PagedKv {
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
             for t in start..start + seq_len {
                 slots.push(
-                    (pages[t / self.page_size] * self.page_size as u32)
+                    (pages[t / self.page_size].0 * self.page_size as u32)
                         + (t % self.page_size) as u32,
                 );
             }
@@ -2310,7 +2291,7 @@ impl PagedKv {
         n_prev: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let pool = self.pool.as_ref().expect("a pass has begun");
+        let pool = self.pool.as_ref().expect("a pass has begun").pages();
         let (pk, pv) = self.pools[block_idx]
             .as_ref()
             .expect("the layer has a pool");
@@ -2320,7 +2301,8 @@ impl PagedKv {
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
             let ids: Vec<u32> = (0..n_prev)
                 .map(|t| {
-                    pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32
+                    pages[t / self.page_size].0 * self.page_size as u32
+                        + (t % self.page_size) as u32
                 })
                 .collect();
             let ids = Tensor::new(ids.as_slice(), device)?;
@@ -2334,12 +2316,9 @@ impl PagedKv {
     /// command buffer encoded now belongs to.
     fn release_all(&mut self) {
         if let Some(pool) = self.pool.as_mut() {
-            let mut freed = Vec::new();
             for s in 0..self.n_seqs {
-                freed.extend(pool.release(s));
+                pool.release(s);
             }
-            self.quarantine
-                .quarantine(self.clock.current_epoch(), freed);
         }
         self.len = 0;
         self.pass_len = 0;
@@ -2360,7 +2339,9 @@ impl PagedKv {
         }
         if let Some(pool) = self.pool.as_mut() {
             for s in 0..self.n_seqs {
-                pool.rewind(s, n).map_err(lloom_tensor::Error::wrap)?;
+                pool.pages_mut()
+                    .rewind(s, n)
+                    .map_err(lloom_tensor::Error::wrap)?;
             }
         }
         self.len -= n;
@@ -2387,12 +2368,20 @@ impl PagedKv {
         let mut kv = Self::new(config, kv_capacity, slab, num_layers, clock)?;
         kv.n_seqs = slots;
         let pool_pages = kv.pool_pages();
-        let mut pool = KvPagePool::new(kv.page_size, pool_pages, slots + 1, pool_pages + 1);
+        let mut pool = crate::nn::page_pool::PagePool::with_clock(
+            kv.page_size,
+            pool_pages,
+            slots + 1,
+            pool_pages + 1,
+            Arc::clone(&kv.clock),
+        );
         if kv.churn_pages > 0 {
-            pool.append(slots, kv.churn_pages * kv.page_size)
+            let pages = pool.pages_mut();
+            pages
+                .append(slots, kv.churn_pages * kv.page_size)
                 .map_err(lloom_tensor::Error::wrap)?;
-            let freed = pool.release(slots);
-            pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+            let freed = pages.release(slots);
+            pages.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
         }
         kv.pool = Some(pool);
         Ok(kv)
@@ -2402,7 +2391,7 @@ impl PagedKv {
     fn row_len(&self, slot: usize) -> usize {
         self.pool
             .as_ref()
-            .and_then(|p| p.seq(slot))
+            .and_then(|p| p.pages().seq(slot))
             .map(|s| s.len())
             .unwrap_or(0)
     }
@@ -2422,15 +2411,12 @@ impl PagedKv {
     /// the tables the read walks. Runs once per pass, at its first attention
     /// layer; every layer of the pass reuses the result.
     fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
-        let ready = self
-            .quarantine
-            .drain_completed(self.clock.completed_count());
         let (pool_pages, page_size, ppc) = (self.pool_pages(), self.page_size, self.pages_per_chunk);
         let pool = self
             .pool
             .as_mut()
             .ok_or_else(|| lloom_tensor::Error::msg("lfm2 paged KV: the shared pool is unset"))?;
-        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+        pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
 
         let mut slots: Vec<u32> = Vec::new();
         let mut prev = Vec::with_capacity(rows.len());
@@ -2443,13 +2429,10 @@ impl PagedKv {
                 // committed since (a reset between requests encodes no
                 // dispatch of its own): wait the GPU out once and recycle
                 // them, rather than refusing a pool that is free in fact.
-                Err(PageError::Exhausted { .. }) if !self.quarantine.is_empty() => {
+                Err(PageError::Exhausted { .. }) if pool.holds_any() => {
                     device.synchronize()?;
-                    let ready = self
-                        .quarantine
-                        .drain_completed(self.clock.completed_count());
-                    pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
-                    pool.append(slot, n)
+                    pool.recycle_ready().map_err(lloom_tensor::Error::wrap)?;
+                    pool.pages_mut().append(slot, n)
                 }
                 other => other,
             };
@@ -2462,7 +2445,7 @@ impl PagedKv {
             })?;
             let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
             for t in start..start + n {
-                slots.push((pages[t / page_size] * page_size as u32) + (t % page_size) as u32);
+                slots.push((pages[t / page_size].0 * page_size as u32) + (t % page_size) as u32);
             }
         }
         let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
@@ -2480,7 +2463,7 @@ impl PagedKv {
                 )
             }
             n_keys.push(seq.len() as u32);
-            pages.push(seq.pages().to_vec());
+            pages.push(PageIdx::as_u32s(seq.pages()).to_vec());
             per_row.push(pool.table_for(slot, ppc));
         }
         let table_stride = n_keys
@@ -2574,7 +2557,9 @@ impl PagedKv {
             .expect("the layer has a pool once a token was written");
         let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
         let ids: Vec<u32> = (0..n_prev)
-            .map(|t| pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32)
+            .map(|t| {
+                pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32
+            })
             .collect();
         let ids = Tensor::new(ids.as_slice(), device)?;
         Ok((pk.index_select(&ids, 2)?, pv.index_select(&ids, 2)?))
@@ -2590,21 +2575,18 @@ impl PagedKv {
 
     /// Drop slot `slot`'s pages into the quarantine; returns the pages whose
     /// last referent this was.
-    fn release_slot(&mut self, slot: usize) -> Vec<u32> {
+    fn release_slot(&mut self, slot: usize) -> Vec<PageIdx> {
         let Some(pool) = self.pool.as_mut() else {
             return Vec::new();
         };
-        let freed = pool.release(slot);
-        self.quarantine
-            .quarantine(self.clock.current_epoch(), freed.clone());
-        freed
+        pool.release(slot)
     }
 
     /// Slot `slot`'s page table.
-    fn row_pages(&self, slot: usize) -> Vec<u32> {
+    fn row_pages(&self, slot: usize) -> Vec<PageIdx> {
         self.pool
             .as_ref()
-            .and_then(|p| p.seq(slot))
+            .and_then(|p| p.pages().seq(slot))
             .map(|s| s.pages().to_vec())
             .unwrap_or_default()
     }
@@ -2710,7 +2692,7 @@ struct BatchInner {
     /// when a row's pass begins at a page boundary, dropped when the page's
     /// last referent goes. What a row sharing the page starts its own ring
     /// from (`batched-decode-design.md` §12.3).
-    snapshots: HashMap<u32, RingSnapshot>,
+    snapshots: HashMap<PageIdx, RingSnapshot>,
     /// Whether the layers take the batched arms (one dispatch per kernel for
     /// the batch) or the per-row loop over the same pool — the A/B, and the
     /// identity gate's two arms. `LLOOM_148_ROWS_ARM=per-row` turns them off.
@@ -3101,6 +3083,11 @@ pub struct Cache {
     /// The grow granularity in tokens — [`DEFAULT_KV_BUCKET`] unless
     /// [`Cache::with_kv_bucket`] said otherwise.
     kv_bucket: usize,
+    /// This cache's row on the device's ledger (`ledger.rs`): the slab as
+    /// its floor, the ceiling as its want, a bucket as its unit, the KV
+    /// bytes held. Dropped with the cache; a clone shares it.
+    #[cfg(feature = "metal")]
+    ledger: Option<Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
     /// Tokens the slab (or the pool, per sequence) is sized for now. Every
     /// slot, plane and pool is at this width; only `prepare_pass` moves it.
     kv_slab: usize,
@@ -3126,10 +3113,20 @@ pub struct Cache {
     /// The turn checkpoints: the last [`TURN_CHECKPOINTS`] multi-token
     /// passes, each the tail of its conv input per conv layer, so the cache
     /// can be put back at any position within [`TURN_CHECKPOINT_SLACK`] of a
-    /// pass's end ([`Cache::restore`]). A ring: a slot's buffers are reused
-    /// by the pass that takes it over, so a prefill allocates none after the
-    /// first `TURN_CHECKPOINTS` passes.
+    /// pass's end ([`Cache::restore`]). The slots' tails live in `turn_ring`,
+    /// one allocation per sequence; this is their bookkeeping.
     turn_checkpoints: Vec<TurnCheckpoint>,
+    /// The checkpoints' tails: [`TURN_CHECKPOINTS`] frames of `[conv layers,
+    /// b, hidden, l_cache + TURN_CHECKPOINT_SLACK]`, allocated once at a
+    /// sequence's first checkpointing pass and kept across `clear` (the next
+    /// sequence of the same geometry writes over it), so no pass allocates a
+    /// tail (`nn::ring::Ring`).
+    turn_ring: Option<crate::nn::ring::Ring>,
+    /// The model's weight-group tier, when its layers stream (§4.8) —
+    /// attached by the model at each pass's entry, so the KV grow's
+    /// admission can apply the arbiter's pledge (the tier's yield) and
+    /// ask again, as Qwen4-exp's `prepare_pass_as` does with its experts.
+    layer_tier: Option<std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>>,
     /// The ring slot the pass in flight writes its tails into, `None` on a
     /// pass that takes no checkpoint (a decode step, a verify, `Cat`).
     turn_ckpt_cur: Option<usize>,
@@ -3510,11 +3507,10 @@ pub const TURN_CHECKPOINT_SLACK: usize = 16;
 /// the input it convolved over (`[b, hidden, l_cache + TURN_CHECKPOINT_SLACK]`,
 /// the valid columns at the front). The KV needs nothing kept — a restore is
 /// a length decrement there.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct TurnCheckpoint {
     pos: usize,
     tail_len: usize,
-    tails: Vec<Option<Tensor>>,
     valid: bool,
 }
 
@@ -3754,12 +3750,32 @@ impl Cache {
         } else {
             None
         };
+        #[cfg(feature = "metal")]
+        let ledger = match device {
+            Device::Metal(m) if use_kv_cache => {
+                use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+                let gauge = Gauge::new(
+                    "lfm2-kv",
+                    Claim {
+                        floor: slab * kv_bytes_per_token,
+                        want: kv_capacity * kv_bytes_per_token,
+                        unit: DEFAULT_KV_BUCKET.min(kv_capacity) * kv_bytes_per_token,
+                        class: Class::Capability,
+                    },
+                    0,
+                );
+                let tenant: Arc<dyn Tenant> = gauge.clone();
+                m.ledger().register(&tenant);
+                Some(gauge)
+            }
+            _ => None,
+        };
         Ok(Self {
             masks: HashMap::new(),
             use_kv_cache,
             kvs: vec![None; num_layers],
             kv_slots: (0..num_layers)
-                .map(|_| (KvSlot::new(slab), KvSlot::new(slab)))
+                .map(|_| (kv_slot(slab), kv_slot(slab)))
                 .collect(),
             quant_slots: (0..num_layers)
                 .map(|_| {
@@ -3778,6 +3794,8 @@ impl Cache {
             kv_quant: config.kv_quant,
             kv_capacity,
             kv_bucket: DEFAULT_KV_BUCKET,
+            #[cfg(feature = "metal")]
+            ledger,
             kv_slab: slab,
             kv_grows: 0,
             kv_grow_fraction,
@@ -3785,6 +3803,8 @@ impl Cache {
             conv_states: vec![None; num_layers],
             conv_spare: vec![None; num_layers],
             turn_checkpoints: Vec::with_capacity(TURN_CHECKPOINTS),
+            turn_ring: None,
+            layer_tier: None,
             turn_ckpt_cur: None,
             turn_ckpt_next: 0,
             conv_phase: 0,
@@ -4253,7 +4273,7 @@ impl Cache {
         if bucket == 0 {
             lloom_tensor::bail!("lfm2 kv_bucket must be at least one token")
         }
-        let allocated = self.kv_slots.iter().any(|(k, _)| k.all_data.is_some())
+        let allocated = self.kv_slots.iter().any(|(k, _)| k.is_allocated())
             || self.quant_slots.iter().any(|(k, _)| k.codes.is_some());
         if allocated {
             lloom_tensor::bail!(
@@ -4310,8 +4330,8 @@ impl Cache {
             KvAppend::InPlace => self
                 .kv_slots
                 .iter()
-                .find(|(k, _)| k.all_data.is_some())
-                .map(|(k, _)| k.len)
+                .find(|(k, _)| k.is_allocated())
+                .map(|(k, _)| k.len())
                 .unwrap_or(0),
             KvAppend::Paged => {
                 #[cfg(feature = "metal")]
@@ -4406,10 +4426,35 @@ impl Cache {
     /// layer 5 — leaves the planes it widened widened and the rest as they
     /// were; every plane is self-describing, nothing was written, and the next
     /// call widens the remainder. Idempotent by construction.
+    /// The model's tier, for the admission below (once; cheap after).
+    pub(crate) fn attach_layer_tier(
+        &mut self,
+        tier: &std::sync::Arc<parking_lot::Mutex<crate::nn::weight_groups::WeightGroups>>,
+    ) {
+        if self.layer_tier.is_none() {
+            self.layer_tier = Some(std::sync::Arc::clone(tier));
+        }
+    }
+
+    /// Apply the arbiter's grant to the tier at this pass boundary, if it
+    /// moved (A6b: the dense tier yields as the expert tier does).
+    pub(crate) fn apply_layer_grant(&self) -> Result<Option<usize>> {
+        match &self.layer_tier {
+            Some(t) => t.lock().apply_grant(),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn prepare_pass(&mut self, seq_len: usize) -> Result<()> {
+        self.apply_layer_grant()?;
         if let Some(plan) = self.plan_pass(seq_len)? {
             self.admit_grow(plan.bytes, &plan.describe())?;
             self.apply_grow(&plan)?;
+        }
+        // The planes allocate at the first append, at the slab's width: the
+        // ledger hears that here, once per sequence, and at every grow after.
+        if seq_len > 0 && self.kv_len() == 0 {
+            self.ledger_set_held(self.kv_slab * self.kv_bytes_per_token);
         }
         Ok(())
     }
@@ -4456,10 +4501,26 @@ impl Cache {
                 shared: true,
             }));
         }
-        if need <= self.kv_slab {
+        let mut slab = if need <= self.kv_slab {
+            self.kv_slab
+        } else {
+            (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity)
+        };
+        // The paged pool is sized by the pages a pass can take, not by
+        // positions alone: pages a quarantine still holds are neither the
+        // sequence's nor free (`PagedKv::pages_short`). The headroom may take
+        // the pool past the ceiling; the ceiling check above bounds positions.
+        #[cfg(feature = "metal")]
+        if let Some(p) = self.paged.as_ref() {
+            let short = p.pages_short(seq_len);
+            if short > 0 {
+                let wide = self.kv_slab + short * p.page_size;
+                slab = slab.max(wide.div_ceil(self.kv_bucket) * self.kv_bucket);
+            }
+        }
+        if slab <= self.kv_slab {
             return Ok(None);
         }
-        let slab = (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity);
         Ok(Some(GrowPlan {
             from: self.kv_slab,
             slab,
@@ -4504,6 +4565,7 @@ impl Cache {
         }
         self.kv_slab = slab;
         self.kv_grows += 1;
+        self.ledger_note();
         Ok(())
     }
 
@@ -4512,8 +4574,8 @@ impl Cache {
     /// it.
     fn set_slab(&mut self, slab: usize) {
         for (k, v) in self.kv_slots.iter_mut() {
-            k.capacity = slab;
-            v.capacity = slab;
+            k.set_capacity(slab);
+            v.set_capacity(slab);
         }
         for (k, v) in self.quant_slots.iter_mut() {
             k.capacity = slab;
@@ -4533,6 +4595,34 @@ impl Cache {
             slab = b.pool.inner.lock().kv.slab;
         }
         self.kv_slab = slab;
+        self.ledger_note();
+    }
+
+    /// What the ledger reads as held: the planes' bytes once they exist, or
+    /// the width the first pass will allocate them at (`prepare_pass`).
+    fn ledger_set_held(&self, bytes: usize) {
+        #[cfg(feature = "metal")]
+        if let Some(g) = &self.ledger {
+            g.set_held(bytes);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = bytes;
+    }
+
+    /// Tell the ledger what this cache holds and needs now: the planes' bytes
+    /// as held, the slab's as the floor. At a grow and a clear, never per token.
+    fn ledger_note(&self) {
+        #[cfg(feature = "metal")]
+        if let Some(g) = &self.ledger {
+            use lloom_tensor::kernels::metal::ledger::{Claim, Class};
+            g.set_held(self.kv_report().bytes);
+            g.set_claim(Claim {
+                floor: self.kv_slab * self.kv_bytes_per_token,
+                want: self.kv_capacity * self.kv_bytes_per_token,
+                unit: self.kv_bucket.min(self.kv_capacity) * self.kv_bytes_per_token,
+                class: Class::Capability,
+            });
+        }
     }
 
     /// Bytes widening the slab to `slab` tokens will allocate, read from an
@@ -4558,7 +4648,7 @@ impl Cache {
                     .kv_slots
                     .iter()
                     .flat_map(|(k, v)| [k, v])
-                    .filter_map(|s| s.all_data.as_ref())
+                    .filter_map(|s| s.data().as_ref())
                     .map(|t| {
                         let d = t.dims();
                         d[0] * d[1] * d[3] * elem(t)
@@ -4635,23 +4725,44 @@ impl Cache {
             return Ok(());
         };
         let dev = metal.device();
-        let allocated = dev.current_allocated_size();
         let working_set = dev.recommended_max_working_set_size();
-        if kv_grow_fits(allocated, working_set, self.kv_grow_fraction, grow) {
+        // The free lists are given back before a refusal stands
+        // (`MetalDevice::admit_bytes`); the arithmetic is `kv_grow_fits`'.
+        let mut a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+        if !a.fits && a.pledged > 0 {
+            // The tenants pledged a yield (the layers' slots): apply it —
+            // the tier resized to its grant — and ask again on the figure
+            // after (the expert tier's shape, `prepare_pass_as`).
+            if self.apply_layer_grant()?.is_some() {
+                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+                a.pledged = pledged;
+                a.reclaimed += reclaimed;
+            }
+        }
+        if a.fits {
+            debug_assert!(kv_grow_fits(
+                a.committed,
+                working_set,
+                self.kv_grow_fraction,
+                grow
+            ));
             return Ok(());
         }
         let gb = |b: usize| b as f64 / 1e9;
         lloom_tensor::bail!(
-            "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the process already \
+            "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the ledger already \
              holds {:.2} GB of the {:.2} GB it may ({:.2} x recommendedMaxWorkingSetSize \
-             {:.2} GB). The reply stops here, before anything is written, rather than risk \
+             {:.2} GB) after giving back {:.3} GB of free lists. The reply stops here, \
+             before anything is written, rather than risk \
              the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
              free memory, or bound the run.",
             gb(grow),
-            gb(allocated),
+            gb(a.committed),
             gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
             self.kv_grow_fraction,
             gb(working_set),
+            gb(a.reclaimed),
         )
     }
 
@@ -4698,20 +4809,22 @@ impl Cache {
         Ok(())
     }
 
+    /// §9.5d's admission arithmetic for this configuration, as a pure
+    /// function of `config`, `budget` and the KV ceiling — the figure
+    /// `admit_memory_budget` refuses on, exposed so a caller deciding
+    /// **before** construction (§4.8's weight streaming, #892 A6a: how many
+    /// MLP slots the quota leaves once the resident rest and its predicted
+    /// peak are in) sizes from the same arithmetic the KV cache will be
+    /// admitted on, rather than from a second figure that can disagree with
+    /// it. The RoPE tables are not in it: `rope_table_bytes` is their cost,
+    /// taken from the residual (see below).
     #[cfg(feature = "metal")]
-    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+    pub fn admission_budget(
+        config: &Config,
+        budget: &MemoryBudget,
+        kv_capacity: usize,
+    ) -> lloom_tensor::metal_backend::admission::Budget {
         use lloom_tensor::metal_backend::admission;
-
-        let Some(budget) = config.memory_budget else {
-            return Ok(());
-        };
-        // Non-Metal device with the metal feature built in: no denominator
-        // exists, so there is nothing to check against. Silent rather than an
-        // error -- a CPU run is a legitimate thing to do and refusing it here
-        // would be an unrelated regression.
-        let Ok(metal) = device.as_metal_device() else {
-            return Ok(());
-        };
 
         let mut b = admission::Budget::new(
             budget.weight_bytes,
@@ -4753,6 +4866,14 @@ impl Cache {
         b.conv_state_bytes = admission::CONV_STATE_BYTES
             * config.conv_state.width(config.conv_l_cache)
             / config.conv_l_cache;
+        b
+    }
+
+    /// The RoPE `cos`/`sin` tables' cost — resident plus the transient peak
+    /// of building them — which admission takes from the residual rather
+    /// than from the five classes (§9.5k). Pure in `config`.
+    #[cfg(feature = "metal")]
+    pub fn rope_table_bytes(config: &Config) -> usize {
         // The RoPE `cos`/`sin` tables (§9.5k's "sixth allocation the five
         // classes do not name"). Two f16 tables of
         // `max_position_embeddings x head_dim/2`, built through the pool in
@@ -4765,7 +4886,26 @@ impl Cache {
         // `idx_theta` plus f32 `cos`/`sin` before the cast, ~49 MB at 128000 --
         // and it is the one that has to fit, since it is live inside this call.
         let rope_transient = 3 * config.max_position_embeddings * (config.head_dim() / 2) * 4;
-        let rope = rope_resident + rope_transient;
+        rope_resident + rope_transient
+    }
+
+    #[cfg(feature = "metal")]
+    fn admit_memory_budget(config: &Config, device: &Device, kv_capacity: usize) -> Result<()> {
+        use lloom_tensor::metal_backend::admission;
+
+        let Some(budget) = config.memory_budget else {
+            return Ok(());
+        };
+        // Non-Metal device with the metal feature built in: no denominator
+        // exists, so there is nothing to check against. Silent rather than an
+        // error -- a CPU run is a legitimate thing to do and refusing it here
+        // would be an unrelated regression.
+        let Ok(metal) = device.as_metal_device() else {
+            return Ok(());
+        };
+
+        let b = Self::admission_budget(config, &budget, kv_capacity);
+        let rope = Self::rope_table_bytes(config);
 
         let admission = b.admit(metal.device().recommended_max_working_set_size());
         // The RoPE tables come out of the residual rather than being added to
@@ -4912,8 +5052,11 @@ impl Cache {
         self.paged.as_ref().map(|p| {
             (
                 p.len,
-                p.pool.as_ref().map(|pool| pool.pages_in_use()).unwrap_or(0),
-                p.quarantine.held(),
+                p.pool
+                    .as_ref()
+                    .map(|pool| pool.pages().pages_in_use())
+                    .unwrap_or(0),
+                p.pool.as_ref().map(|pool| pool.held()).unwrap_or(0),
             )
         })
     }
@@ -4986,7 +5129,7 @@ impl Cache {
     /// and are never cleared). The caller has decided the conv half.
     fn rewind_kv(&mut self, n: usize) -> Result<()> {
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(n)?;
@@ -5022,7 +5165,6 @@ impl Cache {
             return;
         }
         let pos = self.kv_len() + seq_len;
-        let layers = self.conv_states.len();
         let slot = self.turn_ckpt_next % TURN_CHECKPOINTS;
         if slot < self.turn_checkpoints.len() {
             let c = &mut self.turn_checkpoints[slot];
@@ -5033,7 +5175,6 @@ impl Cache {
             self.turn_checkpoints.push(TurnCheckpoint {
                 pos,
                 tail_len: 0,
-                tails: vec![None; layers],
                 valid: false,
             });
         }
@@ -5058,33 +5199,42 @@ impl Cache {
         let want = l_cache + TURN_CHECKPOINT_SLACK;
         let keep = src_len.min(want);
         let src = conv_in.narrow(2, src_len - keep, keep)?;
-        let c = &mut self.turn_checkpoints[slot];
-        let buf = match &c.tails[layer] {
-            Some(t)
-                if t.dims() == [b_sz, hidden, want]
-                    && t.dtype() == conv_in.dtype()
-                    && t.is_contiguous() =>
-            {
-                t.clone()
-            }
-            _ => {
-                // Outlives every pass, so no plan serves it; a fresh slot's
-                // buffer, allocated once.
-                #[cfg(feature = "metal")]
-                let _declared = lloom_tensor::EscapeGuard::new();
-                zs::zeros(
-                    zs::LFM2_CONV_STATE,
-                    (b_sz, hidden, want),
-                    conv_in.dtype(),
-                    conv_in.device(),
-                )?
-            }
+        let layers = self.conv_states.len();
+        let frame = (layers, b_sz, hidden, want);
+        // The whole ring at a sequence's first checkpointing pass — one
+        // request, session state, outside every plan — and kept for the next
+        // sequence of the same geometry.
+        let fresh = match &self.turn_ring {
+            Some(r) => !r.fits(TURN_CHECKPOINTS, frame, conv_in.dtype()),
+            None => true,
         };
-        buf.slice_set(&src.contiguous()?, 2, 0)?;
-        c.tails[layer] = Some(buf);
+        if fresh {
+            self.turn_ring = Some(crate::nn::ring::Ring::allocate(
+                TURN_CHECKPOINTS,
+                frame,
+                conv_in.dtype(),
+                conv_in.device(),
+                zs::LFM2_CONV_STATE,
+                "lfm2-turn-ring",
+            )?);
+        }
+        // The strided source is written where it lies (`slice_set`): no
+        // transient copy.
+        self.turn_tail_view(slot, layer)?.slice_set(&src, 2, 0)?;
+        let c = &mut self.turn_checkpoints[slot];
         c.tail_len = keep;
         c.valid = true;
         Ok(())
+    }
+
+    /// Slot `slot`'s tail for conv layer `layer`: a contiguous
+    /// `[b, hidden, l_cache + TURN_CHECKPOINT_SLACK]` view into the ring.
+    fn turn_tail_view(&self, slot: usize, layer: usize) -> Result<Tensor> {
+        let ring = self
+            .turn_ring
+            .as_ref()
+            .ok_or_else(|| lloom_tensor::Error::msg("lfm2 turn ring: no ring allocated"))?;
+        ring.frame(slot)?.narrow(0, layer, 1)?.squeeze(0)
     }
 
     /// The checkpoint [`Cache::restore`] would take `pos` from: a valid one
@@ -5146,9 +5296,7 @@ impl Cache {
         let width = self.conv_state.width(l_cache);
         let layers = self.conv_states.len();
         for layer in 0..layers {
-            let Some(tail) = self.turn_checkpoints[idx].tails[layer].clone() else {
-                continue;
-            };
+            let tail = self.turn_tail_view(idx, layer)?;
             let window = tail
                 .narrow(2, tail_len - back - l_cache, l_cache)?
                 .contiguous()?;
@@ -5244,7 +5392,7 @@ impl Cache {
             );
         }
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(n)?;
@@ -5350,8 +5498,8 @@ impl Cache {
             kv_len: self
                 .kv_slots
                 .iter()
-                .find(|(k_slot, _)| k_slot.all_data.is_some())
-                .map(|(k_slot, _)| k_slot.len),
+                .find(|(k_slot, _)| k_slot.is_allocated())
+                .map(|(k_slot, _)| k_slot.len()),
             conv_phase: self.conv_phase,
         })
     }
@@ -5429,7 +5577,7 @@ impl Cache {
         // rather than tolerating a short rewind is what keeps `rewind`'s bound
         // check meaningful for the slots that *are* live.
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if k_slot.all_data.is_none() {
+            if !k_slot.is_allocated() {
                 continue;
             }
             k_slot.rewind(discard)?;
@@ -5468,10 +5616,10 @@ impl Cache {
             tok.kv_len,
             self.kv_slots
                 .iter()
-                .find(|(k_slot, _)| k_slot.all_data.is_some()),
+                .find(|(k_slot, _)| k_slot.is_allocated()),
         ) {
             debug_assert_eq!(
-                k_slot.len,
+                k_slot.len(),
                 before + n,
                 "resolve must leave exactly the accepted positions live"
             );
@@ -5575,6 +5723,9 @@ fn gemv_residual_applies(enabled: bool, x: &Tensor, proj: &Linear, residual: &Te
 /// MLP layer with SwiGLU activation.
 #[derive(Debug, Clone)]
 struct Mlp {
+    /// Resident: the three projections, loaded once. Streamed (§4.8): 1×1
+    /// placeholders, never bound — the slot views are taken per pass
+    /// (`DecoderLayer::weights`).
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
@@ -5610,6 +5761,33 @@ impl Mlp {
         })
     }
 
+    /// A layer whose matrices live on the weight-group tier
+    /// (`profiles-and-memory-design.md` §4.8): nothing is loaded here; the
+    /// group's MLP parts are `w1`, `w3`, `w2` in the tier's slot, taken as
+    /// views at each pass (`DecoderLayer::weights`).
+    fn new_placeholder(cfg: &Config, vb: &VarBuilder) -> Result<Self> {
+        Ok(Self {
+            gate_proj: placeholder_linear(vb)?,
+            up_proj: placeholder_linear(vb)?,
+            down_proj: placeholder_linear(vb)?,
+            gemv_silu: cfg.gemv_silu,
+            gemv_residual: cfg.gemv_residual,
+            gemv_gate: cfg.gemv_gate,
+            span: tracing::span!(tracing::Level::TRACE, "mlp"),
+        })
+    }
+
+    /// The resident projections, borrowed (R1: a model that fits never
+    /// streams — nothing else happens).
+    fn resident(&self) -> Projections<'_> {
+        use std::borrow::Cow;
+        Projections {
+            gate: Cow::Borrowed(&self.gate_proj),
+            up: Cow::Borrowed(&self.up_proj),
+            down: Cow::Borrowed(&self.down_proj),
+        }
+    }
+
     /// Whether the fused `w1` + SiLU arm applies to this call.
     ///
     /// Metal, `seq_len == 1`, no bias, and a dtype the GEMV carries. **Every
@@ -5617,87 +5795,123 @@ impl Mlp {
     /// `flash_decoding` this arm has a correct eager equivalent right beside
     /// it and prefill is a GEMM the fusion is not instantiated for. The same
     /// shape as `sdpa_applies` above.
-    fn gemv_silu_applies(&self, x: &Tensor) -> bool {
+    fn gemv_silu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_silu
             && x.device().is_metal()
-            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && x.dims().last() == Some(&p.gate.weight().dims()[1])
             // One row only, for `gemv_residual_applies`'s reason: at `B > 1`
             // the fused GEMV would sweep `w1` once per row.
             && matches!(x.dims(), [1, 1, _] | [1, _])
-            && self.gate_proj.bias().is_none()
+            && p.gate.bias().is_none()
             // See `gemv_residual_applies`: the fused op serves the contiguous
             // layout `Linear::forward` reshapes, not the broadcast one.
             && x.is_contiguous()
-            && self.gate_proj.weight().is_contiguous()
+            && p.gate.weight().is_contiguous()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         let _enter = self.span.enter();
-        self.down_proj.forward(&self.gated(x)?)
+        p.down.forward(&self.gated(x, p)?)
     }
 
     /// `mlp(x) + residual`, fusing the add onto `w2`'s store when the arm is
     /// on (§12.2h). Otherwise **literally `forward(x)? + residual`** — the
     /// unfused branch calls `forward` rather than reimplementing it, so the
     /// two cannot drift and the shipping path has exactly one definition.
-    fn forward_add(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+    fn forward_add(&self, x: &Tensor, residual: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         if self.gemv_residual {
             let _enter = self.span.enter();
-            let gated = self.gated(x)?;
-            if gemv_residual_applies(true, &gated, &self.down_proj, residual) {
-                return crate::nn::ops::gemv_residual(&gated, self.down_proj.weight(), residual);
+            let gated = self.gated(x, p)?;
+            if gemv_residual_applies(true, &gated, &p.down, residual) {
+                return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
             }
-            return self.down_proj.forward(&gated)? + residual;
+            return p.down.forward(&gated)? + residual;
         }
-        self.forward(x)? + residual
+        self.forward(x, p)? + residual
+    }
+
+    /// Whether [`Self::forward_add_normed`] serves `x`: `w1` and `w3` each
+    /// take the norm. Not under a gate arm (`--gemv-gate mul|swiglu`): no
+    /// kernel carries the norm with `w3`'s product or with both weights, so
+    /// that arm keeps its own path and the norm stays a dispatch.
+    fn norm_gemv_applies(&self, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
+        self.gemv_gate == GateFusion::Off
+            && norm_gemv_applies(x, norm, &p.gate)
+            && norm_gemv_applies(x, norm, &p.up)
+    }
+
+    /// `mlp(rmsnorm(x)) + residual` with the norm inside `w1`'s and `w3`'s
+    /// GEMVs, the product a `bmul`. Every other choice is the one
+    /// [`Self::forward_add`] makes under the same flags: the SiLU rides `w1`
+    /// iff the SiLU arm would fuse it, `w2` adds the residual iff the
+    /// residual arm is on — so the norm arm moves the norms and nothing
+    /// else. The caller has checked [`Self::norm_gemv_applies`].
+    fn forward_add_normed(
+        &self,
+        x: &Tensor,
+        norm: &RmsNorm,
+        residual: &Tensor,
+        p: &Projections<'_>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let gate = if self.gemv_silu_applies(x, p) {
+            norm_gemv(x, norm, &p.gate, true)?
+        } else {
+            crate::nn::ops::silu(&norm_gemv(x, norm, &p.gate, false)?)?
+        };
+        let up = norm_gemv(x, norm, &p.up, false)?;
+        let gated = (gate * up)?;
+        if self.gemv_residual && gemv_residual_applies(true, &gated, &p.down, residual) {
+            return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
+        }
+        p.down.forward(&gated)? + residual
     }
 
     /// `silu(w1(x)) * w3(x)` — the SwiGLU gate, shared by both entry points so
     /// the two cannot drift in what they compute.
-    fn gated(&self, x: &Tensor) -> Result<Tensor> {
+    fn gated(&self, x: &Tensor, p: &Projections<'_>) -> Result<Tensor> {
         // Both weights in one kernel: `w1`, `w3`, the SiLU and the product,
         // no barrier between the two sweeps (§12.2 row 5 with row 3b's
         // product, #732). Under it the SiLU arm is moot — `w1` is never
         // dispatched alone — so it is tried first.
-        if self.gemv_swiglu_applies(x) {
-            return crate::nn::ops::gemv_swiglu(x, self.up_proj.weight(), self.gate_proj.weight());
+        if self.gemv_swiglu_applies(x, p) {
+            return crate::nn::ops::gemv_swiglu(x, p.up.weight(), p.gate.weight());
         }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
-        let gate = if self.gemv_silu_applies(x) {
-            crate::nn::ops::gemv_silu(x, self.gate_proj.weight())?
+        let gate = if self.gemv_silu_applies(x, p) {
+            crate::nn::ops::gemv_silu(x, p.gate.weight())?
         } else {
-            crate::nn::ops::silu(&self.gate_proj.forward(x)?)?
+            crate::nn::ops::silu(&p.gate.forward(x)?)?
         };
         // The product on `w3`'s store, the gate its row-indexed operand: one
         // dispatch for `w3` and the `bmul` (§12.2e row 3b, #732). The same
         // applicability as the residual arm — `w3` has `w1`'s shape, and the
         // gate is exactly `w3`'s output extent, contiguous, as `gemv_silu`
         // and `silu` both store it.
-        if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &self.up_proj, &gate)
-        {
-            return crate::nn::ops::gemv_mul(x, self.up_proj.weight(), &gate);
+        if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &p.up, &gate) {
+            return crate::nn::ops::gemv_mul(x, p.up.weight(), &gate);
         }
-        let up = self.up_proj.forward(x)?;
+        let up = p.up.forward(x)?;
         gate * up
     }
 
     /// Whether the two-weight kernel serves this call: `gemv_silu_applies`'s
     /// conditions on `w1`, and `w3` the same shape and layout — the kernel
     /// streams both under one leading dimension.
-    fn gemv_swiglu_applies(&self, x: &Tensor) -> bool {
+    fn gemv_swiglu_applies(&self, x: &Tensor, p: &Projections<'_>) -> bool {
         self.gemv_gate == GateFusion::Swiglu
             && x.device().is_metal()
-            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && x.dims().last() == Some(&p.gate.weight().dims()[1])
             && matches!(x.dims(), [1, 1, _] | [1, _])
-            && self.gate_proj.bias().is_none()
-            && self.up_proj.bias().is_none()
+            && p.gate.bias().is_none()
+            && p.up.bias().is_none()
             && x.is_contiguous()
-            && self.gate_proj.weight().is_contiguous()
-            && self.up_proj.weight().is_contiguous()
-            && self.gate_proj.weight().dims() == self.up_proj.weight().dims()
+            && p.gate.weight().is_contiguous()
+            && p.up.weight().is_contiguous()
+            && p.gate.weight().dims() == p.up.weight().dims()
             && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 }
@@ -5732,20 +5946,33 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
+    /// `streamed`: the projections live in the weight-group tier (§4.8);
+    /// the fields are placeholders and `LayerWeights` carries the views.
+    fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder, streamed: bool) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let num_attention_heads = cfg.num_attention_heads;
         let num_key_value_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim();
 
-        let q_proj = linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear(
-            num_attention_heads * head_dim,
-            hidden_size,
-            vb.pp("out_proj"),
-        )?;
+        let (q_proj, k_proj, v_proj, o_proj) = if streamed {
+            (
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+                placeholder_linear(&vb)?,
+            )
+        } else {
+            (
+                linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
+                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
+                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
+                linear(
+                    num_attention_heads * head_dim,
+                    hidden_size,
+                    vb.pp("out_proj"),
+                )?,
+            )
+        };
 
         let q_norm = RmsNorm::new(head_dim, cfg.norm_eps, vb.pp("q_layernorm"))?;
         let k_norm = RmsNorm::new(head_dim, cfg.norm_eps, vb.pp("k_layernorm"))?;
@@ -5821,15 +6048,26 @@ impl Attention {
         crate::nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
     }
 
+    fn resident(&self) -> AttnWeights<'_> {
+        use std::borrow::Cow;
+        AttnWeights {
+            q: Cow::Borrowed(&self.q_proj),
+            k: Cow::Borrowed(&self.k_proj),
+            v: Cow::Borrowed(&self.v_proj),
+            o: Cow::Borrowed(&self.o_proj),
+        }
+    }
+
     fn forward(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
-        let y = self.attend(x, index_pos, block_idx, cache)?;
-        self.o_proj.forward(&y)
+        let y = self.attend(w, x, index_pos, block_idx, cache)?;
+        w.o.forward(&y)
     }
 
     /// `attn(x) + residual`, fusing the add onto `out_proj`'s store when the
@@ -5838,6 +6076,7 @@ impl Attention {
     /// definition and the two cannot drift.
     fn forward_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
@@ -5845,13 +6084,33 @@ impl Attention {
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
-            let y = self.attend(x, index_pos, block_idx, cache)?;
-            if gemv_residual_applies(true, &y, &self.o_proj, residual) {
-                return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+            let y = self.attend(w, x, index_pos, block_idx, cache)?;
+            if gemv_residual_applies(true, &y, &w.o, residual) {
+                return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
             }
-            return self.o_proj.forward(&y)? + residual;
+            return w.o.forward(&y)? + residual;
         }
-        self.forward(x, index_pos, block_idx, cache)? + residual
+        self.forward(w, x, index_pos, block_idx, cache)? + residual
+    }
+
+    /// [`Self::forward_add`] over the un-normalized `x`, `norm` riding the
+    /// q/k/v projections.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_add_normed(
+        &self,
+        w: &AttnWeights<'_>,
+        x: &Tensor,
+        norm: &RmsNorm,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let y = self.attend_normed(w, x, Some(norm), index_pos, block_idx, cache)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
+            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
+        }
+        w.o.forward(&y)? + residual
     }
 
     /// [`Self::forward_add`] for one step of `rows.len()` independent
@@ -5861,30 +6120,45 @@ impl Attention {
     /// path exactly.
     fn forward_rows_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let y = self.attend_rows(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
-            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        let y = self.attend_rows(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
+            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
         }
-        self.o_proj.forward(&y)? + residual
+        w.o.forward(&y)? + residual
     }
 
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
     fn attend(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        self.attend_normed(w, x, None, index_pos, block_idx, cache)
+    }
+
+    /// [`Self::attend`] with the input norm riding the projections.
+    fn attend_normed(
+        &self,
+        w: &AttnWeights<'_>,
+        x: &Tensor,
+        norm: Option<&RmsNorm>,
         index_pos: usize,
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q, k, v, rotated) = self.project(x, Some((index_pos, &*cache)))?;
+        let (q, k, v, rotated) = self.project_normed(w, x, norm, Some((index_pos, &*cache)))?;
         let y = self.attend_projected(&q, &k, v, rotated, index_pos, block_idx, cache)?;
         y.transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
@@ -5897,6 +6171,7 @@ impl Attention {
     /// `[B, heads, 1, head_dim]` is itself a contiguous `[1, heads, 1, head_dim]`.
     fn attend_rows(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
@@ -5904,12 +6179,12 @@ impl Attention {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
         #[cfg(feature = "metal")]
-        if let Some(y) = self.attend_rows_shared(x, block_idx, rows)? {
+        if let Some(y) = self.attend_rows_shared(w, x, block_idx, rows)? {
             return Ok(y);
         }
         // Rows attend at different positions, so the rotation is per row: the
         // projections are normed here and rotated below, on every arm.
-        let (q, k, v, rotated) = self.project(x, None)?;
+        let (q, k, v, rotated) = self.project(w, x, None)?;
         debug_assert!(!rotated);
         let mut ys = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
@@ -5934,16 +6209,17 @@ impl Attention {
     /// row, and takes the residual arm `forward_add` takes.
     fn forward_ragged_add(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let y = self.attend_ragged(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
-            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        let y = self.attend_ragged(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &w.o, residual) {
+            return crate::nn::ops::gemv_residual(&y, w.o.weight(), residual);
         }
-        self.o_proj.forward(&y)? + residual
+        w.o.forward(&y)? + residual
     }
 
     /// `attend` over a ragged batch: one set of projections and one pair of
@@ -5955,15 +6231,16 @@ impl Attention {
     /// row's takes the transpose copy `project` takes for a prefill.
     fn attend_ragged(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (_, total, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q = w.q.forward(x)?;
+        let k = w.k.forward(x)?;
+        let v = w.v.forward(x)?;
         let q = self.q_norm.forward(&q.reshape((
             1,
             total,
@@ -6080,6 +6357,7 @@ impl Attention {
     #[cfg(feature = "metal")]
     fn attend_rows_shared(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
@@ -6092,7 +6370,7 @@ impl Attention {
             return Ok(None);
         }
         let device = x.device().clone();
-        let (q, k, v, rotated) = self.project(x, None)?;
+        let (q, k, v, rotated) = self.project(w, x, None)?;
         debug_assert!(!rotated);
         let q = q.contiguous()?;
         let k = k.contiguous()?;
@@ -6366,14 +6644,32 @@ impl Attention {
     /// in-place append writes from where it lies (`Tensor::slice_set`).
     fn project(
         &self,
+        w: &AttnWeights<'_>,
         x: &Tensor,
+        rope_at: Option<(usize, &Cache)>,
+    ) -> Result<(Tensor, Tensor, Tensor, bool)> {
+        self.project_normed(w, x, None, rope_at)
+    }
+
+    /// [`Self::project`]; with `norm`, `x` is the un-normalized input and the
+    /// norm rides each projection's GEMV (`norm_gemv`).
+    fn project_normed(
+        &self,
+        w: &AttnWeights<'_>,
+        x: &Tensor,
+        norm: Option<&RmsNorm>,
         rope_at: Option<(usize, &Cache)>,
     ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let (q, k, v) = match norm {
+            Some(n) => (
+                norm_gemv(x, n, &w.q, false)?,
+                norm_gemv(x, n, &w.k, false)?,
+                norm_gemv(x, n, &w.v, false)?,
+            ),
+            None => (w.q.forward(x)?, w.k.forward(x)?, w.v.forward(x)?),
+        };
 
         // Reshape to (batch, seq, num_heads, head_dim) then transpose to
         // (batch, num_heads, seq, head_dim): a view, contiguous at
@@ -6881,13 +7177,22 @@ fn conv_c_fusion_disabled() -> bool {
 }
 
 impl ShortConv {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    /// `streamed`: the two projections live in the weight-group tier
+    /// (§4.8); the fields are placeholders and `LayerWeights` carries the
+    /// views. The taps are resident either way.
+    fn new(cfg: &Config, vb: VarBuilder, streamed: bool) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let l_cache = cfg.conv_l_cache;
 
         // in_proj projects to 3 * hidden_size for B, C, X components
-        let in_proj = linear(hidden_size, 3 * hidden_size, vb.pp("in_proj"))?;
-        let out_proj = linear(hidden_size, hidden_size, vb.pp("out_proj"))?;
+        let (in_proj, out_proj) = if streamed {
+            (placeholder_linear(&vb)?, placeholder_linear(&vb)?)
+        } else {
+            (
+                linear(hidden_size, 3 * hidden_size, vb.pp("in_proj"))?,
+                linear(hidden_size, hidden_size, vb.pp("out_proj"))?,
+            )
+        };
 
         // Conv weight shape: (hidden_size, 1, l_cache) or (hidden_size, l_cache)
         let conv_weight = vb.get((hidden_size, 1, l_cache), "conv.weight")?;
@@ -7159,9 +7464,23 @@ impl ShortConv {
         }
     }
 
-    fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
-        let conv_out = self.convolve(x, block_idx, cache)?;
-        self.out_proj.forward(&conv_out)
+    fn resident(&self) -> ConvWeights<'_> {
+        use std::borrow::Cow;
+        ConvWeights {
+            in_proj: Cow::Borrowed(&self.in_proj),
+            out_proj: Cow::Borrowed(&self.out_proj),
+        }
+    }
+
+    fn forward(
+        &self,
+        w: &ConvWeights<'_>,
+        x: &Tensor,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let conv_out = self.convolve(w, x, block_idx, cache)?;
+        w.out_proj.forward(&conv_out)
     }
 
     /// `conv(x) + residual`, fusing the add onto `out_proj`'s store when the
@@ -7170,19 +7489,40 @@ impl ShortConv {
     /// definition and the two cannot drift.
     fn forward_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         cache: &mut Cache,
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
-            let conv_out = self.convolve(x, block_idx, cache)?;
-            if gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-                return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+            let conv_out = self.convolve(w, x, block_idx, cache)?;
+            if gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+                return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
             }
-            return self.out_proj.forward(&conv_out)? + residual;
+            return w.out_proj.forward(&conv_out)? + residual;
         }
-        self.forward(x, block_idx, cache)? + residual
+        self.forward(w, x, block_idx, cache)? + residual
+    }
+
+    /// [`Self::forward_add`] over the un-normalized `x`, `norm` riding
+    /// `in_proj`'s GEMV.
+    fn forward_add_normed(
+        &self,
+        w: &ConvWeights<'_>,
+        x: &Tensor,
+        norm: &RmsNorm,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let bcx = norm_gemv(x, norm, &w.in_proj, false)?.transpose(1, 2)?;
+        let conv_out = self.convolve_bcx(&bcx, block_idx, cache)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
+        }
+        w.out_proj.forward(&conv_out)? + residual
     }
 
     /// [`Self::forward_add`] for one step of `rows.len()` independent
@@ -7191,24 +7531,31 @@ impl ShortConv {
     /// residual arm is decided as `forward_add` decides it.
     fn forward_rows_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let conv_out = self.convolve_rows(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        let conv_out = self.convolve_rows(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
         }
-        self.out_proj.forward(&conv_out)? + residual
+        w.out_proj.forward(&conv_out)? + residual
     }
 
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
-    fn convolve(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn convolve(
+        &self,
+        w: &ConvWeights<'_>,
+        x: &Tensor,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         // Project input to B, C, X components
-        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let bcx = w.in_proj.forward(x)?.transpose(1, 2)?;
         self.convolve_bcx(&bcx, block_idx, cache)
     }
 
@@ -7218,12 +7565,13 @@ impl ShortConv {
     /// every arm below sees the layout it was written for.
     fn convolve_rows(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [Row<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let bcx = w.in_proj.forward(x)?.transpose(1, 2)?;
         #[cfg(feature = "metal")]
         if let Some(out) = self.convolve_rows_shared(&bcx, block_idx, rows)? {
             return Ok(out);
@@ -7240,16 +7588,17 @@ impl ShortConv {
     /// own run against its own state.
     fn forward_ragged_add(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
         residual: &Tensor,
     ) -> Result<Tensor> {
-        let conv_out = self.convolve_ragged(x, block_idx, rows)?;
-        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
-            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        let conv_out = self.convolve_ragged(w, x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &w.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, w.out_proj.weight(), residual);
         }
-        self.out_proj.forward(&conv_out)? + residual
+        w.out_proj.forward(&conv_out)? + residual
     }
 
     /// `convolve` over a ragged batch: one `in_proj`, then row `r` takes the
@@ -7260,12 +7609,13 @@ impl ShortConv {
     /// written for.
     fn convolve_ragged(
         &self,
+        w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let bcx = self.in_proj.forward(x)?;
+        let bcx = w.in_proj.forward(x)?;
         #[cfg(feature = "metal")]
         if let Some(out) = self.convolve_ragged_shared(&bcx, block_idx, rows)? {
             return Ok(out);
@@ -7919,17 +8269,167 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     mlp: Mlp,
     kind: LayerKind,
+    /// `Some`: this layer's matrices stream through the tier (§4.8).
+    streamed: Option<StreamedLayer>,
     span: tracing::Span,
 }
 
+/// A 1x1 stand-in for a matrix that lives in the weight-group tier.
+fn placeholder_linear(vb: &VarBuilder) -> Result<Linear> {
+    Ok(Linear::from_weights(
+        Tensor::zeros((1, 1), vb.dtype(), vb.device())?,
+        None,
+    ))
+}
+
+/// The parts of layer `l`'s weight group, in `GROUP_PART_*` order: the
+/// MLP's `w1`, `w3`, `w2`, then the mixer's projections — `q`, `k`, `v`,
+/// `out` for an attention layer, `in`, `out` for a conv layer. The
+/// checkpoint names and shapes, as `nn::weight_groups::GroupSpec` takes them.
+pub fn layer_group_parts(cfg: &Config, l: usize) -> Vec<(String, lloom_tensor::Shape)> {
+    use lloom_tensor::Shape;
+    let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
+    let mut parts = vec![
+        (
+            format!("model.layers.{l}.feed_forward.w1.weight"),
+            Shape::from((i, h)),
+        ),
+        (
+            format!("model.layers.{l}.feed_forward.w3.weight"),
+            Shape::from((i, h)),
+        ),
+        (
+            format!("model.layers.{l}.feed_forward.w2.weight"),
+            Shape::from((h, i)),
+        ),
+    ];
+    let kind = cfg
+        .layer_types
+        .get(l)
+        .copied()
+        .unwrap_or(LayerType::FullAttention);
+    match kind {
+        LayerType::FullAttention => {
+            let (q, kv) = (
+                cfg.num_attention_heads * cfg.head_dim(),
+                cfg.num_key_value_heads * cfg.head_dim(),
+            );
+            parts.push((
+                format!("model.layers.{l}.self_attn.q_proj.weight"),
+                Shape::from((q, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.k_proj.weight"),
+                Shape::from((kv, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.v_proj.weight"),
+                Shape::from((kv, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.self_attn.out_proj.weight"),
+                Shape::from((h, q)),
+            ));
+        }
+        LayerType::Conv => {
+            parts.push((
+                format!("model.layers.{l}.conv.in_proj.weight"),
+                Shape::from((3 * h, h)),
+            ));
+            parts.push((
+                format!("model.layers.{l}.conv.out_proj.weight"),
+                Shape::from((h, h)),
+            ));
+        }
+    }
+    parts
+}
+
+/// The bytes of layer `l`'s weight group at `dtype` — what one slot of the
+/// tier holds for it. The loader's arithmetic (how many slots the quota
+/// leaves) reads this rather than its own copy of the shapes.
+pub fn layer_group_bytes(cfg: &Config, l: usize, dtype: DType) -> usize {
+    layer_group_parts(cfg, l)
+        .iter()
+        .map(|(_, s)| s.elem_count())
+        .sum::<usize>()
+        * dtype.size_in_bytes()
+}
+
+/// `LLOOM_LFM2_NORM_GEMV`: a decode step's RMSNorm runs inside the GEMVs
+/// that consume it (`nn::ops::gemv_norm`). Read once.
+fn norm_gemv_arm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().lfm2.norm_gemv)
+}
+
+/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the arm,
+/// Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
+/// contiguous `[k]` of `x`'s dtype, and a tile the fused kernel is
+/// instantiated at (`nn::ops::gemv_norm_serves`: at `k <= 64` or
+/// `k >= 16 n` the GEMV takes another tile, and the unfused pair runs).
+fn norm_gemv_applies(x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
+    norm_gemv_arm()
+        && x.device().is_metal()
+        && matches!(x.dims(), [1, 1, _] | [1, _])
+        && x.dims().last() == Some(&proj.weight().dims()[1])
+        && crate::nn::ops::gemv_norm_serves(proj.weight().dims()[0], proj.weight().dims()[1])
+        && proj.bias().is_none()
+        && x.is_contiguous()
+        && proj.weight().is_contiguous()
+        && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && norm.weight().dtype() == x.dtype()
+        && norm.weight().is_contiguous()
+        && norm.weight().elem_count() == proj.weight().dims()[1]
+}
+
+/// `proj(rmsnorm(x))` (and its SiLU) in one dispatch.
+fn norm_gemv(x: &Tensor, norm: &RmsNorm, proj: &Linear, silu: bool) -> Result<Tensor> {
+    crate::nn::ops::gemv_norm(x, proj.weight(), norm.weight(), norm.eps() as f32, silu)
+}
+
+/// `LLOOM_LFM2_ABLATE` names `norm`: the decode step skips the layers'
+/// RMSNorms (an instrument pricing a fusion's upper bound; the output is
+/// wrong). Read once.
+fn ablate_norms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::tuning::tuning()
+            .lfm2
+            .ablate
+            .split(',')
+            .any(|s| s.trim() == "norm")
+    })
+}
+
 impl DecoderLayer {
-    fn new(cfg: &Config, layer_idx: usize, route: AttnRoute, vb: VarBuilder) -> Result<Self> {
+    /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
+    /// one-token step.
+    fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
+        if ablate_norms() && x.dim(x.rank() - 2)? == 1 {
+            return Ok(x.clone());
+        }
+        n.forward(x)
+    }
+
+    fn new(
+        cfg: &Config,
+        layer_idx: usize,
+        route: AttnRoute,
+        vb: VarBuilder,
+        streamed: Option<StreamedLayer>,
+    ) -> Result<Self> {
         // LFM2 uses operator_norm and ffn_norm naming
         let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
         let post_attention_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
-        // LFM2 uses feed_forward naming for MLP
-        let mlp = Mlp::new(cfg, vb.pp("feed_forward"))?;
+        // LFM2 uses feed_forward naming for MLP; on the weight-group tier
+        // (§4.8) the layer's three matrices are its group's parts.
+        let mlp = if streamed.is_some() {
+            Mlp::new_placeholder(cfg, &vb)?
+        } else {
+            Mlp::new(cfg, vb.pp("feed_forward"))?
+        };
 
         let layer_type = cfg
             .layer_types
@@ -7937,10 +8437,15 @@ impl DecoderLayer {
             .copied()
             .unwrap_or(LayerType::FullAttention);
         let kind = match layer_type {
-            LayerType::FullAttention => {
-                LayerKind::Attention(Box::new(Attention::new(cfg, route, vb.pp("self_attn"))?))
+            LayerType::FullAttention => LayerKind::Attention(Box::new(Attention::new(
+                cfg,
+                route,
+                vb.pp("self_attn"),
+                streamed.is_some(),
+            )?)),
+            LayerType::Conv => {
+                LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"), streamed.is_some())?)
             }
-            LayerType::Conv => LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"))?),
         };
 
         Ok(Self {
@@ -7948,8 +8453,73 @@ impl DecoderLayer {
             post_attention_layernorm,
             mlp,
             kind,
+            streamed,
             span: tracing::span!(tracing::Level::TRACE, "layer"),
         })
+    }
+
+    /// This layer's matrices for the pass: borrowed when resident. When
+    /// streamed, the group is made resident in the tier (`ensure`), its
+    /// parts taken as views over the slot, and the next `depth` groups of
+    /// the plan prefetched — once per layer per pass, at the layer's entry,
+    /// before the mixer. A group that moved slots since its last pass
+    /// drops the cached pass plans (R2: a plan binds slots; the old one
+    /// bound another).
+    fn weights(&self) -> Result<LayerWeights<'_>> {
+        use std::borrow::Cow;
+        let Some(st) = &self.streamed else {
+            let mixer = match &self.kind {
+                LayerKind::Attention(a) => MixerWeights::Attn(a.resident()),
+                LayerKind::ShortConv(c) => MixerWeights::Conv(c.resident()),
+            };
+            return Ok(LayerWeights {
+                mixer,
+                mlp: self.mlp.resident(),
+            });
+        };
+        let mut tier = st.tier.lock();
+        let (_slot, moved, wait) = tier.ensure(st.group, st.source.as_ref())?;
+        tier.cut_after_ensure()?;
+        let part = |i: usize| -> Result<Cow<'static, Linear>> {
+            Ok(Cow::Owned(Linear::from_weights(
+                tier.tensor(st.group, i)?,
+                None,
+            )))
+        };
+        let mlp = Projections {
+            gate: part(GROUP_PART_W1)?,
+            up: part(GROUP_PART_W3)?,
+            down: part(GROUP_PART_W2)?,
+        };
+        let mixer = match &self.kind {
+            LayerKind::Attention(_) => MixerWeights::Attn(AttnWeights {
+                q: part(GROUP_PART_MIXER)?,
+                k: part(GROUP_PART_MIXER + 1)?,
+                v: part(GROUP_PART_MIXER + 2)?,
+                o: part(GROUP_PART_MIXER + 3)?,
+            }),
+            LayerKind::ShortConv(_) => MixerWeights::Conv(ConvWeights {
+                in_proj: part(GROUP_PART_MIXER)?,
+                out_proj: part(GROUP_PART_MIXER + 1)?,
+            }),
+        };
+        tier.prefetch(st.depth, st.source.as_ref())?;
+        // The group's bytes may still be landing (the loader's thread):
+        // every kernel of this layer waits on the device for them — and
+        // nothing is encoded when they have landed (R1).
+        if let Some(ticket) = wait {
+            tier.encode_wait(ticket)?;
+        }
+        drop(tier);
+        #[cfg(feature = "metal")]
+        if moved {
+            if let Device::Metal(m) = mlp.gate.weight().device() {
+                m.drop_pass_plans();
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = moved;
+        Ok(LayerWeights { mixer, mlp })
     }
 
     fn forward(
@@ -7960,23 +8530,51 @@ impl DecoderLayer {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
-        let x = self.input_layernorm.forward(x)?;
-
-        // `forward_add` is `forward(..)? + residual` unless the fused arm is on
-        // AND applies, in which case the add happens at the producing GEMV's
-        // f32 accumulator instead of in a `badd_f16` over the rounded store
-        // (§12.2h). That is a DIFFERENT COMPUTATION and moves the digests.
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => {
-                attn.forward_add(&x, index_pos, block_idx, cache, residual)?
+        // Under the norm-GEMV arm each half of the layer takes its norm
+        // inside its consumers' GEMVs when every one of them qualifies, and
+        // the norm as a dispatch otherwise (§13.5t).
+        let pre = &self.input_layernorm;
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw))
+                if norm_gemv_applies(x, pre, &aw.q)
+                    && norm_gemv_applies(x, pre, &aw.k)
+                    && norm_gemv_applies(x, pre, &aw.v) =>
+            {
+                attn.forward_add_normed(aw, x, pre, index_pos, block_idx, cache, residual)?
             }
-            LayerKind::ShortConv(conv) => conv.forward_add(&x, block_idx, cache, residual)?,
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw))
+                if norm_gemv_applies(x, pre, &cw.in_proj) =>
+            {
+                conv.forward_add_normed(cw, x, pre, block_idx, cache, residual)?
+            }
+            _ => {
+                let x = self.norm(pre, x)?;
+                // `forward_add` is `forward(..)? + residual` unless the fused
+                // arm is on AND applies, in which case the add happens at the
+                // producing GEMV's f32 accumulator instead of in a `badd_f16`
+                // over the rounded store (§12.2h). That is a DIFFERENT
+                // COMPUTATION and moves the digests.
+                match (&self.kind, &w.mixer) {
+                    (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                        attn.forward_add(aw, &x, index_pos, block_idx, cache, residual)?
+                    }
+                    (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                        conv.forward_add(cw, &x, block_idx, cache, residual)?
+                    }
+                    _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
+                }
+            }
         };
 
         let residual = &x;
-        let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        let post = &self.post_attention_layernorm;
+        if self.mlp.norm_gemv_applies(&x, post, &w.mlp) {
+            return self.mlp.forward_add_normed(&x, post, residual, &w.mlp);
+        }
+        let x = self.norm(post, &x)?;
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 
     /// [`Self::forward`] for one step of `rows.len()` independent sequences:
@@ -7989,15 +8587,21 @@ impl DecoderLayer {
         rows: &mut [Row<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => attn.forward_rows_add(&x, block_idx, rows, residual)?,
-            LayerKind::ShortConv(conv) => conv.forward_rows_add(&x, block_idx, rows, residual)?,
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                attn.forward_rows_add(aw, &x, block_idx, rows, residual)?
+            }
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                conv.forward_rows_add(cw, &x, block_idx, rows, residual)?
+            }
+            _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 
     /// [`Self::forward`] over a ragged batch: the norms, the MLP and every
@@ -8010,15 +8614,21 @@ impl DecoderLayer {
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let w = self.weights()?;
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let x = match &self.kind {
-            LayerKind::Attention(attn) => attn.forward_ragged_add(&x, block_idx, rows, residual)?,
-            LayerKind::ShortConv(conv) => conv.forward_ragged_add(&x, block_idx, rows, residual)?,
+        let x = match (&self.kind, &w.mixer) {
+            (LayerKind::Attention(attn), MixerWeights::Attn(aw)) => {
+                attn.forward_ragged_add(aw, &x, block_idx, rows, residual)?
+            }
+            (LayerKind::ShortConv(conv), MixerWeights::Conv(cw)) => {
+                conv.forward_ragged_add(cw, &x, block_idx, rows, residual)?
+            }
+            _ => lloom_tensor::bail!("lfm2: a layer's weights are not its mixer's kind"),
         };
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        self.mlp.forward_add(&x, residual)
+        self.mlp.forward_add(&x, residual, &w.mlp)
     }
 }
 
@@ -8413,10 +9023,64 @@ impl Model {
             load_warnings.push(w);
         }
 
+        // The layers on the weight-group tier when the loader asked for it
+        // (`Config::stream_layers`, §4.8): one group per layer — the MLP's
+        // `w1`, `w3`, `w2` and the mixer's projections end to end in a slot
+        // (`layer_group_parts`) — the plan their order, the source the
+        // checkpoint's mapped files.
+        let streaming = match &cfg.stream_layers {
+            Some(plan) => {
+                use crate::nn::slot_cache::WeightGroupId;
+                use crate::nn::weight_groups::{GroupSpec, SafetensorsGroups, WeightGroups};
+                let specs: Vec<GroupSpec> = (0..cfg.num_hidden_layers)
+                    .map(|l| GroupSpec::new(WeightGroupId(l as u32), layer_group_parts(cfg, l)))
+                    .collect();
+                let names: Vec<Vec<String>> = specs
+                    .iter()
+                    .map(|g| g.parts.iter().map(|p| p.name.clone()).collect())
+                    .collect();
+                let mut tier = WeightGroups::new(
+                    specs,
+                    plan.slots,
+                    vb.dtype(),
+                    vb.device(),
+                    zs::NN_WEIGHT_GROUPS,
+                )?;
+                tier.set_plan(
+                    (0..cfg.num_hidden_layers as u32)
+                        .map(WeightGroupId)
+                        .collect(),
+                );
+                // SAFETY: the checkpoint files are mapped read-only for the
+                // model's life, as `VarBuilder` maps them.
+                let source = unsafe { SafetensorsGroups::open(&plan.files, names, vb.device())? };
+                let source = std::sync::Arc::new(source)
+                    as std::sync::Arc<dyn crate::nn::weight_groups::GroupSource>;
+                // The non-blocking loader (§4.8): on when the device is
+                // Metal and the checkpoint writes the tier's dtype; else the
+                // tier loads as it is asked, on the calling thread.
+                tier.start_loader(std::sync::Arc::clone(&source))?;
+                Some((
+                    std::sync::Arc::new(parking_lot::Mutex::new(tier)),
+                    source,
+                    plan.depth,
+                ))
+            }
+            None => None,
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
-            let layer = DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx))?;
+            let streamed = streaming
+                .as_ref()
+                .map(|(tier, source, depth)| StreamedLayer {
+                    group: crate::nn::slot_cache::WeightGroupId(layer_idx as u32),
+                    tier: std::sync::Arc::clone(tier),
+                    source: std::sync::Arc::clone(source),
+                    depth: *depth,
+                });
+            let layer =
+                DecoderLayer::new(cfg, layer_idx, attn_route, vb_l.pp(layer_idx), streamed)?;
             layers.push(layer);
         }
 
@@ -8462,6 +9126,48 @@ impl Model {
 
     /// The warnings construction printed to stderr, in order: at most one per
     /// load for the attention route ([`AttnRoute::warning`]).
+    /// A diagnosis of the streamed layers (§4.8): the groups whose slot
+    /// bytes differ from the checkpoint's, and the tier's counters; `None`
+    /// when every weight is resident.
+    pub fn streamed_layers_audit(
+        &self,
+    ) -> Result<Option<(Vec<(u32, usize)>, crate::nn::weight_groups::GroupStats)>> {
+        let Some(st) = self.layers.first().and_then(|l| l.streamed.as_ref()) else {
+            return Ok(None);
+        };
+        let tier = st.tier.lock();
+        let wrong = tier
+            .audit(st.source.as_ref())?
+            .into_iter()
+            .map(|(g, p)| (g.0, p))
+            .collect();
+        Ok(Some((wrong, tier.stats())))
+    }
+
+    /// Hand the cache the tier's handle (once), so its admission can apply
+    /// the arbiter's pledge to the slots and ask again.
+    fn attach_layer_tier(&self, cache: &mut Cache) {
+        if let Some(st) = self.layers.first().and_then(|l| l.streamed.as_ref()) {
+            cache.attach_layer_tier(&st.tier);
+        }
+    }
+
+    /// The tier's shape and counters when the layers stream (§4.8):
+    /// `(slots, groups, slot_bytes, stats)`; `None` when every weight is
+    /// resident. Cheap — no audit.
+    pub fn streamed_layers_stats(
+        &self,
+    ) -> Option<(usize, usize, usize, crate::nn::weight_groups::GroupStats)> {
+        let st = self.layers.first().and_then(|l| l.streamed.as_ref())?;
+        let tier = st.tier.lock();
+        Some((
+            tier.n_slots(),
+            tier.n_groups(),
+            tier.slot_bytes(),
+            tier.stats(),
+        ))
+    }
+
     pub fn load_warnings(&self) -> &[crate::load_warning::LoadWarning] {
         &self.load_warnings
     }
@@ -8473,6 +9179,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        self.attach_layer_tier(cache);
         // Room for this pass, or a refusal that leaves everything as it was —
         // BEFORE the conv phase advances below (`Cache::prepare_pass`).
         cache.prepare_pass(seq_len)?;
@@ -8516,6 +9223,12 @@ impl Model {
 
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
+        if seq_len == 1 && norm_gemv_applies(&hidden_states, &self.embedding_norm, &self.lm_head) {
+            let last = hidden_states.squeeze(1)?;
+            let logits = norm_gemv(&last, &self.embedding_norm, &self.lm_head, false)?;
+            dump_logits(&logits, index_pos)?;
+            return logits.to_dtype(DType::F32);
+        }
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
@@ -8581,6 +9294,7 @@ impl Model {
         // the same grow: admitted once.
         let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
+            self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
                 &format!("for a batched step over {} rows", rows.len()),
@@ -8683,6 +9397,7 @@ impl Model {
         }
         let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
+            self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
                 &format!("for a ragged batched pass over {} rows", rows.len()),
@@ -8770,6 +9485,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len, _) = embeds.dims3()?;
+        self.attach_layer_tier(cache);
         cache.prepare_pass(seq_len)?;
         self.advance_conv_phase(seq_len, cache);
 
@@ -9968,7 +10684,7 @@ pub mod kv_slot_fuzz {
         ops: &[SlotOp],
         dev: &Device,
     ) -> std::result::Result<SlotTransitions, String> {
-        let mut slot = KvSlot::new(capacity);
+        let mut slot = kv_slot(capacity);
         let mut model = SlotModel {
             live: Vec::new(),
             heads: 2,
@@ -10108,15 +10824,15 @@ pub mod kv_slot_fuzz {
                 }
                 SlotOp::Grow { by } => {
                     let to = capacity + by;
-                    if slot.all_data.is_some() {
+                    if slot.is_allocated() {
                         t.grows += 1;
                     }
                     slot.grow_to(to)
                         .map_err(|e| format!("op {i}: grow_to({to}) failed: {e}"))?;
-                    if slot.capacity != to {
+                    if slot.capacity() != to {
                         return Err(format!(
                             "op {i}: grow_to({to}) left the capacity at {}",
-                            slot.capacity
+                            slot.capacity()
                         ));
                     }
                     capacity = to;
@@ -10136,7 +10852,7 @@ pub mod kv_slot_fuzz {
 
             // --- the comparison, after every operation ----------------------
             let want = &model.live;
-            match slot.all_data.as_ref() {
+            match slot.data().as_ref() {
                 None => {
                     if !want.is_empty() {
                         return Err(format!(
@@ -10147,16 +10863,16 @@ pub mod kv_slot_fuzz {
                     }
                 }
                 Some(all) => {
-                    if slot.len != want.len() {
+                    if slot.len() != want.len() {
                         return Err(format!(
-                            "op {i} ({op:?}): slot.len={} model={}",
-                            slot.len,
+                            "op {i} ({op:?}): slot.len()={} model={}",
+                            slot.len(),
                             want.len()
                         ));
                     }
-                    if slot.len > 0 {
+                    if slot.len() > 0 {
                         let view = all
-                            .narrow(2, 0, slot.len)
+                            .narrow(2, 0, slot.len())
                             .map_err(|e| format!("op {i}: narrow failed: {e}"))?;
                         let got = view
                             .flatten_all()
@@ -10185,7 +10901,7 @@ pub mod kv_slot_fuzz {
                                  A length that matches with contents that do not is the \
                                  shape a length-only assertion cannot see (CONTRIBUTING \
                                  §3.1b).",
-                                slot.len,
+                                slot.len(),
                                 &got[..got.len().min(12)],
                                 &expect[..expect.len().min(12)]
                             ));
@@ -10193,10 +10909,10 @@ pub mod kv_slot_fuzz {
                     }
                 }
             }
-            if slot.len > capacity {
+            if slot.len() > capacity {
                 return Err(format!(
                     "op {i} ({op:?}): len {} exceeds capacity {capacity}",
-                    slot.len
+                    slot.len()
                 ));
             }
         }
@@ -10361,7 +11077,7 @@ mod tests {
     fn in_place_append_matches_cat() -> Result<()> {
         let dev = Device::Cpu;
         for steps in 1..=6 {
-            let mut slot = KvSlot::new(8);
+            let mut slot = kv_slot(8);
             let mut got = None;
             for s in 0..steps {
                 got = Some(slot.append(&token(s, &dev)?)?);
@@ -10388,7 +11104,7 @@ mod tests {
     #[test]
     fn in_place_survives_a_multi_token_append_at_a_nonzero_offset() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         // A 3-token "prefill" on top of 2 decoded tokens.
@@ -10423,7 +11139,7 @@ mod tests {
     #[test]
     fn the_read_is_a_view_of_the_preallocated_buffer() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         let first = slot.append(&token(0, &dev)?)?;
         let first_before = first.flatten_all()?.to_vec1::<f32>()?;
         let second = slot.append(&token(1, &dev)?)?;
@@ -10437,7 +11153,7 @@ mod tests {
 
         // Both views must be prefixes of one buffer: read the backing store at
         // full capacity and check each view equals its own leading slice.
-        let backing = slot.all_data.as_ref().unwrap();
+        let backing = slot.data().as_ref().unwrap();
         for (steps, view) in [(1usize, &first), (2usize, &second)] {
             let want = backing
                 .narrow(2, 0, steps)?
@@ -10461,7 +11177,7 @@ mod tests {
     #[test]
     fn exceeding_capacity_fails_loudly() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(2);
+        let mut slot = kv_slot(2);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         let err = slot.append(&token(2, &dev)?).unwrap_err().to_string();
@@ -10480,7 +11196,7 @@ mod tests {
     #[test]
     fn reset_returns_the_slot_to_its_pre_prefill_state() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(8);
+        let mut slot = kv_slot(8);
         slot.append(&token(0, &dev)?)?;
         slot.append(&token(1, &dev)?)?;
         slot.reset();
@@ -10499,29 +11215,29 @@ mod tests {
     #[test]
     fn growing_the_slab_keeps_every_position_where_it_was() -> Result<()> {
         let dev = Device::Cpu;
-        let mut grown = KvSlot::new(2);
-        let mut wide = KvSlot::new(5);
+        let mut grown = kv_slot(2);
+        let mut wide = kv_slot(5);
         for i in 0..2 {
             grown.append(&token(i, &dev)?)?;
             wide.append(&token(i, &dev)?)?;
         }
         let before = grown
-            .all_data
+            .data()
             .as_ref()
             .unwrap()
             .narrow(2, 0, 2)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         grown.grow_to(5)?;
-        assert_eq!(grown.capacity, 5);
-        assert_eq!(grown.len, 2, "a grow moves no position");
+        assert_eq!(grown.capacity(), 5);
+        assert_eq!(grown.len(), 2, "a grow moves no position");
         assert_eq!(
-            grown.all_data.as_ref().unwrap().dims()[2],
+            grown.data().as_ref().unwrap().dims()[2],
             5,
             "the slab is five wide after the grow"
         );
         let after = grown
-            .all_data
+            .data()
             .as_ref()
             .unwrap()
             .narrow(2, 0, 2)?
@@ -10538,7 +11254,7 @@ mod tests {
                 i + 1
             );
         }
-        let view = grown.all_data.as_ref().unwrap().narrow(2, 0, 5)?;
+        let view = grown.data().as_ref().unwrap().narrow(2, 0, 5)?;
         assert_eq!(
             view.flatten_all()?.to_vec1::<f32>()?,
             cat_reference(5, &dev)?.flatten_all()?.to_vec1::<f32>()?
@@ -10551,20 +11267,20 @@ mod tests {
     #[test]
     fn a_grow_never_shrinks_and_never_reallocates_needlessly() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(4);
+        let mut slot = kv_slot(4);
         slot.append(&token(0, &dev)?)?;
-        let id = slot.all_data.as_ref().unwrap().id();
+        let id = slot.data().as_ref().unwrap().id();
         slot.grow_to(4)?;
         slot.grow_to(2)?;
-        assert_eq!(slot.capacity, 4);
+        assert_eq!(slot.capacity(), 4);
         assert_eq!(
-            slot.all_data.as_ref().unwrap().id(),
+            slot.data().as_ref().unwrap().id(),
             id,
             "no-op grows keep the buffer"
         );
         slot.grow_to(6)?;
         assert_ne!(
-            slot.all_data.as_ref().unwrap().id(),
+            slot.data().as_ref().unwrap().id(),
             id,
             "a real grow re-binds it"
         );
@@ -10576,13 +11292,13 @@ mod tests {
     #[test]
     fn a_grow_before_the_first_append_sets_the_width_and_allocates_nothing() -> Result<()> {
         let dev = Device::Cpu;
-        let mut slot = KvSlot::new(2);
+        let mut slot = kv_slot(2);
         slot.grow_to(6)?;
-        assert!(slot.all_data.is_none());
-        assert_eq!(slot.capacity, 6);
+        assert!(!slot.is_allocated());
+        assert_eq!(slot.capacity(), 6);
         let view = slot.append(&token(0, &dev)?)?;
         assert_eq!(view.dims()[2], 1);
-        assert_eq!(slot.all_data.as_ref().unwrap().dims()[2], 6);
+        assert_eq!(slot.data().as_ref().unwrap().dims()[2], 6);
         Ok(())
     }
 

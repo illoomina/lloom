@@ -42,6 +42,7 @@
 
 use super::buffer_pool::{BufferHandle, BufferPool, GpuClock};
 use super::device::Device;
+use crate::retire::Epoch;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -307,7 +308,7 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
                 model.drain();
             }
             Op::CommitEpoch => {
-                let closed = clock.commit_epoch();
+                let closed = clock.commit_epoch().0;
                 if closed != model.submitted {
                     return Err(format!(
                         "op {i}: commit_epoch returned {closed}, model expected {}",
@@ -325,7 +326,7 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
                 }
                 let newest = model.submitted - 1;
                 let epoch = newest - (*back as u64 % (newest + 1));
-                clock.mark_completed(epoch);
+                clock.mark_completed(Epoch(epoch));
                 model.completed = model.completed.max(epoch + 1);
             }
             Op::Drain => {
@@ -496,8 +497,12 @@ fn compare(
     // compared `model.completed` against itself and routed `submitted` through
     // a helper that returned the model's own field -- two gates that could not
     // fail, which is #479's class exactly, in the harness written to find it.
-    check("clock.submitted", clock.current_epoch(), model.submitted);
-    check("clock.completed", clock.completed_count(), model.completed);
+    check("clock.submitted", clock.current_epoch().0, model.submitted);
+    check(
+        "clock.completed",
+        clock.completed_count().0,
+        model.completed,
+    );
 
     if let Some(want) = model.unplanned() {
         let got = pool.unplanned_bytes();
@@ -666,7 +671,7 @@ mod proptests {
                     Op::MarkCompleted { back } => {
                         if submitted > 0 {
                             let newest = submitted - 1;
-                            clock.mark_completed(newest - (*back as u64 % (newest + 1)));
+                            clock.mark_completed(Epoch(newest - (*back as u64 % (newest + 1))));
                         }
                     }
                     Op::Drain => pool.drain_completed(),
@@ -868,8 +873,8 @@ mod proptests {
             )
         ) {
             let clock = GpuClock::new();
-            prop_assert_eq!(clock.current_epoch(), 0);
-            prop_assert_eq!(clock.completed_count(), 0);
+            prop_assert_eq!(clock.current_epoch(), Epoch(0));
+            prop_assert_eq!(clock.completed_count(), crate::retire::Completed(0));
 
             let mut last_completed = 0u64;
             let mut submitted = 0u64;
@@ -878,20 +883,20 @@ mod proptests {
             for op in &ops {
                 match op {
                     ClockOp::Commit => {
-                        let closed = clock.commit_epoch();
+                        let closed = clock.commit_epoch().0;
                         prop_assert_eq!(
                             closed, submitted,
                             "commit_epoch returned the wrong closed epoch"
                         );
                         submitted += 1;
-                        prop_assert_eq!(clock.current_epoch(), submitted);
+                        prop_assert_eq!(clock.current_epoch(), Epoch(submitted));
                     }
                     ClockOp::MarkCompleted(e) => {
-                        clock.mark_completed(*e);
+                        clock.mark_completed(Epoch(*e));
                         highest_marked = Some(highest_marked.map_or(*e, |h: u64| h.max(*e)));
                     }
                 }
-                let now = clock.completed_count();
+                let now = clock.completed_count().0;
                 prop_assert!(
                     now >= last_completed,
                     "completed_count went BACKWARDS ({last_completed} -> {now}): a late \

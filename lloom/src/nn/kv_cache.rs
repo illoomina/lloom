@@ -85,89 +85,59 @@ pub mod seam {
     }
 }
 
+/// One axis of KV: a [`Slab`](crate::nn::slab::Slab) along `dim` that
+/// widens by `max_seq_len` steps on its own (`Grow::By`), the zoo's cache.
+/// A reset drops the backing, so a clone of a reset cache shares nothing.
 #[derive(Debug, Clone)]
 pub struct Cache {
-    // all_data is an option on a Tensor, this makes it possible to only create the actual tensor
-    // on the first call where the batch size is easily known.
-    // Also this makes it safe to clone a KvCache that has been reset (as in it will not share
-    // its internal state with the cloned instance).
-    all_data: Option<Tensor>,
-    dim: usize,
-    current_seq_len: usize,
-    grow_by: usize,
-    max_seq_len: usize,
+    slab: crate::nn::slab::Slab,
 }
 
 impl Cache {
     pub fn new(dim: usize, max_seq_len: usize) -> Self {
         Self {
-            all_data: None,
-            dim,
-            current_seq_len: 0,
-            grow_by: max_seq_len,
-            max_seq_len,
+            slab: crate::nn::slab::Slab::new(
+                dim,
+                max_seq_len,
+                crate::nn::slab::Grow::By(max_seq_len),
+                crate::nn::zeros::NN_KV_SLAB,
+            ),
         }
     }
 
     pub fn dim(&self) -> usize {
-        self.dim
+        self.slab.dim()
     }
 
     pub fn current_seq_len(&self) -> usize {
-        self.current_seq_len
+        self.slab.len()
     }
 
     pub fn max_seq_len(&self) -> usize {
-        self.max_seq_len
+        self.slab.capacity()
     }
 
     pub fn all_data(&self) -> &Option<Tensor> {
-        &self.all_data
+        self.slab.data()
     }
 
     pub fn current_data(&self) -> Result<Option<Tensor>> {
-        let data = match self.all_data.as_ref() {
-            None => None,
-            Some(d) => Some(d.narrow(self.dim, 0, self.current_seq_len)?),
-        };
-        Ok(data)
+        self.slab.current()
     }
 
     pub fn reset(&mut self) {
-        self.current_seq_len = 0;
-        self.all_data = None;
+        self.slab.reset()
     }
 
     /// Keep the first `len` positions and forget the rest — a speculative
     /// window's rejected tail (the bytes stay in the slab; the length is what
     /// the readers see). A `len` past the current length is a no-op.
     pub fn truncate(&mut self, len: usize) {
-        if len < self.current_seq_len {
-            self.current_seq_len = len;
-        }
+        self.slab.truncate(len)
     }
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
-        let seq_len = src.dim(self.dim)?;
-        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
-        // self.all_data.get_or_insert_with.
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.max_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad)
-        };
-        let ad = self.all_data.as_mut().unwrap();
-        while self.current_seq_len + seq_len > self.max_seq_len {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.grow_by;
-            let next_ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            *ad = Tensor::cat(&[&*ad, &next_ad], self.dim)?;
-            self.max_seq_len += self.grow_by;
-        }
-        ad.slice_set(src, self.dim, self.current_seq_len)?;
-        self.current_seq_len += seq_len;
-        Ok(())
+        self.slab.append(src).map(|_| ())
     }
 }
 
@@ -216,7 +186,7 @@ impl KvCache {
         let k = match out_k {
             None => {
                 let mut shape = k.dims().to_vec();
-                shape[self.k.dim] = 0;
+                shape[self.k.dim()] = 0;
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
             Some(k) => k,
@@ -224,7 +194,7 @@ impl KvCache {
         let v = match out_v {
             None => {
                 let mut shape = v.dims().to_vec();
-                shape[self.k.dim] = 0;
+                shape[self.k.dim()] = 0;
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
             Some(v) => v,

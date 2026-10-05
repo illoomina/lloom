@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub family: &'static str,
+    /// The profiles the family ships, as a bound over the eight
+    /// (`lloom::profile`, design §3: "a bound, not a list"; #892 B1). The
+    /// boundary (§7.4) matches `(--profile, rewind, rows)` against it.
+    pub profiles: lloom::profile::Bound,
     /// Forward passes the host may enqueue past an unlearned EOS.
     pub lookahead_max: usize,
     /// The ring arms: `full` (naming any arm on which the input still reaches
@@ -147,6 +151,7 @@ pub struct Qwen4ExpFamily;
 
 pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2",
+    profiles: lloom::profile::LFM2,
     lookahead_max: 1,
     ring: "full",
     batch: true,
@@ -167,6 +172,7 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen4exp",
+    profiles: lloom::profile::QWEN4EXP,
     lookahead_max: 1,
     ring: "full: the PLE fed by the driver's host fill where the arm stamps each token (Metal); the fed id read back on a deferred read at the fixed cadence",
     batch: true,

@@ -26,6 +26,7 @@ pub mod object_detection;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod optimizer;
 pub mod pipelines;
+pub mod profile;
 pub mod quantized_nn;
 pub mod quantized_var_builder;
 #[doc(hidden)]

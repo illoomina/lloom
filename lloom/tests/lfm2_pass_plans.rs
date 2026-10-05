@@ -220,17 +220,20 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     // What a served pass does ask the pool for is exact, and all of it is
     // `Tensor::zeros`, which the Shared pool serves and no plan does: the
     // sequence's session state on the fresh tile (each conv layer's carry,
-    // each attention layer's K and V), and nothing on a later tile, since the
-    // carry's padding is set in place in the state (`pass-plan-design.md`
-    // §18). The private pool, which plans serve, is asked nothing; nor is any
-    // pool by a decode step.
+    // each attention layer's K and V, and the turn-checkpoint ring — one
+    // allocation for every slot and layer, `nn::ring::Ring`), and nothing on
+    // a later tile, since the carry's padding is set in place in the state
+    // (`pass-plan-design.md` §18) and the ring's slots are written in place.
+    // The private pool, which plans serve, is asked nothing; nor is any pool
+    // by a decode step.
     let conv = cfg
         .layer_types
         .iter()
         .filter(|t| matches!(t, LayerType::Conv))
         .count() as u64;
     let attn = cfg.layer_types.len() as u64 - conv;
-    let per_prompt = (conv + 2 * attn, 0);
+    let turn_ring = 1;
+    let per_prompt = (conv + 2 * attn + turn_ring, 0);
     let served_before = m.pass_plan_counters().unwrap().served;
     let requests_before = m.served_pass_pool_requests();
     m.trim_unused_buffers();
@@ -1180,12 +1183,14 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
     );
     assert_eq!(escapes, 0, "the fused shuffle's state escaped its pass");
     // What the measured sequence's served passes asked for is its session
-    // state, once: the fresh prefill's K and V slab (2) and its two conv
-    // states (2), and each conv layer's spare on the first fused step (2), all
-    // from the Shared pool — none per decode step.
+    // state, once: the fresh prefill's K and V slab (2), its two conv states
+    // (2) and its turn-checkpoint ring (1, every slot and layer in one
+    // allocation), and each conv layer's spare on the first fused step (2),
+    // all from the Shared pool — none per decode step.
+    let turn_ring = 1;
     assert_eq!(
         requests,
-        (4 + conv_layers, 0),
+        (4 + turn_ring + conv_layers, 0),
         "served passes asked the pools (shared, private) for more than the sequence's \
          session state: a per-step state allocation is back"
     );
@@ -1199,7 +1204,7 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
     assert_eq!(ids_u, want_u);
     assert_eq!(
         requests_u,
-        (4 + conv_layers * steps as u64, 0),
+        (4 + turn_ring + conv_layers * steps as u64, 0),
         "the unfused shuffle's per-step state is the request the counter must see"
     );
     Ok(())

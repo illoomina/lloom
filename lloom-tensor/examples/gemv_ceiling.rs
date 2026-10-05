@@ -15,6 +15,17 @@
 //!   the shipping tile (`prod`: `bm8` at N >= 4096 else `bm4`, `tm4 tn4`, the
 //!   `derive_gemv_tile` rule) and at wider tiles.
 //!
+//! `-serial` (on any arm) opens a serial-dispatch encoder and places no
+//! explicit barrier: the encoder orders every dispatch after the last. `-res`
+//! keeps `-dec`'s barriers but scopes each to the previous dispatch's output
+//! buffer (`memoryBarrierWithResources`). A `gemv:` tile may be one shape
+//! everywhere or a `+`-separated `class=shape` map over `sq` (q, attn_out,
+//! conv_out), `kv`, `cin` (conv_in), `ffn` (w1, w3), `w2`, `lm`; a shape is
+//! `prod`, `tm<a>tn<b>` or `bm<a>bn<b>sm<c>sn<d>tm<e>tn<f>`.
+//!
+//! `-pf<KB>` (after the other suffixes, e.g. `gemv:prod-dec-pf2048`) streams
+//! the first KB of the next matrix right before each barrier.
+//!
 //! `-nb` drops the buffer barrier between dispatches and `-dec` keeps it
 //! exactly where decode has one (every GEMV but `k`, `v` and `w3`, which read
 //! their predecessor's input and are free to overlap it — the trace's ordering
@@ -48,7 +59,8 @@ use objc2_metal::{
     MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint,
     MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType,
     MTLFunctionConstantValues, MTLLibrary, MTLMathFloatingPointFunctions, MTLMathMode,
-    MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResource, MTLResourceOptions, MTLSize,
+    MTLStorageMode,
 };
 use std::ptr::NonNull;
 
@@ -208,21 +220,58 @@ fn decode_sequence() -> Vec<Mat> {
     v
 }
 
-/// A GEMV tile: `bm` simdgroups of `tm` rows, each lane `tn` columns wide.
-/// `bm: None` is the production rule (`derive_gemv_tile`: 8 at N >= 4096).
+/// A GEMV tile: `bm × bn` simdgroups, each `sm × sn` lanes of `tm` rows and
+/// `tn` columns. `bm: None` is the production rule (`derive_gemv_tile`: 8 at
+/// N >= 4096).
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Tile {
+struct Shape {
     bm: Option<usize>,
+    bn: usize,
+    sm: usize,
+    sn: usize,
     tm: usize,
     tn: usize,
 }
 
-impl Tile {
+impl Shape {
     fn bm_for(&self, n: usize) -> usize {
         self.bm.unwrap_or(if n >= 4096 { 8 } else { 4 })
     }
+    fn rows(&self, n: usize) -> usize {
+        self.bm_for(n) * self.sm * self.tm
+    }
     fn fn_name(&self, n: usize) -> String {
-        tile_name(self.bm_for(n), self.tm, self.tn)
+        tile_name(self.bm_for(n), self.bn, self.sm, self.sn, self.tm, self.tn)
+    }
+}
+
+/// The weight classes of the decode sweep, for a per-class tile.
+const CLASSES: [&str; 6] = ["sq", "kv", "cin", "ffn", "w2", "lm"];
+
+fn class_of(name: &str) -> usize {
+    match name {
+        "q_proj" | "attn_out" | "conv_out" => 0,
+        "k_proj" | "v_proj" => 1,
+        "conv_in" => 2,
+        "w1" | "w3" => 3,
+        "w2" => 4,
+        _ => 5,
+    }
+}
+
+/// A tile per weight class (`gemv:<spec>`): one [`Shape`] everywhere, or a
+/// `+`-separated map `class=shape` over `CLASSES`, the rest at `prod`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tile {
+    by_class: [Shape; 6],
+}
+
+impl Tile {
+    fn shape(&self, mat: &Mat) -> Shape {
+        self.by_class[class_of(mat.name)]
+    }
+    fn fn_name(&self, mat: &Mat) -> String {
+        self.shape(mat).fn_name(mat.n)
     }
 }
 
@@ -231,47 +280,105 @@ impl Tile {
 /// instantiation of the same template arguments, so these are reached by
 /// their production `[[host_name]]` -- the name the census reports -- and only
 /// the other tiles are instantiated here.
-const LIBRARY_TILES: [(usize, usize, usize); 3] = [(4, 1, 4), (4, 4, 4), (8, 4, 4)];
+const LIBRARY_TILES: [(usize, usize, usize, usize, usize, usize); 7] = [
+    (1, 8, 1, 32, 4, 4),
+    (1, 8, 1, 32, 1, 4),
+    (1, 1, 8, 4, 4, 4),
+    (1, 1, 8, 4, 1, 4),
+    (4, 1, 1, 32, 1, 4),
+    (4, 1, 1, 32, 4, 4),
+    (8, 1, 1, 32, 4, 4),
+];
 
-fn tile_name(bm: usize, tm: usize, tn: usize) -> String {
-    if LIBRARY_TILES.contains(&(bm, tm, tn)) {
-        format!("gemv_float16_bm{bm}_bn1_sm1_sn32_tm{tm}_tn{tn}_nc0_axpby0")
+fn tile_name(bm: usize, bn: usize, sm: usize, sn: usize, tm: usize, tn: usize) -> String {
+    if LIBRARY_TILES.contains(&(bm, bn, sm, sn, tm, tn)) {
+        format!("gemv_float16_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0")
     } else {
-        format!("probe_gemv_bm{bm}_tm{tm}_tn{tn}")
+        format!("probe_gemv_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}")
     }
 }
 
-const PROD: Tile = Tile {
+const PROD_SHAPE: Shape = Shape {
     bm: None,
+    bn: 1,
+    sm: 1,
+    sn: 32,
     tm: 4,
     tn: 4,
 };
 
-fn parse_tile(s: &str) -> Result<Tile> {
+const PROD: Tile = Tile {
+    by_class: [PROD_SHAPE; 6],
+};
+
+/// One shape: `prod`, `bm4all`, `bm8all`, `tm<a>tn<b>`, or the full
+/// `bm<a>bn<b>sm<c>sn<d>tm<e>tn<f>`.
+fn parse_shape(s: &str) -> Result<Shape> {
     Ok(match s {
-        "prod" => PROD,
-        "bm4all" => Tile {
+        "prod" => PROD_SHAPE,
+        "bm4all" => Shape {
             bm: Some(4),
-            ..PROD
+            ..PROD_SHAPE
         },
-        "bm8all" => Tile {
+        "bm8all" => Shape {
             bm: Some(8),
-            ..PROD
+            ..PROD_SHAPE
         },
+        other if other.starts_with("bm") => {
+            let mut v = [0usize; 6];
+            let mut rest = other;
+            for (i, key) in ["bm", "bn", "sm", "sn", "tm", "tn"].iter().enumerate() {
+                rest = rest
+                    .strip_prefix(key)
+                    .with_context(|| format!("shape {other:?}: expected {key}"))?;
+                let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+                v[i] = rest[..end].parse()?;
+                rest = &rest[end..];
+            }
+            ensure!(v[2] * v[3] == 32, "shape {other:?}: sm * sn must be 32");
+            Shape {
+                bm: Some(v[0]),
+                bn: v[1],
+                sm: v[2],
+                sn: v[3],
+                tm: v[4],
+                tn: v[5],
+            }
+        }
         other => {
             let (tm, tn) = other
                 .strip_prefix("tm")
                 .and_then(|r| r.split_once("tn"))
                 .context(format!(
-                    "tile {other:?}: want prod|bm4all|bm8all|tm<a>tn<b>"
+                    "shape {other:?}: want prod|bm4all|bm8all|tm<a>tn<b>|bm<a>bn<b>sm<c>sn<d>tm<e>tn<f>"
                 ))?;
-            Tile {
-                bm: None,
+            Shape {
                 tm: tm.parse()?,
                 tn: tn.parse()?,
+                ..PROD_SHAPE
             }
         }
     })
+}
+
+fn parse_tile(s: &str) -> Result<Tile> {
+    if !s.contains('=') {
+        return Ok(Tile {
+            by_class: [parse_shape(s)?; 6],
+        });
+    }
+    let mut t = PROD;
+    for part in s.split('+') {
+        let (class, shape) = part
+            .split_once('=')
+            .with_context(|| format!("tile {s:?}: want class=shape+..."))?;
+        let i = CLASSES
+            .iter()
+            .position(|c| *c == class)
+            .with_context(|| format!("class {class:?}: want one of {CLASSES:?}"))?;
+        t.by_class[i] = parse_shape(shape)?;
+    }
+    Ok(t)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,11 +395,38 @@ struct Arm {
     barrier: bool,
     /// `-dec`: a barrier only where decode has one (`Mat::decode_free`).
     decode_order: bool,
+    /// `-serial`: a serial-dispatch encoder, every dispatch ordered after the
+    /// last by the encoder itself, no explicit barrier.
+    serial: bool,
+    /// `-res`: the decode-order barrier scoped to the producer's output buffer
+    /// (`memoryBarrierWithResources`) rather than to every buffer.
+    res: bool,
+    /// `-pf<KB>`: before each barrier, a streaming dispatch over the first
+    /// `KB` kilobytes of the NEXT matrix — independent of the barrier's
+    /// producer, so it runs beside the producer's tail and the consumer's
+    /// first rows come from the system-level cache.
+    prefetch_kb: usize,
 }
 
 fn parse_arm(s: &str) -> Result<Arm> {
     let base = s.split('#').next().unwrap_or(s);
-    let (base, barrier, decode_order) = if let Some(b) = base.strip_suffix("-nb") {
+    let (base, prefetch_kb) = match base.rfind("-pf") {
+        Some(at) if base[at + 3..].chars().all(|c| c.is_ascii_digit()) && at + 3 < base.len() => {
+            (&base[..at], base[at + 3..].parse()?)
+        }
+        _ => (base, 0),
+    };
+    let (base, serial) = match base.strip_suffix("-serial") {
+        Some(b) => (b, true),
+        None => (base, false),
+    };
+    let (base, res) = match base.strip_suffix("-res") {
+        Some(b) => (b, true),
+        None => (base, false),
+    };
+    let (base, barrier, decode_order) = if res {
+        (base, true, true)
+    } else if let Some(b) = base.strip_suffix("-nb") {
         (b, false, false)
     } else if let Some(b) = base.strip_suffix("-dec") {
         (b, true, true)
@@ -311,8 +445,11 @@ fn parse_arm(s: &str) -> Result<Arm> {
     Ok(Arm {
         label: s.to_string(),
         kind,
-        barrier,
+        barrier: barrier && !serial,
         decode_order,
+        serial,
+        res,
+        prefetch_kb,
     })
 }
 
@@ -339,25 +476,23 @@ kernel void stream_h4x2(device const half4* src [[buffer(0)]],
 
 /// The production GEMV source plus one explicit instantiation per tile, named
 /// by `Tile::fn_name`. Same template, same compile options as the engine.
-fn gemv_source(tiles: &[Tile]) -> String {
+fn gemv_source(tiles: &[Tile], mats: &[Mat]) -> String {
     let mut s = String::from(lloom_tensor::kernels::source::GEMV);
     let mut seen = std::collections::HashSet::new();
     for t in tiles {
-        for bm in [4usize, 8] {
-            if t.bm.is_some_and(|b| b != bm) {
+        for m in mats {
+            let sh = t.shape(m);
+            let bm = sh.bm_for(m.n);
+            let (bn, sm, sn, tm, tn) = (sh.bn, sh.sm, sh.sn, sh.tm, sh.tn);
+            if LIBRARY_TILES.contains(&(bm, bn, sm, sn, tm, tn)) {
                 continue;
             }
-            if LIBRARY_TILES.contains(&(bm, t.tm, t.tn)) {
-                continue;
-            }
-            let name = tile_name(bm, t.tm, t.tn);
+            let name = tile_name(bm, bn, sm, sn, tm, tn);
             if seen.insert(name.clone()) {
                 s.push_str(&format!(
                     "\ntemplate [[host_name(\"{name}\")]] [[kernel]] \
-                     decltype(gemv<half, {bm}, 1, 1, 32, {tm}, {tn}, false, false>) \
-                     gemv<half, {bm}, 1, 1, 32, {tm}, {tn}, false, false>;\n",
-                    tm = t.tm,
-                    tn = t.tn
+                     decltype(gemv<half, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, false, false>) \
+                     gemv<half, {bm}, {bn}, {sm}, {sn}, {tm}, {tn}, false, false>;\n"
                 ));
             }
         }
@@ -522,8 +657,9 @@ impl Probe {
         out: &Buf,
         in_size: usize,
     ) -> Result<()> {
-        let bm = tile.bm_for(mat.n);
-        let name = tile.fn_name(mat.n);
+        let sh = tile.shape(mat);
+        let bm = sh.bm_for(mat.n);
+        let name = tile.fn_name(mat);
         let p = self
             .gemv
             .get(&name)
@@ -546,7 +682,7 @@ impl Probe {
         set_bytes(enc, &[0i64; 1], 12);
         set_bytes(enc, &[0i64; 1], 13);
         set_bytes(enc, &1i32, 14);
-        let rows = bm * tile.tm;
+        let rows = sh.rows(mat.n);
         ensure!(
             mat.n.is_multiple_of(rows),
             "{}: N={} not a multiple of {rows}",
@@ -561,7 +697,7 @@ impl Probe {
             },
             MTLSize {
                 width: 32,
-                height: 1,
+                height: sh.bn,
                 depth: bm,
             },
         );
@@ -599,7 +735,11 @@ impl Probe {
         let open = |i: usize| -> Result<Enc> {
             match sample {
                 None => cb
-                    .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                    .computeCommandEncoderWithDispatchType(if arm.serial {
+                        MTLDispatchType::Serial
+                    } else {
+                        MTLDispatchType::Concurrent
+                    })
                     .context("encoder"),
                 Some(sb) => {
                     let d = MTLComputePassDescriptor::computePassDescriptor();
@@ -646,7 +786,25 @@ impl Probe {
                             enc = open(i)?;
                             enc.waitForFence(f);
                         } else if arm.barrier && !(arm.decode_order && m.decode_free()) {
-                            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                            if arm.prefetch_kb > 0 {
+                                let bytes = (arm.prefetch_kb << 10).min(m.bytes());
+                                self.encode_stream(&enc, w, bytes, 1024);
+                                dispatches += 1;
+                            }
+                            if arm.res {
+                                // The producer of this dispatch's input: the
+                                // previous ordered GEMV's output.
+                                let prev: &ProtocolObject<dyn MTLResource> =
+                                    ProtocolObject::from_ref(&*self.outs[i - 1]);
+                                unsafe {
+                                    enc.memoryBarrierWithResources_count(
+                                        NonNull::from(&prev).cast(),
+                                        1,
+                                    )
+                                };
+                            } else {
+                                enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                            }
                         }
                     }
                     match &arm.kind {
@@ -754,25 +912,6 @@ fn main() -> Result<()> {
             }
         }
     }
-    let stream_lib = compile(&device, STREAM_SRC)?;
-    let gemv_lib = compile(&device, &gemv_source(&tiles))?;
-    let stream = pipeline(&device, &stream_lib, "stream_h4x2", false)?;
-    let mut gemv = std::collections::HashMap::new();
-    for t in &tiles {
-        for n in [512usize, 10752] {
-            if let std::collections::hash_map::Entry::Vacant(slot) = gemv.entry(t.fn_name(n)) {
-                let p = pipeline(&device, &gemv_lib, slot.key(), true)?;
-                println!(
-                    "pipeline {}: maxTotalThreadsPerThreadgroup={} threadExecutionWidth={}",
-                    slot.key(),
-                    p.maxTotalThreadsPerThreadgroup(),
-                    p.threadExecutionWidth()
-                );
-                slot.insert(p);
-            }
-        }
-    }
-
     let mats = match &args.shape {
         None => decode_sequence(),
         Some(s) => {
@@ -788,6 +927,34 @@ fn main() -> Result<()> {
             vec![m; (args.total_mb * 1_000_000).div_ceil(m.bytes()).max(2)]
         }
     };
+    // Every class once, for the pipelines and the parity gate.
+    let class_reps = [
+        Mat { name: "q_proj", n: 2048, k: 2048 },
+        Mat { name: "k_proj", n: 512, k: 2048 },
+        Mat { name: "conv_in", n: 6144, k: 2048 },
+        Mat { name: "w1", n: 10752, k: 2048 },
+        Mat { name: "w2", n: 2048, k: 10752 },
+        Mat { name: "lm_head", n: 128000, k: 2048 },
+    ];
+    let stream_lib = compile(&device, STREAM_SRC)?;
+    let all_mats: Vec<Mat> = class_reps.iter().chain(&mats).copied().collect();
+    let gemv_lib = compile(&device, &gemv_source(&tiles, &all_mats))?;
+    let stream = pipeline(&device, &stream_lib, "stream_h4x2", false)?;
+    let mut gemv = std::collections::HashMap::new();
+    for t in &tiles {
+        for m in &all_mats {
+            if let std::collections::hash_map::Entry::Vacant(slot) = gemv.entry(t.fn_name(m)) {
+                let p = pipeline(&device, &gemv_lib, slot.key(), true)?;
+                println!(
+                    "pipeline {}: maxTotalThreadsPerThreadgroup={} threadExecutionWidth={}",
+                    slot.key(),
+                    p.maxTotalThreadsPerThreadgroup(),
+                    p.threadExecutionWidth()
+                );
+                slot.insert(p);
+            }
+        }
+    }
     let weight_bytes: usize = mats.iter().map(Mat::bytes).sum();
     println!(
         "weights {} matrices, {:.3} MB",
@@ -834,19 +1001,7 @@ fn main() -> Result<()> {
     upload(&probe.device, &probe.queue, &probe.x_large, 10752, 2, false)?;
 
     // ---- correctness first: nothing below is readable if this fails -------
-    let checks = [
-        Mat {
-            name: "k_proj",
-            n: 512,
-            k: 2048,
-        },
-        Mat {
-            name: "w2",
-            n: 2048,
-            k: 10752,
-        },
-    ];
-    for m in checks {
+    for m in class_reps {
         for t in &tiles {
             let e = parity(&probe, *t, m, m.k)?;
             println!(
@@ -861,6 +1016,9 @@ fn main() -> Result<()> {
                 "tile {t:?} disagrees with the CPU reference on {}: {e}",
                 m.name
             );
+        }
+        if m.name == "lm_head" {
+            continue;
         }
         let inv = parity(&probe, PROD, m, m.k / 2)?;
         println!(

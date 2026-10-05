@@ -4423,6 +4423,8 @@ impl lloom_tensor::CustomOp3 for GemvFused {
 /// A decode GEMV with its RMSNorm computed inside it (`GemvNormInline`,
 /// `docs/tuning.md` §13.5t): `x` is the un-normalized `[.., 1, k]` input,
 /// `norm_weight` the norm's `[k]` weight. `silu` puts SiLU on the store.
+// The fields are read by the Metal arm only, as `GemvFused`'s are.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 struct GemvNorm {
     eps: f32,
     silu: bool,
@@ -4540,6 +4542,22 @@ pub fn gemv_norm(
     silu: bool,
 ) -> Result<Tensor> {
     x.apply_op3_no_bwd(weight, norm_weight, &GemvNorm { eps, silu })
+}
+
+/// Whether [`gemv_norm`] serves a weight `[n, k]`: the GEMV's tile at that
+/// shape is one the inline norm is instantiated at. A caller with an unfused
+/// path checks this and takes that path where it is false. Always false
+/// without Metal.
+pub fn gemv_norm_serves(n: usize, k: usize) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        lloom_tensor::kernels::gemv_norm_serves(n, k)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (n, k);
+        false
+    }
 }
 
 /// Dispatch the runtime fused GEMV: `x @ weight.t()` with the epilogue named by

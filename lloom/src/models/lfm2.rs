@@ -8364,13 +8364,16 @@ fn norm_gemv_arm() -> bool {
 }
 
 /// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the arm,
-/// Metal, one contiguous row, a dtype the kernel carries, and the norm's
-/// weight a contiguous `[k]` of `x`'s dtype.
+/// Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
+/// contiguous `[k]` of `x`'s dtype, and a tile the fused kernel is
+/// instantiated at (`nn::ops::gemv_norm_serves`: at `k <= 64` or
+/// `k >= 16 n` the GEMV takes another tile, and the unfused pair runs).
 fn norm_gemv_applies(x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
     norm_gemv_arm()
         && x.device().is_metal()
         && matches!(x.dims(), [1, 1, _] | [1, _])
         && x.dims().last() == Some(&proj.weight().dims()[1])
+        && crate::nn::ops::gemv_norm_serves(proj.weight().dims()[0], proj.weight().dims()[1])
         && proj.bias().is_none()
         && x.is_contiguous()
         && proj.weight().is_contiguous()

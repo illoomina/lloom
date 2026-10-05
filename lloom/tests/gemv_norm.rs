@@ -165,3 +165,38 @@ fn gemv_norm_agrees_with_the_pair_and_is_bit_stable() -> Result<()> {
     assert!(err < 4e-3, "gemv_norm drifts from the pair: {err}");
     Ok(())
 }
+
+/// `gemv_norm_serves` names exactly the shapes the fused kernel runs at: true
+/// at every LFM2 consumer of a norm (`q`, `k`/`v`, conv `in_proj`, `w1`/`w3`,
+/// `lm_head`), false where the GEMV takes another tile (`k <= 64`;
+/// `k >= 16 n`) — and where it says true the kernel runs, where false it is
+/// refused, so a caller that checks it never meets the refusal.
+#[test]
+fn gemv_norm_serves_the_tiles_it_runs_at() -> Result<()> {
+    use lloom::nn::ops::gemv_norm_serves;
+    let dev = Device::new_metal(0)?;
+    for &(n, k, serves) in &[
+        (2048, 2048, true),
+        (512, 2048, true),
+        (6144, 2048, true),
+        (8192, 2048, true),
+        (65536, 2048, true),
+        (37, 2048, false),
+        (16, 8, false),
+        (40, 64, false),
+    ] {
+        assert_eq!(gemv_norm_serves(n, k), serves, "gemv_norm_serves({n}, {k})");
+        let x = Tensor::ones((1, 1, k), DType::F32, &dev)?;
+        let w = Tensor::ones((n, k), DType::F32, &dev)?;
+        let g = Tensor::ones(k, DType::F32, &dev)?;
+        let ran = lloom::nn::ops::gemv_norm(&x, &w, &g, EPS, false)
+            .and_then(|y| y.flatten_all()?.to_vec1::<f32>());
+        assert_eq!(
+            ran.is_ok(),
+            serves,
+            "gemv_norm at [{n}, {k}]: serves={serves} but ran={:?}",
+            ran.err()
+        );
+    }
+    Ok(())
+}

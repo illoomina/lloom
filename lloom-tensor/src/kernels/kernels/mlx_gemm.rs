@@ -160,6 +160,41 @@ fn derive_gemv_tile(out_vec_size: usize, in_vec_size: usize) -> (usize, usize, u
     }
 }
 
+/// The non-transposed GEMV's whole tile `(bm, bn, sm, sn, tm, tn)` as
+/// `gemv_dispatch` selects it: [`derive_gemv_tile`], #492's override and the
+/// `tm`/`tn` that follow. One definition for the dispatcher and for
+/// [`gemv_norm_serves`], so a caller's "does the fused kernel serve this
+/// shape" cannot drift from the tile the dispatcher then picks.
+fn gemv_tile(
+    out_vec_size: usize,
+    in_vec_size: usize,
+) -> (usize, usize, usize, usize, usize, usize) {
+    let (bm, bn, sm, sn) = derive_gemv_tile(out_vec_size, in_vec_size);
+    // #492's override, applied AFTER the shipping branch has chosen, so an
+    // unset variable leaves this expression byte-for-byte what it was. It
+    // reaches only the `(4|8, 1, 1, 32)` decode tiles: the `in_vec_size`
+    // branches above pick `bm == 1` shapes whose `bn`/`sm`/`sn` differ, and
+    // substituting `bm` alone there would name a tile that is not
+    // instantiated. Guarded rather than trusted, because the failure mode is
+    // a `LoadFunctionError` at a shape the caller cannot see.
+    let bm = match forced_gemv_bm() {
+        Some(forced) if bn == 1 && sm == 1 && sn == 32 => forced,
+        _ => bm,
+    };
+    let tm: usize = if out_vec_size < 4 { 1 } else { 4 };
+    (bm, bn, sm, sn, tm, 4usize)
+}
+
+/// Whether [`call_mlx_gemv_norm`] serves a non-transposed `[out, in]`
+/// matrix: the tile the dispatcher selects for it is one of the two decode
+/// tiles the inline norm is instantiated at (`bm4`/`bm8 bn1 sm1 sn32 tm4
+/// tn4`). A caller with an unfused path checks this first and takes that
+/// path where it is false, rather than meeting the refusal.
+pub fn gemv_norm_serves(out_vec_size: usize, in_vec_size: usize) -> bool {
+    let (bm, bn, sm, sn, tm, tn) = gemv_tile(out_vec_size, in_vec_size);
+    bn == 1 && sm == 1 && sn == 32 && tn == 4 && tm == 4 && (bm == 4 || bm == 8)
+}
+
 /// The largest `m` `select_tile_config` serves with the 16-row tile
 /// (`TILE_16_32_16_2_2`), inclusive. Measured cheapest of the three
 /// instantiated row tiles at every `m` to 32 and at 33..48 for a prefill;
@@ -984,20 +1019,7 @@ fn gemv_dispatch(
         (1usize, bn, sm, sn, 4usize, tn)
     } else {
         // gemv: mat[M_out,K] x vec[K] -> out[M_out]
-        let (bm, bn, sm, sn) = derive_gemv_tile(out_vec_size, in_vec_size);
-        // #492's override, applied AFTER the shipping branch has chosen, so an
-        // unset variable leaves this expression byte-for-byte what it was. It
-        // reaches only the `(4|8, 1, 1, 32)` decode tiles: the `in_vec_size`
-        // branches above pick `bm == 1` shapes whose `bn`/`sm`/`sn` differ, and
-        // substituting `bm` alone there would name a tile that is not
-        // instantiated. Guarded rather than trusted, because the failure mode is
-        // a `LoadFunctionError` at a shape the caller cannot see.
-        let bm = match forced_gemv_bm() {
-            Some(forced) if bn == 1 && sm == 1 && sn == 32 => forced,
-            _ => bm,
-        };
-        let tm: usize = if out_vec_size < 4 { 1 } else { 4 };
-        (bm, bn, sm, sn, tm, 4usize)
+        gemv_tile(out_vec_size, in_vec_size)
     };
 
     let dtype_str = match dtype {

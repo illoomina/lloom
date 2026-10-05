@@ -63,19 +63,17 @@ struct GemvDefaultAccT {
 // round-trip §12.2 #2 is about, and §12.1 is explicit that the round-trip is
 // the win rather than the dispatch count.
 //
-// WHAT A PROLOGUE CANNOT DO, and it decides this entry's shape. A functor here
-// sees one thread's `TN` elements at offset `bn`. It cannot see the whole
-// vector, because a GEMV partitions the OUTPUT across `n_tgp` threadgroups
-// (336 of them for w1 at LFM2's geometry) and Metal has no cross-threadgroup
-// barrier inside a dispatch. So a reduction over all of `K` -- which is what
-// RMSNorm's `rsqrt(mean(x^2))` is -- cannot be computed here; it can only be
-// *recomputed*, once per threadgroup. `measurements/issue-266-raw/prediction.py`
-// prices that at 432x the reduction work and 106.2 MB/token of re-reads
-// against a 0.492 MB/token saving.
-//
-// Hence the split: the reduction stays its own dispatch and produces a scale,
-// and the prologue applies the scale and the norm weight. What disappears is
-// the normalized vector's write and the consumer's read of it.
+// A functor here sees one thread's `TN` elements at offset `bn`; a reduction
+// over all of `K` -- RMSNorm's `rsqrt(mean(x^2))` -- is not visible to it.
+// Two shapes follow. `PrologueRmsNorm` imports the reduction as a scale a
+// separate dispatch computed: a GEMV partitions its OUTPUT across `n_tgp`
+// threadgroups with no barrier between them, and at a tile whose simdgroups
+// split K a per-threadgroup recompute re-reads the input `n_tgp` times
+// (`measurements/issue-266-raw/prediction.py`: 432x the reduction work).
+// `PrologueNormInline` recomputes it in every
+// simdgroup from the coefficients the K-walk already loads, which at the
+// decode tiles (`bn1 sm1 sn32`: one simdgroup spans K) costs no read, and
+// applies `1/rms` at the store (`docs/tuning.md` §13.5t).
 
 // The identity. Selected when no fusion is asked for, and byte-for-byte what
 // shipped: it holds no state and its `operator()` returns its argument, so it
@@ -1166,17 +1164,9 @@ void gemv_mul(
 // swappable.
 //
 // The scale buffer is produced by a separate reduction dispatch
-// (`reduce.metal`'s `rmsnorm_scale`). That is not a concession: it is forced.
-// A GEMV partitions the output across `n_tgp` threadgroups and Metal has no
-// cross-threadgroup barrier inside a dispatch, so no prologue can compute a
-// reduction over the whole input vector -- it can only recompute it per
-// threadgroup, which `measurements/issue-266-raw/prediction.py` prices at 432x
-// the reduction work.
-//
-// So this removes the normalized vector's ROUND-TRIP and not the norm's
-// dispatch. §12.1 is explicit that the round-trip is the win and the dispatch
-// count is the visible number; here the two come apart, and this arm collects
-// only the first.
+// (`reduce.metal`'s `rmsnorm_scale`), so this removes the normalized vector's
+// round-trip and not the norm's dispatch. `gemv_norm` (below) removes both by
+// recomputing the reduction in the K-walk.
 template <
     typename T,
     const int BM, const int BN,

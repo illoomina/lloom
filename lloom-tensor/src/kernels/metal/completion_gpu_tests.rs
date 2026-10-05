@@ -408,6 +408,26 @@ fn the_polling_arm_polls_on_the_same_work() {
     );
 }
 
+/// The polling arm polls a buffer about to complete and parks on the rest: on
+/// work that outlasts its bound it stops at the bound, and the value is right
+/// (`completion::SHARED_EVENT_POLL_BOUND`, `expert-streaming.md` §20.14b).
+///
+/// The work is ~128 MB of traffic (~0.4 ms), against a bound of ~40 µs of
+/// reads, so an arm that polled through the buffer would read far past it.
+#[test]
+fn the_polling_arm_parks_once_its_bound_is_spent() {
+    let n = 1 << 24;
+    let (out, signals, polls) = run_affine(CompletionWait::SharedEvent, n, 1.0, 0.0);
+    assert!(signals >= 1);
+    assert!(polls > 0, "the arm never polled");
+    assert!(
+        polls <= crate::kernels::metal::completion::SHARED_EVENT_POLL_BOUND,
+        "the arm polled {polls} times: it spun through the buffer instead of parking"
+    );
+    assert_eq!(out[n - 1], (n - 1) as f32);
+    assert_eq!(out[0], 0.0);
+}
+
 /// A larger dispatch, so the wait is not trivially satisfied on its first read.
 ///
 /// The 64-element cases above may complete before the host looks, which would

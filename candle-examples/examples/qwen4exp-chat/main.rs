@@ -1280,7 +1280,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
                 .join(",")
         );
         println!(
-            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-{} steps={} commits={} host_fill_forwards={} host_fill_fills={} overrun={} config=[{}]",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-{} steps={} commits={} host_fill_forwards={} host_fill_fills={} host_fill_parked={} publish_parks={} poll_fallbacks={} overrun={} config=[{}]",
             prompt_ids.len(),
             out.ids.len(),
             out.eos,
@@ -1290,6 +1290,9 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             out.stats.commits,
             out.stats.host_feed.as_ref().map_or(0, |f| f.forwards),
             out.stats.host_feed.as_ref().map_or(0, |f| f.fills),
+            out.stats.host_feed.as_ref().map_or(0, |f| f.parked),
+            out.stats.readback.publish_parks,
+            out.stats.readback.poll_fallbacks,
             out.stats.overrun,
             model.config().axes_line(),
         );

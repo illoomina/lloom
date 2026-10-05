@@ -218,6 +218,12 @@ pub struct DecodeOptions {
     /// per token already) or on [`Self::decode_until`]'s stop return (a caller
     /// that needs stop-strings under a reader thread signals the loop itself).
     pub stream_via_reader: bool,
+    /// How the host fill's producer waits between tokens for this run; `None`
+    /// takes `LLOOM_HOST_FEED_POLL` ([`FeedWait`]).
+    pub host_feed_wait: Option<FeedWait>,
+    /// Whether the fixed cadence's EOS wait parks on the ring's publish event
+    /// for this run; `None` takes `LLOOM_RING_EOS_PARK`.
+    pub eos_park: Option<bool>,
     /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
     /// cadences, both kept"). The loop closes its command buffer only when the
     /// GPU has started every buffer committed before it, on no cadence of its
@@ -441,6 +447,8 @@ impl DecodeOptions {
             prefill_bulk: 0,
             prefill_pacer_depth: 0,
             stream_via_reader: false,
+            host_feed_wait: None,
+            eos_park: None,
             adaptive_commit: false,
             run_ahead: 0,
             stop: None,
@@ -593,9 +601,12 @@ pub struct HostFeedReport {
     pub qos_errno: i32,
     /// How the producer waited between tokens (`LLOOM_HOST_FEED_POLL`).
     pub poll: FeedWait,
-    /// The producer's waits by the spinning arm and by the sleeping one.
+    /// The producer's waits: spinning, sleeping, parked on the publish event.
     pub spun: u64,
     pub slept: u64,
+    pub parked: u64,
+    /// Wakes the forwards posted to the producer as they demanded a value.
+    pub demand_wakes: u64,
     /// Under `LLOOM_HOST_FEED_TRACE`: per-fill host times and the
     /// producer's scheduling, for the park a forward's wait can see.
     pub trace: Option<HostFeedTrace>,
@@ -604,14 +615,16 @@ pub struct HostFeedReport {
 /// How the host fill's producer waits for the next token
 /// (`LLOOM_HOST_FEED_POLL`).
 ///
-/// A spinning wait holds a core for as long as it spins, and while a core
-/// spins through the streamed tier's host-planned pass the GPU runs that pass
-/// at low clocks; a wait that sleeps throughout costs the pipelined decode
-/// ~0.5 ms a token (`expert-streaming.md` §20.14a). [`FeedWait::OnDemand`]
-/// spins only while a forward already waits for a value the producer has not
-/// filled — the pipelined case — and sleeps otherwise, which is every token
-/// of a host-planned pass: there the host encodes a forward's wait only after
-/// it has itself waited for the token the producer fills from.
+/// A wait that spins holds a core, and while a core spins through the
+/// streamed tier's host-planned pass the GPU runs that pass at low clocks
+/// (`expert-streaming.md` §20.14a). [`FeedWait::Event`] parks, woken by the
+/// ring's publish event (signalled right behind each stamp, delivered by a
+/// listener block) or by a forward demanding a value (`FeedLink::encode_read`),
+/// and spins (`WFE`) only for an imminent token: while a forward already
+/// waits for a value the producer has not filled, and for at most
+/// [`FEED_SPIN_BOUND`] retirements (§20.14b). In a host-planned pass the host
+/// encodes a forward's wait only after it has waited for the token itself, so
+/// the producer never spins there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FeedWait {
     /// One poll arm throughout.
@@ -619,26 +632,56 @@ pub enum FeedWait {
     /// [`crate::generation::poll::PollMechanism::DEFAULT`] while a wait is
     /// pending on an unfilled value, a sleep of `idle_us` otherwise.
     OnDemand { idle_us: u64 },
+    /// Park on the publish event; the bounded `WFE` above while a wait is
+    /// pending; a sleep of `idle_us` where the run armed no event.
+    Event { idle_us: u64 },
+}
+
+/// The producer's `WFE` retirements (~1 µs each, `poll.rs`) for one imminent
+/// token before it parks instead: past the longest demand-to-token window
+/// measured on the pipelined decode (6.4 ms, `expert-streaming.md` §20.14b),
+/// a fail-safe for a stalled stream rather than a latency budget.
+pub const FEED_SPIN_BOUND: u64 = 16_384;
+
+/// The longest one park lasts: a fail-safe, since the token's publish, a
+/// forward's demand and the run's end each wake the producer.
+pub const FEED_PARK_MS: u64 = 50;
+
+/// What the producer does for one wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedStep {
+    /// Wait on the stamp word by this arm.
+    Poll(crate::generation::poll::PollMechanism),
+    /// Park on the ring's publish event.
+    Park,
 }
 
 impl Default for FeedWait {
+    /// `on-demand:50`: measured faster than [`FeedWait::Event`] wherever the
+    /// streamed pool misses (`expert-streaming.md` §20.14b).
     fn default() -> Self {
         FeedWait::OnDemand { idle_us: 50 }
     }
 }
 
 impl FeedWait {
-    /// The arm for the next wait, given the highest value a forward of the
-    /// run waits for and the values filled so far.
-    pub fn arm(self, demanded: u64, filled: u64) -> crate::generation::poll::PollMechanism {
+    /// The next wait, given the highest value a forward of the run waits for,
+    /// the values filled so far, the `WFE` waits spent on the token now
+    /// awaited, and whether the run armed a publish event.
+    pub fn step(self, demanded: u64, filled: u64, spins: u64, parks: bool) -> FeedStep {
+        use crate::generation::poll::PollMechanism;
+        let idle = |us| FeedStep::Poll(PollMechanism::Sleep(std::time::Duration::from_micros(us)));
         match self {
-            FeedWait::Fixed(m) => m,
+            FeedWait::Fixed(m) => FeedStep::Poll(m),
             FeedWait::OnDemand { .. } if demanded > filled => {
-                crate::generation::poll::PollMechanism::DEFAULT
+                FeedStep::Poll(PollMechanism::DEFAULT)
             }
-            FeedWait::OnDemand { idle_us } => crate::generation::poll::PollMechanism::Sleep(
-                std::time::Duration::from_micros(idle_us),
-            ),
+            FeedWait::OnDemand { idle_us } => idle(idle_us),
+            FeedWait::Event { .. } if demanded > filled && spins < FEED_SPIN_BOUND => {
+                FeedStep::Poll(PollMechanism::DEFAULT)
+            }
+            FeedWait::Event { .. } if parks => FeedStep::Park,
+            FeedWait::Event { idle_us } => idle(idle_us),
         }
     }
 }
@@ -648,6 +691,7 @@ impl std::fmt::Display for FeedWait {
         match self {
             FeedWait::Fixed(m) => write!(f, "{m}"),
             FeedWait::OnDemand { idle_us } => write!(f, "on-demand:{idle_us}"),
+            FeedWait::Event { idle_us } => write!(f, "event:{idle_us}"),
         }
     }
 }
@@ -655,19 +699,26 @@ impl std::fmt::Display for FeedWait {
 impl std::str::FromStr for FeedWait {
     type Err = String;
 
-    /// `on-demand` (a 50 µs idle sleep), `on-demand:<µs>`, or any
+    /// `event` / `event:<µs>` (the sleep where no event is armed),
+    /// `on-demand` / `on-demand:<µs>`, or any
     /// [`crate::generation::poll::PollMechanism`] spelling for one arm
     /// throughout.
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let s = s.trim();
-        if s == "on-demand" {
-            return Ok(FeedWait::default());
+        let us = |rest: &str| {
+            rest.parse::<u64>()
+                .map_err(|e| format!("host feed wait {s:?}: bad microseconds: {e}"))
+        };
+        match s {
+            "event" => return Ok(FeedWait::Event { idle_us: 50 }),
+            "on-demand" => return Ok(FeedWait::OnDemand { idle_us: 50 }),
+            _ => {}
         }
-        if let Some(us) = s.strip_prefix("on-demand:") {
-            return us
-                .parse::<u64>()
-                .map(|idle_us| FeedWait::OnDemand { idle_us })
-                .map_err(|e| format!("host feed wait {s:?}: bad microseconds: {e}"));
+        if let Some(rest) = s.strip_prefix("event:") {
+            return us(rest).map(|idle_us| FeedWait::Event { idle_us });
+        }
+        if let Some(rest) = s.strip_prefix("on-demand:") {
+            return us(rest).map(|idle_us| FeedWait::OnDemand { idle_us });
         }
         s.parse::<crate::generation::poll::PollMechanism>()
             .map(FeedWait::Fixed)
@@ -1289,6 +1340,7 @@ struct ProducerRun {
     poll: FeedWait,
     spun: u64,
     slept: u64,
+    parked: u64,
     trace: Option<HostFeedTrace>,
 }
 
@@ -1296,6 +1348,7 @@ impl FeedThread {
     fn start(
         feed: crate::nn::ngram_memory::HostFeed,
         mut reader: crate::generation::RingReader,
+        wait: FeedWait,
     ) -> Result<Self> {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
@@ -1306,7 +1359,7 @@ impl FeedThread {
         let handle = std::thread::Builder::new()
             .name("host-feed".into())
             .spawn(
-                move || match produce(&mut fill, &mut reader, &link_t, &done_t) {
+                move || match produce(&mut fill, &mut reader, &link_t, &done_t, wait) {
                     Ok(run) => Ok((fill, run)),
                     Err(e) => {
                         link_t.fail(&e);
@@ -1331,6 +1384,7 @@ impl FeedThread {
     /// and its counters.
     fn finish(mut self) -> Result<(Vec<u32>, HostFeedReport)> {
         self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.link.wake().wake();
         let handle = self.handle.take().expect("finished once");
         let (fill, run) = handle
             .join()
@@ -1341,10 +1395,11 @@ impl FeedThread {
                 .map(|k| self.link.encoded_ns(k))
                 .collect();
             eprintln!(
-                "HOSTFEED {} spun={} slept={}",
+                "HOSTFEED {} spun={} slept={} parked={}",
                 t.line(run.qos, &poll.to_string()),
                 run.spun,
-                run.slept
+                run.slept,
+                run.parked
             );
             t
         });
@@ -1357,6 +1412,8 @@ impl FeedThread {
             poll,
             spun: run.spun,
             slept: run.slept,
+            parked: run.parked,
+            demand_wakes: self.link.demand_wakes(),
             trace,
         };
         Ok((fill.into_consumed(), report))
@@ -1368,6 +1425,7 @@ impl Drop for FeedThread {
         if let Some(handle) = self.handle.take() {
             self.link.release();
             self.done.store(true, std::sync::atomic::Ordering::Release);
+            self.link.wake().wake();
             let _ = handle.join();
         }
     }
@@ -1404,19 +1462,19 @@ fn thread_cpu_ns() -> u64 {
 /// The producer's loop: fill every token the ring stamps until `done` and
 /// every demanded value is filled (or the run released its waits). The GPU
 /// waits on this thread, so it takes its stated class first
-/// (`docs/invariants.md` §15.2 #10b) and spins only while a forward waits on
-/// it ([`FeedWait`]). Each fill's host time in a debug or
+/// (`docs/invariants.md` §15.2 #10b), parks on the ring's publish event and
+/// spins only for an imminent token ([`FeedWait`]). Each fill's host time in a debug or
 /// `profile` build; the trace under `LLOOM_HOST_FEED_TRACE`.
 fn produce(
     fill: &mut crate::nn::ngram_memory::NgramFill,
     reader: &mut crate::generation::RingReader,
     link: &crate::nn::ngram_memory::FeedLink,
     done: &std::sync::atomic::AtomicBool,
+    wait: FeedWait,
 ) -> Result<ProducerRun> {
     use crate::nn::ngram_memory::trace_now_ns;
     let (qos, qos_errno) =
         crate::generation::hot_thread::claim_for_spawned(&crate::tuning::tuning().ring.feed_qos);
-    let wait = feed_poll();
     let mut run = ProducerRun {
         qos,
         qos_errno,
@@ -1430,6 +1488,9 @@ fn produce(
     });
     let mut last = trace.as_ref().map_or(0, |t| t.wall_ns);
     let mut tokens: Vec<u32> = Vec::with_capacity(64);
+    let parks = reader.parks();
+    let mut spins = 0u64;
+    let mut notified = 0u64;
     loop {
         if let Some(t) = trace.as_mut() {
             let now = trace_now_ns();
@@ -1459,14 +1520,39 @@ fn produce(
                 }
                 return Ok(run);
             }
-            let arm = wait.arm(link.demanded(), fill.filled());
-            match arm {
-                crate::generation::poll::PollMechanism::Sleep(_) => run.slept += 1,
-                _ => run.spun += 1,
+            match wait.step(link.demanded(), fill.filled(), spins, parks) {
+                FeedStep::Park => {
+                    run.parked += 1;
+                    let wake = link.wake();
+                    let seen = wake.epoch();
+                    // The GPU's wake for the next token, once per token.
+                    let next = reader.cursor() as u64 + 1;
+                    if notified != next {
+                        let w = std::sync::Arc::clone(wake);
+                        reader.notify_on_publish(next, move || w.wake());
+                        notified = next;
+                    }
+                    // Looked at after the epoch: a wake from here on is not lost.
+                    if !reader.has_new()
+                        && link.demanded() <= fill.filled()
+                        && !done.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        wake.park(seen, std::time::Duration::from_millis(FEED_PARK_MS));
+                    }
+                }
+                FeedStep::Poll(m @ crate::generation::poll::PollMechanism::Sleep(_)) => {
+                    run.slept += 1;
+                    reader.wait_for_publish(m);
+                }
+                FeedStep::Poll(m) => {
+                    run.spun += 1;
+                    spins += 1;
+                    reader.wait_for_publish(m);
+                }
             }
-            reader.wait_for_publish(arm);
             continue;
         }
+        spins = 0;
         let observed = if trace.is_some() { trace_now_ns() } else { 0 };
         for &t in &tokens {
             #[cfg(any(debug_assertions, feature = "profile"))]
@@ -1773,11 +1859,32 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the GPU waits for it, so no forward reads its input back. Armed
         // after the prefill, whose ids are the host's already.
         let mut host_feed = None;
-        if readback.stamps_each_token(opts.adaptive_commit) {
-            if let Some(f) = self.model.host_feed(&mut self.seq.cache)? {
+        let feed = if readback.stamps_each_token(opts.adaptive_commit) {
+            self.model.host_feed(&mut self.seq.cache)?
+        } else {
+            None
+        };
+        // A host thread that waits on the ring's stamp parks on its publish
+        // event: armed for this run before the producer's reader is taken,
+        // for a producer that parks ([`FeedWait::Event`]) and for the fixed
+        // cadence's EOS wait.
+        let wait = opts.host_feed_wait.unwrap_or_else(feed_poll);
+        let producer_parks = feed.is_some() && matches!(wait, FeedWait::Event { .. });
+        let eos_park = opts
+            .eos_park
+            .unwrap_or(crate::tuning::tuning().ring.eos_park);
+        if let Err(e) = readback.arm_publish_event(producer_parks, eos_park, opts.adaptive_commit) {
+            if let Some(f) = &feed {
+                f.link().release();
+                self.model.host_feed_end(&mut self.seq.cache, &[])?;
+            }
+            return Err(e);
+        }
+        {
+            if let Some(f) = feed {
                 let link = std::sync::Arc::clone(f.link());
                 let started = match readback.reader() {
-                    Some(reader) => FeedThread::start(f, reader).map(Some),
+                    Some(reader) => FeedThread::start(f, reader, wait).map(Some),
                     None => Ok(None),
                 };
                 match started {
@@ -2282,6 +2389,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.model.host_feed_end(&mut self.seq.cache, &published)?;
             stats.host_feed = Some(report);
         }
+        readback.arm_publish_event(false, false, true)?;
         if all_ids.len() != produced {
             lloom_tensor::bail!(
                 "Session::decode: the strategy returned {} ids for {} produced tokens — the \

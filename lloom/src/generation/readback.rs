@@ -43,6 +43,11 @@ use crate::generation::token_ring::TokenRing;
 use crate::generation::{LogitsProcessor, Sampling};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
+/// How long the EOS wait parks on the publish event before it takes the
+/// blocking read: a fail-safe two orders of magnitude above a token, never a
+/// latency budget.
+pub const EOS_PARK_TIMEOUT_MS: u64 = 2_000;
+
 /// Which readback arms a strategy is, for the `RESULT` line.
 ///
 /// Rendered from the strategy that ran rather than from the flags that selected
@@ -76,6 +81,9 @@ pub struct ReadbackCounters {
     pub poll_iters: u64,
     /// Steps on which the non-blocking poll gave up and took the blocking read.
     pub poll_fallbacks: u64,
+    /// Steps whose EOS wait parked on the ring's publish event instead of
+    /// polling the stamp (`EosRead::Poll` with the event armed).
+    pub publish_parks: u64,
     /// Publishes discarded past an EOS the host learned late
     /// ([`EosRead::HostOnDrain`]): the forwards the loop enqueued after the EOS
     /// before the drain showed it. `ring_publishes == ids + ring_eos_publishes
@@ -299,6 +307,22 @@ pub trait ReadbackStrategy {
     fn stamps_each_token(&self, adaptive_commit: bool) -> bool {
         let _ = adaptive_commit;
         false
+    }
+
+    /// Arm the ring's publish event for this run where a host thread will park
+    /// on the stamp: a [`RingReader`] that parks (`for_reader`), or the per-step
+    /// EOS wait on the fixed cadence when it parks (`eos_park`). Disarmed
+    /// otherwise, so a run with no such waiter (the adaptive commit's, and the
+    /// default fixed cadence's) encodes nothing more per stamp. A no-op on a
+    /// strategy with no ring.
+    fn arm_publish_event(
+        &mut self,
+        for_reader: bool,
+        eos_park: bool,
+        adaptive_commit: bool,
+    ) -> Result<()> {
+        let _ = (for_reader, eos_park, adaptive_commit);
+        Ok(())
     }
 
     /// Under the adaptive commit: publish each step with the fused
@@ -620,6 +644,10 @@ pub struct RingReader {
     /// history slots run behind the stamps by one per EOS retracted so far.
     slot_shift: usize,
     ended: bool,
+    /// The ring's publish event when the run armed it: a reader with nothing
+    /// new is woken from it ([`Self::notify_on_publish`]).
+    #[cfg(feature = "metal")]
+    publish: Option<std::sync::Arc<lloom_tensor::metal_backend::PublishEvent>>,
 }
 
 // SAFETY: the pointers are into Metal buffers the held tensors keep alive; the
@@ -708,6 +736,35 @@ impl RingReader {
         }
         #[cfg(not(feature = "metal"))]
         mechanism.wait();
+    }
+
+    /// Run `f` once the ring stamps `value` (on a dispatch-queue thread), on
+    /// the publish event the run armed; `false` when there is none.
+    pub fn notify_on_publish<F: Fn() + Send + Sync + 'static>(&self, value: u64, f: F) -> bool {
+        #[cfg(feature = "metal")]
+        if let Some(ev) = &self.publish {
+            ev.notify_at(value, f);
+            return true;
+        }
+        let _ = (value, f);
+        false
+    }
+
+    /// Whether the ring has stamped past this reader's cursor.
+    pub fn has_new(&self) -> bool {
+        self.published().is_some_and(|p| p as usize > self.cursor)
+    }
+
+    /// Whether the run armed a publish event this reader can park on.
+    pub fn parks(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            self.publish.is_some()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
     }
 
     fn read_published(
@@ -1763,6 +1820,7 @@ impl Ring {
                 head: self.generation as usize,
                 slot_shift: (total_tiles - behind) % total_tiles,
                 ended: false,
+                publish: self.ring.publish_event(),
             })
         }
     }
@@ -2047,6 +2105,35 @@ impl ReadbackStrategy for Ring {
                 self.counters.poll_fallbacks += 1;
                 self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
             }
+            #[cfg(feature = "metal")]
+            EosRead::Poll(_) if self.ring.publish_event().is_some() => {
+                self.counters.poll_iters += 1;
+                let generation = self.generation;
+                match self.ring.poll_eos(generation) {
+                    Some(eos) => eos,
+                    None => {
+                        let ev = self.ring.publish_event().expect("armed above");
+                        // The stamp must be on the GPU before the host parks on
+                        // it: commit the buffer it sits in if nothing has yet.
+                        if !ev.committed() {
+                            if let Device::Metal(m) = self.ring.input_device().device() {
+                                m.flush_and_prune()?;
+                            }
+                        }
+                        self.counters.publish_parks += 1;
+                        let landed = ev.wait(generation as u64, EOS_PARK_TIMEOUT_MS);
+                        match self.ring.poll_eos(generation) {
+                            Some(eos) if landed => eos,
+                            // A timeout, or a stamp not yet visible behind its
+                            // signal: the blocking read, counted.
+                            _ => {
+                                self.counters.poll_fallbacks += 1;
+                                self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
+                            }
+                        }
+                    }
+                }
+            }
             EosRead::Poll(poll) => {
                 let generation = self.generation;
                 let poll_budget = self.poll_budget;
@@ -2217,6 +2304,17 @@ impl ReadbackStrategy for Ring {
 
     fn reader(&self) -> Option<RingReader> {
         Ring::reader(self)
+    }
+
+    fn arm_publish_event(
+        &mut self,
+        for_reader: bool,
+        eos_park: bool,
+        adaptive_commit: bool,
+    ) -> Result<()> {
+        let eos_waits = eos_park && !adaptive_commit && matches!(self.eos, EosRead::Poll(_));
+        let on = self.ring.poll_is_mapped() && (for_reader || eos_waits);
+        self.ring.arm_publish_event(on)
     }
 
     fn stamps_each_token(&self, adaptive_commit: bool) -> bool {

@@ -373,14 +373,78 @@ fn mv_constant(dtype: GgmlDType) -> Option<(usize, Value)> {
     }
 }
 
-/// [`mv_constants`] plus the pair's grid order, which every
-/// `kernel_mul_mv_id2` names and so is always supplied.
-fn mv_id2_constants(dtype: GgmlDType, grid: PairGrid) -> ConstantValues {
-    let order = (916, Value::USize(grid.order()));
+/// The most rows a routed launch takes the union form for. Its threadgroup
+/// of a slot runs every plane naming the slot one after another, so over
+/// many rows sharing experts — a prefill tile's — it serialises what the
+/// incumbent runs side by side; over a verify window or a few rows the
+/// planes a slot gathers are few.
+pub const MV_ID_UNION_MAX_ROWS: usize = 8;
+
+/// Whether a routed launch of `batch` rows takes the union form
+/// (`MV_ID_UNION`, function constant 917): `LLOOM_QMV_ID_UNION` on and
+/// 2 to [`MV_ID_UNION_MAX_ROWS`] rows sharing the launch. Counted, so a
+/// test can show the arm engaged.
+fn mv_id_union(batch: usize) -> (usize, Value) {
+    let on = (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on();
+    if on {
+        ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    (917, Value::Bool(on))
+}
+
+/// [`mv_constants`] plus the union form, which every `kernel_mul_mv_id` and
+/// `kernel_mul_mv_id_f16` names and so is always supplied.
+fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
+    let union = mv_id_union(batch);
     ConstantValues::new(match mv_constant(dtype) {
-        Some(c) => vec![c, order],
-        None => vec![order],
+        Some(c) => vec![c, union],
+        None => vec![union],
     })
+}
+
+/// [`mv_id_constants`] plus the pair's grid order, which every
+/// `kernel_mul_mv_id2` names and so is always supplied. The union form
+/// decodes order 0's grid (`z = half·planes + plane`), so a pair on any
+/// other order takes the incumbent: each order is its own grid shape, and a
+/// kernel that decoded another's would compute the wrong planes.
+fn mv_id2_constants(dtype: GgmlDType, batch: usize, grid: PairGrid) -> ConstantValues {
+    let union_rows = if grid.order() == 0 { batch } else { 0 };
+    let mut values = mv_id_constants(dtype, union_rows).into_values();
+    values.push((916, Value::USize(grid.order())));
+    ConstantValues::new(values)
+}
+
+/// Routed matvec launches specialised to the union form, since process
+/// start: the arm's engagement count.
+static ID_UNION_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`ID_UNION_LAUNCHES`] now.
+pub fn qmv_id_union_launches() -> u64 {
+    ID_UNION_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `LLOOM_QMV_ID_UNION=on` (read once, or [`set_qmv_id_union`]): the routed
+/// matvec's union form.
+fn id_union_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ID_UNION.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qmv.id_union;
+            ID_UNION.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 off, 2 on.
+static ID_UNION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select the routed matvec's union form for this process (a test runs both
+/// forms; `LLOOM_QMV_ID_UNION` otherwise). The two are separate pipelines.
+pub fn set_qmv_id_union(on: bool) {
+    ID_UNION.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
@@ -752,7 +816,12 @@ pub fn call_quantized_matmul_mv_id_t(
         depth: 1,
     };
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Quantized,
+        name.clone(),
+        Some(mv_id_constants(dtype, batch)),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -1437,7 +1506,7 @@ pub fn call_quantized_matmul_mv_id2_t(
         device,
         Source::Quantized,
         name.clone(),
-        Some(mv_id2_constants(dtype, grid)),
+        Some(mv_id2_constants(dtype, batch, grid)),
     )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

@@ -104,7 +104,12 @@ fn parse_draft_loads(v: &str) -> Result<String, String> {
 fn parse_fusion(v: &str) -> Result<String, String> {
     one_of(v, "fusion", &["manual", "derived"])
 }
-
+fn parse_verify_key(v: &str) -> Result<String, String> {
+    one_of(v, "verify key", &["kind", "variant"])
+}
+fn parse_qsa_window(v: &str) -> Result<String, String> {
+    one_of(v, "QSA window", &["rows", "batched"])
+}
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
@@ -344,6 +349,15 @@ pub struct Qwen4ExpTuning {
     /// Where the MTP head's own streamed experts are planned in the drafter's observe: `device` (no readback at its layer; its record settled after the draft's argmax) or `host` (a readback per round, the A/B arm).
     #[opt(flag = "mtp-observe-plan", env = "QWEN4EXP_MTP_OBSERVE_PLAN", parser = "parse_plan", variants = ["device", "host"])]
     pub mtp_observe_plan: String,
+    /// How a verify window's planned pass is keyed: `kind` (one key per window length, the incumbent) or `variant` (also by the sequence the window runs: the rows that complete an indexer block, the device or host plan, the drafts' loads, the dense range — so each is served its own plan instead of evicting another's).
+    #[opt(flag = "mtp-verify-key", env = "QWEN4EXP_MTP_VERIFY_KEY", parser = "parse_verify_key", variants = ["kind", "variant"])]
+    pub mtp_verify_key: String,
+    /// The QSA layers of a verify window: `rows` (each position's prep, append, indexer and attention launched one after another, the incumbent) or `batched` (the window's positions in one launch per kernel, each row's arithmetic unchanged).
+    #[opt(flag = "qsa-window", env = "QWEN4EXP_QSA_WINDOW", parser = "parse_qsa_window", variants = ["rows", "batched"])]
+    pub qsa_window: String,
+    /// Run the MTP head on every verify window row inside the verify's pass (draft-for-every-prefix) and take the accepted row's draft after the accept, in place of the observe's own submission and readback.
+    #[opt(flag = "mtp-fold", env = "QWEN4EXP_MTP_FOLD", bool)]
+    pub mtp_fold: bool,
 }
 
 impl Default for Qwen4ExpTuning {
@@ -372,6 +386,9 @@ impl Default for Qwen4ExpTuning {
             mtp_trace: false,
             mtp_draft_loads: "auto".into(),
             mtp_observe_plan: "host".into(),
+            mtp_verify_key: "kind".into(),
+            qsa_window: "rows".into(),
+            mtp_fold: false,
         }
     }
 }

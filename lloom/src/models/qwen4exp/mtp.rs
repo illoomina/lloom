@@ -49,6 +49,92 @@ pub struct MtpHead<R: ExpertResidency> {
     head_mix: HyperConnection,
     n: usize,
     pub(crate) d: usize,
+    /// Where a drafter that folds its observe into the verify
+    /// (`QWEN4EXP_MTP_FOLD`) hands the target its lane's cache, and the
+    /// target hands back what the head drafted on every window row. The
+    /// drafter and the target share this head.
+    fold: parking_lot::Mutex<FoldSlot>,
+}
+
+/// The lanes in flight between a drafter's `draft` and its `observe`.
+#[derive(Debug, Default)]
+struct FoldSlot {
+    /// Lanes handed over for the next verify, the latest last.
+    pending: Vec<(SeqId, Cache)>,
+    /// Folded verifies awaiting their observe.
+    done: Vec<(SeqId, Folded)>,
+}
+
+/// The head over a verify window's rows inside its pass, awaiting the
+/// window's readback ([`Qwen4Exp::fold_head`]).
+pub(crate) struct FoldRun {
+    seq: SeqId,
+    cache: Cache,
+    rows_before: usize,
+    t: usize,
+    /// The head's argmax per window row `[T]` u32, on the device.
+    drafts: Tensor,
+    /// The head layer's carry per row `[1, T, n·d]`.
+    multi: Tensor,
+    record: Option<WindowPlan>,
+    kind: Option<WindowPlanKind>,
+    misses_before: u64,
+}
+
+impl FoldRun {
+    /// The tensors the window's readback carries for the fold: the drafts,
+    /// then a device plan's record.
+    pub(crate) fn read_tensors(&self) -> Vec<&Tensor> {
+        let mut v = vec![&self.drafts];
+        if let Some(WindowPlan::Device(t)) = &self.record {
+            v.push(t);
+        }
+        v
+    }
+
+    /// The run with its readback (`read`, as [`Self::read_tensors`] laid it).
+    pub(crate) fn read(self, read: Vec<Vec<u32>>, topk: usize) -> Result<Folded> {
+        let mut read = read.into_iter();
+        let drafts = read.next().unwrap_or_default();
+        if drafts.len() != self.t {
+            lloom_tensor::bail!("mtp fold: {} drafts for {} rows", drafts.len(), self.t)
+        }
+        let record = match self.record {
+            Some(WindowPlan::Host(r)) => Some(r),
+            Some(WindowPlan::Device(_)) => match read.next() {
+                Some(data) => Some(WindowRecord::device(data, self.t, topk)?),
+                None => lloom_tensor::bail!("mtp fold: the head's record was not read"),
+            },
+            None => None,
+        };
+        Ok(Folded {
+            seq: self.seq,
+            cache: self.cache,
+            rows_before: self.rows_before,
+            drafts,
+            multi: self.multi,
+            record,
+            kind: self.kind,
+            misses_before: self.misses_before,
+            valid: true,
+        })
+    }
+}
+
+/// A folded verify, read back: what its observe takes.
+#[derive(Debug)]
+pub(crate) struct Folded {
+    seq: SeqId,
+    cache: Cache,
+    rows_before: usize,
+    drafts: Vec<u32>,
+    multi: Tensor,
+    record: Option<WindowRecord>,
+    kind: Option<WindowPlanKind>,
+    misses_before: u64,
+    /// `false` once the verify redid its window: the rows it drafted on are
+    /// not the window's.
+    valid: bool,
 }
 
 impl<R: ExpertResidency> MtpHead<R> {
@@ -68,7 +154,24 @@ impl<R: ExpertResidency> MtpHead<R> {
             head_mix,
             n: cfg.hc_count,
             d: cfg.hidden_size,
+            fold: parking_lot::Mutex::new(FoldSlot::default()),
         }
+    }
+
+    /// The head's lane cache handed over for a folded verify, and its
+    /// sequence (`QWEN4EXP_MTP_FOLD`); `None` when no drafter handed one.
+    fn take_pending(&self) -> Option<(SeqId, Cache)> {
+        self.fold.lock().pending.pop()
+    }
+
+    /// The position and the armed device plan of the lane the next folded
+    /// verify runs over, for the verify's pass key.
+    pub(crate) fn pending_lane(&self) -> Option<(usize, bool)> {
+        self.fold
+            .lock()
+            .pending
+            .last()
+            .map(|(_, c)| (c.pos, c.device_plan_armed))
     }
 
     /// `hidden [1, a, n·d]` (the target's carries at `a` positions) with
@@ -197,6 +300,9 @@ struct MtpLane {
     /// and reset it.
     resets: u64,
     seeded: bool,
+    /// The prompt rows the seeding observes have keyed so far: a prefill in
+    /// units (`DecodeOptions::prefill_ubatch`) seeds the lane unit by unit.
+    seed_rows: usize,
     draft: Option<u32>,
     /// The MTP layer's pre-collapse carry after the last observed row — the
     /// state a second draft step continues from.
@@ -207,16 +313,27 @@ struct MtpLane {
     observe_device: u64,
     observe_host: u64,
     observe_redos: u64,
+    /// The cache the lane holds while its own is handed to a folded verify
+    /// (`QWEN4EXP_MTP_FOLD`), swapped back by the observe.
+    spare: Option<Cache>,
+    /// Observes that took a folded verify's draft, and those that fell back
+    /// to running the head (a redone window, a head row that missed).
+    folded: u64,
+    fold_fallbacks: u64,
 }
 
 impl MtpLane {
     fn new(cfg: &Config) -> Self {
         Self {
+            spare: Some(Cache::with_layers(cfg, 1)),
+            folded: 0,
+            fold_fallbacks: 0,
             cache: Cache::with_layers(cfg, 1),
             prompt: Vec::new(),
             keyed: Vec::new(),
             resets: 0,
             seeded: false,
+            seed_rows: 0,
             draft: None,
             multi: None,
             rows_seen: 0,
@@ -296,6 +413,106 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
         })
     }
 
+    /// Observes that took a folded verify's draft, and those that fell back
+    /// to running the head, over every lane (`QWEN4EXP_MTP_FOLD`).
+    pub fn fold_stats(&self) -> (u64, u64) {
+        self.lanes
+            .iter()
+            .fold((0, 0), |(f, b), l| (f + l.folded, b + l.fold_fallbacks))
+    }
+
+    /// Hand sequence `seq`'s lane cache to the next verify, which runs the
+    /// head over every window row inside its pass ([`Qwen4Exp::fold_head`]).
+    fn hand_over(&mut self, seq: SeqId) -> Result<()> {
+        let head = self.head;
+        let lane = self.lane(seq)?;
+        if !lane.seeded {
+            return Ok(());
+        }
+        if let Some(spare) = lane.spare.take() {
+            let cache = std::mem::replace(&mut lane.cache, spare);
+            head.fold.lock().pending.push((seq, cache));
+        }
+        Ok(())
+    }
+
+    /// Bring sequence `seq`'s lane cache home from the fold slot: a hand-over
+    /// no verify took, and a folded verify's rows, cut back to where the lane
+    /// stood (nothing of them kept). For a lane about to be re-keyed.
+    fn reclaim(&mut self, seq: SeqId) -> Result<()> {
+        let (head, ratio) = (self.head, self.ratio);
+        let (pending, done) = take_fold(head, seq);
+        let lane = self.lane(seq)?;
+        if let Some(c) = pending {
+            lane.spare = Some(std::mem::replace(&mut lane.cache, c));
+        }
+        if let Some(f) = done {
+            lane.spare = Some(std::mem::replace(&mut lane.cache, f.cache));
+            if let Some(r) = &f.record {
+                R::settle_window(&[(head.layer().moe().experts(), r)], 0)?;
+            }
+            lane.cache.truncate_attention(f.rows_before, ratio)?;
+        }
+        Ok(())
+    }
+
+    /// The observe of a folded verify: the head ran on every window row
+    /// inside the verify's pass, row `i` keyed from the target's carry at
+    /// row `i` and the embedding of its argmax — which, for the `a` rows
+    /// accepted, is the token the observe would key it with. The head's
+    /// rows past `a` are cut away, its plan settled for the `a`, and the
+    /// draft is row `a − 1`'s. `false` (the lane put back as it stood) when
+    /// there is no fold to take, or it cannot stand: the window was redone,
+    /// or a kept row computed on a missing head expert.
+    fn observe_folded(&mut self, seq: SeqId, accepted: &[u32]) -> Result<bool> {
+        let (head, ratio) = (self.head, self.ratio);
+        let (pending, done) = take_fold(head, seq);
+        let lane = self.lane(seq)?;
+        if let Some(c) = pending {
+            lane.spare = Some(std::mem::replace(&mut lane.cache, c));
+        }
+        let Some(f) = done else {
+            return Ok(false);
+        };
+        lane.spare = Some(std::mem::replace(&mut lane.cache, f.cache));
+        let a = accepted.len();
+        let tier = head.layer().moe().experts();
+        let flagged = f.record.as_ref().and_then(|r| r.first_flagged_row());
+        let usable = f.valid && a >= 1 && a <= f.drafts.len() && flagged.is_none_or(|p| p >= a);
+        if let Some(r) = &f.record {
+            R::settle_window(&[(tier, r)], if usable { a } else { 0 })?;
+        }
+        match f.kind {
+            Some(WindowPlanKind::Device) if flagged.is_some_and(|p| p < a) => {
+                lane.cache.device_plan_armed = false
+            }
+            Some(WindowPlanKind::Host { .. })
+                if usable && tier.misses_so_far() == f.misses_before =>
+            {
+                lane.cache.device_plan_armed = true
+            }
+            _ => {}
+        }
+        lane.cache
+            .truncate_attention(f.rows_before + if usable { a } else { 0 }, ratio)?;
+        if !usable {
+            lane.fold_fallbacks += 1;
+            return Ok(false);
+        }
+        if lane.keyed.is_empty() {
+            lane.keyed.push(lane.prompt.first().copied().unwrap_or(0));
+        }
+        lane.keyed.extend_from_slice(accepted);
+        let held = lane.draft.replace(f.drafts[a - 1]);
+        lane.multi = Some(f.multi.narrow(1, a - 1, 1)?);
+        lane.rows_seen += a;
+        lane.folded += 1;
+        if mtp_probe() {
+            self.probe.score(held, Some(&f.drafts[..a]), accepted);
+        }
+        Ok(true)
+    }
+
     /// Propose `k` tokens a round (`k ≥ 1`; the target verifies `k + 1`
     /// positions sequentially, byte-identical to greedy whatever `k`).
     pub fn with_k(mut self, k: usize) -> Self {
@@ -315,6 +532,13 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     /// Positions sequence `seq`'s MTP cache holds.
     pub fn seq_rows_seen(&self, seq: SeqId) -> usize {
         self.lanes.get(seq.0).map_or(0, |l| l.rows_seen)
+    }
+
+    /// The tokens sequence `seq`'s lane was keyed from: row `j` pairs the
+    /// target's carry at position `j` with the embedding of `keyed[j + 1]`
+    /// (what [`Speculator::begin_at`] matches a reused prefix against).
+    pub fn seq_keyed(&self, seq: SeqId) -> &[u32] {
+        self.lanes.get(seq.0).map_or(&[], |l| l.keyed.as_slice())
     }
 
     /// Sequence 0's MTP-layer cache (its KV), for a probe.
@@ -406,6 +630,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     /// restart costs the reused prefix's context, which the acceptance rate
     /// pays for, and nothing else.
     fn begin_at(&mut self, seq: SeqId, prompt: &[u32], kept: &[u32]) -> Result<()> {
+        self.reclaim(seq)?;
         let ratio = self.ratio;
         let lane = self.lane(seq)?;
         let at = kept.len();
@@ -429,6 +654,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         }
         lane.prompt = prompt.to_vec();
         lane.seeded = false;
+        lane.seed_rows = 0;
         lane.draft = None;
         lane.multi = None;
         Ok(())
@@ -439,30 +665,44 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     }
 
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
-        active
-            .iter()
-            .map(|&seq| Ok(Draft::host(self.draft_one(seq)?)))
-            .collect()
+        let mut drafts = Vec::with_capacity(active.len());
+        for &seq in active {
+            drafts.push(Draft::host(self.draft_one(seq)?));
+            if fold_on() {
+                self.hand_over(seq)?;
+            }
+        }
+        Ok(drafts)
     }
 
     /// `probe [1, a, n·d]` = the target's carries at the `a` positions the
     /// round ran; `accepted` = the tokens the target kept at those positions
     /// (the token that follows each). Row `i` pairs with the token that follows
-    /// it: after the prefill that is the prompt's next token for all but the
-    /// last row, and the accepted anchor for the last.
+    /// it: during the prefill that is the prompt's next token, and the
+    /// accepted anchor for the prompt's last row. A prefill in units seeds
+    /// the lane unit by unit, each unit's rows at their offset in the prompt
+    /// (an earlier unit's `accepted` is empty).
     fn observe(&mut self, seq: SeqId, probe: &Tensor, accepted: &[u32]) -> Result<()> {
         let a = probe.dim(1)?;
         if a == 0 {
+            return Ok(());
+        }
+        if self.lane(seq)?.seeded && fold_on() && self.observe_folded(seq, accepted)? {
             return Ok(());
         }
         let (head, embed, lm_head) = (self.head, self.embed, self.lm_head);
         let device = self.device.clone();
         let lane = self.lane(seq)?;
         let seeding = !lane.seeded;
+        let first_unit = seeding && lane.seed_rows == 0;
         let nexts: Vec<u32> = if seeding {
-            lane.seeded = true;
-            let mut v: Vec<u32> = lane.prompt.iter().skip(1).copied().collect();
-            v.extend_from_slice(accepted);
+            let off = lane.seed_rows;
+            let mut v: Vec<u32> = lane.prompt.iter().skip(off + 1).take(a).copied().collect();
+            if off + a >= lane.prompt.len() {
+                v.extend_from_slice(accepted);
+                lane.seeded = true;
+            }
+            lane.seed_rows = off + a;
             v
         } else {
             accepted.to_vec()
@@ -475,7 +715,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                 accepted.len()
             )
         }
-        if mtp_probe() && seeding {
+        if mtp_probe() && first_unit {
             self.probe_prefill_rows(seq, probe, &nexts)?;
         }
         let lane = self.lane(seq)?;
@@ -724,6 +964,138 @@ impl<R: ExpertResidency> MtpDrafter<'_, R> {
     }
 }
 
+/// Sequence `seq`'s hand-over and folded verify, taken out of the slot.
+fn take_fold<R: ExpertResidency>(head: &MtpHead<R>, seq: SeqId) -> (Option<Cache>, Option<Folded>) {
+    let mut f = head.fold.lock();
+    let pending = f
+        .pending
+        .iter()
+        .position(|(s, _)| *s == seq)
+        .map(|i| f.pending.remove(i).1);
+    let done = f
+        .done
+        .iter()
+        .position(|(s, _)| *s == seq)
+        .map(|i| f.done.remove(i).1);
+    (pending, done)
+}
+
+impl<R: ExpertResidency> Qwen4Exp<R> {
+    /// The MTP head over every row of a verify window, inside the verify's
+    /// pass, when a drafter handed it a lane (`QWEN4EXP_MTP_FOLD`):
+    /// draft-for-every-prefix. Row `i` is keyed from the target's carry at
+    /// row `i` (`carries [T, 1, n·d]`) and the embedding of the target's
+    /// argmax at row `i` (on the device), so for every row the accept keeps
+    /// it is the row the observe would key, and the draft the next round
+    /// needs is row `a − 1`'s. The head's streamed experts are planned on
+    /// the device when its lane is armed, else on the host with every row
+    /// loaded. Its allocations are declared escapes: the lane's KV outlives
+    /// the pass, and a further draft step reads its carry after it.
+    pub(crate) fn fold_head(
+        &self,
+        carries: &Tensor,
+        argmax: &Tensor,
+        t: usize,
+    ) -> Result<Option<FoldRun>> {
+        let Some(head) = self.mtp_head() else {
+            return Ok(None);
+        };
+        let Some((seq, mut cache)) = head.take_pending() else {
+            return Ok(None);
+        };
+        let _declared = lloom_tensor::EscapeGuard::new();
+        let rows_before = cache.pos;
+        let hidden = carries.reshape((1, t, head.n * head.d))?;
+        let emb = self.embed_tokens().embedding(&argmax.reshape((1, t))?)?;
+        let tier = head.layer().moe().experts();
+        let kind = tier
+            .plans_on_device()
+            .then_some(if cache.device_plan_armed {
+                WindowPlanKind::Device
+            } else {
+                WindowPlanKind::Host {
+                    real_rows: t,
+                    loaded_rows: t,
+                }
+            });
+        let misses_before = tier.misses_so_far();
+        let (sample, multi, record) =
+            head.forward_planned(&hidden, &emb, &mut cache, false, kind)?;
+        let drafts = self
+            .lm_head()
+            .forward(&sample)?
+            .squeeze(0)?
+            .argmax(D::Minus1)?
+            .contiguous()?;
+        Ok(Some(FoldRun {
+            seq,
+            cache,
+            rows_before,
+            t,
+            drafts,
+            multi,
+            record,
+            kind,
+            misses_before,
+        }))
+    }
+
+    /// The MTP head's routed experts a row (the target's when there is no
+    /// head).
+    pub(crate) fn mtp_topk(&self) -> usize {
+        self.mtp_head()
+            .map_or(self.config().n_experts_per_tok, |h| h.layer().moe().topk())
+    }
+}
+
+/// `QWEN4EXP_MTP_FOLD` (read once, or [`set_mtp_fold`]): the drafter folds
+/// its observe into the verify.
+fn fold_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match FOLD.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qwen4exp.mtp_fold;
+            FOLD.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 off, 2 on.
+static FOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Fold the drafter's observe into the verify for this process (a test runs
+/// both arms; `QWEN4EXP_MTP_FOLD` otherwise).
+pub fn set_mtp_fold(on: bool) {
+    FOLD.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `QWEN4EXP_MTP_VERIFY_KEY` (read once): `variant` keys a verify window's
+/// planned pass by the sequence it runs; `kind` (the default) by its length.
+fn verify_keyed_by_variant() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match VERIFY_KEY.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qwen4exp.mtp_verify_key == "variant";
+            VERIFY_KEY.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 `kind`, 2 `variant`.
+static VERIFY_KEY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Key the verify window's pass by its sequence for this process (a test
+/// runs both arms; `QWEN4EXP_MTP_VERIFY_KEY` otherwise).
+pub fn set_verify_key_variant(on: bool) {
+    VERIFY_KEY.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `QWEN4EXP_MTP_PROBE` (read once): the prompt-row ablation probe above.
 fn mtp_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -788,6 +1160,21 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         let pending = self.verify_enqueue(&drafts[0], &anchors[0], cache)?;
         let (accepted, probe) = self.verify_complete(pending, cache, eos_ids)?;
         Ok((vec![accepted], probe))
+    }
+
+    /// Under `QWEN4EXP_MTP_VERIFY_KEY=variant` the window's pass key names
+    /// the sequence it runs ([`Qwen4Exp::verify_variant`]).
+    fn prepare_verify(&self, cache: &mut Cache, t: usize) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if verify_keyed_by_variant() {
+            if let Ok(m) = self.device().as_metal_device() {
+                if m.pass_plans_enabled() {
+                    m.set_next_pass_variant(self.verify_variant(cache, t));
+                }
+            }
+        }
+        let _ = (cache, t);
+        Ok(())
     }
 
     type Pending = MtpPending;
@@ -904,7 +1291,8 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
             pass,
         } = pending;
         let (argmax, a, verdict) = match pass {
-            Some(pass) => {
+            Some(mut pass) => {
+                let fold = pass.fold.take();
                 let proposed = &tokens[1..];
                 let v = self.verify_window_settle(
                     pass,
@@ -912,6 +1300,12 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
                     true,
                     cache,
                 )?;
+                if let (Some(mut f), Some(head)) = (fold, self.mtp_head()) {
+                    // A redone window's argmax is the redo's; the head's rows
+                    // were keyed from the first pass's.
+                    f.valid = !v.redo;
+                    head.fold.lock().done.push((f.seq, f));
+                }
                 let a = v.accepted;
                 (v.argmax.clone(), a, Some(v))
             }

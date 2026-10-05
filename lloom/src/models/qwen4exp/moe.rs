@@ -358,6 +358,13 @@ impl<R: ExpertResidency> MoeLayer<R> {
         } else {
             None
         };
+        // More rows' ids are read on the host by a streamed tier's plan,
+        // after the pass has allocated past them (the activations' cast
+        // below, under f16): a read no recorder sees, so they are a declared
+        // escape — a plan would end their interval at the top-k and serve
+        // their memory on (§9.2aa).
+        let _declared = (ids_slot.is_none() && self.experts.plans_on_device())
+            .then(lloom_tensor::EscapeGuard::new);
         let (ids, w) = match super::kernels::moe_topk_into(&logits, topk, ids_slot) {
             Some(r) => r?,
             None => {
@@ -371,6 +378,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
                 (ids, w)
             }
         };
+        drop(_declared);
         if super::trace_enabled() {
             eprintln!(
                 "TRACE moe.ids={:?} w={:?}",

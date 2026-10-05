@@ -428,6 +428,13 @@ pub struct Cache {
     /// not resident (`ExpertResidency::settle`) — the streamed tier's miss
     /// cost under the device plan.
     pub redos: u64,
+    /// Replays run on the DEVICE plan (`QWEN4EXP_REPLAY=device`, the arm
+    /// that keeps the plan armed through a miss): one settle readback a
+    /// replay, no per-layer drain; `replay_fallbacks` counts the replays
+    /// that exhausted the bound (one per layer) and fell back to the host
+    /// plan.
+    pub device_replays: u64,
+    pub replay_fallbacks: u64,
     /// Whether the next decode pass plans on the device: armed by a pass
     /// that completed with every expert resident, disarmed by a pass that
     /// missed (the cold phase runs the host plan — one token and its loads,
@@ -616,6 +623,8 @@ impl Cache {
             standing: false,
             redos: 0,
             device_plan_armed: false,
+            device_replays: 0,
+            replay_fallbacks: 0,
             host_plan_passes: 0,
             replay_ns: 0,
             host_pass_ns: 0,
@@ -2486,6 +2495,40 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         cache.settle_after_first += after_first;
         let t0 = std::time::Instant::now();
+        // The arm (`QWEN4EXP_REPLAY=device`): the plan stays armed through
+        // the miss. The settle loaded what the pass missed; the replay runs
+        // on the device plan again — right up to the layer past the loaded
+        // one at worst, so it may miss once more one layer further, at
+        // most once per layer (#849's "the device plan staying armed
+        // through misses": one settle readback a replay instead of the
+        // host plan's drain at every layer). The bound exhausted, the host
+        // plan once, as the default does.
+        if replay_on_device() {
+            let bound = self.layers.len().max(1);
+            let mut h = h.clone();
+            for _ in 0..bound {
+                self.note_replay();
+                cache.rewind_window()?;
+                cache.redos += 1;
+                cache.device_replays += 1;
+                cache.open_window()?;
+                h = self.replay_input_owned(&h)?;
+                let (logits, records) = self.decode_embed_pass(&h, cache, obs, RowPlan::Device)?;
+                self.replay_read_encoded(&h);
+                let records: Vec<(usize, Tensor)> = records
+                    .into_iter()
+                    .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
+                    .collect();
+                let (redo, after_first) = self.settle_records(&records)?;
+                if !redo {
+                    cache.keep_standing();
+                    cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                    return Ok(logits);
+                }
+                cache.settle_after_first += after_first;
+            }
+            cache.replay_fallbacks += 1;
+        }
         self.note_replay();
         cache.rewind_window()?;
         cache.redos += 1;
@@ -2697,6 +2740,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
             m.pass_diverged();
+        }
+        // The tiers: the replay's resolves must not count the settled
+        // token's experts into the hotlist again (#899's finding).
+        for layer in &self.layers {
+            layer.moe().experts().note_replay();
         }
     }
 
@@ -3759,6 +3807,15 @@ impl super::moe::PlanHook for JoinHook {
             }
         }
     }
+}
+
+/// `QWEN4EXP_REPLAY=device` (read once): a decode step that missed replays
+/// on the device plan, the plan staying armed (#849 D's base, #892's
+/// follow-up); the default replays on the host plan and disarms, as
+/// before — the maintainer decides the default on the numbers.
+fn replay_on_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
 }
 
 /// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.

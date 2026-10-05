@@ -145,10 +145,14 @@ fn streamed_model_is_byte_identical_to_resident() -> Result<()> {
     for l in streamed.layers() {
         stats += l.moe().experts().stats();
     }
+    // A plan a layer a pass at least, host or device: under
+    // `QWEN4EXP_REPLAY=device` a token that missed replays on the device
+    // plan, so its layers' plans land in `device_plans`, not `plans`.
     assert!(
-        stats.plans >= 7 * cfg.n_layers as u64,
-        "plans {}",
-        stats.plans
+        stats.plans + stats.device_plans >= 7 * cfg.n_layers as u64,
+        "plans {} device_plans {}",
+        stats.plans,
+        stats.device_plans
     );
     assert!(
         stats.groups > stats.plans,

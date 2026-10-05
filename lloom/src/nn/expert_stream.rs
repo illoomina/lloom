@@ -220,6 +220,13 @@ pub trait ExpertResidency {
         0
     }
 
+    /// The pass that follows replays the token the last settle counted
+    /// (the host plan over the same token): its resolves must not count
+    /// those experts into the hotlist's usage again (#899's finding, a
+    /// device-planned step that misses counted them twice). `Resident`
+    /// keeps no usage.
+    fn note_replay(&self) {}
+
     /// Whether [`Self::plan_device`] can answer: the strategy keeps a
     /// residency table on the device. `Resident` never needs to.
     fn plans_on_device(&self) -> bool {
@@ -1112,6 +1119,16 @@ struct SlotPool {
 }
 
 struct Inner {
+    /// The experts the last settle counted into the hotlist's usage (the
+    /// record's distinct ids: the resident ones touched, the missing ones
+    /// loaded), and whether the pass that follows is that token's REPLAY —
+    /// the host plan over the same token, whose resolves must not count
+    /// them again (#899's finding, `design/measurements/issue-746-mtp.md`:
+    /// a device-planned step that misses counted its replayed token's
+    /// experts twice, once at the settle and once at the replay's loads).
+    /// `note_replay` arms it; the first resolve under it clears both.
+    counted: Vec<u32>,
+    replay_pending: bool,
     /// gate, up, down.
     pools: [SlotPool; 3],
     sources: [ExpertSource; 3],
@@ -1665,6 +1682,8 @@ impl Streamed {
                 direct,
                 scratch_ids: Vec::new(),
                 scratch_missing: Vec::new(),
+                counted: Vec::new(),
+                replay_pending: false,
                 plans_open: 0,
                 live: None,
                 landing: Retire::new(),
@@ -1977,12 +1996,24 @@ impl Streamed {
                     .fetch_add(n, Ordering::Relaxed);
             }
         }
+        // A replay's resolve: the settle counted this token's experts
+        // already; those are not counted again, the rest (a layer past the
+        // miss, whose true experts the replay finds) are. One resolve clears
+        // it: the replay visits each layer's tier once.
+        let replaying = std::mem::take(&mut inner.replay_pending);
+        let counted = if replaying {
+            std::mem::take(&mut inner.counted)
+        } else {
+            Vec::new()
+        };
         for &e in experts {
             let e = e as usize;
             if e >= self.n_experts {
                 lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
             }
-            inner.map.usage[e] = inner.map.usage[e].saturating_add(1);
+            if !(replaying && counted.contains(&(e as u32))) {
+                inner.map.usage[e] = inner.map.usage[e].saturating_add(1);
+            }
             let slot = match inner.map.slot_of(e) {
                 Some(s) => {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -3042,6 +3073,12 @@ impl Streamed {
                 None => missing.push(e),
             }
         }
+        // Every id of the record is counted by this settle — the resident
+        // above, the missing by the loads below. A replay of the token must
+        // not count them again (`note_replay`, `resolve_begin`).
+        inner.counted.clear();
+        inner.counted.extend_from_slice(&distinct);
+        inner.replay_pending = false;
         inner.scratch_ids = distinct;
         let flagged = flags.iter().any(|&f| f != 0);
         if trace_settle() {
@@ -3241,6 +3278,11 @@ impl ExpertResidency for Streamed {
     /// Grow the slots in service to `active`: the pools are reallocated
     /// at `active` slots with every slot in service carried over; the
     /// slots brought back are empty. Returns the bytes taken.
+    fn note_replay(&self) {
+        let mut inner = self.inner.lock();
+        inner.replay_pending = !inner.counted.is_empty();
+    }
+
     fn grow_slots(&self, active: usize) -> usize {
         let mut inner = self.inner.lock();
         let was = inner.map.active();
@@ -3808,6 +3850,95 @@ mod tests {
     /// Streamed == Resident bit for bit over decode rows and a chunk whose
     /// expert union exceeds the pool (several groups, evictions), for a float
     /// stack and a real block type; the counters prove the streaming ran.
+    /// #899's finding: a device-planned step that misses counted its
+    /// replayed token's experts twice — once at the settle, once at the
+    /// replay's loads. A settle followed by `note_replay` and the host plan
+    /// over the same ids counts each expert once; the same host plan
+    /// without `note_replay` (a new token) counts again.
+    #[test]
+    fn a_replayed_token_counts_its_experts_once() {
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::Q8_0);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::Q8_0);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::Q8_0);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        // Experts 1 and 2 resident; the token wants 1, 2, 7: the device plan
+        // would have found 7 missing — its record says so.
+        let pre = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
+        for g in streamed.plan(&pre).unwrap() {
+            streamed.ensure(&g).unwrap();
+        }
+        let before = streamed.usage();
+        // The record: [slots.. | ids.. | flags..] for n = topk ids.
+        let ids_tok = [1u32, 2, 7];
+        let slots: Vec<u32> = ids_tok
+            .iter()
+            .map(|&i| {
+                streamed
+                    .inner
+                    .lock()
+                    .map
+                    .slot_of(i as usize)
+                    .map(|s| s as u32)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let flags: Vec<u32> = ids_tok
+            .iter()
+            .map(|&i| (streamed.inner.lock().map.slot_of(i as usize).is_none()) as u32)
+            .collect();
+        let record: Vec<u32> = slots
+            .iter()
+            .chain(ids_tok.iter())
+            .chain(flags.iter())
+            .copied()
+            .collect();
+        assert!(streamed.settle_host(&record).unwrap(), "a miss settles");
+        let settled = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                settled[i as usize],
+                before[i as usize] + 1,
+                "expert {i} counted once at the settle"
+            );
+        }
+        // The replay: the host plan over the same token.
+        streamed.note_replay();
+        let tok = Tensor::new(&[[1u32, 2, 7]], &Device::Cpu).unwrap();
+        for g in streamed.plan(&tok).unwrap() {
+            streamed.ensure(&g).unwrap();
+        }
+        let replayed = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                replayed[i as usize], settled[i as usize],
+                "expert {i} not counted again by the replay"
+            );
+        }
+        // A new token with the same experts: counted.
+        for g in streamed.plan(&tok).unwrap() {
+            streamed.ensure(&g).unwrap();
+        }
+        let next = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                next[i as usize],
+                settled[i as usize] + 1,
+                "expert {i} counted by the next token"
+            );
+        }
+        let _ = topk;
+    }
+
     fn streamed_matches_resident(dtype: GgmlDType) {
         let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
         let gate = stacked(e, ff, d, 1.0, dtype);

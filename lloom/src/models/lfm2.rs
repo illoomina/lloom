@@ -5832,17 +5832,23 @@ impl Mlp {
     }
 
     /// Whether [`Self::forward_add_normed`] serves `x`: `w1` and `w3` each
-    /// take the norm. Not under a gate arm (`--gemv-gate mul|swiglu`): no
-    /// kernel carries the norm with `w3`'s product or with both weights, so
+    /// take the norm — in their own GEMVs with the gate arm off, inside the
+    /// two-weight kernel under `--gemv-gate swiglu` (`gemv_norm_swiglu`, the
+    /// two weights the same shape, as that arm requires). Not under
+    /// `--gemv-gate mul`: no kernel carries the norm with `w3`'s product, so
     /// that arm keeps its own path and the norm stays a dispatch.
     fn norm_gemv_applies(&self, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
-        self.gemv_gate == GateFusion::Off
-            && norm_gemv_applies(x, norm, &p.gate)
-            && norm_gemv_applies(x, norm, &p.up)
+        let gate = match self.gemv_gate {
+            GateFusion::Off => true,
+            GateFusion::Swiglu => p.gate.weight().dims() == p.up.weight().dims(),
+            GateFusion::Mul => false,
+        };
+        gate && norm_gemv_applies(x, norm, &p.gate) && norm_gemv_applies(x, norm, &p.up)
     }
 
     /// `mlp(rmsnorm(x)) + residual` with the norm inside `w1`'s and `w3`'s
-    /// GEMVs, the product a `bmul`. Every other choice is the one
+    /// GEMVs, the product a `bmul` — or inside `gemv_swiglu`'s one kernel
+    /// under that gate arm. Every other choice is the one
     /// [`Self::forward_add`] makes under the same flags: the SiLU rides `w1`
     /// iff the SiLU arm would fuse it, `w2` adds the residual iff the
     /// residual arm is on — so the norm arm moves the norms and nothing
@@ -5855,13 +5861,25 @@ impl Mlp {
         p: &Projections<'_>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = if self.gemv_silu_applies(x, p) {
-            norm_gemv(x, norm, &p.gate, true)?
+        let gated = if self.gemv_gate == GateFusion::Swiglu {
+            // `gated`'s first branch with the norm inside: both weights in
+            // one kernel, the SiLU arm moot as it is there.
+            crate::nn::ops::gemv_norm_swiglu(
+                x,
+                p.up.weight(),
+                p.gate.weight(),
+                norm.weight(),
+                norm.eps() as f32,
+            )?
         } else {
-            crate::nn::ops::silu(&norm_gemv(x, norm, &p.gate, false)?)?
+            let gate = if self.gemv_silu_applies(x, p) {
+                norm_gemv(x, norm, &p.gate, true)?
+            } else {
+                crate::nn::ops::silu(&norm_gemv(x, norm, &p.gate, false)?)?
+            };
+            let up = norm_gemv(x, norm, &p.up, false)?;
+            (gate * up)?
         };
-        let up = norm_gemv(x, norm, &p.up, false)?;
-        let gated = (gate * up)?;
         if self.gemv_residual && gemv_residual_applies(true, &gated, &p.down, residual) {
             return crate::nn::ops::gemv_residual(&gated, p.down.weight(), residual);
         }

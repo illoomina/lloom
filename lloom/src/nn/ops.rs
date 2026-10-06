@@ -4422,12 +4422,15 @@ impl lloom_tensor::CustomOp3 for GemvFused {
 
 /// A decode GEMV with its RMSNorm computed inside it (`GemvNormInline`,
 /// `docs/tuning.md` §13.5t): `x` is the un-normalized `[.., 1, k]` input,
-/// `norm_weight` the norm's `[k]` weight. `silu` puts SiLU on the store.
+/// `norm_weight` the norm's `[k]` weight. `silu` puts SiLU on the store;
+/// `gate` makes it the two-weight SwiGLU (`gemv_norm_swiglu`): the op's weight
+/// is then the UP projection and `gate` the gate's, `[n, k]` like it.
 // The fields are read by the Metal arm only, as `GemvFused`'s are.
 #[cfg_attr(not(feature = "metal"), allow(dead_code))]
 struct GemvNorm {
     eps: f32,
     silu: bool,
+    gate: Option<Tensor>,
 }
 
 impl lloom_tensor::CustomOp3 for GemvNorm {
@@ -4489,6 +4492,31 @@ impl lloom_tensor::CustomOp3 for GemvNorm {
             [b, m, _] => Shape::from_dims(&[b, m, n]),
             _ => Shape::from_dims(&[1, n]),
         };
+        // The gate weight, held by the op (a fourth tensor a `CustomOp3`
+        // has no slot for): the up weight's dtype, shape and contiguity, on
+        // this device — checked, since a mismatched one would be read at the
+        // up weight's strides and give a well-formed wrong number.
+        let gate_sl = self.gate.as_ref().map(|t| t.storage_and_layout());
+        let gate = match &gate_sl {
+            None => None,
+            Some((gs, gl)) => {
+                let gm = match &**gs {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!("gemv-norm-swiglu: the gate weight must be on Metal"),
+                };
+                if gm.dtype() != w.dtype() || gl.dims() != w_l.dims() || !gl.is_contiguous() {
+                    lloom_tensor::bail!(
+                        "gemv-norm-swiglu: the gate weight {:?} {:?} must be a contiguous \
+                         {:?} of the up weight's dtype {:?}",
+                        gl.dims(),
+                        gm.dtype(),
+                        w_l.dims(),
+                        w.dtype()
+                    );
+                }
+                Some((gm.buffer(), gl.start_offset() * w.dtype().size_in_bytes()))
+            }
+        };
         let elem_count = b * n;
         let output = device
             .new_buffer_builder()
@@ -4515,11 +4543,12 @@ impl lloom_tensor::CustomOp3 for GemvNorm {
                 weight_offset: g_l.start_offset() * g.dtype().size_in_bytes(),
                 eps: self.eps,
             },
-            if self.silu {
-                GemvEpilogue::Silu
-            } else {
-                GemvEpilogue::None
+            match (&gate, self.silu) {
+                (Some(_), _) => GemvEpilogue::Swiglu,
+                (None, true) => GemvEpilogue::Silu,
+                (None, false) => GemvEpilogue::None,
             },
+            gate,
         )
         .map_err(lloom_tensor::Error::wrap)?;
         let newstorage =
@@ -4541,7 +4570,39 @@ pub fn gemv_norm(
     eps: f32,
     silu: bool,
 ) -> Result<Tensor> {
-    x.apply_op3_no_bwd(weight, norm_weight, &GemvNorm { eps, silu })
+    x.apply_op3_no_bwd(
+        weight,
+        norm_weight,
+        &GemvNorm {
+            eps,
+            silu,
+            gate: None,
+        },
+    )
+}
+
+/// `silu(gate·n(x)) * (up·n(x))` with `n(x) = rmsnorm(x, norm_weight, eps)`,
+/// in ONE dispatch: [`gemv_swiglu`]'s two sweeps over the same coefficients,
+/// the norm's reduction riding them as in [`gemv_norm`] (`docs/tuning.md`
+/// §13.5t). `up_weight` and `gate_weight` `[n, k]`, the rest as
+/// [`gemv_norm`]. Not bit-identical to `rmsnorm` then [`gemv_swiglu`]: the
+/// normalized vector is never rounded to `x`'s dtype.
+pub fn gemv_norm_swiglu(
+    x: &Tensor,
+    up_weight: &Tensor,
+    gate_weight: &Tensor,
+    norm_weight: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    x.apply_op3_no_bwd(
+        up_weight,
+        norm_weight,
+        &GemvNorm {
+            eps,
+            silu: false,
+            gate: Some(gate_weight.clone()),
+        },
+    )
 }
 
 /// Whether [`gemv_norm`] serves a weight `[n, k]`: the GEMV's tile at that

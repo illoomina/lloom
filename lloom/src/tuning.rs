@@ -314,6 +314,12 @@ pub struct Qwen4ExpTuning {
     /// Where the MTP head's own streamed experts are planned in the drafter's observe: `device` (no readback at its layer; its record settled after the draft's argmax) or `host` (a readback per round, the A/B arm).
     #[opt(flag = "mtp-observe-plan", env = "QWEN4EXP_MTP_OBSERVE_PLAN", parser = "parse_plan", variants = ["device", "host"])]
     pub mtp_observe_plan: String,
+    /// Each HyperConnection bracket's grouped RMSNorm computed inside its consumers at a one-row step — the `down` and `inject` mixed GEMVs (the norm in their prologue, `down` also writing the stream scales) and the collapse (reading them) — so `hc_norm_f32` is not launched (`docs/tuning.md` §13.5u). An arm, off by default.
+    #[opt(flag = "qwen-hc-norm-gemv", env = "QWEN4EXP_HC_NORM_GEMV", bool)]
+    pub hc_norm_gemv: bool,
+    /// Skip a decode step's work by name, comma-separated (`hcnorm`: each HC bracket's grouped RMSNorm, its input passed through) — an instrument pricing a fusion's bound; the output is wrong.
+    #[opt(flag = "qwen-ablate", env = "QWEN4EXP_ABLATE")]
+    pub ablate: String,
 }
 
 impl Default for Qwen4ExpTuning {
@@ -341,6 +347,8 @@ impl Default for Qwen4ExpTuning {
             mtp_trace: false,
             mtp_draft_loads: "auto".into(),
             mtp_observe_plan: "host".into(),
+            hc_norm_gemv: false,
+            ablate: String::new(),
         }
     }
 }

@@ -614,6 +614,100 @@ impl lloom_tensor::CustomOp2 for HcCollapse {
     }
 }
 
+/// [`HcCollapse`] over the carry `h` `[.., n·d]` itself, `xn` recomputed in
+/// the kernel from γ (held here: a fourth input) and the per-row stream
+/// `scales` `[.., n]` a grouped-norm GEMV wrote (`docs/tuning.md` §13.5u).
+pub(crate) struct HcCollapseScaled {
+    pub n: usize,
+    pub d: usize,
+    pub gamma: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for HcCollapseScaled {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-collapse-scaled"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("hc_collapse_scaled: no cpu kernel; `HyperConnection::mix` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        sh: &lloom_tensor::MetalStorage,
+        lh: &Layout,
+        ss: &lloom_tensor::MetalStorage,
+        ls: &Layout,
+        sg: &lloom_tensor::MetalStorage,
+        lg: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        if lh.dims().last() != Some(&nd) || lh.shape() != lg.shape() {
+            lloom_tensor::bail!(
+                "hc_collapse_scaled: h {:?} / gate {:?} vs n·d {nd}",
+                lh.shape(),
+                lg.shape()
+            )
+        }
+        let rows = lh.shape().elem_count() / nd;
+        if ls.shape().elem_count() != rows * self.n {
+            lloom_tensor::bail!(
+                "hc_collapse_scaled: {} scales for {rows} rows of {} streams",
+                ls.shape().elem_count(),
+                self.n
+            )
+        }
+        if !lh.is_contiguous() || !ls.is_contiguous() || !lg.is_contiguous() {
+            lloom_tensor::bail!("hc_collapse_scaled: contiguous inputs only")
+        }
+        let (gs, gl) = self.gamma.storage_and_layout();
+        let gs = match &*gs {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("hc_collapse_scaled: γ must be on Metal"),
+        };
+        if gs.dtype() != lloom_tensor::DType::F32 || !gl.is_contiguous() || gl.shape().elem_count() != nd {
+            lloom_tensor::bail!("hc_collapse_scaled: γ must be a contiguous f32 [{nd}]")
+        }
+        let device = sh.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_collapse_scaled");
+        let elem_count = rows * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_collapse_scaled")
+            .build()?;
+        lloom_tensor::kernels::call_hc_collapse_scaled(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            metal_bo(sh, lh),
+            metal_bo(gs, gl),
+            metal_bo(ss, ls),
+            metal_bo(sg, lg),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        let mut dims = lh.dims().to_vec();
+        *dims.last_mut().unwrap() = self.d;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, sh.dtype()),
+            Shape::from(dims),
+        ))
+    }
+}
+
 /// `h + bo ⊗ 2·sigmoid(inject / n)`: `[.., n·d]`, `[.., d]`, `[.., n]` → `[.., n·d]`.
 pub(crate) struct HcCombine {
     pub n: usize,
@@ -718,6 +812,41 @@ pub(crate) fn hc_collapse(
 ) -> Option<Result<Tensor>> {
     (fused_applies(xn) && fused_applies(gate))
         .then(|| xn.apply_op2_no_bwd(gate, &HcCollapse { n, d }))
+}
+
+/// Whether [`hc_collapse_scaled`] would run for this carry and γ (the gate
+/// is the up GEMV's f32 output, contiguous by construction) — decided before
+/// anything is dispatched.
+pub(crate) fn hc_collapse_scaled_applies(h: &Tensor, gamma: &Tensor) -> bool {
+    fused_applies(h) && gamma.is_contiguous() && gamma.dtype() == lloom_tensor::DType::F32
+}
+
+/// The scaled collapse ([`HcCollapseScaled`]), or `None` where the composed
+/// path applies.
+pub(crate) fn hc_collapse_scaled(
+    h: &Tensor,
+    gamma: &Tensor,
+    scales: &Tensor,
+    gate: &Tensor,
+    n: usize,
+    d: usize,
+) -> Option<Result<Tensor>> {
+    (fused_applies(h)
+        && fused_applies(scales)
+        && fused_applies(gate)
+        && gamma.is_contiguous()
+        && gamma.dtype() == lloom_tensor::DType::F32)
+        .then(|| {
+            h.apply_op3_no_bwd(
+                scales,
+                gate,
+                &HcCollapseScaled {
+                    n,
+                    d,
+                    gamma: gamma.clone(),
+                },
+            )
+        })
 }
 
 pub(crate) fn hc_combine(

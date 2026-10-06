@@ -101,16 +101,16 @@ fn the_qwen4exp_step_remarks() {
         class(&r, "mul_mv", "silu_mul"),
         [(&Why::NewBody("no store hook on mul_mv".to_string()), 96)]
     );
-    // The bracket's grouped norm feeds the projections' load: a reduction a
-    // prologue cannot import unless the tile walks K (step (b)'s fact).
-    assert_eq!(
-        class(&r, "hc_norm", "gemv_mixed"),
-        [(&Why::CrossThreadgroup(Side::Load), 96)]
-    );
-    assert_eq!(
-        class(&r, "hc_norm", "gemv_mixed_silu"),
-        [(&Why::CrossThreadgroup(Side::Load), 97)]
-    );
+    // The bracket's grouped norm feeds the projections' load. The
+    // catalogue's grouped-norm prologue computes it there at any tile (its
+    // per-group sums in the threadgroup before the K-walk) and is refused by
+    // name: its third reader, the collapse, is not a product.
+    let gnorm = Why::Refused {
+        fragment: "mixed_gnorm".to_string(),
+        reason: lloom::optimizer::fragments::MIXED_GNORM_REFUSAL.to_string(),
+    };
+    assert_eq!(class(&r, "hc_norm", "gemv_mixed"), [(&gnorm, 96)]);
+    assert_eq!(class(&r, "hc_norm", "gemv_mixed_silu"), [(&gnorm, 97)]);
     // The up projection's sigmoid store feeds the gated mean over streams:
     // an output element reads n stores a stream apart.
     assert_eq!(
@@ -163,14 +163,26 @@ fn the_lfm2_step_remarks() {
         class(&r, "copy2d", "bmul"),
         [(&Why::NewBody("movement to elementwise".to_string()), 22)]
     );
-    // The operator / FFN norms into their projections' load.
+    // The operator / FFN / final norms into their products' load: every
+    // product's tile walks K in one simdgroup, so the inline norm applies —
+    // the three attention projections, the conv's in-projection, the
+    // two-weight kernel, the head — and the default budget refuses it by
+    // class (its sum of squares takes another tree).
+    let refused_norm = Why::Refused {
+        fragment: "norm".to_string(),
+        reason: "class reorder exceeds the budget rounding".to_string(),
+    };
     let norm_into_gemv: u64 = r
         .rows
         .iter()
-        .filter(|x| x.producer == "rmsnorm" && x.why == Why::CrossThreadgroup(Side::Load))
+        .filter(|x| x.producer == "rmsnorm" && x.why == refused_norm)
         .map(|x| x.edges)
         .sum();
-    assert!(norm_into_gemv > 0, "{r}");
+    assert_eq!(norm_into_gemv, 8 * 3 + 22 + 1 + 30, "{r}");
+    assert!(
+        !r.rows.iter().any(|x| x.producer == "rmsnorm" && x.why == Why::CrossThreadgroup(Side::Load)),
+        "{r}"
+    );
 
     let mut crown = lfm2_2_6b();
     lloom::models::lfm2_presets::crown(&mut crown);

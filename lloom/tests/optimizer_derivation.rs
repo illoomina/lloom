@@ -200,14 +200,11 @@ fn the_derivation_reproduces_the_hand_written_composition() {
     assert_eq!(plan.after.get("gemv_residual"), Some(&60));
     assert_eq!(plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(plan.class, NumericClass::Rounding);
-    // Only the two-weight kernel is refused, by the policy that excludes it.
-    assert_eq!(
-        d.refused,
-        vec![(
-            "swiglu".to_string(),
-            "excluded by the exclusion set".to_string()
-        )]
-    );
+    // The two-weight kernel is refused by the policy that excludes it; the
+    // norm prologues by the default budget and by their measurement.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(refused, ["swiglu", "norm", "rmsnorm"], "{:?}", d.refused);
+    assert_eq!(d.refused[0].1, "excluded by the exclusion set");
 
     // The derived graph carries 120 fused nodes and no standalone silu/add.
     let fused = d.graph.nodes().iter().filter(|n| n.op == Op::Fused).count();
@@ -357,16 +354,26 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     assert!(d.plan.sites.is_empty());
     assert_eq!(d.plan.dispatches_after(), 560);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    // The catalogue's six: the GEMV's four and the mixed GEMV's two, each
-    // refused by the budget before its rule exists.
-    assert_eq!(d.refused.len(), 6, "{:?}", d.refused);
-    assert!(
-        d.refused
-            .iter()
-            .all(|(_, why)| why.contains("class rounding exceeds the budget bit-exact")),
+    // Every block that applies here, each refused before its rule exists:
+    // the GEMV's four epilogues and the SwiGLU kernel by the budget, the
+    // inline norm by the budget (its class is `reorder`), the imported-scale
+    // norm by its measurement. The mixed GEMV's blocks do not apply: no
+    // product here runs on that core.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        refused,
+        ["silu", "residual", "mul", "swiglu", "norm", "rmsnorm", "silu_mul_f16"],
         "{:?}",
         d.refused
     );
+    for (name, why) in &d.refused {
+        let budget = match name.as_str() {
+            "norm" => "class reorder exceeds the budget bit-exact",
+            "rmsnorm" => continue,
+            _ => "class rounding exceeds the budget bit-exact",
+        };
+        assert_eq!(why, budget, "{name}");
+    }
 }
 
 /// The fused arms (`conv_fused`, `QkvLayout::Fused`) change what the block
@@ -512,11 +519,54 @@ fn the_two_weight_kernel_is_derived_on_the_real_step() {
     assert_eq!(d.plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(d.plan.after.get("silu"), None);
     assert_eq!(d.plan.after.get("bmul"), Some(&66));
-    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    // The norm prologues apply here and are refused: by the default budget,
+    // by their measurement.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(refused, ["norm", "rmsnorm"], "{:?}", d.refused);
     let sw = d.marginals.iter().find(|m| m.fragment == "swiglu").unwrap();
     assert_eq!(sw.sites, 30);
     assert!(sw.delta_us < 0.0, "{sw:?}");
     assert_eq!(d.plan.seams.len(), 2, "{:?}", d.plan.seams);
     let (before, after) = d.plan.cost.as_ref().unwrap();
     assert_eq!((before.dispatches, after.dispatches), (560, 410));
+}
+
+/// **The derivation reaches the norm arm (#912, #915) at the `reorder`
+/// budget.** On the traced arms' step the tile fact admits the norm in the
+/// load of every product it feeds — the attention's three projections, the
+/// conv's in-projection, the MLP's two weights (inside the two-weight
+/// kernel) and the head — and the plan is the hand-built composition
+/// `--lfm2-norm-gemv --gemv-gate swiglu --gemv-residual` runs: 410 → 349,
+/// the 61 layer and final norms gone, the 16 QK norms (they feed the
+/// rotation, not a product) left.
+#[test]
+fn the_norm_prologue_is_derived_on_the_real_step_at_the_reorder_budget() {
+    let mut cfg = lfm2_2_6b();
+    traced_arms(&mut cfg, ConvState::Shuffle);
+    let g = decode_step(&cfg, DType::F16);
+    let policy = Policy {
+        budget: NumericClass::ReorderEquiv,
+        ..Default::default()
+    };
+    let d = derive(&g, &policy).expect("derivation");
+    eprintln!("plan: {}", d.plan);
+    let norm = d.plan.sites_of("norm");
+    assert_eq!(norm.len(), 8 * 3 + 22 + 1, "{norm:?}");
+    for kind in ["q_proj", "k_proj", "v_proj", "conv.in_proj", "embed_tokens"] {
+        assert!(norm.iter().any(|s| s.contains(kind)), "{kind}: {norm:?}");
+    }
+    let swiglu = d.plan.sites_of("norm_swiglu");
+    assert_eq!(swiglu.len(), 30);
+    assert!(swiglu.iter().all(|s| s.ends_with(".feed_forward.w3.weight")));
+    assert_eq!(d.plan.sites_of("residual").len(), 60);
+    assert_eq!(d.plan.sites.len(), 47 + 30 + 60);
+    assert_eq!(d.plan.dispatches_after(), 410 - 61);
+    assert_eq!(d.plan.after.get("rmsnorm"), Some(&16));
+    assert_eq!(d.plan.after.get("gemv_norm"), Some(&47));
+    assert_eq!(d.plan.after.get("gemv_norm_swiglu"), Some(&30));
+    assert_eq!(d.plan.class, NumericClass::ReorderEquiv);
+    let m = d.marginals.iter().find(|m| m.fragment == "norm").unwrap();
+    assert_eq!(m.sites, 77);
+    assert!(m.delta_us < 0.0, "{m:?}");
+    assert!(d.refused.iter().all(|(n, _)| n != "norm"), "{:?}", d.refused);
 }

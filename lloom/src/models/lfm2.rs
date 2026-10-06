@@ -1044,6 +1044,8 @@ pub struct FusionReport {
     pub gemv_silu: bool,
     pub gemv_residual: bool,
     pub gemv_gate: GateFusion,
+    /// The norms inside their consumers' GEMVs (the norm prologue).
+    pub norm_gemv: bool,
     /// The build's math mode the model was constructed under.
     pub math_mode: &'static str,
     /// Fragments the policy refused: (name, why).
@@ -1097,11 +1099,12 @@ impl std::fmt::Display for FusionReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} gemv_gate={} math={} ({} refused, {} validated, {} unvalidated",
+            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} gemv_gate={} norm_gemv={} math={} ({} refused, {} validated, {} unvalidated",
             self.plan,
             self.gemv_silu,
             self.gemv_residual,
             self.gemv_gate.name(),
+            self.norm_gemv,
             self.math_mode,
             self.refused.len(),
             self.validated.len(),
@@ -5871,13 +5874,13 @@ impl Mlp {
     /// two weights the same shape, as that arm requires). Not under
     /// `--gemv-gate mul`: no kernel carries the norm with `w3`'s product, so
     /// that arm keeps its own path and the norm stays a dispatch.
-    fn norm_gemv_applies(&self, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
+    fn norm_gemv_applies(&self, on: bool, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
         let gate = match self.gemv_gate {
             GateFusion::Off => true,
             GateFusion::Swiglu => p.gate.weight().dims() == p.up.weight().dims(),
             GateFusion::Mul => false,
         };
-        gate && norm_gemv_applies(x, norm, &p.gate) && norm_gemv_applies(x, norm, &p.up)
+        gate && norm_gemv_applies(on, x, norm, &p.gate) && norm_gemv_applies(on, x, norm, &p.up)
     }
 
     /// `mlp(rmsnorm(x)) + residual` with the norm inside `w1`'s and `w3`'s
@@ -8678,6 +8681,10 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     mlp: Mlp,
     kind: LayerKind,
+    /// Whether the layer's two norms may run inside their consumers' GEMVs
+    /// (`nn::ops::gemv_norm`): `LLOOM_LFM2_NORM_GEMV` at construction, or a
+    /// derived plan's verdict (`Fusion=Derived`).
+    norm_gemv: bool,
     /// `Some`: this layer's matrices stream through the tier (§4.8).
     streamed: Option<StreamedLayer>,
     span: tracing::Span,
@@ -8772,14 +8779,13 @@ fn norm_gemv_arm() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().lfm2.norm_gemv)
 }
 
-/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the arm,
-/// Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
+/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the
+/// block's switch (`on`), Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
 /// contiguous `[k]` of `x`'s dtype, and a tile the fused kernel is
 /// instantiated at (`nn::ops::gemv_norm_serves`: at `k <= 64` or
 /// `k >= 16 n` the GEMV takes another tile, and the unfused pair runs).
-fn norm_gemv_applies(x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
-    norm_gemv_arm()
-        && x.device().is_metal()
+fn norm_gemv_applies(on: bool, x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
+    on && x.device().is_metal()
         && matches!(x.dims(), [1, 1, _] | [1, _])
         && x.dims().last() == Some(&proj.weight().dims()[1])
         && crate::nn::ops::gemv_norm_serves(proj.weight().dims()[0], proj.weight().dims()[1])
@@ -8862,6 +8868,7 @@ impl DecoderLayer {
             post_attention_layernorm,
             mlp,
             kind,
+            norm_gemv: norm_gemv_arm(),
             streamed,
             span: tracing::span!(tracing::Level::TRACE, "layer"),
         })
@@ -8947,14 +8954,14 @@ impl DecoderLayer {
         let pre = &self.input_layernorm;
         let x = match (&self.kind, &w.mixer) {
             (LayerKind::Attention(attn), MixerWeights::Attn(aw))
-                if norm_gemv_applies(x, pre, &aw.q)
-                    && norm_gemv_applies(x, pre, &aw.k)
-                    && norm_gemv_applies(x, pre, &aw.v) =>
+                if norm_gemv_applies(self.norm_gemv, x, pre, &aw.q)
+                    && norm_gemv_applies(self.norm_gemv, x, pre, &aw.k)
+                    && norm_gemv_applies(self.norm_gemv, x, pre, &aw.v) =>
             {
                 attn.forward_add_normed(aw, x, pre, index_pos, block_idx, cache, residual)?
             }
             (LayerKind::ShortConv(conv), MixerWeights::Conv(cw))
-                if norm_gemv_applies(x, pre, &cw.in_proj) =>
+                if norm_gemv_applies(self.norm_gemv, x, pre, &cw.in_proj) =>
             {
                 conv.forward_add_normed(cw, x, pre, block_idx, cache, residual)?
             }
@@ -8979,7 +8986,7 @@ impl DecoderLayer {
 
         let residual = &x;
         let post = &self.post_attention_layernorm;
-        if self.mlp.norm_gemv_applies(&x, post, &w.mlp) {
+        if self.mlp.norm_gemv_applies(self.norm_gemv, &x, post, &w.mlp) {
             return self.mlp.forward_add_normed(&x, post, residual, &w.mlp);
         }
         let x = self.norm(post, &x)?;
@@ -9081,6 +9088,9 @@ pub struct Model {
     load_warnings: Vec<crate::load_warning::LoadWarning>,
     embedding_norm: RmsNorm,
     lm_head: Linear,
+    /// Whether the final norm may run inside `lm_head`'s GEMV
+    /// ([`DecoderLayer`]'s `norm_gemv`, for the head).
+    norm_gemv_head: bool,
     dtype: DType,
     conv_state: ConvState,
     l_cache: usize,
@@ -9092,6 +9102,8 @@ struct EpilogueFlags {
     silu: bool,
     residual: bool,
     gate: GateFusion,
+    /// The norms inside their consumers' GEMVs (the prologue).
+    norm: bool,
 }
 
 /// Derive the epilogue plan over the walk of `model` as built
@@ -9104,7 +9116,11 @@ struct EpilogueFlags {
 /// approximated — that would be a finding about the catalogue or the model,
 /// and it is reported as an error naming the sites.
 #[cfg(not(target_arch = "wasm32"))]
-fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
+fn derive_fusion(
+    model: &Model,
+    cfg: &Config,
+    budget: crate::optimizer::NumericClass,
+) -> Result<(EpilogueFlags, FusionReport)> {
     use crate::optimizer::{
         derive, exclusions, numeric, ExclusionSet, Lookup, Policy, RegionKind, TargetFpModel,
         Verdict,
@@ -9260,33 +9276,58 @@ fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionRe
     }
 
     let graph = crate::optimizer::walk(model);
-    let policy = Policy::default();
+    // The kernel fragments run in no LFM2 switch.
+    let policy = Policy {
+        budget,
+        unavailable: crate::optimizer::fragments::kernels()
+            .into_iter()
+            .map(|k| (k.name.to_string(), "no LFM2 switch selects it".to_string()))
+            .collect(),
+        ..Policy::default()
+    };
     let d = derive(&graph, &policy)?;
     let plan = &d.plan;
-
-    let uniform = |kind: &str, fragment: &str| -> Result<bool> {
-        let sites: Vec<&str> = graph
+    if !plan.kernels.is_empty() {
+        lloom_tensor::bail!("lfm2 fusion=derived: the plan places kernel fragments; plan: {plan}")
+    }
+    // A site's block, split into its prologue (the norm in its load) and its
+    // epilogue (the block on its store).
+    let block = |site: &str| -> (bool, String) {
+        match plan.sites.get(site).map(String::as_str) {
+            Some("norm") => (true, String::new()),
+            Some(b) => match b.strip_prefix("norm_") {
+                Some(e) => (true, e.to_string()),
+                None => (false, b.to_string()),
+            },
+            None => (false, String::new()),
+        }
+    };
+    let sites_of = |kind: &str| -> Vec<&str> {
+        graph
             .nodes()
             .iter()
             .filter(|n| n.op == crate::optimizer::Op::Weight && n.name.ends_with(kind))
             .map(|n| n.name.as_str())
-            .collect();
-        let fused = sites
-            .iter()
-            .filter(|s| plan.sites.get(**s).map(String::as_str) == Some(fragment))
-            .count();
+            .collect()
+    };
+    // Whether every `kind` site carries `want` (true), none does (false), or
+    // some do — which no model-wide flag expresses.
+    let uniform_by = |kind: &str, what: &str, want: &dyn Fn(&str) -> bool| -> Result<bool> {
+        let sites = sites_of(kind);
+        let fused = sites.iter().filter(|s| want(s)).count();
         if fused == 0 {
             Ok(false)
         } else if fused == sites.len() {
             Ok(true)
         } else {
             lloom_tensor::bail!(
-                "lfm2 fusion=derived: the plan fuses `{fragment}` onto {fused} of {} `{kind}` \
-                 sites, which the model-wide flag cannot express; plan: {plan}",
+                "lfm2 fusion=derived: the plan fuses `{what}` onto {fused} of {} `{kind}` sites, \
+                 which the model-wide flag cannot express; plan: {plan}",
                 sites.len()
             )
         }
     };
+    let uniform = |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
@@ -9297,16 +9338,51 @@ fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionRe
     } else {
         GateFusion::Off
     };
+    // The norm prologue: every site a norm feeds, or none — the forward's
+    // switch is model-wide. Under the two-weight kernel `w1` is its operand,
+    // not a site.
+    let mut norm_kinds = vec![
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "conv.in_proj.weight",
+        "feed_forward.w3.weight",
+    ];
+    if gemv_gate != GateFusion::Swiglu {
+        norm_kinds.push("feed_forward.w1.weight");
+    }
+    let lm_head = model.lm_head_site();
+    let mut norm_votes = Vec::new();
+    for kind in &norm_kinds {
+        if !sites_of(kind).is_empty() {
+            norm_votes.push(uniform_by(kind, "norm", &|s| block(s).0)?);
+        }
+    }
+    norm_votes.push(block(&lm_head).0);
+    let norm = match (norm_votes.iter().all(|v| *v), norm_votes.iter().any(|v| *v)) {
+        (true, _) => true,
+        (false, false) => false,
+        _ => lloom_tensor::bail!(
+            "lfm2 fusion=derived: the plan puts the norm in the load of some of its consumers \
+             and not others, which the model-wide switch cannot express; plan: {plan}"
+        ),
+    };
     // Every fused site must be one of the kinds the flags name.
-    for (site, fragment) in &plan.sites {
-        let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
+    for (site, b) in &plan.sites {
+        let (pro, fragment) = block(site);
+        let fragment = fragment.as_str();
+        let known_epilogue = fragment.is_empty()
+            || (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
             || ((fragment == "mul" || fragment == "swiglu")
                 && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
-        if !known {
+        let known_prologue = !pro
+            || *site == lm_head
+            || norm_kinds.iter().any(|k| site.ends_with(k));
+        if !(known_epilogue && known_prologue) {
             lloom_tensor::bail!(
-                "lfm2 fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site no flag \
+                "lfm2 fusion=derived: the plan fuses `{b}` onto `{site}`, a site no flag \
                  selects; plan: {plan}"
             )
         }
@@ -9320,6 +9396,7 @@ fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionRe
     report.gemv_silu = gemv_silu;
     report.gemv_residual = gemv_residual;
     report.gemv_gate = gemv_gate;
+    report.norm_gemv = norm;
     report.refused = d.refused.clone();
     report.fused_in_stateful = plan
         .regions
@@ -9331,6 +9408,7 @@ fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionRe
         silu: gemv_silu,
         residual: gemv_residual,
         gate: gemv_gate,
+        norm,
     };
     Ok((flags, report))
 }
@@ -9375,7 +9453,7 @@ fn conv_fold_gain(layers: &[DecoderLayer]) -> Result<Option<ConvFoldGain>> {
 /// A browser build has no optimizer (`egglog` is host-only); the arm is
 /// refused rather than silently manual.
 #[cfg(target_arch = "wasm32")]
-fn derive_fusion(_model: &Model, _cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
+fn derive_fusion(_model: &Model, _cfg: &Config, _budget: ()) -> Result<(EpilogueFlags, FusionReport)> {
     lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
 }
 
@@ -9530,6 +9608,7 @@ impl Model {
             load_warnings,
             embedding_norm,
             lm_head,
+            norm_gemv_head: norm_gemv_arm(),
             dtype: vb.dtype(),
             conv_state: cfg.conv_state,
             l_cache: cfg.conv_l_cache,
@@ -9542,7 +9621,17 @@ impl Model {
         // the loaded weights, so it is read here too and the report printed
         // complete.
         if cfg.fusion == FusionPolicy::Derived {
-            let (flags, mut r) = derive_fusion(&model, cfg)?;
+            // The budget is the arm's (`--lfm2-fusion-budget`): `reorder`
+            // admits the norm inside its consumers' GEMVs, whose sum of
+            // squares takes another tree.
+            #[cfg(not(target_arch = "wasm32"))]
+            let budget = match crate::tuning::tuning().lfm2.fusion_budget.as_str() {
+                "reorder" => crate::optimizer::NumericClass::ReorderEquiv,
+                _ => crate::optimizer::NumericClass::Rounding,
+            };
+            #[cfg(target_arch = "wasm32")]
+            let budget = ();
+            let (flags, mut r) = derive_fusion(&model, cfg, budget)?;
             model.set_epilogues(flags);
             r.conv_fold_gain = conv_fold_gain(&model.layers)?;
             eprintln!("{r}");
@@ -9553,6 +9642,7 @@ impl Model {
 
     /// Set every block's epilogue arms (`Fusion=Derived`'s plan).
     fn set_epilogues(&mut self, f: EpilogueFlags) {
+        self.set_norm_gemv(f.norm);
         for layer in &mut self.layers {
             layer.mlp.gemv_silu = f.silu;
             layer.mlp.gemv_residual = f.residual;
@@ -9562,6 +9652,41 @@ impl Model {
                 LayerKind::ShortConv(conv) => conv.gemv_residual = f.residual,
             }
         }
+    }
+
+    /// The weight name the walk gives `lm_head`'s GEMV: the embedding table
+    /// when the two are tied.
+    fn lm_head_site(&self) -> String {
+        if self.lm_head.weight().id() == self.embed_tokens.embeddings().id() {
+            "model.embed_tokens.weight".to_string()
+        } else {
+            "lm_head.weight".to_string()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    /// `Fusion=Derived` at `budget` on a model built from `cfg`: the plan
+    /// derived over its walk and set on its blocks, as construction does
+    /// under that policy; the report returned. For a caller that compares
+    /// budgets in one process (the tuning's budget is read once).
+    pub fn derive_fusion_at(
+        &mut self,
+        cfg: &Config,
+        budget: crate::optimizer::NumericClass,
+    ) -> Result<FusionReport> {
+        let (flags, r) = derive_fusion(self, cfg, budget)?;
+        self.set_epilogues(flags);
+        Ok(r)
+    }
+
+    /// Whether every layer's norms and the final norm may run inside their
+    /// consumers' GEMVs (`LLOOM_LFM2_NORM_GEMV`'s arm, set per block; a
+    /// derived plan sets it from its prologue sites).
+    pub fn set_norm_gemv(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            layer.norm_gemv = on;
+        }
+        self.norm_gemv_head = on;
     }
 
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
@@ -9673,7 +9798,9 @@ impl Model {
 
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
-        if seq_len == 1 && norm_gemv_applies(&hidden_states, &self.embedding_norm, &self.lm_head) {
+        if seq_len == 1
+            && norm_gemv_applies(self.norm_gemv_head, &hidden_states, &self.embedding_norm, &self.lm_head)
+        {
             let last = hidden_states.squeeze(1)?;
             let logits = norm_gemv(&last, &self.embedding_norm, &self.lm_head, false)?;
             dump_logits(&logits, index_pos)?;

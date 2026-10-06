@@ -1,9 +1,9 @@
 remarks: 262 dispatches, 90 fused sites, 245 barriers (model); 337 seams in 16 classes
 rank dispatches barriers edges stateful      bytes  seam  why  [site]
    1         60       60    60        0     491520  gemv_residual>rmsnorm  cross-threadgroup reduction (store)  [model.layers.0.conv.out_proj.weight]
-   2         31       31    47        0     385024  rmsnorm>gemv  cross-threadgroup reduction (load)  [model.layers.0.operator_norm.weight]
+   2         31       31    47        0     385024  rmsnorm>gemv  refused norm: class reorder exceeds the budget rounding  [model.layers.0.operator_norm.weight]
    3         30       30    30        0    1290240  gemv_swiglu>gemv_residual  needs a new body (two products)  [model.layers.0.feed_forward.w3.weight]
-   4         30       30    30        0     245760  rmsnorm>gemv_swiglu  cross-threadgroup reduction (load)  [model.layers.0.ffn_norm.weight]
+   4         30       30    30        0     245760  rmsnorm>gemv_swiglu  refused norm: class reorder exceeds the budget rounding  [model.layers.0.ffn_norm.weight]
    5         59        0    59        0     483328  gemv_residual>gemv_residual  needs a new body (two products)  [model.layers.0.conv.out_proj.weight]
    6         22       22    22       22     540672  gemv>shortconv_step  needs a new body (a recurrence after a product)  [model.layers.0.conv.in_proj.weight]
    7         22       22    22       22     180224  shortconv_step>gemv_residual  needs a new body (recurrence into a product)  [model.layers.0.conv.out_proj.weight]

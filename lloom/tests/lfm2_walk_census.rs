@@ -13,7 +13,7 @@ use lloom::models::lfm2::{
     QkvLayout,
 };
 use lloom::models::lfm2_testing::Lfm2Tiny;
-use lloom::optimizer::{census_of_labels, derive, walk_at, Census, Policy};
+use lloom::optimizer::{census_of_labels, derive, walk_at, Census, NumericClass, Policy};
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -45,14 +45,24 @@ fn base() -> Config {
     }
 }
 
+/// How an arm's model is set after it is built: as configured, with the
+/// norm arm's switch on, or derived at the `reorder` budget.
+#[derive(Clone, Copy, PartialEq)]
+enum Set {
+    Built,
+    NormGemv,
+    DerivedReorder,
+}
+
 /// Every arm the walk describes, by name.
-fn arms() -> Vec<(&'static str, Config)> {
+fn arms() -> Vec<(&'static str, Config, Set)> {
     let arm = |f: &dyn Fn(&mut Config)| {
         let mut c = base();
         f(&mut c);
         c
     };
-    vec![
+    let built = |(name, cfg): (&'static str, Config)| (name, cfg, Set::Built);
+    let mut arms: Vec<_> = vec![
         ("default", base()),
         ("conv-fused", arm(&|c| c.conv_fused = true)),
         (
@@ -77,29 +87,73 @@ fn arms() -> Vec<(&'static str, Config)> {
         ("derived", arm(&|c| c.fusion = FusionPolicy::Derived)),
         ("crown", arm(&lloom::models::lfm2_presets::crown)),
     ]
+    .into_iter()
+    .map(built)
+    .collect();
+    // The norm inside its consumers' GEMVs (`LLOOM_LFM2_NORM_GEMV`'s
+    // switch), alone and under the two-weight kernel; and the plan derived
+    // at the budget that admits it, from the default arms.
+    arms.push(("norm-gemv", base(), Set::NormGemv));
+    arms.push((
+        "norm-gemv-swiglu",
+        arm(&|c| {
+            c.gemv_gate = GateFusion::Swiglu;
+            c.gemv_residual = true;
+        }),
+        Set::NormGemv,
+    ));
+    arms.push(("derived-reorder", base(), Set::DerivedReorder));
+    arms
+}
+
+/// The fragments only LFM2's flags select: the kernel fragments run in no
+/// LFM2 switch.
+fn unavailable() -> Vec<(String, String)> {
+    lloom::optimizer::fragments::kernels()
+        .into_iter()
+        .map(|k| (k.name.to_string(), "no LFM2 switch".to_string()))
+        .collect()
 }
 
 /// The composition an arm runs: the derived plan under `Derived`; under
 /// `Manual` the fragments its flags select, every other refused, nothing
 /// re-priced (a hand composition is what it is); `None`, the source.
-fn policy(cfg: &Config) -> Option<Policy> {
-    if cfg.fusion == FusionPolicy::Derived {
-        return Some(Policy::default());
+fn policy(cfg: &Config, set: Set) -> Option<Policy> {
+    if set == Set::DerivedReorder {
+        return Some(Policy {
+            budget: NumericClass::ReorderEquiv,
+            unavailable: unavailable(),
+            ..Policy::default()
+        });
     }
+    if cfg.fusion == FusionPolicy::Derived {
+        return Some(Policy {
+            unavailable: unavailable(),
+            ..Policy::default()
+        });
+    }
+    let norm = set == Set::NormGemv;
     let mut excluded = Vec::new();
     for (on, name) in [
         (cfg.gemv_silu, "silu"),
         (cfg.gemv_residual, "residual"),
         (cfg.gemv_gate == GateFusion::Mul, "mul"),
         (cfg.gemv_gate == GateFusion::Swiglu, "swiglu"),
+        (norm, "norm"),
     ] {
         if !on {
             excluded.push(name.to_string());
         }
     }
-    (excluded.len() < 4).then(|| Policy {
+    (excluded.len() < 5).then(|| Policy {
         excluded,
         barrier_model: None,
+        budget: if norm {
+            NumericClass::ReorderEquiv
+        } else {
+            NumericClass::Rounding
+        },
+        unavailable: unavailable(),
         ..Policy::default()
     })
 }
@@ -136,16 +190,25 @@ type Wrong = (usize, Vec<(String, u64, u64)>);
 
 /// The positions of `cfg`'s arm whose step dispatches other than its walk,
 /// and how many of its steps took the 2-pass attention.
-fn check(name: &str, cfg: &Config, dev: &Device) -> Result<(Vec<Wrong>, usize)> {
-    let model: Model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+fn check(name: &str, cfg: &Config, set: Set, dev: &Device) -> Result<(Vec<Wrong>, usize)> {
+    let mut model: Model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(DType::F16)
         .model(dev)?;
+    match set {
+        Set::Built => {}
+        Set::NormGemv => model.set_norm_gemv(true),
+        Set::DerivedReorder => {
+            let r = model.derive_fusion_at(cfg, NumericClass::ReorderEquiv)?;
+            eprintln!("{name}: {r}");
+            assert!(r.norm_gemv, "{name}: the plan at `reorder` takes the norm prologue");
+        }
+    }
     let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
     dev.synchronize()?;
-    let policy = policy(cfg);
+    let policy = policy(cfg, set);
     let sliding = matches!(cfg.conv_state, ConvState::SlidingRing { .. });
     let mut wrong = Vec::new();
     let mut two_pass = 0;
@@ -223,8 +286,8 @@ fn every_arm_dispatches_what_its_walk_names_at_every_position() -> Result<()> {
         return Ok(());
     };
     let mut wrong = Vec::new();
-    for (name, cfg) in arms() {
-        let (w, two_pass) = check(name, &cfg, &dev)?;
+    for (name, cfg, set) in arms() {
+        let (w, two_pass) = check(name, &cfg, set, &dev)?;
         if cfg.attn_impl == AttnImpl::Sdpa {
             assert!(
                 two_pass >= 2,

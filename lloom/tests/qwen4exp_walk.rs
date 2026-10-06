@@ -209,7 +209,9 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
 
 /// The plan reaches the model: `derive_fusion` sets every bracket from it
 /// — all on under the default policy, the down projections off when
-/// `mixed_silu` is excluded — and a model built `manual` has them all on.
+/// `mixed_silu` is excluded — and a model built `manual` has them all on;
+/// it sets the shared expert's store switch too, off where its blocks are
+/// refused and on where they are admitted.
 #[test]
 fn the_plan_is_set_on_the_brackets_it_decides() {
     let mut m = model();
@@ -227,6 +229,27 @@ fn the_plan_is_set_on_the_brackets_it_decides() {
     assert!(brackets(&m).iter().all(|&e| e == (true, true)));
     assert_eq!(brackets(&m).len(), 97);
     assert!(m.switches_policy().unavailable.iter().any(|(f, _)| f == "quant_silu"));
+    // The switch is the plan's to set either way: on, the derivation turns
+    // it off; admitted, the blocks are placed and it turns it on.
+    let store_on = |m: &Qwen4Exp<GhostExperts>| {
+        !m.switches_policy()
+            .unavailable
+            .iter()
+            .any(|(f, _)| f == "quant_silu")
+    };
+    m.set_shared_store(true);
+    assert!(store_on(&m));
+    m.derive_fusion().expect("derive");
+    assert!(!store_on(&m));
+    let admit = Policy {
+        admit: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+        ..Default::default()
+    };
+    let line = m.derive_fusion_with(&admit).expect("derive");
+    assert!(line.contains("gemv_quant_silu=48"), "{line}");
+    assert!(line.contains("gemv_quant_mul=48"), "{line}");
+    assert!(store_on(&m));
+    m.set_shared_store(false);
 
     let policy = Policy {
         excluded: vec!["mixed_silu".to_string()],

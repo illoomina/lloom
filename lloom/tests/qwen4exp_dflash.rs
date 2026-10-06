@@ -231,13 +231,13 @@ fn a_rewound_step_retains_nothing_of_itself() -> Result<()> {
 fn greedy(
     model: &Qwen4Exp<Resident>,
     cfg: &Config,
+    dev: &Device,
     prompt: &[u32],
     max: usize,
 ) -> Result<Vec<u32>> {
-    let dev = Device::Cpu;
-    let mut session = Session::new(model, model.new_cache(cfg, &dev)?);
+    let mut session = Session::new(model, model.new_cache(cfg, dev)?);
     let eos = [cfg.eos_token_id];
-    let mut rb = Blocking::new(&eos, &dev)?;
+    let mut rb = Blocking::new(&eos, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let out = session.decode(
         &mut IdentityProposer,
@@ -255,23 +255,23 @@ fn greedy(
 fn speculative<S: Speculator<Probe = LayerTaps<5>>>(
     model: &Qwen4Exp<Resident>,
     cfg: &Config,
+    dev: &Device,
     spec: &mut S,
     prompt: &[u32],
     max: usize,
     ring: bool,
 ) -> Result<(Vec<u32>, usize, usize)> {
-    let dev = Device::Cpu;
     let k = spec.max_draft();
     let mut cache: Cache = if ring {
-        Cache::in_pools(cfg, &model.spec_pools(1, k, &dev))?
+        Cache::in_pools(cfg, &model.spec_pools(1, k, dev))?
     } else {
-        model.new_cache(cfg, &dev)?
+        model.new_cache(cfg, dev)?
     };
     let taps: Vec<usize> = TARGET_IDS.iter().map(|l| l + 1).collect();
     cache.set_tap_layers(&taps)?;
     let mut session = Session::new(model, cache);
     let eos = [cfg.eos_token_id];
-    let mut rb = Blocking::new(&eos, &dev)?;
+    let mut rb = Blocking::new(&eos, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let out = session.decode_speculative(
         spec,
@@ -290,11 +290,12 @@ fn speculative<S: Speculator<Probe = LayerTaps<5>>>(
 fn long_prompt(
     model: &Qwen4Exp<Resident>,
     cfg: &Config,
+    dev: &Device,
     max: usize,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     for seed in 0..8u32 {
         let prompt: Vec<u32> = (0..6).map(|i| (seed * 11 + i * 7 + 1) % 120).collect();
-        let ids = greedy(model, cfg, &prompt, max)?;
+        let ids = greedy(model, cfg, dev, &prompt, max)?;
         if ids.len() >= 10 {
             return Ok((prompt, ids));
         }
@@ -357,13 +358,16 @@ impl Speculator for Scripted {
     }
 }
 
-#[test]
-fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
+/// The speculative stream against greedy's on `dev`. On the CPU a verify
+/// window runs position by position through the decode step; on Metal it is
+/// one pass over the phase rings (`Layer::decode_parts_seq`), which retains
+/// its taps on its own path — the Metal arm is what reaches it.
+fn identity_on(dev: &Device) -> Result<()> {
     let cfg = config();
-    let dev = Device::Cpu;
+    let dev = dev.clone();
     let model: Qwen4Exp<Resident> = testing::resident_model(&cfg, &dev);
     let max = 24;
-    let (prompt, want) = long_prompt(&model, &cfg, max)?;
+    let (prompt, want) = long_prompt(&model, &cfg, &dev, max)?;
 
     for ring in [true, false] {
         // The drafter on the target's own pair, at widths below and at its block.
@@ -376,7 +380,7 @@ fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
                 CtxKv::Contiguous,
             )?;
             spec.set_max_draft(k);
-            let (ids, kept, pos) = speculative(&model, &cfg, &mut spec, &prompt, max, ring)?;
+            let (ids, kept, pos) = speculative(&model, &cfg, &dev, &mut spec, &prompt, max, ring)?;
             assert_eq!(
                 ids, want,
                 "ring={ring} block={block} k={k}: not the greedy stream"
@@ -398,7 +402,7 @@ fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
             rows: 0,
             seeded: false,
         };
-        let (ids, kept, pos) = speculative(&model, &cfg, &mut oracle, &prompt, max, ring)?;
+        let (ids, kept, pos) = speculative(&model, &cfg, &dev, &mut oracle, &prompt, max, ring)?;
         assert_eq!(ids, want, "ring={ring}: the oracle's stream");
         assert!(kept > 0, "ring={ring}: the oracle kept no draft");
         assert_eq!(
@@ -413,7 +417,7 @@ fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
             rows: 0,
             seeded: false,
         };
-        let (ids, kept, pos) = speculative(&model, &cfg, &mut garbage, &prompt, max, ring)?;
+        let (ids, kept, pos) = speculative(&model, &cfg, &dev, &mut garbage, &prompt, max, ring)?;
         assert_eq!(ids, want, "ring={ring}: the garbage drafter's stream");
         assert_eq!(kept, 0, "ring={ring}: a garbage draft was kept");
         assert_eq!(
@@ -421,6 +425,67 @@ fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
             "ring={ring}: the garbage probes against the target's positions"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn dflash_on_qwen_is_byte_identical_to_greedy() -> Result<()> {
+    identity_on(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn dflash_on_qwen_is_byte_identical_to_greedy_on_metal() -> Result<()> {
+    identity_on(&Device::new_metal(0)?)
+}
+
+/// Taps a forward left untaken before a verify are not the verify's: the
+/// window's probe covers exactly the positions it kept, and the discarded
+/// set is counted as a dropped probe (what the drivers refuse a seed over).
+#[test]
+fn a_verify_drops_the_taps_left_before_it() -> Result<()> {
+    use lloom::nn::speculator::{Anchor, Probes};
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model: Qwen4Exp<Resident> = testing::resident_model(&cfg, &dev);
+    let mut cache = Cache::in_pools(&cfg, &model.spec_pools(1, 2, &dev))?;
+    let taps: Vec<usize> = TARGET_IDS.iter().map(|l| l + 1).collect();
+    cache.set_tap_layers(&taps)?;
+    let prompt: Vec<u32> = vec![3, 9, 27, 81, 5, 15];
+    let logits = model.forward(
+        &Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?,
+        0,
+        &mut cache,
+    )?;
+    let anchor = logits
+        .squeeze(0)?
+        .argmax(lloom_tensor::D::Minus1)?
+        .to_scalar::<u32>()?;
+    let drops = Probes::<LayerTaps<5>>::probe_drops(&model, &cache);
+    let (accepted, probe) = Probes::<LayerTaps<5>>::verify_and_probe(
+        &model,
+        &[Draft::host(vec![125, 125])],
+        &[Anchor {
+            last: anchor,
+            pos: cache.pos,
+        }],
+        &mut cache,
+        &[cfg.eos_token_id],
+    )?;
+    let a = accepted[0].len();
+    assert_eq!(probe.len(), 5);
+    for t in &probe {
+        assert_eq!(
+            t.dim(1)?,
+            a,
+            "the probe holds the prompt's stale taps beside the window's"
+        );
+    }
+    assert_eq!(
+        Probes::<LayerTaps<5>>::probe_drops(&model, &cache),
+        drops + 1,
+        "the untaken prompt taps were not counted as a dropped probe"
+    );
     Ok(())
 }
 

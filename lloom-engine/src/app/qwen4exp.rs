@@ -30,6 +30,7 @@ use crate::{
 use anyhow::{Context, Result};
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::load_warning::{LoadWarning, LoadWarningKind};
+use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
 };
@@ -154,7 +155,7 @@ fn dflash_device_bytes(dcfg: &DSparkConfig, max_pos: usize) -> usize {
     let rope = 2 * max_pos * (dcfg.head_dim / 2) * 2;
     let ctx = dcfg.num_hidden_layers
         * 2
-        * (4096 + dcfg.block_size).next_multiple_of(256)
+        * (4096usize + dcfg.block_size).next_multiple_of(256)
         * dcfg.num_key_value_heads
         * dcfg.head_dim
         * 2;

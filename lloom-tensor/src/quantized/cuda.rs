@@ -668,7 +668,7 @@ impl QCudaStorage {
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
-        // Run the dequantization on cpu. The IQ family and Q2_0 have no CUDA
+        // Run the dequantization on cpu. The IQ family, Q2_0, MXFP4 and FP8 have no CUDA
         // kernel and no tested host route, so they are refused by name before
         // any copy (§15.2a). No wildcard: a new dtype must choose here.
         let host_deq: fn(&[u8], usize, &mut [f32]) = match self.dtype {
@@ -694,7 +694,9 @@ impl QCudaStorage {
             | GgmlDType::IQ3S
             | GgmlDType::IQ4NL
             | GgmlDType::IQ4XS
-            | GgmlDType::Q2_0 => crate::bail!(
+            | GgmlDType::Q2_0
+            | GgmlDType::MXFP4
+            | GgmlDType::FP8E4M3 => crate::bail!(
                 "{:?} is not supported on the CUDA quantized path: no dequantize",
                 self.dtype
             ),

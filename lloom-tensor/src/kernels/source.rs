@@ -123,6 +123,34 @@ pub const GEMV: &str = with_utils!(
 pub const MLX_GEMM: &str = include_str!("metal_src/gemm/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
 pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
+
+/// The quantized matvec with a block on its store (`metal_src/quantized_store.metal`):
+/// the quantized source, the store types, and one instantiation per kind
+/// whose plain matvec has a genericized core × store block, generated from
+/// the kinds table rather than listed — `kernel_mul_mv_<stem>_f32_silu` and
+/// `kernel_mul_mv_<stem>_f32_mul`. Its own translation unit, compiled only
+/// when a dispatch asks for a store block, so the default library is
+/// untouched.
+pub fn quantized_store() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        use std::fmt::Write as _;
+        let mut s = String::with_capacity(QUANTIZED.len() + 8192);
+        s.push_str(QUANTIZED);
+        s.push('\n');
+        s.push_str(include_str!("metal_src/quantized_store.metal"));
+        s.push('\n');
+        for (stem, store, suffix) in super::kernels::quantized::mv_store_instantiations() {
+            let _ = writeln!(
+                s,
+                "template [[host_name(\"kernel_mul_mv_{stem}_f32{suffix}\")]] kernel \
+                 decltype(kernel_mul_mv_{stem}_generic<float, {store}>) \
+                 kernel_mul_mv_{stem}_generic<float, {store}>;"
+            );
+        }
+        s
+    })
+}
 pub const RANDOM: &str = include_str!("metal_src/random.metal");
 pub const REDUCE: &str = with_utils!(
     "#include <metal_stdlib>\n#include <metal_limits>\nusing namespace metal;",
@@ -323,6 +351,9 @@ pub enum Source {
     Indexing,
     MlxSort,
     Quantized,
+    /// The quantized matvec with a block on its store ([`quantized_store`]):
+    /// its own translation unit, compiled on the first dispatch that asks.
+    QuantizedStore,
     /// The Qwen4-exp block kernels (`lloom::models::qwen4exp::kernels`).
     Qwen4Exp,
     Random,

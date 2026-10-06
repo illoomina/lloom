@@ -463,6 +463,77 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// One f32 row through the matvec with `store` on its store
+    /// (`kernels::call_quantized_matmul_mv_store`): a fresh `[n]` f32 under
+    /// [`MvStore::Silu`](crate::kernels::MvStore::Silu); under `MulInto` the
+    /// products multiplied into `into`'s `[n]` f32 elements, nothing returned.
+    /// The caller has checked the kind, the row and the layouts.
+    pub fn fwd_mv_store(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+        store: crate::kernels::MvStore,
+        into: Option<(&MetalStorage, &crate::Layout)>,
+    ) -> Result<Option<MetalStorage>> {
+        use crate::MetalError;
+        let (n, k) = self_shape.dims2()?;
+        if !layout.is_contiguous() || layout.shape().elem_count() != k || storage.dtype() != DType::F32 {
+            crate::bail!("quantized matvec store block: one contiguous f32 row of {k}, got {layout:?}")
+        }
+        let device = storage.device().clone();
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let encoder = device.command_encoder()?;
+        let lhs_offset = layout.start_offset() * storage.dtype().size_in_bytes();
+        match into {
+            None => {
+                let dst = device
+                    .new_buffer_builder()
+                    .with_size_for(n, DType::F32)
+                    .with_label("qmatmul_store")
+                    .build()?;
+                crate::kernels::call_quantized_matmul_mv_store(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    ggml_dtype,
+                    (n, k),
+                    storage.buffer(),
+                    lhs_offset,
+                    &self.buffer,
+                    0,
+                    &dst,
+                    store,
+                )
+                .map_err(MetalError::from)?;
+                Ok(Some(crate::MetalStorage::new(dst, device.clone(), n, DType::F32)))
+            }
+            Some((dst, dst_layout)) => {
+                if !dst_layout.is_contiguous()
+                    || dst_layout.shape().elem_count() != n
+                    || dst.dtype() != DType::F32
+                {
+                    crate::bail!("quantized matvec store block: the destination is not a contiguous f32 [{n}], {dst_layout:?}")
+                }
+                crate::kernels::call_quantized_matmul_mv_store(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    ggml_dtype,
+                    (n, k),
+                    storage.buffer(),
+                    lhs_offset,
+                    &self.buffer,
+                    dst_layout.start_offset() * DType::F32.size_in_bytes(),
+                    dst.buffer(),
+                    store,
+                )
+                .map_err(MetalError::from)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub fn fwd(
         &self,
         self_shape: &Shape,

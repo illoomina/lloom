@@ -187,6 +187,7 @@ impl Kernels {
             Source::Indexing => INDEXING,
             Source::MlxSort => MLX_SORT,
             Source::Quantized => QUANTIZED,
+            Source::QuantizedStore => super::source::quantized_store(),
             Source::Qwen4Exp => QWEN4EXP,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
@@ -671,6 +672,10 @@ mod tests {
                 // `Transform*` bodies and colliding function-constant indices
                 // 200/201/300 (§13.1e). A port, not a merge (#409).
                 Source::Gemm | Source::MlxSort | Source::Sdpa => false,
+                // The quantized source again with the store blocks: merging
+                // it beside `Quantized` would define every quantized kernel
+                // twice. Compiled alone, on demand.
+                Source::QuantizedStore => false,
             }
         };
 
@@ -700,6 +705,7 @@ mod tests {
             Source::Indexing,
             Source::MlxSort,
             Source::Quantized,
+            Source::QuantizedStore,
             Source::Qwen4Exp,
             Source::Random,
             Source::Reduce,
@@ -726,7 +732,7 @@ mod tests {
             "21 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree, +eos_gate #735, \
              +qwen4exp, +gdn)"
         );
-        assert_eq!(all.len(), 24, "24 Source variants");
+        assert_eq!(all.len(), 25, "25 Source variants");
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from

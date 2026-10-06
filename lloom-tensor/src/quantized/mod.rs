@@ -1402,6 +1402,36 @@ impl QTensor {
     }
 }
 
+/// A block on the quantized matvec's store (`Source::QuantizedStore`,
+/// `metal_src/quantized_store.metal`): the f32 store's type swapped for one
+/// whose conversion or assignment carries the block, the cores unedited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MvStore {
+    /// `silu(W·x)`.
+    Silu,
+    /// `dst[i] · (W·x)[i]` into `dst`: the SwiGLU's up projection multiplied
+    /// into the gate's buffer.
+    MulInto,
+}
+
+impl MvStore {
+    /// The MSL store type.
+    pub fn store_type(self) -> &'static str {
+        match self {
+            MvStore::Silu => "MvStoreSilu",
+            MvStore::MulInto => "MvStoreMulInto",
+        }
+    }
+
+    /// The `[[host_name]]` suffix after `_f32`.
+    pub fn name_suffix(self) -> &'static str {
+        match self {
+            MvStore::Silu => "_silu",
+            MvStore::MulInto => "_mul",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
@@ -1659,6 +1689,89 @@ impl crate::Module for QMatMul {
 }
 
 impl QMatMul {
+    /// Whether the quantized matvec takes a block on its store for `xs`:
+    /// a packed weight whose kind has a genericized core
+    /// (`kernels::mv_store_instantiations`), Metal, one contiguous f32 row of
+    /// the weight's `k`. One predicate for both store entry points.
+    pub fn mv_store_serves(&self, xs: &Tensor) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            let Self::QTensor(q) = self else {
+                return false;
+            };
+            let kind: crate::kernels::GgmlDType = q.dtype().into();
+            let Ok((_, k)) = q.shape().dims2() else {
+                return false;
+            };
+            matches!(kind.kind().mul_mv, crate::kernels::kernels::quantized::MulMv::Quant(_))
+                && matches!(q.storage, QStorage::Metal(_))
+                && xs.device().is_metal()
+                && xs.dtype() == DType::F32
+                && xs.is_contiguous()
+                && xs.elem_count() == k
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = xs;
+            false
+        }
+    }
+
+    /// `silu(W·x)` with the SiLU on the quantized matvec's store, one launch
+    /// (`MvStore::Silu`). `None` where [`Self::mv_store_serves`] is false —
+    /// the caller composes.
+    pub fn forward_silu(&self, xs: &Tensor) -> Option<Result<Tensor>> {
+        #[cfg(feature = "metal")]
+        {
+            if !self.mv_store_serves(xs) {
+                return None;
+            }
+            let Self::QTensor(q) = self else {
+                return None;
+            };
+            Some(xs.apply_op1_no_bwd(&MvSilu(q.clone())))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = xs;
+            None
+        }
+    }
+
+    /// `gate ← gate · (W·x)`: the products multiplied into `gate`'s own
+    /// buffer at the store (`MvStore::MulInto`), one launch — the SwiGLU's up
+    /// projection landing as `silu(g)·u` where the gate's SiLU stored
+    /// `silu(g)`. `gate` is overwritten: it must have no other reader. `None`
+    /// where the store block does not serve (`gate` an f32 contiguous
+    /// `[.., n]` on Metal too) — the caller composes.
+    pub fn forward_mul_into(&self, xs: &Tensor, gate: &Tensor) -> Option<Result<()>> {
+        #[cfg(feature = "metal")]
+        {
+            if !self.mv_store_serves(xs) {
+                return None;
+            }
+            let Self::QTensor(q) = self else {
+                return None;
+            };
+            let n = q.shape().dims2().ok()?.0;
+            if !gate.device().is_metal()
+                || gate.dtype() != DType::F32
+                || !gate.is_contiguous()
+                || gate.elem_count() != n
+            {
+                return None;
+            }
+            Some(gate.inplace_op2(xs, &MvMulInto(q.clone())))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (xs, gate);
+            None
+        }
+    }
+}
+
+impl QMatMul {
     /// `epilogue(scale · xs · Wᵀ)` for f16 weights and an f32 `xs` of at most
     /// [`gemv_mixed::GEMV_MIXED_MAX_ROWS`] rows, as ONE launch on Metal
     /// (`gemv_mixed`), `None` where the arm does not apply — the CPU, another
@@ -1881,4 +1994,82 @@ impl PairOrder {
 fn moe_pair_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().moe.pair)
+}
+
+/// The quantized matvec with `silu` on its store ([`QMatMul::forward_silu`]).
+#[cfg(feature = "metal")]
+struct MvSilu(std::sync::Arc<QTensor>);
+
+#[cfg(feature = "metal")]
+impl crate::CustomOp1 for MvSilu {
+    fn name(&self) -> &'static str {
+        "qmatmul-mv-silu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &crate::CpuStorage,
+        _: &crate::Layout,
+    ) -> Result<(crate::CpuStorage, Shape)> {
+        crate::bail!("the quantized matvec store block is Metal's")
+    }
+
+    fn metal_fwd(
+        &self,
+        storage: &crate::MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::MetalStorage, Shape)> {
+        let QStorage::Metal(w) = &self.0.storage else {
+            crate::bail!("the quantized matvec store block needs a Metal weight")
+        };
+        let out = w
+            .fwd_mv_store(&self.0.shape, storage, layout, crate::kernels::MvStore::Silu, None)?
+            .expect("a fresh store returns its storage");
+        let n = self.0.shape.dims2()?.0;
+        let mut dims = layout.shape().dims().to_vec();
+        *dims.last_mut().expect("a row") = n;
+        Ok((out, Shape::from(dims)))
+    }
+}
+
+/// The quantized matvec's products multiplied into the gate's buffer
+/// ([`QMatMul::forward_mul_into`]).
+#[cfg(feature = "metal")]
+struct MvMulInto(std::sync::Arc<QTensor>);
+
+#[cfg(feature = "metal")]
+impl crate::InplaceOp2 for MvMulInto {
+    fn name(&self) -> &'static str {
+        "qmatmul-mv-mul-into"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &mut crate::CpuStorage,
+        _: &crate::Layout,
+        _: &crate::CpuStorage,
+        _: &crate::Layout,
+    ) -> Result<()> {
+        crate::bail!("the quantized matvec store block is Metal's")
+    }
+
+    fn metal_fwd(
+        &self,
+        gate: &mut crate::MetalStorage,
+        gate_layout: &crate::Layout,
+        xs: &crate::MetalStorage,
+        xs_layout: &crate::Layout,
+    ) -> Result<()> {
+        let QStorage::Metal(w) = &self.0.storage else {
+            crate::bail!("the quantized matvec store block needs a Metal weight")
+        };
+        w.fwd_mv_store(
+            &self.0.shape,
+            xs,
+            xs_layout,
+            crate::kernels::MvStore::MulInto,
+            Some((gate, gate_layout)),
+        )?;
+        Ok(())
+    }
 }

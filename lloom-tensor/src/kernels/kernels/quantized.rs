@@ -759,6 +759,122 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+pub use crate::quantized::MvStore;
+
+/// Every store-block instantiation the store source carries, read off the
+/// kinds table: `(stem, store type, suffix)` for every kind whose plain
+/// matvec is a genericized core, × every [`MvStore`].
+pub fn mv_store_instantiations() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut out = Vec::new();
+    for dtype in GgmlDType::ALL {
+        let k = dtype.kind();
+        if let MulMv::Quant(_) = k.mul_mv {
+            for store in [MvStore::Silu, MvStore::MulInto] {
+                out.push((k.stem, store.store_type(), store.name_suffix()));
+            }
+        }
+    }
+    out
+}
+
+/// [`call_quantized_matmul_mv_t`] at one f32 row with `store` on its store
+/// (`kernel_mul_mv_<stem>_f32<suffix>`, from `Source::QuantizedStore`):
+/// `dst` is `[n]` f32 — under [`MvStore::MulInto`] the buffer whose values
+/// the products multiply into. The grid is the plain one-row matvec's: the
+/// block is the store's type, nothing else of the launch moves. A kind with
+/// no genericized core is refused by name.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_store(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n, k): (usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+    store: MvStore,
+) -> Result<(), MetalKernelError> {
+    let stem = match dtype.kind().mul_mv {
+        MulMv::Quant(stem) => stem,
+        _ => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "a store block rides the genericized quantized cores only",
+                "quantized matmul-vec store block",
+            ))
+        }
+    };
+    let name = format!("{stem}_f32{}", store.name_suffix());
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = 1i64;
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as i64;
+    let nb00 = dtype_type_size(dtype) as i64;
+    let nb01 = row_bytes;
+    let nb02 = n as i64 * row_bytes;
+    let ne10 = k as i64;
+    let ne11 = 1i64;
+    let ne12 = 1i64;
+    let nb10 = core::mem::size_of::<f32>() as i64;
+    let nb11 = k as i64 * nb10;
+    let nb12 = nb11;
+    let ne0 = n as i64;
+    let ne1 = 1i64;
+    let (r2, r3) = (1u32, 1u32);
+    let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let thread_groups_count = MTLSize {
+        width: divide(n, align),
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::QuantizedStore,
+        name.clone(),
+        mv_constants(dtype),
+    )?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    if needs_iq_shared(dtype) {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
+    debug_group!(encoder, "qmm_mv_store {name} K={k} N={n}");
+    set_params!(
+        encoder,
+        (
+            rhs,
+            (lhs, lhs_offset),
+            Output::with_offset(dst, dst_offset),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 /// The bytes of one activation element and one stored element under `triple`:
 /// the routed launches step `src1` and `dst` by them.
 fn triple_leg_bytes(triple: GemvTriple) -> (u64, u64) {

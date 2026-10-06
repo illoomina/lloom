@@ -1962,7 +1962,6 @@ mod tile_config_gate {
     /// returns `None`, which is the whole of the no-op claim.
     #[test]
     fn the_gemv_tile_override_is_absent_unless_asked_for() {
-        use crate::gemv_tile::forced_gemv_bm;
         assert!(
             std::env::var("LLOOM_492_GEMV_BM").is_err(),
             "this test asserts the DEFAULT; it cannot run with the override set"

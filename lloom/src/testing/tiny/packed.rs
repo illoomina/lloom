@@ -4,32 +4,45 @@
 //! and the whole tensor scaled so its dequantized magnitude is the law's.
 //! Every GGUF kind is covered, including the IQ family and Q2_0, which have
 //! no quantizer in the tree; the reference for what a block means is the
-//! format's own `to_float`.
+//! format's own `to_float`. A power-of-two scale (MXFP4's E8M0) can only be
+//! scaled by powers of two, so its magnitude lands within a factor √2 of the
+//! law's.
 
 use super::init::{Key, Role, ValueLaw};
 use lloom_tensor::quantized::{GgmlDType, QStorage, QTensor};
 use lloom_tensor::{bail, Device, Result, Shape};
 use std::borrow::Cow;
 
-/// The float fields of one block of `dtype`: the byte offsets of its f16
-/// scales, and of its f32 scales. Everything else in a block is integer
-/// codes, indices into a grid, or sign bits.
-pub fn scale_fields(dtype: GgmlDType) -> (&'static [usize], &'static [usize]) {
+/// One scale field of a block: its byte offset and its encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scale {
+    F16(usize),
+    F32(usize),
+    Bf16(usize),
+    /// A power-of-two exponent byte, `2^(e - 127)`.
+    E8m0(usize),
+}
+
+/// The scale fields of one block of `dtype`. Everything else in a block is
+/// integer codes, float codes, indices into a grid, or sign bits.
+pub fn scale_fields(dtype: GgmlDType) -> &'static [Scale] {
     use GgmlDType::*;
     match dtype {
-        Q4_0 | Q5_0 | Q8_0 => (&[0], &[]),
-        Q4_1 | Q5_1 => (&[0, 2], &[]),
+        Q4_0 | Q5_0 | Q8_0 => &[Scale::F16(0)],
+        Q4_1 | Q5_1 => &[Scale::F16(0), Scale::F16(2)],
         // `s` (offset 2) is `d · Σqs`, a cache for the dot product: it is
         // recomputed, not drawn (`fix_derived`).
-        Q8_1 => (&[0], &[]),
-        Q2K => (&[80, 82], &[]),
-        Q3K => (&[108], &[]),
-        Q4K | Q5K => (&[0, 2], &[]),
-        Q6K => (&[208], &[]),
+        Q8_1 => &[Scale::F16(0)],
+        Q2K => &[Scale::F16(80), Scale::F16(82)],
+        Q3K => &[Scale::F16(108)],
+        Q4K | Q5K => &[Scale::F16(0), Scale::F16(2)],
+        Q6K => &[Scale::F16(208)],
         // `bsums` are Σqs per 16, recomputed (`fix_derived`).
-        Q8K => (&[], &[0]),
-        IQ2XXS | IQ2XS | IQ2S | IQ3XXS | IQ3S | IQ4NL | IQ4XS | Q2_0 => (&[0], &[]),
-        F32 | F16 | BF16 => (&[], &[]),
+        Q8K => &[Scale::F32(0)],
+        IQ2XXS | IQ2XS | IQ2S | IQ3XXS | IQ3S | IQ4NL | IQ4XS | Q2_0 => &[Scale::F16(0)],
+        MXFP4 => &[Scale::E8m0(0)],
+        FP8E4M3 => &[Scale::Bf16(0)],
+        F32 | F16 | BF16 => &[],
     }
 }
 
@@ -39,7 +52,7 @@ pub fn is_packed(dtype: GgmlDType) -> bool {
 }
 
 /// Every kind the GGUF reader accepts, in type-code order.
-pub const ALL_KINDS: [GgmlDType; 23] = [
+pub const ALL_KINDS: [GgmlDType; 25] = [
     GgmlDType::F32,
     GgmlDType::F16,
     GgmlDType::Q4_0,
@@ -62,7 +75,9 @@ pub const ALL_KINDS: [GgmlDType; 23] = [
     GgmlDType::IQ2S,
     GgmlDType::IQ4XS,
     GgmlDType::BF16,
+    GgmlDType::MXFP4,
     GgmlDType::Q2_0,
+    GgmlDType::FP8E4M3,
 ];
 
 fn get_f16(b: &[u8], at: usize) -> f32 {
@@ -77,11 +92,51 @@ fn get_f32(b: &[u8], at: usize) -> f32 {
 fn put_f32(b: &mut [u8], at: usize, v: f32) {
     b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
+fn get_bf16(b: &[u8], at: usize) -> f32 {
+    half::bf16::from_le_bytes([b[at], b[at + 1]]).to_f32()
+}
+fn put_bf16(b: &mut [u8], at: usize, v: f32) {
+    b[at..at + 2].copy_from_slice(&half::bf16::from_f32(v).to_le_bytes());
+}
+
+impl Scale {
+    /// Draw this field at `u` ∈ [0, 1): a float in `[0.75, 1)`, an
+    /// exponent in `2^[-2, 2)`.
+    fn draw(self, block: &mut [u8], u: f32) {
+        match self {
+            Scale::F16(at) => put_f16(block, at, 0.75 + 0.25 * u),
+            Scale::F32(at) => put_f32(block, at, 0.75 + 0.25 * u),
+            Scale::Bf16(at) => put_bf16(block, at, 0.75 + 0.25 * u),
+            Scale::E8m0(at) => block[at] = 125 + (4.0 * u) as u8,
+        }
+    }
+
+    /// Multiply this field by `k`; an exponent moves by `log2 k` rounded.
+    fn scale(self, block: &mut [u8], k: f32) {
+        match self {
+            Scale::F16(at) => put_f16(block, at, get_f16(block, at) * k),
+            Scale::F32(at) => put_f32(block, at, get_f32(block, at) * k),
+            Scale::Bf16(at) => put_bf16(block, at, get_bf16(block, at) * k),
+            Scale::E8m0(at) => {
+                let e = block[at] as i32 + k.log2().round() as i32;
+                block[at] = e.clamp(1, 254) as u8;
+            }
+        }
+    }
+}
 
 /// Recompute the fields that cache a function of the codes: Q8_1's
-/// `s = d · Σqs`, Q8_K's `bsums` (Σqs per 16).
+/// `s = d · Σqs`, Q8_K's `bsums` (Σqs per 16); and move FP8's two NaN codes
+/// to the largest finite magnitude, so a drawn block is finite.
 fn fix_derived(dtype: GgmlDType, block: &mut [u8]) {
     match dtype {
+        GgmlDType::FP8E4M3 => {
+            for q in &mut block[2..] {
+                if *q & 0x7F == 0x7F {
+                    *q ^= 0x01;
+                }
+            }
+        }
         GgmlDType::Q8_1 => {
             let d = get_f16(block, 0);
             let sum: i32 = block[4..36].iter().map(|&q| q as i8 as i32).sum();
@@ -125,18 +180,13 @@ pub fn synthesize_bytes(
         let v = key.bits(w as u64).to_le_bytes();
         chunk.copy_from_slice(&v[..chunk.len()]);
     }
-    let (f16s, f32s) = scale_fields(dtype);
+    let scales = scale_fields(dtype);
     // The scales draw from a stream of their own, so they do not repeat the
     // codes they sit beside.
     let skey = Key::new(key.bits(u64::MAX), "scales");
     for (b, block) in bytes.chunks_mut(ts).enumerate() {
-        for (j, &at) in f16s.iter().enumerate() {
-            let u = skey.unit((b * 4 + j) as u64);
-            put_f16(block, at, 0.75 + 0.25 * u);
-        }
-        for (j, &at) in f32s.iter().enumerate() {
-            let u = skey.unit((b * 4 + j) as u64);
-            put_f32(block, at, 0.75 + 0.25 * u);
+        for (j, f) in scales.iter().enumerate() {
+            f.draw(block, skey.unit((b * 4 + j) as u64));
         }
         fix_derived(dtype, block);
     }
@@ -149,13 +199,8 @@ pub fn synthesize_bytes(
     }
     let k = amplitude / amax;
     for block in bytes.chunks_mut(ts) {
-        for &at in f16s {
-            let v = get_f16(block, at);
-            put_f16(block, at, v * k);
-        }
-        for &at in f32s {
-            let v = get_f32(block, at);
-            put_f32(block, at, v * k);
+        for f in scales {
+            f.scale(block, k);
         }
         fix_derived(dtype, block);
     }
@@ -280,8 +325,18 @@ mod tests {
             let v = dequant_cpu(&a, dtype, &shape).unwrap();
             assert!(v.iter().all(|x| x.is_finite()), "{dtype:?}: non-finite");
             let amax = v.iter().fold(0f32, |m, x| m.max(x.abs()));
-            // f16 rounding of the rescaled scales moves the peak by < 0.1 %.
-            assert!((amax - 0.05).abs() < 0.05 * 2e-3, "{dtype:?}: amax {amax}");
+            if scale_fields(dtype)
+                .iter()
+                .any(|f| matches!(f, Scale::E8m0(_)))
+            {
+                // A power-of-two scale lands within a factor √2.
+                let r = amax / 0.05;
+                assert!((0.70..=1.42).contains(&r), "{dtype:?}: amax {amax}");
+            } else {
+                // f16 rounding of the rescaled scales moves the peak by
+                // < 0.1 %, bf16's by < 0.2 %.
+                assert!((amax - 0.05).abs() < 0.05 * 2e-3, "{dtype:?}: amax {amax}");
+            }
             let distinct = v
                 .iter()
                 .map(|x| x.to_bits())

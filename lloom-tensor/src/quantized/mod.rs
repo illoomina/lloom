@@ -8,6 +8,7 @@ use std::{borrow::Cow, sync::OnceLock};
 pub mod avx;
 mod dummy_cuda;
 mod dummy_metal;
+pub mod fp_quants;
 pub mod gemv_mixed;
 pub mod ggml_file;
 pub mod gguf_file;
@@ -140,6 +141,12 @@ impl QStorage {
                 GgmlDType::Q2_0 => {
                     metal::load_quantized(d, as_t_slice::<iq_quants::BlockQ2_0>(data))
                 }
+                GgmlDType::MXFP4 => {
+                    metal::load_quantized(d, as_t_slice::<fp_quants::BlockMxfp4>(data))
+                }
+                GgmlDType::FP8E4M3 => {
+                    metal::load_quantized(d, as_t_slice::<fp_quants::BlockFp8E4M3>(data))
+                }
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -167,7 +174,9 @@ impl QStorage {
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ4NL
                 | GgmlDType::IQ4XS
-                | GgmlDType::Q2_0 => {
+                | GgmlDType::Q2_0
+                | GgmlDType::MXFP4
+                | GgmlDType::FP8E4M3 => {
                     crate::bail!("{dtype:?} is not supported on the CUDA quantized path")
                 }
             },
@@ -381,7 +390,18 @@ pub enum GgmlDType {
     IQ4NL,
     IQ4XS,
     Q2_0,
+    // ggml's MXFP4 (type 39): 32 E2M1 codes under one E8M0 scale.
+    MXFP4,
+    // 32 E4M3FN codes under one bf16 scale. No ggml type exists; its GGUF
+    // id is lloom's own (`GGUF_TYPE_FP8_E4M3`).
+    FP8E4M3,
 }
+
+/// The GGUF tensor type id of [`GgmlDType::FP8E4M3`]. ggml has no FP8 type,
+/// so the id is lloom's: upstream assigns ids densely from 0 (43 so far) and
+/// refuses one at or past its count, so an id at `1 << 24` can neither
+/// collide with a future upstream type nor be misread by another reader.
+pub const GGUF_TYPE_FP8_E4M3: u32 = 1 << 24;
 
 impl GgmlDType {
     /// Whether lloom only reads blocks of this type. For the IQ family and
@@ -439,6 +459,8 @@ impl GgmlDType {
             30 => Self::BF16,
             // Q2_0: the qwen4exp / GSQ-RCO fork's own type (GGML_TYPE_Q2_0=42).
             42 => Self::Q2_0,
+            39 => Self::MXFP4,
+            GGUF_TYPE_FP8_E4M3 => Self::FP8E4M3,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -470,6 +492,8 @@ impl GgmlDType {
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
             Self::Q2_0 => 42,
+            Self::MXFP4 => 39,
+            Self::FP8E4M3 => GGUF_TYPE_FP8_E4M3,
         }
     }
 
@@ -523,6 +547,14 @@ impl GgmlDType {
                 iq_quants::BlockQ2_0::zeros();
                 elem_count / iq_quants::BlockQ2_0::BLCK_SIZE
             ]),
+            Self::MXFP4 => Box::new(vec![
+                fp_quants::BlockMxfp4::zeros();
+                elem_count / fp_quants::BlockMxfp4::BLCK_SIZE
+            ]),
+            Self::FP8E4M3 => Box::new(vec![
+                fp_quants::BlockFp8E4M3::zeros();
+                elem_count / fp_quants::BlockFp8E4M3::BLCK_SIZE
+            ]),
         }
     }
 
@@ -552,6 +584,8 @@ impl GgmlDType {
             Self::IQ4NL => Box::new(as_t_slice::<iq_quants::BlockIQ4nl>(data).to_vec()),
             Self::IQ4XS => Box::new(as_t_slice::<iq_quants::BlockIQ4xs>(data).to_vec()),
             Self::Q2_0 => Box::new(as_t_slice::<iq_quants::BlockQ2_0>(data).to_vec()),
+            Self::MXFP4 => Box::new(as_t_slice::<fp_quants::BlockMxfp4>(data).to_vec()),
+            Self::FP8E4M3 => Box::new(as_t_slice::<fp_quants::BlockFp8E4M3>(data).to_vec()),
         }
     }
 
@@ -582,6 +616,8 @@ impl GgmlDType {
             Self::IQ4NL => std::mem::size_of::<iq_quants::BlockIQ4nl>(),
             Self::IQ4XS => std::mem::size_of::<iq_quants::BlockIQ4xs>(),
             Self::Q2_0 => std::mem::size_of::<iq_quants::BlockQ2_0>(),
+            Self::MXFP4 => std::mem::size_of::<fp_quants::BlockMxfp4>(),
+            Self::FP8E4M3 => std::mem::size_of::<fp_quants::BlockFp8E4M3>(),
         }
     }
 
@@ -603,6 +639,8 @@ impl GgmlDType {
             }
             Self::IQ4NL => iq_quants::QK4_NL,
             Self::Q2_0 => iq_quants::QK2_0,
+            Self::MXFP4 => fp_quants::QK_MXFP4,
+            Self::FP8E4M3 => fp_quants::QK_FP8,
         }
     }
 }

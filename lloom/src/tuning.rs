@@ -116,6 +116,9 @@ fn parse_qsa_window(v: &str) -> Result<String, String> {
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
+fn parse_fetch(v: &str) -> Result<String, String> {
+    one_of(v, "expert fetch", &["off", "inside"])
+}
 fn parse_state_write(v: &str) -> Result<String, String> {
     one_of(v, "state write", &["in-place", "copy"])
 }
@@ -257,6 +260,30 @@ pub struct StreamTuning {
     /// Print every settle's ids, flags and misses — an instrument.
     #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool)]
     pub trace_settle: bool,
+    /// The fetch inside the token: `inside` = while the pool misses, a device-planned decode step waits on the device at each layer for the misses its router chose, read beside the pass, instead of replaying the token or taking the host plan (`off` = the settle and replay).
+    #[opt(flag = "expert-fetch", env = "QWEN4EXP_FETCH", parser = "parse_fetch", variants = ["off", "inside"])]
+    pub fetch: String,
+    /// Microseconds the fetch worker sleeps between looks at a layer's routing (it never spins).
+    #[opt(
+        flag = "fetch-poll-us",
+        env = "QWEN4EXP_FETCH_POLL_US",
+        parser = "parse_at_least_one"
+    )]
+    pub fetch_poll_us: usize,
+    /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
+    #[opt(
+        flag = "fetch-exit",
+        env = "QWEN4EXP_FETCH_EXIT",
+        parser = "parse_at_least_one"
+    )]
+    pub fetch_exit: usize,
+    /// The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`.
+    #[opt(
+        flag = "fetch-qos",
+        env = "QWEN4EXP_FETCH_QOS",
+        parser = "parse_spawned_qos"
+    )]
+    pub fetch_qos: String,
 }
 
 impl Default for StreamTuning {
@@ -275,6 +302,10 @@ impl Default for StreamTuning {
             settle_batch: true,
             spike0: "off".into(),
             trace_settle: false,
+            fetch: "off".into(),
+            fetch_poll_us: 50,
+            fetch_exit: 8,
+            fetch_qos: "user-interactive".into(),
         }
     }
 }

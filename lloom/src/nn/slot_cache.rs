@@ -619,6 +619,45 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         best.map(|(s, _)| (SlotId(s as u32), true))
     }
 
+    /// The slot a load beside a running pass takes: the LRU unpinned slot
+    /// not used in `tick` and not in flight whose own last reader or writer
+    /// has run — in an epoch before `floor` (every one of which the caller
+    /// knows complete) or one `completed` covers. The device plan's blanket
+    /// stamp is not read: the caller's pass reads this tier only after the
+    /// load (`expert_stream`'s fetch). An empty slot wins outright unless
+    /// `skip_empty` (the quarantined arm, whose empty slots are held).
+    pub fn victim_beside(
+        &self,
+        tick: Tick,
+        floor: Epoch,
+        completed: Completed,
+        skip_empty: bool,
+    ) -> Option<(SlotId, bool)> {
+        let p = &self.policy;
+        let mut best: Option<(usize, Tick)> = None;
+        for s in 0..self.active {
+            let e = p.last_epoch[s];
+            if p.pinned[s]
+                || p.last_use[s] == tick
+                || p.inflight[s] != 0
+                || !(e < floor || completed.covers(e))
+            {
+                continue;
+            }
+            if self.key_in[s].is_none() {
+                if skip_empty {
+                    continue;
+                }
+                return Some((SlotId(s as u32), false));
+            }
+            match best {
+                Some((_, t)) if t <= p.last_use[s] => {}
+                _ => best = Some((s, p.last_use[s])),
+            }
+        }
+        best.map(|(s, _)| (SlotId(s as u32), true))
+    }
+
     /// The epoch of `slot`'s last GPU reader or writer.
     pub fn reader_epoch(&self, slot: SlotId) -> Epoch {
         self.policy.last_epoch[slot.index()].max(self.policy.plan_epoch)
@@ -767,6 +806,44 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, ListLru> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A load beside a running pass takes a slot whose own last reader ran
+    /// before the pass's floor (or has completed), never one written or read
+    /// at or past it, never one routed to in this tick — and is blind to the
+    /// device plan's blanket stamp, which covers the pass the load is for.
+    #[test]
+    fn a_load_beside_a_pass_takes_only_a_slot_whose_readers_ran() {
+        let mut c = ExpertSlots::new(8, 3);
+        let t = c.begin();
+        for s in 0..3u32 {
+            c.install(SlotId(s), ExpertId(s));
+            c.touch(SlotId(s), t);
+        }
+        // Slot 0: read at epoch 9 (past the floor, not complete); slot 1 at
+        // 2 (before it); slot 2 at 5 (past the floor, complete).
+        c.stamp(SlotId(0), Epoch(9));
+        c.stamp(SlotId(1), Epoch(2));
+        c.stamp(SlotId(2), Epoch(5));
+        // The running pass's plan may read every slot.
+        c.plan_read_all(Epoch(9));
+        let t = c.begin();
+        let floor = Epoch(4);
+        // Nothing past the floor complete: slot 1 alone.
+        assert_eq!(
+            c.victim_beside(t, floor, Completed(4), false),
+            Some((SlotId(1), true))
+        );
+        // Slot 1 routed to now: none until epoch 5 completes, then slot 2.
+        c.touch(SlotId(1), t);
+        assert_eq!(c.victim_beside(t, floor, Completed(4), false), None);
+        assert_eq!(
+            c.victim_beside(t, floor, Completed(6), false),
+            Some((SlotId(2), true))
+        );
+        // The blanket stamp is what the other paths read: none of them
+        // would take a slot here.
+        assert_eq!(c.victim_in(t, true, Completed(6)), None);
+    }
 
     #[test]
     fn a_dense_cache_installs_evicts_lru_and_recycles_through_the_quarantine() {

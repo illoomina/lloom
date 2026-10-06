@@ -77,7 +77,7 @@ fn every_store_block_is_its_pair_bit_for_bit() -> Result<()> {
         names, expect,
         "the library carries the instantiations the kinds table names"
     );
-    assert_eq!(names.len(), 2 * 18);
+    assert_eq!(names.len(), 2 * 20);
     let (n, k) = (96usize, 512usize);
     let mut failures = Vec::new();
     let mut ran = 0;
@@ -138,7 +138,7 @@ fn every_store_block_is_its_pair_bit_for_bit() -> Result<()> {
         ran += 1;
     }
     eprintln!("{ran} kinds, {} cells", 2 * ran);
-    assert_eq!(ran, 18, "every kind the library carries ran");
+    assert_eq!(ran, 20, "every kind the library carries ran");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }

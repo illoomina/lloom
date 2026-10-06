@@ -406,6 +406,36 @@ pub trait ExpertResidency {
     fn prefetch_stats(&self) -> PrefetchStats {
         PrefetchStats::default()
     }
+
+    /// The fetch inside the token (`QWEN4EXP_FETCH=inside`,
+    /// `nn::expert_fetch`): whether this tier can load a running pass's
+    /// misses beside it — reader threads, Shared slot pools the host
+    /// writes, a residency table the device reads in place. `Resident`
+    /// never needs to.
+    fn fetch_ready(&self) -> bool {
+        false
+    }
+
+    /// Before a fetching pass, with no command that writes it pending:
+    /// fill the routing's host-read slot with a value no expert has, so the
+    /// worker can tell the pass's routing from the last one. `false` when
+    /// the tier does not fetch.
+    fn fetch_prepare(&self, _topk: usize) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// At a fetching pass's layer: hand `lane` this layer's job — the
+    /// routing `ids`, written into the tier's host-read slot — and encode
+    /// the device's wait for it. `false` (nothing encoded) when the tier
+    /// does not fetch or `ids` is not its slot's.
+    #[cfg(feature = "metal")]
+    fn fetch_register(
+        &self,
+        _lane: &crate::nn::expert_fetch::FetchLane,
+        _ids: &Tensor,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// The prefetcher's counters; the real type on Metal, zeros elsewhere.
@@ -777,6 +807,19 @@ impl ResidencyMap {
             .map(|(s, e)| (s.index(), e))
     }
 
+    /// [`SlotCache::victim_beside`].
+    fn victim_beside(
+        &self,
+        tick: Tick,
+        floor: Epoch,
+        completed: Completed,
+        skip_empty: bool,
+    ) -> Option<(usize, bool)> {
+        self.cache
+            .victim_beside(tick, floor, completed, skip_empty)
+            .map(|(s, e)| (s.index(), e))
+    }
+
     /// The epoch of slot `s`'s last GPU reader or writer.
     fn reader_epoch(&self, s: usize) -> Epoch {
         self.cache.reader_epoch(SlotId(s as u32))
@@ -831,6 +874,11 @@ impl ResidencyMap {
 
     fn install(&mut self, slot: usize, e: usize) {
         self.cache.install(SlotId(slot as u32), ExpertId(e as u32))
+    }
+
+    /// Empty `slot` (its key out of the map), returning the key it held.
+    fn uninstall(&mut self, slot: usize) -> Option<u32> {
+        self.cache.uninstall(SlotId(slot as u32)).map(|e| e.0)
     }
 
     fn inflight(&self, slot: usize) -> u64 {
@@ -953,6 +1001,22 @@ pub struct StreamCounters {
     /// (already resident, or no slot) — `QWEN4EXP_PREDICT=hotlist`.
     pub predict_landed: AtomicU64,
     pub predict_wasted: AtomicU64,
+}
+
+/// The fetch worker's counters (`nn::expert_fetch::FetchLane::stats`; zeros
+/// off Metal or before a fetching step): jobs taken (one a layer a step),
+/// layers that missed, experts loaded, experts left missing for want of a
+/// slot, routings not seen in time, and the host time spent watching for
+/// the routings and serving them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FetchStats {
+    pub jobs: u64,
+    pub missed_layers: u64,
+    pub loads: u64,
+    pub short: u64,
+    pub timeouts: u64,
+    pub watch_ns: u64,
+    pub serve_ns: u64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -1205,6 +1269,9 @@ struct Inner {
     /// The slot pools are Shared and a miss is read straight into its slot
     /// (`pread_direct_on`, the `pread` arm on Metal).
     direct: bool,
+    /// The slot pools are Shared: the direct read's, or the fetch arm's
+    /// (`fetch_on`), whose worker writes a slot from the host.
+    shared_pools: bool,
     /// A settle's distinct ids and misses, kept between calls so a settle
     /// allocates nothing once they have grown.
     scratch_ids: Vec<u32>,
@@ -1507,6 +1574,16 @@ impl Inner {
         }
     }
 
+    /// Write `e → slot` into the live table NOW, whatever plan is open, and
+    /// drop any write for `e` deferred under one (`table_set`'s H3): the
+    /// fetch worker's, whose pass reads the table only after it is done.
+    fn live_store(&mut self, e: u32, slot: u32) {
+        self.live_pending.retain(|&(x, _)| x != e);
+        if let Some(t) = &self.live {
+            t.store(e as usize, slot);
+        }
+    }
+
     /// Every device plan has settled: deferred evictions retire at this
     /// epoch (H2) and the live-table writes made under the plans are
     /// published (H3). Returns the writes published.
@@ -1634,10 +1711,12 @@ impl Streamed {
         #[cfg(not(feature = "metal"))] staging: Option<()>,
     ) -> Result<Self> {
         #[cfg(feature = "metal")]
-        let direct = pread_direct_on();
+        let (direct, shared) = (pread_direct_on(), pread_direct_on() || fetch_on());
         #[cfg(not(feature = "metal"))]
-        let direct = false;
-        Self::with_staging_direct(gate, up, down, n_slots, loader, device, staging, direct)
+        let (direct, shared) = (false, false);
+        Self::with_staging_pools(
+            gate, up, down, n_slots, loader, device, staging, direct, shared,
+        )
     }
 
     /// [`Self::with_staging`] with the direct read chosen here rather than
@@ -1657,8 +1736,32 @@ impl Streamed {
         #[cfg(not(feature = "metal"))] staging: Option<()>,
         direct: bool,
     ) -> Result<Self> {
+        Self::with_staging_pools(
+            gate, up, down, n_slots, loader, device, staging, direct, direct,
+        )
+    }
+
+    /// [`Self::with_staging_direct`] with the pools' storage chosen apart
+    /// from the direct read: `shared` makes them Shared (the fetch arm's
+    /// worker writes a slot from the host) whether or not a miss on the
+    /// encoding thread is read straight into its slot (`direct`).
+    #[allow(clippy::too_many_arguments)]
+    fn with_staging_pools(
+        gate: ExpertSource,
+        up: ExpertSource,
+        down: ExpertSource,
+        n_slots: usize,
+        loader: LoaderArm,
+        device: &Device,
+        #[cfg(feature = "metal")] staging: Option<
+            lloom_tensor::kernels::metal::staging::SharedStagingRing,
+        >,
+        #[cfg(not(feature = "metal"))] staging: Option<()>,
+        direct: bool,
+        shared: bool,
+    ) -> Result<Self> {
         #[cfg(not(feature = "metal"))]
-        let _ = (staging, direct);
+        let _ = (staging, direct, shared);
         let n_experts = gate.n_experts();
         if up.n_experts() != n_experts || down.n_experts() != n_experts {
             lloom_tensor::bail!(
@@ -1680,16 +1783,18 @@ impl Streamed {
             }
         }
         // Persistent storage of known geometry: never a pool bucket. Shared
-        // under the direct read (the CPU writes a miss into its slot).
+        // under the direct read and the fetch arm (the CPU writes a miss
+        // into its slot).
         #[cfg(feature = "metal")]
-        let direct =
-            direct && matches!(loader, LoaderArm::Pread) && matches!(device, Device::Metal(_));
+        let pread_metal = matches!(loader, LoaderArm::Pread) && matches!(device, Device::Metal(_));
+        #[cfg(feature = "metal")]
+        let (direct, shared) = (direct && pread_metal, (shared || direct) && pread_metal);
         #[cfg(not(feature = "metal"))]
-        let direct = false;
+        let (direct, shared) = (false, false);
         let pool = |s: &ExpertSource| -> Result<SlotPool> {
             let (n, k) = s.dims();
             Ok(SlotPool {
-                qt: QTensor::zeros_persistent_with((n_slots, n, k), s.dtype(), device, direct)?,
+                qt: QTensor::zeros_persistent_with((n_slots, n, k), s.dtype(), device, shared)?,
                 plane_bytes: s.plane_bytes(),
             })
         };
@@ -1723,6 +1828,7 @@ impl Streamed {
                 #[cfg(feature = "metal")]
                 clock,
                 direct,
+                shared_pools: shared,
                 scratch_ids: Vec::new(),
                 scratch_missing: Vec::new(),
                 counted: Vec::new(),
@@ -1760,8 +1866,12 @@ impl Streamed {
         }
         inner.map.set_spare(k);
         inner.live = None;
+        // The fetch arm's worker tells the device of a load mid-pass: the
+        // table is the one the device reads, written in place.
         #[cfg(feature = "metal")]
-        if inner.map.quarantined() && matches!(inner.loader, LoaderArm::Pread) {
+        if (inner.map.quarantined() || (fetch_on() && inner.shared_pools))
+            && matches!(inner.loader, LoaderArm::Pread)
+        {
             if let Device::Metal(d) = &inner.device {
                 inner.live = Some(LiveTable::new(d, self.n_experts)?);
             }
@@ -2942,6 +3052,16 @@ pub fn pread_direct_on() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().stream.pread_direct)
 }
 
+/// `QWEN4EXP_FETCH=inside` (off by default, read once): while the pool
+/// misses, a device-planned decode step waits on the device at each layer
+/// for the misses its router chose, read beside the pass
+/// (`nn::expert_fetch`, `expert-streaming.md` §20.14c). The tier's half: its
+/// slot pools are Shared and its device table is live.
+pub fn fetch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.fetch == "inside")
+}
+
 /// Whether a value allocated now is read after the open pass closes: the
 /// open pass is a model's own (`MetalDevice::model_pass_open`), whose settle
 /// runs after it. False with no pass open, off Metal, or under a driver's.
@@ -3212,13 +3332,24 @@ impl Streamed {
         distinct.sort_unstable();
         distinct.dedup();
         let tick = inner.map.begin();
+        // A device-planned replay's settle: the settle before it counted the
+        // token's experts already (`note_replay`); those are not counted
+        // again, as a host-planned replay's resolve does not count them.
+        let replaying = std::mem::take(&mut inner.replay_pending);
+        let prior = if replaying {
+            std::mem::take(&mut inner.counted)
+        } else {
+            Vec::new()
+        };
         // What the pass used and found: touched first, so a load below never
         // evicts an expert this pass needs.
         for &e in &distinct {
             match inner.map.slot_of(e as usize) {
                 Some(s) => {
                     inner.map.touch(s, tick);
-                    inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
+                    if !prior.contains(&e) {
+                        inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
+                    }
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 }
                 // Counted by `resolve` below.
@@ -3230,7 +3361,6 @@ impl Streamed {
         // not count them again (`note_replay`, `resolve_begin`).
         inner.counted.clear();
         inner.counted.extend_from_slice(&distinct);
-        inner.replay_pending = false;
         inner.scratch_ids = distinct;
         let flagged = flags.iter().any(|&f| f != 0);
         if trace_settle() {
@@ -3339,6 +3469,132 @@ impl Streamed {
             inner.map.plan_epoch() >= epoch,
             "H1: a routed kernel outran its stamp"
         );
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Streamed {
+    /// The fetch worker's turn at this tier's layer of a running pass whose
+    /// router chose `ids` (`nn::expert_fetch`): the experts the pool lacks
+    /// given slots — a free slot, else the LRU slot not routed to now whose
+    /// last reader ran before `floor` or has completed — their planes read
+    /// straight into the Shared slots by the prefetcher's reader threads,
+    /// and the device's live table told. Returns `(loaded, short)`: experts
+    /// loaded, and experts left missing for want of a slot (the pass maps
+    /// them missing and the step is redone).
+    ///
+    /// Why a resident slot may be written while a device plan is open: in a
+    /// fetching pass this layer's slot map and routed experts are encoded
+    /// after the wait the worker satisfies once this returns, so no command
+    /// of the pass reads the tier before then, and every command before
+    /// `floor` has completed (`FetchLane::begin_pass`). The routed experts
+    /// of this layer are touched first and never chosen. No use is counted
+    /// here: the pass's settle counts every routed expert once.
+    pub(crate) fn fetch_beside(&self, ids: &[u32], floor: Epoch) -> (u64, u64) {
+        let Some(p) = &self.prefetch else {
+            return (0, ids.len() as u64);
+        };
+        let mut jobs: Vec<crate::nn::expert_prefetch::DirectJob> = Vec::new();
+        let mut installed: Vec<(u32, u32)> = Vec::new();
+        let mut short = 0u64;
+        let mut bytes = 0u64;
+        {
+            let mut inner = self.inner.lock();
+            if inner.live.is_none() {
+                return (0, ids.len() as u64);
+            }
+            let completed = inner.completed_epochs();
+            let quarantined = inner.map.quarantined();
+            if quarantined {
+                let n = inner.map.recycle(completed);
+                self.counters
+                    .recycled
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+            let tick = inner.map.begin();
+            let mut missing: Vec<u32> = Vec::new();
+            for &e in ids {
+                match inner.map.slot_of(e as usize) {
+                    Some(s) => inner.map.touch(s, tick),
+                    None if (e as usize) < self.n_experts && !missing.contains(&e) => {
+                        missing.push(e)
+                    }
+                    None => {}
+                }
+            }
+            for &e in &missing {
+                let free = if quarantined {
+                    inner.map.take_free().map(|s| (s, false))
+                } else {
+                    None
+                };
+                let Some((s, evicted)) =
+                    free.or_else(|| inner.map.victim_beside(tick, floor, completed, quarantined))
+                else {
+                    short += 1;
+                    continue;
+                };
+                if evicted {
+                    let old = inner.map.expert_in(s);
+                    inner.live_store(old, NONE);
+                    self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                inner.map.install(s, e as usize);
+                inner.map.touch(s, tick);
+                self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                let mut dsts = [crate::nn::expert_prefetch::DirectDst(std::ptr::null_mut()); 3];
+                for (i, pool) in inner.pools.iter().enumerate() {
+                    let base = match pool.qt.metal_buffer() {
+                        Ok(b) => b.contents(),
+                        Err(_) => std::ptr::null_mut(),
+                    };
+                    // SAFETY: `s * plane` is inside the pool (`s < n_slots`);
+                    // a null base is caught below.
+                    dsts[i] = crate::nn::expert_prefetch::DirectDst(if base.is_null() {
+                        base
+                    } else {
+                        unsafe { base.add(s * pool.plane_bytes) }
+                    });
+                    bytes += pool.plane_bytes as u64;
+                }
+                if dsts.iter().any(|d| d.0.is_null()) {
+                    // No CPU mapping (cannot happen with Shared pools): the
+                    // expert stays out, mapped missing.
+                    inner.map.uninstall(s);
+                    short += 1;
+                    continue;
+                }
+                jobs.push(crate::nn::expert_prefetch::DirectJob {
+                    expert: e,
+                    planes: [
+                        inner.sources[0].plane_source(),
+                        inner.sources[1].plane_source(),
+                        inner.sources[2].plane_source(),
+                    ],
+                    dsts,
+                    // The slot's readers have run (chosen so): no wait.
+                    epoch: Epoch::ZERO,
+                });
+                installed.push((e, s as u32));
+            }
+        }
+        if !jobs.is_empty() {
+            let ticket = p.submit_direct(self.key, jobs);
+            p.wait_direct(ticket);
+            self.counters
+                .direct_loads
+                .fetch_add(installed.len() as u64, Ordering::Relaxed);
+            self.counters
+                .bytes_loaded
+                .fetch_add(bytes, Ordering::Relaxed);
+            let mut inner = self.inner.lock();
+            for &(e, slot) in &installed {
+                if inner.map.slot_of(e as usize) == Some(slot as usize) {
+                    inner.live_store(e, slot);
+                }
+            }
+        }
+        (installed.len() as u64, short)
     }
 }
 
@@ -3611,6 +3867,68 @@ impl ExpertResidency for Streamed {
             .as_ref()
             .map(|p| p.stats())
             .unwrap_or_default()
+    }
+
+    fn fetch_ready(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            if self.prefetch.is_none() {
+                return false;
+            }
+            let inner = self.inner.lock();
+            inner.shared_pools
+                && inner.live.is_some()
+                && matches!(inner.loader, LoaderArm::Pread)
+                && matches!(inner.device, Device::Metal(_))
+        }
+        #[cfg(not(feature = "metal"))]
+        false
+    }
+
+    fn fetch_prepare(&self, topk: usize) -> Result<bool> {
+        #[cfg(feature = "metal")]
+        {
+            if !self.fetch_ready() {
+                return Ok(false);
+            }
+            let slot = self.inner.lock().decode_ids_slot(topk)?;
+            match slot {
+                Some(s) => {
+                    s.fill_u32(NONE, topk)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = topk;
+            Ok(false)
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn fetch_register(
+        &self,
+        lane: &crate::nn::expert_fetch::FetchLane,
+        ids: &Tensor,
+    ) -> Result<bool> {
+        if !self.fetch_ready() {
+            return Ok(false);
+        }
+        let slot = self
+            .inner
+            .lock()
+            .decode_io
+            .ids_slot
+            .as_ref()
+            .filter(|s| s.holds(ids))
+            .map(Arc::clone);
+        let Some(slot) = slot else {
+            return Ok(false);
+        };
+        lane.register(self, slot, ids.elem_count(), self.n_experts)?;
+        Ok(true)
     }
 
     fn group_misses(&self, group: &RoutedGroup) -> usize {
@@ -4137,6 +4455,66 @@ mod tests {
             );
         }
         let _ = topk;
+    }
+
+    /// A device-planned replay (`QWEN4EXP_REPLAY=device`, the fetch arm's
+    /// redo) settles the same token's record again: its experts are counted
+    /// once — at the first settle — and a later token's are counted again.
+    #[test]
+    fn a_device_planned_replay_counts_its_experts_once() {
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::Q8_0);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::Q8_0);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::Q8_0);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let pre = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
+        for g in streamed.plan(&pre).unwrap() {
+            streamed.ensure(&g).unwrap();
+        }
+        let ids_tok = [1u32, 2, 7];
+        let record = |streamed: &Streamed| -> Vec<u32> {
+            let inner = streamed.inner.lock();
+            let slots = ids_tok
+                .iter()
+                .map(|&i| inner.map.slot_of(i as usize).map_or(0, |s| s as u32));
+            let flags = ids_tok
+                .iter()
+                .map(|&i| inner.map.slot_of(i as usize).is_none() as u32);
+            slots.chain(ids_tok.iter().copied()).chain(flags).collect()
+        };
+        let before = streamed.usage();
+        // The step missed 7: its settle loads it and counts the three.
+        assert!(streamed.settle_host(&record(&streamed)).unwrap());
+        // The replay on the device plan: every expert resident now.
+        streamed.note_replay();
+        assert!(!streamed.settle_host(&record(&streamed)).unwrap());
+        let replayed = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                replayed[i as usize],
+                before[i as usize] + 1,
+                "expert {i} counted once over the settle and its replay"
+            );
+        }
+        // The next token's settle, no replay: counted.
+        assert!(!streamed.settle_host(&record(&streamed)).unwrap());
+        let next = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                next[i as usize],
+                before[i as usize] + 2,
+                "expert {i} counted by the next token"
+            );
+        }
     }
 
     fn streamed_matches_resident(dtype: GgmlDType) {

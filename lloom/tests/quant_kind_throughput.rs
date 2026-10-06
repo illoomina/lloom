@@ -192,7 +192,9 @@ fn quant_kind_throughput() {
                 Tensor::from_vec(v, (1, TOPK), &dev).unwrap()
             })
             .collect();
-        type Stack = (QTensor, QTensor, QTensor);
+        // Down reads K = INTER = 640, which no 256-element block divides:
+        // Q4_K has no down arm here (the Q4 checkpoint stores down in MXFP4).
+        type Stack = (QTensor, QTensor, Option<QTensor>);
         let w: Vec<Vec<Stack>> = ARMS
             .iter()
             .map(|(l, kind)| {
@@ -211,12 +213,14 @@ fn quant_kind_throughput() {
                                 &format!("up.{l}.{s}"),
                                 &dev,
                             ),
-                            weight(
-                                *kind,
-                                &[EXPERTS, HIDDEN, INTER],
-                                &format!("down.{l}.{s}"),
-                                &dev,
-                            ),
+                            INTER.is_multiple_of(kind.block_size()).then(|| {
+                                weight(
+                                    *kind,
+                                    &[EXPERTS, HIDDEN, INTER],
+                                    &format!("down.{l}.{s}"),
+                                    &dev,
+                                )
+                            }),
                         )
                     })
                     .collect()
@@ -255,6 +259,7 @@ fn quant_kind_throughput() {
         let down: Vec<Arm> = ARMS
             .iter()
             .zip(&w)
+            .filter(|((_, kind), _)| INTER.is_multiple_of(kind.block_size()))
             .map(|((l, kind), ws)| {
                 let (h, ids) = (&h, &ids);
                 Arm {
@@ -263,6 +268,8 @@ fn quant_kind_throughput() {
                     run: Box::new(move |i| {
                         let (_, _, d) = &ws[i % ws.len()];
                         let _ = d
+                            .as_ref()
+                            .unwrap()
                             .indexed_moe_forward_with(h, &ids[i % ids.len()], MoeArm::MatVec)
                             .unwrap();
                     }),

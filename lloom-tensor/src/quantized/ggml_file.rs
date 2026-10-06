@@ -208,7 +208,18 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q2_0 => {
             from_raw_data::<iq_quants::BlockQ2_0>(raw_data, size_in_bytes, dims, device)
         }
-        _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
+        GgmlDType::MXFP4 => {
+            from_raw_data::<super::fp_quants::BlockMxfp4>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::FP8E4M3 => {
+            from_raw_data::<super::fp_quants::BlockFp8E4M3>(raw_data, size_in_bytes, dims, device)
+        }
+        // The activation-side kinds; no file stores a weight in them. No
+        // wildcard: a new kind must choose here, or a GGUF holding it builds
+        // and is refused only when read.
+        GgmlDType::Q8_1 | GgmlDType::Q8K => {
+            crate::bail!("quantized type {ggml_dtype:?} is not supported yet")
+        }
     }
 }
 

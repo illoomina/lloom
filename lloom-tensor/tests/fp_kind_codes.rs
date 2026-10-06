@@ -259,9 +259,10 @@ fn every_e2m1_code_and_e8m0_scale_decodes_as_the_cpu_does() -> Result<()> {
 }
 
 /// An E8M0 scale below f32's normal range (`e8m0_to_f32_half` of 0 and 1,
-/// 2^-128 and 2^-127) decodes to zero on the GPU, which flushes f32
-/// subnormals, where the CPU keeps them; 2 is the smallest scale the two
-/// decode alike. A weight there is under 2^-125 in magnitude.
+/// 2^-128 and 2^-127) is flushed to zero by the GPU, so the whole block
+/// decodes to zero — even codes whose product with the scale is a normal
+/// float — where the CPU keeps every value; 2 is the smallest scale the two
+/// decode alike. A weight there is under 2^-123 in magnitude.
 #[test]
 fn subnormal_e8m0_scales_flush_to_zero_on_the_gpu() -> Result<()> {
     let gpu = metal();
@@ -277,12 +278,13 @@ fn subnormal_e8m0_scales_flush_to_zero_on_the_gpu() -> Result<()> {
             .to_vec1::<f32>()?;
         println!("e={e}: cpu {:?}", &w[..8]);
         println!("e={e}: gpu {:?}", &got[..8]);
+        assert!(
+            w.iter().filter(|r| **r != 0.0).count() >= 28,
+            "e={e}: the CPU keeps them"
+        );
         for (g, r) in got.iter().zip(&w) {
             if e < 2 {
-                assert!(
-                    r.is_subnormal() || *r == 0.0,
-                    "e={e}: {r:e} is not subnormal"
-                );
+                assert!(r.abs() < 2f32.powi(-123), "e={e}: {r:e}");
                 assert_eq!(*g, 0.0, "e={e}: the GPU kept {g:e}");
             } else {
                 assert_eq!(g.to_bits(), r.to_bits(), "e={e}");

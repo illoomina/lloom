@@ -57,8 +57,11 @@ pub struct Regions {
 /// The result of deriving over one graph.
 #[derive(Debug, Clone)]
 pub struct FusionPlan {
-    /// Weight name → fragment name, for every GEMV the plan fuses.
+    /// Weight name → block name, for every GEMV the plan fuses (a prologue
+    /// first: `norm_silu`).
     pub sites: Sites,
+    /// Each kernel fragment's placements (`silu_mul`, `combine_cast`).
+    pub kernels: BTreeMap<String, usize>,
     /// The class the derived graph's roots land in relative to the source.
     pub class: NumericClass,
     /// Dispatches per family, before.
@@ -109,6 +112,9 @@ impl fmt::Display for FusionPlan {
         )?;
         for (frag, n) in per_fragment {
             write!(f, " gemv_{frag}={n}")?;
+        }
+        for (k, n) in &self.kernels {
+            write!(f, " {k}={n}")?;
         }
         if !self.seams.is_empty() {
             write!(f, " unfused[")?;
@@ -207,7 +213,7 @@ pub fn sites(graph: &Graph) -> Sites {
     for node in graph.nodes() {
         if node.op == Op::Fused {
             let w = graph.node(node.inputs[0]);
-            sites.insert(w.name.clone(), node.name.clone());
+            sites.insert(w.name.clone(), node.block());
         }
     }
     sites

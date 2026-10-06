@@ -264,6 +264,41 @@ impl ExpertResidency for GhostExperts {
     }
 }
 
+/// [`GhostExperts`] planned on the host: a walk of a step whose routed
+/// experts the host plans (the ids read back at the layer, no slot map) —
+/// the regime a tier with misses runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GhostHostExperts;
+
+impl ExpertResidency for GhostHostExperts {
+    fn plan(&self, ids: &Tensor) -> Result<Vec<crate::nn::expert_stream::RoutedGroup>> {
+        GhostExperts.plan(ids)
+    }
+    fn ensure(&self, group: &crate::nn::expert_stream::RoutedGroup) -> Result<Tensor> {
+        GhostExperts.ensure(group)
+    }
+    fn gate_up(
+        &self,
+        x: &Tensor,
+        slot_ids: &Tensor,
+        arm: lloom_tensor::quantized::MoeArm,
+        act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        GhostExperts.gate_up(x, slot_ids, arm, act)
+    }
+    fn down(
+        &self,
+        h: &Tensor,
+        slot_ids: &Tensor,
+        arm: lloom_tensor::quantized::MoeArm,
+    ) -> Result<Tensor> {
+        GhostExperts.down(h, slot_ids, arm)
+    }
+    fn plans_on_device(&self) -> bool {
+        false
+    }
+}
+
 /// The committed real checkpoint's model (`scale_manifest_path`) built over
 /// ghost weights by the loader's own assembly, with the PLE: the structure
 /// the decode step's walk reads.
@@ -272,6 +307,46 @@ pub fn ghost_model(dev: &Device) -> Result<Qwen4Exp<GhostExperts>> {
     let manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
     let opts = super::loader::LoadOptions {
         ple: true,
+        ..Default::default()
+    };
+    Qwen4Exp::ghost_of_manifest(&manifest, dev, &opts, |_| GhostExperts)
+}
+
+/// The committed shape of the MTP sidecar (`qwen4exp-mtp-quantize`'s Q8
+/// file, `~/.cache/lloom/qwen4exp-mtp-q8.gguf`): its headers, every tensor's
+/// name, shape and kind — the head's layer `blk.{n_layers}.*` and
+/// `blk.{n_layers}.nextn.*`.
+pub const MTP_SIDECAR_MANIFEST: &str = "qwen4exp-mtp-q8.json";
+
+/// Where [`MTP_SIDECAR_MANIFEST`] is in this source tree.
+pub fn mtp_sidecar_manifest_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/scale_manifests")
+        .join(MTP_SIDECAR_MANIFEST)
+}
+
+/// [`ghost_model`] over [`GhostHostExperts`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ghost_model_host_planned(dev: &Device) -> Result<Qwen4Exp<GhostHostExperts>> {
+    let manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
+    let opts = super::loader::LoadOptions {
+        ple: true,
+        ..Default::default()
+    };
+    Qwen4Exp::ghost_of_manifest(&manifest, dev, &opts, |_| GhostHostExperts)
+}
+
+/// [`ghost_model`] with its MTP head, read from the committed sidecar's
+/// shape as one more shard: the loader's own head assembly
+/// (`LoadOptions::mtp`) over ghost weights.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ghost_model_with_mtp(dev: &Device) -> Result<Qwen4Exp<GhostExperts>> {
+    let mut manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
+    let sidecar = crate::testing::scale::ShapeManifest::read(&mtp_sidecar_manifest_path())?;
+    manifest.shards.extend(sidecar.shards);
+    let opts = super::loader::LoadOptions {
+        ple: true,
+        mtp: true,
         ..Default::default()
     };
     Qwen4Exp::ghost_of_manifest(&manifest, dev, &opts, |_| GhostExperts)

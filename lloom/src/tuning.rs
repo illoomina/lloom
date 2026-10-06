@@ -101,6 +101,9 @@ fn parse_draft_loads(v: &str) -> Result<String, String> {
     }
 }
 
+fn parse_fusion_budget(v: &str) -> Result<String, String> {
+    one_of(v, "fusion budget", &["rounding", "reorder"])
+}
 fn parse_fusion(v: &str) -> Result<String, String> {
     one_of(v, "fusion", &["manual", "derived"])
 }
@@ -145,6 +148,9 @@ pub struct Lfm2Tuning {
     /// The decode step's RMSNorms computed inside the projections that consume them (`nn::ops::gemv_norm`: one dispatch where the pair is two; moves digests). An arm, off by default.
     #[opt(flag = "lfm2-norm-gemv", env = "LLOOM_LFM2_NORM_GEMV", bool)]
     pub norm_gemv: bool,
+    /// The weakest numerical class `--fusion derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
+    #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"])]
+    pub fusion_budget: String,
     /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
     #[opt(flag = "lfm2-ablate", env = "LLOOM_LFM2_ABLATE")]
     pub ablate: String,
@@ -170,6 +176,7 @@ impl Default for Lfm2Tuning {
             flash_partial_bn: 32,
             sdpa_two_pass_k: crate::nn::ops::SDPA_TWO_PASS_K_THRESHOLD,
             norm_gemv: false,
+            fusion_budget: "rounding".into(),
             ablate: String::new(),
             share_trace: false,
             verify_poll_trace: false,

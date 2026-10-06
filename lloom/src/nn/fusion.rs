@@ -63,6 +63,30 @@ pub enum Semantics {
     SwigluGate,
     /// `y = sigmoid(x)`.
     Sigmoid,
+    /// A prologue: the input normalized inside the product, its reduction
+    /// included — `W·(x ⊙ w) · rsqrt(mean(x²) + ε)`, the sum of squares
+    /// taken from the coefficients the K-walk loads and the scale applied at
+    /// the store.
+    RmsNorm,
+    /// A prologue: the input's elementwise half of a norm — `x · s · w` with
+    /// the scale `s` a separate reduction dispatch computed and the product
+    /// imports.
+    RmsNormScaled,
+    /// A prologue: the input normalized per group of `K / groups` inside the
+    /// product (a grouped RMSNorm), its per-group scales reduced across the
+    /// threadgroup before the K-walk.
+    GroupRmsNorm,
+}
+
+/// What a [`Prologue`] needs of the tile it rides: the legality fact a
+/// reduction over `K` moving into the product reads (`docs/fusion.md`
+/// §12.2s). An elementwise prologue rides any tile; a sum over `K` taken in
+/// registers needs a tile whose simdgroup walks all of `K`
+/// (`lloom_tensor::gemv_tile::KWalk::Simdgroup`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileNeed {
+    Any,
+    SimdgroupKWalk,
 }
 
 /// Which second operand an [`Operand`] type binds, as a value the optimizer
@@ -146,13 +170,24 @@ pub trait Epilogue: Elementwise {
 
 /// Input side of the partition. Evaluated `n_tgp × K` times.
 ///
-/// G2: cannot reduce over K — same signature argument as [`Epilogue`].
+/// G2: a functor cannot reduce over K — same signature argument as
+/// [`Epilogue`]. A prologue that carries a reduction does it OUTSIDE the
+/// functor, in the kernel's K-walk, and says which tile that needs
+/// ([`Prologue::NEEDS`]).
 ///
-/// **SEALED**: a prologue is admitted only with a measured win in its doc and a
-/// row in the fusion registry. Today the sealed set is `{PrologueNone}`: both
-/// measured prologues lost (§12.2a 216:1, §12.2b 127:1). So `.before(RmsNorm)`
-/// does not compile until a measurement opens the gate.
-pub trait Prologue: Elementwise + sealed::Sealed {}
+/// **SEALED**: a prologue is admitted with its measurement in its doc — a
+/// win the optimizer may propose, a loss it names and refuses
+/// (`optimizer::fragments`). `RmsNorm`, the standalone norm, is not a
+/// member: `.before(RmsNorm)` does not compile; the members are the
+/// kernels' own prologue functors.
+pub trait Prologue: Elementwise + sealed::Sealed {
+    /// The tile the prologue needs.
+    const NEEDS: TileNeed;
+    /// Whether the producer it absorbs stops being a dispatch: a prologue
+    /// that computes the reduction removes the norm's launch; one that
+    /// imports the reduction's result leaves it.
+    const REMOVES_PRODUCER: bool;
+}
 
 /// The identity prologue — no input-side transform. The only member of the
 /// sealed `Prologue` set (§1.2).
@@ -163,7 +198,65 @@ impl Elementwise for PrologueNone {
     const SEMANTICS: Semantics = Semantics::Identity;
 }
 impl sealed::Sealed for PrologueNone {}
-impl Prologue for PrologueNone {}
+impl Prologue for PrologueNone {
+    const NEEDS: TileNeed = TileNeed::Any;
+    const REMOVES_PRODUCER: bool = false;
+}
+
+/// The RMSNorm computed inside the GEMV, reduction included
+/// (`gemv.metal`'s `PrologueNormInline`, `gemv_norm`; `docs/fusion.md`
+/// §12.2s): at a tile whose simdgroup walks all of `K`, `sum(x²)` rides the
+/// dot product's loaded coefficients and `1/rms` is applied at the store.
+/// Measured: −61 dispatches and −2.64 % of GPU a token on LFM2-2.6B, 4 of 4
+/// rotations. A different summation tree for the sum of squares and no
+/// rounding of the normalized vector: not bit-identical to the pair.
+pub struct PrologueNormInline;
+impl Elementwise for PrologueNormInline {
+    const SUFFIX: &'static str = "_norm";
+    const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::RmsNorm;
+}
+impl sealed::Sealed for PrologueNormInline {}
+impl Prologue for PrologueNormInline {
+    const NEEDS: TileNeed = TileNeed::SimdgroupKWalk;
+    const REMOVES_PRODUCER: bool = true;
+}
+
+/// The norm's elementwise half on the load, its scale imported from a
+/// separate reduction dispatch (`gemv.metal`'s `PrologueRmsNorm`,
+/// `gemv_rmsnorm`; `docs/fusion.md` §12.2a). Measured a loss: the reduction
+/// stays a dispatch, and every threadgroup re-applies the transform to the
+/// whole input — 216–432× the work it moves at LFM2's projections.
+pub struct PrologueRmsNorm;
+impl Elementwise for PrologueRmsNorm {
+    const SUFFIX: &'static str = "_rmsnorm";
+    const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::RmsNormScaled;
+}
+impl sealed::Sealed for PrologueRmsNorm {}
+impl Prologue for PrologueRmsNorm {
+    const NEEDS: TileNeed = TileNeed::Any;
+    const REMOVES_PRODUCER: bool = false;
+}
+
+/// A grouped RMSNorm inside the mixed GEMV (`gemv.metal`'s
+/// `PrologueGroupNorm`, `gemv_mixed_*_gnorm`; `docs/fusion.md` §12.2t): the
+/// per-group scales reduced across the threadgroup before the K-walk, in the
+/// standalone norm's own tree when the threadgroup is its 256 threads — the
+/// composed chain's bits. Any tile; instantiated at the mixed arm's long-K
+/// tile. Measured +6.61 % slower end to end on Qwen4-exp's brackets
+/// (`docs/tuning.md` §13.5u).
+pub struct PrologueGroupNorm;
+impl Elementwise for PrologueGroupNorm {
+    const SUFFIX: &'static str = "_gnorm";
+    const PRECISION: Precision = Precision::Store;
+    const SEMANTICS: Semantics = Semantics::GroupRmsNorm;
+}
+impl sealed::Sealed for PrologueGroupNorm {}
+impl Prologue for PrologueGroupNorm {
+    const NEEDS: TileNeed = TileNeed::Any;
+    const REMOVES_PRODUCER: bool = true;
+}
 
 /// The identity epilogue — no output-side transform. The unfused arm's tail.
 pub struct EpilogueNone;
@@ -320,9 +413,11 @@ pub struct Rope;
 /// ```
 pub struct QkNorm;
 
-/// RMSNorm — a prologue candidate that is sealed out. `RmsNorm` is not a member
-/// of the sealed [`Prologue`] set, so `.before(RmsNorm)` does not compile: both
-/// measured prologues lost (§12.2a, §12.2b) and none is admitted.
+/// RMSNorm, the standalone dispatch — not a member of the sealed
+/// [`Prologue`] set, so `.before(RmsNorm)` does not compile: a norm rides a
+/// product only as one of the kernels' prologue functors
+/// ([`PrologueNormInline`], [`PrologueRmsNorm`]), whose tile need and
+/// measurement the type carries.
 ///
 /// Asserted on the `Prologue` bound (the sealed set), not an orphan `impl`:
 ///
@@ -427,9 +522,10 @@ impl<'w> GemvBuilder<'w> {
         self.then(EpilogueNone).eval(x)
     }
 
-    /// Attach an input-side prologue. `Prologue` is sealed to `{PrologueNone}`
-    /// today, so `.before(RmsNorm)` does not compile until a measured win opens
-    /// the gate. Present so the surface reads `gemv(w).before(P).then(E)`.
+    /// Attach an input-side prologue. `Prologue` is sealed to the kernels'
+    /// prologue functors, so `.before(RmsNorm)` does not compile. Present so
+    /// the surface reads `gemv(w).before(P).then(E)`; the norm prologue's
+    /// runtime op is `super::ops::gemv_norm`.
     pub fn before<P: Prologue>(self, _prologue: P) -> Self {
         self
     }
@@ -562,6 +658,23 @@ mod tests {
         let _: <Silu as Epilogue>::Operand = NoOperand;
         let _: <Residual as Epilogue>::Operand = RowIndexed::<half::f16>(PhantomData);
         let _: <Gate as Epilogue>::Operand = RowIndexed::<half::f16>(PhantomData);
+    }
+
+    /// The prologues' tile needs and suffixes, pinned (§3.1b rule 1): the
+    /// inline norm needs a simdgroup that walks K and removes the norm's
+    /// launch; the imported-scale norm rides any tile and leaves it.
+    #[test]
+    fn the_prologues_carry_their_tile_need() {
+        assert_eq!(PrologueNormInline::SUFFIX, "_norm");
+        assert_eq!(PrologueNormInline::SEMANTICS, Semantics::RmsNorm);
+        assert_eq!(PrologueNormInline::NEEDS, TileNeed::SimdgroupKWalk);
+        assert!(PrologueNormInline::REMOVES_PRODUCER);
+        assert_eq!(PrologueRmsNorm::SUFFIX, "_rmsnorm");
+        assert_eq!(PrologueRmsNorm::NEEDS, TileNeed::Any);
+        assert!(!PrologueRmsNorm::REMOVES_PRODUCER);
+        assert_eq!(PrologueGroupNorm::SUFFIX, "_gnorm");
+        assert_eq!(PrologueGroupNorm::SEMANTICS, Semantics::GroupRmsNorm);
+        assert_eq!(PrologueNone::NEEDS, TileNeed::Any);
     }
 
     /// The typed `Epilogue::SUFFIX` equals the `[[host_name]]` suffix the

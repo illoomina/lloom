@@ -297,6 +297,52 @@ typedef struct {
 } block_iq4_nl;
 static_assert(sizeof(block_iq4_nl) == sizeof(half) + QK4_NL/2, "wrong iq4_nl block size/padding");
 
+// ggml's MXFP4: 32 E2M1 codes (element j in byte j's low nibble, j + 16 in
+// its high nibble) under one E8M0 power-of-two scale.
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4/2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
+// 32 E4M3FN codes under one bf16 scale (its bits: `bfloat` arithmetic is
+// emulated on Apple7, and the widening to float is a shift).
+#define QK_FP8 32
+typedef struct {
+    ushort  d;
+    uint8_t qs[QK_FP8];
+} block_fp8_e4m3;
+static_assert(sizeof(block_fp8_e4m3) == sizeof(ushort) + QK_FP8, "wrong fp8_e4m3 block size/padding");
+
+// The E2M1 values doubled (ggml's `kvalues_mxfp4`); the scale is halved to
+// match, so a decoded weight is the same f32 product the CPU forms.
+constexpr constant static float kvalues_mxfp4_f[16] = {
+    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f, 0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f
+};
+
+// Half an E8M0 scale's value, 2^(e - 128); the two smallest are subnormal.
+static inline float e8m0_to_float_half(uint8_t e) {
+    return as_type<float>(e < 2 ? (0x00200000u << e) : (uint(e - 1) << 23));
+}
+
+static inline float bf16_bits_to_float(ushort b) {
+    return as_type<float>(uint(b) << 16);
+}
+
+// An E4M3FN code at 2^-8 of its value: its exponent and mantissa bits are a
+// half whose exponent is biased by 15 where E4M3's is biased by 7, so the
+// shift is exact for every finite code, subnormals included. The two NaN
+// codes keep their sign.
+static inline float e4m3_x2m8(uint8_t b) {
+    const float v = float(as_type<half>(ushort(((b & 0x80) << 8) | ((b & 0x7F) << 7))));
+    return (b & 0x7F) == 0x7F ? as_type<float>(0x7FC00000u | (uint(b & 0x80) << 24)) : v;
+}
+
+static inline float e4m3_to_float(uint8_t b) {
+    return e4m3_x2m8(b) * 256.0f;
+}
+
 typedef struct {
     half d;
     uint16_t scales_h;
@@ -2755,8 +2801,23 @@ kernel void kernel_mul_mv_q5_1_f32(
 
 #define NB_Q8_0 8
 
-template<typename ACT = float, typename STORE = float>
-void kernel_mul_mv_q8_0_impl(
+// A block of 32 one-byte codes under one scale, the shape the byte-code
+// core reads: `code` is a code's value and `scale` the block's, up to one
+// power of two moved between them (FP8's 2^-8 rides on its scale).
+template<typename B> struct b8_block;
+template<> struct b8_block<block_q8_0> {
+    typedef int8_t code_t;
+    static float code(int8_t q) { return q; }
+    static float scale(device const block_q8_0 & xb) { return xb.d; }
+};
+template<> struct b8_block<block_fp8_e4m3> {
+    typedef uint8_t code_t;
+    static float code(uint8_t q) { return e4m3_x2m8(q); }
+    static float scale(device const block_fp8_e4m3 & xb) { return bf16_bits_to_float(xb.d) * 256.0f; }
+};
+
+template<typename BLOCK, typename ACT = float, typename STORE = float>
+void kernel_mul_mv_b8_impl(
         device const  void * src0,
         device const ACT * src1,
         device       STORE * dst,
@@ -2789,7 +2850,7 @@ void kernel_mul_mv_q8_0_impl(
 
     const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q8_0 * x = (device const block_q8_0 *) src0 + offset0;
+    device const BLOCK * x = (device const BLOCK *) src0 + offset0;
     device const ACT      * y = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[NB_Q8_0];
@@ -2807,12 +2868,12 @@ void kernel_mul_mv_q8_0_impl(
         }
 
         for (int row = 0; row < nr; row++) {
-            device const int8_t * qs = x[ib+row*nb].qs + NB_Q8_0*il;
+            device const typename b8_block<BLOCK>::code_t * qs = x[ib+row*nb].qs + NB_Q8_0*il;
             float sumq = 0.f;
             for (int iq = 0; iq < NB_Q8_0; ++iq) {
-                sumq += qs[iq] * yl[iq];
+                sumq += b8_block<BLOCK>::code(qs[iq]) * yl[iq];
             }
-            sumf[row] += sumq*x[ib+row*nb].d;
+            sumf[row] += sumq*b8_block<BLOCK>::scale(x[ib+row*nb]);
         }
 
         yb += NB_Q8_0 * nw;
@@ -2824,6 +2885,27 @@ void kernel_mul_mv_q8_0_impl(
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
         }
     }
+}
+
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q8_0_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_b8_impl<block_q8_0, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 // Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q8_0_impl (issue #750).
@@ -6378,8 +6460,31 @@ kernel void kernel_mul_mv_iq2_s_f32(
     kernel_mul_mv_iq2_s_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-template<typename ACT = float, typename STORE = float>
-void kernel_mul_mv_iq4_nl_impl(
+// A block of 32 four-bit codes indexing a 16-entry table, under one scale,
+// the shape the 4-bit-codebook core reads: `word(xb, it, w)` is code bytes
+// `8·it + 4·w` to `+ 3` of the block, little-endian.
+template<typename B> struct lut4_block;
+template<> struct lut4_block<block_iq4_nl> {
+    static float entry(int i) { return kvalues_iq4nl_f[i]; }
+    static float scale(device const block_iq4_nl & xb) { return (float)xb.d; }
+    static uint32_t word(device const block_iq4_nl & xb, int it, int w) {
+        device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
+        return q4[2*w] | (q4[2*w+1] << 16);
+    }
+};
+// MXFP4's codes sit at odd addresses (a one-byte scale leads the block), so
+// the word is assembled from bytes.
+template<> struct lut4_block<block_mxfp4> {
+    static float entry(int i) { return kvalues_mxfp4_f[i]; }
+    static float scale(device const block_mxfp4 & xb) { return e8m0_to_float_half(xb.e); }
+    static uint32_t word(device const block_mxfp4 & xb, int it, int w) {
+        device const uint8_t * q = xb.qs + 8*it + 4*w;
+        return uint32_t(q[0]) | (uint32_t(q[1]) << 8) | (uint32_t(q[2]) << 16) | (uint32_t(q[3]) << 24);
+    }
+};
+
+template<typename BLOCK, typename ACT = float, typename STORE = float>
+void kernel_mul_mv_lut4_impl(
         device const  void * src0,
         device const ACT * src1,
         device       STORE * dst,
@@ -6411,13 +6516,13 @@ void kernel_mul_mv_iq4_nl_impl(
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
-    device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + ib_row + offset0;
+    device const BLOCK      * x = (device const BLOCK      *) src0 + ib_row + offset0;
     device const ACT        * y = (device const ACT        *) src1 + r1*ne10 + im*ne00*ne1;
 
     const int ix = tiisg/2;  // 0...15
     const int it = tiisg%2;  // 0 or 1
 
-    shared_values[tiisg] = kvalues_iq4nl_f[tiisg%16];
+    shared_values[tiisg] = lut4_block<BLOCK>::entry(tiisg%16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float4 yl[4];
@@ -6437,12 +6542,11 @@ void kernel_mul_mv_iq4_nl_impl(
 
         for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
 
-            device const block_iq4_nl & xb = x[row*nb + ib];
-            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
+            device const BLOCK & xb = x[row*nb + ib];
 
             float4 acc1 = {0.f}, acc2 = {0.f};
 
-            aux32[0] = q4[0] | (q4[1] << 16);
+            aux32[0] = lut4_block<BLOCK>::word(xb, it, 0);
             aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
             aux32[0] &= 0x0f0f0f0f;
             qf1 = {shared_values[q8[0]], shared_values[q8[1]], shared_values[q8[2]], shared_values[q8[3]]};
@@ -6450,7 +6554,7 @@ void kernel_mul_mv_iq4_nl_impl(
             acc1 += yl[0] * qf1;
             acc2 += yl[1] * qf2;
 
-            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[0] = lut4_block<BLOCK>::word(xb, it, 1);
             aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
             aux32[0] &= 0x0f0f0f0f;
             qf1 = {shared_values[q8[0]], shared_values[q8[1]], shared_values[q8[2]], shared_values[q8[3]]};
@@ -6460,7 +6564,7 @@ void kernel_mul_mv_iq4_nl_impl(
 
             acc1 += acc2;
 
-            sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+            sumf[row] += lut4_block<BLOCK>::scale(xb) * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
 
         }
 
@@ -6473,6 +6577,27 @@ void kernel_mul_mv_iq4_nl_impl(
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
+}
+
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq4_nl_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_lut4_impl<block_iq4_nl, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 // Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq4_nl_impl (issue #750).
@@ -7062,6 +7187,26 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
         reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
         reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
         reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
+    }
+}
+
+// `il` 0 the low nibbles (elements 0..15), 1 the high (16..31).
+template <typename type4x4>
+void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = xb->qs;
+    const float d = e8m0_to_float_half(xb->e);
+    const short shr = 4*il;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = kvalues_mxfp4_f[(q[i] >> shr) & 0x0F] * d;
+    }
+}
+
+template <typename type4x4>
+void dequantize_fp8_e4m3(device const block_fp8_e4m3 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = xb->qs + 16*il;
+    const float d = bf16_bits_to_float(xb->d);
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = e4m3_to_float(q[i]) * d;
     }
 }
 
@@ -9241,8 +9386,8 @@ void kernel_mul_mv_iq4_xs_rows_impl(
     }
 }
 
-template<typename ACT = float, typename STORE = float, int NR1 = 2>
-void kernel_mul_mv_iq4_nl_rows_impl(
+template<typename BLOCK, typename ACT = float, typename STORE = float, int NR1 = 2>
+void kernel_mul_mv_lut4_rows_impl(
         device const  void * src0,
         device const ACT * src1,
         device       STORE * dst,
@@ -9270,12 +9415,12 @@ void kernel_mul_mv_iq4_nl_rows_impl(
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
-    device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + ib_row + offset0;
+    device const BLOCK * x = (device const BLOCK *) src0 + ib_row + offset0;
 
     const int ix = tiisg/2;
     const int it = tiisg%2;
 
-    shared_values[tiisg] = kvalues_iq4nl_f[tiisg%16];
+    shared_values[tiisg] = lut4_block<BLOCK>::entry(tiisg%16);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device const ACT * ybr[NR1];
@@ -9298,14 +9443,13 @@ void kernel_mul_mv_iq4_nl_rows_impl(
             yl[r][0] = float4(y4[0]); yl[r][1] = float4(y4[4]); yl[r][2] = float4(y4[1]); yl[r][3] = float4(y4[5]);
         }
         for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
-            device const block_iq4_nl & xb = x[row*nb + ib];
-            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
-            aux32[0] = q4[0] | (q4[1] << 16);
+            device const BLOCK & xb = x[row*nb + ib];
+            aux32[0] = lut4_block<BLOCK>::word(xb, it, 0);
             aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
             aux32[0] &= 0x0f0f0f0f;
             qf1 = {shared_values[q8[0]], shared_values[q8[1]], shared_values[q8[2]], shared_values[q8[3]]};
             qf2 = {shared_values[q8[4]], shared_values[q8[5]], shared_values[q8[6]], shared_values[q8[7]]};
-            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[0] = lut4_block<BLOCK>::word(xb, it, 1);
             aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
             aux32[0] &= 0x0f0f0f0f;
             qf3 = {shared_values[q8[0]], shared_values[q8[1]], shared_values[q8[2]], shared_values[q8[3]]};
@@ -9317,7 +9461,7 @@ void kernel_mul_mv_iq4_nl_rows_impl(
                 acc1 += yl[r][2] * qf3;
                 acc2 += yl[r][3] * qf4;
                 acc1 += acc2;
-                sumf[r][row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+                sumf[r][row] += lut4_block<BLOCK>::scale(xb) * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
             }
         }
         for (int r = 0; r < NR1; ++r) ybr[r] += 16 * QK4_NL;
@@ -9434,6 +9578,160 @@ void kernel_mul_mv_iq3_s_rows_impl(
     }
 }
 
+template<typename ACT = float, typename STORE = float, int NR1 = 2>
+void kernel_mul_mv_iq4_nl_rows_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne11,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_lut4_rows_impl<block_iq4_nl, ACT, STORE, NR1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne11, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+// The byte-code core's rows form: `NR1` activation rows share each block's
+// decode, at the one-row core's geometry (`N_SIMDGROUP` simdgroups of
+// `N_DST` rows); each row's sum runs in the one-row core's order.
+template<typename BLOCK, typename ACT = float, typename STORE = float, int NR1 = 2>
+void kernel_mul_mv_b8_rows_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne11,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    typedef b8_block<BLOCK> B;
+    const int nr  = N_DST;
+    const int nsg = N_SIMDGROUP;
+    const int nw  = N_SIMDWIDTH;
+
+    const int nb = ne00/QK8_0;
+    const int r0 = tgpig.x;
+    const int64_t r1 = (int64_t)tgpig.y * NR1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * nsg + sgitg) * nr;
+
+    const uint i12 = im%ne12;
+    const uint i13 = im/ne12;
+
+    const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const BLOCK * x = (device const BLOCK *) src0 + offset0;
+
+    const int ix = tiisg/4;
+    const int il = tiisg%4;
+
+    device const ACT * ybr[NR1];
+    for (int r = 0; r < NR1; ++r) {
+        const int64_t rr = min(r1 + r, ne11 - 1);
+        ybr[r] = (device const ACT *) src1 + rr*ne10 + im*ne00*ne1 + ix * QK8_0 + NB_Q8_0*il;
+    }
+
+    float yl[NR1][NB_Q8_0];
+    float sumf[NR1][N_DST];
+    for (int r = 0; r < NR1; ++r) {
+        for (int row = 0; row < nr; ++row) {
+            sumf[r][row] = 0.f;
+        }
+    }
+
+    for (int ib = ix; ib < nb; ib += nw/4) {
+        for (int r = 0; r < NR1; ++r) {
+            for (int i = 0; i < NB_Q8_0; ++i) {
+                yl[r][i] = ybr[r][i];
+            }
+        }
+        for (int row = 0; row < nr; row++) {
+            device const typename B::code_t * qs = x[ib+row*nb].qs + NB_Q8_0*il;
+            float q[NB_Q8_0];
+            for (int iq = 0; iq < NB_Q8_0; ++iq) {
+                q[iq] = B::code(qs[iq]);
+            }
+            const float d = B::scale(x[ib+row*nb]);
+            for (int r = 0; r < NR1; ++r) {
+                float sumq = 0.f;
+                for (int iq = 0; iq < NB_Q8_0; ++iq) {
+                    sumq += q[iq] * yl[r][iq];
+                }
+                sumf[r][row] += sumq*d;
+            }
+        }
+        for (int r = 0; r < NR1; ++r) ybr[r] += NB_Q8_0 * nw;
+    }
+
+    for (int r = 0; r < NR1; ++r) {
+        for (int row = 0; row < nr; ++row) {
+            const float tot = simd_sum(sumf[r][row]);
+            if (tiisg == 0 && first_row + row < ne01 && r1 + r < ne11) {
+                dst[(r1 + r)*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
+            }
+        }
+    }
+}
+
+// A kind whose matmul-vec core is the 4-bit-codebook core over its block:
+// the core under the kinds' naming (`_impl` over (ACT, STORE), `_f32_impl`
+// the f32 alias), the plain matmul-vec kernel over (ACT, STORE), the rows
+// form. `LLOOM_QUANT_KIND` instantiates them.
+#define LLOOM_LUT4_CORE(STEM, BLOCK) \
+template<typename ACT = float, typename STORE = float> \
+void kernel_mul_mv_##STEM##_impl(device const void * src0, device const ACT * src1, device STORE * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, threadgroup int8_t * shared_values, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_lut4_impl<BLOCK, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+} \
+void kernel_mul_mv_##STEM##_f32_impl(device const void * src0, device const float * src1, device float * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, threadgroup int8_t * shared_values, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_lut4_impl<BLOCK, float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+} \
+template<typename ACT, typename STORE> \
+kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, threadgroup int8_t * shared_values [[threadgroup(0)]], uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_lut4_impl<BLOCK, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+} \
+template<typename ACT = float, typename STORE = float, int NR1 = 2> \
+void kernel_mul_mv_##STEM##_rows_impl(device const void * src0, device const ACT * src1, device STORE * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, threadgroup int8_t * shared_values, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_lut4_rows_impl<BLOCK, ACT, STORE, NR1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne11, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+}
+
+// The same for a kind whose core is the byte-code core (no threadgroup table).
+#define LLOOM_B8_CORE(STEM, BLOCK) \
+template<typename ACT = float, typename STORE = float> \
+void kernel_mul_mv_##STEM##_impl(device const void * src0, device const ACT * src1, device STORE * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, threadgroup int8_t * shared_values, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_b8_impl<BLOCK, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+} \
+void kernel_mul_mv_##STEM##_f32_impl(device const void * src0, device const float * src1, device float * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, threadgroup int8_t * shared_values, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_b8_impl<BLOCK, float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg); \
+} \
+template<typename ACT, typename STORE> \
+kernel void kernel_mul_mv_##STEM##_generic(device const void * src0, device const ACT * src1, device STORE * dst, constant int64_t & ne00, constant int64_t & ne01, constant int64_t & ne02, constant uint64_t & nb00, constant uint64_t & nb01, constant uint64_t & nb02, constant int64_t & ne10, constant int64_t & ne11, constant int64_t & ne12, constant uint64_t & nb10, constant uint64_t & nb11, constant uint64_t & nb12, constant int64_t & ne0, constant int64_t & ne1, constant uint & r2, constant uint & r3, uint3 tgpig[[threadgroup_position_in_grid]], uint tiisg[[thread_index_in_simdgroup]], uint sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_b8_impl<BLOCK, ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg); \
+} \
+template<typename ACT = float, typename STORE = float, int NR1 = 2> \
+void kernel_mul_mv_##STEM##_rows_impl(device const void * src0, device const ACT * src1, device STORE * dst, int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne0, int64_t ne1, uint r2, uint r3, uint3 tgpig, uint tiisg, uint sgitg) { \
+    kernel_mul_mv_b8_rows_impl<BLOCK, ACT, STORE, NR1>(src0, src1, dst, ne00, ne01, ne02, ne10, ne11, ne12, ne0, ne1, r2, r3, tgpig, tiisg, sgitg); \
+}
+
+LLOOM_LUT4_CORE(mxfp4, block_mxfp4)
+LLOOM_B8_CORE(fp8_e4m3, block_fp8_e4m3)
+
 #define instantiate_mul_mv_rows(stem, impl, nr1, shared_arg, shared_pass)                        \
 [[host_name("kernel_mul_mv_" #stem "_f32_r" #nr1)]]                                            \
 kernel void kernel_mul_mv_##stem##_f32_r##nr1(                                                 \
@@ -9479,6 +9777,10 @@ instantiate_mul_mv_rows(iq4_nl, kernel_mul_mv_iq4_nl_rows_impl, 2, SHARED_ARG, S
 instantiate_mul_mv_rows(iq4_nl, kernel_mul_mv_iq4_nl_rows_impl, 4, SHARED_ARG, SHARED_PASS)
 instantiate_mul_mv_rows(iq3_s,  kernel_mul_mv_iq3_s_rows_impl,  2, SHARED_ARG, SHARED_PASS)
 instantiate_mul_mv_rows(iq3_s,  kernel_mul_mv_iq3_s_rows_impl,  4, SHARED_ARG, SHARED_PASS)
+instantiate_mul_mv_rows(mxfp4,  kernel_mul_mv_mxfp4_rows_impl,  2, SHARED_ARG, SHARED_PASS)
+instantiate_mul_mv_rows(mxfp4,  kernel_mul_mv_mxfp4_rows_impl,  4, SHARED_ARG, SHARED_PASS)
+instantiate_mul_mv_rows(fp8_e4m3, kernel_mul_mv_fp8_e4m3_rows_impl, 2, NO_SHARED_ARG, NO_SHARED_PASS)
+instantiate_mul_mv_rows(fp8_e4m3, kernel_mul_mv_fp8_e4m3_rows_impl, 4, NO_SHARED_ARG, NO_SHARED_PASS)
 
 // ---- The kinds table (#892 B2, `profiles-and-memory-design.md` §6) ---------
 //
@@ -9523,3 +9825,14 @@ LLOOM_QUANT_KIND(iq3_s, block_iq3_s,    QK_NL, dequantize_iq3_s)
 LLOOM_QUANT_KIND(iq4_nl, block_iq4_nl,   2,     dequantize_iq4_nl)
 LLOOM_QUANT_KIND(iq4_xs, block_iq4_xs,   QK_NL, dequantize_iq4_xs)
 LLOOM_QUANT_KIND(q2_0, block_q2_0,     4,     dequantize_q2_0)
+LLOOM_QUANT_KIND(mxfp4, block_mxfp4,   2,     dequantize_mxfp4)
+LLOOM_QUANT_KIND(fp8_e4m3, block_fp8_e4m3, 2, dequantize_fp8_e4m3)
+
+// The plain f32 matmul-vec of a kind added through the generic kernel (the
+// kinds above it keep their hand-written `_f32` kernels, the byte-identical
+// lock).
+#define LLOOM_QUANT_KIND_MV_F32(STEM) \
+template [[host_name("kernel_mul_mv_" #STEM "_f32")]] kernel decltype(kernel_mul_mv_##STEM##_generic<float, float>) kernel_mul_mv_##STEM##_generic<float, float>;
+
+LLOOM_QUANT_KIND_MV_F32(mxfp4)
+LLOOM_QUANT_KIND_MV_F32(fp8_e4m3)

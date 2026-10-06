@@ -1967,7 +1967,7 @@ mod tile_config_gate {
             "this test asserts the DEFAULT; it cannot run with the override set"
         );
         assert_eq!(
-            forced_gemv_bm(),
+            crate::gemv_tile::forced_gemv_bm(),
             None,
             "unset must select the derived tile, so every recorded figure \
              belongs to the shipping path (§7.1a)"

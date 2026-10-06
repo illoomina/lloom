@@ -329,6 +329,33 @@ fn dequant_row(dtype: GgmlDType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
                 .collect();
             BlockIQ4nl::to_float(&blocks, out);
         }
+        GgmlDType::MXFP4 => {
+            use lloom_tensor::quantized::fp_quants::BlockMxfp4;
+            let blocks: Vec<BlockMxfp4> = bytes
+                .chunks_exact(std::mem::size_of::<BlockMxfp4>())
+                .map(|b| {
+                    let mut qs = [0u8; 16];
+                    qs.copy_from_slice(&b[1..17]);
+                    BlockMxfp4 { e: b[0], qs }
+                })
+                .collect();
+            BlockMxfp4::to_float(&blocks, out);
+        }
+        GgmlDType::FP8E4M3 => {
+            use lloom_tensor::quantized::fp_quants::BlockFp8E4M3;
+            let blocks: Vec<BlockFp8E4M3> = bytes
+                .chunks_exact(std::mem::size_of::<BlockFp8E4M3>())
+                .map(|b| {
+                    let mut qs = [0u8; 32];
+                    qs.copy_from_slice(&b[2..34]);
+                    BlockFp8E4M3 {
+                        d: half::bf16::from_le_bytes([b[0], b[1]]),
+                        qs,
+                    }
+                })
+                .collect();
+            BlockFp8E4M3::to_float(&blocks, out);
+        }
         GgmlDType::F32 => {
             for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
                 *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -389,7 +416,12 @@ impl MmapRows {
             )
         }
         match dtype {
-            GgmlDType::IQ4NL | GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {}
+            GgmlDType::IQ4NL
+            | GgmlDType::MXFP4
+            | GgmlDType::FP8E4M3
+            | GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16 => {}
             other => lloom_tensor::bail!("ngram table dtype {other:?}: no row dequant here"),
         }
         let row_bytes = head_dim / dtype.block_size() * dtype.type_size();
@@ -1285,6 +1317,13 @@ mod tests {
                     .unwrap();
                 QTensor::new(st, (rows, head_dim)).unwrap()
             }
+            GgmlDType::MXFP4 | GgmlDType::FP8E4M3 => {
+                let vals: Vec<f32> = (0..rows * head_dim)
+                    .map(|i| ((i * 37 % 1009) as f32 - 504.0) * 0.001 * (1 + i % 7) as f32)
+                    .collect();
+                let t = Tensor::from_vec(vals, (rows, head_dim), &Device::Cpu).unwrap();
+                QTensor::quantize(&t, dtype).unwrap()
+            }
             other => panic!("no fixture for {other:?}"),
         };
         let path =
@@ -1328,6 +1367,43 @@ mod tests {
                 pooled >= ids.len() as u64,
                 "the concurrent policy must read through the pool: {pooled}"
             );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A table stored in a float-code kind (the FP8 checkpoint stores its
+    /// n-gram table as E4M3 under one bf16 scale) gathers, row by row, what
+    /// the kind's own `to_float` of the whole table holds — an absolute
+    /// reference, not the row path compared with itself.
+    #[test]
+    fn a_float_code_table_gathers_its_to_float_rows() {
+        for dtype in [GgmlDType::MXFP4, GgmlDType::FP8E4M3] {
+            let (rows, head_dim) = (300usize, 160usize);
+            let path = table_file(&format!("fp-{dtype:?}"), rows, head_dim, dtype);
+            let mut f = std::fs::File::open(&path).unwrap();
+            let content = gguf_file::Content::read(&mut f).unwrap();
+            let whole = content
+                .tensor(&mut f, PER_LAYER_TOKEN_EMBD, &Device::Cpu)
+                .unwrap()
+                .dequantize(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let t = MmapRows::open(&path).unwrap();
+            let ids: Vec<i64> = vec![0, 299, 17, 150, 17, 3];
+            let mut got = vec![0f32; ids.len() * head_dim];
+            t.gather_into(&ids, &mut got).unwrap();
+            for (i, &id) in ids.iter().enumerate() {
+                let want = &whole[id as usize * head_dim..(id as usize + 1) * head_dim];
+                assert_eq!(
+                    &got[i * head_dim..(i + 1) * head_dim],
+                    want,
+                    "{dtype:?} row {id}"
+                );
+            }
+            assert!(whole.iter().any(|v| *v != 0.0), "{dtype:?}: an empty table");
             std::fs::remove_file(&path).ok();
         }
     }

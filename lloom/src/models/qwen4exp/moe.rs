@@ -786,30 +786,26 @@ impl<R: ExpertResidency> MoeLayer<R> {
         );
         let g = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
         let u = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
-        let hmid = if act != DType::F16 || self.f16_fuse {
-            w.opaque("silu_mul", &[g, u], Shape::of(&[1, topk, mi]), act)
-        } else {
-            let s = w.silu(g);
-            w.mul(s, u)
-        };
+        // The SwiGLU and, at f16, the combine's widening, as what they
+        // compute: the derivation composes them (`silu_mul`, the combine
+        // reading f16) where the step's switch does.
+        let s = w.silu(g);
+        let hmid = w.mul(s, u);
         let y = w.opaque(
             "mul_mv_id",
             &[wd, hmid, slots],
             Shape::of(&[1, topk, h]),
             act,
         );
-        let y = if act == DType::F16 && !self.f16_fuse {
+        let y = if act == DType::F16 {
             w.opaque("cast", &[y], Shape::of(&[1, topk, h]), f32)
         } else {
             y
         };
         let sg = w.project_qmat("ffn_gate_shexp.weight", &self.sh_gate, x1);
         let su = w.project_qmat("ffn_up_shexp.weight", &self.sh_up, x1);
-        let si = match w.node(sg).shape.last() {
-            Some(Dim::Const(n)) => n,
-            _ => unreachable!(),
-        };
-        let sm = w.opaque("silu_mul", &[sg, su], Shape::of(&[1, si]), f32);
+        let ss = w.silu(sg);
+        let sm = w.mul(ss, su);
         let shared = w.project_qmat("ffn_down_shexp.weight", &self.sh_down, sm);
         let sh_logit = w.project_qmat("ffn_gate_inp_shexp.weight", &self.sh_router, x1);
         let out = w.opaque(

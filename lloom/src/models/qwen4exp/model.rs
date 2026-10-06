@@ -1283,6 +1283,30 @@ impl PassPlan {
     }
 }
 
+
+/// What Qwen4-exp's switches can express, added to `policy`: the bracket
+/// epilogues ride the brackets' own products only (`mixed_silu` the `down`
+/// projection, `mixed_sigmoid` the `up`), and no switch puts a norm in a
+/// product's load. A derivation over the walk under this policy proposes
+/// only what [`Qwen4Exp::derive_fusion_with`] can set.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fusion_policy(policy: &crate::optimizer::Policy) -> crate::optimizer::Policy {
+    let mut policy = policy.clone();
+    for f in ["norm", "rmsnorm"] {
+        if !policy.unavailable.iter().any(|(n, _)| n == f) {
+            policy
+                .unavailable
+                .push((f.to_string(), "no Qwen4-exp switch selects it".to_string()));
+        }
+    }
+    for (f, site) in [("mixed_silu", "_down.weight"), ("mixed_sigmoid", "_up.weight")] {
+        if !policy.sites.iter().any(|(n, _)| n == f) {
+            policy.sites.push((f.to_string(), vec![site.to_string()]));
+        }
+    }
+    policy
+}
+
 impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn new(
         embed_tokens: QMatMul,
@@ -1332,7 +1356,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.derive_fusion_with(&crate::optimizer::Policy::default())
     }
 
-    /// [`Self::derive_fusion`] under `policy` (a test's exclusions).
+    /// [`Self::derive_fusion`] under `policy` (a test's exclusions), with
+    /// what the model's switches can express added ([`fusion_policy`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn derive_fusion_with(&mut self, policy: &crate::optimizer::Policy) -> Result<String> {
         if super::kernels::hc_mix_on() {
@@ -1347,9 +1372,65 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                  launches, not the composed step"
             )
         }
+        if self.brackets().any(|hc| hc.norm_gemv()) {
+            lloom_tensor::bail!(
+                "qwen4exp fusion=derived with qwen4exp.hc_norm_gemv: the arm's grouped-norm \
+                 prologue is {}",
+                crate::optimizer::fragments::MIXED_GNORM_REFUSAL
+            )
+        }
         let graph = crate::optimizer::walk(&*self);
-        let d = crate::optimizer::derive(&graph, policy)?;
+        let policy = fusion_policy(policy);
+        let d = crate::optimizer::derive(&graph, &policy)?;
         let sites = &d.plan.sites;
+        // The kernel fragments: the f32 SwiGLUs are one launch whatever the
+        // switches say, so the plan must place every one; the f16 routed
+        // step's SwiGLU and combine read are its `f16_fuse` switch, set as
+        // the plan places them — all, or none.
+        let placed = |k: &str| d.plan.kernels.get(k).copied().unwrap_or(0);
+        let swiglus = |dt: lloom_tensor::DType| {
+            graph
+                .nodes()
+                .iter()
+                .filter(|n| {
+                    n.op == crate::optimizer::Op::Mul
+                        && n.inputs.iter().any(|&i| {
+                            let s = graph.node(i);
+                            s.op == crate::optimizer::Op::Silu && s.dtype == dt
+                        })
+                })
+                .count()
+        };
+        let combines = graph
+            .nodes()
+            .iter()
+            .filter(|n| {
+                n.name == "moe_combine"
+                    && n.inputs.first().is_some_and(|&c| graph.node(c).name == "cast")
+            })
+            .count();
+        let (f32_sites, f16_sites) = (
+            swiglus(lloom_tensor::DType::F32),
+            swiglus(lloom_tensor::DType::F16),
+        );
+        if placed("silu_mul_f32") != f32_sites {
+            lloom_tensor::bail!(
+                "qwen4exp fusion=derived: the plan leaves {} of {f32_sites} f32 SwiGLUs composed, \
+                 which no switch selects; plan: {}",
+                f32_sites - placed("silu_mul_f32"),
+                d.plan
+            )
+        }
+        let f16_fuse = match (placed("silu_mul_f16"), placed("combine_cast")) {
+            _ if f16_sites == 0 && combines == 0 => None,
+            (s, c) if s == f16_sites && c == combines => Some(true),
+            (0, 0) => Some(false),
+            (s, c) => lloom_tensor::bail!(
+                "qwen4exp fusion=derived: the plan fuses {s} of {f16_sites} f16 SwiGLUs and {c} of \
+                 {combines} combine reads, which the one `f16_fuse` switch cannot express; plan: {}",
+                d.plan
+            ),
+        };
         for (site, fragment) in sites {
             let known = (fragment == "mixed_silu" && site.ends_with("_down.weight"))
                 || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"));
@@ -1374,6 +1455,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             set(&mut layer.hc_ffn, &format!("blk.{l}.hc_ffn"));
         }
         set(&mut self.hc_head, "output_hc");
+        if let Some(on) = f16_fuse {
+            self.set_f16_fuse(on);
+        }
         let refused: Vec<String> = d
             .refused
             .iter()
@@ -1396,6 +1480,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         );
         self.fusion_report = Some(line.clone());
         Ok(line)
+    }
+
+    /// Every HyperConnection bracket of the decode step: each layer's attn
+    /// and ffn brackets in order, then the head's.
+    fn brackets(&self) -> impl Iterator<Item = &HyperConnection> {
+        self.layers
+            .iter()
+            .flat_map(|l| [&l.hc_attn, &l.hc_ffn])
+            .chain(std::iter::once(&self.hc_head))
+    }
+
+    /// Whether every bracket's grouped norm may run inside its consumers
+    /// (`QWEN4EXP_HC_NORM_GEMV`, per bracket; the products keep their
+    /// epilogue switches). `fusion = derived` refuses the arm by name.
+    pub fn set_hc_norm_gemv(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.hc_attn.set_norm_gemv(on);
+            l.hc_ffn.set_norm_gemv(on);
+        }
+        self.hc_head.set_norm_gemv(on);
     }
 
     /// What `qwen4exp.fusion = derived` decided at load; `None` under `manual`.

@@ -11,6 +11,7 @@
 //! The stems are f16, the real checkpoint's dense-stem kind.
 #![cfg(feature = "metal")]
 
+use lloom::models::qwen4exp::model::fusion_policy;
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
@@ -88,27 +89,59 @@ fn differences(a: &Census, b: &Census) -> Vec<(String, u64, u64)> {
 /// that differ (family, walked, ran).
 type Wrong = (usize, Vec<(String, u64, u64)>);
 
+/// The HyperConnection brackets' grouped-norm arm (`QWEN4EXP_HC_NORM_GEMV`,
+/// set per bracket): off; on; on with every bracket's epilogue switches off
+/// (as a plan that refuses them sets them) — the arm keeps them.
+#[derive(Clone, Copy, PartialEq)]
+enum Hc {
+    Off,
+    NormGemv,
+    NormGemvSwitchesOff,
+}
+
 /// The arms the walk describes on top of the default (an f32 KV store, the
 /// routed experts at f32): the store at f16 and quantized to 8 and 4 bits,
 /// the routed experts' activations at f16 with the SwiGLU and the combine's
-/// read fused and composed.
-fn arms() -> Vec<(&'static str, Option<KvPrecision>, Option<bool>)> {
+/// read fused and composed, the brackets' grouped norm in their products.
+fn arms() -> Vec<(&'static str, Option<KvPrecision>, Option<bool>, Hc)> {
     vec![
-        ("default", None, None),
-        ("kv-f16", Some(KvPrecision::dense(DType::F16)), None),
+        ("default", None, None, Hc::Off),
+        ("kv-f16", Some(KvPrecision::dense(DType::F16)), None, Hc::Off),
         (
             "kv-int8",
             Some(KvPrecision::quantized(KvQuant::Int8).unwrap()),
             None,
+            Hc::Off,
         ),
         (
             "kv-int4",
             Some(KvPrecision::quantized(KvQuant::Int4).unwrap()),
             None,
+            Hc::Off,
         ),
-        ("act-f16-fused", None, Some(true)),
-        ("act-f16-composed", None, Some(false)),
+        ("act-f16-fused", None, Some(true), Hc::Off),
+        ("act-f16-composed", None, Some(false), Hc::Off),
+        ("hc-norm-gemv", None, None, Hc::NormGemv),
+        ("hc-norm-gemv-switches-off", None, None, Hc::NormGemvSwitchesOff),
     ]
+}
+
+/// The composition an arm runs, as the policy the walk is derived under —
+/// the model's own (`fusion_policy`: the bracket epilogues on the brackets'
+/// products only); with the f16 routed step composed, its two kernel
+/// fragments refused; with the brackets' epilogues off, theirs.
+fn policy(act_f16_fuse: Option<bool>, hc: Hc) -> Policy {
+    let mut excluded = Vec::new();
+    if act_f16_fuse == Some(false) {
+        excluded.extend(["silu_mul_f16".to_string(), "combine_cast".to_string()]);
+    }
+    if hc == Hc::NormGemvSwitchesOff {
+        excluded.extend(["mixed_silu".to_string(), "mixed_sigmoid".to_string()]);
+    }
+    fusion_policy(&Policy {
+        excluded,
+        ..Policy::default()
+    })
 }
 
 /// Decode `arm`'s model from an empty cache over every kind of position,
@@ -117,10 +150,16 @@ fn check(
     name: &str,
     kv: Option<KvPrecision>,
     act_f16_fuse: Option<bool>,
+    hc: Hc,
     dev: &Device,
 ) -> Result<(Vec<Wrong>, [usize; 3])> {
     let quant = kv.is_some_and(|p| p.quant().is_on());
-    let cfg = if quant { config_at(64) } else { config() };
+    let mut cfg = if quant { config_at(64) } else { config() };
+    if hc != Hc::Off {
+        // Four streams: the injection's product (`[n, n·d]`) reaches the
+        // grouped-norm kernel's tile (`n_out >= 4`, `K >= 16 n_out`).
+        cfg.hc_count = 4;
+    }
     let mut m = if act_f16_fuse.is_some() {
         model_with_experts(&cfg, dev, GgmlDType::Q8_0)
     } else {
@@ -132,6 +171,15 @@ fn check(
     if let Some(fuse) = act_f16_fuse {
         m.set_routed_act(DType::F16);
         m.set_f16_fuse(fuse);
+    }
+    let policy = policy(act_f16_fuse, hc);
+    if hc == Hc::NormGemvSwitchesOff {
+        // A plan refusing the brackets' epilogues sets every switch off.
+        m.derive_fusion_with(&policy)?;
+        assert!(m.bracket_epilogues().iter().all(|e| *e == (false, false)));
+    }
+    if hc != Hc::Off {
+        m.set_hc_norm_gemv(true);
     }
     let ratio = cfg.indexer_compress_ratio;
     let dense = cfg.indexer_budget + ratio - 1;
@@ -158,10 +206,14 @@ fn check(
             .map(|d| d.pipeline.clone())
             .collect();
         let ran = census_of_labels(census.close().iter().map(|(l, n)| (l.as_str(), *n)));
-        let walked = derive(&walk_at(&m, pos), &Policy::default())?
-            .graph
-            .census();
+        let walked = derive(&walk_at(&m, pos), &policy)?.graph.census();
         let d = differences(&walked, &ran);
+        if hc != Hc::Off && pos == 0 {
+            assert!(
+                walked.contains_key("hc_collapse_scaled") && !walked.contains_key("hc_norm"),
+                "{name}: the arm serves the tiny brackets: {walked:?}"
+            );
+        }
         eprintln!(
             "{name} pos {pos}: ran {} walked {} {}",
             ran.values().sum::<u64>(),
@@ -192,8 +244,8 @@ fn every_arm_dispatches_what_its_walk_names_at_every_position() -> Result<()> {
         return Ok(());
     };
     let mut wrong = Vec::new();
-    for (name, kv, act) in arms() {
-        let (w, [blocks, past, two_pass]) = check(name, kv, act, &dev)?;
+    for (name, kv, act, hc) in arms() {
+        let (w, [blocks, past, two_pass]) = check(name, kv, act, hc, &dev)?;
         assert!(
             blocks >= 2 && past >= 2,
             "{name}: the positions cover the block and the past-dense steps"
@@ -260,7 +312,7 @@ fn every_head_pass_dispatches_what_its_walk_names() -> Result<()> {
             eprintln!("head pos 0 labels: {labels:?}");
         }
         let ran = census_of_labels(labels.iter().map(|(l, n)| (l.as_str(), *n)));
-        let walked = derive(&walk_at(&head, pos), &Policy::default())?
+        let walked = derive(&walk_at(&head, pos), &fusion_policy(&Policy::default()))?
             .graph
             .census();
         let d = differences(&walked, &ran);

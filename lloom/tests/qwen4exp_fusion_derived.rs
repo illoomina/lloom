@@ -139,3 +139,29 @@ fn the_derived_plan_reaches_the_brackets() -> Result<()> {
     assert_eq!(delta, 0.0, "the composed chain's bits, on this fixture");
     Ok(())
 }
+
+/// The brackets' grouped-norm arm (`QWEN4EXP_HC_NORM_GEMV`, set per
+/// bracket) is a composition the catalogue cannot express — the collapse
+/// reads the stream scales `down` writes — so `fusion = derived` refuses it
+/// by name rather than derive a plan the arm would then override.
+#[test]
+fn the_derived_plan_refuses_the_grouped_norm_arm_by_name() -> Result<()> {
+    let Some(dev) = device() else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let mut m = model(&dev);
+    m.set_hc_norm_gemv(true);
+    let err = m
+        .derive_fusion_with(&Policy::default())
+        .expect_err("the arm cannot be derived");
+    let msg = err.to_string();
+    eprintln!("{msg}");
+    assert!(
+        msg.contains("qwen4exp.hc_norm_gemv") && msg.contains("not expressible"),
+        "{msg}"
+    );
+    m.set_hc_norm_gemv(false);
+    m.derive_fusion_with(&Policy::default())?;
+    Ok(())
+}

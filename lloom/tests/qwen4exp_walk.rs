@@ -95,7 +95,8 @@ const TRACED_STEP: &[(&str, u64)] = &[
 /// launches, equals the traced step family by family, 1 581 dispatches;
 /// the source walk is the same step with every bracket's epilogues
 /// unfused — 97 `affine`, `silu` and `sigmoid` more, the 194 mixed
-/// products bare.
+/// products bare — and every SwiGLU as its activation and its product, the
+/// 96 `silu_mul` launches a `silu` and a `bmul` each.
 #[test]
 fn the_derived_walk_is_the_traced_step() {
     let source = walk(&model());
@@ -121,9 +122,10 @@ fn the_derived_walk_is_the_traced_step() {
             src.get("silu"),
             src.get("sigmoid")
         ),
-        (Some(&388), None, Some(&98), Some(&98), Some(&98))
+        (Some(&388), None, Some(&98), Some(&(98 + 96)), Some(&98))
     );
-    assert_eq!(source.dispatches(), 1579 + 3 * 97);
+    assert_eq!((src.get("silu_mul"), src.get("bmul").is_some()), (None, true));
+    assert_eq!(source.dispatches(), 1579 + 3 * 97 + 96);
 }
 
 /// E2 of #749's ledger, re-read through the walk: the derived step's
@@ -168,7 +170,18 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
     );
     assert!(silu.contains(&"output_hc_down.weight"));
     assert!(silu.contains(&"blk.47.hc_ffn_down.weight"));
-    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    // The one refusal that applies here: the grouped norm the brackets'
+    // products cannot take as the catalogue stands.
+    assert_eq!(
+        d.refused,
+        [(
+            "mixed_gnorm".to_string(),
+            lloom::optimizer::fragments::MIXED_GNORM_REFUSAL.to_string()
+        )]
+    );
+    // The SwiGLUs as one launch each: the routed experts' and the shared
+    // expert's, 48 layers.
+    assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&96));
     assert_eq!(d.plan.class, NumericClass::Rounding);
     // Every scale absorbed is the bracket's 1/n.
     for n in d.graph.nodes().iter().filter(|n| n.op == Op::Fused) {

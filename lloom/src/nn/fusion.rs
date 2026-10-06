@@ -100,6 +100,10 @@ pub enum OperandKind {
     /// A second weight matrix of the GEMV's own `[n, k]`, swept by the same
     /// threadgroup over the same input coefficients.
     Weight,
+    /// One buffer of exactly the output extent that the block multiplies
+    /// INTO and so overwrites: the operand's only reader, an f32 of the
+    /// product's own extent (the quantized matvec's store block).
+    Into,
 }
 
 /// G1 — a functor sees ONE accumulator value and its index (`gemv.metal:392`).

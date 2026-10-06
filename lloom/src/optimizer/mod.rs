@@ -592,7 +592,9 @@ mod tests {
             policy.unvalidated(),
             vec![
                 ("mixed_silu".to_string(), "no entry".to_string()),
-                ("mixed_sigmoid".to_string(), "no entry".to_string())
+                ("mixed_sigmoid".to_string(), "no entry".to_string()),
+                ("quant_silu".to_string(), "no entry".to_string()),
+                ("quant_mul".to_string(), "no entry".to_string())
             ]
         );
         assert!(policy.unvalidated_in(&mlp(1)).is_empty());
@@ -893,7 +895,19 @@ mod tests {
         let route = g.input("route", Shape::of(&[1, 4]), DType::F32);
         let out = g.opaque("moe_combine", &[y32, route], Shape::of(&[1, 64]), DType::F32);
         g.mark_root(out);
+        // On packed products the store blocks take the SwiGLU — the SiLU on
+        // the gate's store, the product into the gate's buffer — one launch
+        // fewer than the kernel fragment's, which is the answer where the
+        // blocks are excluded.
         let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("wg").map(String::as_str), Some("quant_silu"));
+        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        assert!(d.plan.kernels.get("silu_mul_f32").is_none());
+        let policy = Policy {
+            excluded: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
         assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&1));
         assert_eq!(d.plan.kernels.get("combine_cast"), Some(&1));
         assert_eq!(d.plan.after.get("silu_mul"), Some(&1));
@@ -906,12 +920,50 @@ mod tests {
         assert!(d.plan.to_string().contains(" combine_cast=1 silu_mul_f32=1"), "{}", d.plan);
         // Excluded by name, both pairs stay.
         let policy = Policy {
-            excluded: vec!["silu_mul_f32".to_string(), "combine_cast".to_string()],
+            excluded: vec![
+                "silu_mul_f32".to_string(),
+                "combine_cast".to_string(),
+                "quant_silu".to_string(),
+                "quant_mul".to_string(),
+            ],
             ..Default::default()
         };
         let d = derive(&g, &policy).unwrap();
         assert!(d.plan.kernels.is_empty());
         assert_eq!(d.plan.after.get("cast"), Some(&1));
+    }
+
+    /// The product multiplied into its operand overwrites the operand, so
+    /// it rides only where the operand has no other reader; and the store
+    /// blocks ride packed weights only, never a dense quantized tensor.
+    #[test]
+    fn the_store_product_into_its_operand_needs_the_operand_alone_and_a_packed_weight() {
+        let swiglu = |extra_reader: bool, wdtype: DType| {
+            let mut g = Graph::new();
+            let x = g.input("x", Shape::of(&[1, 1, 64]), DType::F32);
+            let wg = g.weight("wg", Shape::of(&[32, 64]), wdtype);
+            let wu = g.weight("wu", Shape::of(&[32, 64]), wdtype);
+            let a = g.gemv_on(Core::Quant, wg, x);
+            let s = g.silu(a);
+            let b = g.gemv_on(Core::Quant, wu, x);
+            let h = g.mul(s, b);
+            g.mark_root(h);
+            if extra_reader {
+                let e = g.sigmoid(s);
+                g.mark_root(e);
+            }
+            derive(&g, &Policy::default()).unwrap()
+        };
+        let d = swiglu(false, DType::U8);
+        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        let d = swiglu(true, DType::U8);
+        assert_eq!(d.plan.sites.get("wu"), None, "{:?}", d.plan.sites);
+        let d = swiglu(false, DType::F32);
+        assert!(
+            d.plan.sites.values().all(|f| !f.starts_with("quant_")),
+            "{:?}",
+            d.plan.sites
+        );
     }
 
     #[test]

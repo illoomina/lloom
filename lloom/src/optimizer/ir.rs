@@ -271,6 +271,16 @@ pub fn kernel_family(label: &str) -> String {
             .unwrap_or("");
         format!("{before}{after}{epi}")
     };
+    // The quantized matvec with a block on its store: the fused product's
+    // family, as the IR names it.
+    if label.starts_with("kernel_mul_mv_") && !label.starts_with("kernel_mul_mv_id") {
+        if label.ends_with("_f32_silu") {
+            return "gemv_quant_silu".to_string();
+        }
+        if label.ends_with("_f32_mul") {
+            return "gemv_quant_mul".to_string();
+        }
+    }
     for (prefix, family) in [
         ("kernel_mul_mv_id2_", "mul_mv_id2"),
         ("kernel_mul_mv_id_", "mul_mv_id"),
@@ -875,6 +885,8 @@ mod tests {
                 "gemv_mixed_gnorm_silu",
             ),
             ("hc_collapse_scaled_f32", "hc_collapse_scaled"),
+            ("kernel_mul_mv_q8_0_f32_silu", "gemv_quant_silu"),
+            ("kernel_mul_mv_iq3_s_f32_mul", "gemv_quant_mul"),
         ] {
             assert_eq!(kernel_family(label), family, "{label}");
         }

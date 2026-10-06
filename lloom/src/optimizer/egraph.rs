@@ -189,7 +189,7 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
                     let _ = write!(p, " (EpiS_{} i64 :cost 0)", f.name);
                 }
             }
-            OperandKind::RowIndexed | OperandKind::Weight => {
+            OperandKind::RowIndexed | OperandKind::Weight | OperandKind::Into => {
                 let _ = write!(p, " (Epi_{} Expr :cost 0)", f.name);
             }
         }
@@ -238,6 +238,7 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
     p.push_str("(function kwalk (Expr) i64 :merge (max old new))\n");
     p.push_str("(function dt (Expr) i64 :merge (max old new))\n");
     p.push_str("(function sz (Expr) i64 :merge (max old new))\n");
+    p.push_str("(function uses (Expr) i64 :merge (max old new))\n");
     for (f, _) in sites {
         let _ = writeln!(p, "(function ok_{f} (Expr) i64 :merge (max old new))");
     }
@@ -327,6 +328,16 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
     // the core's tag).
     for f in &epilogues {
         let (name, tag) = (f.name, f.core.tag());
+        // The quantized matvec's blocks ride the packed kinds' cores: a dense
+        // `QTensor` weight carries its float dtype, a packed one `U8` (code 0).
+        let packed = |w: &str| {
+            if f.core == Core::Quant {
+                format!(" (= (dt {w}) 0)")
+            } else {
+                String::new()
+            }
+        };
+        let at = |name: &str, w: &str| format!("{}{}", at(name, w), packed(w));
         match (f.semantics, f.operand) {
             (Semantics::Silu | Semantics::Sigmoid, OperandKind::None) => {
                 let act = if f.semantics == Semantics::Silu { "Silu" } else { "Sigmoid" };
@@ -362,6 +373,18 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
                 let _ = writeln!(
                     p,
                     "(rule ((= e (Mul g r)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
+                     ((union e (Fused{tag} w x (Epi_{name} r)))))",
+                    ok = at(name, "w")
+                );
+            }
+            // The product multiplied into the operand's own buffer: the
+            // operand must have no other reader (the block overwrites it), be
+            // f32 and of the product's extent.
+            (Semantics::MulOperand, OperandKind::Into) => {
+                let _ = writeln!(
+                    p,
+                    "(rule ((= e (Mul g r)) (= g (Gemv{tag} w x)) (= (rows g) 1) (= (uses r) 1) \
+                     (= (dt r) 1) (= z (sz r)) (= z (sz g)){ok})\n      \
                      ((union e (Fused{tag} w x (Epi_{name} r)))))",
                     ok = at(name, "w")
                 );
@@ -443,6 +466,7 @@ fn segment_leaf(id: NodeId) -> String {
 /// The `let`s and facts for `graph`; `sites` the site-restricted blocks.
 fn lower(graph: &Graph, sites: &[(String, Vec<String>)]) -> Result<String> {
     let cut = cut_points(graph);
+    let uses = graph.use_counts();
     let mut p = String::new();
     for (id, node) in graph.nodes().iter().enumerate() {
         // A reader names a cut value by its leaf, not its term.
@@ -524,6 +548,7 @@ fn lower(graph: &Graph, sites: &[(String, Vec<String>)]) -> Result<String> {
         {
             let _ = writeln!(p, "(set (dt {name}) {})", dtype_code(node.dtype));
             let _ = writeln!(p, "(set (sz {name}) {size})");
+            let _ = writeln!(p, "(set (uses {name}) {})", uses[id]);
         }
         if node.op == Op::Gemv {
             let rows = match graph.gemv_rows(id) {

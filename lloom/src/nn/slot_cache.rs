@@ -652,6 +652,12 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         self.policy.inflight.iter().filter(|&&v| v != 0).count()
     }
 
+    /// The largest in-flight value over the slots (0: none in flight);
+    /// the IO queue is in order, so a wait for it covers every load.
+    pub fn inflight_max(&self) -> u64 {
+        self.policy.inflight.iter().copied().max().unwrap_or(0)
+    }
+
     /// Forget the in-flight state of every slot whose load landed (event
     /// value ≤ `done`); how many.
     pub fn settle_inflight(&mut self, done: u64) -> u64 {

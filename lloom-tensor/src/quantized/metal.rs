@@ -531,7 +531,16 @@ impl QMetalStorage {
         };
         let encoder = device.command_encoder()?;
 
-        assert_eq!(storage.dtype(), DType::F32);
+        // The GEMM arms read f32 activations; an f16 activation past the
+        // matmul-vec's rows is refused here (#907's finding: it panicked on
+        // an assert), not read under the wrong dtype.
+        if storage.dtype() != DType::F32 {
+            crate::bail!(
+                "quantized matmul on Metal reads f32 activations at {rows_total} rows (the GEMM arms); got {:?} for weight {:?} — the f16 arm is the matmul-vec's, rows <= 8",
+                storage.dtype(),
+                self.dtype
+            )
+        }
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
@@ -1272,8 +1281,7 @@ static MOE_MM_BN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 
 /// Whether a weight kind has a `kernel_mul_mm_id_mapped` arm.
 fn mm_id_has_arm(dtype: crate::kernels::GgmlDType) -> bool {
-    use crate::kernels::GgmlDType as G;
-    !matches!(dtype, G::Q8_1 | G::Q8K | G::BF16)
+    dtype.kind().mul_mm_id_mapped
 }
 
 /// `xs [.., k]` (f32) · `w [n, k]`ᵀ (f16) → `[.., n]` f32 through the
@@ -1427,8 +1435,7 @@ static DEQUANT_ONCE_FROM: std::sync::atomic::AtomicUsize =
 /// The weight kinds with a `kernel_dequant_rows_f16` arm (every quantized
 /// kind; the float kinds have nothing to dequantise).
 fn dequant_once_kind(dtype: crate::kernels::GgmlDType) -> bool {
-    use crate::kernels::GgmlDType as G;
-    !matches!(dtype, G::F32 | G::F16 | G::BF16 | G::Q8_1 | G::Q8K)
+    dtype.kind().dequant_rows_f16
 }
 
 /// One Private scratch a device for the dequantised stems, grown to the
@@ -1464,6 +1471,49 @@ impl super::PairOrder {
             PairOrder::Expert => Some(PairGrid::HalfByPlane),
             PairOrder::Tile => Some(PairGrid::HalfFastest),
             PairOrder::Split => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod kind_table_tests {
+    use super::GgmlDType;
+
+    /// The kernel side's table (`kernels::QuantKind`, #892 B2) carries each
+    /// format's block geometry; it must agree with this module's block
+    /// definitions, the bytes a tensor is sized by.
+    #[test]
+    fn the_kernel_table_agrees_with_the_block_geometry() {
+        const ALL: [GgmlDType; 23] = [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q8_1,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8K,
+            GgmlDType::F16,
+            GgmlDType::F32,
+            GgmlDType::BF16,
+            GgmlDType::IQ2XXS,
+            GgmlDType::IQ2XS,
+            GgmlDType::IQ2S,
+            GgmlDType::IQ3XXS,
+            GgmlDType::IQ3S,
+            GgmlDType::IQ4NL,
+            GgmlDType::IQ4XS,
+            GgmlDType::Q2_0,
+        ];
+        for d in ALL {
+            let k: crate::kernels::GgmlDType = d.into();
+            let kind = k.kind();
+            assert_eq!(kind.block_size, d.block_size(), "{d:?} block_size");
+            assert_eq!(kind.type_size, d.type_size(), "{d:?} type_size");
         }
     }
 }

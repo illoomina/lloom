@@ -193,13 +193,15 @@ fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
         hinted.io_inflight_hits
             + hinted.io_inflight_wasted
             + hinted.io_inflight_landed
+            + hinted.io_inflight_planned
             + inflight as u64
             == hinted.io_hints,
-        "hints {} = in-flight hits {} + wasted {} + landed unwaited {} + still in flight {inflight}",
+        "hints {} = in-flight hits {} + wasted {} + landed unwaited {} + waited for by a device plan {} + still in flight {inflight}",
         hinted.io_hints,
         hinted.io_inflight_hits,
         hinted.io_inflight_wasted,
-        hinted.io_inflight_landed
+        hinted.io_inflight_landed,
+        hinted.io_inflight_planned
     );
     assert_eq!(hinted.bytes_loaded, bytes2, "bytes must be the queue's");
     std::fs::remove_file(&path).ok();

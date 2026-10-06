@@ -25,16 +25,16 @@ use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
 pub use device::{
-    served_pass_request_sites, set_served_request_trace, wire_weights_on, DeviceId, MetalDevice,
-    PassPlansPaused,
+    served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
+    DeviceId, MetalDevice, PassPlansPaused,
 };
 mod host_fed;
 mod host_slot;
-pub use host_slot::HostSlot;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
+pub use host_slot::HostSlot;
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///

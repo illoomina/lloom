@@ -484,6 +484,7 @@ template [[host_name("silu_mul_f16")]] [[kernel]] decltype(silu_mul<half>) silu_
 // type: an f16 `y` widens exactly on load, so the sum is the f32 form's over
 // `y` cast to f32. One thread per output element; the composed path was a
 // broadcast multiply, a sum, a sigmoid, a multiply and an add.
+constant bool moe_masked [[function_constant(778)]];
 template <typename Y>
 kernel void moe_combine(
     const device Y* y [[buffer(0)]],
@@ -494,12 +495,19 @@ kernel void moe_combine(
     constant uint& k [[buffer(5)]],
     constant uint& d [[buffer(6)]],
     constant uint& rows [[buffer(7)]],
+    // The mask arm (`moe_masked`, function constant 778): a flag per plane
+    // `[rows, k]` — the device plan's record, 1 where the plane's expert
+    // was not resident and slot 0 was read — whose plane contributes
+    // nothing: the pass without that expert, defined and finite. With the
+    // constant false the argument is absent and the loop is the plain one.
+    const device uint* flags [[buffer(8), function_constant(moe_masked)]],
     uint idx [[thread_position_in_grid]]) {
   if (idx >= rows * d) return;
   const uint r = idx / d;
   const uint i = idx % d;
   float acc = 0.0f;
   for (uint e = 0; e < k; e++) {
+    if (moe_masked && flags[(size_t)r * k + e] != 0u) continue;
     acc += w[(size_t)r * k + e] * static_cast<float>(y[((size_t)r * k + e) * d + i]);
   }
   const float gz = gate[r];

@@ -33,33 +33,146 @@ pub enum GgmlDType {
     Q2_0,
 }
 
+/// The plain matmul-vec kernel a weight kind has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulMv {
+    /// The #750 genericized core: `<stem>_<triple suffix>` — `_f32` (the
+    /// byte-identical historical arm) and `_f16_f16`.
+    Quant(&'static str),
+    /// The dense template's one f32-store instantiation.
+    Dense(&'static str),
+    /// No kernel built (BF16, Q8_1, Q8_K): refused by name.
+    None,
+}
+
+/// One quant storage kind: what every dispatch that decodes the format
+/// reads, resolved once from the [`GgmlDType`] (`profiles-and-memory-design.md`
+/// §6, #892 B2). The one table for the kernel-name stems, the block
+/// geometry and which entry points the format has an arm in; a format
+/// without an arm is refused by name here, not by a pipeline that fails to
+/// load. Adding a kind is one row (and the Metal instantiations, which the
+/// parity matrix reads from the compiled library — `invariants.md` §15.1p).
+#[derive(Debug)]
+pub struct QuantKind {
+    pub dtype: GgmlDType,
+    /// The kernel-name stem (`q4_K`, `iq3_xxs`, `f16`, …).
+    pub stem: &'static str,
+    /// Elements per block (ggml's `blck_size`) and bytes per block
+    /// (`type_size`).
+    pub block_size: usize,
+    pub type_size: usize,
+    /// The #750 genericized matmul-vec core: the `(f16, f32, f16)` and
+    /// `(f32 as f16, f32, f16)` arms exist beside `_f32`.
+    pub f16_arm: bool,
+    pub mul_mv: MulMv,
+    /// The routed matmul-vec stems (`kernel_mul_mv_id{,2}_<stem>`).
+    pub mul_mv_id: bool,
+    /// The mapped routed GEMMs (`kernel_mul_mm_id_mapped{,16}_<stem>_f32`).
+    pub mul_mm_id_mapped: bool,
+    pub mul_mm: Option<&'static str>,
+    pub get_rows: Option<&'static str>,
+    /// `kernel_dequant_rows_f16_<stem>` (the prefill stems' dequantise-once).
+    pub dequant_rows_f16: bool,
+    /// The core stages a codebook into threadgroup memory (8192 bytes).
+    pub iq_shared: bool,
+}
+
+const fn kind(
+    dtype: GgmlDType,
+    stem: &'static str,
+    block_size: usize,
+    type_size: usize,
+    mul_mv: MulMv,
+    mul_mm: Option<&'static str>,
+    get_rows: Option<&'static str>,
+    iq_shared: bool,
+) -> QuantKind {
+    let quant = matches!(mul_mv, MulMv::Quant(_));
+    let dense = matches!(mul_mv, MulMv::Dense(_));
+    QuantKind {
+        dtype,
+        stem,
+        block_size,
+        type_size,
+        f16_arm: quant,
+        mul_mv,
+        mul_mv_id: quant || dense,
+        mul_mm_id_mapped: quant || dense,
+        mul_mm,
+        get_rows,
+        dequant_rows_f16: quant,
+        iq_shared,
+    }
+}
+
+/// The table, in the enum's order ([`GgmlDType::kind`] indexes it by the
+/// discriminant; a test pins the order).
+#[rustfmt::skip]
+const KINDS: [QuantKind; 23] = [
+    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false),
+    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false),
+    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false),
+    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some("kernel_get_rows_q5_1"),    false),
+    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some("kernel_get_rows_q8_0"),    false),
+    kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false),
+    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some("kernel_get_rows_q2_K"),    false),
+    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some("kernel_get_rows_q3_K"),    false),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some("kernel_get_rows_q4_K"),    false),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some("kernel_get_rows_q5_K"),    false),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some("kernel_get_rows_q6_K"),    false),
+    kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false),
+    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some("kernel_get_rows_f16"),     false),
+    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some("kernel_get_rows_f32"),     false),
+    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some("kernel_get_rows_bf16"),    false),
+    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some("kernel_get_rows_iq2_xxs"), true),
+    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some("kernel_get_rows_iq2_xs"),  true),
+    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some("kernel_get_rows_iq2_s"),   true),
+    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some("kernel_get_rows_iq3_xxs"), true),
+    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some("kernel_get_rows_iq3_s"),   true),
+    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true),
+    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true),
+    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false),
+];
+
 impl GgmlDType {
+    /// Every kind, in the enum's order.
+    pub const ALL: [GgmlDType; 23] = [
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+        GgmlDType::Q8_1,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8K,
+        GgmlDType::F16,
+        GgmlDType::F32,
+        GgmlDType::BF16,
+        GgmlDType::IQ2XXS,
+        GgmlDType::IQ2XS,
+        GgmlDType::IQ2S,
+        GgmlDType::IQ3XXS,
+        GgmlDType::IQ3S,
+        GgmlDType::IQ4NL,
+        GgmlDType::IQ4XS,
+        GgmlDType::Q2_0,
+    ];
+
+    /// The kind's row of the table.
+    pub fn kind(self) -> &'static QuantKind {
+        &KINDS[self as usize]
+    }
+
     /// Whether this weight dtype has a genericized #750 matmul-vec core, and so
     /// can be dispatched under a non-f32 [`GemvTriple`]. The dense (F16/BF16/F32)
     /// and Q8-family weights keep their f32-store-only kernels, so only these
     /// rows offer the `(f16, f32, f16)` arm.
     pub fn has_gemv_triple(self) -> bool {
-        matches!(
-            self,
-            GgmlDType::Q4_0
-                | GgmlDType::Q4_1
-                | GgmlDType::Q5_0
-                | GgmlDType::Q5_1
-                | GgmlDType::Q8_0
-                | GgmlDType::Q2K
-                | GgmlDType::Q3K
-                | GgmlDType::Q4K
-                | GgmlDType::Q5K
-                | GgmlDType::Q6K
-                | GgmlDType::IQ2XXS
-                | GgmlDType::IQ2XS
-                | GgmlDType::IQ2S
-                | GgmlDType::IQ3XXS
-                | GgmlDType::IQ3S
-                | GgmlDType::IQ4NL
-                | GgmlDType::IQ4XS
-                | GgmlDType::Q2_0
-        )
+        self.kind().f16_arm
     }
 }
 
@@ -478,16 +591,7 @@ fn rows_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
 /// Whether the dtype's matmul-vec core stages a codebook into threadgroup
 /// memory (`shared_values [[threadgroup(0)]]`, 8192 bytes per llama.cpp).
 fn needs_iq_shared(dtype: GgmlDType) -> bool {
-    matches!(
-        dtype,
-        GgmlDType::IQ2XXS
-            | GgmlDType::IQ2XS
-            | GgmlDType::IQ2S
-            | GgmlDType::IQ3XXS
-            | GgmlDType::IQ3S
-            | GgmlDType::IQ4NL
-            | GgmlDType::IQ4XS
-    )
+    dtype.kind().iq_shared
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,60 +654,29 @@ pub fn call_quantized_matmul_mv_t(
         ));
     }
 
-    // The weight-dtype stem, e.g. `kernel_mul_mv_q4_0`. The `(activation, store)`
-    // triple suffix is appended below. The dense-weight rows (F16/BF16/F32/Q8K)
-    // keep their historical `_f32`-store names — they are not part of the #750
-    // quantized-core genericization and have no `_f16_f16` arm — so the triple's
-    // f16 arm is only offered on the quantized-weight rows.
-    let quant_stem = match dtype {
-        GgmlDType::Q4_0 => Some("kernel_mul_mv_q4_0"),
-        GgmlDType::Q4_1 => Some("kernel_mul_mv_q4_1"),
-        GgmlDType::Q5_0 => Some("kernel_mul_mv_q5_0"),
-        GgmlDType::Q5_1 => Some("kernel_mul_mv_q5_1"),
-        GgmlDType::Q8_0 => Some("kernel_mul_mv_q8_0"),
-        GgmlDType::Q2K => Some("kernel_mul_mv_q2_K"),
-        GgmlDType::Q3K => Some("kernel_mul_mv_q3_K"),
-        GgmlDType::Q4K => Some("kernel_mul_mv_q4_K"),
-        GgmlDType::Q5K => Some("kernel_mul_mv_q5_K"),
-        GgmlDType::Q6K => Some("kernel_mul_mv_q6_K"),
-        GgmlDType::IQ2XXS => Some("kernel_mul_mv_iq2_xxs"),
-        GgmlDType::IQ2XS => Some("kernel_mul_mv_iq2_xs"),
-        GgmlDType::IQ2S => Some("kernel_mul_mv_iq2_s"),
-        GgmlDType::IQ3XXS => Some("kernel_mul_mv_iq3_xxs"),
-        GgmlDType::IQ3S => Some("kernel_mul_mv_iq3_s"),
-        GgmlDType::IQ4NL => Some("kernel_mul_mv_iq4_nl"),
-        GgmlDType::IQ4XS => Some("kernel_mul_mv_iq4_xs"),
-        GgmlDType::Q2_0 => Some("kernel_mul_mv_q2_0"),
-        // Dense and Q8-family weights: no genericized #750 core, f32 store only.
-        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32 => {
-            None
-        }
-    };
-    // A `String` naming the kernel: the quantized rows are `stem_<triple suffix>`;
-    // the dense/Q8 rows the triple does not reach keep their f32-store names.
-    let name: String = match quant_stem {
-        // Every quant stem ships both `_f32` (byte-identical) and `_f16_f16`
-        // (issue #750), so the suffix the triple selects is always instantiated.
-        Some(stem) => format!("{stem}_{}", triple.name_suffix()),
-        None => {
-            // The triple does not apply to a dense/Q8 weight; a caller asking for
-            // a non-f32 triple on one of these has selected an arm that does not
-            // exist, which is a dispatch error rather than a silent f32 fallback.
+    // The kind's plain matmul-vec: the quantized rows are `stem_<triple
+    // suffix>` (every quant stem ships `_f32`, byte-identical, and
+    // `_f16_f16`, #750); the dense rows keep their one f32-store name,
+    // which the triple does not reach — a non-f32 triple on one has
+    // selected an arm that does not exist, a dispatch error rather than a
+    // silent f32 fallback; a kind with no kernel built (BF16, Q8_1, Q8_K)
+    // is refused here by name, not by the pipeline failing to load.
+    let name: String = match dtype.kind().mul_mv {
+        MulMv::Quant(stem) => format!("{stem}_{}", triple.name_suffix()),
+        MulMv::Dense(name) => {
             if triple != GemvTriple::F32F32F32 {
                 return Err(MetalKernelError::UnsupportedDTypeForOp(
                     "non-f32 GemvTriple",
-                    "dense/Q8 quantized matmul-vec",
+                    "dense quantized matmul-vec",
                 ));
             }
-            match dtype {
-                GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
-                GgmlDType::Q8K => "kernel_mul_mv_q8_K_f32",
-                GgmlDType::F16 => "kernel_mul_mv_f16_f32",
-                GgmlDType::BF16 => "kernel_mul_mv_bf16_f32",
-                GgmlDType::F32 => "kernel_mul_mv_f32_f32",
-                _ => unreachable!("quant_stem None only for the dense/Q8 rows above"),
-            }
-            .to_string()
+            name.to_string()
+        }
+        MulMv::None => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "no kernel_mul_mv kernel is built for this weight dtype (BF16, Q8_1, Q8_K)",
+                "quantized matmul-vec",
+            ))
         }
     };
 
@@ -698,34 +771,14 @@ fn triple_leg_bytes(triple: GemvTriple) -> (u64, u64) {
 
 /// The `kernel_mul_mv_id_<stem>` / `kernel_mul_mv_id2_<stem>` stem of a weight kind.
 fn mv_id_stem(dtype: GgmlDType) -> Result<&'static str, MetalKernelError> {
-    Ok(match dtype {
-        GgmlDType::F32 => "f32",
-        GgmlDType::F16 => "f16",
-        GgmlDType::Q4_0 => "q4_0",
-        GgmlDType::Q4_1 => "q4_1",
-        GgmlDType::Q5_0 => "q5_0",
-        GgmlDType::Q5_1 => "q5_1",
-        GgmlDType::Q8_0 => "q8_0",
-        GgmlDType::Q2K => "q2_K",
-        GgmlDType::Q3K => "q3_K",
-        GgmlDType::Q4K => "q4_K",
-        GgmlDType::Q5K => "q5_K",
-        GgmlDType::Q6K => "q6_K",
-        GgmlDType::IQ2XXS => "iq2_xxs",
-        GgmlDType::IQ2XS => "iq2_xs",
-        GgmlDType::IQ2S => "iq2_s",
-        GgmlDType::IQ3XXS => "iq3_xxs",
-        GgmlDType::IQ3S => "iq3_s",
-        GgmlDType::IQ4NL => "iq4_nl",
-        GgmlDType::IQ4XS => "iq4_xs",
-        GgmlDType::Q2_0 => "q2_0",
-        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "no kernel_mul_mv_id arm for this weight dtype",
-                "routed quantized matmul-vec",
-            ))
-        }
-    })
+    let k = dtype.kind();
+    if !k.mul_mv_id {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "no kernel_mul_mv_id arm for this weight dtype",
+            "routed quantized matmul-vec",
+        ));
+    }
+    Ok(k.stem)
 }
 
 /// The routed-expert matmul-vec (`kernel_mul_mv_id_<q>_f32`): for every
@@ -967,33 +1020,15 @@ pub fn call_quantized_matmul_mm_id_mapped(
             "routed quantized matmul (rows grouped by expert)",
         ));
     }
-    let stem = match dtype {
-        GgmlDType::F32 => "f32",
-        GgmlDType::F16 => "f16",
-        GgmlDType::Q4_0 => "q4_0",
-        GgmlDType::Q4_1 => "q4_1",
-        GgmlDType::Q5_0 => "q5_0",
-        GgmlDType::Q5_1 => "q5_1",
-        GgmlDType::Q8_0 => "q8_0",
-        GgmlDType::Q2_0 => "q2_0",
-        GgmlDType::Q2K => "q2_K",
-        GgmlDType::Q3K => "q3_K",
-        GgmlDType::Q4K => "q4_K",
-        GgmlDType::Q5K => "q5_K",
-        GgmlDType::Q6K => "q6_K",
-        GgmlDType::IQ2XXS => "iq2_xxs",
-        GgmlDType::IQ2XS => "iq2_xs",
-        GgmlDType::IQ2S => "iq2_s",
-        GgmlDType::IQ3XXS => "iq3_xxs",
-        GgmlDType::IQ3S => "iq3_s",
-        GgmlDType::IQ4NL => "iq4_nl",
-        GgmlDType::IQ4XS => "iq4_xs",
-        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
+    let stem = {
+        let k = dtype.kind();
+        if !k.mul_mm_id_mapped {
             return Err(MetalKernelError::UnsupportedDTypeForOp(
                 "no kernel_mul_mm_id_mapped arm for this weight dtype",
                 "routed quantized matmul (rows grouped by expert)",
-            ))
+            ));
         }
+        k.stem
     };
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
@@ -1076,31 +1111,15 @@ pub fn call_quantized_dequant_rows_f16(
     src: &Buffer,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let stem = match dtype {
-        GgmlDType::Q4_0 => "q4_0",
-        GgmlDType::Q4_1 => "q4_1",
-        GgmlDType::Q5_0 => "q5_0",
-        GgmlDType::Q5_1 => "q5_1",
-        GgmlDType::Q8_0 => "q8_0",
-        GgmlDType::Q2_0 => "q2_0",
-        GgmlDType::Q2K => "q2_K",
-        GgmlDType::Q3K => "q3_K",
-        GgmlDType::Q4K => "q4_K",
-        GgmlDType::Q5K => "q5_K",
-        GgmlDType::Q6K => "q6_K",
-        GgmlDType::IQ2XXS => "iq2_xxs",
-        GgmlDType::IQ2XS => "iq2_xs",
-        GgmlDType::IQ2S => "iq2_s",
-        GgmlDType::IQ3XXS => "iq3_xxs",
-        GgmlDType::IQ3S => "iq3_s",
-        GgmlDType::IQ4NL => "iq4_nl",
-        GgmlDType::IQ4XS => "iq4_xs",
-        _ => {
+    let stem = {
+        let kind = dtype.kind();
+        if !kind.dequant_rows_f16 {
             return Err(MetalKernelError::UnsupportedDTypeForOp(
                 "no kernel_dequant_rows_f16 arm for this weight dtype",
                 "dequantise rows to f16",
-            ))
+            ));
         }
+        kind.stem
     };
     if !k.is_multiple_of(16) {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
@@ -1134,57 +1153,12 @@ pub fn call_quantized_dequant_rows_f16(
 
 /// Elements per block of a weight dtype (the ggml `blck_size`).
 fn dtype_block_size(dtype: GgmlDType) -> usize {
-    match dtype {
-        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => 1,
-        GgmlDType::Q4_0
-        | GgmlDType::Q4_1
-        | GgmlDType::Q5_0
-        | GgmlDType::Q5_1
-        | GgmlDType::Q8_0
-        | GgmlDType::Q8_1
-        | GgmlDType::IQ4NL => 32,
-        GgmlDType::Q2_0 => 64,
-        GgmlDType::Q2K
-        | GgmlDType::Q3K
-        | GgmlDType::Q4K
-        | GgmlDType::Q5K
-        | GgmlDType::Q6K
-        | GgmlDType::Q8K
-        | GgmlDType::IQ2XXS
-        | GgmlDType::IQ2XS
-        | GgmlDType::IQ2S
-        | GgmlDType::IQ3XXS
-        | GgmlDType::IQ3S
-        | GgmlDType::IQ4XS => 256,
-    }
+    dtype.kind().block_size
 }
 
 /// Bytes per block of a weight dtype (the ggml `type_size`).
 fn dtype_type_size(dtype: GgmlDType) -> usize {
-    match dtype {
-        GgmlDType::F32 => 4,
-        GgmlDType::F16 | GgmlDType::BF16 => 2,
-        GgmlDType::Q4_0 => 18,
-        GgmlDType::Q4_1 => 20,
-        GgmlDType::Q5_0 => 22,
-        GgmlDType::Q5_1 => 24,
-        GgmlDType::Q8_0 => 34,
-        GgmlDType::Q8_1 => 36,
-        GgmlDType::Q2K => 84,
-        GgmlDType::Q3K => 110,
-        GgmlDType::Q4K => 144,
-        GgmlDType::Q5K => 176,
-        GgmlDType::Q6K => 210,
-        GgmlDType::Q8K => 292,
-        GgmlDType::IQ2XXS => 66,
-        GgmlDType::IQ2XS => 74,
-        GgmlDType::IQ2S => 82,
-        GgmlDType::IQ3XXS => 98,
-        GgmlDType::IQ3S => 110,
-        GgmlDType::IQ4NL => 18,
-        GgmlDType::IQ4XS => 136,
-        GgmlDType::Q2_0 => 18,
-    }
+    dtype.kind().type_size
 }
 
 /// - src0 is usually weight
@@ -1241,31 +1215,13 @@ pub fn call_quantized_matmul_mm_t(
         height: 1,
         depth: 1,
     };
-    let name = match dtype {
-        GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
-        GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
-        GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
-        GgmlDType::F16 => "kernel_mul_mm_f16_f32",
-        GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
-        GgmlDType::F32 => "kernel_mul_mm_f32_f32",
-        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
-        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
-        GgmlDType::IQ2XXS => "kernel_mul_mm_iq2_xxs_f32",
-        GgmlDType::IQ2XS => "kernel_mul_mm_iq2_xs_f32",
-        GgmlDType::IQ2S => "kernel_mul_mm_iq2_s_f32",
-        GgmlDType::IQ3XXS => "kernel_mul_mm_iq3_xxs_f32",
-        GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
-        GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
-        GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
-        GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_f32",
-    };
+    let name = dtype
+        .kind()
+        .mul_mm
+        .ok_or(MetalKernelError::UnsupportedDTypeForOp(
+            "no kernel_mul_mm arm for this weight dtype (Q8_1, Q8_K)",
+            "qmatmul",
+        ))?;
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
     let encoder = ep.encoder();
@@ -1317,31 +1273,13 @@ pub fn call_quantized_get_rows(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let dst_row_stride = hidden_size * core::mem::size_of::<f32>();
-    let name = match dtype {
-        GgmlDType::F32 => "kernel_get_rows_f32",
-        GgmlDType::F16 => "kernel_get_rows_f16",
-        GgmlDType::BF16 => "kernel_get_rows_bf16",
-        GgmlDType::Q4_0 => "kernel_get_rows_q4_0",
-        GgmlDType::Q4_1 => "kernel_get_rows_q4_1",
-        GgmlDType::Q5_0 => "kernel_get_rows_q5_0",
-        GgmlDType::Q5_1 => "kernel_get_rows_q5_1",
-        GgmlDType::Q8_0 => "kernel_get_rows_q8_0",
-        GgmlDType::Q2K => "kernel_get_rows_q2_K",
-        GgmlDType::Q3K => "kernel_get_rows_q3_K",
-        GgmlDType::Q4K => "kernel_get_rows_q4_K",
-        GgmlDType::Q5K => "kernel_get_rows_q5_K",
-        GgmlDType::Q6K => "kernel_get_rows_q6_K",
-        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
-        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
-        GgmlDType::IQ2XXS => "kernel_get_rows_iq2_xxs",
-        GgmlDType::IQ2XS => "kernel_get_rows_iq2_xs",
-        GgmlDType::IQ2S => "kernel_get_rows_iq2_s",
-        GgmlDType::IQ3XXS => "kernel_get_rows_iq3_xxs",
-        GgmlDType::IQ3S => "kernel_get_rows_iq3_s",
-        GgmlDType::IQ4NL => "kernel_get_rows_iq4_nl",
-        GgmlDType::IQ4XS => "kernel_get_rows_iq4_xs",
-        GgmlDType::Q2_0 => "kernel_get_rows_q2_0",
-    };
+    let name = dtype
+        .kind()
+        .get_rows
+        .ok_or(MetalKernelError::UnsupportedDTypeForOp(
+            "no kernel_get_rows arm for this weight dtype (Q8_1, Q8_K)",
+            "get_rows",
+        ))?;
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
     let encoder = ep.encoder();
@@ -1551,6 +1489,22 @@ pub fn call_quantized_matmul_mv_id2_t(
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
+}
+
+#[cfg(test)]
+mod kind_tests {
+    /// The table is indexed by the enum's discriminant: every row sits at
+    /// its own dtype's index (the block geometry against the quantized
+    /// module's definitions is checked where both are in scope,
+    /// `quantized/metal.rs`).
+    #[test]
+    fn every_kind_sits_at_its_dtypes_index() {
+        for (i, d) in super::GgmlDType::ALL.iter().enumerate() {
+            assert_eq!(*d as usize, i, "{d:?}");
+            assert_eq!(d.kind().dtype as usize, i, "{d:?}");
+            assert!(!d.kind().stem.is_empty());
+        }
+    }
 }
 
 #[cfg(test)]

@@ -97,28 +97,23 @@ fn from_stem(s: &str) -> Option<GgmlDType> {
 /// Instantiated kernels no production dispatch selects, each with the reason.
 /// The matrix fails if a name here is no longer in the library, or is
 /// launched by a cell: the list cannot go stale silently.
-pub const UNREACHED: &[(&str, &str)] = &[
-    (
-        "kernel_mul_mv_f16_f16",
-        "the dense f16 weight has no (f16, f32, f16) arm; the dispatch refuses it",
-    ),
-    ("kernel_mul_mv_f16_f32_1row", "no dispatch names it"),
-    ("kernel_mul_mv_f16_f32_l4", "no dispatch names it"),
-    (
-        "kernel_get_rows_i32",
-        "an integer gather, not a quant decode",
-    ),
-];
-
-/// Name prefixes of instantiated families no dispatch selects.
-pub const UNREACHED_PREFIX: &[(&str, &str)] = &[(
-    "kernel_mul_mm_id_",
-    "the unmapped routed GEMM: only `kernel_mul_mm_id_mapped{,16}` is dispatched",
+pub const UNREACHED: &[(&str, &str)] = &[(
+    "kernel_get_rows_i32",
+    "an integer gather, not a quant decode",
 )];
 
+/// Name prefixes of instantiated families no dispatch selects. Empty since
+/// #892 B2 dropped the unmapped routed GEMM (`kernel_mul_mm_id_<fmt>`: only
+/// `kernel_mul_mm_id_mapped{,16}` was ever dispatched), the `iq1_s` /
+/// `iq1_m` instantiations (no `GgmlDType`, no CPU reference) and the three
+/// dense f16 variants no dispatch named — 50 kernels of library bytes and
+/// compile time with no caller (#907's finding).
+pub const UNREACHED_PREFIX: &[(&str, &str)] = &[];
+
 /// Format stems instantiated with no `GgmlDType`: no tensor can carry them,
-/// so no dispatch reaches them and there is no CPU reference.
-pub const NO_GGML_DTYPE: &[&str] = &["iq1_s", "iq1_m"];
+/// so no dispatch reaches them and there is no CPU reference. Empty since
+/// #892 B2 (see [`UNREACHED_PREFIX`]).
+pub const NO_GGML_DTYPE: &[&str] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Entry {

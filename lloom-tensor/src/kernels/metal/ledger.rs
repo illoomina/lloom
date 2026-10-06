@@ -157,6 +157,9 @@ pub struct LedgerSnapshot {
     pub committed: usize,
     /// Pass-level admissions that reclaimed the free lists, and their bytes.
     pub reclaims: (u32, usize),
+    /// Refusals that waited the queue out for the pending lists (the
+    /// admission's second rung, `MetalDevice::admit_bytes`).
+    pub drains: u32,
     pub tenants: Vec<TenantRow>,
 }
 
@@ -175,13 +178,14 @@ impl LedgerSnapshot {
     pub fn line(&self) -> String {
         let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
         let mut s = format!(
-            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB reclaims={}/{:.1} MiB",
+            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB reclaims={}/{:.1} MiB drains={}",
             mib(self.quota),
             mib(self.committed),
             mib(self.floors()),
             mib(self.wants()),
             self.reclaims.0,
-            mib(self.reclaims.1)
+            mib(self.reclaims.1),
+            self.drains
         );
         for t in &self.tenants {
             s.push_str(&format!(
@@ -207,6 +211,7 @@ pub struct Ledger {
     /// release counter on the path a refusal used to take at once.
     reclaims: AtomicU32,
     reclaimed_bytes: AtomicUsize,
+    drains: AtomicU32,
     next_id: AtomicU32,
     tenants: parking_lot::Mutex<Vec<(TenantId, Weak<dyn Tenant>)>>,
 }
@@ -218,6 +223,7 @@ impl Default for Ledger {
             committed: AtomicUsize::new(0),
             reclaims: AtomicU32::new(0),
             reclaimed_bytes: AtomicUsize::new(0),
+            drains: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
             tenants: parking_lot::Mutex::new(Vec::new()),
         }
@@ -308,6 +314,16 @@ impl Ledger {
     }
 
     /// A pass-level admission gave the free lists back: count it.
+    /// A refusal waited the queue out for the pending lists (the second
+    /// rung); counted so the arm's cost is a number.
+    pub fn note_drain(&self) {
+        self.drains.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn drains(&self) -> u32 {
+        self.drains.load(Ordering::Relaxed)
+    }
+
     pub fn note_reclaim(&self, bytes: usize) {
         self.reclaims.fetch_add(1, Ordering::Relaxed);
         self.reclaimed_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -369,6 +385,7 @@ impl Ledger {
             quota: self.quota(),
             committed: self.committed(),
             reclaims: self.reclaims(),
+            drains: self.drains(),
             tenants,
         }
     }
@@ -833,8 +850,16 @@ mod admit_tests {
     /// The second rung: buffers released while their command buffer is still
     /// open sit in the pending lists, out of the first reclaim's reach; the
     /// admission waits the queue out once and gives them back too.
+    /// The admission's second rung is a process-wide knob
+    /// (`set_admission_drain`): the two tests that read it hold this lock
+    /// (libtest runs tests on threads; one flipping the knob under the
+    /// other was the first red).
+    static DRAIN_KNOB: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn a_refusal_drains_the_pending_lists_after_one_wait() {
+        let _knob = DRAIN_KNOB.lock();
+        crate::metal_backend::set_admission_drain(true);
         let Ok(dev @ Device::Metal(_)) = Device::new_metal(0) else {
             return;
         };
@@ -859,13 +884,56 @@ mod admit_tests {
             "the pending lists held 32 MiB behind an open epoch; reclaimed {}",
             a.reclaimed
         );
-        assert!(a.fits, "{a:?}");
+        assert!(a.fits && a.drained, "{a:?}");
     }
 
     /// A pool buffer is committed for as long as it exists, live or free:
     /// through the node going back to the free list (the common release)
     /// and through a `PooledBuffer` released from outside its node (a weak
     /// handle outstanding) alike; the trim that destroys it releases it.
+    /// The arm without the second rung (`--pool-no-admission-drain`): the
+    /// same 32 MiB behind an open epoch is NOT given back, the refusal
+    /// stands, and the ledger counted no drain; the rung back on, the twin
+    /// above holds and the count moves. The default is the rung on.
+    #[test]
+    fn the_second_rung_off_leaves_the_pending_lists_and_refuses() {
+        let _knob = DRAIN_KNOB.lock();
+        let Ok(dev @ Device::Metal(_)) = Device::new_metal(0) else {
+            return;
+        };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let mib = 1usize << 20;
+        let drains = m.ledger().drains();
+        crate::metal_backend::set_admission_drain(false);
+        let held: Vec<_> = (0..32)
+            .map(|_| crate::Tensor::zeros(mib / 4, crate::DType::F32, &dev).unwrap())
+            .collect();
+        drop(held);
+        let committed = m.ledger().committed();
+        let need = 4 * mib;
+        let budget = committed + need - 8 * mib;
+        let a = m.admit_bytes(need, budget);
+        crate::metal_backend::set_admission_drain(true);
+        assert!(!a.drained, "{a:?}");
+        assert_eq!(m.ledger().drains(), drains, "no drain counted");
+        assert!(
+            a.reclaimed < 32 * mib && !a.fits,
+            "the rung off: the pending lists stay behind their epoch and the refusal stands; {a:?}"
+        );
+        // The rung on again: the same shape is given back and counted.
+        let held: Vec<_> = (0..32)
+            .map(|_| crate::Tensor::zeros(mib / 4, crate::DType::F32, &dev).unwrap())
+            .collect();
+        drop(held);
+        let committed = m.ledger().committed();
+        let budget = committed + need - 8 * mib;
+        let a = m.admit_bytes(need, budget);
+        assert!(a.drained && a.fits, "{a:?}");
+        assert_eq!(m.ledger().drains(), drains + 1);
+    }
+
     #[test]
     fn a_free_buffer_stays_committed_until_the_pool_destroys_it() {
         let Ok(Device::Metal(m)) = Device::new_metal(0) else {

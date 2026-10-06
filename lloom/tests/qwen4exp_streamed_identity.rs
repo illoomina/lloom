@@ -145,10 +145,14 @@ fn streamed_model_is_byte_identical_to_resident() -> Result<()> {
     for l in streamed.layers() {
         stats += l.moe().experts().stats();
     }
+    // A plan a layer a pass at least, host or device: under
+    // `QWEN4EXP_REPLAY=device` a token that missed replays on the device
+    // plan, so its layers' plans land in `device_plans`, not `plans`.
     assert!(
-        stats.plans >= 7 * cfg.n_layers as u64,
-        "plans {}",
-        stats.plans
+        stats.plans + stats.device_plans >= 7 * cfg.n_layers as u64,
+        "plans {} device_plans {}",
+        stats.plans,
+        stats.device_plans
     );
     assert!(
         stats.groups > stats.plans,
@@ -159,6 +163,17 @@ fn streamed_model_is_byte_identical_to_resident() -> Result<()> {
         "{stats:?}"
     );
     assert!(stats.bytes_loaded > 0);
+    // The arm, when this binary runs under it: the chunk's groups ran in
+    // readiness order at least once (a count at 0 says the arm did not
+    // fire, and the identity above was vacuous for it).
+    if std::env::var("QWEN4EXP_READY_FIRST").is_ok_and(|v| v == "1") {
+        let n = lloom::models::qwen4exp::moe::ready_reorders();
+        assert!(
+            n > 0,
+            "QWEN4EXP_READY_FIRST=1: no tile's groups were reordered"
+        );
+        println!("READY-FIRST reorders={n}");
+    }
     std::fs::remove_file(&path).ok();
     Ok(())
 }

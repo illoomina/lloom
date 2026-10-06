@@ -226,6 +226,9 @@ pub struct PassAdmission {
     /// reclaim: the owner of those tenants applies the pledge (an elastic
     /// expert tier parks slots) and asks again.
     pub pledged: usize,
+    /// The second rung ran: the queue waited out once and the pending lists
+    /// given back (`--pool-no-admission-drain` turns it off).
+    pub drained: bool,
     pub fits: bool,
 }
 
@@ -472,6 +475,29 @@ fn served_request_trace_on() -> bool {
 /// test's switch; the knob sets it for a run).
 pub fn set_served_request_trace(on: bool) {
     SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The admission's second rung (`admit_bytes`: wait the queue out once and
+/// give the pending lists back before refusing): on unless
+/// `--pool-no-admission-drain`. 0 = not yet read, 1 = off, 2 = on.
+static ADMISSION_DRAIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn admission_drain_on() -> bool {
+    match ADMISSION_DRAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = !crate::tuning::tuning().pool.no_admission_drain;
+            set_admission_drain(on);
+            on
+        }
+    }
+}
+
+/// Turn the admission's second rung on or off for the process (a test's
+/// way to run the arm without it; the CLI's is the tuning flag).
+pub fn set_admission_drain(on: bool) {
+    ADMISSION_DRAIN.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
 type SiteCounts = HashMap<(usize, String), u64>;
@@ -890,12 +916,16 @@ impl MetalDevice {
                 committed,
                 reclaimed: 0,
                 pledged: 0,
+                drained: false,
                 fits: true,
             };
         }
         let mut reclaimed = self.trim_unused_buffers();
         let mut committed = self.ledger.committed();
-        if committed.saturating_add(need) > budget {
+        let mut drained = false;
+        if committed.saturating_add(need) > budget && admission_drain_on() {
+            drained = true;
+            self.ledger.note_drain();
             // The second rung: what the host released and the GPU may still
             // read sits in the pending lists until their epochs complete.
             // Wait the queue out once — the pass would otherwise end the
@@ -922,6 +952,7 @@ impl MetalDevice {
             committed,
             reclaimed,
             pledged,
+            drained,
             fits: committed.saturating_add(need) <= budget,
         }
     }

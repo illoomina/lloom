@@ -487,11 +487,31 @@ pub struct Cache {
     /// not resident (`ExpertResidency::settle`) — the streamed tier's miss
     /// cost under the device plan.
     pub redos: u64,
+    /// Replays run on the DEVICE plan (`QWEN4EXP_REPLAY=device`, the arm
+    /// that keeps the plan armed through a miss): one settle readback a
+    /// replay, no per-layer drain; `replay_fallbacks` counts the replays
+    /// that exhausted the bound (one per layer) and fell back to the host
+    /// plan.
+    pub device_replays: u64,
+    pub replay_fallbacks: u64,
     /// Whether the next decode pass plans on the device: armed by a pass
     /// that completed with every expert resident, disarmed by a pass that
     /// missed (the cold phase runs the host plan — one token and its loads,
     /// no replay — and the warm phase the device plan).
     pub device_plan_armed: bool,
+    /// The plan armed by the arm (`QWEN4EXP_REPLAY=device`) after a
+    /// host-planned pass that loaded, not by a clean one: the decode's
+    /// tokens run the device plan and replay there; a verify window keeps
+    /// the default's rule (a window planned on a pool that misses is cut
+    /// or redone, and its accounting is the host plan's — the MTP tests
+    /// pin it), so the forced arming does not reach it.
+    pub armed_through_misses: bool,
+    /// The tier's miss count at the last device-planned token's hint: the
+    /// hotlist's prediction (`QWEN4EXP_PREDICT=hotlist`) stages only after
+    /// a token that loaded — a warm pool stages nothing (the third A/B:
+    /// eight spare slots a layer, always free, had the hint stage 384
+    /// experts a token on a pool that missed nothing, +10 % warm).
+    pub predict_misses_seen: u64,
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
@@ -689,6 +709,10 @@ impl Cache {
             standing: false,
             redos: 0,
             device_plan_armed: false,
+            armed_through_misses: false,
+            predict_misses_seen: 0,
+            device_replays: 0,
+            replay_fallbacks: 0,
             host_plan_passes: 0,
             replay_ns: 0,
             host_pass_ns: 0,
@@ -2660,6 +2684,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             return Ok(logits);
         }
+        // The arm (`QWEN4EXP_PREDICT=hotlist`): before a device-planned
+        // token, every layer's tier stages the hotlist's experts not
+        // resident; its plan lands them before it maps the pool (#849's D
+        // with the prediction the hotlist gives).
+        if cache.device_plan_armed && predict_hot() {
+            let misses = self.stream_misses();
+            if misses != cache.predict_misses_seen {
+                cache.predict_misses_seen = misses;
+                for layer in &self.layers {
+                    layer.moe().experts().prefetch_hot()?;
+                }
+            }
+        }
         // The cold phase: a pool that missed on the last pass runs the host
         // plan — one token and its loads, no replay — until a pass completes
         // with every expert resident; then the device plan, until it misses.
@@ -2673,8 +2710,16 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             cache.keep_standing();
             cache.host_plan_passes += 1;
             cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
-            if self.stream_misses() == before {
+            // The arm (`QWEN4EXP_REPLAY=device`): the plan arms after the
+            // first host-planned pass whatever it loaded — in a steady miss
+            // regime no pass is ever miss-free, so the default's switch
+            // never arms and every token is host-planned (48 drains); the
+            // arm puts those tokens on the device plan, their misses
+            // settled and replayed there.
+            let clean = self.stream_misses() == before;
+            if clean || replay_on_device() {
                 cache.device_plan_armed = true;
+                cache.armed_through_misses = !clean;
             }
             return Ok(logits);
         }
@@ -2701,6 +2746,45 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         cache.settle_after_first += after_first;
         let t0 = std::time::Instant::now();
+        // The arm (`QWEN4EXP_REPLAY=device`): the plan stays armed through
+        // the miss. The settle loaded what the pass missed; the replay runs
+        // on the device plan again — right up to the layer past the loaded
+        // one at worst, so it may miss once more one layer further, at
+        // most once per layer (#849's "the device plan staying armed
+        // through misses": one settle readback a replay instead of the
+        // host plan's drain at every layer). The bound exhausted, the host
+        // plan once, as the default does.
+        if replay_on_device() {
+            let bound = self.layers.len().max(1);
+            let mut h = h.clone();
+            for _ in 0..bound {
+                self.note_replay();
+                cache.rewind_window()?;
+                cache.redos += 1;
+                cache.device_replays += 1;
+                cache.open_window()?;
+                if predict_hot() {
+                    for layer in &self.layers {
+                        layer.moe().experts().prefetch_hot()?;
+                    }
+                }
+                h = self.replay_input_owned(&h)?;
+                let (logits, records) = self.decode_embed_pass(&h, cache, obs, RowPlan::Device)?;
+                self.replay_read_encoded(&h);
+                let records: Vec<(usize, Tensor)> = records
+                    .into_iter()
+                    .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
+                    .collect();
+                let (redo, after_first) = self.settle_records(&records)?;
+                if !redo {
+                    cache.keep_standing();
+                    cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                    return Ok(logits);
+                }
+                cache.settle_after_first += after_first;
+            }
+            cache.replay_fallbacks += 1;
+        }
         self.note_replay();
         cache.rewind_window()?;
         cache.redos += 1;
@@ -2912,6 +2996,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
             m.pass_diverged();
+        }
+        // The tiers: the replay's resolves must not count the settled
+        // token's experts into the hotlist again (#899's finding).
+        for layer in &self.layers {
+            layer.moe().experts().note_replay();
         }
     }
 
@@ -3391,7 +3480,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let h = self.embed(tokens)?; // [B, 1, hidden]
         let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let planned =
-            self.device_plan && plan_on_device() && caches.iter().all(|c| c.device_plan_armed);
+            self.device_plan
+                && plan_on_device()
+                && caches
+                    .iter()
+                    .all(|c| c.device_plan_armed && !c.armed_through_misses);
         if !planned {
             let before = self.stream_misses();
             // Timed only where a tier streams (the miss regime's pass).
@@ -3626,7 +3719,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
-        let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let planned = self.device_plan
+            && plan_on_device()
+            && cache.device_plan_armed
+            && !cache.armed_through_misses;
         let h = if planned { Self::replay_input(&h)? } else { h };
         let drafts = !planned && cache.window_loads_drafts();
         let kind = if planned {
@@ -4060,6 +4156,23 @@ impl super::moe::PlanHook for JoinHook {
             }
         }
     }
+}
+
+/// `QWEN4EXP_REPLAY=device` (read once): a decode step that missed replays
+/// on the device plan, the plan staying armed (#849 D's base, #892's
+/// follow-up); the default replays on the host plan and disarms, as
+/// before — the maintainer decides the default on the numbers.
+fn replay_on_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
+}
+
+/// `QWEN4EXP_PREDICT=hotlist` (read once): before a device-planned token
+/// the tiers stage the hotlist's experts not resident and the plan lands
+/// them (#849's D with the hotlist's prediction); off by default.
+fn predict_hot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist"))
 }
 
 /// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.

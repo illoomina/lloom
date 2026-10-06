@@ -586,6 +586,15 @@ pub struct PoolTuning {
     /// Never reuse a freed buffer (the corruption-class diagnostic; §2.3.8b).
     #[opt(flag = "pool-no-reuse", env = "LLOOM_POOL_NO_REUSE", bool)]
     pub no_reuse: bool,
+    /// The admission's second rung off: a pass that does not fit after the
+    /// free lists are trimmed is NOT waited out for the pending lists
+    /// (`MetalDevice::admit_bytes`, `memory.md` §9.5t) — the refusal stands
+    /// on the first figure, or the tenants' pledge alone. The rung costs
+    /// nothing while the budget suffices (it runs on the refusal path
+    /// alone) and is counted in the ledger's `drains`; this is the arm
+    /// without it, for the maintainer's numbers (#892).
+    #[opt(flag = "pool-no-admission-drain", env = "LLOOM_POOL_NO_ADMISSION_DRAIN", bool)]
+    pub no_admission_drain: bool,
     /// Completed command buffers a released buffer must outlive before reuse (0 ships; the #748 A/B).
     #[opt(flag = "pool-quarantine", env = "LLOOM_POOL_QUARANTINE")]
     pub quarantine: u64,
@@ -609,6 +618,7 @@ impl Default for PoolTuning {
             reuse_oversize_bound: None,
             eviction_order: "age".into(),
             no_reuse: false,
+            no_admission_drain: false,
             quarantine: 0,
             retain_evicted: false,
             unpooled_uploads: false,

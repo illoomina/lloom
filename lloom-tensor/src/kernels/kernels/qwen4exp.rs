@@ -351,6 +351,11 @@ pub fn call_silu_mul(
     Ok(())
 }
 
+/// The function constant selecting `moe_combine`'s masked variant
+/// (`moe_masked` in `qwen4exp.metal`): the flags bound at buffer 8, a
+/// flagged plane skipped. False, the plain kernel.
+pub const MOE_MASK_FUNCTION_CONSTANT: usize = 778;
+
 /// `moe_combine_<y_dtype>`: `out [rows, d] = Σ_k w · y + shared ·
 /// sigmoid(gate)`, f32 except `y`, which is `y_dtype` (f32 or f16).
 #[allow(clippy::too_many_arguments)]
@@ -367,9 +372,17 @@ pub fn call_moe_combine(
     shared: BufferOffset,
     gate: BufferOffset,
     out: &Buffer,
+    flags: Option<BufferOffset>,
 ) -> Result<(), MetalKernelError> {
     let name = float_kernel("moe_combine_f32", "moe_combine_f16", y_dtype)?;
-    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, name)?;
+    // The kernel references a function constant, so it is always built
+    // specialized: the masked variant with flags, the plain one without.
+    let constants = crate::kernels::metal::library::ConstantValues::new(vec![(
+        MOE_MASK_FUNCTION_CONSTANT,
+        crate::kernels::metal::library::Value::Bool(flags.is_some()),
+    )]);
+    let pipeline =
+        kernels.load_pipeline_with_constants(device, Source::Qwen4Exp, name, Some(constants))?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -387,6 +400,9 @@ pub fn call_moe_combine(
             rows as u32
         )
     );
+    if let Some(f) = &flags {
+        crate::kernels::utils::set_param(encoder, 8, f);
+    }
     let total = rows * d;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, total.div_ceil(width), width);

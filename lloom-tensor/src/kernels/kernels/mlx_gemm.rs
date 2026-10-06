@@ -838,9 +838,11 @@ pub fn call_mlx_gemv_epilogue(
 
 /// A GEMV with its RMSNorm computed inside it ([`GemvNormInline`]): `out =
 /// epilogue((W (x * norm.w)) * rsqrt(mean(x^2) + eps))`, one dispatch where the
-/// unfused pair is an `rmsnorm` and a GEMV. Only `GemvEpilogue::None` and
-/// `GemvEpilogue::Silu` are instantiated, at the non-transposed `bm4`/`bm8`
-/// decode tiles, `ParamStyle::Split`; anything else is refused.
+/// unfused pair is an `rmsnorm` and a GEMV. `GemvEpilogue::None`, `Silu` and
+/// `Swiglu` are instantiated (`Swiglu`: `rhs` is the UP weight and
+/// `epilogue_operand` the GATE weight, both sweeps normalized,
+/// `gemv_norm_swiglu`), at the non-transposed `bm4`/`bm8` decode tiles,
+/// `ParamStyle::Split`; anything else is refused.
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemv_norm(
     device: &Device,
@@ -857,6 +859,7 @@ pub fn call_mlx_gemv_norm(
     output: &Buffer,
     norm: GemvNormInline<'_>,
     epilogue: GemvEpilogue,
+    epilogue_operand: Option<(&Buffer, usize)>,
 ) -> Result<(), MetalKernelError> {
     gemv_dispatch(
         device,
@@ -874,7 +877,7 @@ pub fn call_mlx_gemv_norm(
         ParamStyle::Split,
         GemvPrologue::NormInline(norm),
         epilogue,
-        None,
+        epilogue_operand,
     )
 }
 
@@ -1050,9 +1053,13 @@ fn gemv_dispatch(
                  bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn} {style:?} (mnk={m}x{n}x{k})"
             )));
         }
-        if !matches!(epilogue, GemvEpilogue::None | GemvEpilogue::Silu) {
+        if !matches!(
+            epilogue,
+            GemvEpilogue::None | GemvEpilogue::Silu | GemvEpilogue::Swiglu
+        ) {
             return Err(MetalKernelError::LoadFunctionError(format!(
-                "gemv inline norm composes with no epilogue or SiLU only, not {epilogue:?}"
+                "gemv inline norm composes with no epilogue, SiLU or the two-weight SwiGLU \
+                 only, not {epilogue:?}"
             )));
         }
     }
@@ -1219,15 +1226,19 @@ fn gemv_dispatch(
             encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
             encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
         }
+        // After the epilogue's operand when it reads one (`gemv_norm_swiglu`:
+        // the gate weight at 15, the norm at 16 and 17), else at 15 and 16.
         GemvPrologue::NormInline(norm) => {
-            encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
-            encoder.set_bytes(16, &norm.eps);
+            let at = if epilogue.needs_operand() { 16 } else { 15 };
+            encoder.set_input_buffer(at, Some(norm.weight), norm.weight_offset);
+            encoder.set_bytes(at + 1, &norm.eps);
         }
         GemvPrologue::None => {}
     }
 
-    // The fused epilogue's one binding, also at 15 -- the two fused arms are
-    // refused together above, so they never both bind it. The same index under
+    // The fused epilogue's one binding, also at 15 -- the `_rmsnorm` prologue
+    // and an epilogue are refused together above, and the inline norm binds
+    // past it when both are present, so nothing else is bound there. The same index under
     // both styles: the packed sibling declares `residual` at 15, past every
     // slot the packed layout uses, and this bind happens after the capture
     // has closed, so it is not renumbered. `set_input_buffer`
@@ -1295,7 +1306,7 @@ pub fn call_mlx_gemv_mixed(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
-    (b, n_out, k): (usize, usize, usize),
+    bnk: (usize, usize, usize),
     mat_buffer: &Buffer,
     mat_offset: usize,
     vec_buffer: &Buffer,
@@ -1305,11 +1316,129 @@ pub fn call_mlx_gemv_mixed(
     epilogue: MixedEpilogue,
     scale: f32,
 ) -> Result<(), MetalKernelError> {
+    gemv_mixed_dispatch(
+        device,
+        ep,
+        kernels,
+        bnk,
+        mat_buffer,
+        mat_offset,
+        vec_buffer,
+        vec_offset,
+        vec_batch_stride,
+        output,
+        epilogue,
+        scale,
+        None,
+    )
+}
+
+/// The grouped RMSNorm a [`call_mlx_gemv_mixed_gnorm`] computes inside the
+/// GEMV (`gemv.metal`'s `PrologueGroupNorm`): `vec` normalized per group of
+/// `group` elements (`groups` of them, `group · groups == k`), then scaled by
+/// the f32 `weight` `[k]`. With `scales`, the per-row group scales
+/// (`rsqrt(mean(x_g^2) + eps)`, `b · groups` f32) are written there too.
+pub struct GemvGroupNorm<'a> {
+    pub weight: &'a Buffer,
+    pub weight_offset: usize,
+    pub eps: f32,
+    pub group: usize,
+    pub groups: usize,
+    pub scales: Option<(&'a Buffer, usize)>,
+}
+
+/// The most groups `PrologueGroupNorm`'s threadgroup scratch holds
+/// (`kGroupNormMaxGroups`).
+pub const GEMV_GROUP_NORM_MAX_GROUPS: usize = 8;
+
+/// Whether [`call_mlx_gemv_mixed_gnorm`] serves an `[n_out, k]` matrix with
+/// `groups` groups: the tile `derive_gemv_tile` picks is the one instantiated
+/// (`bm1 bn8 sm1 sn32 tm4`, 256 threads), `k` splits into the groups, and the
+/// groups fit the scratch. A caller checks this and composes otherwise.
+pub fn gemv_mixed_gnorm_serves(n_out: usize, k: usize, groups: usize) -> bool {
+    derive_gemv_tile(n_out, k) == (1, 8, 1, 32)
+        && n_out >= 4
+        && (1..=GEMV_GROUP_NORM_MAX_GROUPS).contains(&groups)
+        && k.is_multiple_of(groups)
+}
+
+/// [`call_mlx_gemv_mixed`] with a grouped RMSNorm of `vec` computed inside it
+/// ([`GemvGroupNorm`]): `out = epilogue(scale · mat · norm(vec))`, one launch
+/// where the composed route is the norm's launch and the GEMV. Refused where
+/// [`gemv_mixed_gnorm_serves`] is false, and for the sigmoid epilogue (not
+/// instantiated).
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_mixed_gnorm(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    bnk: (usize, usize, usize),
+    mat_buffer: &Buffer,
+    mat_offset: usize,
+    vec_buffer: &Buffer,
+    vec_offset: usize,
+    vec_batch_stride: usize,
+    output: &Buffer,
+    epilogue: MixedEpilogue,
+    scale: f32,
+    norm: GemvGroupNorm<'_>,
+) -> Result<(), MetalKernelError> {
+    gemv_mixed_dispatch(
+        device,
+        ep,
+        kernels,
+        bnk,
+        mat_buffer,
+        mat_offset,
+        vec_buffer,
+        vec_offset,
+        vec_batch_stride,
+        output,
+        epilogue,
+        scale,
+        Some(norm),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemv_mixed_dispatch(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, n_out, k): (usize, usize, usize),
+    mat_buffer: &Buffer,
+    mat_offset: usize,
+    vec_buffer: &Buffer,
+    vec_offset: usize,
+    vec_batch_stride: usize,
+    output: &Buffer,
+    epilogue: MixedEpilogue,
+    scale: f32,
+    norm: Option<GemvGroupNorm<'_>>,
+) -> Result<(), MetalKernelError> {
     let (bm, bn, sm, sn) = derive_gemv_tile(n_out, k);
     let tm: usize = if n_out < 4 { 1 } else { 4 };
     let tn: usize = 4;
+    let gnorm_suffix = match &norm {
+        None => "",
+        Some(g) => {
+            if !gemv_mixed_gnorm_serves(n_out, k, g.groups) || g.group * g.groups != k {
+                return Err(MetalKernelError::LoadFunctionError(format!(
+                    "gemv_mixed grouped norm: not instantiated for [{n_out}, {k}] in {} groups \
+                     of {} (tile bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}; only bm1_bn8_sm1_sn32_tm4)",
+                    g.groups, g.group
+                )));
+            }
+            if epilogue == MixedEpilogue::Sigmoid {
+                return Err(MetalKernelError::LoadFunctionError(
+                    "gemv_mixed grouped norm: no sigmoid variant is instantiated".to_string(),
+                ));
+            }
+            "_gnorm"
+        }
+    };
     let name = format!(
-        "gemv_mixed_f16w_f32_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{}",
+        "gemv_mixed_f16w_f32_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{}{gnorm_suffix}",
         epilogue.name_suffix()
     );
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
@@ -1341,6 +1470,22 @@ pub fn call_mlx_gemv_mixed(
             1i32 // bias_stride
         )
     );
+    // The grouped norm's bindings, after every slot the classical layout
+    // declares (`gemv_mixed_gnorm_wrapper`). Reads through `set_input_buffer`
+    // (the hazard edge to the input's producer), the scales through
+    // `set_output_buffer` (a later consumer's edge to this dispatch); with no
+    // scales asked for, the output is bound at 19 and never written there.
+    if let Some(g) = &norm {
+        encoder.set_input_buffer(15, Some(g.weight), g.weight_offset);
+        encoder.set_bytes(16, &g.eps);
+        encoder.set_bytes(17, &(g.group as i32));
+        encoder.set_bytes(18, &(g.groups as i32));
+        match g.scales {
+            Some((buf, off)) => encoder.set_output_buffer(19, Some(buf), off),
+            None => encoder.set_output_buffer(19, Some(output), 0),
+        }
+        encoder.set_bytes(20, &(g.scales.is_some() as i32));
+    }
     let n_out_per_tgp = bm * sm * tm;
     let n_tgp = n_out.div_ceil(n_out_per_tgp);
     encoder.dispatch_thread_groups(

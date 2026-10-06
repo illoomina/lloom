@@ -74,6 +74,8 @@ fn rel_err_at(
         .flatten_all()?
         .to_vec1::<f32>()?;
     assert_eq!(got.len(), n);
+    // `f32::max` drops a NaN, so a non-finite output would read as no error.
+    assert!(got.iter().all(|v| v.is_finite()), "gemv_norm [{n}, {k}]: a non-finite output");
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
     Ok(got
         .iter()
@@ -198,5 +200,106 @@ fn gemv_norm_serves_the_tiles_it_runs_at() -> Result<()> {
             ran.err()
         );
     }
+    Ok(())
+}
+
+/// `silu(gate·n(x)) * (up·n(x))` in f64 over the dtype-rounded inputs.
+fn reference_swiglu(x: &[f32], g: &[f32], up: &[f32], gate: &[f32], n: usize, k: usize) -> Vec<f32> {
+    let ms: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / k as f64;
+    let inv = 1.0 / (ms + EPS as f64).sqrt();
+    (0..n)
+        .map(|r| {
+            let dot = |w: &[f32]| -> f64 {
+                (0..k)
+                    .map(|c| w[r * k + c] as f64 * x[c] as f64 * g[c] as f64 * inv)
+                    .sum()
+            };
+            let (u, a) = (dot(up), dot(gate));
+            (a / (1.0 + (-a).exp()) * u) as f32
+        })
+        .collect()
+}
+
+/// `gemv_norm_swiglu` at `(n, k)`, the largest error relative to the largest
+/// reference magnitude; `x_scale` as in [`rel_err_at`].
+fn swiglu_rel_err(n: usize, k: usize, dtype: DType, seed: u64, x_scale: f32) -> Result<f32> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let x = round(&rand_vec(&mut rng, k, x_scale), dtype)?;
+    let g = round(&rand_vec(&mut rng, k, 1.5), dtype)?;
+    let up = round(&rand_vec(&mut rng, n * k, 0.05), dtype)?;
+    let gate = round(&rand_vec(&mut rng, n * k, 0.05), dtype)?;
+    let want = reference_swiglu(&x, &g, &up, &gate, n, k);
+    let dev = Device::new_metal(0)?;
+    let xt = Tensor::from_vec(x, (1, 1, k), &dev)?.to_dtype(dtype)?;
+    let gt = Tensor::from_vec(g, k, &dev)?.to_dtype(dtype)?;
+    let ut = Tensor::from_vec(up, (n, k), &dev)?.to_dtype(dtype)?;
+    let at = Tensor::from_vec(gate, (n, k), &dev)?.to_dtype(dtype)?;
+    let got = lloom::nn::ops::gemv_norm_swiglu(&xt, &ut, &at, &gt, EPS)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert_eq!(got.len(), n);
+    assert!(got.iter().all(|v| v.is_finite()), "gemv_norm_swiglu [{n}, {k}]: a non-finite output");
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+    Ok(got
+        .iter()
+        .zip(&want)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+        / scale)
+}
+
+/// The two-weight kernel with the norm inside (`gemv_norm_swiglu`): against
+/// the f64 reference at both tiles (`bm4` below N = 4096, `bm8` from it — LFM2's
+/// `[6144, 2048]` `w1`/`w3`), an N off the tile, a K with a leftover, an
+/// eps-dominated input; against the unfused `rmsnorm` + `gemv_swiglu` on the
+/// device; bit-stable run to run.
+#[test]
+fn gemv_norm_swiglu_matches_the_reference_and_the_pair() -> Result<()> {
+    for &(n, k) in &[(2048, 2048), (203, 2048), (6144, 2048), (40, 200)] {
+        for dtype in [DType::F32, DType::F16] {
+            let e = swiglu_rel_err(n, k, dtype, (n * 17 + k) as u64, 3.0)?;
+            let tol = if dtype == DType::F32 { 1e-5 } else { 4e-3 };
+            println!("gemv_norm_swiglu n={n} k={k} {dtype:?} rel_err={e:.3e} (tol {tol:.0e})");
+            assert!(e <= tol, "gemv_norm_swiglu n={n} k={k} {dtype:?}: rel_err {e} > {tol}");
+        }
+    }
+    let e = swiglu_rel_err(2048, 2048, DType::F32, 98, 1e-3)?;
+    println!("gemv_norm_swiglu n=2048 k=2048 F32 |x|~1e-3 rel_err={e:.3e}");
+    assert!(e <= 1e-5, "gemv_norm_swiglu at |x|~1e-3 (eps-dominated): rel_err {e}");
+
+    let (n, k) = (6144, 2048);
+    let dev = Device::new_metal(0)?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+    let f16 = |v: Vec<f32>, s: &[usize]| -> Result<Tensor> {
+        Tensor::from_vec(v, s, &dev)?.to_dtype(DType::F16)
+    };
+    let x = f16(rand_vec(&mut rng, k, 3.0), &[1, 1, k])?;
+    let g = f16(rand_vec(&mut rng, k, 1.5), &[k])?;
+    let up = f16(rand_vec(&mut rng, n * k, 0.05), &[n, k])?;
+    let gate = f16(rand_vec(&mut rng, n * k, 0.05), &[n, k])?;
+    let norm = lloom::nn::RmsNorm::new(g.clone(), EPS as f64);
+    let pair = lloom::nn::ops::gemv_swiglu(&lloom_tensor::Module::forward(&norm, &x)?, &up, &gate)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let fused = || -> Result<Vec<u16>> {
+        lloom::nn::ops::gemv_norm_swiglu(&x, &up, &gate, &g, EPS)?
+            .flatten_all()?
+            .to_vec1::<half::f16>()
+            .map(|v| v.iter().map(|h| h.to_bits()).collect())
+    };
+    let a = fused()?;
+    for i in 1..4 {
+        assert_eq!(a, fused()?, "gemv_norm_swiglu is not bit-stable run to run (run {i})");
+    }
+    let scale = pair.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let err = a
+        .iter()
+        .map(|&b| half::f16::from_bits(b).to_f32())
+        .zip(&pair)
+        .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
+        / scale;
+    println!("gemv_norm_swiglu vs rmsnorm+gemv_swiglu at [{n}, {k}] f16: rel_err {err:.3e}");
+    assert!(err < 4e-3, "gemv_norm_swiglu drifts from the pair: {err}");
     Ok(())
 }

@@ -266,6 +266,55 @@ impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpHead<P, R
     }
 }
 
+/// The head's pass over one row ([`MtpHead::forward`] at `a = 1`, a draft
+/// step's): the embedding's norm (`enorm`) broadcast over the `n` streams
+/// and the target's carry normed whole (`hnorm`), the two copied side by
+/// side (three strided copies), `eh_proj` over the `n` stream rows, the layer's prefill row
+/// ([`Layer::visit_row`], its KV the lane's own at the default precision),
+/// and the head's collapse — the sample the `lm_head` reads, the step's
+/// result. The layer's carry is the pass's other output, which the next
+/// draft continues from. Inside the indexer's dense range only.
+#[cfg(not(target_arch = "wasm32"))]
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> crate::optimizer::Visit
+    for MtpHead<P, R>
+{
+    type In = ();
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
+        use crate::optimizer::Shape;
+        use lloom_tensor::DType;
+        let (n, d) = (self.n, self.d);
+        let f32 = DType::F32;
+        let hidden = w.input("mtp.hidden", Shape::of(&[1, 1, n * d]), f32);
+        let embeds = w.input("mtp.embeds", Shape::of(&[1, 1, d]), f32);
+        let ge = self.norm_e.weight();
+        let ge = w.weight("nextn.enorm.weight", Shape::of(ge.dims()), ge.dtype());
+        let gh = self.norm_h.weight();
+        let gh = w.weight("nextn.hnorm.weight", Shape::of(gh.dims()), gh.dtype());
+        let e = w.rms_norm(ge, embeds);
+        let e = w.view("broadcast", e, Shape::of(&[1, 1, n, d]));
+        let hn = w.rms_norm(gh, hidden);
+        let hn = w.view("reshape", hn, Shape::of(&[1, 1, n, d]));
+        // A broadcast is no `copy2d` source (`Tensor::cat`'s outer-stride
+        // test), so the cat transposes the pair, copies each (strided) into
+        // one buffer, and the reshape of the transposed result copies again.
+        let pair = Shape::of(&[1, 1, n, 2 * d]);
+        let eh = w.opaque("copy_strided", &[e], pair.clone(), f32);
+        let eh = w.opaque("copy_strided", &[hn, eh], pair, f32);
+        let eh = w.opaque("copy_strided", &[eh], Shape::of(&[n, 2 * d]), f32);
+        let h0 = w.project_qmat("nextn.eh_proj.weight", &self.eh_proj, eh);
+        let h0 = w.view("reshape", h0, Shape::of(&[1, 1, n * d]));
+        let multi = w.scoped("mtp", |w| {
+            self.layer
+                .visit_row(w, h0, 0, super::config::DEFAULT_KV_PRECISION)
+        });
+        // The next draft's carry.
+        w.state_out(multi);
+        let (sample, _) = self.head_mix.visit(w, (multi, "nextn.hc_head", false));
+        sample
+    }
+}
+
 /// The MTP drafter: one token per round from the target's carry at the last
 /// accepted position, re-keyed from every accepted row. One [`MtpLane`] per
 /// sequence it drafts for.

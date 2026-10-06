@@ -645,7 +645,9 @@ impl lloom_tensor::CustomOp3 for HcCollapseScaled {
         _s3: &CpuStorage,
         _l3: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
-        lloom_tensor::bail!("hc_collapse_scaled: no cpu kernel; `HyperConnection::mix` composes it there")
+        lloom_tensor::bail!(
+            "hc_collapse_scaled: no cpu kernel; `HyperConnection::mix` composes it there"
+        )
     }
     #[cfg(feature = "metal")]
     fn metal_fwd(
@@ -682,7 +684,10 @@ impl lloom_tensor::CustomOp3 for HcCollapseScaled {
             lloom_tensor::Storage::Metal(m) => m,
             _ => lloom_tensor::bail!("hc_collapse_scaled: γ must be on Metal"),
         };
-        if gs.dtype() != lloom_tensor::DType::F32 || !gl.is_contiguous() || gl.shape().elem_count() != nd {
+        if gs.dtype() != lloom_tensor::DType::F32
+            || !gl.is_contiguous()
+            || gl.shape().elem_count() != nd
+        {
             lloom_tensor::bail!("hc_collapse_scaled: γ must be a contiguous f32 [{nd}]")
         }
         let device = sh.device();

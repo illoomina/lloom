@@ -240,7 +240,6 @@ fn mtp_keys_its_layer_from_a_prompt_past_the_dense_range() -> Result<()> {
     use lloom::generation::{Blocking, LogitsProcessor, Sampling};
     use lloom::models::qwen4exp::model::{Layer, Mixer};
     use lloom::models::qwen4exp::{testing, Indexer, MtpDrafter, MtpHead};
-    use lloom::nn::model::CausalLM;
     use lloom::nn::{DecodeOptions, IdentityProposer, RmsNorm, Session};
     let dev = Device::Cpu;
     let mut cfg = Config::tiny();

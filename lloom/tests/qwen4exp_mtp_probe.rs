@@ -13,7 +13,6 @@ use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::Shape as _;
 use lloom::models::qwen4exp::{Config, MtpDrafter};
-use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, Session};
 use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{Device, Result};

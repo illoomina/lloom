@@ -34,7 +34,7 @@ use lloom::models::lfm2::{
     Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
 };
 use lloom::nn::VarBuilder;
-use lloom::profile::{CrownExact, RewindableExact};
+use lloom::profile::CrownExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// Six layers, alternating conv and attention, so a tap index can fall on

@@ -10,7 +10,9 @@
 
 use lloom::models::qwen4exp::testing::{ghost_model, GhostExperts};
 use lloom::models::qwen4exp::Qwen4Exp;
-use lloom::optimizer::{derive, walk, Graph, NumericClass, Op, Policy};
+use lloom::optimizer::{
+    census_of_labels, derive, walk, walk_at, Census, Graph, NumericClass, Op, Policy,
+};
 use lloom::profile::CrownExact;
 use lloom_tensor::{DType, Device};
 
@@ -28,7 +30,7 @@ fn with_driver(mut g: Graph) -> Graph {
     // writes, emitted inside the layers).
     let root = *g.roots().iter().max().expect("a root");
     let next = g.opaque("fast_argmax", &[root], Shape::of(&[1]), DType::U32);
-    let read = g.opaque("copy2d_u32", &[next], Shape::of(&[1]), DType::U32);
+    let read = g.opaque("copy2d", &[next], Shape::of(&[1]), DType::U32);
     g.mark_root(read);
     g
 }
@@ -44,8 +46,10 @@ fn with_driver(mut g: Graph) -> Graph {
 /// `gemv_mixed_f16w_*[_silu|_sigmoid]` → `gemv_mixed[_silu|_sigmoid]`,
 /// `gemv_float32_*` → `gemv`, `gdn_step_r16` → `gdn_step`,
 /// `kernel_get_rows_*` → `get_rows`, `sdpa_vector_float_256` →
-/// `sdpa_vector`, `bmul_f32_strided` → `bmul`, the `_f32`/`_cs` suffixes
-/// dropped where the family carries none in the IR.
+/// `sdpa_vector`, `bmul_f32_strided` → `bmul`, a copy or a cast named
+/// without its dtype (`copy2d_f32`, `copy2d_u32` → `copy2d`), the `_f32`/`_cs`
+/// suffixes dropped — `optimizer::kernel_family`'s rules, which [`traced`]
+/// applies to the trace file itself.
 const TRACED_STEP: &[(&str, u64)] = &[
     ("abs", 1),
     ("affine", 1),
@@ -54,10 +58,9 @@ const TRACED_STEP: &[(&str, u64)] = &[
     ("bminimum", 1),
     ("bmul", 10),
     ("bsub", 1),
-    ("cast_u8", 2),
-    ("copy2d_f32", 39),
-    ("copy2d_u32", 1),
-    ("copy_f32_strided", 1),
+    ("cast", 2),
+    ("copy2d", 40),
+    ("copy_strided", 1),
     ("fast_argmax", 1),
     ("fast_sum", 1),
     ("gdn_gated_norm", 36),
@@ -93,7 +96,8 @@ const TRACED_STEP: &[(&str, u64)] = &[
 /// launches, equals the traced step family by family, 1 581 dispatches;
 /// the source walk is the same step with every bracket's epilogues
 /// unfused — 97 `affine`, `silu` and `sigmoid` more, the 194 mixed
-/// products bare.
+/// products bare — and every SwiGLU as its activation and its product, the
+/// 96 `silu_mul` launches a `silu` and a `bmul` each.
 #[test]
 fn the_derived_walk_is_the_traced_step() {
     let source = walk(&model());
@@ -119,9 +123,10 @@ fn the_derived_walk_is_the_traced_step() {
             src.get("silu"),
             src.get("sigmoid")
         ),
-        (Some(&388), None, Some(&98), Some(&98), Some(&98))
+        (Some(&388), None, Some(&98), Some(&(98 + 96)), Some(&98))
     );
-    assert_eq!(source.dispatches(), 1579 + 3 * 97);
+    assert_eq!((src.get("silu_mul"), src.get("bmul").is_some()), (None, true));
+    assert_eq!(source.dispatches(), 1579 + 3 * 97 + 96);
 }
 
 /// E2 of #749's ledger, re-read through the walk: the derived step's
@@ -166,7 +171,18 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
     );
     assert!(silu.contains(&"output_hc_down.weight"));
     assert!(silu.contains(&"blk.47.hc_ffn_down.weight"));
-    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    // The one refusal that applies here: the grouped norm the brackets'
+    // products cannot take as the catalogue stands.
+    assert_eq!(
+        d.refused,
+        [(
+            "mixed_gnorm".to_string(),
+            lloom::optimizer::fragments::MIXED_GNORM_REFUSAL.to_string()
+        )]
+    );
+    // The SwiGLUs as one launch each: the routed experts' and the shared
+    // expert's, 48 layers.
+    assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&96));
     assert_eq!(d.plan.class, NumericClass::Rounding);
     // Every scale absorbed is the bracket's 1/n.
     for n in d.graph.nodes().iter().filter(|n| n.op == Op::Fused) {
@@ -220,4 +236,96 @@ fn the_recurrences_are_marked() {
     let d = derive(&g, &Policy::default()).expect("derive");
     let r = &d.plan.regions;
     assert_eq!((r.ssm, r.kv, r.conv_ring), (36, 12, 1), "{}", d.plan);
+}
+
+/// Step `step` of run 1 of the committed trace (the one `TRACED_STEP` was
+/// read from), every `TRACE … kernel=<label> n=<count>` line in the IR's
+/// families.
+fn traced(step: usize) -> Census {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../design/measurements/issue-732-raw/walker/qwen4exp-trace-dev-bfc70b8f4.txt",
+    );
+    let text = std::fs::read_to_string(&path).expect("the committed trace");
+    let prefix = format!("TRACE run=1 step={step} kernel=");
+    census_of_labels(text.lines().filter_map(|l| {
+        let rest = l.strip_prefix(&prefix)?;
+        let (label, rest) = rest.split_once(" n=")?;
+        let n = rest.split_whitespace().next()?.parse().ok()?;
+        Some((label, n))
+    }))
+}
+
+/// **The step that completes an indexer block is walked.** Of four
+/// consecutive positions inside the dense range exactly one completes a
+/// block of `ratio` = 4 keys, and its derived walk with the driver's two
+/// launches is the trace's step 10 family by family — 1 737 dispatches, the
+/// steady step's 1 581 and the 13 launches of the block's pooling, norm,
+/// rope and append in each of the 12 full-attention layers; the other three
+/// are step 9's.
+#[test]
+fn the_block_completing_walk_is_the_traced_step_10() {
+    let m = model();
+    assert_eq!(m.config().indexer_compress_ratio, 4);
+    let (steady, block) = (traced(9), traced(10));
+    assert_eq!(steady.values().sum::<u64>(), 1581);
+    assert_eq!(block.values().sum::<u64>(), 1737);
+    let mut heavy = 0;
+    for pos in 44..48 {
+        let d = derive(&walk_at(&m, pos), &Policy::default()).expect("derive");
+        let got = with_driver(d.graph).census();
+        if (pos + 1) % 4 == 0 {
+            heavy += 1;
+            assert_eq!(got, block, "the block-completing position {pos}");
+        } else {
+            assert_eq!(got, steady, "the steady position {pos}");
+        }
+    }
+    assert_eq!(heavy, 1);
+}
+
+/// **The step past the dense range is walked.** The needle prompt's decode
+/// (3 749 tokens, `qwen4exp-trace-needle-dev-a5c815f13.txt`, run 1 step 9,
+/// 1 992 launches): every QSA layer selects (the indexer's query heads, the
+/// block scores, the order, the cells and their 2-cell tail), gathers the
+/// selected cells and attends over 2 050 of them in two launches. That run
+/// planned its experts on the host (no slot map) and loaded 147 missing
+/// experts (`copy2d_u32` at ≥ 100 k threads, which routing decides and the
+/// walk does not describe); set aside, the step is the derived walk — over
+/// a host-planned residency — at a position of the same kind (no block
+/// completing, a tail of two), with the driver's two launches.
+#[test]
+fn the_past_dense_walk_is_the_needle_step() {
+    use lloom::models::qwen4exp::testing::ghost_model_host_planned;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../design/measurements/issue-732-raw/walker/qwen4exp-trace-needle-dev-a5c815f13.txt",
+    );
+    let text = std::fs::read_to_string(&path).expect("the committed needle trace");
+    let prefix = "TRACE run=1 step=9 kernel=";
+    let mut loads = 0u64;
+    let needle = census_of_labels(text.lines().filter_map(|l| {
+        let rest = l.strip_prefix(prefix)?;
+        let (label, rest) = rest.split_once(" n=")?;
+        let n: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        if label == "copy2d_u32" {
+            // `<count>×[grid=… tg=… threads=<t>]` per shape: the loads are
+            // the copies of ≥ 4 096 threads.
+            for shape in rest.split(']').filter(|s| s.contains('×')) {
+                let (head, tail) = shape.split_once("×[")?;
+                let count: u64 = head.split_whitespace().last()?.parse().ok()?;
+                let threads: u64 = tail.rsplit_once("threads=")?.1.parse().ok()?;
+                if threads >= 4096 {
+                    loads += count;
+                }
+            }
+            return Some((label, n - loads));
+        }
+        Some((label, n))
+    }));
+    assert_eq!(loads, 147, "the tier's expert loads in the traced step");
+    assert_eq!(needle.values().sum::<u64>(), 1992 - 147);
+    let m = ghost_model_host_planned::<CrownExact>(&Device::Cpu).expect("ghost build");
+    let pos = 4001;
+    assert_eq!(((pos + 1) % 4, pos + 1 > m.dense_limit().unwrap()), (2, true));
+    let d = derive(&walk_at(&m, pos), &Policy::default()).expect("derive");
+    assert_eq!(with_driver(d.graph).census(), needle);
 }

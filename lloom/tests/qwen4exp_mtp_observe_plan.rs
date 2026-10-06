@@ -13,7 +13,6 @@ use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::Shape as _;
 use lloom::models::qwen4exp::{Config, MtpDrafter, Qwen4Exp, Resident, State, Streamed};
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
-use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
 use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::quantized::gguf_file::{self, Content};

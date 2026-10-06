@@ -23,7 +23,6 @@ use lloom::generation::{
 use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::speculator::{Draft, NoProbe, SeqId, TargetProbe};
 use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Speculator};
-use lloom::profile::RewindableExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;
@@ -1847,8 +1846,6 @@ fn gate_cache_case(
     conv_state: lloom::models::lfm2::ConvState,
     conv_fused: bool,
 ) -> Result<GateCase> {
-    use lloom::models::lfm2::State;
-    const EXTRA: usize = 12;
     let dev = Device::new_metal(0).expect("metal");
     let cfg = tiny_lfm2::config(conv_state, conv_fused);
     let key = cfg.exact_key();
@@ -1856,6 +1853,7 @@ fn gate_cache_case(
 }
 
 /// `gate_cache_case` at the profile the config names.
+#[cfg(feature = "metal")]
 fn gate_cache_case_at<P: lloom::models::lfm2::Shape>(
     cfg: &lloom::models::lfm2::Config,
     dev: &Device,

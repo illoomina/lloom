@@ -17,7 +17,6 @@
 use lloom::models::lfm2_testing::Lfm2Tiny;
 #[cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
-use lloom::profile::CrownExact;
 use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, Weights};
 #[cfg(feature = "metal")]
 use serde_json::json;

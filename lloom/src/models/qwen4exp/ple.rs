@@ -277,9 +277,9 @@ impl<P: Profile> crate::optimizer::Visit for PleLayer<P> {
         let mag = w.opaque("bminimum", &[mag, hi], s3.clone(), f32);
         let mag = w.opaque("sqrt", &[mag], s3.clone(), f32);
         let gt = w.opaque("gt", &[s, zero], s3.clone(), lloom_tensor::DType::U8);
-        let gt = w.opaque("cast_u8", &[gt], s3.clone(), f32);
+        let gt = w.opaque("cast", &[gt], s3.clone(), f32);
         let lt = w.opaque("lt", &[s, zero], s3.clone(), lloom_tensor::DType::U8);
-        let lt = w.opaque("cast_u8", &[lt], s3.clone(), f32);
+        let lt = w.opaque("cast", &[lt], s3.clone(), f32);
         let sgn = w.opaque("bsub", &[gt, lt], s3, f32);
         let gate = w.mul(sgn, mag);
         let gate = w.sigmoid(gate);
@@ -294,13 +294,8 @@ impl<P: Profile> crate::optimizer::Visit for PleLayer<P> {
         let hist = self.history_len();
         let x_t = w.view("transpose", normed, Shape::of(&[nd, 1]));
         let history = w.input(&format!("ple.conv@{l}"), Shape::of(&[nd, hist]), f32);
-        let h_copy = w.opaque("copy2d_f32", &[history], Shape::of(&[nd, hist]), f32);
-        let x_copy = w.opaque(
-            "copy2d_f32",
-            &[x_t, h_copy],
-            Shape::of(&[nd, hist + 1]),
-            f32,
-        );
+        let h_copy = w.opaque("copy2d", &[history], Shape::of(&[nd, hist]), f32);
+        let x_copy = w.opaque("copy2d", &[x_t, h_copy], Shape::of(&[nd, hist + 1]), f32);
         let cw = w.weight(
             "ple_conv1d.weight",
             Shape::of(self.conv_weight.dims()),
@@ -316,7 +311,7 @@ impl<P: Profile> crate::optimizer::Visit for PleLayer<P> {
                 None => term,
             });
         }
-        let next = w.opaque("copy2d_f32", &[x_copy], Shape::of(&[nd, hist]), f32);
+        let next = w.opaque("copy2d", &[x_copy], Shape::of(&[nd, hist]), f32);
         // The next step's history: written here, read there.
         w.state_out(next);
         w.mark(&[history, h_copy, x_copy, next], Region::ConvRing(l));

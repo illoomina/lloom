@@ -114,11 +114,24 @@ fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str, prefetch: bool)
         return Ok(());
     }
     assert!(st.device_plans > 0, "{tag}: no device plan ran: {st:?}");
-    assert!(
-        cache.redos > 0 && st.settled_misses > 0,
-        "{tag}: no token was replayed — the pool never missed: {st:?} redos {}",
-        cache.redos
-    );
+    // Under the fetch arm with its worker (the prefetcher's reader threads)
+    // a missing pool is fetched inside the step instead of replayed
+    // (`qwen4exp_fetch.rs` pins that); without the prefetcher the tier
+    // cannot fetch and the steps replay as by default.
+    let fetching = prefetch && std::env::var("QWEN4EXP_FETCH").is_ok_and(|v| v == "inside");
+    if fetching {
+        assert!(
+            cache.fetch_passes > 0 && streamed.fetch_stats().loads > 0,
+            "{tag}: QWEN4EXP_FETCH=inside: no step fetched its misses: {:?}",
+            streamed.fetch_stats()
+        );
+    } else {
+        assert!(
+            cache.redos > 0 && st.settled_misses > 0,
+            "{tag}: no token was replayed — the pool never missed: {st:?} redos {}",
+            cache.redos
+        );
+    }
     // The arms, when this binary runs under them: each must have fired —
     // a counter at 0 says the arm was not exercised, and the identity
     // above was vacuous for it.

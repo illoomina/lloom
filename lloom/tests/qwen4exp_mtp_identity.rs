@@ -22,7 +22,7 @@ use lloom::models::qwen4exp::{Config, MtpDrafter, Qwen4Exp, Resident, State};
 use lloom::nn::model::CausalLM;
 use lloom::nn::speculator::{Anchor, Draft, KvSource, NextnHidden, Probes, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
-use lloom::profile::{CrownExact, Own, RewindableExact};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{Device, Result, Tensor};
 
 fn config() -> Config {

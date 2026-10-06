@@ -187,6 +187,16 @@ impl QMetalStorage {
                     read_to_vec(&buffer, block_len);
                 crate::quantized::iq_quants::BlockQ2_0::to_float(&vec, &mut out);
             }
+            GgmlDType::MXFP4 => {
+                let vec: Vec<crate::quantized::fp_quants::BlockMxfp4> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::fp_quants::BlockMxfp4::to_float(&vec, &mut out);
+            }
+            GgmlDType::FP8E4M3 => {
+                let vec: Vec<crate::quantized::fp_quants::BlockFp8E4M3> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::fp_quants::BlockFp8E4M3::to_float(&vec, &mut out);
+            }
         }
 
         let buffer = self
@@ -1213,6 +1223,8 @@ impl From<GgmlDType> for crate::kernels::GgmlDType {
             GgmlDType::IQ4NL => crate::kernels::GgmlDType::IQ4NL,
             GgmlDType::IQ4XS => crate::kernels::GgmlDType::IQ4XS,
             GgmlDType::Q2_0 => crate::kernels::GgmlDType::Q2_0,
+            GgmlDType::MXFP4 => crate::kernels::GgmlDType::MXFP4,
+            GgmlDType::FP8E4M3 => crate::kernels::GgmlDType::FP8E4M3,
         }
     }
 }
@@ -1484,7 +1496,7 @@ mod kind_table_tests {
     /// definitions, the bytes a tensor is sized by.
     #[test]
     fn the_kernel_table_agrees_with_the_block_geometry() {
-        const ALL: [GgmlDType; 23] = [
+        const ALL: [GgmlDType; 25] = [
             GgmlDType::Q4_0,
             GgmlDType::Q4_1,
             GgmlDType::Q5_0,
@@ -1508,6 +1520,8 @@ mod kind_table_tests {
             GgmlDType::IQ4NL,
             GgmlDType::IQ4XS,
             GgmlDType::Q2_0,
+            GgmlDType::MXFP4,
+            GgmlDType::FP8E4M3,
         ];
         for d in ALL {
             let k: crate::kernels::GgmlDType = d.into();

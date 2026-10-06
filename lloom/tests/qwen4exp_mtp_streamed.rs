@@ -24,7 +24,7 @@ use lloom::nn::expert_stream::{ExpertSource, LoaderArm, StreamStats};
 use lloom::nn::model::CausalLM;
 use lloom::nn::speculator::{Draft, KvSource, NextnHidden, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
-use lloom::profile::{CrownExact, Own, RewindableExact};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};

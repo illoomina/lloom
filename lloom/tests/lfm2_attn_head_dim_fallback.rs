@@ -14,7 +14,9 @@
 
 use lloom::models::lfm2::{AttnImpl, Config, DecodeAttn, Model, PrefillAttn, Shape as Lfm2Shape};
 use lloom::models::lfm2_testing::Lfm2Tiny;
-use lloom::profile::{CrownExact, PoolExact, PoolSpecExact};
+use lloom::profile::CrownExact;
+#[cfg(feature = "metal")]
+use lloom::profile::PoolSpecExact;
 use lloom::testing::tiny::{TinyCheckpoint, TinyFamily, Weights};
 use lloom_tensor::{DType, Device, Result};
 

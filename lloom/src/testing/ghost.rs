@@ -43,6 +43,31 @@ pub fn var_builder(dtype: DType, dev: &Device) -> VarBuilder<'static> {
     VarBuilder::from_backend(Box::new(GhostBackend), dtype, dev.clone())
 }
 
+/// `LFM2.5-2.6B`'s `config.json`
+/// (`models--LiquidAI--LFM2.5-2.6B/snapshots/654f9463…/config.json`): 30
+/// layers, 22 conv and 8 attention in the listed order, hidden 2048,
+/// intermediate 10752, 32 heads over 8 KV heads, `conv_L_cache` 3, tied
+/// embeddings over a 128000 vocabulary. Every other field the default arm.
+pub fn lfm2_2_6b() -> crate::models::lfm2::Config {
+    use crate::models::lfm2::{Config, LayerType::Conv as C, LayerType::FullAttention as A};
+    Config {
+        vocab_size: 128000,
+        hidden_size: 2048,
+        intermediate_size: 10752,
+        num_hidden_layers: 30,
+        num_attention_heads: 32,
+        num_key_value_heads: 8,
+        conv_l_cache: 3,
+        conv_bias: false,
+        layer_types: vec![
+            C, C, A, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, A, C, C, A, C,
+            C,
+        ],
+        tie_embedding: true,
+        ..Default::default()
+    }
+}
+
 /// An LFM2 model of `cfg` built by `Model::new` over ghost weights.
 pub fn lfm2<P: crate::profile::Profile>(
     cfg: &crate::models::lfm2::Config,

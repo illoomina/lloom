@@ -1058,6 +1058,8 @@ pub struct FusionReport {
     pub gemv_silu: bool,
     pub gemv_residual: bool,
     pub gemv_gate: GateFusion,
+    /// The norms inside their consumers' GEMVs (the norm prologue).
+    pub norm_gemv: bool,
     /// The build's math mode the model was constructed under.
     pub math_mode: &'static str,
     /// Fragments the policy refused: (name, why).
@@ -1111,11 +1113,12 @@ impl std::fmt::Display for FusionReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} gemv_gate={} math={} ({} refused, {} validated, {} unvalidated",
+            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} gemv_gate={} norm_gemv={} math={} ({} refused, {} validated, {} unvalidated",
             self.plan,
             self.gemv_silu,
             self.gemv_residual,
             self.gemv_gate.name(),
+            self.norm_gemv,
             self.math_mode,
             self.refused.len(),
             self.validated.len(),
@@ -4242,6 +4245,8 @@ impl<P: Profile> State<P> {
     /// first fused step under an `EscapeGuard` (it outlives every pass, so no
     /// plan serves it), and again only if the state's shape or dtype moved.
     fn conv_spare_for(&mut self, layer: usize, state: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        tests::SPARES_TAKEN.with(|n| n.set(n.get() + 1));
         if let Some(s) = self.conv_spare[layer].take() {
             if s.dims() == state.dims() && s.dtype() == state.dtype() && s.is_contiguous() {
                 return Ok(s);
@@ -6006,13 +6011,13 @@ impl Mlp {
     /// two weights the same shape, as that arm requires). Not under
     /// `--gemv-gate mul`: no kernel carries the norm with `w3`'s product, so
     /// that arm keeps its own path and the norm stays a dispatch.
-    fn norm_gemv_applies(&self, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
+    fn norm_gemv_applies(&self, on: bool, x: &Tensor, norm: &RmsNorm, p: &Projections<'_>) -> bool {
         let gate = match self.gemv_gate {
             GateFusion::Off => true,
             GateFusion::Swiglu => p.gate.weight().dims() == p.up.weight().dims(),
             GateFusion::Mul => false,
         };
-        gate && norm_gemv_applies(x, norm, &p.gate) && norm_gemv_applies(x, norm, &p.up)
+        gate && norm_gemv_applies(on, x, norm, &p.gate) && norm_gemv_applies(on, x, norm, &p.up)
     }
 
     /// `mlp(rmsnorm(x)) + residual` with the norm inside `w1`'s and `w3`'s
@@ -7424,28 +7429,132 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         ]);
         let k_cache = w.input(&format!("kv.k@{l}"), kv_shape.clone(), dt);
         let v_cache = w.input(&format!("kv.v@{l}"), kv_shape.clone(), dt);
-        let append = match self.kv_append {
-            KvAppend::InPlace => "copy2d",
-            KvAppend::Cat => "kv_cat",
-            KvAppend::Paged => "flash_kv_scatter",
+        // The appends: in place, one strided write each; `Cat`, a
+        // `Tensor::cat` of the cache and the row (two copies each); `Paged`,
+        // the pool's scatter (named from the arm).
+        let mut ring = vec![k_cache, v_cache];
+        let mut append = |w: &mut crate::optimizer::Walker, row, cache| match self.kv_append {
+            KvAppend::InPlace => w.opaque("copy2d", &[row, cache], kv_shape.clone(), dt),
+            KvAppend::Cat => {
+                let old = w.opaque("copy2d", &[cache], kv_shape.clone(), dt);
+                ring.push(old);
+                w.opaque("copy2d", &[row, old], kv_shape.clone(), dt)
+            }
+            KvAppend::Paged => w.opaque("flash_kv_scatter", &[row, cache], kv_shape.clone(), dt),
         };
-        let k_all = w.opaque(append, &[kr, k_cache], kv_shape.clone(), dt);
-        let v_all = w.opaque(append, &[v, v_cache], kv_shape, dt);
+        let k_all = append(w, kr, k_cache);
+        let v_all = append(w, v, v_cache);
+        ring.extend([k_all, v_all]);
         let kernel = match self.route.decode {
             DecodeAttn::SdpaVector => "sdpa_vector",
             DecodeAttn::FlashDecoding => "flash_decoding",
             DecodeAttn::Generic => "attention_generic",
         };
-        let y = w.opaque(
-            kernel,
-            &[qr, k_all, v_all],
-            Shape::of(&[1, heads, 1, hd]),
-            dt,
-        );
-        w.mark(&[k_cache, v_cache, k_all, v_all, y], Region::Kv(l));
+        let out = Shape::of(&[1, heads, 1, hd]);
+        // At a position whose keys reach the 2-pass length, the vector
+        // kernel is two launches: the partials, then their merge.
+        let two_pass = self.route.decode == DecodeAttn::SdpaVector
+            && w
+                .position()
+                .is_some_and(|p| crate::nn::ops::sdpa_vector_two_pass(p + 1, hd, dt));
+        let y = if two_pass {
+            let partial = w.opaque("sdpa_vector_2pass_1", &[qr, k_all, v_all], out.clone(), dt);
+            ring.push(partial);
+            w.opaque("sdpa_vector_2pass_2", &[partial], out, dt)
+        } else if self.route.decode == DecodeAttn::Generic {
+            self.visit_generic(w, qr, k_all, v_all, dt, &mut ring)
+        } else {
+            w.opaque(kernel, &[qr, k_all, v_all], out, dt)
+        };
+        ring.push(y);
+        w.mark(&ring, Region::Kv(l));
         let y = w.view("reshape", y, Shape::of(&[1, 1, h]));
         let wo = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
         w.gemv(wo, y)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<P: Profile> Attention<P> {
+    /// The generic arm's decode attention, composed: the KV heads expanded
+    /// to the query heads (`repeat_kv`, a `cat` of `n_rep` copies each), all
+    /// three read up to f32, the scores (a batched GEMV), the scale, the
+    /// softmax, the product with `v` (the transposed GEMV), the result read
+    /// back to the model's dtype. Every node that reads the cache's values
+    /// joins `ring`, as the fused kernel does on the other arms; the query's
+    /// own cast does not.
+    fn visit_generic(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        q: crate::optimizer::NodeId,
+        k: crate::optimizer::NodeId,
+        v: crate::optimizer::NodeId,
+        dt: DType,
+        ring: &mut Vec<crate::optimizer::NodeId>,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::{Dim, Shape};
+        let (heads, kvh, hd) = (
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        );
+        let rep = heads / kvh;
+        let expanded = Shape(vec![
+            Dim::Const(1),
+            Dim::Const(heads),
+            Dim::Sym("kv_len"),
+            Dim::Const(hd),
+        ]);
+        let mut expand = |w: &mut crate::optimizer::Walker, x| {
+            if rep == 1 {
+                return x;
+            }
+            let mut c = w.opaque("copy2d", &[x], expanded.clone(), dt);
+            ring.push(c);
+            for _ in 1..rep {
+                c = w.opaque("copy2d", &[x, c], expanded.clone(), dt);
+                ring.push(c);
+            }
+            c
+        };
+        let k = expand(w, k);
+        let v = expand(w, v);
+        let up = |w: &mut crate::optimizer::Walker, x: crate::optimizer::NodeId| {
+            if dt == DType::F32 {
+                return x;
+            }
+            let shape = w.node(x).shape.clone();
+            w.opaque("cast", &[x], shape, DType::F32)
+        };
+        let q = up(w, q);
+        let (k, v) = (up(w, k), up(w, v));
+        if dt != DType::F32 {
+            ring.extend([k, v]);
+        }
+        let scores = Shape(vec![
+            Dim::Const(1),
+            Dim::Const(heads),
+            Dim::Const(1),
+            Dim::Sym("kv_len"),
+        ]);
+        let raw = w.opaque("gemv", &[q, k], scores, DType::F32);
+        let scaled = w.scale(raw, (1.0 / (hd as f64).sqrt()) as f32);
+        let att_shape = w.node(scaled).shape.clone();
+        let att = w.opaque("softmax", &[scaled], att_shape, DType::F32);
+        ring.extend([raw, scaled]);
+        let y = w.opaque(
+            "gemv_t",
+            &[att, v],
+            Shape::of(&[1, heads, 1, hd]),
+            DType::F32,
+        );
+        ring.extend([att, y]);
+        if dt == DType::F32 {
+            return y;
+        }
+        let y = w.opaque("cast", &[y], Shape::of(&[1, heads, 1, hd]), dt);
+        ring.push(y);
+        y
     }
 }
 
@@ -8161,24 +8270,35 @@ impl<P: Profile> ShortConv<P> {
             };
             // A cache that keeps the state writes it into the layer's spare
             // and swaps the two; the batch arm's state is a pool row, copied
-            // into by `set_conv_state`, so it keeps a fresh one.
-            let next = if cache.use_kv_cache && cache.batch_slot().is_none() {
+            // into by `set_conv_state`, so it keeps a fresh one. Asked for
+            // only on the fused arm, and handed back when the step declines:
+            // the unfused step never takes one, so it allocates none a token.
+            let next = if self.conv_fused
+                && !conv_c_fusion_disabled()
+                && cache.use_kv_cache
+                && cache.batch_slot().is_none()
+            {
                 Some(cache.conv_spare_for(block_idx, &state)?)
             } else {
                 None
             };
-            if let Some((conv_out, new_state)) =
-                self.shortconv_fused(&b, &x_proj, &c, &state, next.as_ref())?
-            {
-                if cache.use_kv_cache {
-                    if next.is_some() {
-                        cache.conv_spare[block_idx] = Some(state);
+            match self.shortconv_fused(&b, &x_proj, &c, &state, next.as_ref())? {
+                Some((conv_out, new_state)) => {
+                    if cache.use_kv_cache {
+                        if next.is_some() {
+                            cache.conv_spare[block_idx] = Some(state);
+                        }
+                        cache.set_conv_state(block_idx, new_state)?;
                     }
-                    cache.set_conv_state(block_idx, new_state)?;
+                    // `c` is already applied in the kernel store; only the
+                    // transpose to `[b, seq, hidden]` for `out_proj` remains.
+                    return conv_out.transpose(1, 2)?.contiguous();
                 }
-                // `c` is already applied in the kernel store; only the transpose
-                // to `[b, seq, hidden]` for `out_proj` remains.
-                return conv_out.transpose(1, 2)?.contiguous();
+                None => {
+                    if let Some(spare) = next {
+                        cache.conv_spare[block_idx] = Some(spare);
+                    }
+                }
             }
         }
 
@@ -8641,11 +8761,16 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
                 let bx = w.mul(b, x);
                 let window = match arm {
                     ConvState::Shuffle => {
-                        // `cat([state[1..], bx])`: two copies into the new state.
+                        // The shift in place (`window_tail`, `docs/dispatch.md`
+                        // §11.5z-x): the tail gathered to a scratch (a strided
+                        // copy), written back to the first columns, `bx` to the
+                        // last — two strided writes into the state.
                         let tail = w.view("narrow", state, Shape::of(&[1, h, lc - 1]));
-                        let shifted = w.opaque("copy2d", &[tail], Shape::of(&[1, h, lc]), dt);
+                        let gathered =
+                            w.opaque("copy_strided", &[tail], Shape::of(&[1, h, lc - 1]), dt);
+                        let shifted = w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
                         let next = w.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dt);
-                        ring.extend([tail, shifted, next]);
+                        ring.extend([tail, gathered, shifted, next]);
                         next
                     }
                     ConvState::RotatingRing { .. } | ConvState::SlidingRing { .. } => {
@@ -8701,6 +8826,10 @@ struct DecoderLayer<P: Profile> {
     post_attention_layernorm: RmsNorm,
     mlp: Mlp,
     kind: LayerKind<P>,
+    /// Whether the layer's two norms may run inside their consumers' GEMVs
+    /// (`nn::ops::gemv_norm`): `LLOOM_LFM2_NORM_GEMV` at construction, or a
+    /// derived plan's verdict (`Fusion=Derived`).
+    norm_gemv: bool,
     /// `Some`: this layer's matrices stream through the tier (§4.8).
     streamed: Option<StreamedLayer>,
     span: tracing::Span,
@@ -8795,14 +8924,13 @@ fn norm_gemv_arm() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().lfm2.norm_gemv)
 }
 
-/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the arm,
-/// Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
+/// Whether `rmsnorm(x)` may be computed inside a GEMV over `proj`: the
+/// block's switch (`on`), Metal, one contiguous row, a dtype the kernel carries, the norm's weight a
 /// contiguous `[k]` of `x`'s dtype, and a tile the fused kernel is
 /// instantiated at (`nn::ops::gemv_norm_serves`: at `k <= 64` or
 /// `k >= 16 n` the GEMV takes another tile, and the unfused pair runs).
-fn norm_gemv_applies(x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
-    norm_gemv_arm()
-        && x.device().is_metal()
+fn norm_gemv_applies(on: bool, x: &Tensor, norm: &RmsNorm, proj: &Linear) -> bool {
+    on && x.device().is_metal()
         && matches!(x.dims(), [1, 1, _] | [1, _])
         && x.dims().last() == Some(&proj.weight().dims()[1])
         && crate::nn::ops::gemv_norm_serves(proj.weight().dims()[0], proj.weight().dims()[1])
@@ -8885,6 +9013,7 @@ impl<P: Profile> DecoderLayer<P> {
             post_attention_layernorm,
             mlp,
             kind,
+            norm_gemv: norm_gemv_arm(),
             streamed,
             span: tracing::span!(tracing::Level::TRACE, "layer"),
         })
@@ -8970,14 +9099,14 @@ impl<P: Profile> DecoderLayer<P> {
         let pre = &self.input_layernorm;
         let x = match (&self.kind, &w.mixer) {
             (LayerKind::Attention(attn), MixerWeights::Attn(aw))
-                if norm_gemv_applies(x, pre, &aw.q)
-                    && norm_gemv_applies(x, pre, &aw.k)
-                    && norm_gemv_applies(x, pre, &aw.v) =>
+                if norm_gemv_applies(self.norm_gemv, x, pre, &aw.q)
+                    && norm_gemv_applies(self.norm_gemv, x, pre, &aw.k)
+                    && norm_gemv_applies(self.norm_gemv, x, pre, &aw.v) =>
             {
                 attn.forward_add_normed(aw, x, pre, index_pos, block_idx, cache, residual)?
             }
             (LayerKind::ShortConv(conv), MixerWeights::Conv(cw))
-                if norm_gemv_applies(x, pre, &cw.in_proj) =>
+                if norm_gemv_applies(self.norm_gemv, x, pre, &cw.in_proj) =>
             {
                 conv.forward_add_normed(cw, x, pre, block_idx, cache, residual)?
             }
@@ -9002,7 +9131,7 @@ impl<P: Profile> DecoderLayer<P> {
 
         let residual = &x;
         let post = &self.post_attention_layernorm;
-        if self.mlp.norm_gemv_applies(&x, post, &w.mlp) {
+        if self.mlp.norm_gemv_applies(self.norm_gemv, &x, post, &w.mlp) {
             return self.mlp.forward_add_normed(&x, post, residual, &w.mlp);
         }
         let x = self.norm(post, &x)?;
@@ -9105,6 +9234,9 @@ pub struct Model<P: Profile> {
     load_warnings: Vec<crate::load_warning::LoadWarning>,
     embedding_norm: RmsNorm,
     lm_head: Linear,
+    /// Whether the final norm may run inside `lm_head`'s GEMV
+    /// ([`DecoderLayer`]'s `norm_gemv`, for the head).
+    norm_gemv_head: bool,
     dtype: DType,
     conv_state: ConvState,
     l_cache: usize,
@@ -9116,6 +9248,8 @@ struct EpilogueFlags {
     silu: bool,
     residual: bool,
     gate: GateFusion,
+    /// The norms inside their consumers' GEMVs (the prologue).
+    norm: bool,
 }
 
 /// Derive the epilogue plan over the walk of `model` as built
@@ -9131,6 +9265,7 @@ struct EpilogueFlags {
 fn derive_fusion<P: Profile>(
     model: &Model<P>,
     cfg: &Config,
+    budget: crate::optimizer::NumericClass,
 ) -> Result<(EpilogueFlags, FusionReport)> {
     use crate::optimizer::{
         derive, exclusions, numeric, ExclusionSet, Lookup, Policy, RegionKind, TargetFpModel,
@@ -9287,33 +9422,58 @@ fn derive_fusion<P: Profile>(
     }
 
     let graph = crate::optimizer::walk(model);
-    let policy = Policy::default();
+    // The kernel fragments run in no LFM2 switch.
+    let policy = Policy {
+        budget,
+        unavailable: crate::optimizer::fragments::kernels()
+            .into_iter()
+            .map(|k| (k.name.to_string(), "no LFM2 switch selects it".to_string()))
+            .collect(),
+        ..Policy::default()
+    };
     let d = derive(&graph, &policy)?;
     let plan = &d.plan;
-
-    let uniform = |kind: &str, fragment: &str| -> Result<bool> {
-        let sites: Vec<&str> = graph
+    if !plan.kernels.is_empty() {
+        lloom_tensor::bail!("lfm2 fusion=derived: the plan places kernel fragments; plan: {plan}")
+    }
+    // A site's block, split into its prologue (the norm in its load) and its
+    // epilogue (the block on its store).
+    let block = |site: &str| -> (bool, String) {
+        match plan.sites.get(site).map(String::as_str) {
+            Some("norm") => (true, String::new()),
+            Some(b) => match b.strip_prefix("norm_") {
+                Some(e) => (true, e.to_string()),
+                None => (false, b.to_string()),
+            },
+            None => (false, String::new()),
+        }
+    };
+    let sites_of = |kind: &str| -> Vec<&str> {
+        graph
             .nodes()
             .iter()
             .filter(|n| n.op == crate::optimizer::Op::Weight && n.name.ends_with(kind))
             .map(|n| n.name.as_str())
-            .collect();
-        let fused = sites
-            .iter()
-            .filter(|s| plan.sites.get(**s).map(String::as_str) == Some(fragment))
-            .count();
+            .collect()
+    };
+    // Whether every `kind` site carries `want` (true), none does (false), or
+    // some do — which no model-wide flag expresses.
+    let uniform_by = |kind: &str, what: &str, want: &dyn Fn(&str) -> bool| -> Result<bool> {
+        let sites = sites_of(kind);
+        let fused = sites.iter().filter(|s| want(s)).count();
         if fused == 0 {
             Ok(false)
         } else if fused == sites.len() {
             Ok(true)
         } else {
             lloom_tensor::bail!(
-                "lfm2 fusion=derived: the plan fuses `{fragment}` onto {fused} of {} `{kind}` \
-                 sites, which the model-wide flag cannot express; plan: {plan}",
+                "lfm2 fusion=derived: the plan fuses `{what}` onto {fused} of {} `{kind}` sites, \
+                 which the model-wide flag cannot express; plan: {plan}",
                 sites.len()
             )
         }
     };
+    let uniform = |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
@@ -9324,16 +9484,51 @@ fn derive_fusion<P: Profile>(
     } else {
         GateFusion::Off
     };
+    // The norm prologue: every site a norm feeds, or none — the forward's
+    // switch is model-wide. Under the two-weight kernel `w1` is its operand,
+    // not a site.
+    let mut norm_kinds = vec![
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "conv.in_proj.weight",
+        "feed_forward.w3.weight",
+    ];
+    if gemv_gate != GateFusion::Swiglu {
+        norm_kinds.push("feed_forward.w1.weight");
+    }
+    let lm_head = model.lm_head_site();
+    let mut norm_votes = Vec::new();
+    for kind in &norm_kinds {
+        if !sites_of(kind).is_empty() {
+            norm_votes.push(uniform_by(kind, "norm", &|s| block(s).0)?);
+        }
+    }
+    norm_votes.push(block(&lm_head).0);
+    let norm = match (norm_votes.iter().all(|v| *v), norm_votes.iter().any(|v| *v)) {
+        (true, _) => true,
+        (false, false) => false,
+        _ => lloom_tensor::bail!(
+            "lfm2 fusion=derived: the plan puts the norm in the load of some of its consumers \
+             and not others, which the model-wide switch cannot express; plan: {plan}"
+        ),
+    };
     // Every fused site must be one of the kinds the flags name.
-    for (site, fragment) in &plan.sites {
-        let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
+    for (site, b) in &plan.sites {
+        let (pro, fragment) = block(site);
+        let fragment = fragment.as_str();
+        let known_epilogue = fragment.is_empty()
+            || (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
             || ((fragment == "mul" || fragment == "swiglu")
                 && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
-        if !known {
+        let known_prologue = !pro
+            || *site == lm_head
+            || norm_kinds.iter().any(|k| site.ends_with(k));
+        if !(known_epilogue && known_prologue) {
             lloom_tensor::bail!(
-                "lfm2 fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site no flag \
+                "lfm2 fusion=derived: the plan fuses `{b}` onto `{site}`, a site no flag \
                  selects; plan: {plan}"
             )
         }
@@ -9347,6 +9542,7 @@ fn derive_fusion<P: Profile>(
     report.gemv_silu = gemv_silu;
     report.gemv_residual = gemv_residual;
     report.gemv_gate = gemv_gate;
+    report.norm_gemv = norm;
     report.refused = d.refused.clone();
     report.fused_in_stateful = plan
         .regions
@@ -9358,6 +9554,7 @@ fn derive_fusion<P: Profile>(
         silu: gemv_silu,
         residual: gemv_residual,
         gate: gemv_gate,
+        norm,
     };
     Ok((flags, report))
 }
@@ -9405,6 +9602,7 @@ fn conv_fold_gain<P: Profile>(layers: &[DecoderLayer<P>]) -> Result<Option<ConvF
 fn derive_fusion<P: Profile>(
     _model: &Model<P>,
     _cfg: &Config,
+    _budget: (),
 ) -> Result<(EpilogueFlags, FusionReport)> {
     lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
 }
@@ -9563,6 +9761,7 @@ impl<P: Profile> Model<P> {
             load_warnings,
             embedding_norm,
             lm_head,
+            norm_gemv_head: norm_gemv_arm(),
             dtype: vb.dtype(),
             conv_state: cfg.conv_state,
             l_cache: cfg.conv_l_cache,
@@ -9575,7 +9774,17 @@ impl<P: Profile> Model<P> {
         // the loaded weights, so it is read here too and the report printed
         // complete.
         if cfg.fusion == FusionPolicy::Derived {
-            let (flags, mut r) = derive_fusion(&model, cfg)?;
+            // The budget is the arm's (`--lfm2-fusion-budget`): `reorder`
+            // admits the norm inside its consumers' GEMVs, whose sum of
+            // squares takes another tree.
+            #[cfg(not(target_arch = "wasm32"))]
+            let budget = match crate::tuning::tuning().lfm2.fusion_budget.as_str() {
+                "reorder" => crate::optimizer::NumericClass::ReorderEquiv,
+                _ => crate::optimizer::NumericClass::Rounding,
+            };
+            #[cfg(target_arch = "wasm32")]
+            let budget = ();
+            let (flags, mut r) = derive_fusion(&model, cfg, budget)?;
             model.set_epilogues(flags);
             r.conv_fold_gain = conv_fold_gain(&model.layers)?;
             eprintln!("{r}");
@@ -9586,6 +9795,7 @@ impl<P: Profile> Model<P> {
 
     /// Set every block's epilogue arms (`Fusion=Derived`'s plan).
     fn set_epilogues(&mut self, f: EpilogueFlags) {
+        self.set_norm_gemv(f.norm);
         for layer in &mut self.layers {
             layer.mlp.gemv_silu = f.silu;
             layer.mlp.gemv_residual = f.residual;
@@ -9595,6 +9805,41 @@ impl<P: Profile> Model<P> {
                 LayerKind::ShortConv(conv) => conv.gemv_residual = f.residual,
             }
         }
+    }
+
+    /// The weight name the walk gives `lm_head`'s GEMV: the embedding table
+    /// when the two are tied.
+    fn lm_head_site(&self) -> String {
+        if self.lm_head.weight().id() == self.embed_tokens.embeddings().id() {
+            "model.embed_tokens.weight".to_string()
+        } else {
+            "lm_head.weight".to_string()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    /// `Fusion=Derived` at `budget` on a model built from `cfg`: the plan
+    /// derived over its walk and set on its blocks, as construction does
+    /// under that policy; the report returned. For a caller that compares
+    /// budgets in one process (the tuning's budget is read once).
+    pub fn derive_fusion_at(
+        &mut self,
+        cfg: &Config,
+        budget: crate::optimizer::NumericClass,
+    ) -> Result<FusionReport> {
+        let (flags, r) = derive_fusion(self, cfg, budget)?;
+        self.set_epilogues(flags);
+        Ok(r)
+    }
+
+    /// Whether every layer's norms and the final norm may run inside their
+    /// consumers' GEMVs (`LLOOM_LFM2_NORM_GEMV`'s arm, set per block; a
+    /// derived plan sets it from its prologue sites).
+    pub fn set_norm_gemv(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            layer.norm_gemv = on;
+        }
+        self.norm_gemv_head = on;
     }
 
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
@@ -9706,7 +9951,9 @@ impl<P: Profile> Model<P> {
 
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
-        if seq_len == 1 && norm_gemv_applies(&hidden_states, &self.embedding_norm, &self.lm_head) {
+        if seq_len == 1
+            && norm_gemv_applies(self.norm_gemv_head, &hidden_states, &self.embedding_norm, &self.lm_head)
+        {
             let last = hidden_states.squeeze(1)?;
             let logits = norm_gemv(&last, &self.embedding_norm, &self.lm_head, false)?;
             dump_logits(&logits, index_pos)?;
@@ -11482,6 +11729,52 @@ mod tests {
     use super::kv_slot_fuzz::*;
     use super::*;
     use crate::profile::CrownExact;
+
+    thread_local! {
+        /// `Cache::conv_spare_for`'s calls on this thread.
+        pub(super) static SPARES_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The unfused `Shuffle` decode step takes no spare state: the spare is
+    /// the fused step's (it writes the next state there and swaps), and a
+    /// step that does not take the fused arm asked for one, zeroed it and
+    /// dropped it — an allocation and a fill a conv layer a token
+    /// (`docs/optimizer-design.md` §10i). Three decode steps of a two-conv-
+    /// layer model on the CPU, where the fused arm never runs: none taken.
+    #[test]
+    fn the_unfused_shuffle_step_takes_no_spare() -> Result<()> {
+        use crate::models::lfm2_testing::Lfm2Tiny;
+        use crate::testing::tiny::{TinyCheckpoint, Weights};
+        let cfg = Config {
+            vocab_size: 64,
+            hidden_size: 64,
+            intermediate_size: 64,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            conv_l_cache: 3,
+            layer_types: vec![LayerType::Conv, LayerType::FullAttention, LayerType::Conv],
+            tie_embedding: true,
+            conv_state: ConvState::Shuffle,
+            conv_fused: false,
+            ..Default::default()
+        };
+        let dev = Device::Cpu;
+        let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+            .with_dtype(DType::F32)
+            .model::<CrownExact>(&dev)?;
+        let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+        let prompt = Tensor::new(&[1u32, 2, 3], &dev)?.reshape((1, 3))?;
+        model.forward(&prompt, 0, &mut cache)?;
+        let before = SPARES_TAKEN.with(|n| n.get());
+        for pos in 3..6 {
+            let tok = Tensor::new(&[pos as u32], &dev)?.reshape((1, 1))?;
+            model.forward(&tok, pos, &mut cache)?;
+        }
+        let taken = SPARES_TAKEN.with(|n| n.get()) - before;
+        assert_eq!(taken, 0, "spares taken by three unfused decode steps");
+        Ok(())
+    }
 
     /// The trait impls dispatch to the inherent entry points, checked at the
     /// bound rather than at a forward pass.

@@ -226,7 +226,6 @@ fn a_slab_grown_thirty_times_emits_the_stream_of_one_that_never_grew() -> Result
 #[test]
 fn the_ceiling_refuses_before_any_state_moves() -> Result<()> {
     let dev = Device::Cpu;
-    let conv_layers = [0usize, 2, 4];
     for arm in [KvAppend::InPlace, KvAppend::Cat] {
         for conv in [ConvState::Shuffle, ConvState::RotatingRing { k: 2 }] {
             let cfg = tiny_config(arm, conv);
@@ -462,10 +461,10 @@ fn forward_rows_refuses_before_any_rows_state_moves() -> Result<()> {
         nexts.push(argmax(&logits));
     }
     let mut pos = [prompts[0].len(), prompts[1].len()];
-    let mut step = |nexts: &[u32],
-                    pos: &[usize; 2],
-                    roomy: &mut State<RewindableExact>,
-                    tight: &mut State<RewindableExact>|
+    let step = |nexts: &[u32],
+                pos: &[usize; 2],
+                roomy: &mut State<RewindableExact>,
+                tight: &mut State<RewindableExact>|
      -> Result<Tensor> {
         let input = Tensor::new(nexts, &dev)?.reshape((2, 1))?;
         let mut rows = [

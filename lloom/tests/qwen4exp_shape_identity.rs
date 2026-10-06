@@ -6,7 +6,7 @@
 //! instantiations of the same seeded tiny model, one profile each; the
 //! profiles are named, never defaulted.
 
-use lloom::models::qwen4exp::{testing, Config, Shape as _};
+use lloom::models::qwen4exp::{testing, Config};
 use lloom::nn::CausalLM;
 use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{Device, Result, Tensor};

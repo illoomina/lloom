@@ -43,6 +43,10 @@ pub struct HyperConnection {
     /// derived plan says otherwise (`qwen4exp.fusion = derived`).
     down_epilogue: bool,
     up_epilogue: bool,
+    /// Whether the grouped norm may run inside its consumers at a one-row
+    /// step ([`Self::mix_parts_norm_gemv`]): `QWEN4EXP_HC_NORM_GEMV` at
+    /// construction. The products keep their epilogue switches under it.
+    norm_gemv: bool,
     /// `n = hc_count`.
     n: usize,
     /// `d = hidden_size`.
@@ -107,6 +111,7 @@ impl HyperConnection {
             inject,
             down_epilogue: true,
             up_epilogue: true,
+            norm_gemv: hc_norm_gemv_on(),
             n,
             d,
             eps,
@@ -122,6 +127,37 @@ impl HyperConnection {
 
     pub fn epilogues(&self) -> (bool, bool) {
         (self.down_epilogue, self.up_epilogue)
+    }
+
+    /// Whether the grouped norm may run inside its consumers (the
+    /// `QWEN4EXP_HC_NORM_GEMV` arm, per bracket).
+    pub fn set_norm_gemv(&mut self, on: bool) {
+        self.norm_gemv = on;
+    }
+
+    pub fn norm_gemv(&self) -> bool {
+        self.norm_gemv
+    }
+
+    /// Whether the arm's products serve a one-row step at this bracket's
+    /// shapes: `down` (and `inject`, when wanted) the f16-weight mixed GEMV
+    /// at the tile the grouped-norm kernel is instantiated for. The shape
+    /// half of the forward's applicability check, which the walk reads.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn norm_gemv_serves(&self, want_inject: bool) -> bool {
+        use crate::optimizer::{walk::qmat_operand, Core, Dim};
+        let serves = |q: &QMatMul| match qmat_operand(q) {
+            (Core::Mixed, shape, _) => match shape.0.as_slice() {
+                [Dim::Const(n_out), Dim::Const(k)] => {
+                    lloom_tensor::gemv_tile::gemv_mixed_gnorm_serves(*n_out, *k, self.n)
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        self.norm_w.dtype() == lloom_tensor::DType::F32
+            && serves(&self.down)
+            && (!want_inject || self.inject.as_ref().is_none_or(serves))
     }
 
     /// Prologue: collapse the `n` streams of `h [b, seq, n*d]` to the sub-block's
@@ -146,7 +182,7 @@ impl HyperConnection {
 
     fn mix_parts(&self, h: &Tensor, want_inject: bool) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, _) = h.dims3()?;
-        if b * seq == 1 && hc_norm_gemv_on() {
+        if b * seq == 1 && self.norm_gemv {
             if let Some(out) = self.mix_parts_norm_gemv(h, want_inject)? {
                 return Ok(out);
             }
@@ -243,9 +279,16 @@ impl HyperConnection {
             || self.inject.as_ref().is_none_or(|w| {
                 w.gemv_mixed_gnorm_applies(h, &self.norm_w, self.n, MixedEpilogue::None, false)
             });
+        // The products' epilogues are the bracket's switches, as on the
+        // composed path: off, the activation is its own launch.
+        let down_epi = if self.down_epilogue {
+            MixedEpilogue::Silu
+        } else {
+            MixedEpilogue::None
+        };
         if !(self
             .down
-            .gemv_mixed_gnorm_applies(h, &self.norm_w, self.n, MixedEpilogue::Silu, true)
+            .gemv_mixed_gnorm_applies(h, &self.norm_w, self.n, down_epi, true)
             && inject_ok
             && super::kernels::hc_collapse_scaled_applies(h, &self.norm_w))
         {
@@ -266,15 +309,28 @@ impl HyperConnection {
                 &self.norm_w,
                 self.eps,
                 self.n,
-                MixedEpilogue::Silu,
-                inv_n as f32,
+                down_epi,
+                if self.down_epilogue {
+                    inv_n as f32
+                } else {
+                    1.0
+                },
                 true,
             )
             .ok_or_else(checked)??;
         let lr = lo_s.dim(lloom_tensor::D::Minus1)? - self.n;
         let lo = lo_s.narrow(lloom_tensor::D::Minus1, 0, lr)?;
         let scales = lo_s.narrow(lloom_tensor::D::Minus1, lr, self.n)?;
-        let gate = match self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0) {
+        let lo = if self.down_epilogue {
+            lo
+        } else {
+            ops::silu(&(lo * inv_n)?)?
+        };
+        let gate = match self
+            .up_epilogue
+            .then(|| self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0))
+            .flatten()
+        {
             Some(g) => g?,
             None => ops::sigmoid(&self.up.forward(&lo)?)?,
         };
@@ -370,6 +426,9 @@ impl crate::optimizer::Visit for HyperConnection {
             Shape::of(&[n * d]),
             self.norm_w.dtype(),
         );
+        if self.norm_gemv && self.norm_gemv_serves(want_inject) {
+            return self.visit_norm_gemv(w, carry, gamma, name, want_inject);
+        }
         let xn = w.opaque("hc_norm", &[carry, gamma], Shape::of(&[1, 1, n * d]), f32);
         let lo = w.project_qmat(&format!("{name}_down.weight"), &self.down, xn);
         let lo = w.scale(lo, (1.0 / n as f64) as f32);
@@ -380,6 +439,76 @@ impl crate::optimizer::Visit for HyperConnection {
         let inject = want_inject.then(|| match &self.inject {
             Some(q) => w.project_qmat(&format!("{name}_inject.weight"), q, xn),
             // `Tensor::zeros`: a fresh zero buffer, no kernel.
+            None => w.input(&format!("{name}.zero_inject"), Shape::of(&[1, 1, n]), f32),
+        });
+        (mixed, inject)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl HyperConnection {
+    /// The bracket under the grouped-norm arm, as it dispatches: `down` and
+    /// `inject` normalizing the carry in their own launches (`down` writing
+    /// the stream scales after its outputs), the collapse forming the
+    /// normalized carry from the scales — no `hc_norm`. The products'
+    /// epilogues follow the bracket's switches. The derivation cannot
+    /// produce this composition (`optimizer::fragments::MIXED_GNORM_REFUSAL`),
+    /// so it is walked as the kernels it runs.
+    fn visit_norm_gemv(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        carry: crate::optimizer::NodeId,
+        gamma: crate::optimizer::NodeId,
+        name: &'static str,
+        want_inject: bool,
+    ) -> (crate::optimizer::NodeId, Option<crate::optimizer::NodeId>) {
+        use crate::optimizer::{walk::qmat_operand, Dim, Shape};
+        let (n, d) = (self.n, self.d);
+        let f32 = lloom_tensor::DType::F32;
+        let weight = |w: &mut crate::optimizer::Walker, part: &str, q: &QMatMul| {
+            let (_, shape, dtype) = qmat_operand(q);
+            let rows = match shape.0.first() {
+                Some(Dim::Const(r)) => *r,
+                _ => unreachable!("a bracket's product has a constant width"),
+            };
+            (
+                w.weight(&format!("{name}_{part}.weight"), shape, dtype),
+                rows,
+            )
+        };
+        let (wd, lr) = weight(w, "down", &self.down);
+        let family = if self.down_epilogue {
+            "gemv_mixed_gnorm_silu"
+        } else {
+            "gemv_mixed_gnorm"
+        };
+        let lo_s = w.opaque(family, &[wd, carry, gamma], Shape::of(&[1, 1, lr + n]), f32);
+        let lo = w.view("narrow", lo_s, Shape::of(&[1, 1, lr]));
+        let scales = w.view("narrow", lo_s, Shape::of(&[1, 1, n]));
+        let lo = if self.down_epilogue {
+            lo
+        } else {
+            let s = w.scale(lo, (1.0 / n as f64) as f32);
+            w.silu(s)
+        };
+        let gate = w.project_qmat(&format!("{name}_up.weight"), &self.up, lo);
+        let gate = w.sigmoid(gate);
+        let mixed = w.opaque(
+            "hc_collapse_scaled",
+            &[carry, gamma, scales, gate],
+            Shape::of(&[1, 1, d]),
+            f32,
+        );
+        let inject = want_inject.then(|| match &self.inject {
+            Some(q) => {
+                let (wi, _) = weight(w, "inject", q);
+                w.opaque(
+                    "gemv_mixed_gnorm",
+                    &[wi, carry, gamma],
+                    Shape::of(&[1, 1, n]),
+                    f32,
+                )
+            }
             None => w.input(&format!("{name}.zero_inject"), Shape::of(&[1, 1, n]), f32),
         });
         (mixed, inject)
@@ -1084,6 +1213,7 @@ mod tests {
             inject: Some(qmm(1, 1, &dev)),
             down_epilogue: true,
             up_epilogue: true,
+            norm_gemv: false,
             n,
             d,
             eps: 1e-6,
@@ -1113,6 +1243,7 @@ mod tests {
             inject: Some(qmm(n, n * d, &dev)),
             down_epilogue: true,
             up_epilogue: true,
+            norm_gemv: false,
             n,
             d,
             eps: 1e-6,

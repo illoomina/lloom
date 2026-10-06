@@ -92,6 +92,9 @@ pub mod metal_backend;
 // `metal` feature exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
 pub mod kernels;
+/// The GEMV's tile selection as plain arithmetic, for the dispatcher and for
+/// a reader with no device (the optimizer's legality facts).
+pub mod gemv_tile;
 /// The paged-KV page allocator (§10.3c–h): pure host bookkeeping — a free
 /// list, per-page refcounts, per-sequence page tables, a quarantine keyed
 /// on GPU epochs — shared by every model's page pool on every backend

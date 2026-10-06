@@ -493,14 +493,15 @@ mod tests {
                 set.get(name)
             );
         }
-        // And the catalogue's GEMV fragments resolve to validated, admitted
+        // And the catalogue's GEMV epilogues resolve to validated, admitted
         // names under the model they compose into. The mixed GEMV's (Qwen4-exp's
-        // HyperConnection epilogues) have no entry — the sweep runs LFM2 — and
-        // must read as unvalidated, never as excluded.
+        // HyperConnection epilogues) and the prologues have no entry — the
+        // sweep ran LFM2's epilogues — and must read as unvalidated, never as
+        // excluded.
         for f in crate::optimizer::catalogue() {
             let t = ExclusionSet::fragment_transform(f.name);
-            match f.core {
-                crate::optimizer::Core::Gemv => assert!(
+            match (f.core, f.side) {
+                (crate::optimizer::Core::Gemv, crate::optimizer::fragments::Side::Store) => assert!(
                     matches!(set.lookup(&t, &f.model), Lookup::Validated(v) if v.verdict == Verdict::Admit),
                     "{t} under {}: {:?}",
                     f.model,

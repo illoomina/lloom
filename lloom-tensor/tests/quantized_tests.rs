@@ -1133,6 +1133,8 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        GgmlDType::MXFP4 => 0.005677,
+        GgmlDType::FP8E4M3 => 0.001290,
 
         // Read-only quants (no `from_float`): nothing to quantize a reference
         // against, so the ggml matmul-error test has no row for them.
@@ -1219,6 +1221,33 @@ fn ggml_matmul_error_test_<T: GgmlType>(a: &[f32], b: &[f32], err_m: f32) -> Res
     Ok(())
 }
 
+/// MXFP4 meets the ggml bounds on the ggml-like vectors. On the ramp
+/// (the second case of [`ggml_matmul_error_test`]) its error is pinned at
+/// what it measures instead: the OCP MX quantizer (`quantize_row_mxfp4_ref`)
+/// takes the shared exponent as `floor(log2 amax) - 2` and saturates, so a
+/// block whose values lie in `(1.5·2^f, 2^(f+1))` clips to `1.5·2^f` — by
+/// design of the format, not of the port, and past the 0.02 a format with
+/// a free per-block scale meets.
+#[test]
+fn quantized_mm_mxfp4() -> Result<()> {
+    use lloom_tensor::quantized::fp_quants::BlockMxfp4;
+    let a = create_ggml_like_vector(0.0);
+    let b = create_ggml_like_vector(1.0);
+    ggml_matmul_error_test_::<BlockMxfp4>(a.as_slice(), b.as_slice(), 1.0)?;
+    let ramp: Vec<f32> = (0..GGML_TEST_SIZE)
+        .map(|i| i as f32 / GGML_TEST_SIZE as f32)
+        .collect();
+    let mut wq = vec![BlockMxfp4::zeros(); GGML_TEST_SIZE / 32];
+    let mut xq = vec![k_quants::BlockQ8_0::zeros(); GGML_TEST_SIZE / 32];
+    BlockMxfp4::from_float(&ramp, &mut wq);
+    k_quants::BlockQ8_0::from_float(&ramp, &mut xq);
+    let got = BlockMxfp4::vec_dot(GGML_TEST_SIZE, &wq, &xq);
+    let error = (got - vec_dot_reference(&ramp, &ramp)).abs() / GGML_TEST_SIZE as f32;
+    println!("mxfp4 ramp dot error {error}");
+    assert!(error < 0.0320, "mxfp4 ramp dot error {error}");
+    Ok(())
+}
+
 #[test]
 fn quantized_mm() -> Result<()> {
     ggml_matmul_error_test::<f32>()?;
@@ -1230,6 +1259,7 @@ fn quantized_mm() -> Result<()> {
     ggml_matmul_error_test::<k_quants::BlockQ5_1>()?;
     ggml_matmul_error_test::<k_quants::BlockQ8_0>()?;
     ggml_matmul_error_test::<k_quants::BlockQ8_1>()?;
+    ggml_matmul_error_test::<lloom_tensor::quantized::fp_quants::BlockFp8E4M3>()?;
     Ok(())
 }
 

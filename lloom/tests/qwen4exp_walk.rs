@@ -99,8 +99,11 @@ const TRACED_STEP: &[(&str, u64)] = &[
 /// 96 `silu_mul` launches a `silu` and a `bmul` each.
 #[test]
 fn the_derived_walk_is_the_traced_step() {
-    let source = walk(&model());
-    let derived = derive(&source, &Policy::default()).expect("derive").graph;
+    let m = model();
+    let source = walk(&m);
+    // The step as the model's switches run it (the shared expert's store
+    // blocks are an arm, off).
+    let derived = derive(&source, &m.switches_policy()).expect("derive").graph;
     let got: Vec<(String, u64)> = with_driver(derived.clone()).census().into_iter().collect();
     let got: Vec<(&str, u64)> = got.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_eq!(
@@ -134,7 +137,8 @@ fn the_derived_walk_is_the_traced_step() {
 /// PLE chain named from counts, the head's collapse called the PLE's).
 #[test]
 fn the_step_depth_and_width() {
-    let derived = derive(&walk(&model()), &Policy::default())
+    let m = model();
+    let derived = derive(&walk(&m), &m.switches_policy())
         .expect("derive")
         .graph;
     let p = derived.depth_profile();
@@ -156,8 +160,9 @@ fn the_step_depth_and_width() {
 /// verdict and are reported as such.
 #[test]
 fn the_derivation_reproduces_the_hand_wired_brackets() {
-    let g = walk(&model());
-    let d = derive(&g, &Policy::default()).expect("derive");
+    let m = model();
+    let g = walk(&m);
+    let d = derive(&g, &m.switches_policy()).expect("derive");
     eprintln!("plan: {}", d.plan);
     let silu = d.plan.sites_of("mixed_silu");
     let sigmoid = d.plan.sites_of("mixed_sigmoid");
@@ -170,14 +175,17 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
     );
     assert!(silu.contains(&"output_hc_down.weight"));
     assert!(silu.contains(&"blk.47.hc_ffn_down.weight"));
-    // The one refusal that applies here: the grouped norm the brackets'
-    // products cannot take as the catalogue stands.
+    // The refusals that apply here: the shared expert's store blocks, by
+    // their switch; the grouped norm the brackets' products cannot take as
+    // the catalogue stands.
+    let refused: Vec<(&str, &str)> = d.refused.iter().map(|(n, w)| (n.as_str(), w.as_str())).collect();
     assert_eq!(
-        d.refused,
-        [(
-            "mixed_gnorm".to_string(),
-            lloom::optimizer::fragments::MIXED_GNORM_REFUSAL.to_string()
-        )]
+        refused,
+        [
+            ("quant_silu", "the switch qwen4exp.shared_store is off"),
+            ("quant_mul", "the switch qwen4exp.shared_store is off"),
+            ("mixed_gnorm", lloom::optimizer::fragments::MIXED_GNORM_REFUSAL),
+        ]
     );
     // The SwiGLUs as one launch each: the routed experts' and the shared
     // expert's, 48 layers.
@@ -194,7 +202,9 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
         Policy::default().unvalidated_in(&g),
         vec![
             ("mixed_silu".to_string(), "no entry".to_string()),
-            ("mixed_sigmoid".to_string(), "no entry".to_string())
+            ("mixed_sigmoid".to_string(), "no entry".to_string()),
+            ("quant_silu".to_string(), "no entry".to_string()),
+            ("quant_mul".to_string(), "no entry".to_string())
         ]
     );
 }
@@ -211,9 +221,13 @@ fn the_plan_is_set_on_the_brackets_it_decides() {
     let line = m.derive_fusion().expect("derive");
     assert!(line.starts_with("qwen4exp fusion=derived: "), "{line}");
     assert!(line.contains("gemv_mixed_silu=97"), "{line}");
-    assert!(line.contains("2 unvalidated"), "{line}");
+    // The shared experts' SwiGLU on their packed projections' stores: the
+    // derived plan takes the quantized store blocks and sets their switch.
+    assert!(line.contains("gemv_quant_mul=48 gemv_quant_silu=48"), "{line}");
+    assert!(line.contains("4 unvalidated"), "{line}");
     assert!(brackets(&m).iter().all(|&e| e == (true, true)));
     assert_eq!(brackets(&m).len(), 97);
+    assert!(m.switches_policy().unavailable.iter().all(|(f, _)| f != "quant_silu"));
 
     let policy = Policy {
         excluded: vec!["mixed_silu".to_string()],
@@ -231,8 +245,9 @@ fn the_plan_is_set_on_the_brackets_it_decides() {
 /// conv history at its layer — and no fused site inside one.
 #[test]
 fn the_recurrences_are_marked() {
-    let g = walk(&model());
-    let d = derive(&g, &Policy::default()).expect("derive");
+    let m = model();
+    let g = walk(&m);
+    let d = derive(&g, &m.switches_policy()).expect("derive");
     let r = &d.plan.regions;
     assert_eq!((r.ssm, r.kv, r.conv_ring), (36, 12, 1), "{}", d.plan);
 }
@@ -270,7 +285,7 @@ fn the_block_completing_walk_is_the_traced_step_10() {
     assert_eq!(block.values().sum::<u64>(), 1737);
     let mut heavy = 0;
     for pos in 44..48 {
-        let d = derive(&walk_at(&m, pos), &Policy::default()).expect("derive");
+        let d = derive(&walk_at(&m, pos), &m.switches_policy()).expect("derive");
         let got = with_driver(d.graph).census();
         if (pos + 1) % 4 == 0 {
             heavy += 1;
@@ -325,6 +340,6 @@ fn the_past_dense_walk_is_the_needle_step() {
     let m = ghost_model_host_planned(&Device::Cpu).expect("ghost build");
     let pos = 4001;
     assert_eq!(((pos + 1) % 4, pos + 1 > m.dense_limit().unwrap()), (2, true));
-    let d = derive(&walk_at(&m, pos), &Policy::default()).expect("derive");
+    let d = derive(&walk_at(&m, pos), &m.switches_policy()).expect("derive");
     assert_eq!(with_driver(d.graph).census(), needle);
 }

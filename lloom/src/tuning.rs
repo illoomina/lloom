@@ -295,6 +295,9 @@ pub struct Qwen4ExpTuning {
     /// The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm).
     #[opt(flag = "qwen-f16-fuse", env = "QWEN4EXP_F16_FUSE", bool)]
     pub f16_fuse: bool,
+    /// The shared expert's SwiGLU on its quantized projections' stores: the SiLU on the gate's, the product multiplied into the gate's buffer on the up's — one launch less a layer (`silu_mul`); off = the two products and `silu_mul` (the A/B arm). An arm, off by default.
+    #[opt(flag = "qwen-shared-store", env = "QWEN4EXP_SHARED_STORE", bool)]
+    pub shared_store: bool,
     /// The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way.
     #[opt(flag = "qwen-f16-fold", env = "QWEN4EXP_F16_FOLD", bool)]
     pub f16_fold: bool,
@@ -380,6 +383,7 @@ impl Default for Qwen4ExpTuning {
             hc_mix: false,
             fused_off: false,
             f16_fuse: true,
+            shared_store: false,
             f16_fold: false,
             chunk_scan: true,
             delta_reduce: false,

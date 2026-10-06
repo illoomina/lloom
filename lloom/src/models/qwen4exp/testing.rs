@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 thread_local! {
     static F16_STEMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SHARED_KIND: std::cell::Cell<Option<GgmlDType>> = const { std::cell::Cell::new(None) };
 }
 
 /// Build the dense matrices of this thread's models as `TensorF16` (the
@@ -25,6 +26,29 @@ thread_local! {
 /// asserts bit-identity of a rows pass against single rows sets it.
 pub fn set_f16_stems(on: bool) {
     F16_STEMS.with(|f| f.set(on));
+}
+
+/// Build the shared expert's gate and up projections of this thread's
+/// models packed as `kind` (the checkpoint's are packed: the quantized
+/// matvec's store blocks ride them), or as [`lin`]'s dense kind (`None`).
+pub fn set_shared_kind(kind: Option<GgmlDType>) {
+    SHARED_KIND.with(|k| k.set(kind));
+}
+
+/// [`lin`] packed as `kind`.
+fn lin_packed(out: usize, inp: usize, seed: f32, dev: &Device, kind: GgmlDType) -> QMatMul {
+    let v: Vec<f32> = (0..out * inp)
+        .map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08)
+        .collect();
+    let t = Tensor::from_vec(v, (out, inp), &Device::Cpu).unwrap();
+    let q = QTensor::quantize(&t, kind).unwrap();
+    let data = q.data().unwrap();
+    let on = QTensor::new(
+        lloom_tensor::quantized::QStorage::from_data(data, dev, kind).unwrap(),
+        (out, inp),
+    )
+    .unwrap();
+    QMatMul::QTensor(Arc::new(on))
 }
 
 /// A dense `[out, inp]` matrix from a seed.
@@ -147,11 +171,15 @@ pub fn moe_with<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> M
     let d = cfg.hidden_size;
     let ne = cfg.n_experts;
     let sh = cfg.shared_expert_intermediate_size;
+    let shared = |seed: f32| match SHARED_KIND.with(|k| k.get()) {
+        Some(kind) => lin_packed(sh, d, seed, dev, kind),
+        None => lin(sh, d, seed, dev),
+    };
     MoeLayer::new(
         lin(ne, d, 1.0, dev),
         experts,
-        lin(sh, d, 2.0, dev),
-        lin(sh, d, 3.0, dev),
+        shared(2.0),
+        shared(3.0),
         lin(d, sh, 4.0, dev),
         lin(1, d, 5.0, dev),
         cfg,

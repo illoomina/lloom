@@ -121,27 +121,10 @@ fn arms() -> Vec<(&'static str, Option<KvPrecision>, Option<bool>, Hc)> {
         ),
         ("act-f16-fused", None, Some(true), Hc::Off),
         ("act-f16-composed", None, Some(false), Hc::Off),
+        ("shared-store", None, None, Hc::Off),
         ("hc-norm-gemv", None, None, Hc::NormGemv),
         ("hc-norm-gemv-switches-off", None, None, Hc::NormGemvSwitchesOff),
     ]
-}
-
-/// The composition an arm runs, as the policy the walk is derived under —
-/// the model's own (`fusion_policy`: the bracket epilogues on the brackets'
-/// products only); with the f16 routed step composed, its two kernel
-/// fragments refused; with the brackets' epilogues off, theirs.
-fn policy(act_f16_fuse: Option<bool>, hc: Hc) -> Policy {
-    let mut excluded = Vec::new();
-    if act_f16_fuse == Some(false) {
-        excluded.extend(["silu_mul_f16".to_string(), "combine_cast".to_string()]);
-    }
-    if hc == Hc::NormGemvSwitchesOff {
-        excluded.extend(["mixed_silu".to_string(), "mixed_sigmoid".to_string()]);
-    }
-    fusion_policy(&Policy {
-        excluded,
-        ..Policy::default()
-    })
 }
 
 /// Decode `arm`'s model from an empty cache over every kind of position,
@@ -160,6 +143,10 @@ fn check(
         // grouped-norm kernel's tile (`n_out >= 4`, `K >= 16 n_out`).
         cfg.hc_count = 4;
     }
+    // The shared expert's projections packed (Q8_0: the tiny width is one
+    // block), its SwiGLU on their stores.
+    let shared = name == "shared-store";
+    testing::set_shared_kind(shared.then_some(GgmlDType::Q8_0));
     let mut m = if act_f16_fuse.is_some() {
         model_with_experts(&cfg, dev, GgmlDType::Q8_0)
     } else {
@@ -172,15 +159,24 @@ fn check(
         m.set_routed_act(DType::F16);
         m.set_f16_fuse(fuse);
     }
-    let policy = policy(act_f16_fuse, hc);
     if hc == Hc::NormGemvSwitchesOff {
         // A plan refusing the brackets' epilogues sets every switch off.
-        m.derive_fusion_with(&policy)?;
+        let refuse = Policy {
+            excluded: vec!["mixed_silu".to_string(), "mixed_sigmoid".to_string()],
+            ..Policy::default()
+        };
+        m.derive_fusion_with(&refuse)?;
         assert!(m.bracket_epilogues().iter().all(|e| *e == (false, false)));
     }
     if hc != Hc::Off {
         m.set_hc_norm_gemv(true);
     }
+    testing::set_shared_kind(None);
+    if shared {
+        m.set_shared_store(true);
+    }
+    // The composition the model's switches run (`Qwen4Exp::switches_policy`).
+    let policy = m.switches_policy();
     let ratio = cfg.indexer_compress_ratio;
     let dense = cfg.indexer_budget + ratio - 1;
     // The cache the model's own configuration asks for: the store at the
@@ -208,6 +204,12 @@ fn check(
         let ran = census_of_labels(census.close().iter().map(|(l, n)| (l.as_str(), *n)));
         let walked = derive(&walk_at(&m, pos), &policy)?.graph.census();
         let d = differences(&walked, &ran);
+        if shared && pos == 0 {
+            assert!(
+                walked.contains_key("gemv_quant_silu") && walked.contains_key("gemv_quant_mul"),
+                "{name}: the shared SwiGLU rides the packed stores: {walked:?}"
+            );
+        }
         if hc != Hc::Off && pos == 0 {
             assert!(
                 walked.contains_key("hc_collapse_scaled") && !walked.contains_key("hc_norm"),

@@ -73,6 +73,9 @@ pub struct Fragment {
     /// prologue alone always): `gemv.metal`'s `_norm`, `_norm_silu`,
     /// `_norm_swiglu`. Empty for an epilogue.
     pub composes_with: &'static [&'static str],
+    /// A measured loss: the block is refused with it unless a policy admits
+    /// it by name (`Policy::admit`, a switch that runs it anyway).
+    pub loss: Option<&'static str>,
 }
 
 impl Fragment {
@@ -107,6 +110,7 @@ fn describe<E: Epilogue>() -> Fragment {
         needs: TileNeed::Any,
         refusal: None,
         composes_with: &[],
+        loss: None,
     }
 }
 
@@ -138,6 +142,7 @@ fn describe_prologue<P: Prologue>(
         needs: P::NEEDS,
         refusal,
         composes_with,
+        loss: None,
     }
 }
 
@@ -166,6 +171,7 @@ fn describe_mixed(e: MixedEpilogue) -> Option<Fragment> {
         needs: TileNeed::Any,
         refusal: None,
         composes_with: &[],
+        loss: None,
     })
 }
 
@@ -192,8 +198,15 @@ fn describe_quant(s: lloom_tensor::quantized::MvStore) -> Fragment {
         needs: TileNeed::Any,
         refusal: None,
         composes_with: &[],
+        loss: Some(QUANT_STORE_LOSS),
     }
 }
+
+/// The quantized store blocks' measurement, as a pair on Qwen4-exp's shared
+/// experts: not a win.
+pub const QUANT_STORE_LOSS: &str = "a measured loss as a pair (optimizer-design.md §10k): \
+     +1.13 % [-0.92, +1.32] decode end to end on Qwen4-exp, 4 rotations, null -0.12 %; the up \
+     projection waits on the gate's sweep where silu_mul waited on both";
 
 /// Why the imported-scale norm prologue is never placed.
 pub const RMSNORM_REFUSAL: &str = "a measured loss (fusion.md §12.2a): the reduction stays a \

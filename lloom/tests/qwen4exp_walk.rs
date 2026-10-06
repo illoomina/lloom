@@ -202,9 +202,7 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
         Policy::default().unvalidated_in(&g),
         vec![
             ("mixed_silu".to_string(), "no entry".to_string()),
-            ("mixed_sigmoid".to_string(), "no entry".to_string()),
-            ("quant_silu".to_string(), "no entry".to_string()),
-            ("quant_mul".to_string(), "no entry".to_string())
+            ("mixed_sigmoid".to_string(), "no entry".to_string())
         ]
     );
 }
@@ -221,13 +219,14 @@ fn the_plan_is_set_on_the_brackets_it_decides() {
     let line = m.derive_fusion().expect("derive");
     assert!(line.starts_with("qwen4exp fusion=derived: "), "{line}");
     assert!(line.contains("gemv_mixed_silu=97"), "{line}");
-    // The shared experts' SwiGLU on their packed projections' stores: the
-    // derived plan takes the quantized store blocks and sets their switch.
-    assert!(line.contains("gemv_quant_mul=48 gemv_quant_silu=48"), "{line}");
-    assert!(line.contains("4 unvalidated"), "{line}");
+    // The shared experts' store blocks are refused by their measurement,
+    // and their switch stays off.
+    assert!(!line.contains("gemv_quant"), "{line}");
+    assert!(line.contains("quant_mul: a measured loss"), "{line}");
+    assert!(line.contains("2 unvalidated"), "{line}");
     assert!(brackets(&m).iter().all(|&e| e == (true, true)));
     assert_eq!(brackets(&m).len(), 97);
-    assert!(m.switches_policy().unavailable.iter().all(|(f, _)| f != "quant_silu"));
+    assert!(m.switches_policy().unavailable.iter().any(|(f, _)| f == "quant_silu"));
 
     let policy = Policy {
         excluded: vec!["mixed_silu".to_string()],

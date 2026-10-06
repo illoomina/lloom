@@ -68,6 +68,9 @@ pub struct Policy {
     /// rides a product whose weight name ends with one of the suffixes, and
     /// no other.
     pub sites: Vec<(String, Vec<String>)>,
+    /// Blocks admitted despite their measured loss: a switch the model runs
+    /// them under is on.
+    pub admit: Vec<String>,
 }
 
 impl Default for Policy {
@@ -101,6 +104,7 @@ impl Default for Policy {
             barrier_model: Some(CostModel::default()),
             unavailable: Vec::new(),
             sites: Vec::new(),
+            admit: Vec::new(),
         }
     }
 }
@@ -138,7 +142,11 @@ impl Policy {
         // validation state worth reporting.
         fragments
             .iter()
-            .filter(|f| f.refusal.is_none() && f.class().within(self.budget))
+            .filter(|f| {
+                f.refusal.is_none()
+                    && f.class().within(self.budget)
+                    && (f.loss.is_none() || self.admit.iter().any(|a| a == f.name))
+            })
             .cloned()
             .filter_map(|f| {
                 let t = ExclusionSet::fragment_transform(f.name);
@@ -592,9 +600,7 @@ mod tests {
             policy.unvalidated(),
             vec![
                 ("mixed_silu".to_string(), "no entry".to_string()),
-                ("mixed_sigmoid".to_string(), "no entry".to_string()),
-                ("quant_silu".to_string(), "no entry".to_string()),
-                ("quant_mul".to_string(), "no entry".to_string())
+                ("mixed_sigmoid".to_string(), "no entry".to_string())
             ]
         );
         assert!(policy.unvalidated_in(&mlp(1)).is_empty());
@@ -895,19 +901,24 @@ mod tests {
         let route = g.input("route", Shape::of(&[1, 4]), DType::F32);
         let out = g.opaque("moe_combine", &[y32, route], Shape::of(&[1, 64]), DType::F32);
         g.mark_root(out);
-        // On packed products the store blocks take the SwiGLU — the SiLU on
-        // the gate's store, the product into the gate's buffer — one launch
-        // fewer than the kernel fragment's, which is the answer where the
-        // blocks are excluded.
-        let d = derive(&g, &Policy::default()).unwrap();
-        assert_eq!(d.plan.sites.get("wg").map(String::as_str), Some("quant_silu"));
-        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
-        assert!(d.plan.kernels.get("silu_mul_f32").is_none());
-        let policy = Policy {
-            excluded: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+        // Admitted, the store blocks take the SwiGLU on packed products —
+        // the SiLU on the gate's store, the product into the gate's buffer —
+        // one launch fewer than the kernel fragment's; by default they are
+        // refused by their measured loss and the kernel fragment is the
+        // answer.
+        let admit = Policy {
+            admit: vec!["quant_silu".to_string(), "quant_mul".to_string()],
             ..Default::default()
         };
-        let d = derive(&g, &policy).unwrap();
+        let d = derive(&g, &admit).unwrap();
+        assert_eq!(d.plan.sites.get("wg").map(String::as_str), Some("quant_silu"));
+        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        assert!(!d.plan.kernels.contains_key("silu_mul_f32"));
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert!(d
+            .refused
+            .iter()
+            .any(|(n, w)| n == "quant_mul" && w == fragments::QUANT_STORE_LOSS));
         assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&1));
         assert_eq!(d.plan.kernels.get("combine_cast"), Some(&1));
         assert_eq!(d.plan.after.get("silu_mul"), Some(&1));
@@ -952,7 +963,11 @@ mod tests {
                 let e = g.sigmoid(s);
                 g.mark_root(e);
             }
-            derive(&g, &Policy::default()).unwrap()
+            let admit = Policy {
+                admit: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+                ..Default::default()
+            };
+            derive(&g, &admit).unwrap()
         };
         let d = swiglu(false, DType::U8);
         assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));

@@ -1508,7 +1508,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// model's own ([`fusion_policy`]) with every block whose switch is off
     /// refused by that switch — the bracket epilogues where every bracket's
     /// is off, the shared expert's store blocks under
-    /// `qwen4exp.shared_store` off, the f16 routed step's compositions under
+    /// `qwen4exp.shared_store` off (admitted, their measured loss
+    /// notwithstanding, with it on), the f16 routed step's compositions under
     /// `qwen4exp.f16_fuse` off. A derivation over the walk under it is the
     /// step the forward dispatches (the census tests hold the two equal).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1525,6 +1526,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if self.layers.iter().all(|l| !l.moe().shared_store()) {
             off("quant_silu", "the switch qwen4exp.shared_store is off");
             off("quant_mul", "the switch qwen4exp.shared_store is off");
+        } else {
+            // The switch runs the blocks whatever their measurement.
+            p.admit.extend(["quant_silu".to_string(), "quant_mul".to_string()]);
         }
         if self.layers.iter().all(|l| !l.moe().f16_fuse()) {
             off("silu_mul_f16", "the switch qwen4exp.f16_fuse is off");

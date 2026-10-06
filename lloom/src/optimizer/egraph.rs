@@ -70,6 +70,8 @@ pub fn admitted(policy: &Policy, catalogue: &[Fragment]) -> (Vec<Fragment>, Vec<
             refused.push((f.name.to_string(), why.to_string()));
         } else if let Some((_, why)) = policy.unavailable.iter().find(|(n, _)| n == f.name) {
             refused.push((f.name.to_string(), why.clone()));
+        } else if let Some(why) = f.loss.filter(|_| !policy.admit.iter().any(|a| a == f.name)) {
+            refused.push((f.name.to_string(), why.to_string()));
         } else if policy.excluded.iter().any(|e| e == f.name) {
             refused.push((
                 f.name.to_string(),

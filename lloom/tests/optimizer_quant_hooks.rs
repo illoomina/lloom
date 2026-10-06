@@ -13,11 +13,26 @@ use lloom_tensor::Device;
 fn the_quantized_store_hooks_priced_on_the_real_step() {
     let model = lloom::models::qwen4exp::testing::ghost_model(&Device::Cpu).expect("ghost build");
     let g = walk(&model);
-    // The step as the switches run it, and the model's own policy, which
-    // admits the quantized store blocks.
+    // The step as the switches run it; the model's own policy, which
+    // refuses the quantized store blocks by their measurement (a pair that
+    // does not pay end to end); and that policy admitting them — the plan
+    // they make.
     let shipped = derive(&g, &model.switches_policy()).expect("derive");
-    let policy =
+    let mut policy =
         lloom::models::qwen4exp::model::fusion_policy(&lloom::optimizer::Policy::default());
+    let refused = derive(&g, &policy).expect("derive");
+    for f in ["quant_silu", "quant_mul"] {
+        assert!(
+            refused
+                .refused
+                .iter()
+                .any(|(n, w)| n == f && w == lloom::optimizer::fragments::QUANT_STORE_LOSS),
+            "{:?}",
+            refused.refused
+        );
+    }
+    assert_eq!(refused.plan.dispatches_after(), 1579);
+    policy.admit = vec!["quant_silu".to_string(), "quant_mul".to_string()];
     let d = derive(&g, &policy).expect("derive");
     eprintln!("shipped: {}", shipped.plan);
     eprintln!("hooked:  {}", d.plan);

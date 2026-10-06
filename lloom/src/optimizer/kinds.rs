@@ -89,6 +89,13 @@ fn opaque(family: &str) -> Option<Facts> {
         // `qwen4exp.metal` `hc_norm_f32`: a threadgroup per (row, stream),
         // the sum of squares over `d`.
         "hc_norm" => facts(Reduction, false, false),
+        // The mixed GEMV with the grouped norm in its load
+        // (`PrologueGroupNorm`), as the hand-built arm runs it: both ends
+        // taken.
+        f if f.starts_with("gemv_mixed_gnorm") => facts(Product, false, false),
+        // `hc_collapse_scaled_f32`: the collapse forming the normalized
+        // carry from the stream scales a product wrote.
+        "hc_collapse_scaled" => facts(Reduction, false, false),
         // `hc_collapse_f32`: the gated mean over the `n` streams; an output
         // element reads `n` inputs a stream apart.
         "hc_collapse" => facts(Reduction, false, false),
@@ -152,11 +159,16 @@ pub fn of(node: &Node) -> Option<Facts> {
     Some(match &node.op {
         Op::Input | Op::Weight | Op::View => return None,
         Op::Gemv => product(node.core),
-        // The store carries the fragment already; the load is the core's.
-        Op::Fused => Facts {
-            store_hook: false,
-            ..product(node.core)
-        },
+        // An end that carries a block is taken; a prologue alone leaves the
+        // store free, an epilogue alone the load.
+        Op::Fused => {
+            let core = product(node.core);
+            Facts {
+                store_hook: core.store_hook && node.name.is_empty(),
+                load_hook: core.load_hook && node.prologue.is_none(),
+                ..core
+            }
+        }
         Op::Silu | Op::Sigmoid | Op::Scale | Op::Mul | Op::Add => facts(Elementwise, false, false),
         // `reduce.metal`'s `rms_norm<…, Store>`: `StoreNorm` / `StoreRope`.
         Op::RmsNorm => facts(Reduction, true, false),
@@ -185,6 +197,19 @@ mod tests {
         assert_eq!(of(g.node(q)), Some(facts(Role::Product, false, false)));
         assert_eq!(of(g.node(m)), Some(facts(Role::Product, true, false)));
         assert_eq!(of(g.node(f)), Some(facts(Role::Product, false, true)));
+        // A prologue alone: the load taken, the store free.
+        let nw = g.weight("nw", Shape::of(&[8]), DType::F32);
+        let p = g.fused_with_prologue(
+            Core::Gemv,
+            "",
+            crate::optimizer::NumericClass::BitExact,
+            w,
+            x,
+            None,
+            None,
+            ("norm", nw, crate::optimizer::NumericClass::ReorderEquiv),
+        );
+        assert_eq!(of(g.node(p)), Some(facts(Role::Product, true, false)));
         assert_eq!(of(g.node(hc)).map(|f| f.role), Some(Role::Reduction));
         assert_eq!(of(g.node(unknown)), None);
         assert_eq!(of(g.node(x)), None, "an input does not dispatch");

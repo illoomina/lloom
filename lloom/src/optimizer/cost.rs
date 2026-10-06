@@ -231,6 +231,16 @@ pub fn step_cost(model: &CostModel, graph: &Graph) -> StepCost {
 pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
     let mut out = Graph::new();
     let mut map: Vec<Option<NodeId>> = vec![None; graph.nodes().len()];
+    // A prologue's norm, once per (weight, input): its readers shared it.
+    let mut norms: std::collections::HashMap<(NodeId, NodeId), NodeId> =
+        std::collections::HashMap::new();
+    let class_of = |name: &str| {
+        super::fragments::catalogue()
+            .into_iter()
+            .find(|f| f.name == name)
+            .map(|f| f.class())
+            .unwrap_or(super::numeric::NumericClass::BitExact)
+    };
     for id in order(graph) {
         let n = graph.node(id);
         let inputs: Vec<NodeId> = n
@@ -239,43 +249,70 @@ pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
             .map(|&i| map[i].expect("post-order: inputs first"))
             .collect();
         let new = match n.op {
-            Op::Fused if n.name == fragment => {
-                let g = out.gemv_on(n.core, inputs[0], inputs[1]);
-                // A scaling block stands for its constant's `affine` too,
-                // unless the constant is 1 (nothing was absorbed).
-                let scaled = |out: &mut Graph, g: NodeId| match n.scalar {
-                    Some(c) if c != 1.0 => out.scale(g, c),
-                    _ => g,
-                };
-                match (n.name.as_str(), inputs.get(2)) {
-                    ("mixed_silu", None) => {
-                        let s = scaled(&mut out, g);
-                        out.silu(s)
+            Op::Fused if n.carries(fragment) => {
+                // The node's own parts: the epilogue's operand and the
+                // prologue's weight, in the mapped graph.
+                let operand = n.operand().map(|i| map[i].expect("post-order"));
+                let pw = n.prologue_weight().map(|i| map[i].expect("post-order"));
+                let (w, x) = (inputs[0], inputs[1]);
+                if n.prologue.as_deref() == Some(fragment) {
+                    // The prologue back to the norm it computed.
+                    let pw = pw.expect("a prologue carries its weight");
+                    let norm = *norms.entry((pw, x)).or_insert_with(|| out.rms_norm(pw, x));
+                    if n.name.is_empty() {
+                        out.gemv_on(n.core, w, norm)
+                    } else {
+                        out.fused_on(n.core, &n.name, class_of(&n.name), w, norm, operand, n.scalar)
                     }
-                    ("mixed_sigmoid", None) => {
-                        let s = scaled(&mut out, g);
-                        out.sigmoid(s)
+                } else {
+                    // The epilogue back to its pair; a prologue stays on the
+                    // product (and on the gate's, for the two-weight kernel).
+                    let product = |out: &mut Graph, w: NodeId| match (&n.prologue, pw) {
+                        (Some(p), Some(pw)) => out.fused_with_prologue(
+                            n.core,
+                            "",
+                            super::numeric::NumericClass::BitExact,
+                            w,
+                            x,
+                            None,
+                            None,
+                            (p.as_str(), pw, class_of(p)),
+                        ),
+                        _ => out.gemv_on(n.core, w, x),
+                    };
+                    let g = product(&mut out, w);
+                    // A scaling block stands for its constant's `affine` too,
+                    // unless the constant is 1 (nothing was absorbed).
+                    let scaled = |out: &mut Graph, g: NodeId| match n.scalar {
+                        Some(c) if c != 1.0 => out.scale(g, c),
+                        _ => g,
+                    };
+                    match (n.name.as_str(), operand) {
+                        ("mixed_silu", None) => {
+                            let s = scaled(&mut out, g);
+                            out.silu(s)
+                        }
+                        ("mixed_sigmoid", None) => {
+                            let s = scaled(&mut out, g);
+                            out.sigmoid(s)
+                        }
+                        ("silu", None) => out.silu(g),
+                        ("residual", Some(r)) => out.add(g, r),
+                        // The emitter's operand order: `mul(gate, up)`, the
+                        // gate first — so the pair is priced in the order the
+                        // layer runs.
+                        ("mul", Some(r)) => out.mul(r, g),
+                        // The two-weight kernel stands for four dispatches:
+                        // `gemv(w1)`, `silu`, `gemv(w3)`, `mul(gate, up)` —
+                        // the emitter's order. The operand is the gate WEIGHT.
+                        ("swiglu", Some(w1)) => {
+                            let gate = product(&mut out, w1);
+                            let gate = out.silu(gate);
+                            out.mul(gate, g)
+                        }
+                        (other, _) => panic!("optimizer: no unfused pair for fragment `{other}`"),
                     }
-                    ("silu", None) => out.silu(g),
-                    ("residual", Some(&r)) => out.add(g, r),
-                    // The emitter's operand order: `mul(gate, up)`, the gate
-                    // first — so the pair is priced in the order the layer runs.
-                    ("mul", Some(&r)) => out.mul(r, g),
-                    // The two-weight kernel stands for four dispatches:
-                    // `gemv(w1)`, `silu`, `gemv(w3)`, `mul(gate, up)` — the
-                    // emitter's order. `inputs[2]` is the gate WEIGHT.
-                    ("swiglu", Some(&w1)) => {
-                        let gate = out.gemv(w1, inputs[1]);
-                        let gate = out.silu(gate);
-                        out.mul(gate, g)
-                    }
-                    (other, _) => panic!("optimizer: no unfused pair for fragment `{other}`"),
                 }
-            }
-            Op::Fused => {
-                let mut node = n.clone();
-                node.inputs = inputs;
-                out.push(node)
             }
             _ => {
                 let mut node = n.clone();
@@ -302,7 +339,7 @@ pub fn marginals(model: &CostModel, derived: &Graph, fragments: &[&str]) -> Vec<
             let sites = derived
                 .nodes()
                 .iter()
-                .filter(|n| n.op == Op::Fused && n.name == f)
+                .filter(|n| n.carries(f))
                 .count();
             if sites == 0 {
                 return Marginal {
@@ -318,8 +355,7 @@ pub fn marginals(model: &CostModel, derived: &Graph, fragments: &[&str]) -> Vec<
                 .barriers
                 .iter()
                 .find(|b| {
-                    let a = derived.node(b.after);
-                    a.op == Op::Fused && a.name == f
+                    derived.node(b.after).carries(f)
                 })
                 .map(|b| {
                     (

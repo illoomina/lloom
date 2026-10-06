@@ -30,13 +30,7 @@ use super::kinds::{self, Facts, Role};
 use super::Derivation;
 
 /// Which end of a product the seam is at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Side {
-    /// The producer is a product; the consumer would ride its store.
-    Store,
-    /// The consumer is a product; the producer would ride its load.
-    Load,
-}
+pub use super::fragments::Side;
 
 /// Why a seam is unfused.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -276,7 +270,26 @@ fn classify(
     // The load side: the producer would ride the consumer product's load.
     if cf.role == Role::Product {
         let why = match pf.role {
-            Role::Reduction => Why::CrossThreadgroup(Side::Load),
+            // A reduction rides a product's load only where the catalogue
+            // has a prologue computing it there and the product's tile admits
+            // it (G2 passed): then it is the policy's, or the prologue's own
+            // refusal, that leaves it.
+            Role::Reduction => match load_prologue(graph, p, c, catalogue) {
+                Some(f) => Why::Refused {
+                    fragment: f.name.to_string(),
+                    reason: f
+                        .refusal
+                        .map(str::to_string)
+                        .or_else(|| {
+                            refused
+                                .iter()
+                                .find(|(n, _)| n == f.name)
+                                .map(|(_, r)| r.clone())
+                        })
+                        .unwrap_or_else(|| "the rule did not place it".to_string()),
+                },
+                None => Why::CrossThreadgroup(Side::Load),
+            },
             Role::Elementwise if cf.load_hook => Why::PrologueRecompute,
             Role::Elementwise => Why::NewBody(format!("no load hook on {}", fam(cn))),
             Role::Product => Why::NewBody("two products".to_string()),
@@ -325,6 +338,28 @@ fn classify(
     (why, c)
 }
 
+/// The catalogue's prologue that computes producer `p` in consumer `c`'s
+/// load where `c`'s tile admits it: the inline norm (an `RmsNorm` into a
+/// GEMV whose simdgroup walks K), the grouped norm (`hc_norm` into the mixed
+/// GEMV, any tile). A prologue that only imports the reduction removes no
+/// dispatch and is not this seam's.
+fn load_prologue<'c>(graph: &Graph, p: NodeId, c: NodeId, catalogue: &'c [Fragment]) -> Option<&'c Fragment> {
+    let (pn, cn) = (graph.node(p), graph.node(c));
+    let semantics = match (&pn.op, pn.name.as_str()) {
+        (Op::RmsNorm, _) if graph.gemv_walks_k(c) => Semantics::RmsNorm,
+        (Op::Opaque, "hc_norm") => Semantics::GroupRmsNorm,
+        _ => return None,
+    };
+    // A fused consumer takes the prologue only beside an epilogue the
+    // kernel instantiates with it.
+    catalogue.iter().find(|f| {
+        f.side == Side::Load
+            && f.semantics == semantics
+            && f.core == cn.core
+            && (cn.op != Op::Fused || f.composes_with.contains(&cn.name.as_str()))
+    })
+}
+
 /// The store-side verdict once the gates pass: the catalogue's block for
 /// the consumer's semantics on the producer's core, refused or never there.
 fn store_fragment(
@@ -344,7 +379,9 @@ fn store_fragment(
     };
     match catalogue
         .iter()
-        .find(|f| f.core == pn.core && f.semantics == sem && f.operand == operand)
+        .find(|f| {
+            f.side == Side::Store && f.core == pn.core && f.semantics == sem && f.operand == operand
+        })
     {
         Some(f) => Why::Refused {
             fragment: f.name.to_string(),

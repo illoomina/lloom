@@ -189,6 +189,40 @@ pub struct Node {
     /// A `Scale`'s constant, or the scale a `Fused` scaling block applies
     /// before its transform; `None` otherwise.
     pub scalar: Option<f32>,
+    /// The prologue a `Fused` node's product carries on its load (`norm`),
+    /// its weight the node's LAST input; `None` otherwise. A prologue alone
+    /// leaves `name` empty: the product's store is free.
+    pub prologue: Option<String>,
+}
+
+impl Node {
+    /// A `Fused` node's composition as the kernels name it: the prologue,
+    /// then the epilogue (`norm_silu`, `norm`, `silu`).
+    pub fn block(&self) -> String {
+        match (&self.prologue, self.name.is_empty()) {
+            (Some(p), true) => p.clone(),
+            (Some(p), false) => format!("{p}_{}", self.name),
+            (None, _) => self.name.clone(),
+        }
+    }
+
+    /// A `Fused` node's epilogue operand, if its block binds one.
+    pub fn operand(&self) -> Option<NodeId> {
+        let n = self.inputs.len() - usize::from(self.prologue.is_some());
+        (self.op == Op::Fused && n > 2).then(|| self.inputs[2])
+    }
+
+    /// A `Fused` node's prologue weight, if it carries a prologue.
+    pub fn prologue_weight(&self) -> Option<NodeId> {
+        self.prologue.as_ref().and_then(|_| self.inputs.last().copied())
+    }
+
+    /// Whether this `Fused` node carries `fragment` at either end.
+    pub fn carries(&self, fragment: &str) -> bool {
+        self.op == Op::Fused
+            && ((!self.name.is_empty() && self.name == fragment)
+                || self.prologue.as_deref() == Some(fragment))
+    }
 }
 
 /// The kernel family a node's dispatch is counted under — the census key.
@@ -203,7 +237,7 @@ pub fn family(node: &Node) -> Option<String> {
         Op::Sigmoid => "sigmoid".to_string(),
         Op::RmsNorm => "rmsnorm".to_string(),
         Op::Opaque => node.name.clone(),
-        Op::Fused => format!("gemv_{}", node.name),
+        Op::Fused => format!("gemv_{}", node.block()),
     })
 }
 
@@ -215,13 +249,27 @@ pub fn family(node: &Node) -> Option<String> {
 /// are both `copy2d`, every cast is `cast`).
 pub fn kernel_family(label: &str) -> String {
     const PRODUCT_BLOCKS: [&str; 5] = ["_silu", "_sigmoid", "_residual", "_mul", "_swiglu"];
+    // The prologues, in the order a name carries them: the classical GEMV's
+    // before its epilogue (`_norm_silu`), the mixed GEMV's after it
+    // (`_silu_gnorm`). A family names the prologue first either way.
+    const PROLOGUES: [&str; 3] = ["_norm", "_rmsnorm", "_gnorm"];
     let block = |l: &str| {
         let l = l.strip_suffix("_packed").unwrap_or(l);
-        PRODUCT_BLOCKS
+        let (l, after) = match l.strip_suffix("_gnorm") {
+            Some(rest) => (rest, "_gnorm"),
+            None => (l, ""),
+        };
+        let epi = PRODUCT_BLOCKS
             .iter()
             .find(|b| l.ends_with(*b))
             .copied()
-            .unwrap_or("")
+            .unwrap_or("");
+        let before = PROLOGUES
+            .iter()
+            .find(|p| l[..l.len() - epi.len()].ends_with(*p))
+            .copied()
+            .unwrap_or("");
+        format!("{before}{after}{epi}")
     };
     for (prefix, family) in [
         ("kernel_mul_mv_id2_", "mul_mv_id2"),
@@ -395,6 +443,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -409,6 +458,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -426,6 +476,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -451,6 +502,7 @@ impl Graph {
             region: Region::Straight,
             core,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -468,6 +520,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -485,6 +538,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -525,6 +579,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -550,6 +605,7 @@ impl Graph {
             region: Region::Straight,
             core: Core::Gemv,
             scalar: None,
+            prologue: None,
         })
     }
 
@@ -598,7 +654,38 @@ impl Graph {
             region: Region::Straight,
             core,
             scalar: scale,
+            prologue: None,
         })
+    }
+
+    /// [`Self::fused_on`] with a prologue on the product's load: `prologue`
+    /// names it, `pw` is its weight (appended as the node's last input),
+    /// `pclass` its class. `fragment` is the epilogue's name, empty when the
+    /// store carries none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_with_prologue(
+        &mut self,
+        core: Core,
+        fragment: &str,
+        class: NumericClass,
+        w: NodeId,
+        x: NodeId,
+        operand: Option<NodeId>,
+        scale: Option<f32>,
+        prologue: (&str, NodeId, NumericClass),
+    ) -> NodeId {
+        let id = self.fused_on(core, fragment, class, w, x, operand, scale);
+        let (name, pw, pclass) = prologue;
+        let node = &mut self.nodes[id];
+        node.inputs.push(pw);
+        node.prologue = Some(name.to_string());
+        node.numeric = node.numeric.join(pclass);
+        id
+    }
+
+    /// Set a node's numerical class (a kernel fragment's composition).
+    pub fn set_numeric(&mut self, id: NodeId, class: NumericClass) {
+        self.nodes[id].numeric = class;
     }
 
     /// How many nodes read each value. A view counts as a use of what it
@@ -631,6 +718,32 @@ impl Graph {
         } else {
             Some(x.shape.0[r - 2])
         }
+    }
+
+    /// Whether GEMV node `id`'s tile (a bare or a fused product's) walks all
+    /// of `K` in one simdgroup at a shape and dtype the inline norm is
+    /// instantiated for — the fact a norm riding its load needs
+    /// (`lloom_tensor::gemv_tile`, the dispatcher's own selection). One row,
+    /// the GEMV core.
+    pub fn gemv_walks_k(&self, id: NodeId) -> bool {
+        let node = &self.nodes[id];
+        if !matches!(node.op, Op::Gemv | Op::Fused) || node.core != Core::Gemv {
+            return false;
+        }
+        if self.gemv_rows(id) != Some(Dim::Const(1)) {
+            return false;
+        }
+        let dims: Option<Vec<usize>> = self.nodes[node.inputs[0]]
+            .shape
+            .0
+            .iter()
+            .map(|d| match d {
+                Dim::Const(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        matches!(node.dtype, DType::F16 | DType::BF16 | DType::F32)
+            && matches!(dims.as_deref(), Some(&[n, k]) if lloom_tensor::gemv_tile::gemv_norm_serves(n, k))
     }
 
     /// Dispatches per kernel family.
@@ -750,6 +863,18 @@ mod tests {
             ("quantize_kv_float_64_8", "quantize_kv"),
             ("sdpa_vector_quant_float_64_8", "sdpa_quant"),
             ("is_u32_f32", "is_u32"),
+            // The prologues: the classical GEMV's before its epilogue, the
+            // mixed GEMV's after it; a family names the prologue first.
+            ("gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm", "gemv_norm"),
+            ("gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_silu", "gemv_norm_silu"),
+            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_swiglu", "gemv_norm_swiglu"),
+            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_rmsnorm", "gemv_rmsnorm"),
+            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_gnorm", "gemv_mixed_gnorm"),
+            (
+                "gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu_gnorm",
+                "gemv_mixed_gnorm_silu",
+            ),
+            ("hc_collapse_scaled_f32", "hc_collapse_scaled"),
         ] {
             assert_eq!(kernel_family(label), family, "{label}");
         }

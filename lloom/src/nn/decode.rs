@@ -85,6 +85,7 @@ pub struct IdentityProposer;
 
 impl Speculator for IdentityProposer {
     type Probe = NoProbe;
+    type Family = crate::nn::speculator::Identity;
 
     fn n_seq(&self) -> usize {
         1
@@ -2783,6 +2784,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     #[allow(clippy::too_many_arguments)]
     pub fn decode_speculative<S, R>(
         &mut self,
+        _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         readback: &mut R,
         _sampler: &mut LogitsProcessor,
@@ -2793,7 +2795,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     ) -> Result<DecodeOut>
     where
         S: Speculator,
-        M: Probes<S::Probe>,
+        M: Probes<S::Probe> + crate::profile::Shaped,
         R: ReadbackStrategy,
     {
         if spec.max_draft() == 0 {
@@ -3052,6 +3054,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     #[allow(clippy::too_many_arguments)]
     pub fn decode_speculative_pipelined<S>(
         sessions: &mut [Self],
+        _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         prompts: &[&[u32]],
         opts: &DecodeOptions,
@@ -3061,7 +3064,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     ) -> Result<Vec<DecodeOut>>
     where
         S: Speculator,
-        M: Probes<S::Probe>,
+        M: Probes<S::Probe> + crate::profile::Shaped,
     {
         let n = sessions.len();
         if n == 0 {

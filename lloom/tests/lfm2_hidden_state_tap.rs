@@ -30,9 +30,12 @@
 //! wrong on every backend; a tap that captures the right one is bit-exact here
 //! and lets the assertions be equalities rather than tolerances.
 
-use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::models::lfm2::{
+    Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::profile::{CrownExact, RewindableExact};
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// Six layers, alternating conv and attention, so a tap index can fall on
 /// either kind. The real target's `target_layer_ids` `[2, 9, 17, 21, 27]` hits
@@ -82,7 +85,7 @@ fn tiny_config(tap_layers: Vec<usize>) -> Config {
 /// Distinct values per position, so a transposed or misaligned capture is
 /// visible rather than accidentally equal — `lfm2.rs`'s own fixture rule
 /// (§11.3l finding 3: a fixture whose values coincide proves nothing).
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -128,7 +131,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
@@ -147,8 +150,8 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
 /// model and the weights (there is only one model), and it does **not** share
 /// the capture: the tap pushes inside the production loop and this reads the
 /// value the loop was about to consume.
-fn reference_layer_inputs(
-    model: &Model,
+fn reference_layer_inputs<P: Lfm2Shape>(
+    model: &Model<P>,
     input: &Tensor,
     index_pos: usize,
     cfg: &Config,
@@ -158,7 +161,7 @@ fn reference_layer_inputs(
     // measured run used. Two runs over one cache are two different
     // computations — §2.3.8d's turn-2 argument, and it would make the
     // comparison meaningless rather than merely noisy.
-    let mut c = Cache::new(true, DType::F32, cfg, dev)?;
+    let mut c = State::<P>::new(true, DType::F32, cfg, dev)?;
     model.layer_input_residuals(input, index_pos, &mut c)
 }
 
@@ -177,8 +180,8 @@ fn the_tap_is_the_layer_input_residual() -> Result<()> {
     let dev = Device::Cpu;
     let taps_at = vec![0usize, 2, 5];
     let cfg = tiny_config(taps_at.clone());
-    let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
 
     let input = Tensor::new(&[[3u32, 7, 1, 9]], &dev)?;
     let _ = model.forward(&input, 0, &mut cache)?;
@@ -190,7 +193,7 @@ fn the_tap_is_the_layer_input_residual() -> Result<()> {
         "one tap per configured layer index"
     );
 
-    let reference = reference_layer_inputs(&model, &input, 0, &cfg, &dev)?;
+    let reference = reference_layer_inputs::<CrownExact>(&model, &input, 0, &cfg, &dev)?;
     assert_eq!(
         reference.len(),
         cfg.num_hidden_layers,
@@ -237,13 +240,13 @@ fn tap_order_follows_tap_layers_and_the_layers_are_distinguishable() -> Result<(
     // `[1, 4]` here and pass an ascending-order fixture by accident.
     let taps_at = vec![4usize, 1];
     let cfg = tiny_config(taps_at.clone());
-    let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
 
     let input = Tensor::new(&[[5u32, 2, 8]], &dev)?;
     let _ = model.forward(&input, 0, &mut cache)?;
     let taps = cache.take_taps();
-    let reference = reference_layer_inputs(&model, &input, 0, &cfg, &dev)?;
+    let reference = reference_layer_inputs::<CrownExact>(&model, &input, 0, &cfg, &dev)?;
 
     // The non-vacuity arm, and it runs first (§3.1a rule 1): if layers 1 and 4
     // carried the same residual, every order assertion below would pass under
@@ -287,8 +290,8 @@ fn forward_all_taps_every_position() -> Result<()> {
     let dev = Device::Cpu;
     let taps_at = vec![2usize, 5];
     let cfg = tiny_config(taps_at.clone());
-    let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
 
     let k = 4usize;
     let input = Tensor::new(&[[3u32, 7, 1, 9]], &dev)?;
@@ -319,8 +322,8 @@ fn forward_all_taps_every_position() -> Result<()> {
 fn taps_are_replaced_per_pass_and_never_accumulate() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(vec![1usize, 3]);
-    let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
 
     // Three passes, and the middle one is deliberately NOT drained -- which is
     // the case the clear-at-entry placement exists for.
@@ -345,7 +348,7 @@ fn taps_are_replaced_per_pass_and_never_accumulate() -> Result<()> {
 
     // And the surviving taps are the THIRD pass's, not the second's. A clear
     // that ran but pushed the wrong pass's values would keep the length right.
-    let reference = reference_layer_inputs(&model, &c, 2, &cfg, &dev)?;
+    let reference = reference_layer_inputs::<CrownExact>(&model, &c, 2, &cfg, &dev)?;
     // The reference walks with a fresh cache at index_pos 2, so its conv and KV
     // history differ from the measured run's; compare only that the tap is not
     // the FIRST pass's, which is what a stale vector would hold.
@@ -373,8 +376,8 @@ fn the_default_taps_nothing() -> Result<()> {
         cfg.tap_layers.is_empty(),
         "tap_layers defaults to empty (7.1a)"
     );
-    let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     let input = Tensor::new(&[[3u32, 7]], &dev)?;
     let _ = model.forward(&input, 0, &mut cache)?;
     assert!(
@@ -397,8 +400,8 @@ fn the_default_taps_nothing() -> Result<()> {
 fn a_tap_index_past_the_last_layer_is_refused() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(vec![0usize, cfg_layers()]);
-    let model = build(&cfg, &dev)?;
-    let err = Cache::new(true, DType::F32, &cfg, &dev)
+    let model = build::<CrownExact>(&cfg, &dev)?;
+    let err = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();

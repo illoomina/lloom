@@ -22,6 +22,7 @@ use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
 use lloom::nn::RecurrentState;
+use lloom::profile::CrownExact;
 use lloom_tensor::kernels::metal::profile;
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{Device, Result, Tensor};
@@ -108,7 +109,7 @@ fn decode_blocks_and_the_token() -> Result<()> {
     })?;
 
     // --- DeltaNet decode step (steady state: the slabs exist) ---
-    let dn = testing::deltanet(&cfg, &dev);
+    let dn = testing::deltanet::<CrownExact>(&cfg, &dev);
     let mut s_state = RecurrentState::new(n_layers);
     let mut conv_state = RecurrentState::new(n_layers);
     let xin = x(&cfg, 0.0, &dev);
@@ -118,7 +119,7 @@ fn decode_blocks_and_the_token() -> Result<()> {
     })?;
 
     // --- QSA decode step (a few tokens in the cache) ---
-    let qsa = testing::qsa(&cfg, &dev);
+    let qsa = testing::qsa::<CrownExact>(&cfg, &dev);
     let mut kv = lloom::models::qwen4exp::KvCache::default();
     for t in 0..3 {
         let _ = qsa.decode(&x(&cfg, t as f32, &dev), &mut kv)?;
@@ -130,7 +131,7 @@ fn decode_blocks_and_the_token() -> Result<()> {
 
     // --- MoE decode (router + routed dispatch + shared expert) ---
     let [g, u, d] = testing::expert_stacks(&cfg, 0, &dev, GgmlDType::Q8_0);
-    let moe = testing::moe_with(
+    let moe = testing::moe_with::<CrownExact, _>(
         &cfg,
         &dev,
         Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)),
@@ -150,10 +151,11 @@ fn decode_blocks_and_the_token() -> Result<()> {
     })?;
 
     // --- one whole layer, both kinds, and one whole token ---
-    let model: Qwen4Exp<Resident> = testing::model_with(&cfg, &dev, |l| {
-        let [g, u, d] = testing::expert_stacks(&cfg, l, &dev, GgmlDType::Q8_0);
-        Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
-    })?;
+    let model: Qwen4Exp<CrownExact, Resident> =
+        testing::model_with::<CrownExact, _>(&cfg, &dev, |l| {
+            let [g, u, d] = testing::expert_stacks(&cfg, l, &dev, GgmlDType::Q8_0);
+            Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
+        })?;
     let mut cache = model.new_cache(&cfg, &dev)?;
     let prompt = Tensor::from_vec(vec![3u32, 5, 2, 8, 8, 1, 9], (1, 7), &dev)?;
     let _ = model.forward(&prompt, 0, &mut cache)?;

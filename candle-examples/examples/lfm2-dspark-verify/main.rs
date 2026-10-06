@@ -95,7 +95,7 @@ use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Tensor, D};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
 use clap::Parser;
-use lloom::models::lfm2::{Cache, ConvState, KvAppend, Model};
+use lloom::models::lfm2::{ConvState, KvAppend, Model, Shape as Lfm2Shape, State};
 use lloom::models::lfm2_dspark::{drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE};
 use lloom::nn::VarBuilder;
 use std::path::{Path, PathBuf};
@@ -820,7 +820,12 @@ fn degeneracy(ids: &[u32]) -> Degeneracy {
 #[allow(clippy::too_many_arguments)]
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     sha256::self_test().map_err(|e| anyhow::anyhow!("sha256 self-test failed: {e}"))?;
     println!("sha256 self-test  : OK");
 
@@ -1053,9 +1058,9 @@ fn main() -> Result<()> {
     let spec_model = {
         let files = weight_files(&target_dir)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
-        Model::new(&spec_cfg, vb)?
+        Model::<P>::new(&spec_cfg, vb)?
     };
-    let mut cache = Cache::new(true, DType::F16, &spec_cfg, &device)?;
+    let mut cache = State::<P>::new(true, DType::F16, &spec_cfg, &device)?;
 
     // Prefill. The taps this pass leaves describe the whole prompt; the drafter
     // keys the LAST position, which is the one the anchor follows from.
@@ -1298,9 +1303,9 @@ fn main() -> Result<()> {
         let plain_model = {
             let files = weight_files(&target_dir)?;
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
-            Model::new(&cfg, vb)?
+            Model::<P>::new(&cfg, vb)?
         };
-        let mut plain_cache = Cache::new(true, DType::F16, &cfg, &device)?;
+        let mut plain_cache = State::<P>::new(true, DType::F16, &cfg, &device)?;
         let input = Tensor::new(prefill_ids.as_slice(), &device)?.unsqueeze(0)?;
         let logits = plain_model.forward(&input, 0, &mut plain_cache)?;
         // Same convention as ARM 1: a held anchor is decoded from, not emitted.
@@ -1347,9 +1352,9 @@ fn main() -> Result<()> {
         let null_model = {
             let files = weight_files(&target_dir)?;
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
-            Model::new(&cfg, vb)?
+            Model::<P>::new(&cfg, vb)?
         };
-        let mut null_cache = Cache::new(true, DType::F16, &cfg, &device)?;
+        let mut null_cache = State::<P>::new(true, DType::F16, &cfg, &device)?;
         let input = Tensor::new(prefill_ids.as_slice(), &device)?.unsqueeze(0)?;
         let logits = null_model.forward(&input, 0, &mut null_cache)?;
         let mut tok = match held_anchor {
@@ -1594,4 +1599,14 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }

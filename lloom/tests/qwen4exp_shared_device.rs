@@ -15,6 +15,7 @@ use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::Config;
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::CrownExact;
 use lloom_tensor::{Device, Result};
 
 const PROMPT: [u32; 9] = [3, 5, 2, 8, 8, 1, 9, 3, 5];
@@ -39,7 +40,7 @@ enum Arm {
 /// Build, decode `PROMPT` greedily on `arm`, drop: the ids.
 fn decode_once(dev: &Device, arm: Arm) -> Result<Vec<u32>> {
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, dev);
     let cache = model.new_cache(&cfg, dev)?;
     let mut session = Session::new(&model, cache);
     let mut spec = IdentityProposer;

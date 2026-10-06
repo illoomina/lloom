@@ -616,9 +616,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             lloom_tensor::bail!("DecodeSession::prefill: eos_ids is empty; a run needs an EOS set");
         }
         let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
-        let opts = self
-            .config
-            .options(params.max_tokens.max(1), ReadbackArm::Blocking, params.prefill_tile);
+        let opts = self.config.options(
+            params.max_tokens.max(1),
+            ReadbackArm::Blocking,
+            params.prefill_tile,
+        );
         self.session.prefill(&mut readback, prompt_ids, &opts)
     }
 
@@ -712,9 +714,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
                 readback.set_thinking_budget(params.thinking.as_ref())?;
-                let opts = self
-                    .config
-                    .options(params.max_tokens, ReadbackArm::Blocking, params.prefill_tile);
+                let opts = self.config.options(
+                    params.max_tokens,
+                    ReadbackArm::Blocking,
+                    params.prefill_tile,
+                );
                 let out = self.session.decode_until(
                     &mut spec,
                     &mut readback,
@@ -810,7 +814,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                     }
                                     match reader.read_new(&mut buf) {
                                         Ok(0) => {
-                                            if stream_done.load(std::sync::atomic::Ordering::Acquire) {
+                                            if stream_done
+                                                .load(std::sync::atomic::Ordering::Acquire)
+                                            {
                                                 buf.clear();
                                                 if let Ok(n) = reader.read_new(&mut buf) {
                                                     if n > 0 && !hook(&buf)? {
@@ -822,11 +828,16 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                                 }
                                                 return Ok(());
                                             }
-                                            std::thread::sleep(std::time::Duration::from_micros(200));
+                                            std::thread::sleep(std::time::Duration::from_micros(
+                                                200,
+                                            ));
                                         }
                                         Ok(_) => {
                                             if !hook(&buf)? {
-                                                stop_flag.store(true, std::sync::atomic::Ordering::Release);
+                                                stop_flag.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
                                             }
                                         }
                                         Err(lap) => {
@@ -907,6 +918,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// a caller that resets between requests never meets.
     pub fn decode_speculative_until<S>(
         &mut self,
+        rewind: lloom::profile::RewindProof<M::Profile>,
         spec: &mut S,
         prompt_ids: &[u32],
         mut detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
@@ -915,7 +927,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     ) -> Result<Decoded>
     where
         S: lloom::nn::Speculator,
-        M: lloom::nn::Probes<S::Probe>,
+        M: lloom::nn::Probes<S::Probe> + lloom::profile::Shaped,
         M::Cache: CacheRewind + CacheReset,
     {
         if params.eos_ids.is_empty() {
@@ -983,6 +995,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         };
         let k = spec.max_draft();
         let out = self.session.decode_speculative(
+            rewind,
             spec,
             &mut readback,
             &mut sampler,
@@ -1043,7 +1056,7 @@ mod tests {
 
     #[test]
     fn decode_session_drives_lfm2() {
-        drives::<lloom::models::lfm2::Model>();
+        drives::<lloom::models::lfm2::Model<lloom::profile::CrownExact>>();
     }
 
     /// `Auto` takes the crown ring for the device-resident samplers and the
@@ -1058,9 +1071,15 @@ mod tests {
             temperature: 0.6,
         };
         let crown = RingArm::CROWN;
-        assert_eq!(ReadbackArm::Auto.resolve(&argmax, crown), ReadbackArm::CROWN);
+        assert_eq!(
+            ReadbackArm::Auto.resolve(&argmax, crown),
+            ReadbackArm::CROWN
+        );
         assert_eq!(ReadbackArm::Auto.resolve(&temp, crown), ReadbackArm::CROWN);
-        assert_eq!(ReadbackArm::Auto.resolve(&top_p, crown), ReadbackArm::Blocking);
+        assert_eq!(
+            ReadbackArm::Auto.resolve(&top_p, crown),
+            ReadbackArm::Blocking
+        );
         assert_eq!(
             ReadbackArm::Blocking.resolve(&argmax, crown),
             ReadbackArm::Blocking
@@ -1931,7 +1950,14 @@ mod tests {
                                 );
                                 assert_eq!(got.text, streamed, "{at}: the reply's text");
                             }
-                            Ok(Ok((ran_adaptive, was_clamped, armed, fired, readers, loops)))
+                            Ok(Ok((
+                                ran_adaptive,
+                                was_clamped,
+                                armed,
+                                fired,
+                                readers,
+                                loops,
+                            )))
                         },
                     ));
                     match outcome {

@@ -14,6 +14,7 @@
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::models::qwen4exp::{Config, LoadOptions, DEFAULT_MEMORY_FRACTION};
 use lloom::nn::memory::MemSnapshot;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::Fixture;
 use lloom_tensor::{Device, Result};
 
@@ -32,7 +33,7 @@ fn the_resident_load_is_admitted_by_its_headers() -> Result<()> {
     let cfg = fx.config(|_| {});
     let before = MemSnapshot::read(&dev);
     if !fx.at_scale() {
-        fx.resident(&cfg, &dev, &LoadOptions::default())?;
+        fx.resident::<CrownExact>(&cfg, &dev, &LoadOptions::default())?;
         return Ok(());
     }
     let budget = before.working_set as f64 * DEFAULT_MEMORY_FRACTION;
@@ -43,7 +44,7 @@ fn the_resident_load_is_admitted_by_its_headers() -> Result<()> {
         );
         return Ok(());
     }
-    let refused = match fx.resident(&cfg, &dev, &LoadOptions::default()) {
+    let refused = match fx.resident::<CrownExact>(&cfg, &dev, &LoadOptions::default()) {
         Ok(_) => panic!(
             "47.03 GB resident was admitted under a {:.2} GB budget",
             budget / 1e9

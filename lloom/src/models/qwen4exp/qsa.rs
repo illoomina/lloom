@@ -35,8 +35,10 @@ use super::config::{Config, DEFAULT_KV_PRECISION};
 use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
+use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Module, Result, Tensor, D};
+use std::marker::PhantomData;
 
 /// Per-layer growing KV state for one sequence (full-attn layers only). Unlike
 /// DeltaNet's fixed `S`, KV grows with context. The rows live in a
@@ -1249,7 +1251,8 @@ impl RowSelection {
 
 /// One QSA (full-attention) layer's weights.
 #[derive(Debug, Clone)]
-pub struct QsaAttention {
+pub struct QsaAttention<P: Profile> {
+    profile: PhantomData<P>,
     /// Fused Q proj → `[q | gate]` interleaved per head (`attn_q`, 2×head_dim/head).
     wq: QMatMul,
     /// K, V projs (`attn_k`, `attn_v`).
@@ -1275,7 +1278,7 @@ pub struct QsaAttention {
     stem_cat: Option<QMatMul>,
 }
 
-impl QsaAttention {
+impl<P: Profile> QsaAttention<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         wq: QMatMul,
@@ -1287,6 +1290,7 @@ impl QsaAttention {
         cfg: &Config,
     ) -> Self {
         Self {
+            profile: PhantomData,
             wq,
             wk,
             wv,
@@ -2415,7 +2419,7 @@ impl QsaAttention {
     }
 }
 
-impl QsaAttention {
+impl<P: Profile> QsaAttention<P> {
     /// [`Self::prefill`] as launches: the projections, `kernels::QsaPrepRows`
     /// (the q/gate split, both norms, the rope at each position, the head-first
     /// layouts the attention kernel and the cache take — no transposes), the KV
@@ -2831,7 +2835,7 @@ fn causal_mask(
 /// dense range (the selection), and the two-pass attention past
 /// `sdpa_vector`'s single-pass length — each adds launches at a position.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for QsaAttention {
+impl<P: Profile> crate::optimizer::Visit for QsaAttention<P> {
     type In = (crate::optimizer::NodeId, usize, KvPrecision);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (x, l, precision): Self::In) -> Self::Out {
@@ -2959,6 +2963,7 @@ impl crate::optimizer::Visit for QsaAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::CrownExact;
     use lloom_tensor::{DType, Device};
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
@@ -3138,7 +3143,7 @@ mod tests {
         let n_keys: Vec<u32> = lens.iter().map(|&n| n as u32).collect();
         let q = Tensor::randn(0f32, 1.0, (rows, nh, hd), &dev)?;
         let scale = 1.0 / (hd as f32).sqrt();
-        let attn = QsaAttention::new(
+        let attn = QsaAttention::<CrownExact>::new(
             lin(nh * hd * 2, 8, 1.0, &dev),
             lin(nkv * hd, 8, 2.0, &dev),
             lin(nkv * hd, 8, 3.0, &dev),
@@ -3194,7 +3199,7 @@ mod tests {
                     1e-6,
                 )
             };
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, d, 1.0, dev),
                 lin(nkv * hd, d, 2.0, dev),
                 lin(nkv * hd, d, 3.0, dev),
@@ -3276,7 +3281,7 @@ mod tests {
                     1e-6,
                 )
             };
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, d, 1.0, dev),
                 lin(nkv * hd, d, 2.0, dev),
                 lin(nkv * hd, d, 3.0, dev),
@@ -3370,7 +3375,7 @@ mod tests {
             })
             .collect();
         let build = |stack: Option<Tensor>| {
-            let attn = QsaAttention::new(
+            let attn = QsaAttention::<CrownExact>::new(
                 QMatMul::TensorF16(views[0].clone()),
                 QMatMul::TensorF16(views[1].clone()),
                 QMatMul::TensorF16(views[2].clone()),
@@ -3453,7 +3458,7 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = Config::tiny();
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        let attn = QsaAttention::new(
+        let attn = QsaAttention::<CrownExact>::new(
             lin(nh * hd * 2, h, 1.0, &dev), // wq → [q|gate]
             lin(nkv * hd, h, 2.0, &dev),    // wk
             lin(nkv * hd, h, 3.0, &dev),    // wv
@@ -3491,7 +3496,7 @@ mod tests {
     fn partial_rope_leaves_tail_unrotated() {
         let dev = Device::Cpu;
         let cfg = Config::tiny();
-        let attn = QsaAttention::new(
+        let attn = QsaAttention::<CrownExact>::new(
             lin(4, 4, 0.0, &dev),
             lin(4, 4, 0.0, &dev),
             lin(4, 4, 0.0, &dev),
@@ -3606,7 +3611,7 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = Config::tiny();
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        let attn = QsaAttention::new(
+        let attn = QsaAttention::<CrownExact>::new(
             lin(nh * hd * 2, h, 1.0, &dev),
             lin(nkv * hd, h, 2.0, &dev),
             lin(nkv * hd, h, 3.0, &dev),
@@ -3680,7 +3685,7 @@ mod tests {
         cfg.hidden_size = 256;
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
         let build = |dev: &Device| {
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, h, 1.0, dev),
                 lin(nkv * hd, h, 2.0, dev),
                 lin(nkv * hd, h, 3.0, dev),
@@ -3758,10 +3763,10 @@ mod tests {
         cfg
     }
 
-    fn indexed_attn(cfg: &Config, dev: &Device) -> QsaAttention {
+    fn indexed_attn(cfg: &Config, dev: &Device) -> QsaAttention<CrownExact> {
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
         let (ih, id) = (cfg.indexer_n_heads, cfg.indexer_head_dim);
-        QsaAttention::new(
+        QsaAttention::<CrownExact>::new(
             lin(nh * hd * 2, h, 1.0, dev),
             lin(nkv * hd, h, 2.0, dev),
             lin(nkv * hd, h, 3.0, dev),
@@ -3934,7 +3939,7 @@ mod tests {
         let attn = indexed_attn(&cfg, &dev);
         let dense = {
             let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, h, 1.0, &dev),
                 lin(nkv * hd, h, 2.0, &dev),
                 lin(nkv * hd, h, 3.0, &dev),
@@ -4007,9 +4012,9 @@ mod tests {
     }
 
     /// [`indexed_attn`]'s layer without its indexer: dense over every cell.
-    fn dense_twin(cfg: &Config, dev: &Device) -> QsaAttention {
+    fn dense_twin(cfg: &Config, dev: &Device) -> QsaAttention<CrownExact> {
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        QsaAttention::new(
+        QsaAttention::<CrownExact>::new(
             lin(nh * hd * 2, h, 1.0, dev),
             lin(nkv * hd, h, 2.0, dev),
             lin(nkv * hd, h, 3.0, dev),
@@ -4045,7 +4050,7 @@ mod tests {
     /// Each of `xs` through `attn` as one decode step on `kv` (at `pos0 +
     /// i`): every output, and the selection made at each step.
     fn decode_steps(
-        attn: &QsaAttention,
+        attn: &QsaAttention<CrownExact>,
         xs: &[Vec<f32>],
         pos0: usize,
         kv: &mut KvCache,
@@ -4069,7 +4074,7 @@ mod tests {
     /// `xs` as one chunk through `attn.prefill` on `kv`: one output row per
     /// position.
     fn prefill_chunk(
-        attn: &QsaAttention,
+        attn: &QsaAttention<CrownExact>,
         xs: &[Vec<f32>],
         kv: &mut KvCache,
         dev: &Device,
@@ -4083,7 +4088,7 @@ mod tests {
     /// The chunk's selection for its rows past the dense range, read back:
     /// row `t` (position `pos0 + t`)'s cells.
     fn chunk_selection(
-        attn: &QsaAttention,
+        attn: &QsaAttention<CrownExact>,
         xs: &[Vec<f32>],
         pos0: usize,
         kv: &KvCache,
@@ -4228,12 +4233,13 @@ mod tests {
         let xs = inputs(h, n, 0.37);
         let mut kv_d = KvCache::with_capacity(16);
         let (want, want_sel) = decode_steps(&a_gpu, &xs, 0, &mut kv_d, &gpu);
-        let run = |attn: &QsaAttention, kv: &mut KvCache, dev: &Device| -> Vec<Vec<f32>> {
-            let mut out = decode_steps(attn, &xs[..cuts[0]], 0, kv, dev).0;
-            out.extend(prefill_chunk(attn, &xs[cuts[0]..cuts[1]], kv, dev));
-            out.extend(prefill_chunk(attn, &xs[cuts[1]..], kv, dev));
-            out
-        };
+        let run =
+            |attn: &QsaAttention<CrownExact>, kv: &mut KvCache, dev: &Device| -> Vec<Vec<f32>> {
+                let mut out = decode_steps(attn, &xs[..cuts[0]], 0, kv, dev).0;
+                out.extend(prefill_chunk(attn, &xs[cuts[0]..cuts[1]], kv, dev));
+                out.extend(prefill_chunk(attn, &xs[cuts[1]..], kv, dev));
+                out
+            };
         let mut kv_g = KvCache::with_capacity(16);
         let got = run(&a_gpu, &mut kv_g, &gpu);
         let mut kv_c = KvCache::with_capacity(16);
@@ -4561,7 +4567,7 @@ mod tests {
         cfg.hidden_size = 256; // small in-proj, real head geometry
         let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
         let build = |dev: &Device| {
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, h, 1.0, dev),
                 lin(nkv * hd, h, 2.0, dev),
                 lin(nkv * hd, h, 3.0, dev),
@@ -4646,7 +4652,7 @@ mod tests {
     /// (initial capacity 16, so the store grows twice), every output read back.
     #[cfg(feature = "metal")]
     fn decode_arm(
-        attn: &QsaAttention,
+        attn: &QsaAttention<CrownExact>,
         precision: KvPrecision,
         dev: &Device,
         steps: usize,
@@ -4683,7 +4689,7 @@ mod tests {
         let attn = indexed_attn(&cfg, &gpu);
         let dense_twin = {
             let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-            QsaAttention::new(
+            QsaAttention::<CrownExact>::new(
                 lin(nh * hd * 2, h, 1.0, &gpu),
                 lin(nkv * hd, h, 2.0, &gpu),
                 lin(nkv * hd, h, 3.0, &gpu),

@@ -28,7 +28,7 @@ use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::{
-    Cache, ExpertResidency, MemCheck, MtpDrafter, Qwen4Exp, Resident, Streamed,
+    ExpertResidency, MemCheck, MtpDrafter, Qwen4Exp, Resident, Shape as QwenShape, State, Streamed,
 };
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
@@ -543,9 +543,9 @@ fn mem_check_arm(args: &Args) -> Result<MemCheck> {
 /// it runs) and paced at depth 2 on Metal — the drivers' `StepPacer` shape,
 /// here for the harness's own prompt loop. Returns the last position's
 /// logits.
-fn prefill_tiled<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
-    cache: &mut Cache,
+fn prefill_tiled<P: QwenShape, R: ExpertResidency>(
+    model: &Qwen4Exp<P, R>,
+    cache: &mut State<P>,
     ids: &[u32],
     tile: usize,
     device: &Device,
@@ -672,9 +672,30 @@ fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
+    // The profile the run's mode names (`profiles-and-memory-design.md` §3):
+    // `Ring` under `--mtp` (the verify window's rings), `Paged` when the
+    // rows share a pool (`--rows N --rows-pool`, or `--mtp` over rows); the
+    // regime from the contract the harness pins below.
     candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
         .map_err(anyhow::Error::msg)?;
+    use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
+    let key = lloom::profile::ProfileKey::at_contract(
+        if args.mtp.is_some() {
+            Ring::NAME
+        } else {
+            NoRewind::NAME
+        },
+        if args.rows > 1 && (args.rows_pool || args.mtp.is_some()) {
+            Paged::NAME
+        } else {
+            One::NAME
+        },
+    );
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::QWEN4EXP_ANY, P => run::<P>(args))
+}
+
+fn run<P: QwenShape>(args: Args) -> Result<()> {
     let contract = candle::tuning::gate_contract("qwen4exp-chat").map_err(anyhow::Error::msg)?;
     println!("CONTRACT {}", contract.report());
     let gguf = match &args.gguf {
@@ -772,7 +793,7 @@ fn main() -> Result<()> {
 
     match args.experts.as_str() {
         "resident" => {
-            let mut model: Qwen4Exp<Resident> =
+            let mut model: Qwen4Exp<P, Resident> =
                 Qwen4Exp::from_gguf_shards(&shards, &device, &opts)?;
             model.apply_axes(&args.axes)?;
             model.set_prefill_mode(prefill_mode);
@@ -818,7 +839,7 @@ fn main() -> Result<()> {
                 prefetch: args.prefetch,
                 io_hints: args.io_hints,
             };
-            let mut model: Qwen4Exp<Streamed> =
+            let mut model: Qwen4Exp<P, Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
             model.apply_axes(&args.axes)?;
             model.set_prefill_mode(prefill_mode);
@@ -888,11 +909,22 @@ fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The evidence the speculative drivers take: the `Ring` shapes give it,
+/// the `No` shapes refuse by name (`profiles-and-memory-design.md` §7.3).
+fn rewindable<P: lloom::profile::Profile>() -> Result<lloom::profile::RewindProof<P>> {
+    lloom::profile::RewindProof::<P>::ask().with_context(|| {
+        format!(
+            "the MTP drafter on the {} shape: `--mtp` is the `Ring` shape",
+            P::KEY
+        )
+    })
+}
+
 /// `--rows N`: the prompt decoded `N` times at once through the batched
 /// driver; `ROWS` lines with the per-run aggregate rate.
 #[allow(clippy::too_many_arguments)]
-fn rows_gate<R: ExpertResidency + HasStreamStats>(
-    model: &Qwen4Exp<R>,
+fn rows_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<P, R>,
     args: &Args,
     device: &Device,
     prompt_ids: &[u32],
@@ -902,16 +934,18 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
     use lloom::nn::{DecodeOptions, Session};
     let cfg = model.config();
     for run in 0..args.runs {
-        let pools = args.rows_pool.then(|| model.state_pools(args.rows, device));
-        let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
-            .map(|_| {
-                let cache = match &pools {
-                    Some(p) => lloom::models::qwen4exp::Cache::in_pools(cfg, p)?,
-                    None => model.new_cache(cfg, device)?,
-                };
-                Ok(Session::new(model, cache))
-            })
-            .collect::<Result<_>>()?;
+        // The rows' states at the shape: pooled (`Paged`) or each its own.
+        let (pools, caches) = if args.rows_pool || args.mtp.is_some() {
+            let (pools, caches) = P::rows(model, device, args.rows, args.mtp_k)?;
+            (Some(pools), caches)
+        } else {
+            let caches = (0..args.rows)
+                .map(|_| P::single(model, device, args.mtp_k))
+                .collect::<candle::Result<Vec<_>>>()?;
+            (None, caches)
+        };
+        let mut sessions: Vec<Session<'_, Qwen4Exp<P, R>>> =
+            caches.into_iter().map(|c| Session::new(model, c)).collect();
         let prompts: Vec<&[u32]> = (0..args.rows).map(|_| prompt_ids).collect();
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions {
@@ -997,14 +1031,14 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             // would be two sessions' state the budget did not plan for.
             drop(sessions);
             drop(pools);
-            let pools = model.spec_pools(args.rows, args.mtp_k, device);
-            let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
-                .map(|_| {
-                    let mut cache = lloom::models::qwen4exp::Cache::in_pools(cfg, &pools)?;
+            let (_pools, caches) = P::rows(model, device, args.rows, args.mtp_k)?;
+            let mut sessions: Vec<Session<'_, Qwen4Exp<P, R>>> = caches
+                .into_iter()
+                .map(|mut cache| {
                     cache.want_nextn = true;
-                    Ok(Session::new(model, cache))
+                    Session::new(model, cache)
                 })
-                .collect::<Result<_>>()?;
+                .collect();
             let mut drafter = MtpDrafter::with_seqs(
                 head,
                 model.embed_tokens(),
@@ -1017,6 +1051,7 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             let t = std::time::Instant::now();
             let spec = Session::decode_spec_batched(
                 &mut sessions,
+                rewindable::<P>()?,
                 &mut drafter,
                 &prompts,
                 &opts,
@@ -1048,8 +1083,8 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
 }
 
 /// The `LOADED` line and the post-load `MEM` line, shared by the gates.
-fn loaded_line<R: ExpertResidency + HasStreamStats>(
-    model: &Qwen4Exp<R>,
+fn loaded_line<P: QwenShape, R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<P, R>,
     args: &Args,
     shards: &[PathBuf],
     device: &Device,
@@ -1080,9 +1115,9 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
 }
 
 /// The prefetcher's counters for the run so far (cumulative over runs).
-fn prefetch_line<R: ExpertResidency + HasStreamStats>(
+fn prefetch_line<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     run: usize,
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<P, R>,
     args: &Args,
 ) {
     let pf = model.prefetch_stats();
@@ -1096,11 +1131,11 @@ fn prefetch_line<R: ExpertResidency + HasStreamStats>(
 
 /// The streamed tier's counters (cumulative over the process's runs) and
 /// the cache's (this run's): where a miss's host time went, by path.
-fn stream_line<R: ExpertResidency + HasStreamStats>(
+fn stream_line<P: QwenShape, R: ExpertResidency + HasStreamStats>(
     run: usize,
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<P, R>,
     args: &Args,
-    cache: &Cache,
+    cache: &State<P>,
 ) {
     let s = model.stream_stats();
     println!(
@@ -1161,8 +1196,8 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
 /// minus the logits digest (`logits_sha256=-`: the driver never reads the
 /// logits back; the tokens digest is the gate).
 #[allow(clippy::too_many_arguments)]
-fn driver_gate<R: ExpertResidency + HasStreamStats>(
-    model: &Qwen4Exp<R>,
+fn driver_gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<P, R>,
     args: &Args,
     shards: &[PathBuf],
     device: &Device,
@@ -1197,7 +1232,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
     );
     let mut greedy_digest: Option<String> = None;
     for run in 0..args.runs {
-        let cache: Cache = model.new_cache(&cfg, device)?;
+        let cache: State<P> = P::single(model, device, args.mtp_k)?;
         let mut session = Session::new(model, cache);
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let mut spec = IdentityProposer;
@@ -1351,8 +1386,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
     // tokens against the greedy run's (byte-identical is the gate).
     if let Some(head) = model.mtp_head() {
         use lloom::models::qwen4exp::MtpDrafter;
-        let pools = model.spec_pools(1, args.mtp_k, device);
-        let mut cache: Cache = Cache::in_pools(&cfg, &pools)?;
+        let mut cache: State<P> = P::single(model, device, args.mtp_k)?;
         cache.want_nextn = true;
         let mut session = Session::new(model, cache);
         let mut drafter =
@@ -1369,6 +1403,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let gauge = MemGauge::start(device, args.mem_sample);
         let t2 = std::time::Instant::now();
         let out = session.decode_speculative(
+            rewindable::<P>()?,
             &mut drafter,
             &mut rb,
             &mut sampler,
@@ -1469,8 +1504,8 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
     Ok(())
 }
 
-fn gate<R: ExpertResidency + HasStreamStats>(
-    model: &Qwen4Exp<R>,
+fn gate<P: QwenShape, R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<P, R>,
     args: &Args,
     shards: &[PathBuf],
     device: &Device,
@@ -1508,7 +1543,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             _ => None,
         };
         let (mut forced_steps, mut overrides) = (0usize, 0usize);
-        let mut cache: Cache = model.new_cache(&cfg, device)?;
+        let mut cache: State<P> = P::single(model, device, args.mtp_k)?;
         if args.probe && run == 0 {
             let first = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), device)?;
             let h = model.embed(&first)?;
@@ -1517,7 +1552,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             // Every prompt position, one at a time, with a per-step summary
             // (the first step verbose): where does the state-threaded forward
             // first go non-finite, and how does the carry's magnitude move.
-            let mut probe_cache: Cache = model.new_cache(&cfg, device)?;
+            let mut probe_cache: State<P> = P::single(model, device, args.mtp_k)?;
             let mut probe = Probe::new(true);
             for (t, &tok) in prompt_ids.iter().enumerate() {
                 probe.reset();
@@ -1700,7 +1735,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             );
             prefetch_line(run, model, args);
             report_pass_plans(device);
-            let dh = lloom::models::qwen4exp::Qwen4Exp::<lloom::models::qwen4exp::Streamed>::decode_hints();
+            let dh = lloom::models::qwen4exp::Qwen4Exp::<P, lloom::models::qwen4exp::Streamed>::decode_hints();
             if dh > 0 {
                 println!("DECODEHINT run={run} hints={dh}");
             }
@@ -1738,8 +1773,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         // One speculative decode of the same prompt: the MTP drafter on the
         // seam, verified by the target; must equal the greedy stream.
         // The verify window's states in phase rings: an accept by phase.
-        let pools = model.spec_pools(1, args.mtp_k, device);
-        let mut cache: Cache = Cache::in_pools(&cfg, &pools)?;
+        let mut cache: State<P> = P::single(model, device, args.mtp_k)?;
         cache.want_nextn = true;
         let mut session = Session::new(model, cache);
         let mut drafter =
@@ -1756,6 +1790,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         let gauge = MemGauge::start(device, args.mem_sample);
         let t2 = std::time::Instant::now();
         let out = session.decode_speculative(
+            rewindable::<P>()?,
             &mut drafter,
             &mut rb,
             &mut sampler,
@@ -1813,8 +1848,8 @@ fn gate<R: ExpertResidency + HasStreamStats>(
 }
 
 /// The rollback probe (see `--rollback-probe`).
-fn rollback_probe<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+fn rollback_probe<P: QwenShape, R: ExpertResidency>(
+    model: &Qwen4Exp<P, R>,
     cfg: &lloom::models::qwen4exp::Config,
     device: &Device,
     prompt_ids: &[u32],
@@ -1824,7 +1859,7 @@ fn rollback_probe<R: ExpertResidency>(
     let wrong = cfg.vocab_size as u32 - 2;
     let mode = std::env::var("QWEN4EXP_ROLLBACK_MODE").unwrap_or_else(|_| "rounds".into());
     // subject: verify rounds with a wrong draft, each a partial accept
-    let mut sub: Cache = model.new_cache(cfg, device)?;
+    let mut sub: State<P> = P::single(model, device, 1)?;
     sub.want_nextn = true;
     let input = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), device)?;
     let logits = model.forward(&input, 0, &mut sub)?;
@@ -1889,7 +1924,7 @@ fn rollback_probe<R: ExpertResidency>(
         }
     }
     // reference: the same tokens decoded greedily, one per forward
-    let mut refc: Cache = model.new_cache(cfg, device)?;
+    let mut refc: State<P> = P::single(model, device, 1)?;
     model.forward(&input, 0, &mut refc)?;
     let mut ref_next = Vec::new();
     for &t in &consumed {

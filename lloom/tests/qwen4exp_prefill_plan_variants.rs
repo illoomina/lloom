@@ -15,8 +15,9 @@
 #![cfg(feature = "metal")]
 
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident, State};
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKind, PassOpener};
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{Device, Result, Tensor};
@@ -45,8 +46,8 @@ fn metal(dev: &Device) -> &MetalDevice {
     }
 }
 
-fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
-    testing::model_with_indexer(cfg, dev, |l| {
+fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<CrownExact, Resident>> {
+    testing::model_with_indexer::<CrownExact, _>(cfg, dev, |l| {
         let [g, u, d] = testing::expert_stacks(cfg, l, dev, GgmlDType::F32);
         Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
     })
@@ -55,8 +56,12 @@ fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
 /// The prompt as `CHUNKS` forwards of `W` tokens each on a fresh cache — the
 /// model brackets every chunk as a pass of its own — and the last chunk's
 /// logits.
-fn prefill_in_chunks(model: &Qwen4Exp<Resident>, cfg: &Config, dev: &Device) -> Result<Vec<f32>> {
-    let mut cache: Cache = model.new_cache(cfg, dev)?;
+fn prefill_in_chunks(
+    model: &Qwen4Exp<CrownExact, Resident>,
+    cfg: &Config,
+    dev: &Device,
+) -> Result<Vec<f32>> {
+    let mut cache: State<CrownExact> = model.new_cache(cfg, dev)?;
     let mut last = None;
     for c in 0..CHUNKS {
         let toks: Vec<u32> = (0..W).map(|i| ((c * W + i) * 7 + 3) as u32 % 120).collect();
@@ -93,7 +98,9 @@ fn each_chunk_kind_across_the_dense_range_is_served_its_own_plan() -> Result<()>
     let cfg = tiny();
     let limit = {
         let dev = Device::new_metal(0)?;
-        resident(&cfg, &dev)?.dense_limit().expect("the tiny indexer")
+        resident(&cfg, &dev)?
+            .dense_limit()
+            .expect("the tiny indexer")
     };
     assert!(
         2 * W <= limit && limit < 3 * W && 4 * W > limit,
@@ -115,7 +122,10 @@ fn each_chunk_kind_across_the_dense_range_is_served_its_own_plan() -> Result<()>
     eprintln!(
         "[prefill variants] limit {limit}, first {c1:?}, repeat {c2:?}, plans (fresh, variant, served, recorded, escapes) {plans:?}"
     );
-    assert_eq!(first, want, "a planned chunk moved the logits (first sight)");
+    assert_eq!(
+        first, want,
+        "a planned chunk moved the logits (first sight)"
+    );
     assert_eq!(again, want, "a served chunk moved the logits");
     assert_eq!(
         c2.evicted, 0,

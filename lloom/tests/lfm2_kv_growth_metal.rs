@@ -8,9 +8,12 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    AttnImpl, Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::ops::KvQuant;
 use lloom::nn::VarBuilder;
+use lloom::profile::{CrownExact, PoolExact};
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn device() -> Option<Device> {
@@ -55,7 +58,7 @@ fn config(kv_append: KvAppend, attn_impl: AttnImpl, kv_quant: KvQuant) -> Config
     }
 }
 
-fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -104,7 +107,7 @@ fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 const PROMPT: [u32; 5] = [3, 11, 20, 5, 9];
@@ -119,7 +122,12 @@ fn argmax(v: &[f32]) -> u32 {
     best as u32
 }
 
-fn decode(model: &Model, cache: &mut Cache, steps: usize, dev: &Device) -> Result<Vec<Vec<f32>>> {
+fn decode<P: Lfm2Shape>(
+    model: &Model<P>,
+    cache: &mut State<P>,
+    steps: usize,
+    dev: &Device,
+) -> Result<Vec<Vec<f32>>> {
     let mut out = Vec::with_capacity(steps + 1);
     let input = Tensor::new(&PROMPT, dev)?.unsqueeze(0)?;
     let logits = model.forward(&input, 0, cache)?.i(0)?.to_vec1::<f32>()?;
@@ -157,12 +165,12 @@ fn assert_same_stream(a: &[Vec<f32>], b: &[Vec<f32>], what: &str) {
 fn a_paged_pool_grown_by_pages_matches_one_sized_upfront() -> Result<()> {
     let Some(dev) = device() else { return Ok(()) };
     let cfg = config(KvAppend::Paged, AttnImpl::FlashDecoding, KvQuant::Off);
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<PoolExact>(&cfg, DType::F32, &dev)?;
     let steps = 600;
-    let mut wide = Cache::new(true, DType::F32, &cfg, &dev)?;
-    let mut narrow = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(256)?;
-    let wide_stream = decode(&model, &mut wide, steps, &dev)?;
-    let narrow_stream = decode(&model, &mut narrow, steps, &dev)?;
+    let mut wide = State::<PoolExact>::new(true, DType::F32, &cfg, &dev)?;
+    let mut narrow = State::<PoolExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(256)?;
+    let wide_stream = decode::<PoolExact>(&model, &mut wide, steps, &dev)?;
+    let narrow_stream = decode::<PoolExact>(&model, &mut narrow, steps, &dev)?;
     assert_same_stream(
         &wide_stream,
         &narrow_stream,
@@ -201,12 +209,13 @@ fn quantized_planes_grown_by_buckets_match_planes_sized_upfront() -> Result<()> 
     let Some(dev) = device() else { return Ok(()) };
     for quant in [KvQuant::Int8, KvQuant::Int4] {
         let cfg = config(KvAppend::InPlace, AttnImpl::Sdpa, quant);
-        let model = build(&cfg, DType::F16, &dev)?;
+        let model = build::<CrownExact>(&cfg, DType::F16, &dev)?;
         let steps = 300;
-        let mut wide = Cache::new(true, DType::F16, &cfg, &dev)?;
-        let mut narrow = Cache::new(true, DType::F16, &cfg, &dev)?.with_kv_bucket(64)?;
-        let wide_stream = decode(&model, &mut wide, steps, &dev)?;
-        let narrow_stream = decode(&model, &mut narrow, steps, &dev)?;
+        let mut wide = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        let mut narrow =
+            State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?.with_kv_bucket(64)?;
+        let wide_stream = decode::<CrownExact>(&model, &mut wide, steps, &dev)?;
+        let narrow_stream = decode::<CrownExact>(&model, &mut narrow, steps, &dev)?;
         assert_same_stream(
             &wide_stream,
             &narrow_stream,
@@ -226,7 +235,12 @@ fn quantized_planes_grown_by_buckets_match_planes_sized_upfront() -> Result<()> 
 }
 
 /// A pass of `len` tokens from position 0, as a turn's prefill.
-fn prefill(model: &Model, cache: &mut Cache, len: usize, dev: &Device) -> Result<Vec<f32>> {
+fn prefill<P: Lfm2Shape>(
+    model: &Model<P>,
+    cache: &mut State<P>,
+    len: usize,
+    dev: &Device,
+) -> Result<Vec<f32>> {
     let ids: Vec<u32> = (0..len as u32).map(|i| (i * 7 + 3) % 48).collect();
     let input = Tensor::new(ids.as_slice(), dev)?.unsqueeze(0)?;
     model.forward(&input, 0, cache)?.i(0)?.to_vec1::<f32>()
@@ -250,11 +264,11 @@ fn prefill(model: &Model, cache: &mut Cache, len: usize, dev: &Device) -> Result
 fn a_cleared_paged_pool_refilled_under_quarantine_grows_instead_of_refusing() -> Result<()> {
     let Some(dev) = device() else { return Ok(()) };
     let cfg = config(KvAppend::Paged, AttnImpl::FlashDecoding, KvQuant::Off);
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<PoolExact>(&cfg, DType::F32, &dev)?;
     // Two pages of 256: one turn of 300 positions holds both.
     let turn = 300;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
-    let first = prefill(&model, &mut cache, turn, &dev)?;
+    let mut cache = State::<PoolExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
+    let first = prefill::<PoolExact>(&model, &mut cache, turn, &dev)?;
     let (_, in_use, _) = cache.paged_stats().expect("the paged arm");
     assert_eq!(in_use, 2, "300 positions take both pages of 256");
     cache.clear();
@@ -265,11 +279,11 @@ fn a_cleared_paged_pool_refilled_under_quarantine_grows_instead_of_refusing() ->
         "the turn's pages are quarantined until the open epoch completes; nothing has \
          committed since the clear, so the refill finds them held (the premise of this test)"
     );
-    let second = prefill(&model, &mut cache, turn, &dev).map_err(|e| {
+    let second = prefill::<PoolExact>(&model, &mut cache, turn, &dev).map_err(|e| {
         lloom_tensor::Error::msg(format!("the refill after a clear was refused: {e}"))
     })?;
-    let mut fresh = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
-    let reference = prefill(&model, &mut fresh, turn, &dev)?;
+    let mut fresh = State::<PoolExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(512)?;
+    let reference = prefill::<PoolExact>(&model, &mut fresh, turn, &dev)?;
     assert!(
         first == reference,
         "two first turns on fresh caches disagree: the model is not deterministic here"

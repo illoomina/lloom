@@ -851,9 +851,12 @@ impl CtxCache {
         #[cfg(feature = "metal")]
         {
             let shared = match caches.first().and_then(|c| c.paged.as_ref()) {
-                Some(first) if first.shared() => caches
-                    .iter()
-                    .all(|c| c.paged.as_ref().map(|p| p.same_pool(first)).unwrap_or(false)),
+                Some(first) if first.shared() => caches.iter().all(|c| {
+                    c.paged
+                        .as_ref()
+                        .map(|p| p.same_pool(first))
+                        .unwrap_or(false)
+                }),
                 _ => false,
             };
             if shared {
@@ -962,9 +965,7 @@ impl CtxCache {
 #[cfg(feature = "metal")]
 mod paged_ctx {
     use super::{Arc, Device, Mutex, Result, Tensor};
-    use lloom_tensor::kernels::metal::{
-        Epoch, GpuClock, PageError, PageIdx,
-    };
+    use lloom_tensor::kernels::metal::{Epoch, GpuClock, PageError, PageIdx};
 
     /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
     /// so a drafter and its target widen at the same cadence.
@@ -1133,7 +1134,11 @@ mod paged_ctx {
                     return t.narrow(0, 0, n);
                 }
             }
-            let have = cached.slots_t.as_ref().and_then(|t| t.dim(0).ok()).unwrap_or(0);
+            let have = cached
+                .slots_t
+                .as_ref()
+                .and_then(|t| t.dim(0).ok())
+                .unwrap_or(0);
             let cap = n.max(have).max(64).next_power_of_two();
             let mut init = std::mem::take(&mut cached.slots);
             init.resize(cap, 0);
@@ -1759,7 +1764,8 @@ mod paged_ctx {
             v: &Tensor,
             scale: f32,
         ) -> Result<Tensor> {
-            self.lock().attend_block(self.layer, self.seq, q, k, v, scale)
+            self.lock()
+                .attend_block(self.layer, self.seq, q, k, v, scale)
         }
 
         /// Whether `other` is a handle over the same pool set (the batched
@@ -2675,11 +2681,15 @@ impl DSparkDrafter {
         }
         let (cos, sin) = self.rotary.at_positions(&positions)?;
         for (l, layer) in self.layers.iter().enumerate() {
-            let mut row_caches: Vec<&mut CtxCache> =
-                caches.iter_mut().map(|c| &mut c[l]).collect();
-            layer
-                .self_attn
-                .update_ctx_rows(&fused, &cos, &sin, &self.rotary, &lens, &mut row_caches)?;
+            let mut row_caches: Vec<&mut CtxCache> = caches.iter_mut().map(|c| &mut c[l]).collect();
+            layer.self_attn.update_ctx_rows(
+                &fused,
+                &cos,
+                &sin,
+                &self.rotary,
+                &lens,
+                &mut row_caches,
+            )?;
         }
         Ok(())
     }
@@ -3198,7 +3208,10 @@ impl DSparkSpeculator {
         let CtxKv::Paged { shared: true, .. } = self.ctx_kv else {
             return None;
         };
-        self.seqs.first().and_then(|s| s.ctx.first()).and_then(|c| c.batched_appends())
+        self.seqs
+            .first()
+            .and_then(|s| s.ctx.first())
+            .and_then(|c| c.batched_appends())
     }
 
     /// The context KV arm this proposer runs on.
@@ -3371,7 +3384,6 @@ impl DSparkSpeculator {
         Ok(out)
     }
 
-
     /// Draft one block for one already-seeded sequence — the verify example's
     /// per-round draft body, factored behind the seam.
     fn draft_one(&self, seq: &PerSeq) -> Result<Draft> {
@@ -3423,6 +3435,7 @@ impl DSparkSpeculator {
 
 impl Speculator for DSparkSpeculator {
     type Probe = LayerTaps<5>;
+    type Family = crate::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         self.seqs.len()
@@ -3438,7 +3451,6 @@ impl Speculator for DSparkSpeculator {
     fn max_draft(&self) -> usize {
         self.max_draft
     }
-
 
     fn want_confidence(&mut self, wanted: bool) {
         self.confidence_wanted = wanted;

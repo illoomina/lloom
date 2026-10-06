@@ -20,9 +20,11 @@
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{
-    Cache, Composition, Config, ConvState, FusionPolicy, GateFusion, KvAppend, LayerType, Model,
+    Composition, Config, ConvState, FusionPolicy, GateFusion, KvAppend, LayerType, Model,
+    Shape as Lfm2Shape, State,
 };
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::metal_backend::profile::CensusRefused;
 use lloom_tensor::quantized::GgmlDType;
@@ -65,10 +67,10 @@ fn tiny_config(fusion: FusionPolicy, gemv_silu: bool, gemv_residual: bool) -> Co
 
 /// The tiny LFM2 at `cfg`'s geometry and arms (`lloom::testing::tiny`,
 /// keyed weights), at f16.
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
     TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(DType::F16)
-        .model(dev)
+        .model::<P>(dev)
 }
 
 /// The decode step on the CPU backend at f32 over the f16 model's (rounded)
@@ -81,6 +83,12 @@ fn cpu_decode(cfg: &Config) -> Result<Vec<f32>> {
     cpu.gemv_silu = false;
     cpu.gemv_residual = false;
     cpu.gemv_gate = GateFusion::Off;
+    let key = cpu.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => cpu_decode_at::<P>(&cpu))
+}
+
+/// `cpu_decode` at the profile the config names.
+fn cpu_decode_at<P: Lfm2Shape>(cpu: &Config) -> Result<Vec<f32>> {
     let dev = Device::Cpu;
     let model = TinyCheckpoint::<Lfm2Tiny>::new(
         cpu.clone(),
@@ -90,8 +98,8 @@ fn cpu_decode(cfg: &Config) -> Result<Vec<f32>> {
         },
     )
     .with_dtype(DType::F32)
-    .model(&dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cpu, &dev)?;
+    .model::<P>(&dev)?;
+    let mut cache = State::<P>::new(true, DType::F32, cpu, &dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
@@ -107,8 +115,14 @@ fn cpu_decode(cfg: &Config) -> Result<Vec<f32>> {
 /// `CANDLE_METAL_PROFILE=1`, empty otherwise), which no test on another
 /// device lands in.
 fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> {
-    let model = build(cfg, dev)?;
-    let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => decode_at::<P>(cfg, dev))
+}
+
+/// `decode` at the profile the config names.
+fn decode_at<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> {
+    let model = build::<P>(cfg, dev)?;
+    let mut cache = State::<P>::new(true, DType::F16, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
@@ -317,7 +331,7 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     let mut crown = tiny_config(FusionPolicy::Derived, false, false);
     crown.conv_fused = true;
     crown.conv_state = ConvState::RotatingRing { k: 0 };
-    let model = build(&crown, &dev)?;
+    let model = build::<CrownExact>(&crown, &dev)?;
     let r = model.fusion_report().expect("Derived keeps its report");
     eprintln!("{r}");
     assert!(!r.gemv_silu && r.gemv_residual && r.gemv_gate == GateFusion::Swiglu);
@@ -357,7 +371,7 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     let mut sliding = tiny_config(FusionPolicy::Derived, false, false);
     sliding.conv_fused = true;
     sliding.conv_state = ConvState::SlidingRing { k: 2, slack: 4 };
-    let model = build(&sliding, &dev)?;
+    let model = build::<CrownExact>(&sliding, &dev)?;
     let r = model.fusion_report().unwrap();
     eprintln!("{r}");
     assert_eq!(
@@ -382,7 +396,10 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     // (`fast_sum`, store-width, simd tree), validated under that.
     let mut step = tiny_config(FusionPolicy::Derived, false, false);
     step.conv_fused = true;
-    let r = build(&step, &dev)?.fusion_report().unwrap().clone();
+    let r = build::<CrownExact>(&step, &dev)?
+        .fusion_report()
+        .unwrap()
+        .clone();
     assert_eq!(
         r.validated,
         vec![("conv_fused".to_string(), "shortconv_step".to_string())]
@@ -390,7 +407,10 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     assert!(r.compositions.is_empty());
     let mut rot = tiny_config(FusionPolicy::Derived, false, false);
     rot.conv_state = ConvState::RotatingRing { k: 0 };
-    let r = build(&rot, &dev)?.fusion_report().unwrap().clone();
+    let r = build::<CrownExact>(&rot, &dev)?
+        .fusion_report()
+        .unwrap()
+        .clone();
     assert_eq!(
         r.validated,
         vec![("conv_state=rotating".to_string(), "fast_sum".to_string())]
@@ -412,7 +432,7 @@ fn the_conv_fold_gain_is_the_weights_norm_and_the_horizon_is_the_window() -> Res
         return Ok(());
     };
     let cfg = tiny_config(FusionPolicy::Derived, false, false);
-    let model = build(&cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
     let g = model
         .fusion_report()
         .unwrap()

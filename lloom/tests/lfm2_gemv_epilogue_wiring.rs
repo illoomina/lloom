@@ -35,8 +35,9 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{Config, KvAppend, LayerType, Model, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::Fixture;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::quantized::GgmlDType;
@@ -105,8 +106,8 @@ fn tiny_geometry() -> Config {
 
 /// The fixture's LFM2 at `cfg`'s geometry and arms, at f16 — so two runs
 /// agree and any difference between two *arms* is attributable to the arms.
-fn build(fx: &Fixture<Lfm2Tiny>, cfg: &Config, dev: &Device) -> Result<Model> {
-    fx.model_in(cfg, Some(DType::F16), dev)
+fn build(fx: &Fixture<Lfm2Tiny>, cfg: &Config, dev: &Device) -> Result<Model<CrownExact>> {
+    fx.model_in::<CrownExact>(cfg, Some(DType::F16), dev)
 }
 
 /// The same decode step on the CPU backend at f32, over the weights the f16
@@ -127,7 +128,7 @@ fn cpu_decode_logits(cfg: &Config) -> Result<Vec<f32>> {
         },
     )
     .with_dtype(DType::F32)
-    .model(&dev)?;
+    .model::<CrownExact>(&dev)?;
     decode_with(&model, &cpu, &dev, DType::F32)
 }
 
@@ -166,8 +167,13 @@ fn decode_logits(fx: &Fixture<Lfm2Tiny>, cfg: &Config, dev: &Device) -> Result<V
     decode_with(&model, cfg, dev, DType::F16)
 }
 
-fn decode_with(model: &Model, cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<f32>> {
-    let mut cache = Cache::new(true, dtype, cfg, dev)?;
+fn decode_with(
+    model: &Model<CrownExact>,
+    cfg: &Config,
+    dev: &Device,
+    dtype: DType,
+) -> Result<Vec<f32>> {
+    let mut cache = State::<CrownExact>::new(true, dtype, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
@@ -334,7 +340,7 @@ fn prefill_is_bit_identical_with_the_flags_on() -> Result<()> {
 
     let prefill_logits = |cfg: &Config| -> Result<Vec<f32>> {
         let model = build(&fx, cfg, &dev)?;
-        let mut cache = Cache::new(true, DType::F16, cfg, &dev)?;
+        let mut cache = State::<CrownExact>::new(true, DType::F16, cfg, &dev)?;
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
         let logits = model.forward(&inp, 0, &mut cache)?;

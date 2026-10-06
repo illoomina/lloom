@@ -18,11 +18,13 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, MtpDrafter, Qwen4Exp, Streamed};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{Config, MtpDrafter, Qwen4Exp, State, Streamed};
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm, StreamStats};
 use lloom::nn::model::CausalLM;
 use lloom::nn::speculator::{Draft, KvSource, NextnHidden, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::{CrownExact, Own, RewindableExact};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -59,11 +61,15 @@ fn write_checkpoint(cfg: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn streamed_model(cfg: &Config, path: &Path, slots: usize) -> Result<Qwen4Exp<Streamed>> {
+fn streamed_model(
+    cfg: &Config,
+    path: &Path,
+    slots: usize,
+) -> Result<Qwen4Exp<RewindableExact, Streamed>> {
     let mut f = File::open(path)?;
     let content = Content::read(&mut f)?;
     let dev = Device::Cpu;
-    testing::model_with(cfg, &dev, |l| {
+    testing::model_with::<RewindableExact, _>(cfg, &dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
         Streamed::new(
             src("ffn_gate_exps.weight")?,
@@ -77,7 +83,7 @@ fn streamed_model(cfg: &Config, path: &Path, slots: usize) -> Result<Qwen4Exp<St
 }
 
 /// The tier's counters and usage profile, summed over the layers.
-fn tier_state(model: &Qwen4Exp<Streamed>) -> (StreamStats, Vec<Vec<u32>>) {
+fn tier_state(model: &Qwen4Exp<RewindableExact, Streamed>) -> (StreamStats, Vec<Vec<u32>>) {
     let mut stats = StreamStats::default();
     for l in model.layers() {
         stats += l.moe().experts().stats();
@@ -86,13 +92,13 @@ fn tier_state(model: &Qwen4Exp<Streamed>) -> (StreamStats, Vec<Vec<u32>>) {
 }
 
 fn greedy(
-    model: &Qwen4Exp<Streamed>,
+    model: &Qwen4Exp<RewindableExact, Streamed>,
     cfg: &Config,
     prompt: &[u32],
     max: usize,
 ) -> Result<(Vec<u32>, bool)> {
     let dev = Device::Cpu;
-    let cache = model.new_cache(cfg, &dev)?;
+    let cache = RewindableExact::single(&model, &dev, 8)?;
     let mut session = Session::new(model, cache);
     let mut spec = IdentityProposer;
     let eos = [cfg.eos_token_id];
@@ -113,14 +119,14 @@ fn decode_positions(
     slots: usize,
     prompt: &[u32],
     tokens: &[u32],
-) -> Result<Qwen4Exp<Streamed>> {
+) -> Result<Qwen4Exp<RewindableExact, Streamed>> {
     let dev = Device::Cpu;
     let mut model = streamed_model(cfg, path, slots)?;
     // On the host plan: a device-planned decode step that misses counts
     // its replayed token's experts twice (once at the settle, once at the
     // replay's loads) — the reference is one use per position.
     model.set_device_plan(false);
-    let mut cache = model.new_cache(cfg, &dev)?;
+    let mut cache = RewindableExact::single(&model, &dev, 8)?;
     let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), &dev)?;
     model.forward(&input, 0, &mut cache)?;
     for &t in tokens {
@@ -154,7 +160,7 @@ struct SpecRun {
     /// Positions the cache consumed past the prompt: the stream's prefix of
     /// this length was fed (the final anchor is streamed, never fed).
     fed: usize,
-    /// The cache's window counters (`Cache::window_*`), read before the
+    /// The cache's window counters (`State::::window_*`), read before the
     /// pooled cache is dropped (a pooled channel cannot be cloned: the
     /// pool has one slot).
     truncations: u64,
@@ -167,7 +173,7 @@ struct SpecRun {
 /// The speculative loop over the phase rings (the verify as one window with
 /// the accept by phase), on a fresh cache.
 fn speculative<S: Speculator<Probe = NextnHidden>>(
-    model: &Qwen4Exp<Streamed>,
+    model: &Qwen4Exp<RewindableExact, Streamed>,
     cfg: &Config,
     spec: &mut S,
     prompt: &[u32],
@@ -175,7 +181,8 @@ fn speculative<S: Speculator<Probe = NextnHidden>>(
     k: usize,
 ) -> Result<SpecRun> {
     let dev = Device::Cpu;
-    let mut cache: Cache = Cache::in_pools(cfg, &model.spec_pools(1, k, &dev))?;
+    let mut cache: State<RewindableExact> =
+        State::<RewindableExact>::in_ring(cfg, &model.spec_pools(1, k, &dev))?;
     cache.want_nextn = true;
     let mut session = Session::new(model, cache);
     let eos = [cfg.eos_token_id];
@@ -183,6 +190,7 @@ fn speculative<S: Speculator<Probe = NextnHidden>>(
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let opts = DecodeOptions::new(max);
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         spec,
         &mut rb,
         &mut sampler,
@@ -215,6 +223,7 @@ struct Oracle {
 
 impl Speculator for Oracle {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         1
     }
@@ -248,6 +257,7 @@ struct Garbage {
 
 impl Speculator for Garbage {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         1
     }
@@ -416,7 +426,11 @@ fn the_real_drafter_over_the_streamed_tier_is_greedy() -> Result<()> {
     let (prompt, ref_ids) = long_prompt(&cfg, &path, slots, max)?;
     for k in [1usize, 2] {
         let model = streamed_model(&cfg, &path, slots)?;
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut mtp =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let run = speculative(&model, &cfg, &mut mtp, &prompt, max, k)?;

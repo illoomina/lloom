@@ -6,9 +6,10 @@
 //! And the streamed tier under the device plan over rows decodes what the
 //! resident model decodes, replays included.
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident, State};
 use lloom::nn::expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Streamed};
 use lloom::nn::model::{CausalLM, Row};
+use lloom::profile::{CrownExact, PoolExact, Profile};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -25,7 +26,7 @@ fn prompts() -> Vec<Vec<u32>> {
 }
 
 /// Per row: the ids, the logits of every step; and the caches after.
-type Batched = (Vec<Vec<u32>>, Vec<Vec<Vec<f32>>>, Vec<Cache>);
+type Batched<P> = (Vec<Vec<u32>>, Vec<Vec<Vec<f32>>>, Vec<State<P>>);
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
@@ -37,7 +38,7 @@ fn argmax(v: &[f32]) -> usize {
 /// Every row alone: `steps` greedy tokens after its prompt, the logits of
 /// every step.
 fn solo<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
@@ -61,39 +62,39 @@ fn solo<R: ExpertResidency>(
     Ok((ids, rows))
 }
 
-/// The rows together: each prefilled alone, then `steps` batched steps.
+/// The rows together: each prefilled alone, then `steps` batched steps,
+/// every row its own `No × One` state.
 fn batched<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     prompts: &[Vec<u32>],
     steps: usize,
-) -> Result<Batched> {
-    batched_on(model, cfg, dev, prompts, steps, false)
+) -> Result<Batched<CrownExact>> {
+    batched_on(model, cfg, dev, prompts, steps, |cfg| {
+        model.new_cache(cfg, dev)
+    })
 }
 
-/// `pooled`: the rows' recurrent state in one `StatePools` (the batched
-/// kernels' arm on Metal; the pooled channels through the composed path on
-/// the CPU).
-fn batched_on<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+/// The rows together on `model`'s shape: `make` builds a row's state —
+/// its own on `No × One`, a slot of one `StatePools` on `No × Paged` (the
+/// batched kernels' arm on Metal; the pooled channels through the composed
+/// path on the CPU).
+fn batched_on<P: Profile, R: ExpertResidency>(
+    model: &Qwen4Exp<P, R>,
     cfg: &Config,
     dev: &Device,
     prompts: &[Vec<u32>],
     steps: usize,
-    pooled: bool,
-) -> Result<Batched> {
+    make: impl Fn(&Config) -> Result<State<P>>,
+) -> Result<Batched<P>> {
     let b = prompts.len();
-    let pools = pooled.then(|| model.state_pools(b, dev));
-    let mut caches: Vec<Cache> = Vec::with_capacity(b);
+    let mut caches: Vec<State<P>> = Vec::with_capacity(b);
     let mut next: Vec<u32> = Vec::with_capacity(b);
     let mut ids = vec![Vec::new(); b];
     let mut rows_logits = vec![Vec::new(); b];
     for p in prompts {
-        let mut cache = match &pools {
-            Some(pools) => Cache::in_pools(cfg, pools)?,
-            None => model.new_cache(cfg, dev)?,
-        };
+        let mut cache = make(cfg)?;
         let input = Tensor::from_vec(p.clone(), (1, p.len()), dev)?;
         let logits: Vec<f32> = model
             .forward(&input, 0, &mut cache)?
@@ -107,7 +108,7 @@ fn batched_on<R: ExpertResidency>(
             ids[r].push(next[r]);
         }
         let tokens = Tensor::from_vec(next.clone(), (b, 1), dev)?;
-        let mut rows: Vec<Row<'_, Cache>> = caches
+        let mut rows: Vec<Row<'_, State<P>>> = caches
             .iter_mut()
             .map(|c| Row {
                 pos: c.pos,
@@ -125,43 +126,65 @@ fn batched_on<R: ExpertResidency>(
     Ok((ids, rows_logits, caches))
 }
 
+/// The rows on their own states (`model`, `No × One`) and on one pool
+/// (`pooled`, `No × Paged`: the same weights at the rows' shape), each
+/// against the solo forward on `model`.
 fn check_rows(
     tag: &str,
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<CrownExact, Resident>,
+    pooled: &Qwen4Exp<PoolExact, Resident>,
     cfg: &Config,
     dev: &Device,
     tol: f32,
 ) -> Result<()> {
-    check_rows_on(tag, model, cfg, dev, tol, false, 6)?;
-    check_rows_on(&format!("{tag} pooled"), model, cfg, dev, tol, true, 6)?;
+    check_rows_on(tag, model, model, cfg, dev, tol, 6, |cfg| {
+        model.new_cache(cfg, dev)
+    })?;
+    let b = prompts().len();
+    let pools = pooled.state_pools(b, dev);
+    check_rows_on(
+        &format!("{tag} pooled"),
+        model,
+        pooled,
+        cfg,
+        dev,
+        tol,
+        6,
+        |cfg| State::<PoolExact>::in_pools(cfg, &pools),
+    )?;
     // Past the indexer's dense range (`Config::tiny`: 19 cells) the pooled
     // rows leave the one-launch arm for the per-row selection through
     // their page tables, row by row as each crosses it.
     let limit = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
     let longest = prompts().iter().map(|p| p.len()).max().unwrap_or(0);
     let steps = limit + 4 - longest.min(limit);
+    let pools = pooled.state_pools(b, dev);
     check_rows_on(
         &format!("{tag} pooled long"),
         model,
+        pooled,
         cfg,
         dev,
         tol,
-        true,
         steps,
+        |cfg| State::<PoolExact>::in_pools(cfg, &pools),
     )
 }
 
-fn check_rows_on(
+#[allow(clippy::too_many_arguments)]
+fn check_rows_on<P: Profile>(
     tag: &str,
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<CrownExact, Resident>,
+    rows_model: &Qwen4Exp<P, Resident>,
     cfg: &Config,
     dev: &Device,
     tol: f32,
-    pooled: bool,
     steps: usize,
+    make: impl Fn(&Config) -> Result<State<P>>,
 ) -> Result<()> {
     let prompts = prompts();
-    let (ids_b, logits_b, caches) = batched_on(model, cfg, dev, &prompts, steps, pooled)?;
+    let (ids_b, logits_b, caches) = batched_on(rows_model, cfg, dev, &prompts, steps, make)?;
+    let pooled = P::KEY.rows == "Paged";
     if pooled {
         for (r, c) in caches.iter().enumerate() {
             assert!(
@@ -217,8 +240,9 @@ fn check_rows_on(
 fn each_row_of_a_batched_step_is_its_own_forward_on_the_cpu() -> Result<()> {
     let cfg = Config::tiny();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
-    check_rows("cpu", &model, &cfg, &dev, 1e-4)
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
+    let pooled = testing::resident_model::<PoolExact>(&cfg, &dev);
+    check_rows("cpu", &model, &pooled, &cfg, &dev, 1e-4)
 }
 
 #[cfg(feature = "metal")]
@@ -229,15 +253,16 @@ fn each_row_of_a_batched_step_is_its_own_forward_on_metal() -> Result<()> {
     };
     let mut cfg = Config::tiny();
     cfg.head_dim = 32; // the fused QSA step needs a head the sdpa kernel is built for
-    let model = testing::resident_model(&cfg, &dev);
-    check_rows("metal", &model, &cfg, &dev, 1e-4)
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
+    let pooled = testing::resident_model::<PoolExact>(&cfg, &dev);
+    check_rows("metal", &model, &pooled, &cfg, &dev, 1e-4)
 }
 
 #[test]
 fn forward_rows_refuses_what_it_cannot_batch() -> Result<()> {
     let cfg = Config::tiny();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let mut a = model.new_cache(&cfg, &dev)?;
     let mut b = model.new_cache(&cfg, &dev)?;
     let input = Tensor::from_vec(vec![3u32, 5, 2], (1, 3), &dev)?;
@@ -341,10 +366,11 @@ fn streamed_rows_on(dev: &Device, tag: &str) -> Result<()> {
     }
     let path = temp_gguf(tag);
     write_experts(&cfg, &path)?;
-    let resident: Qwen4Exp<Resident> = testing::model_with(&cfg, dev, |l| {
-        let [g, u, d] = testing::expert_stacks(&cfg, l, dev, GgmlDType::F32);
-        Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
-    })?;
+    let resident: Qwen4Exp<CrownExact, Resident> =
+        testing::model_with::<CrownExact, _>(&cfg, dev, |l| {
+            let [g, u, d] = testing::expert_stacks(&cfg, l, dev, GgmlDType::F32);
+            Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
+        })?;
     let content = Content::read(&mut File::open(&path)?)?;
     let prompts = prompts();
     let steps = 8;
@@ -354,17 +380,18 @@ fn streamed_rows_on(dev: &Device, tag: &str) -> Result<()> {
     // everything once seen (8 slots: the device plan from the second step).
     let mut any_device = 0u64;
     for slots in [5usize, 8] {
-        let streamed: Qwen4Exp<Streamed> = testing::model_with(&cfg, dev, |l| {
-            let src = |n: &str| ExpertSource::from_gguf(&content, &path, n);
-            Streamed::new(
-                src(&format!("blk.{l}.ffn_gate_exps.weight"))?,
-                src(&format!("blk.{l}.ffn_up_exps.weight"))?,
-                src(&format!("blk.{l}.ffn_down_exps.weight"))?,
-                slots,
-                LoaderArm::Pread,
-                dev,
-            )
-        })?;
+        let streamed: Qwen4Exp<CrownExact, Streamed> =
+            testing::model_with::<CrownExact, _>(&cfg, dev, |l| {
+                let src = |n: &str| ExpertSource::from_gguf(&content, &path, n);
+                Streamed::new(
+                    src(&format!("blk.{l}.ffn_gate_exps.weight"))?,
+                    src(&format!("blk.{l}.ffn_up_exps.weight"))?,
+                    src(&format!("blk.{l}.ffn_down_exps.weight"))?,
+                    slots,
+                    LoaderArm::Pread,
+                    dev,
+                )
+            })?;
         let (ids_s, logits_s, caches) = batched(&streamed, &cfg, dev, &prompts, steps)?;
         assert_eq!(
             ids_s, ids_r,

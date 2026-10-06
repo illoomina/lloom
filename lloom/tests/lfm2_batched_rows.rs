@@ -28,8 +28,11 @@
 //! another (non-vacuity: a `forward_rows` that used row 0's cache for every
 //! row would fail the second).
 
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::{RaggedRow, Row, VarBuilder};
+use lloom::profile::{CrownExact, PoolSpecExact};
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// The process-wide switches this binary runs under, set before any test
@@ -165,7 +168,7 @@ fn layer_counts(cfg: &Config) -> (u64, u64) {
 
 /// Fixed-ramp weights, so the two arms agree on the model and any divergence
 /// is the paths'.
-fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -214,7 +217,7 @@ fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 /// Three prompts of different lengths and content, and the token each row
@@ -235,13 +238,24 @@ fn both_arms(dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>
 }
 
 fn both_arms_on(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-    let model = build(&cfg, dtype, dev)?;
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => both_arms_on_at::<P>(cfg, dtype, dev))
+}
+
+/// `both_arms_on` at the profile the config names.
+
+fn both_arms_on_at<P: Lfm2Shape>(
+    cfg: Config,
+    dtype: DType,
+    dev: &Device,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let model = build::<P>(&cfg, dtype, dev)?;
     let rows = rows();
 
     // Reference: each row alone through `forward`.
     let mut solo = Vec::with_capacity(rows.len());
     for (prompt, next) in &rows {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
         let _ = model.forward(&input, 0, &mut cache)?;
         let input = Tensor::new(&[*next], dev)?.unsqueeze(0)?;
@@ -252,14 +266,14 @@ fn both_arms_on(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>
     // Subject: the same prefills, then one batched step over all rows.
     let mut caches = Vec::with_capacity(rows.len());
     for (prompt, _) in &rows {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
         let _ = model.forward(&input, 0, &mut cache)?;
         caches.push(cache);
     }
     let nexts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
     let input = Tensor::new(nexts.as_slice(), dev)?.reshape((rows.len(), 1))?;
-    let mut row_refs: Vec<Row<'_, Cache>> = caches
+    let mut row_refs: Vec<Row<'_, State<P>>> = caches
         .iter_mut()
         .zip(rows.iter())
         .map(|(cache, (prompt, _))| Row {
@@ -383,9 +397,9 @@ fn forward_rows_refuses_what_it_cannot_batch() -> Result<()> {
     knobs();
     let dev = Device::Cpu;
     let cfg = tiny_config();
-    let model = build(&cfg, DType::F32, &dev)?;
-    let mut a = Cache::new(true, DType::F32, &cfg, &dev)?;
-    let mut b = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, DType::F32, &dev)?;
+    let mut a = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+    let mut b = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
 
     let two_tokens = Tensor::new(&[[1u32, 2]], &dev)?;
     let mut rows = vec![Row {
@@ -415,7 +429,7 @@ fn forward_rows_refuses_what_it_cannot_batch() -> Result<()> {
         .expect("1 token for 2 rows is refused");
     assert!(err.to_string().contains("caches"), "{err}");
 
-    let mut rows: Vec<Row<'_, Cache>> = Vec::new();
+    let mut rows: Vec<Row<'_, State<CrownExact>>> = Vec::new();
     let none = Tensor::new(&[0u32; 0], &dev)?.reshape((0, 1))?;
     assert!(model.forward_rows(&none, &mut rows).is_err());
     Ok(())
@@ -429,7 +443,17 @@ fn forward_rows_refuses_what_it_cannot_batch() -> Result<()> {
 /// against one pass over the concatenation, not against another chunked
 /// pass. `conv_prefill_ctx` is on for the reason §13.2f gives.
 fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-    let model = build(&cfg, dtype, dev)?;
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => ragged_arms_at::<P>(cfg, dtype, dev))
+}
+
+/// `ragged_arms` at the profile the config names.
+fn ragged_arms_at<P: Lfm2Shape>(
+    cfg: Config,
+    dtype: DType,
+    dev: &Device,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let model = build::<P>(&cfg, dtype, dev)?;
     let decode_rows = rows();
     let piece_prompt: Vec<u32> = vec![7, 22, 13, 4, 35, 18, 9, 26, 2, 41];
     let split = 6;
@@ -437,7 +461,7 @@ fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>
     // References: each decode row alone; the piece row as one whole prefill.
     let mut solo = Vec::new();
     for (prompt, next) in &decode_rows[..2] {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
         let _ = model.forward(&input, 0, &mut cache)?;
         let input = Tensor::new(&[*next], dev)?.unsqueeze(0)?;
@@ -445,7 +469,7 @@ fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>
         solo.push(logits.i(0)?.to_vec1::<f32>()?);
     }
     {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(piece_prompt.as_slice(), dev)?.unsqueeze(0)?;
         let logits = model.forward(&input, 0, &mut cache)?;
         solo.push(logits.i(0)?.to_vec1::<f32>()?);
@@ -456,13 +480,13 @@ fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>
     // `[next_0, next_1, piece_prompt[split..]]`.
     let mut caches = Vec::new();
     for (prompt, _) in &decode_rows[..2] {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
         let _ = model.forward(&input, 0, &mut cache)?;
         caches.push(cache);
     }
     {
-        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let mut cache = State::<P>::new(true, dtype, &cfg, dev)?;
         let input = Tensor::new(&piece_prompt[..split], dev)?.unsqueeze(0)?;
         let _ = model.forward(&input, 0, &mut cache)?;
         caches.push(cache);
@@ -472,7 +496,7 @@ fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>
     let input = Tensor::new(tokens.as_slice(), dev)?.unsqueeze(0)?;
     let lens = [1usize, 1, piece_prompt.len() - split];
     let poss = [decode_rows[0].0.len(), decode_rows[1].0.len(), split];
-    let mut row_refs: Vec<RaggedRow<'_, Cache>> = caches
+    let mut row_refs: Vec<RaggedRow<'_, State<P>>> = caches
         .iter_mut()
         .zip(lens.iter().zip(poss.iter()))
         .map(|(cache, (&len, &pos))| RaggedRow { pos, len, cache })
@@ -617,14 +641,14 @@ mod pool_arms {
         pool.set_batched_arms(batched);
         let mut caches = Vec::with_capacity(rows.len());
         for (prompt, _) in &rows {
-            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let mut cache = State::<PoolSpecExact>::for_batch(true, dtype, cfg, dev, &pool)?;
             let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
             let _ = model.forward(&input, 0, &mut cache)?;
             caches.push(cache);
         }
         let nexts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
         let input = Tensor::new(nexts.as_slice(), dev)?.reshape((rows.len(), 1))?;
-        let mut row_refs: Vec<Row<'_, Cache>> = caches
+        let mut row_refs: Vec<Row<'_, State<PoolSpecExact>>> = caches
             .iter_mut()
             .zip(rows.iter())
             .map(|(cache, (prompt, _))| Row {
@@ -640,7 +664,7 @@ mod pool_arms {
             .map(|n| (n + 5) % cfg.vocab_size as u32)
             .collect();
         let input2 = Tensor::new(nexts2.as_slice(), dev)?.reshape((rows.len(), 1))?;
-        let mut row_refs: Vec<Row<'_, Cache>> = caches
+        let mut row_refs: Vec<Row<'_, State<PoolSpecExact>>> = caches
             .iter_mut()
             .zip(rows.iter())
             .map(|(cache, (prompt, _))| Row {
@@ -698,11 +722,11 @@ mod pool_arms {
         let dev = Device::new_metal(0)?;
         let cfg = pool_config();
         let dtype = DType::F32;
-        let model = build(&cfg, dtype, &dev)?;
+        let model = build::<PoolSpecExact>(&cfg, dtype, &dev)?;
         let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
         for (prompt, next) in pool_rows() {
-            let mut private = Cache::new(true, dtype, &cfg, &dev)?;
-            let mut pooled = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut private = State::<PoolSpecExact>::new(true, dtype, &cfg, &dev)?;
+            let mut pooled = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
             let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
             let _ = model.forward(&input, 0, &mut private)?;
             let _ = model.forward(&input, 0, &mut pooled)?;
@@ -735,13 +759,13 @@ mod pool_arms {
         pool.set_batched_arms(batched);
         let mut caches = Vec::new();
         for (prompt, _) in &decode_rows[..2] {
-            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let mut cache = State::<PoolSpecExact>::for_batch(true, dtype, cfg, dev, &pool)?;
             let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
             let _ = model.forward(&input, 0, &mut cache)?;
             caches.push(cache);
         }
         {
-            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let mut cache = State::<PoolSpecExact>::for_batch(true, dtype, cfg, dev, &pool)?;
             let input = Tensor::new(&piece_prompt[..split], dev)?.unsqueeze(0)?;
             let _ = model.forward(&input, 0, &mut cache)?;
             caches.push(cache);
@@ -751,7 +775,7 @@ mod pool_arms {
         let input = Tensor::new(tokens.as_slice(), dev)?.unsqueeze(0)?;
         let lens = [1usize, 1, piece_prompt.len() - split];
         let poss = [decode_rows[0].0.len(), decode_rows[1].0.len(), split];
-        let mut row_refs: Vec<RaggedRow<'_, Cache>> = caches
+        let mut row_refs: Vec<RaggedRow<'_, State<PoolSpecExact>>> = caches
             .iter_mut()
             .zip(lens.iter().zip(poss.iter()))
             .map(|(cache, (&len, &pos))| RaggedRow { pos, len, cache })
@@ -762,7 +786,7 @@ mod pool_arms {
         let nexts: Vec<u32> = vec![12, 33, 21];
         let input = Tensor::new(nexts.as_slice(), dev)?.reshape((3, 1))?;
         let poss2 = [poss[0] + 1, poss[1] + 1, piece_prompt.len()];
-        let mut row_refs: Vec<Row<'_, Cache>> = caches
+        let mut row_refs: Vec<Row<'_, State<PoolSpecExact>>> = caches
             .iter_mut()
             .zip(poss2.iter())
             .map(|(cache, &pos)| Row { pos, cache })
@@ -818,13 +842,13 @@ mod pool_arms {
         let dev = Device::new_metal(0)?;
         let cfg = pool_config();
         let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
-        let a = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
-        let b = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
-        assert!(Cache::for_batch(true, DType::F32, &cfg, &dev, &pool).is_err());
+        let a = State::<PoolSpecExact>::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        let b = State::<PoolSpecExact>::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        assert!(State::<PoolSpecExact>::for_batch(true, DType::F32, &cfg, &dev, &pool).is_err());
         assert_eq!(pool.report().slots_free, 0);
         drop(a);
         assert_eq!(pool.report().slots_free, 1);
-        let c = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        let c = State::<PoolSpecExact>::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
         assert_ne!(c.batch_slot(), b.batch_slot());
         Ok(())
     }
@@ -841,14 +865,14 @@ mod pool_arms {
         let dev = Device::new_metal(0)?;
         let cfg = pool_config();
         let dtype = DType::F32;
-        let model = build(&cfg, dtype, &dev)?;
+        let model = build::<PoolSpecExact>(&cfg, dtype, &dev)?;
         // Two slots, 64 tokens each at page 32: four pages, filled by two
         // rows of 40 tokens (two pages each).
         let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
         let prompt: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % 48).collect();
         let want = {
-            let mut a = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-            let mut b = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut a = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut b = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
             let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
             let la = model.forward(&input, 0, &mut a)?;
             let _ = model.forward(&input, 0, &mut b)?;
@@ -859,8 +883,8 @@ mod pool_arms {
         };
         // Both caches dropped: their pages are quarantined against the
         // current epoch, which nothing has committed since.
-        let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-        let mut d = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let mut c = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let mut d = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
         let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
         let lc = model
             .forward(&input, 0, &mut c)
@@ -901,9 +925,9 @@ mod prefix_share {
     /// every piece boundary is a pass boundary (and a page boundary when
     /// `piece` is the page): the state a sharer starts from is snapshotted
     /// there. Returns the last piece's logits.
-    fn prefill_pieces(
-        model: &Model,
-        cache: &mut Cache,
+    fn prefill_pieces<P: Lfm2Shape>(
+        model: &Model<P>,
+        cache: &mut State<P>,
         prompt: &[u32],
         piece: usize,
         dev: &Device,
@@ -939,15 +963,15 @@ mod prefix_share {
             (DType::F16, 70),
             (DType::F32, 40),
         ] {
-            let model = build(&cfg, dtype, &dev)?;
+            let model = build::<PoolSpecExact>(&cfg, dtype, &dev)?;
             let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
             let prompt: Vec<u32> = (0..70u32).map(|i| (i * 13 + 7) % 48).collect();
             let question: Vec<u32> = prompt[64..].to_vec();
             let next = 21u32;
 
             // The source: the whole prompt, in `piece`-token pieces.
-            let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-            let _ = prefill_pieces(&model, &mut src, &prompt, piece, &dev)?;
+            let mut src = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let _ = prefill_pieces::<PoolSpecExact>(&model, &mut src, &prompt, piece, &dev)?;
             assert_eq!(src.kv_len(), 70);
             assert!(
                 pool.snapshots() >= 2,
@@ -956,12 +980,13 @@ mod prefix_share {
             );
 
             // The reference: a fresh row, the same pieces.
-            let mut fresh = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-            let want_tail = prefill_pieces(&model, &mut fresh, &prompt, piece, &dev)?;
+            let mut fresh = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let want_tail =
+                prefill_pieces::<PoolSpecExact>(&model, &mut fresh, &prompt, piece, &dev)?;
             let pages_before = pool.report().pages_in_use;
 
             // The sharer: two pages from the source, then the remainder.
-            let mut shared = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut shared = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
             let n = shared.share_prefix_from(&src, 64)?;
             assert_eq!(n, 64, "piece {piece}: two whole pages shared");
             assert_eq!(shared.kv_len(), 64);
@@ -996,7 +1021,7 @@ mod prefix_share {
             );
             // Non-vacuity: the logits depend on the prefix — a row that
             // prefilled only the remainder differs.
-            let mut bare = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut bare = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
             let q = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
             let c = model.forward(&q, 0, &mut bare)?;
             assert_ne!(bits(&c)?, bits(&want_tail)?, "the prefix matters");
@@ -1012,20 +1037,20 @@ mod prefix_share {
         let dev = Device::new_metal(0)?;
         let cfg = share_config();
         let dtype = DType::F32;
-        let model = build(&cfg, dtype, &dev)?;
+        let model = build::<PoolSpecExact>(&cfg, dtype, &dev)?;
         let pool = BatchPool::new(&cfg, &dev, 3, 128)?;
         let other = BatchPool::new(&cfg, &dev, 1, 128)?;
         let prompt: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % 48).collect();
-        let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-        let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
-        let mut a = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let mut src = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let _ = prefill_pieces::<PoolSpecExact>(&model, &mut src, &prompt, 32, &dev)?;
+        let mut a = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
         assert_eq!(a.share_prefix_from(&src, 20)?, 0, "below a page: nothing");
         assert_eq!(a.share_prefix_from(&src, 40)?, 32, "one page of the 40");
         assert!(
             a.share_prefix_from(&src, 32).is_err(),
             "a non-empty sharer is refused"
         );
-        let mut foreign = Cache::for_batch(true, dtype, &cfg, &dev, &other)?;
+        let mut foreign = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &other)?;
         assert!(
             foreign.share_prefix_from(&src, 32).is_err(),
             "another pool is refused"
@@ -1076,7 +1101,7 @@ mod ragged_verify {
         let cfg = verify_config();
         let eos = [7u32];
         for dtype in [DType::F32, DType::F16] {
-            let model = build(&cfg, dtype, &dev)?;
+            let model = build::<PoolSpecExact>(&cfg, dtype, &dev)?;
             let rows = pool_rows_for_verify();
             // Two pools, one per arm, the same three rows prefilled the same way.
             let mut arms = Vec::new();
@@ -1085,7 +1110,7 @@ mod ragged_verify {
                 pool.set_batched_arms(batched);
                 let mut caches = Vec::new();
                 for (prompt, _) in &rows {
-                    let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                    let mut c = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
                     let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
                     let _ = model.forward(&input, 0, &mut c)?;
                     let _ = c.take_taps();
@@ -1099,7 +1124,7 @@ mod ragged_verify {
             let lasts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
             let predicted = {
                 let pool = BatchPool::new(&cfg, &dev, 1, 128)?;
-                let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                let mut c = State::<PoolSpecExact>::for_batch(true, dtype, &cfg, &dev, &pool)?;
                 let input = Tensor::new(rows[0].0.as_slice(), &dev)?.unsqueeze(0)?;
                 let _ = model.forward(&input, 0, &mut c)?;
                 let _ = c.take_taps();
@@ -1131,7 +1156,7 @@ mod ragged_verify {
                 .map(|d| Tensor::new(d.as_slice(), &dev))
                 .collect::<Result<_>>()?;
             let (got, census) = censused(&dev, || {
-                let mut vrows: Vec<VerifyRow<'_>> = sub_caches
+                let mut vrows: Vec<VerifyRow<'_, PoolSpecExact>> = sub_caches
                     .iter_mut()
                     .enumerate()
                     .map(|(r, c)| VerifyRow {
@@ -1143,7 +1168,7 @@ mod ragged_verify {
                     .collect();
                 let pending = model.verify_rows_enqueue(&mut vrows)?;
                 drop(vrows);
-                let mut refs: Vec<&mut Cache> = sub_caches.iter_mut().collect();
+                let mut refs: Vec<&mut State<PoolSpecExact>> = sub_caches.iter_mut().collect();
                 let eos_sets: Vec<&[u32]> = vec![&eos[..]; refs.len()];
                 model.verify_rows_complete(pending, &mut refs, &eos_sets)
             })?;

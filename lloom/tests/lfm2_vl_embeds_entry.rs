@@ -32,9 +32,10 @@
 //! thing, not what a kernel computes, and the CPU backend is bit-stable
 //! (`CONTRIBUTING.md` §3.1).
 
-use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
+use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::profile::CrownExact;
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn tiny_config() -> Config {
     Config {
@@ -71,7 +72,7 @@ fn tiny_config() -> Config {
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<CrownExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -117,14 +118,19 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<CrownExact>::new(cfg, vb)
 }
 
-fn logits_of(model: &Model, cfg: &Config, ids: &[u32], via_embeds: bool) -> Result<Vec<f32>> {
+fn logits_of(
+    model: &Model<CrownExact>,
+    cfg: &Config,
+    ids: &[u32],
+    via_embeds: bool,
+) -> Result<Vec<f32>> {
     let dev = Device::Cpu;
     // A fresh cache per arm: the conv phase and the KV length are state, and
     // reusing one would make the second arm a continuation rather than a repeat.
-    let mut cache = Cache::new(true, DType::F32, cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, cfg, &dev)?;
     let input = Tensor::new(ids, &dev)?.unsqueeze(0)?;
     let logits = if via_embeds {
         let embeds = model.embed(&input)?;
@@ -207,7 +213,7 @@ fn forward_embeds_refuses_token_ids() -> Result<()> {
     let cfg = tiny_config();
     let model = build(&cfg, &Device::Cpu)?;
     let dev = Device::Cpu;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     let ids = Tensor::new(&[3u32, 9], &dev)?.unsqueeze(0)?;
     assert!(
         model.forward_embeds(&ids, 0, &mut cache).is_err(),

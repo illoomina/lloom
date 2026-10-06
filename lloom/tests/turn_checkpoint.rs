@@ -13,10 +13,13 @@
 //! speculative one.
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::speculator::{SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, ReuseAction, Session, VarBuilder};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use rand::SeedableRng;
 use rand_distr::Distribution;
@@ -65,7 +68,7 @@ fn target_config(conv_state: ConvState, kv_append: KvAppend, taps: Vec<usize>) -
 
 /// Fixed-ramp weights: deterministic, so two sessions over one model agree
 /// exactly and a divergence is the paths'.
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
     let mut tensors = HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -111,7 +114,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 fn drafter_cfg() -> DSparkConfig {
@@ -203,9 +206,9 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
         .fold(0f32, f32::max))
 }
 
-fn greedy_decode(
-    model: &Model,
-    session: &mut Session<'_, Model>,
+fn greedy_decode<P: Lfm2Shape>(
+    model: &Model<P>,
+    session: &mut Session<'_, Model<P>>,
     prompt: &[u32],
     n: usize,
 ) -> Result<Vec<u32>> {
@@ -250,77 +253,94 @@ fn a_chat_re_render_rewinds_to_the_previous_prompts_checkpoint() -> Result<()> {
         (ConvState::Shuffle, KvAppend::Cat, false),
     ] {
         let cfg = target_config(conv_state, kv_append, Vec::new());
-        let model = build(&cfg, &dev)?;
-        let mut session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
-        let reply = greedy_decode(&model, &mut session, &prompt1, 8)?;
-        assert!(
-            reply.len() >= 4,
-            "{conv_state:?}/{kv_append:?}: the first turn produced a reply"
-        );
-        let before = session.tokens().len();
-        assert!(
-            before > keep + 1,
-            "the divergence is past the reply: {before} > {keep} + 1"
-        );
-        let prepared = session.prepare(&full2)?;
-        if !expect_restore {
-            assert_eq!(
-                prepared.action,
-                ReuseAction::Fresh,
-                "{conv_state:?}/{kv_append:?}"
-            );
-            continue;
-        }
+        let key = cfg.exact_key();
+        lloom::profile::dispatch!(key, lloom::profile::LFM2, P => re_render_case::<P>(&cfg, &dev, &prompt1, &full2, keep, expect_restore, conv_state, kv_append))?;
+    }
+    Ok(())
+}
+
+/// One cell of the re-render test, at the profile its config names.
+#[allow(clippy::too_many_arguments)]
+fn re_render_case<P: Lfm2Shape>(
+    cfg: &Config,
+    dev: &Device,
+    prompt1: &[u32],
+    full2: &[u32],
+    keep: usize,
+    expect_restore: bool,
+    conv_state: ConvState,
+    kv_append: KvAppend,
+) -> Result<()> {
+    let model = build::<P>(&cfg, &dev)?;
+    let mut session = Session::new(&model, State::<P>::new(true, DType::F32, &cfg, &dev)?);
+    let reply = greedy_decode(&model, &mut session, &prompt1, 8)?;
+    assert!(
+        reply.len() >= 4,
+        "{conv_state:?}/{kv_append:?}: the first turn produced a reply"
+    );
+    let before = session.tokens().len();
+    assert!(
+        before > keep + 1,
+        "the divergence is past the reply: {before} > {keep} + 1"
+    );
+    let prepared = session.prepare(&full2)?;
+    if !expect_restore {
         assert_eq!(
             prepared.action,
-            ReuseAction::Rewound(before - keep),
-            "{conv_state:?}/{kv_append:?}: the re-render is a rewind to the checkpoint, not a fresh prefill"
+            ReuseAction::Fresh,
+            "{conv_state:?}/{kv_append:?}"
         );
-        assert_eq!(prepared.reused, keep);
-        assert_eq!(prepared.suffix, full2[keep..]);
-        assert_eq!(session.pos(), keep);
-        assert_eq!(
-            session.tokens(),
-            &full2[..keep],
-            "the token log was cut to the kept prefix"
-        );
+        return Ok(());
+    }
+    assert_eq!(
+        prepared.action,
+        ReuseAction::Rewound(before - keep),
+        "{conv_state:?}/{kv_append:?}: the re-render is a rewind to the checkpoint, not a fresh prefill"
+    );
+    assert_eq!(prepared.reused, keep);
+    assert_eq!(prepared.suffix, full2[keep..]);
+    assert_eq!(session.pos(), keep);
+    assert_eq!(
+        session.tokens(),
+        &full2[..keep],
+        "the token log was cut to the kept prefix"
+    );
 
-        // The reference: a fresh prefill of exactly the kept tokens.
-        let mut fresh = Cache::new(true, DType::F32, &cfg, &dev)?;
-        let input = Tensor::new(&full2[..keep], &dev)?.unsqueeze(0)?;
-        model.forward(&input, 0, &mut fresh)?;
-        assert_eq!(
-            session.sequence().cache().kv_len(),
-            fresh.kv_len(),
-            "KV length"
-        );
-        assert_eq!(
-            session.sequence().cache().conv_phase(),
-            fresh.conv_phase(),
-            "conv phase"
-        );
-        for l in 0..cfg.num_hidden_layers {
-            let (Some(a), Some(b)) = (
-                session.sequence().cache().conv_state_for_test(l),
-                fresh.conv_state_for_test(l),
-            ) else {
-                continue;
-            };
-            let d = max_abs_diff(&a, &b)?;
-            assert!(
-                d == 0.0,
-                "{conv_state:?}: layer {l} conv state after restore differs from a fresh prefill by {d}"
-            );
-        }
-        // And the continuation is the fresh session's, token for token.
-        let mut fresh_session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
-        let want = greedy_decode(&model, &mut fresh_session, &full2, 12)?;
-        let got = greedy_decode(&model, &mut session, &prepared.suffix, 12)?;
-        assert_eq!(
-            got, want,
-            "{conv_state:?}: the reused turn's stream is the fresh turn's"
+    // The reference: a fresh prefill of exactly the kept tokens.
+    let mut fresh = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+    let input = Tensor::new(&full2[..keep], &dev)?.unsqueeze(0)?;
+    model.forward(&input, 0, &mut fresh)?;
+    assert_eq!(
+        session.sequence().cache().kv_len(),
+        fresh.kv_len(),
+        "KV length"
+    );
+    assert_eq!(
+        session.sequence().cache().conv_phase(),
+        fresh.conv_phase(),
+        "conv phase"
+    );
+    for l in 0..cfg.num_hidden_layers {
+        let (Some(a), Some(b)) = (
+            session.sequence().cache().conv_state_for_test(l),
+            fresh.conv_state_for_test(l),
+        ) else {
+            return Ok(());
+        };
+        let d = max_abs_diff(&a, &b)?;
+        assert!(
+            d == 0.0,
+            "{conv_state:?}: layer {l} conv state after restore differs from a fresh prefill by {d}"
         );
     }
+    // And the continuation is the fresh session's, token for token.
+    let mut fresh_session = Session::new(&model, State::<P>::new(true, DType::F32, &cfg, &dev)?);
+    let want = greedy_decode(&model, &mut fresh_session, &full2, 12)?;
+    let got = greedy_decode(&model, &mut session, &prepared.suffix, 12)?;
+    assert_eq!(
+        got, want,
+        "{conv_state:?}: the reused turn's stream is the fresh turn's"
+    );
     Ok(())
 }
 
@@ -331,9 +351,12 @@ fn a_chat_re_render_rewinds_to_the_previous_prompts_checkpoint() -> Result<()> {
 fn a_divergence_past_the_checkpoints_reach_is_a_fresh_prefill() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = target_config(ConvState::Shuffle, KvAppend::InPlace, Vec::new());
-    let model = build(&cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
     let prompt1: Vec<u32> = (0..40u32).map(|i| (i * 5 + 3) % 46).collect();
-    let mut session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+    let mut session = Session::new(
+        &model,
+        State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
     greedy_decode(&model, &mut session, &prompt1, 4)?;
     let slack = lloom::models::lfm2::TURN_CHECKPOINT_SLACK;
     // Within reach: `slack` before the end.
@@ -372,18 +395,19 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
         KvAppend::InPlace,
         dcfg.tap_layers(),
     );
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let (prompt1, full2) = two_turns();
     let keep = prompt1.len() - 1;
     let eos = vec![7u32];
     let n = 12usize;
-    let spec_decode = |session: &mut Session<'_, Model>,
+    let spec_decode = |session: &mut Session<'_, Model<RewindableExact>>,
                        spec: &mut DSparkSpeculator,
                        prompt: &[u32]|
      -> Result<(Vec<u32>, Option<(usize, usize)>)> {
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             spec,
             &mut rb,
             &mut sampler,
@@ -402,7 +426,10 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
         1,
         CtxKv::Contiguous,
     )?;
-    let mut session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+    let mut session = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
     let out1 = spec_decode(&mut session, &mut spec, &prompt1)?;
     assert_eq!(
         out1.1,
@@ -434,7 +461,10 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
     );
 
     // The reference: a fresh session's greedy stream for `full2`.
-    let mut fresh = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+    let mut fresh = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
     let want = greedy_decode(&model, &mut fresh, &full2, n)?;
     assert_eq!(
         out2.0, want,
@@ -452,7 +482,10 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
         1,
         CtxKv::Contiguous,
     )?;
-    let mut session2 = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+    let mut session2 = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
     spec_decode(&mut session2, &mut spec, &prompt1)?;
     let prepared = session2.prepare(&full2)?;
     assert!(matches!(prepared.action, ReuseAction::Rewound(_)));
@@ -488,7 +521,7 @@ fn a_context_keyed_from_other_tokens_is_not_kept() -> Result<()> {
         KvAppend::InPlace,
         dcfg.tap_layers(),
     );
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let mut spec = DSparkSpeculator::new_with_ctx(
         tiny_drafter(&dev, 11)?,
         model.draft_embedding().clone(),
@@ -497,7 +530,7 @@ fn a_context_keyed_from_other_tokens_is_not_kept() -> Result<()> {
         CtxKv::Contiguous,
     )?;
     let prompt: Vec<u32> = vec![3, 11, 20, 5, 9, 14, 2, 8];
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let logits = model.forward(
         &Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?,
         0,
@@ -551,6 +584,7 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
     }
     impl Speculator for Allocating {
         type Probe = LayerTaps<5>;
+        type Family = lloom::nn::speculator::DSpark;
         fn n_seq(&self) -> usize {
             self.inner.n_seq()
         }
@@ -620,13 +654,13 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
     // in-kernel). The eager arm builds a `[k + 1, kv_len]` mask and a
     // `repeat_kv` copy per round, both of a size that grows with the cache.
     cfg.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let (prompt1, full2) = two_turns();
     let eos = vec![7u32];
     let n = 48usize;
     const WARMUP: usize = 4;
     fn per_round<S: Speculator<Probe = LayerTaps<5>>>(
-        session: &mut Session<'_, Model>,
+        session: &mut Session<'_, Model<RewindableExact>>,
         spec: &mut S,
         prompt: &[u32],
         eos: &[u32],
@@ -645,6 +679,7 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
             ..DecodeOptions::new(n)
         };
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             spec,
             &mut rb,
             &mut sampler,
@@ -670,7 +705,7 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
             .collect())
     }
     fn two_turn_rounds<S: Speculator<Probe = LayerTaps<5>>>(
-        model: &Model,
+        model: &Model<RewindableExact>,
         cfg: &Config,
         spec: &mut S,
         prompt1: &[u32],
@@ -679,7 +714,10 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
         n: usize,
         dev: &Device,
     ) -> Result<Vec<(usize, u64, u64)>> {
-        let mut session = Session::new(model, Cache::new(true, DType::F32, cfg, dev)?);
+        let mut session = Session::new(
+            model,
+            State::<RewindableExact>::new(true, DType::F32, cfg, dev)?,
+        );
         let mut rounds = per_round(&mut session, spec, prompt1, eos, n, dev)?;
         let prepared = session.prepare(full2)?;
         assert!(
@@ -786,9 +824,12 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
 fn a_rewound_sequence_does_not_restore_from_a_stale_checkpoint() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = target_config(ConvState::Shuffle, KvAppend::InPlace, Vec::new());
-    let model = build(&cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
     let prompt1: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % 46).collect();
-    let mut session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+    let mut session = Session::new(
+        &model,
+        State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
     greedy_decode(&model, &mut session, &prompt1, 6)?;
     // Diverge at 22: positions 22.. are rewritten by the second turn.
     let mut full2 = prompt1[..22].to_vec();
@@ -811,7 +852,7 @@ fn a_rewound_sequence_does_not_restore_from_a_stale_checkpoint() -> Result<()> {
         p3.action
     );
     assert_eq!(p3.reused, 23);
-    let mut fresh = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut fresh = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     model.forward(
         &Tensor::new(&full3[..23], &dev)?.unsqueeze(0)?,
         0,
@@ -848,7 +889,7 @@ fn an_extended_request_keeps_the_drafters_context_through_the_reply() -> Result<
         KvAppend::InPlace,
         dcfg.tap_layers(),
     );
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let (prompt1, _) = two_turns();
     let eos = vec![7u32];
     let mut spec = DSparkSpeculator::new_with_ctx(
@@ -858,14 +899,18 @@ fn an_extended_request_keeps_the_drafters_context_through_the_reply() -> Result<
         1,
         CtxKv::Contiguous,
     )?;
-    let mut session = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
-    let run = |session: &mut Session<'_, Model>,
+    let mut session = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+    );
+    let run = |session: &mut Session<'_, Model<RewindableExact>>,
                spec: &mut DSparkSpeculator,
                prompt: &[u32]|
      -> Result<()> {
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             spec,
             &mut rb,
             &mut sampler,

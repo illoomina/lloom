@@ -34,12 +34,13 @@ use lloom::models::qwen4exp::loader::{
 };
 use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::{
-    Cache, ExpertResidency, MtpDrafter, MtpLanes, Qwen4Exp, Resident, Streamed,
+    ExpertResidency, MtpDrafter, MtpLanes, Qwen4Exp, Resident, Shape as QwenShape, State, Streamed,
 };
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::Sequence;
 use lloom::nn::{DecodeOptions, Session};
+use lloom::profile::{Own, Profile, ProfileKey};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -115,21 +116,21 @@ pub fn routed_act(
 }
 
 /// The model, shared with the batch thread.
-pub struct QwenCore<R: ExpertResidency + HasStreamStats> {
-    pub model: Qwen4Exp<R>,
+pub struct QwenCore<P: Profile, R: ExpertResidency + HasStreamStats> {
+    pub model: Qwen4Exp<P, R>,
 }
 
 /// The one sequence every request drives, and the rings kept across
 /// requests.
-struct Single {
-    seq: Option<Sequence<Cache>>,
+struct Single<P: Profile> {
+    seq: Option<Sequence<State<P>>>,
     rings: Option<RingPool>,
     /// The loop's options, handed to every request's session.
     decode: crate::DecodeConfig,
 }
 
-pub struct Engine<R: ExpertResidency + HasStreamStats> {
-    core: Arc<QwenCore<R>>,
+pub struct Engine<P: QwenShape, R: ExpertResidency + HasStreamStats> {
+    core: Arc<QwenCore<P, R>>,
     device: Device,
     /// Rows the scheduler serves at once; 1 = the single sequence.
     batch: usize,
@@ -155,21 +156,21 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     tier: Value,
     /// The load's degradations (`Served::load_warnings`).
     load_warnings: Vec<LoadWarning>,
-    single: Mutex<Single>,
+    single: Mutex<Single<P>>,
     /// The MTP drafter's lanes between requests: the head's own KV follows
     /// the single sequence's prefix reuse (`Speculator::begin_at`). Taken
     /// and put back under `single`'s lock.
-    mtp_lanes: Mutex<Option<MtpLanes>>,
+    mtp_lanes: Mutex<Option<MtpLanes<Own<P>>>>,
     /// `--batch N`: the scheduler and its thread.
-    sched: Option<BatchHandle<Qwen4Exp<R>, ()>>,
+    sched: Option<BatchHandle<Qwen4Exp<P, R>, ()>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Why a ring arm on this engine cannot take the PLE's host fill
 /// (`CausalLM::host_feed`), or `None` when it can. Without the fill a ring
 /// arm's forward reads its fed id back.
-fn host_fill_absent<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+fn host_fill_absent<P: Profile, R: ExpertResidency>(
+    model: &Qwen4Exp<P, R>,
     device: &Device,
 ) -> Option<&'static str> {
     if !device.is_metal() {
@@ -265,9 +266,41 @@ fn discover_shards(first: &Path) -> Vec<PathBuf> {
     }
 }
 
-impl Engine<Resident> {
-    /// Load the family `opts` names, on the tier `opts.experts` names.
-    pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
+/// The boundary (`profiles-and-memory-design.md` §7.4): the engine at the
+/// profile the mode names — `Ring` under `--mtp`, `Paged` at `--batch N`,
+/// the regime from the contract — one `match` over the eight
+/// (`lloom::profile::dispatch!`), bounded by what the family ships.
+pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
+    let key = ProfileKey::at_contract(
+        if opts.mtp.is_some() {
+            Ring::NAME
+        } else {
+            NoRewind::NAME
+        },
+        if opts.batch > 1 {
+            Paged::NAME
+        } else {
+            One::NAME
+        },
+    );
+    lloom::profile::dispatch!(key, lloom::profile::QWEN4EXP, P => load_as::<P>(opts))
+}
+
+/// The evidence the speculative drivers take: the `Ring` shapes give it,
+/// the `No` shapes refuse by name (`profiles-and-memory-design.md` §7.3).
+fn rewindable<P: Profile>() -> Result<lloom::profile::RewindProof<P>> {
+    lloom::profile::RewindProof::<P>::ask().with_context(|| {
+        format!(
+            "the MTP drafter on the {} shape: `--mtp` is the `Ring` shape",
+            P::KEY
+        )
+    })
+}
+
+/// Load the family `opts` names, on the tier `opts.experts` names, at `P`.
+fn load_as<P: QwenShape>(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    {
         let device = if opts.cpu {
             Device::Cpu
         } else {
@@ -309,7 +342,7 @@ impl Engine<Resident> {
         let t = Instant::now();
         match opts.experts.as_str() {
             "resident" => {
-                let mut model: Qwen4Exp<Resident> =
+                let mut model: Qwen4Exp<P, Resident> =
                     Qwen4Exp::from_gguf_shards(&shards, &device, &mload)
                         .context("loading Qwen4-exp (resident experts)")?;
                 model.set_prefill_mode(prefill_mode);
@@ -317,10 +350,11 @@ impl Engine<Resident> {
                 #[cfg(feature = "metal")]
                 if let Device::Metal(m) = &device {
                     let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+                    m.ledger()
+                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
                 }
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
-                Engine::<Resident>::finish(model, device, opts, tier, installed)
+                Engine::<P, Resident>::finish(model, device, opts, tier, installed)
             }
             "stream" => {
                 let slots = match opts.slots.as_str() {
@@ -343,7 +377,7 @@ impl Engine<Resident> {
                     prefetch: opts.prefetch,
                     io_hints: opts.io_hints,
                 };
-                let mut model: Qwen4Exp<Streamed> =
+                let mut model: Qwen4Exp<P, Streamed> =
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(prefill_mode);
@@ -351,7 +385,8 @@ impl Engine<Resident> {
                 #[cfg(feature = "metal")]
                 if let Device::Metal(m) = &device {
                     let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger().set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+                    m.ledger()
+                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
                 }
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
@@ -386,16 +421,16 @@ impl Engine<Resident> {
                     "load_ms": ms(t.elapsed()),
                     "warm": warmed,
                 });
-                Engine::<Streamed>::finish(model, device, opts, tier, installed)
+                Engine::<P, Streamed>::finish(model, device, opts, tier, installed)
             }
             other => anyhow::bail!("--experts {other}: resident | stream"),
         }
     }
 }
 
-impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
+impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<P, R> {
     fn finish(
-        model: Qwen4Exp<R>,
+        model: Qwen4Exp<P, R>,
         device: Device,
         opts: LoadOptions,
         mut tier: Value,
@@ -454,13 +489,10 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         if mtp && model.mtp_head().is_none() {
             anyhow::bail!("--mtp was given but the loader found no MTP head in the shards");
         }
-        let mut cache = if mtp {
-            // The verify window's states in phase rings: an accept by phase.
-            let pools = model.spec_pools(1, opts.mtp_k.max(1), &device);
-            Cache::in_pools(model.config(), &pools)?
-        } else {
-            model.new_cache(model.config(), &device)?
-        };
+        // The sequence's state at the shape `P` names (`Shape::single`): its
+        // own on `No × One`; under `--mtp` the verify window's states in
+        // phase rings, an accept by phase.
+        let mut cache = P::single(&model, &device, opts.mtp_k.max(1))?;
         cache.want_nextn = mtp;
         tier["mtp"] = json!(mtp);
         tier["ple"] = json!(opts.ple);
@@ -514,11 +546,12 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             // recurrent channels have no page to share).
             // The rows' recurrent state in one slot-indexed pool: the
             // DeltaNet step runs as one launch per kernel over the rows.
-            let cfg_model = engine.core.model.config().clone();
-            let pools = engine.core.model.state_pools(opts.batch, &engine.device);
-            let mut caches: Vec<Cache> = (0..opts.batch)
-                .map(|_| Cache::in_pools(&cfg_model, &pools))
-                .collect::<lloom_tensor::Result<_>>()?;
+            let (_pools, mut caches) = P::rows(
+                &engine.core.model,
+                &engine.device,
+                opts.batch,
+                opts.mtp_k.max(1),
+            )?;
             let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
             let cfg = BatchConfig {
                 device: engine.device.clone(),
@@ -537,7 +570,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 on_counters: None,
             };
             let (handle, thread) =
-                spawn_batch(Arc::clone(&engine.core), |c: &QwenCore<R>| &c.model, cfg)
+                spawn_batch(Arc::clone(&engine.core), |c: &QwenCore<P, R>| &c.model, cfg)
                     .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
             engine.sched = Some(handle);
             *lock(&engine.sched_thread) = Some(thread);
@@ -568,7 +601,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     /// back whatever `f` returned.
     fn with_single<T>(
         &self,
-        f: impl FnOnce(&mut DecodeSession<'_, Qwen4Exp<R>>) -> Result<T>,
+        f: impl FnOnce(&mut DecodeSession<'_, Qwen4Exp<P, R>>) -> Result<T>,
     ) -> Result<T> {
         let mut single = lock(&self.single);
         let seq = single
@@ -610,7 +643,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     /// The MTP drafter for one run: the head, the shared embedding and
     /// `lm_head`, and `lanes` (a previous run's, else a fresh one-layer
     /// cache). Cheap to build per request.
-    fn drafter(&self, lanes: Option<MtpLanes>) -> Result<MtpDrafter<'_, R>> {
+    fn drafter(&self, lanes: Option<MtpLanes<Own<P>>>) -> Result<MtpDrafter<'_, Own<P>, R>> {
         let head = self
             .core
             .model
@@ -646,13 +679,13 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
 
 /// `n` sequences checked out of the pool for a closed job, reset, and the
 /// slots to return them to.
-struct TakenSessions<'m, R: ExpertResidency + HasStreamStats> {
-    sessions: Vec<Session<'m, Qwen4Exp<R>>>,
+struct TakenSessions<'m, P: QwenShape, R: ExpertResidency + HasStreamStats> {
+    sessions: Vec<Session<'m, Qwen4Exp<P, R>>>,
     slots: Vec<usize>,
 }
 
-impl<'m, R: ExpertResidency + HasStreamStats> TakenSessions<'m, R> {
-    fn give_back(self, idle: &mut Idle<'_, 'm, Qwen4Exp<R>, ()>) {
+impl<'m, P: QwenShape, R: ExpertResidency + HasStreamStats> TakenSessions<'m, P, R> {
+    fn give_back(self, idle: &mut Idle<'_, 'm, Qwen4Exp<P, R>, ()>) {
         for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
             s.reset();
             idle.pool.release(slot, s.into_sequence());
@@ -662,10 +695,13 @@ impl<'m, R: ExpertResidency + HasStreamStats> TakenSessions<'m, R> {
 
 /// Run `f` over `n` sequences checked out of the pool and reset, and put
 /// them back — reset again — whatever `f` returned.
-fn with_sessions<'m, R: ExpertResidency + HasStreamStats, T>(
-    idle: &mut Idle<'_, 'm, Qwen4Exp<R>, ()>,
+fn with_sessions<'m, P: QwenShape, R: ExpertResidency + HasStreamStats, T>(
+    idle: &mut Idle<'_, 'm, Qwen4Exp<P, R>, ()>,
     n: usize,
-    f: impl FnOnce(&mut Idle<'_, 'm, Qwen4Exp<R>, ()>, &mut Vec<Session<'m, Qwen4Exp<R>>>) -> Result<T>,
+    f: impl FnOnce(
+        &mut Idle<'_, 'm, Qwen4Exp<P, R>, ()>,
+        &mut Vec<Session<'m, Qwen4Exp<P, R>>>,
+    ) -> Result<T>,
 ) -> Result<T> {
     let mut sessions = Vec::with_capacity(n);
     let mut slots = Vec::with_capacity(n);
@@ -692,11 +728,11 @@ fn with_sessions<'m, R: ExpertResidency + HasStreamStats, T>(
     out
 }
 
-impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
+impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<P, R> {
     /// Run a closed job on the scheduler's thread, the rows idle.
     fn closed<T: Send + 'static>(
         &self,
-        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Qwen4Exp<R>, ()>) -> T + Send + 'static,
+        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Qwen4Exp<P, R>, ()>) -> T + Send + 'static,
     ) -> Result<T> {
         let sched = self
             .sched
@@ -711,7 +747,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     /// the channel and streamed as text, its outcome the row's.
     fn complete_batched(
         &self,
-        sched: &BatchHandle<Qwen4Exp<R>, ()>,
+        sched: &BatchHandle<Qwen4Exp<P, R>, ()>,
         prompt_ids: &[u32],
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str) -> bool + Send,
@@ -887,7 +923,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     }
 }
 
-impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Engine<R> {
+impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served
+    for Engine<P, R>
+{
     fn device(&self) -> &Device {
         &self.device
     }
@@ -1019,10 +1057,14 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             if self.mtp {
                 let lanes = lock(&self.mtp_lanes).take();
                 let mut drafter = self.drafter(lanes)?;
-                let out =
-                    s.decode_speculative_until(&mut drafter, prompt_ids, detok, params, |f| {
-                        on_fragment(f)
-                    });
+                let out = s.decode_speculative_until(
+                    rewindable::<P>()?,
+                    &mut drafter,
+                    prompt_ids,
+                    detok,
+                    params,
+                    |f| on_fragment(f),
+                );
                 *lock(&self.mtp_lanes) = Some(drafter.into_lanes());
                 out.map_err(anyhow::Error::from)
             } else {
@@ -1096,8 +1138,14 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
                 let mut drafter = self.drafter(None)?;
                 super::common::profile_reset();
                 let t = Instant::now();
-                let run =
-                    s.decode_speculative_until(&mut drafter, &prompt, detok, &params, |_| true)?;
+                let run = s.decode_speculative_until(
+                    rewindable::<P>()?,
+                    &mut drafter,
+                    &prompt,
+                    detok,
+                    &params,
+                    |_| true,
+                )?;
                 device.synchronize()?;
                 let wall = ms(t.elapsed());
                 let prof = super::common::profile_take();
@@ -1340,7 +1388,10 @@ mod tests {
             let (arm, note) = resolve_readback(ring, None);
             assert_eq!(arm, ring);
             let note = note.unwrap();
-            assert!(note.contains("host fill") && note.contains("misses"), "{note}");
+            assert!(
+                note.contains("host fill") && note.contains("misses"),
+                "{note}"
+            );
         }
         let drain = ReadbackArm::Ring(RingArm {
             eos: EosRead::HostOnDrain,

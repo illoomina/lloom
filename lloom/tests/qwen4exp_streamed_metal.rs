@@ -10,6 +10,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom_tensor::kernels::metal::io_queue::IoQueue;
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
@@ -39,7 +40,7 @@ fn streamed(
     slots: usize,
     arm: LoaderArm,
     dev: &Device,
-) -> Result<Qwen4Exp<Streamed>> {
+) -> Result<Qwen4Exp<CrownExact, Streamed>> {
     streamed_with(cfg, path, slots, arm, dev, false)
 }
 
@@ -51,10 +52,10 @@ fn streamed_with(
     arm: LoaderArm,
     dev: &Device,
     io_hints: bool,
-) -> Result<Qwen4Exp<Streamed>> {
+) -> Result<Qwen4Exp<CrownExact, Streamed>> {
     let mut f = File::open(path)?;
     let content = Content::read(&mut f)?;
-    testing::model_with(cfg, dev, |l| {
+    testing::model_with::<CrownExact, _>(cfg, dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
         let mut t = Streamed::new(
             src("ffn_gate_exps.weight")?,
@@ -70,7 +71,7 @@ fn streamed_with(
 }
 
 fn run<R: lloom::nn::ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
 ) -> Result<Vec<Vec<f32>>> {
@@ -113,7 +114,7 @@ fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
     let resident = {
         let mut f = File::open(&path)?;
         let content = Content::read(&mut f)?;
-        testing::model_with(&cfg, &dev, |l| {
+        testing::model_with::<CrownExact, _>(&cfg, &dev, |l| {
             let mut f = File::open(&path)?;
             let mut t = |n: &str| {
                 content

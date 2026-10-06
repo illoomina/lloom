@@ -422,7 +422,9 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
                 let (os, ol) = t.storage_and_layout();
                 let os = match &*os {
                     lloom_tensor::Storage::Metal(m) => m,
-                    _ => lloom_tensor::bail!("softmax: the output slot must be on the metal device"),
+                    _ => {
+                        lloom_tensor::bail!("softmax: the output slot must be on the metal device")
+                    }
                 };
                 if ol.shape().elem_count() != elem_count
                     || !ol.is_contiguous()

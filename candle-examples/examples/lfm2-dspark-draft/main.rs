@@ -58,7 +58,7 @@ use anyhow::{bail, Context, Result};
 use candle::{DType, Device, IndexOp, Tensor, D};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
 use clap::Parser;
-use lloom::models::lfm2::{Cache, Model};
+use lloom::models::lfm2::{Model, Shape as Lfm2Shape, State};
 use lloom::models::lfm2_dspark::{drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE};
 use lloom::nn::VarBuilder;
 use std::path::{Path, PathBuf};
@@ -209,7 +209,12 @@ fn read_drafter_config(dir: &Path) -> Result<DSparkConfig> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     sha256::self_test().map_err(|e| anyhow::anyhow!("sha256 self-test failed: {e}"))?;
     println!("sha256 self-test  : OK");
 
@@ -344,8 +349,8 @@ fn main() -> Result<()> {
 
     let files = weight_files(&target_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
-    let model = Model::new(&cfg, vb)?;
-    let mut cache = Cache::new(true, DType::F16, &cfg, &device)?;
+    let model = Model::<P>::new(&cfg, vb)?;
+    let mut cache = State::<P>::new(true, DType::F16, &cfg, &device)?;
     println!("\ntarget loaded     : {} layers", cfg.num_hidden_layers);
 
     // ---- the drafter ------------------------------------------------------
@@ -558,4 +563,14 @@ fn main() -> Result<()> {
          anchor (§3.1b: a reference from the same run is not a comparison)."
     );
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }

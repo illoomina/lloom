@@ -15,6 +15,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -38,9 +39,9 @@ fn write_table(cfg: &Config, ple_rows: usize, path: &Path) -> Result<()> {
 }
 
 /// A resident tiny model with the PLE attached at layer 1.
-fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<Resident>> {
+fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<CrownExact, Resident>> {
     let dev = Device::Cpu;
-    let mut model = testing::resident_model(cfg, &dev);
+    let mut model = testing::resident_model::<CrownExact>(cfg, &dev);
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
         vec![13, 17, 19, 23],
@@ -51,7 +52,7 @@ fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<Resident>> {
     let table = MmapPleTable::open(path)?;
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<CrownExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, &dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
         testing::ones(hc_dim, &dev),
@@ -70,7 +71,7 @@ fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<Resident>> {
 /// The harness's loop: the whole prompt, then greedy steps with the sampled
 /// id read back and re-uploaded.
 fn harness_loop(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<CrownExact, Resident>,
     cfg: &Config,
     prompt: &[u32],
     steps: usize,
@@ -223,12 +224,22 @@ fn a_decode_step_is_undone_by_the_standing_window() -> Result<()> {
     let _ = model.forward(&input, 0, &mut cache)?;
     assert_eq!(cache.rewind_horizon(), 0, "a prefill leaves no horizon");
     let pos = prompt.len();
-    let step = |cache: &mut lloom::models::qwen4exp::Cache, tok: u32, pos: usize| -> Result<Vec<f32>> {
+    let step = |cache: &mut lloom::models::qwen4exp::State<CrownExact>,
+                tok: u32,
+                pos: usize|
+     -> Result<Vec<f32>> {
         let t = Tensor::new(&[tok], &dev)?.unsqueeze(0)?;
-        model.forward(&t, pos, cache)?.flatten_all()?.to_vec1::<f32>()
+        model
+            .forward(&t, pos, cache)?
+            .flatten_all()?
+            .to_vec1::<f32>()
     };
     let a = step(&mut cache, 4, pos)?;
-    assert_eq!(cache.rewind_horizon(), 1, "a decode step leaves a horizon of one");
+    assert_eq!(
+        cache.rewind_horizon(),
+        1,
+        "a decode step leaves a horizon of one"
+    );
     assert_eq!(cache.pos, pos + 1);
     assert!(cache.rewind(2).is_err(), "past the horizon is refused");
     cache.rewind(1)?;

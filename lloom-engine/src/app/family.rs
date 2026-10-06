@@ -9,9 +9,9 @@
 //! here is on the token path.
 
 use super::{lfm2, qwen4exp, ModelArgs, Served, Shape};
-use anyhow::{Context, Result};
 #[allow(unused_imports)]
 use anyhow::Context as _;
+use anyhow::{Context, Result};
 use lloom::nn::ops::{KvPrecision, KvQuant};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -297,7 +297,10 @@ fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
         anyhow::bail!("{} does not serve --batch {}", cap.family, s.batch);
     }
     if !cap.prefix_share && s.share_prefix {
-        anyhow::bail!("{} has no prefix sharing between rows (its recurrent channels have no page to share)", cap.family);
+        anyhow::bail!(
+            "{} has no prefix sharing between rows (its recurrent channels have no page to share)",
+            cap.family
+        );
     }
     if !cap.executor_arms && (s.executor.arena || s.executor.packed || s.executor.replay) {
         anyhow::bail!(
@@ -331,7 +334,7 @@ impl Family for Lfm2Family {
         let (model, shape) = (req.model, req.shape);
         let rows = lfm2::RowsArm::parse(&shape.rows, shape.batch > 1)?;
         let spec = &shape.speculative;
-        let engine = lfm2::Engine::load(lfm2::LoadOptions {
+        lfm2::load(lfm2::LoadOptions {
             model_dir: dir,
             cpu: model.cpu,
             kv_capacity: shape.memory.kv_capacity,
@@ -354,8 +357,7 @@ impl Family for Lfm2Family {
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
             flash_k: model.flash_k,
-        })?;
-        Ok(Box::new(engine))
+        })
     }
 }
 
@@ -365,7 +367,8 @@ impl Family for Qwen4ExpFamily {
     }
     fn detect(&self, path: &Path) -> Option<PathBuf> {
         if path.is_file() {
-            return (path.extension().and_then(|e| e.to_str()) == Some("gguf")).then(|| path.to_path_buf());
+            return (path.extension().and_then(|e| e.to_str()) == Some("gguf"))
+                .then(|| path.to_path_buf());
         }
         if !path.is_dir() || path.join("config.json").is_file() {
             return None;
@@ -435,7 +438,7 @@ impl Family for Qwen4ExpFamily {
     fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
         let (model, shape) = (req.model, req.shape);
         let spec = &shape.speculative;
-        qwen4exp::Engine::load(qwen4exp::LoadOptions {
+        qwen4exp::load(qwen4exp::LoadOptions {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
             cpu: model.cpu,
@@ -455,7 +458,9 @@ impl Family for Qwen4ExpFamily {
             ple_cache_rows: model.ple_cache_rows,
             ple: !model.no_ple,
             moe_act: model.moe_act.clone(),
-            mtp: (spec.method == "mtp").then(|| spec.drafter.clone()).flatten(),
+            mtp: (spec.method == "mtp")
+                .then(|| spec.drafter.clone())
+                .flatten(),
             hotlist: model.hotlist.clone(),
             batch: shape.batch,
             mtp_k: spec.k.unwrap_or(1),
@@ -482,7 +487,12 @@ fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<Strin
     }
     readback.eos_gate = false;
     let rides = readback.kind == crate::ReadbackKind::Ring && readback.ring_arm().adaptive;
-    rides.then(|| format!("eos_gate is off on {}: {}", cap.family, cap.eos_gate_missing))
+    rides.then(|| {
+        format!(
+            "eos_gate is off on {}: {}",
+            cap.family, cap.eos_gate_missing
+        )
+    })
 }
 
 /// `speculative.method = auto` resolved for `family`: LFM2's DSpark when
@@ -592,37 +602,83 @@ mod tests {
         let m = model_args(&[]);
         let mut s = shape();
         s.speculative.method = "mtp".into();
-        let err = Lfm2Family.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not lfm2's"), "{err}");
         let mut s = shape();
         s.speculative.method = "dspark".into();
-        let err = Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not qwen4exp's"), "{err}");
         let mut s = shape();
         s.model.axes.insert("attn".into(), "flash".into());
-        let err = Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("LFM2's `Config`'s"), "{err}");
         let mut s = shape();
         s.executor.replay = true;
-        let err = Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("pass_plans"), "{err}");
         let mut s = shape();
         s.speculative.method = "mtp".into();
-        let err = Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("needs the MTP sidecar"), "{err}");
         let mut s = shape();
         s.share_prefix = true;
-        let err = Lfm2Family.resolve(&Requested { model: &m, shape: s }).unwrap_err().to_string();
+        let err = Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--rows pool"), "{err}");
         // The shapes each family serves pass.
         let mut s = shape();
         s.speculative.method = "dspark".into();
         s.executor.replay = false;
-        Lfm2Family.resolve(&Requested { model: &m, shape: s }).unwrap();
+        Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap();
         let mut s = shape();
         s.speculative.method = "mtp".into();
         s.speculative.drafter = Some("/x.gguf".into());
-        Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap();
+        Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap();
     }
 
     /// `auto` resolves to the family's own drafter when one is named, to
@@ -645,7 +701,10 @@ mod tests {
         assert_eq!(s.speculative.method, "mtp", "{note}");
         let mut s = auto(2, Some(&drafter));
         resolve_auto_speculation("qwen4exp", &mut s);
-        assert_eq!(s.speculative.method, "none", "the MTP head speculates at one row");
+        assert_eq!(
+            s.speculative.method, "none",
+            "the MTP head speculates at one row"
+        );
         let mut s = auto(1, Some(&drafter));
         resolve_auto_speculation("lfm2", &mut s);
         assert_eq!(s.speculative.method, "dspark");
@@ -658,8 +717,18 @@ mod tests {
         assert!(resolve_auto_speculation("qwen4exp", &mut s).is_none());
         assert_eq!(s.speculative.method, "mtp");
         // Unresolved, `auto` is a method every family's `resolve` takes.
-        Lfm2Family.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
-        Qwen4ExpFamily.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
+        Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: auto(1, None),
+            })
+            .unwrap();
+        Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: auto(1, None),
+            })
+            .unwrap();
         std::fs::remove_file(&drafter).ok();
     }
 
@@ -787,10 +856,16 @@ mod tests {
         let (f, p) = detect(&dir.join("lfm2")).unwrap();
         assert_eq!((f.name(), p), ("lfm2", dir.join("lfm2")));
         let (f, p) = detect(&dir.join("qwen")).unwrap();
-        assert_eq!((f.name(), p), ("qwen4exp", dir.join("qwen/m-00001-of-00002.gguf")));
+        assert_eq!(
+            (f.name(), p),
+            ("qwen4exp", dir.join("qwen/m-00001-of-00002.gguf"))
+        );
         let (f, _) = detect(&dir.join("qwen/m-00002-of-00002.gguf")).unwrap();
         assert_eq!(f.name(), "qwen4exp");
-        let err = detect(&dir.join("nope")).err().map(|e| e.to_string()).unwrap();
+        let err = detect(&dir.join("nope"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap();
         assert!(err.contains("no such model"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(LFM2_CAPABILITIES.speculation, &["dspark"]);
@@ -828,7 +903,11 @@ mod tests {
         );
         for spelling in ["auto", "blocking", "ring-fixed"] {
             let mut s = with(spelling);
-            assert_eq!(clamp_ungated_eos_gate(&QWEN4EXP_CAPABILITIES, &mut s), None, "{spelling}");
+            assert_eq!(
+                clamp_ungated_eos_gate(&QWEN4EXP_CAPABILITIES, &mut s),
+                None,
+                "{spelling}"
+            );
             assert!(!s.decode.readback.eos_gate, "{spelling}: clamped, silently");
         }
         let mut s = with("ring-nonblocking");

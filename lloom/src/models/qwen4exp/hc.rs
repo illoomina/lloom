@@ -251,7 +251,11 @@ impl HyperConnection {
         {
             return Ok(None);
         }
-        let checked = || lloom_tensor::Error::Msg("hc_norm_gemv: an applicability check passed and the op declined".into());
+        let checked = || {
+            lloom_tensor::Error::Msg(
+                "hc_norm_gemv: an applicability check passed and the op declined".into(),
+            )
+        };
         // `down` with the norm, `silu(lo / n)` as the composed path's scale,
         // and the stream scales after its `hc_lowrank` outputs.
         let inv_n = 1.0 / self.n as f64;
@@ -282,7 +286,15 @@ impl HyperConnection {
         }
         let inject = match &self.inject {
             Some(w) => w
-                .gemv_mixed_gnorm(h, &self.norm_w, self.eps, self.n, MixedEpilogue::None, 1.0, false)
+                .gemv_mixed_gnorm(
+                    h,
+                    &self.norm_w,
+                    self.eps,
+                    self.n,
+                    MixedEpilogue::None,
+                    1.0,
+                    false,
+                )
                 .ok_or_else(checked)??,
             None => Tensor::zeros((b, seq, self.n), h.dtype(), h.device())?,
         };
@@ -686,7 +698,10 @@ mod tests {
                 let h_gpu = h.to_device(&gpu).unwrap();
                 let fused = hc_gpu.mix_parts_norm_gemv(&h_gpu, true).unwrap();
                 if seq != 1 {
-                    assert!(fused.is_none(), "seq {seq}: the scales' form is one row; it must decline");
+                    assert!(
+                        fused.is_none(),
+                        "seq {seq}: the scales' form is one row; it must decline"
+                    );
                     continue;
                 }
                 let (m_f, i_f) = fused.expect("one row: the fused bracket must take it");
@@ -695,18 +710,38 @@ mod tests {
                 let (m_c, i_c) = hc_gpu.mix(&h_gpu).unwrap();
                 let (m_cpu, i_cpu) = hc_cpu.mix(&h).unwrap();
                 let v = |t: &Tensor| -> Vec<f32> {
-                    t.to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap()
+                    t.to_device(&cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap()
                 };
                 for (name, f, c, r) in [
                     ("mixed", v(&m_f), v(&m_c), v(&m_cpu)),
                     ("inject", v(&i_f), v(&i_c), v(&i_cpu)),
                 ] {
                     assert_eq!(f.len(), c.len(), "{name}");
-                    assert!(f.iter().all(|x| x.is_finite()), "{name}: a non-finite output");
-                    let differ = f.iter().zip(&c).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    assert!(
+                        f.iter().all(|x| x.is_finite()),
+                        "{name}: a non-finite output"
+                    );
+                    let differ = f
+                        .iter()
+                        .zip(&c)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
                     let scale = r.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
-                    let d_dev = f.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-                    let d_cpu = f.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    let d_dev = f
+                        .iter()
+                        .zip(&c)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    let d_cpu = f
+                        .iter()
+                        .zip(&r)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
                     println!(
                         "norm_gemv bracket inject={with_inject} {name}: {differ} of {} differ from the composed chain bit-wise, max |d| {d_dev:.3e}; vs CPU {d_cpu:.3e} at scale {scale:.3e}",
                         f.len()
@@ -716,7 +751,10 @@ mod tests {
                     // collapse see the composed chain's inputs exactly:
                     // measured 0 differing elements, pinned here.
                     assert_eq!(differ, 0, "{name} inject={with_inject}: {differ} elements differ from the device's composed chain (max |d| {d_dev})");
-                    assert!(d_cpu <= 3e-5 * scale, "{name} inject={with_inject}: {d_cpu} from the CPU");
+                    assert!(
+                        d_cpu <= 3e-5 * scale,
+                        "{name} inject={with_inject}: {d_cpu} from the CPU"
+                    );
                     if name == "inject" && !with_inject {
                         assert!(f.iter().all(|x| *x == 0.0), "no-inject rows must be zero");
                     } else {

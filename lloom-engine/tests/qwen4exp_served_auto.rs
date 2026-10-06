@@ -26,6 +26,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::model::CausalLM;
 use lloom::nn::Sequence;
+use lloom::profile::CrownExact;
 use lloom_engine::{
     DecodeConfig, DecodeParams, DecodeSession, Decoded, ReadbackArm, ReadbackConfig, RingArm,
     RingPool, Stop,
@@ -68,10 +69,10 @@ fn write_table(cfg: &Config, rows: usize, path: &Path) -> Result<()> {
 
 /// The resident tiny model on this thread's Metal device, the PLE at layer 1
 /// over the table at `path`.
-fn model_with_ple(path: &Path) -> Result<Qwen4Exp<Resident>> {
+fn model_with_ple(path: &Path) -> Result<Qwen4Exp<CrownExact, Resident>> {
     let cfg = tiny();
     let dev = metal();
-    let mut model = testing::resident_model(&cfg, &dev);
+    let mut model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
         vec![13, 17, 19, 23],
@@ -81,7 +82,7 @@ fn model_with_ple(path: &Path) -> Result<Qwen4Exp<Resident>> {
     )?;
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<CrownExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, &dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
         testing::ones(hc_dim, &dev),
@@ -168,7 +169,7 @@ fn detok(ids: &[u32]) -> Result<String> {
 /// serves them: the sequence and the rings handed from each request's
 /// session to the next.
 fn serve(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<CrownExact, Resident>,
     arm: Arm,
     eos: u32,
     requests: &[(Vec<u32>, usize)],

@@ -13,6 +13,7 @@ use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::{testing, Config, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::CrownExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKey, PassKind, PassOpener};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -46,7 +47,10 @@ fn prefill_key() -> PassKey {
 }
 
 /// `STEPS` greedy ids for `PROMPT` through the driver (`Session::decode`).
-fn decode(session: &mut Session<'_, Qwen4Exp<Resident>>, dev: &Device) -> Result<Vec<u32>> {
+fn decode(
+    session: &mut Session<'_, Qwen4Exp<CrownExact, Resident>>,
+    dev: &Device,
+) -> Result<Vec<u32>> {
     session.reset();
     let mut spec = IdentityProposer;
     let mut rb = Blocking::new(&[u32::MAX], dev)?;
@@ -60,7 +64,10 @@ fn decode(session: &mut Session<'_, Qwen4Exp<Resident>>, dev: &Device) -> Result
 
 /// `PROMPT`'s last-position logits from a direct `forward`, as the logprobs
 /// path takes them: no driver bracket, so the model opens its own pass.
-fn direct(session: &mut Session<'_, Qwen4Exp<Resident>>, dev: &Device) -> Result<Vec<f32>> {
+fn direct(
+    session: &mut Session<'_, Qwen4Exp<CrownExact, Resident>>,
+    dev: &Device,
+) -> Result<Vec<f32>> {
     session.reset();
     let input = Tensor::new(PROMPT.as_slice(), dev)?.unsqueeze(0)?;
     let logits = session.model().forward(&input, 0, session.cache_mut())?;
@@ -72,7 +79,7 @@ fn direct(session: &mut Session<'_, Qwen4Exp<Resident>>, dev: &Device) -> Result
 fn pool_reference() -> Result<(Vec<u32>, Vec<f32>)> {
     let dev = Device::new_metal(0)?;
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
     let ids = decode(&mut session, &dev)?;
     let logits = direct(&mut session, &dev)?;
@@ -164,7 +171,7 @@ fn a_direct_forward_does_not_plan_the_drivers_prefill() -> Result<()> {
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
     // Recorded, closed, served: the third sight runs on the model's plan.
     for round in 0..3 {
@@ -199,21 +206,22 @@ fn a_direct_forward_does_not_plan_the_drivers_prefill() -> Result<()> {
 /// served prefill passes, and the driver's unplanned one is refused.
 #[test]
 fn admission_reads_the_plan_of_the_pass_that_runs() -> Result<()> {
-    use lloom::models::qwen4exp::{Cache, MemCheck};
+    use lloom::models::qwen4exp::{MemCheck, State};
     let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
     let cfg = tiny();
-    let mut model = testing::resident_model(&cfg, &dev);
-    let mut cache: Cache = model.new_cache(&cfg, &dev)?;
+    let mut model = testing::resident_model::<CrownExact>(&cfg, &dev);
+    let mut cache: State<CrownExact> = model.new_cache(&cfg, &dev)?;
     let input = Tensor::new(PROMPT.as_slice(), &dev)?.unsqueeze(0)?;
-    let forward = |model: &Qwen4Exp<Resident>, cache: &mut Cache| -> Result<()> {
-        cache.reset();
-        model.forward(&input, 0, cache)?;
-        cache.reset();
-        Ok(())
-    };
+    let forward =
+        |model: &Qwen4Exp<CrownExact, Resident>, cache: &mut State<CrownExact>| -> Result<()> {
+            cache.reset();
+            model.forward(&input, 0, cache)?;
+            cache.reset();
+            Ok(())
+        };
     // Recorded, closed, served: the model's own prefill has a plan, the
     // driver's has none.
     for _ in 0..3 {
@@ -256,7 +264,7 @@ fn a_drivers_prefill_plan_is_not_served_to_a_direct_forward() -> Result<()> {
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
     for round in 0..3 {
         assert_eq!(

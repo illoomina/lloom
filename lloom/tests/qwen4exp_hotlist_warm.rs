@@ -13,6 +13,7 @@ use lloom::models::qwen4exp::{
     Config, LoadOptions, Qwen4Exp, SlotBudget, StreamLoader, StreamOptions, Streamed,
 };
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::Fixture;
 use lloom_tensor::{Device, Result, Tensor};
 
@@ -26,7 +27,7 @@ fn stream(slots: usize) -> StreamOptions {
 }
 
 fn decode(
-    model: &Qwen4Exp<Streamed>,
+    model: &Qwen4Exp<CrownExact, Streamed>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],

@@ -11,6 +11,7 @@
 
 use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
 use lloom::optimizer::{walk, Graph};
+use lloom::profile::CrownExact;
 use lloom::testing::ghost;
 use lloom_tensor::{DType, Device};
 
@@ -55,7 +56,8 @@ fn traced() -> Config {
 fn off_metal_the_walk_reads_the_route_the_model_took() {
     let mut cfg = lfm2_2_6b();
     cfg.attn_impl = AttnImpl::Sdpa;
-    let walked = walk(&ghost::lfm2(&cfg, DType::F16, &Device::Cpu).expect("ghost build"));
+    let walked =
+        walk(&ghost::lfm2::<CrownExact>(&cfg, DType::F16, &Device::Cpu).expect("ghost build"));
     assert_eq!(walked.census().get("attention_generic"), Some(&8));
     assert_eq!(walked.census().get("sdpa_vector"), None);
     assert_eq!(walked.dispatches(), 538);
@@ -101,7 +103,8 @@ fn listing_gate(name: &str, g: &Graph) {
 
 #[test]
 fn the_qwen4exp_walk_matches_its_committed_listing() {
-    let model = lloom::models::qwen4exp::testing::ghost_model(&Device::Cpu).expect("ghost build");
+    let model = lloom::models::qwen4exp::testing::ghost_model::<CrownExact>(&Device::Cpu)
+        .expect("ghost build");
     listing_gate("qwen4exp-iq3xxs", &walk(&model));
 }
 
@@ -109,6 +112,6 @@ fn the_qwen4exp_walk_matches_its_committed_listing() {
 #[test]
 fn the_lfm2_walk_matches_its_committed_listing() {
     let dev = Device::new_metal(0).expect("metal");
-    let model = ghost::lfm2(&traced(), DType::F16, &dev).expect("ghost build");
+    let model = ghost::lfm2::<CrownExact>(&traced(), DType::F16, &dev).expect("ghost build");
     listing_gate("lfm2-2.6b-traced", &walk(&model));
 }

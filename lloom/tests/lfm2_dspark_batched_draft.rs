@@ -21,10 +21,13 @@
 //! compared on the arm the serving loop runs.
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    AttnImpl, BatchPool, Config, ConvState, KvAppend, LayerType, Model, State,
+};
 use lloom::models::lfm2_dspark::{CtxCache, CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::speculator::{DraftTokens, SeqId, Session, Speculator};
 use lloom::nn::{DecodeOptions, VarBuilder};
+use lloom::profile::PoolSpecExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 use rand::SeedableRng;
 use rand_distr::Distribution;
@@ -164,7 +167,7 @@ fn tiny_drafter(dtype: DType, dev: &Device, seed: u64) -> Result<DSparkDrafter> 
 }
 
 /// Fixed-ramp target weights (the batched-rows fixture's).
-fn tiny_target(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
+fn tiny_target(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model<PoolSpecExact>> {
     let mut tensors = HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -213,7 +216,7 @@ fn tiny_target(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    Model::<PoolSpecExact>::new(cfg, vb)
 }
 
 fn bits(t: &Tensor) -> Result<Vec<u32>> {
@@ -330,7 +333,7 @@ fn a_batched_draft_proposes_what_each_rows_own_draft_proposes() -> Result<()> {
         // Seed every sequence from its own prompt's taps, the prefill's
         // argmax the anchor.
         for (i, p) in prompts.iter().enumerate() {
-            let mut cache = Cache::new(true, dtype, &tcfg, &dev)?;
+            let mut cache = State::<PoolSpecExact>::new(true, dtype, &tcfg, &dev)?;
             let input = Tensor::new(p.as_slice(), &dev)?.unsqueeze(0)?;
             let logits = model.forward(&input, 0, &mut cache)?;
             let taps = cache.take_taps();
@@ -414,8 +417,16 @@ fn ctx_kv_for(shared: bool) -> CtxKv {
 }
 
 fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<(f32, usize)> {
-    let a = a.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let b = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let a = a
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let b = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let mut max = 0f32;
     let mut n = 0usize;
     for (x, y) in a.iter().zip(&b) {
@@ -481,8 +492,8 @@ fn update_context_rows_keys_what_each_rows_own_update_context_keys_bit_for_bit()
                     b.iter_mut().map(|s| s.as_mut_slice()).collect();
                 drafter.update_context_rows(&taps, &ctx, &mut caches)?;
             }
-            let blocks = randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?
-                .to_dtype(dtype)?;
+            let blocks =
+                randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?.to_dtype(dtype)?;
             for r in 0..3 {
                 let off = ctx[r] + acc[r];
                 assert_eq!(a[r][0].len(), off, "row {r} reference length");
@@ -562,7 +573,10 @@ fn a_queued_draft_is_not_disturbed_by_the_next_append() -> Result<()> {
         drafter.update_context(&round, ctx, &mut b[0])?;
         let (x, y) = (bits(&ha)?, bits(&hb)?);
         let distinct = x.iter().collect::<std::collections::HashSet<_>>().len();
-        assert!(distinct > 8, "shared={shared}: vacuous ({distinct} distinct)");
+        assert!(
+            distinct > 8,
+            "shared={shared}: vacuous ({distinct} distinct)"
+        );
         assert!(
             x == y,
             "shared={shared}: the draft encoded before the append differs from the fenced one"
@@ -571,7 +585,10 @@ fn a_queued_draft_is_not_disturbed_by_the_next_append() -> Result<()> {
         let block2 = randn(&mut rng, vec![1, cfg.block_size, cfg.hidden_size], &dev)?;
         let ha2 = drafter.block_hidden(&block2, ctx + 3, &a[0])?;
         let hb2 = drafter.block_hidden(&block2, ctx + 3, &b[0])?;
-        assert!(bits(&ha2)? == bits(&hb2)?, "shared={shared}: the next draft differs");
+        assert!(
+            bits(&ha2)? == bits(&hb2)?,
+            "shared={shared}: the next draft differs"
+        );
         println!("shared={shared}: a queued draft is undisturbed by the next append (bit-identical to the fenced arm)");
     }
     Ok(())
@@ -612,8 +629,8 @@ fn a_one_position_row_moves_only_by_the_gemv_seam() -> Result<()> {
             let mut caches: Vec<&mut [CtxCache]> = b.iter_mut().map(|s| s.as_mut_slice()).collect();
             drafter.update_context_rows(&taps, &ctx, &mut caches)?;
         }
-        let blocks = randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?
-            .to_dtype(dtype)?;
+        let blocks =
+            randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?.to_dtype(dtype)?;
         for r in 0..3 {
             let off = ctx[r] + acc[r];
             let block = blocks.narrow(0, r, 1)?;
@@ -680,7 +697,7 @@ fn a_batched_observe_keys_what_each_rows_own_observe_keys() -> Result<()> {
                 ctx_kv_for(shared),
             )?;
             for (i, p) in prompts.iter().enumerate() {
-                let mut cache = Cache::new(true, dtype, &tcfg, &dev)?;
+                let mut cache = State::<PoolSpecExact>::new(true, dtype, &tcfg, &dev)?;
                 let input = Tensor::new(p.as_slice(), &dev)?.unsqueeze(0)?;
                 let logits = model.forward(&input, 0, &mut cache)?;
                 let taps = cache.take_taps();
@@ -710,7 +727,11 @@ fn a_batched_observe_keys_what_each_rows_own_observe_keys() -> Result<()> {
                 })
                 .collect::<Result<_>>()?;
             let accepted: Vec<Vec<u32>> = (0..3)
-                .map(|r| (0..acc[r] as u32).map(|k| (k * 5 + 7 * r as u32 + 1) % 46).collect())
+                .map(|r| {
+                    (0..acc[r] as u32)
+                        .map(|k| (k * 5 + 7 * r as u32 + 1) % 46)
+                        .collect()
+                })
                 .collect();
             // Reference: per row.
             for r in 0..3 {
@@ -740,8 +761,16 @@ fn a_batched_observe_keys_what_each_rows_own_observe_keys() -> Result<()> {
             } else {
                 assert_eq!(specs[1].batched_appends(), None);
             }
-            let want: Vec<Vec<u32>> = specs[0].draft(&all)?.iter().map(ids).collect::<Result<_>>()?;
-            let got: Vec<Vec<u32>> = specs[1].draft(&all)?.iter().map(ids).collect::<Result<_>>()?;
+            let want: Vec<Vec<u32>> = specs[0]
+                .draft(&all)?
+                .iter()
+                .map(ids)
+                .collect::<Result<_>>()?;
+            let got: Vec<Vec<u32>> = specs[1]
+                .draft(&all)?
+                .iter()
+                .map(ids)
+                .collect::<Result<_>>()?;
             for r in 0..3 {
                 assert_eq!(
                     got[r], want[r],
@@ -753,7 +782,9 @@ fn a_batched_observe_keys_what_each_rows_own_observe_keys() -> Result<()> {
                 want[0] != want[1] || want[1] != want[2],
                 "every row drafted the same block"
             );
-            println!("shared={shared} round {round} ({acc:?} accepted): drafts identical: {want:?}");
+            println!(
+                "shared={shared} round {round} ({acc:?} accepted): drafts identical: {want:?}"
+            );
         }
     }
     Ok(())
@@ -781,9 +812,14 @@ fn the_speculative_batched_loop_streams_what_each_row_streams_alone() -> Result<
     let run = |rows: &[usize], shared: bool| -> Result<(Vec<Vec<u32>>, u64, u64)> {
         let pool = BatchPool::new(&tcfg, &dev, rows.len(), 128)?;
         pool.set_batched_arms(true);
-        let mut sessions: Vec<Session<'_, Model>> = rows
+        let mut sessions: Vec<Session<'_, Model<PoolSpecExact>>> = rows
             .iter()
-            .map(|_| Ok(Session::new(&model, Cache::for_batch(true, dtype, &tcfg, &dev, &pool)?)))
+            .map(|_| {
+                Ok(Session::new(
+                    &model,
+                    State::<PoolSpecExact>::for_batch(true, dtype, &tcfg, &dev, &pool)?,
+                ))
+            })
             .collect::<Result<_>>()?;
         let mut spec = DSparkSpeculator::new_with_ctx(
             tiny_drafter(dtype, &dev, 153)?,
@@ -795,6 +831,7 @@ fn the_speculative_batched_loop_streams_what_each_row_streams_alone() -> Result<
         let refs: Vec<&[u32]> = rows.iter().map(|&r| prompts[r].as_slice()).collect();
         let outs = Session::decode_spec_batched(
             &mut sessions,
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &refs,
             &opts,
@@ -828,7 +865,10 @@ fn the_speculative_batched_loop_streams_what_each_row_streams_alone() -> Result<
                 "shared={shared}: row {r}'s batched stream differs from its own"
             );
         }
-        assert!(solo[0] != solo[1] || solo[1] != solo[2], "the rows streamed one text");
+        assert!(
+            solo[0] != solo[1] || solo[1] != solo[2],
+            "the rows streamed one text"
+        );
         println!(
             "shared={shared}: 3 rows through the speculative batched loop stream what each streams alone ({drafts} batched drafts, {observes} batched re-keys): {ids:?}"
         );

@@ -280,7 +280,11 @@ impl<M: BatchedCausalLM, E> BatchHandle<M, E> {
     /// Queue a row; its events arrive on the returned receiver.
     pub fn submit(&self, req: BatchRequest) -> Receiver<BatchEvent> {
         let (tx, rx) = mpsc::channel();
-        if self.tx.send(Job::Request(Box::new(req), tx.clone())).is_err() {
+        if self
+            .tx
+            .send(Job::Request(Box::new(req), tx.clone()))
+            .is_err()
+        {
             let _ = tx.send(BatchEvent::Error(
                 "the batch scheduler has stopped".to_string(),
             ));
@@ -567,10 +571,11 @@ where
             .next()
             .map(|(_, s)| s.cache().share_granularity())
             .or_else(|| {
-                self.decoder
-                    .row_ids()
-                    .into_iter()
-                    .find_map(|id| self.decoder.row_source(id).map(|(_, c, _)| c.share_granularity()))
+                self.decoder.row_ids().into_iter().find_map(|id| {
+                    self.decoder
+                        .row_source(id)
+                        .map(|(_, c, _)| c.share_granularity())
+                })
             })
             .unwrap_or(0)
     }
@@ -585,7 +590,11 @@ where
         }
         let cap = prompt.len() - 1;
         let lcp_of = |log: &[u32]| -> usize {
-            let n = log.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+            let n = log
+                .iter()
+                .zip(prompt.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
             (n.min(cap) / page) * page
         };
         let mut best: Option<ShareSource> = None;
@@ -601,7 +610,9 @@ where
             }
         }
         for id in self.decoder.row_ids() {
-            let Some((fed, _, _)) = self.decoder.row_source(id) else { continue };
+            let Some((fed, _, _)) = self.decoder.row_source(id) else {
+                continue;
+            };
             let n = lcp_of(fed);
             if n >= page && n > best_n {
                 best_n = n;
@@ -622,7 +633,11 @@ where
         }
         let cap = prompt.len() - 1;
         let pages_of = |log: &[u32]| -> usize {
-            let n = log.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+            let n = log
+                .iter()
+                .zip(prompt.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
             n.min(cap) / page
         };
         // What the idle slots already give: a live row must beat it to be
@@ -635,11 +650,15 @@ where
             .max()
             .unwrap_or(0);
         for id in self.decoder.row_ids() {
-            let Some((fed, _, complete)) = self.decoder.row_source(id) else { continue };
+            let Some((fed, _, complete)) = self.decoder.row_source(id) else {
+                continue;
+            };
             if complete {
                 continue;
             }
-            let Some(full) = self.decoder.row_prospective_log(id) else { continue };
+            let Some(full) = self.decoder.row_prospective_log(id) else {
+                continue;
+            };
             let could = pages_of(&full);
             // Until the row's prompt is fully in, the ring snapshot of its
             // last shared page may not exist yet (it is taken when the NEXT
@@ -767,7 +786,12 @@ where
         if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
             eprintln!(
                 "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
-                self.counters.steps, report.live, report.pieces, report.piece_tokens, report.retired, report.pending
+                self.counters.steps,
+                report.live,
+                report.pieces,
+                report.piece_tokens,
+                report.retired,
+                report.pending
             );
         }
         for (id, session, out) in self.decoder.take_finished() {
@@ -1314,7 +1338,8 @@ mod tests {
             Box::new(move |idle, sessions, prompts, specs, on_tokens| {
                 seen.fetch_add(1, Ordering::AcqRel);
                 assert_eq!(sessions.len(), prompts.len());
-                let mut sampler = lloom::generation::LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                let mut sampler =
+                    lloom::generation::LogitsProcessor::from_sampling(0, Sampling::ArgMax);
                 let opts = DecodeOptions {
                     lookahead: 1,
                     ..DecodeOptions::new(specs.iter().map(|s| s.max_tokens).max().unwrap())

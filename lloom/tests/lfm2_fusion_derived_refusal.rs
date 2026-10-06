@@ -10,6 +10,7 @@
 
 use lloom::models::lfm2::{Config, FusionPolicy, KvAppend, LayerType, Model};
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, Result};
@@ -36,10 +37,10 @@ fn tiny_config(fusion: FusionPolicy, silu_impl: SiluImpl) -> Config {
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<CrownExact>> {
     TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(DType::F16)
-        .model(dev)
+        .model::<CrownExact>(dev)
 }
 
 /// P2: the exclusion set is consulted for the arms the config selects, not

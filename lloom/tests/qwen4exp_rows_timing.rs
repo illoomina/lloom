@@ -5,10 +5,11 @@
 //! measure`).
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::{
-    testing, Cache, Config, GatedDeltaNet, HyperConnection, KvCache, KvPool, Layer, Mixer,
-    MoeLayer, QsaAttention, Resident,
+    testing, Config, GatedDeltaNet, HyperConnection, KvCache, KvPool, Layer, Mixer, MoeLayer,
+    QsaAttention, Resident, State,
 };
 use lloom::nn::{RecurrentState, RmsNorm};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{DType, Device, Module, Tensor};
 use std::sync::Arc;
@@ -68,7 +69,7 @@ fn blocks_at_rows_1_and_4() {
         )
         .unwrap()
     };
-    let dn = GatedDeltaNet::new(
+    let dn = GatedDeltaNet::<CrownExact>::new(
         q4(cc, d, &dev),
         q4(vd, d, &dev),
         Tensor::randn(0f32, 0.2, (cc, cfg.ssm_conv_kernel), &dev).unwrap(),
@@ -80,7 +81,7 @@ fn blocks_at_rows_1_and_4() {
         q4(d, vd, &dev),
         &cfg,
     );
-    let qsa = QsaAttention::new(
+    let qsa = QsaAttention::<CrownExact>::new(
         q4(nh * hd * 2, d, &dev),
         q4(nkv * hd, d, &dev),
         q4(nkv * hd, d, &dev),
@@ -91,7 +92,7 @@ fn blocks_at_rows_1_and_4() {
     );
     let moe = |seed: usize| {
         let [g, u, dn_w] = testing::expert_stacks(&cfg, seed, &dev, GgmlDType::Q8_0);
-        MoeLayer::new(
+        MoeLayer::<CrownExact, _>::new(
             q4(cfg.n_experts, d, &dev),
             Resident::new(Arc::new(g), Arc::new(u), Arc::new(dn_w)),
             q4(cfg.shared_expert_intermediate_size, d, &dev),
@@ -184,9 +185,10 @@ fn blocks_at_rows_1_and_4() {
         let t_moe = time(&dev, steps, || {
             let _ = moe_a.decode(&xin).unwrap();
         });
-        let mut caches: Vec<Cache> = (0..rows).map(|_| Cache::new(&cfg)).collect();
+        let mut caches: Vec<State<CrownExact>> =
+            (0..rows).map(|_| State::<CrownExact>::new(&cfg)).collect();
         let t_layer = time(&dev, steps, || {
-            let mut refs: Vec<&mut Cache> = caches.iter_mut().collect();
+            let mut refs: Vec<&mut State<CrownExact>> = caches.iter_mut().collect();
             let _ = layer.decode_parts_rows(&h, 0, &mut refs, false).unwrap();
         });
         println!(
@@ -230,7 +232,7 @@ fn blocks_at_seq_512() {
         )
         .unwrap()
     };
-    let dn = GatedDeltaNet::new(
+    let dn = GatedDeltaNet::<CrownExact>::new(
         q4(cc, d, &dev),
         q4(vd, d, &dev),
         Tensor::randn(0f32, 0.2, (cc, cfg.ssm_conv_kernel), &dev).unwrap(),
@@ -242,7 +244,7 @@ fn blocks_at_seq_512() {
         q4(d, vd, &dev),
         &cfg,
     );
-    let qsa = QsaAttention::new(
+    let qsa = QsaAttention::<CrownExact>::new(
         q4(nh * hd * 2, d, &dev),
         q4(nkv * hd, d, &dev),
         q4(nkv * hd, d, &dev),
@@ -252,7 +254,7 @@ fn blocks_at_seq_512() {
         &cfg,
     );
     let [g, u, dn_w] = testing::expert_stacks(&cfg, 0, &dev, GgmlDType::Q8_0);
-    let moe = MoeLayer::new(
+    let moe = MoeLayer::<CrownExact, _>::new(
         q4(cfg.n_experts, d, &dev),
         Resident::new(Arc::new(g), Arc::new(u), Arc::new(dn_w)),
         q4(cfg.shared_expert_intermediate_size, d, &dev),
@@ -368,7 +370,7 @@ fn moe_tile_by_weight_kind_at(n_experts: usize) {
         ]
     };
     for (dtype, down) in kinds {
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             q4(cfg.n_experts, d, &dev),
             Resident::new(
                 Arc::new(raw_stack(cfg.n_experts, ff, d, dtype, &dev)),
@@ -492,7 +494,16 @@ fn stem_mv_by_weight_kind() {
     });
     let mut file = std::fs::File::open(&path).unwrap();
     let content = Content::read(&mut file).unwrap();
-    let stems = ["attn_qkv", "attn_gate", "ssm_out", "attn_output", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "ffn_gate_inp"];
+    let stems = [
+        "attn_qkv",
+        "attn_gate",
+        "ssm_out",
+        "attn_output",
+        "ffn_gate_shexp",
+        "ffn_up_shexp",
+        "ffn_down_shexp",
+        "ffn_gate_inp",
+    ];
     // (stem, kind) → tensor names, in layer order.
     let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
     for (name, info) in &content.tensor_infos {
@@ -505,7 +516,10 @@ fn stem_mv_by_weight_kind() {
             }
         }
     }
-    groups.insert(("output".into(), "Q5K".into()), vec!["output.weight".into()]);
+    groups.insert(
+        ("output".into(), "Q5K".into()),
+        vec!["output.weight".into()],
+    );
     println!("STEMMV shard={path}");
     for ((stem, kind), mut names) in groups {
         names.sort();
@@ -601,7 +615,9 @@ fn routed_mv_id_census() {
     let mut by_gate: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     let mut by_down: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for l in 0..256 {
-        let Some(g) = kind_of(l, "ffn_gate_exps") else { break };
+        let Some(g) = kind_of(l, "ffn_gate_exps") else {
+            break;
+        };
         let d = kind_of(l, "ffn_down_exps").unwrap();
         by_gate.entry(g).or_default().push(l);
         by_down.entry(d).or_default().push(l);
@@ -620,17 +636,34 @@ fn routed_mv_id_census() {
     let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
     println!(
         "ROUTEDMV shard={path} gate_kinds={:?} down_kinds={:?} cycle={cycle}",
-        by_gate.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>(),
-        by_down.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
+        by_gate
+            .iter()
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect::<Vec<_>>(),
+        by_down
+            .iter()
+            .map(|(k, v)| (k.clone(), v.len()))
+            .collect::<Vec<_>>()
     );
     let mut load_tiers = |layers: &[usize]| -> Vec<(Resident, usize, usize)> {
         layers
             .iter()
             .map(|l| {
-                let mut load = |n: &str| Arc::new(content.tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev).unwrap());
-                let (g, u, d) = (load("ffn_gate_exps"), load("ffn_up_exps"), load("ffn_down_exps"));
+                let mut load = |n: &str| {
+                    Arc::new(
+                        content
+                            .tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev)
+                            .unwrap(),
+                    )
+                };
+                let (g, u, d) = (
+                    load("ffn_gate_exps"),
+                    load("ffn_up_exps"),
+                    load("ffn_down_exps"),
+                );
                 let n_experts = g.shape().dims()[0];
-                let gu_per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes()) / n_experts;
+                let gu_per_expert =
+                    (g.storage_size_in_bytes() + u.storage_size_in_bytes()) / n_experts;
                 let d_per_expert = d.storage_size_in_bytes() / n_experts;
                 (Resident::new(g, u, d), gu_per_expert, d_per_expert)
             })

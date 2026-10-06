@@ -21,8 +21,9 @@
 //! Its own binary: the census switch and the contract are read once.
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
-use lloom::models::qwen4exp::{Cache, Config, LoadOptions};
+use lloom::models::qwen4exp::{Config, LoadOptions, State};
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::Fixture;
 use lloom::testing::tiny::Weights;
 use lloom_tensor::quantized::metal::moe_mm_from;
@@ -81,7 +82,7 @@ fn an_f16_routed_tile_stays_on_the_gemm_and_the_decode_row_takes_f16() -> Result
         model.set_routed_act(act);
         model.set_f16_fuse(fuse);
         model.set_f16_fold(fold);
-        let mut cache: Cache = model.new_cache(&cfg, &dev)?;
+        let mut cache: State<CrownExact> = model.new_cache(&cfg, &dev)?;
         dev.synchronize()?;
         let window = dev
             .as_metal_device()?

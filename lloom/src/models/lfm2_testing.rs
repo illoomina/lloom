@@ -9,6 +9,7 @@
 use super::lfm2::{AttnImpl, Config, LayerType, Lfm2Config, Model};
 use crate::nn::var_builder::RecordingBackend;
 use crate::nn::VarBuilder;
+use crate::profile::Profile;
 use crate::testing::tiny::backend::TinyBackend;
 use crate::testing::tiny::{Schema, TinyCheckpoint, TinyFamily, TinyTokenizer, Workload};
 use lloom_tensor::quantized::GgmlDType;
@@ -50,7 +51,7 @@ fn backend(
 
 impl TinyFamily for Lfm2Tiny {
     type Config = Config;
-    type Model = Model;
+    type Model<P: Profile> = Model<P>;
     const NAME: &'static str = "lfm2";
     const DENSE_KINDS: &'static [GgmlDType] = &[GgmlDType::F32, GgmlDType::F16, GgmlDType::BF16];
     const EXPERT_KINDS: &'static [GgmlDType] = &[];
@@ -93,7 +94,8 @@ impl TinyFamily for Lfm2Tiny {
     fn schema(ckpt: &TinyCheckpoint<Self>) -> Result<Schema> {
         let (be, rec) = backend(ckpt)?;
         let vb = VarBuilder::from_backend(Box::new(be), DType::F32, Device::Cpu);
-        Model::new(&ckpt.cfg, vb)?;
+        // The schema is the loader's reads, the same at every profile.
+        Model::<crate::profile::CrownExact>::new(&ckpt.cfg, vb)?;
         Ok(rec.schema(ckpt.weights.dense))
     }
 
@@ -117,7 +119,7 @@ impl TinyFamily for Lfm2Tiny {
         ]
     }
 
-    fn build(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Model> {
+    fn build<P: Profile>(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Model<P>> {
         let (be, _) = backend(ckpt)?;
         let dtype = ckpt.dtype.unwrap_or_else(|| run_dtype(dev));
         let vb = VarBuilder::from_backend(Box::new(be), dtype, dev.clone());
@@ -149,8 +151,8 @@ impl TinyFamily for Lfm2Tiny {
         Ok(dir.to_path_buf())
     }
 
-    fn load(path: &Path, dev: &Device) -> Result<Model> {
-        let (model, _) = load_recorded(path, dev, None)?;
+    fn load<P: Profile>(path: &Path, dev: &Device) -> Result<Model<P>> {
+        let (model, _) = load_recorded::<P>(path, dev, None)?;
         Ok(model)
     }
 
@@ -158,7 +160,7 @@ impl TinyFamily for Lfm2Tiny {
     /// matrices rounded through the dtype it computes in (f16 on Metal by
     /// the engine's rule), so the reference differs from it by the
     /// activations' precision alone.
-    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Model> {
+    fn reference<P: Profile>(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Model<P>> {
         let run = ckpt.dtype.unwrap_or(DType::F16);
         let mut r = ckpt.dequantized().with_dtype(DType::F32);
         if r.weights.dense == GgmlDType::F32 {
@@ -168,7 +170,7 @@ impl TinyFamily for Lfm2Tiny {
                 _ => GgmlDType::F32,
             };
         }
-        Self::build(&r, dev)
+        Self::build::<P>(&r, dev)
     }
 
     /// The attention arms: the generic path, `sdpa_vector` /
@@ -264,13 +266,13 @@ impl crate::testing::fixture::Scaled for Lfm2Tiny {
     /// The real checkpoint through the loader the engine uses (the mapped
     /// safetensors), or the synthetic one in memory: the recording backend's
     /// keyed values at the real geometry, no file read.
-    fn scale_model(
+    fn scale_model<P: Profile>(
         source: &crate::testing::fixture::Source,
         cfg: &Config,
         dtype: Option<DType>,
         weights: &crate::testing::tiny::Weights,
         dev: &Device,
-    ) -> Result<Model> {
+    ) -> Result<Model<P>> {
         use crate::testing::fixture::Source;
         let dtype = dtype.unwrap_or_else(|| run_dtype(dev));
         match source {
@@ -283,7 +285,7 @@ impl crate::testing::fixture::Scaled for Lfm2Tiny {
             }
             Source::Synthetic => TinyCheckpoint::<Self>::new(cfg.clone(), *weights)
                 .with_dtype(dtype)
-                .model(dev),
+                .model::<P>(dev),
         }
     }
 }
@@ -291,11 +293,11 @@ impl crate::testing::fixture::Scaled for Lfm2Tiny {
 /// A checkpoint directory through the loader the engine uses
 /// (`RecordingBackend` over `model.safetensors`, `config.json` through
 /// `Lfm2Config`), and the names the constructor loaded.
-pub fn load_recorded(
+pub fn load_recorded<P: Profile>(
     dir: &Path,
     dev: &Device,
     dtype: Option<DType>,
-) -> Result<(Model, crate::nn::var_builder::LoadRecord)> {
+) -> Result<(Model<P>, crate::nn::var_builder::LoadRecord)> {
     let cfg: Lfm2Config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
         .map_err(lloom_tensor::Error::wrap)?;
     let cfg = cfg.into_config(false);

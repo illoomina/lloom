@@ -34,13 +34,15 @@ use anyhow::{Context, Result};
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::load_warning::{LoadWarning, LoadWarningKind};
 use lloom::models::lfm2::{
-    AttnImpl, BatchPool, Cache, Config, KvAppend, Lfm2Config, MemoryBudget, Model,
+    AttnImpl, BatchPool, Config, KvAppend, Lfm2Config, MemoryBudget, Model, Shape as Lfm2Shape,
+    State,
 };
 use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::models::lfm2_presets as presets;
 use lloom::models::lfm2_vl::{ImageProcessor, Lfm2VlConfig, VisionEncoder};
 use lloom::nn::var_builder::{LoadRecord, RecordingBackend};
 use lloom::nn::{DecodeOptions, DecodeOut, ReuseAction, Sequence, Session, VarBuilder};
+use lloom::profile::{Profile, ProfileKey};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -51,16 +53,16 @@ use tokenizers::Tokenizer;
 
 /// The model and the device: the half every request borrows, shared with
 /// the batch thread.
-pub struct Core {
-    pub model: Model,
+pub struct Core<P: Profile> {
+    pub model: Model<P>,
     pub device: Device,
 }
 
 /// The `--batch 1` state: the one sequence every request drives, taken out
 /// for the request's session and put back after it, the token rings kept
 /// across requests (`RingPool`, built at load, #702), and the drafter.
-struct Single {
-    seq: Option<Sequence<Cache>>,
+struct Single<P: Profile> {
+    seq: Option<Sequence<State<P>>>,
     rings: Option<RingPool>,
     spec: Option<DSparkSpeculator>,
     /// The loop's options, handed to every request's session.
@@ -172,25 +174,34 @@ pub struct Speculators {
     pub eos_ids: Vec<u32>,
 }
 
-impl crate::MakeDriver<Model> for Speculators {
+impl<P: Profile> crate::MakeDriver<Model<P>> for Speculators {
     fn make_driver<'m>(
         &mut self,
-        model: &'m Model,
+        model: &'m Model<P>,
         opts: &DecodeOptions,
         device: &Device,
-    ) -> lloom_tensor::Result<Option<crate::Driver<'m, Model>>> {
+    ) -> lloom_tensor::Result<Option<crate::Driver<'m, Model<P>>>> {
         let _ = model;
         if !self.continuous {
             return Ok(None);
         }
         match self.spec.take() {
             Some(spec) => {
+                // The drafter needs a rewindable state: the `Ring` shapes
+                // give the evidence, the `No` shapes refuse by name.
+                let Some(rewind) = lloom::profile::RewindProof::<P>::ask() else {
+                    lloom_tensor::bail!(
+                        "a DSpark drafter on the {} shape: the speculative loop needs `Ring` \
+                         (`--cache rewindable` / `pool-spec`)",
+                        P::KEY
+                    )
+                };
                 let dec = lloom::nn::SpecBatchDecoder::<
                     'm,
-                    Model,
+                    Model<P>,
                     DSparkSpeculator,
-                    Session<'m, Model>,
-                >::new(spec, opts.clone(), device.clone())?;
+                    Session<'m, Model<P>>,
+                >::new(rewind, spec, opts.clone(), device.clone())?;
                 Ok(Some(Box::new(dec)))
             }
             None => Ok(None),
@@ -200,8 +211,8 @@ impl crate::MakeDriver<Model> for Speculators {
 
 pub type Extra = Speculators;
 
-pub struct Engine {
-    pub core: Arc<Core>,
+pub struct Engine<P: Profile> {
+    pub core: Arc<Core<P>>,
     pub text: Text,
     pub model_name: String,
     pub kv_capacity: usize,
@@ -255,8 +266,8 @@ pub struct Engine {
     /// The load's degradations: `load_engine`'s notes, the model's, this
     /// engine's (`Served::load_warnings`).
     load_warnings: Vec<LoadWarning>,
-    single: Mutex<Single>,
-    sched: Option<BatchHandle<Model, Extra>>,
+    single: Mutex<Single<P>>,
+    sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -357,13 +368,13 @@ impl RowsArm {
     }
 }
 
-impl Single {
+impl<P: Profile> Single<P> {
     /// Run `f` over a session on the held sequence, and put the sequence back
     /// whatever `f` returned.
     fn with_session<T>(
         &mut self,
-        core: &Core,
-        f: impl FnOnce(&mut DecodeSession<'_, Model>, &mut Option<DSparkSpeculator>) -> Result<T>,
+        core: &Core<P>,
+        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
     ) -> Result<T> {
         let seq = self
             .seq
@@ -380,9 +391,129 @@ impl Single {
     }
 }
 
-impl Engine {
-    pub fn load(opts: LoadOptions) -> Result<Self> {
-        let model_dir = opts.model_dir;
+/// The evidence the speculative drivers take: the `Ring` shapes give it,
+/// the `No` shapes refuse by name (`profiles-and-memory-design.md` §7.3).
+fn rewindable<P: Profile>() -> lloom_tensor::Result<lloom::profile::RewindProof<P>> {
+    lloom::profile::RewindProof::<P>::ask().ok_or_else(|| {
+        lloom_tensor::Error::msg(format!(
+            "the speculative body on the {} shape: it needs `Ring` (`--cache rewindable` / `pool-spec`)",
+            P::KEY
+        ))
+    })
+}
+
+/// The drafter's directory under `--dspark`: the named one, or the HF
+/// cache's LFM2.5-2.6B-DSpark snapshot when none is named.
+fn drafter_dir(opts: &LoadOptions) -> Result<Option<PathBuf>> {
+    Ok(match &opts.dspark {
+        None => None,
+        Some(p) if p.as_os_str().is_empty() => Some(
+            newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").context(
+                "no LFM2.5-2.6B-DSpark snapshot in the HF cache and no --draft-dir; the \
+                 drafter is trained against THIS target (design/docs/speculation.md §10.2l)",
+            )?,
+        ),
+        Some(p) => Some(p.clone()),
+    })
+}
+
+/// The preset `--cache` names, over `config`: `auto` is the rule below; a
+/// named one is refused where it needs the drafter's config it has not
+/// got. The per-axis overrides are applied over it by the caller.
+fn apply_preset(
+    config: &mut Config,
+    opts: &LoadOptions,
+    dcfg: Option<&DSparkConfig>,
+    pooled: bool,
+) -> Result<()> {
+    match opts.model.cache.as_str() {
+        "auto" => match dcfg {
+            Some(dcfg) if pooled => presets::pool_spec(config, dcfg),
+            Some(dcfg) => presets::rewindable(config, dcfg.max_draft(), dcfg.tap_layers()),
+            None if pooled => presets::pool(config),
+            None => presets::crown(config),
+        },
+        "crown" => presets::crown(config),
+        "pool" => presets::pool(config),
+        // Without a drafter the speculative body's cache runs K = 1, so
+        // the cost of leaving the crown separates from the verify loop's;
+        // its taps are the 2.6B drafter's (the same per-token capture), or
+        // none on `rewindable-notap`, which separates the taps' cost from
+        // the ring's. The ring is sized for a `--dspark-k` window (the
+        // drafter's block, 9, by default).
+        "rewindable" => match dcfg {
+            Some(dcfg) => presets::rewindable(config, dcfg.max_draft(), dcfg.tap_layers()),
+            None => {
+                let two_six = DSparkConfig::lfm2_2_6b();
+                let k = opts.dspark_k.unwrap_or(two_six.max_draft());
+                presets::rewindable(config, k, two_six.tap_layers())
+            }
+        },
+        "rewindable-notap" => match dcfg {
+            Some(_) => anyhow::bail!(
+                "--cache rewindable-notap drops the taps the drafter's projection reads; \
+                 under --dspark the preset is `rewindable`"
+            ),
+            None => {
+                let k = opts
+                    .dspark_k
+                    .unwrap_or(DSparkConfig::lfm2_2_6b().max_draft());
+                presets::rewindable(config, k, Vec::new())
+            }
+        },
+        "pool-spec" => match dcfg {
+            Some(dcfg) => presets::pool_spec(config, dcfg),
+            None => anyhow::bail!("--cache pool-spec needs --dspark"),
+        },
+        other => anyhow::bail!(
+            "--cache {other}: auto | crown | rewindable | rewindable-notap | pool | pool-spec"
+        ),
+    }
+    Ok(())
+}
+
+/// The profile the resolved config names (`Config::shape`, at the contract
+/// in force): what `load` instantiates the engine at.
+fn shape_key(opts: &LoadOptions) -> Result<ProfileKey> {
+    let bytes = std::fs::read(opts.model_dir.join("config.json"))?;
+    let root: Value = serde_json::from_slice(&bytes).context("parsing config.json")?;
+    let config: Lfm2Config = if root.get("vision_config").is_some() {
+        text_config_of(&root)?
+    } else {
+        serde_json::from_slice(&bytes).context("parsing config.json")?
+    };
+    let mut config = config.into_config(false);
+    let dcfg = match drafter_dir(opts)? {
+        Some(dir) => Some(
+            DSparkConfig::read_from_dir(&dir)
+                .with_context(|| format!("reading the drafter config in {}", dir.display()))?,
+        ),
+        None => None,
+    };
+    let pooled = opts.batch > 1 && opts.rows.pooled();
+    apply_preset(&mut config, opts, dcfg.as_ref(), pooled)?;
+    opts.model
+        .apply_axes(&mut config)
+        .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
+    let (rewind, rows) = config.shape();
+    Ok(ProfileKey::at_contract(rewind, rows))
+}
+
+/// The boundary (`profiles-and-memory-design.md` §7.4): the engine at the
+/// profile the resolved config names, one `match` over the eight
+/// (`lloom::profile::dispatch!`), bounded by what the family ships.
+pub fn load(opts: LoadOptions) -> Result<Box<dyn super::served::Served>> {
+    let key = shape_key(&opts)?;
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => {
+        Engine::<P>::load_as(opts).map(|e| Box::new(e) as Box<dyn super::served::Served>)
+    })
+}
+
+impl<P: Lfm2Shape> Engine<P> {
+    /// The engine at the shape `P` names; `load` picks `P` from the
+    /// resolved config (`shape_key`) and dispatches here.
+    pub fn load_as(opts: LoadOptions) -> Result<Self> {
+        let model_dir = opts.model_dir.clone();
         let device = if opts.cpu {
             Device::Cpu
         } else {
@@ -411,16 +542,7 @@ impl Engine {
 
         // The drafter's config first: the target's cache arms depend on it
         // (the verify window sizes the conv ring, the taps feed the drafter).
-        let dspark_dir = match &opts.dspark {
-            None => None,
-            Some(p) if p.as_os_str().is_empty() => Some(
-                newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").context(
-                    "no LFM2.5-2.6B-DSpark snapshot in the HF cache and no --draft-dir; the \
-                     drafter is trained against THIS target (design/docs/speculation.md §10.2l)",
-                )?,
-            ),
-            Some(p) => Some(p.clone()),
-        };
+        let dspark_dir = drafter_dir(&opts)?;
         // The speculative arm's pool budget: 1024 MiB, sized from measurement
         // (#148, the B=1 defaults pass):
         // a round is two models' activations plus the verify's logits,
@@ -428,7 +550,11 @@ impl Engine {
         // the 256 MiB ceiling that working set is evicted as it frees — ~10
         // allocations and a residency commit per round; at 1024, none.
         #[cfg(feature = "metal")]
-        if let Some(mb) = opts.memory.free_budget_mb.or(dspark_dir.is_some().then_some(1024)) {
+        if let Some(mb) = opts
+            .memory
+            .free_budget_mb
+            .or(dspark_dir.is_some().then_some(1024))
+        {
             if let Device::Metal(m) = &device {
                 m.set_free_budget(mb * 1024 * 1024);
             }
@@ -480,49 +606,7 @@ impl Engine {
         // it needs the drafter's config it has not got. Then the per-axis
         // overrides (`--attn`, `--kv-append`, … or `--set
         // model.<axis>=<arm>`), applied over it in key order.
-        match opts.model.cache.as_str() {
-            "auto" => match &dcfg {
-                Some(dcfg) if pooled => presets::pool_spec(&mut config, dcfg),
-                Some(dcfg) => presets::rewindable(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
-                None if pooled => presets::pool(&mut config),
-                None => presets::crown(&mut config),
-            },
-            "crown" => presets::crown(&mut config),
-            "pool" => presets::pool(&mut config),
-            // Without a drafter the speculative body's cache runs K = 1, so
-            // the cost of leaving the crown separates from the verify loop's;
-            // its taps are the 2.6B drafter's (the same per-token capture), or
-            // none on `rewindable-notap`, which separates the taps' cost from
-            // the ring's. The ring is sized for a `--dspark-k` window (the
-            // drafter's block, 9, by default).
-            "rewindable" => match &dcfg {
-                Some(dcfg) => presets::rewindable(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
-                None => {
-                    let two_six = DSparkConfig::lfm2_2_6b();
-                    let k = opts.dspark_k.unwrap_or(two_six.max_draft());
-                    presets::rewindable(&mut config, k, two_six.tap_layers())
-                }
-            },
-            "rewindable-notap" => match &dcfg {
-                Some(_) => anyhow::bail!(
-                    "--cache rewindable-notap drops the taps the drafter's projection reads; \
-                     under --dspark the preset is `rewindable`"
-                ),
-                None => {
-                    let k = opts
-                        .dspark_k
-                        .unwrap_or(DSparkConfig::lfm2_2_6b().max_draft());
-                    presets::rewindable(&mut config, k, Vec::new())
-                }
-            },
-            "pool-spec" => match &dcfg {
-                Some(dcfg) => presets::pool_spec(&mut config, dcfg),
-                None => anyhow::bail!("--cache pool-spec needs --dspark"),
-            },
-            other => anyhow::bail!(
-                "--cache {other}: auto | crown | rewindable | rewindable-notap | pool | pool-spec"
-            ),
-        }
+        apply_preset(&mut config, &opts, dcfg.as_ref(), pooled)?;
         opts.model
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
@@ -637,19 +721,15 @@ impl Engine {
                 // tables it adds (`Cache::new`). Three slots at least: the
                 // group in use, the previous stage's (its reader still open)
                 // and one loading.
-                let rope = lloom::models::lfm2::Cache::rope_table_bytes(&config);
+                let rope = State::<P>::rope_table_bytes(&config);
                 let mut peak = String::from(
                     "no memory budget declared: the quota less the resident rest and the KV floor",
                 );
                 let room = match config.memory_budget {
                     Some(mut b) => {
                         b.weight_bytes = resident;
-                        let a = lloom::models::lfm2::Cache::admission_budget(
-                            &config,
-                            &b,
-                            opts.kv_capacity,
-                        )
-                        .admit(m.device().recommended_max_working_set_size());
+                        let a = State::<P>::admission_budget(&config, &b, opts.kv_capacity)
+                            .admit(m.device().recommended_max_working_set_size());
                         // The classes, for the refusal: which one took the room.
                         let f = &a.footprint;
                         peak = format!(
@@ -729,7 +809,7 @@ impl Engine {
             None
         };
         let make_cache = |device: &Device| {
-            let mut cache = Cache::new_with(true, dtype, &config, device, opts.kv_capacity)
+            let mut cache = P::state(&config, dtype, device, opts.kv_capacity, None)
                 .context("allocating the KV cache")?
                 .with_kv_bucket(opts.memory.kv_bucket)
                 .context("memory.kv_bucket")?;
@@ -959,7 +1039,7 @@ impl Engine {
             pool.set_batched_arms(opts.rows == RowsArm::Pool);
             for _ in 0..opts.batch {
                 caches.push(
-                    Cache::for_batch(true, dtype, &config, &core.device, &pool)
+                    P::state(&config, dtype, &core.device, opts.kv_capacity, Some(&pool))
                         .context("leasing a row's slot")?,
                 );
             }
@@ -990,7 +1070,7 @@ impl Engine {
         };
         // `--dspark` on private caches runs the static pipelined driver; on
         // the pool arms the continuous speculative driver (§12.4).
-        let mode: BatchMode<Model, Extra> = if dcfg.is_some() && !pooled {
+        let mode: BatchMode<Model<P>, Extra> = if dcfg.is_some() && !pooled {
             BatchMode::Static(Box::new(static_dspark_body))
         } else {
             BatchMode::Continuous
@@ -1007,7 +1087,7 @@ impl Engine {
             extra,
             on_counters: None,
         };
-        let (handle, thread) = spawn_batch(Arc::clone(&core), |c: &Core| &c.model, cfg)
+        let (handle, thread) = spawn_batch(Arc::clone(&core), |c: &Core<P>| &c.model, cfg)
             .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
         eprintln!(
             "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, {}]",
@@ -1097,7 +1177,7 @@ impl Engine {
 
     fn with_single<T>(
         &self,
-        f: impl FnOnce(&mut DecodeSession<'_, Model>, &mut Option<DSparkSpeculator>) -> Result<T>,
+        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
     ) -> Result<T> {
         lock(&self.single).with_session(&self.core, f)
     }
@@ -1105,7 +1185,7 @@ impl Engine {
     /// Run a closed job on the batch thread and wait for it.
     pub fn closed<T: Send + 'static>(
         &self,
-        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Model, Extra>) -> T + Send + 'static,
+        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Model<P>, Extra>) -> T + Send + 'static,
     ) -> Result<T> {
         let sched = self
             .sched
@@ -1253,7 +1333,14 @@ impl Engine {
             }
             match spec {
                 Some(spec) => s
-                    .decode_speculative_until(spec, prompt_ids, detok, params, on_fragment)
+                    .decode_speculative_until(
+                        rewindable::<P>()?,
+                        spec,
+                        prompt_ids,
+                        detok,
+                        params,
+                        on_fragment,
+                    )
                     .map_err(anyhow::Error::from),
                 None => s
                     .decode_until(prompt_ids, detok, params, on_fragment)
@@ -1511,7 +1598,7 @@ impl Engine {
     /// the channel and streamed as text, its outcome the row's.
     fn complete_batched(
         &self,
-        sched: &BatchHandle<Model, Extra>,
+        sched: &BatchHandle<Model<P>, Extra>,
         prompt_ids: &[u32],
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str) -> bool + Send,
@@ -1911,7 +1998,14 @@ impl Engine {
                     ..DecodeParams::default()
                 };
                 let t = Instant::now();
-                let run = s.decode_speculative_until(spec, &prompt, detok, &params, |_| true)?;
+                let run = s.decode_speculative_until(
+                    rewindable::<P>()?,
+                    spec,
+                    &prompt,
+                    detok,
+                    &params,
+                    |_| true,
+                )?;
                 device.synchronize()?;
                 let wall = ms(t.elapsed());
                 let prefill_ms = run.stats.prefill_ns as f64 / 1e6;
@@ -2204,13 +2298,13 @@ impl Engine {
 
 /// `n` sequences checked out of the pool for a closed job, reset, and the
 /// slots to return them to.
-struct TakenSessions<'m> {
-    sessions: Vec<Session<'m, Model>>,
+struct TakenSessions<'m, P: Profile> {
+    sessions: Vec<Session<'m, Model<P>>>,
     slots: Vec<usize>,
 }
 
-impl<'m> TakenSessions<'m> {
-    fn give_back(self, idle: &mut Idle<'_, 'm, Model, Extra>) {
+impl<'m, P: Profile> TakenSessions<'m, P> {
+    fn give_back(self, idle: &mut Idle<'_, 'm, Model<P>, Extra>) {
         for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
             s.reset();
             idle.pool.release(slot, s.into_sequence());
@@ -2222,10 +2316,10 @@ impl<'m> TakenSessions<'m> {
 /// them back — reset again — whatever `f` returned: a failed cell must not
 /// cost the pool a slot. `f` may move the sessions out and back (a run
 /// through the scheduler's driver does), as long as it returns them all.
-fn with_sessions<'m, T>(
-    idle: &mut Idle<'_, 'm, Model, Extra>,
+fn with_sessions<'m, P: Profile, T>(
+    idle: &mut Idle<'_, 'm, Model<P>, Extra>,
     n: usize,
-    f: impl FnOnce(&mut Idle<'_, 'm, Model, Extra>, &mut Vec<Session<'m, Model>>) -> Result<T>,
+    f: impl FnOnce(&mut Idle<'_, 'm, Model<P>, Extra>, &mut Vec<Session<'m, Model<P>>>) -> Result<T>,
 ) -> Result<T> {
     let mut taken = take_sessions(idle, n)?;
     let out = f(idle, &mut taken.sessions);
@@ -2240,7 +2334,10 @@ fn with_sessions<'m, T>(
     out
 }
 
-fn take_sessions<'m>(idle: &mut Idle<'_, 'm, Model, Extra>, n: usize) -> Result<TakenSessions<'m>> {
+fn take_sessions<'m, P: Profile>(
+    idle: &mut Idle<'_, 'm, Model<P>, Extra>,
+    n: usize,
+) -> Result<TakenSessions<'m, P>> {
     let mut sessions = Vec::with_capacity(n);
     let mut slots = Vec::with_capacity(n);
     for _ in 0..n {
@@ -2260,10 +2357,10 @@ fn take_sessions<'m>(idle: &mut Idle<'_, 'm, Model, Extra>, n: usize) -> Result<
 /// continuous driver on the pool arms (the speculative batched loop and its
 /// one drafter, `drive_closed_rows`), the static pipelined driver over the
 /// batch thread's drafter on private caches. Greedy, one EOS set.
-fn run_spec_rows<'m>(
+fn run_spec_rows<'m, P: Profile>(
     pooled: bool,
-    idle: &mut Idle<'_, 'm, Model, Extra>,
-    sessions: &mut Vec<Session<'m, Model>>,
+    idle: &mut Idle<'_, 'm, Model<P>, Extra>,
+    sessions: &mut Vec<Session<'m, Model<P>>>,
     prompts: &[&[u32]],
     opts: &DecodeOptions,
     eos_ids: &[u32],
@@ -2289,6 +2386,7 @@ fn run_spec_rows<'m>(
         .context("no drafter on the batch thread")?;
     Ok(Session::decode_speculative_pipelined(
         sessions,
+        rewindable::<P>()?,
         spec,
         prompts,
         opts,
@@ -2304,9 +2402,9 @@ fn run_spec_rows<'m>(
 /// per batch — mixed sets are refused rather than served under the first
 /// row's.
 
-fn static_dspark_body<'a, 'm>(
-    idle: &mut Idle<'a, 'm, Model, Extra>,
-    sessions: &mut [Session<'m, Model>],
+fn static_dspark_body<'a, 'm, P: Profile>(
+    idle: &mut Idle<'a, 'm, Model<P>, Extra>,
+    sessions: &mut [Session<'m, Model<P>>],
     prompts: &[&[u32]],
     specs: &[RowSpec],
     on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
@@ -2337,6 +2435,7 @@ fn static_dspark_body<'a, 'm>(
     let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
     let mut outs = Session::decode_speculative_pipelined(
         sessions,
+        rewindable::<P>()?,
         spec,
         prompts,
         &opts,
@@ -2468,7 +2567,7 @@ pub fn default_model_dir() -> Option<PathBuf> {
     newest_snapshot("models--LiquidAI--LFM2.5-2.6B")
 }
 
-impl super::served::Served for Engine {
+impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     fn device(&self) -> &Device {
         &self.core.device
     }

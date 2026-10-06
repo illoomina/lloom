@@ -60,9 +60,9 @@ use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::models::lfm2::{AttnImpl, ConvState, KvAppend, Model, Shape as Lfm2Shape, State};
 use lloom::nn::ops::KvQuant;
 use lloom::nn::VarBuilder;
 use std::path::PathBuf;
@@ -647,6 +647,12 @@ fn main() -> Result<()> {
     // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
     candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
         .map_err(anyhow::Error::msg)?;
+    let key = shape_key(&args, &matches)?;
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args, matches))
+}
+
+fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
     let contract = candle::tuning::gate_contract("lfm2-determinism").map_err(anyhow::Error::msg)?;
     println!("CONTRACT {}", contract.report());
     let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
@@ -936,8 +942,9 @@ fn main() -> Result<()> {
         vb
     };
 
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let model = Model::<P>::new(&config, vb).context("constructing LFM2 model")?;
+    let mut cache =
+        State::<P>::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
@@ -1856,6 +1863,41 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The profile the run's axes name (`profiles-and-memory-design.md` §3): the
+/// preset, then the `--kv-append` / `--conv-state` flags over it exactly as
+/// `run` resolves them, read off `Config::profile_key` at the contract in
+/// force. `run` resolves the config again in full; a divergence between the
+/// two is refused by `Model::new` (`Config::check_shape`), never served.
+fn shape_key(args: &Args, matches: &ArgMatches) -> Result<lloom::profile::ProfileKey> {
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let model_dir = args
+        .model_dir
+        .clone()
+        .or_else(default_model_dir)
+        .context("no --model-dir given and no LFM2 snapshot in the HF cache")?;
+    let raw = std::fs::read_to_string(model_dir.join("config.json"))?;
+    let mut config = parse_config(&raw)?;
+    let preset = candle_examples::lfm2_setup::preset(&args.preset)?;
+    if let Some(apply) = preset {
+        apply(&mut config);
+    }
+    let set = |id: &str| preset.is_none() || given(id);
+    if set("kv_append") {
+        config.kv_append = match args.kv_append.as_str() {
+            "paged" => KvAppend::Paged,
+            "cat" => KvAppend::Cat,
+            "in-place" => KvAppend::InPlace,
+            other => {
+                anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`")
+            }
+        };
+    }
+    if set("conv_state") {
+        config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    }
+    Ok(config.profile_key())
 }
 
 #[cfg(test)]

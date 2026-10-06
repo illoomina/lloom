@@ -6,8 +6,11 @@
 //! for what no plan serves — an exact count, not "fewer".
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    AttnImpl, Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::VarBuilder;
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::metal_backend::{ArenaLayout, PassKind};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -54,7 +57,7 @@ fn tiny_config(conv_state: ConvState) -> Config {
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -100,14 +103,14 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 /// One prompt through the driver's own brackets — `Session::decode`, which
 /// prefills `prompt` in `tile`-wide forwards and then decodes `steps` tokens,
 /// exactly as `lfm2-chat` does — returning the ids it produced.
-fn run_prompt(
-    model: &Model,
+fn run_prompt<P: Lfm2Shape>(
+    model: &Model<P>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
@@ -116,7 +119,7 @@ fn run_prompt(
 ) -> Result<Vec<u32>> {
     use lloom::generation::{Blocking, LogitsProcessor, Sampling};
     use lloom::nn::{DecodeOptions, IdentityProposer, Session};
-    let cache = Cache::new(true, DType::F16, cfg, dev)?;
+    let cache = State::<P>::new(true, DType::F16, cfg, dev)?;
     let mut session = Session::new(model, cache);
     let mut spec = IdentityProposer;
     let mut rb = Blocking::new(&[u32::MAX], dev)?;
@@ -141,13 +144,13 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     // A multi-forward prefill onto a warm cache carries the conv context.
     cfg.conv_prefill_ctx = true;
     let tile = 4;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompt: Vec<u32> = (1..=10).collect();
     let other: Vec<u32> = (11..=20).collect();
 
     // Reference: the pool path.
-    let want = run_prompt(&model, &cfg, &dev, &prompt, tile, 6)?;
-    let want_other = run_prompt(&model, &cfg, &dev, &other, tile, 6)?;
+    let want = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, tile, 6)?;
+    let want_other = run_prompt::<RewindableExact>(&model, &cfg, &dev, &other, tile, 6)?;
     assert_eq!(want.len(), 6);
     assert_ne!(want, want_other, "the two prompts must decode differently");
     eprintln!("[pool reference] want={want:?} want_other={want_other:?}");
@@ -165,9 +168,9 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     };
     // Two sightings of every shape: Prefill{4} ×2 + Prefill{2} + Decode{1} ×6 per run.
     snapshot("before run 1");
-    let got1 = run_prompt(&model, &cfg, &dev, &prompt, tile, 6)?;
+    let got1 = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, tile, 6)?;
     snapshot("after run 1");
-    let got2 = run_prompt(&model, &cfg, &dev, &prompt, tile, 6)?;
+    let got2 = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, tile, 6)?;
     snapshot("after run 2");
     assert_eq!(got1, want, "first planned run differs from the pool path");
     assert_eq!(got2, want, "second planned run differs from the pool path");
@@ -239,9 +242,9 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     m.trim_unused_buffers();
     let (shared, private) = m.pool_counters();
     let allocs_before = shared.allocations + private.allocations;
-    let got3 = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
+    let got3 = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 4, 6)?;
     snapshot("after run 3");
-    let got_other = run_prompt(&model, &cfg, &dev, &other, 4, 6)?;
+    let got_other = run_prompt::<RewindableExact>(&model, &cfg, &dev, &other, 4, 6)?;
     snapshot("after run 4");
     assert_eq!(got3, want, "served run differs from the pool path");
     assert_eq!(
@@ -293,7 +296,7 @@ fn a_served_pass_is_charged_its_own_pool_requests_and_nothing_else() -> Result<(
     };
     let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
     cfg.conv_prefill_ctx = true;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     m.enable_pass_plans(ArenaLayout::Packed);
     let lookups = || {
         let (shared, private) = m.pool_counters();
@@ -307,7 +310,7 @@ fn a_served_pass_is_charged_its_own_pool_requests_and_nothing_else() -> Result<(
         Ok(())
     };
 
-    let mut cache = Cache::new(true, DType::F16, &cfg, &dev)?;
+    let mut cache = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
     let prompt = Tensor::new(&[1u32, 2, 3, 4], &dev)?.unsqueeze(0)?;
     model.prepare_pass(&mut cache, 4)?;
     m.begin_pass(PassKey::new(PassKind::Prefill { w: 4, fresh: true }))?;
@@ -380,8 +383,8 @@ fn a_served_pass_is_charged_its_own_pool_requests_and_nothing_else() -> Result<(
 
 /// Decode `prompt` on `session` — an empty prompt resumes from its held
 /// logits — and return the ids.
-fn decode_on(
-    session: &mut lloom::nn::Session<'_, Model>,
+fn decode_on<P: Lfm2Shape>(
+    session: &mut lloom::nn::Session<'_, Model<P>>,
     dev: &Device,
     prompt: &[u32],
     steps: usize,
@@ -400,8 +403,8 @@ fn decode_on(
 /// Session A decodes and holds its last logits; session B runs its own
 /// passes on the same device; A resumes from what it held. Returns A's
 /// ids over both calls and B's.
-fn interleaved(
-    model: &Model,
+fn interleaved<P: Lfm2Shape>(
+    model: &Model<P>,
     cfg: &Config,
     dev: &Device,
     a_prompt: &[u32],
@@ -409,11 +412,11 @@ fn interleaved(
     steps: usize,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
     use lloom::nn::Session;
-    let mut a = Session::new(model, Cache::new(true, DType::F16, cfg, dev)?);
-    let mut b = Session::new(model, Cache::new(true, DType::F16, cfg, dev)?);
-    let mut ids_a = decode_on(&mut a, dev, a_prompt, steps)?;
-    let ids_b = decode_on(&mut b, dev, b_prompt, steps)?;
-    ids_a.extend(decode_on(&mut a, dev, &[], steps)?);
+    let mut a = Session::new(model, State::<P>::new(true, DType::F16, cfg, dev)?);
+    let mut b = Session::new(model, State::<P>::new(true, DType::F16, cfg, dev)?);
+    let mut ids_a = decode_on::<P>(&mut a, dev, a_prompt, steps)?;
+    let ids_b = decode_on::<P>(&mut b, dev, b_prompt, steps)?;
+    ids_a.extend(decode_on::<P>(&mut a, dev, &[], steps)?);
     Ok((ids_a, ids_b))
 }
 
@@ -430,11 +433,12 @@ fn held_logits_survive_another_sessions_passes() -> Result<()> {
         unreachable!()
     };
     let cfg = tiny_config(ConvState::RotatingRing { k: 4 });
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let a_prompt: Vec<u32> = (1..=10).collect();
     let b_prompt: Vec<u32> = (11..=20).collect();
 
-    let (want_a, want_b) = interleaved(&model, &cfg, &dev, &a_prompt, &b_prompt, 6)?;
+    let (want_a, want_b) =
+        interleaved::<RewindableExact>(&model, &cfg, &dev, &a_prompt, &b_prompt, 6)?;
     assert_eq!(want_a.len(), 12);
     assert_ne!(
         want_a[..6],
@@ -444,7 +448,8 @@ fn held_logits_survive_another_sessions_passes() -> Result<()> {
 
     m.enable_pass_plans(ArenaLayout::Packed);
     for round in 0..3 {
-        let (got_a, got_b) = interleaved(&model, &cfg, &dev, &a_prompt, &b_prompt, 6)?;
+        let (got_a, got_b) =
+            interleaved::<RewindableExact>(&model, &cfg, &dev, &a_prompt, &b_prompt, 6)?;
         assert_eq!(got_b, want_b, "round {round}: B differs from the pool path");
         assert_eq!(
             got_a, want_a,
@@ -477,11 +482,11 @@ fn served_tiles_compute_the_pool_paths_logits_bit_for_bit() -> Result<()> {
     };
     let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
     cfg.conv_prefill_ctx = true;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompt: Vec<u32> = (1..=10).collect();
     let widths: Vec<usize> = vec![4, 4, 2];
     let run = |bracket: bool| -> Result<Vec<Vec<f32>>> {
-        let mut cache = Cache::new(true, DType::F16, &cfg, &dev)?;
+        let mut cache = State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?;
         let mut outs = Vec::new();
         let mut pos = 0usize;
         for &w in &widths {
@@ -555,17 +560,17 @@ fn ragged_steps_are_planned_under_both_width_arms() -> Result<()> {
     };
     let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
     cfg.conv_prefill_ctx = true;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompts: Vec<Vec<u32>> = vec![(1..=10).collect(), (11..=17).collect(), (21..=33).collect()];
     let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
     let arrivals = [0u64, 1, 2];
     let run = |widths: PassWidths| -> Result<Vec<Vec<u32>>> {
-        let mut sessions: Vec<Session<'_, Model>> = prompts
+        let mut sessions: Vec<Session<'_, Model<RewindableExact>>> = prompts
             .iter()
             .map(|_| {
                 Ok(Session::new(
                     &model,
-                    Cache::new(true, DType::F16, &cfg, &dev)?,
+                    State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
                 ))
             })
             .collect::<Result<_>>()?;
@@ -678,6 +683,7 @@ struct GarbageDrafter {
 
 impl lloom::nn::speculator::Speculator for GarbageDrafter {
     type Probe = lloom::nn::speculator::LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         1
@@ -743,12 +749,15 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
     // The taps `LayerTaps<5>` needs, on layers this fixture has.
     cfg.tap_layers = vec![0, 1, 2, 0, 1];
     cfg.tap_dtype = DType::F32;
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompt: Vec<u32> = (1..=10).collect();
     let eos: Vec<u32> = vec![u32::MAX];
 
     let run = || -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
-        let mut session = Session::new(&model, Cache::new(true, DType::F16, &cfg, &dev)?);
+        let mut session = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+        );
         let mut spec = GarbageDrafter {
             k,
             token: 0,
@@ -757,6 +766,7 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -829,14 +839,15 @@ fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
         unreachable!()
     };
     let cfg = tiny_config(ConvState::RotatingRing { k: 4 });
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompt: Vec<u32> = (1..=8).collect();
 
     m.enable_pass_plans(ArenaLayout::Packed);
     // A fraction the process is certainly already past, so the FIRST base
     // grow — the one closing the first key — is the one refused.
     m.set_pass_plan_admit_fraction(1e-9);
-    let err = run_prompt(&model, &cfg, &dev, &prompt, 0, 3).expect_err("the grow must be refused");
+    let err = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 0, 3)
+        .expect_err("the grow must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("pass plan base grow refused"),
@@ -852,7 +863,7 @@ fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
 
     // With the check off the same run completes and caches its plans.
     m.set_pass_plan_admit_fraction(0.0);
-    let ids = run_prompt(&model, &cfg, &dev, &prompt, 0, 3)?;
+    let ids = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 0, 3)?;
     assert_eq!(ids.len(), 3);
     let c = m.pass_plan_counters().unwrap();
     assert!(c.plans > 0, "{c:?}");
@@ -921,11 +932,11 @@ fn a_ring_conv_arm_has_no_escapes_fused_or_not() -> Result<()> {
         let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
         cfg.conv_prefill_ctx = true;
         cfg.conv_fused = conv_fused;
-        let model = build(&cfg, &dev)?;
+        let model = build::<RewindableExact>(&cfg, &dev)?;
         m.enable_pass_plans(ArenaLayout::Packed);
         let before = m.pass_plan_counters().unwrap().escapes;
         for _ in 0..3 {
-            run_prompt(&model, &cfg, &dev, &prompt, 0, 6)?;
+            run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 0, 6)?;
         }
         Ok(m.pass_plan_counters().unwrap().escapes - before)
     };
@@ -1069,8 +1080,8 @@ fn a_ramped_prefill_has_no_escapes_under_eviction_on_either_attention_arm() -> R
         let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
         cfg.conv_prefill_ctx = true;
         cfg.attn_impl = attn;
-        let model = build(&cfg, &dev)?;
-        let want = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
+        let model = build::<RewindableExact>(&cfg, &dev)?;
+        let want = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 4, 6)?;
         m.set_free_budget(0);
         m.enable_pass_plans(ArenaLayout::Packed);
         let evicted = || {
@@ -1079,7 +1090,7 @@ fn a_ramped_prefill_has_no_escapes_under_eviction_on_either_attention_arm() -> R
         };
         let evicted_before = evicted();
         for round in 0..3 {
-            let got = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
+            let got = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 4, 6)?;
             assert_eq!(
                 got, want,
                 "{attn:?} round {round}: ids differ from the pool path"
@@ -1147,10 +1158,10 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
         let mut cfg = tiny_config(ConvState::Shuffle);
         cfg.conv_prefill_ctx = true;
         cfg.conv_fused = conv_fused;
-        let model = build(&cfg, &dev)?;
+        let model = build::<CrownExact>(&cfg, &dev)?;
         if !plans {
             return Ok((
-                run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?,
+                run_prompt::<CrownExact>(&model, &cfg, &dev, &prompt, 0, steps)?,
                 0,
                 0,
                 (0, 0),
@@ -1159,11 +1170,11 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
         m.enable_pass_plans(ArenaLayout::Packed);
         // Two prompts see every key twice; the third is the measured one.
         for _ in 0..2 {
-            run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?;
+            run_prompt::<CrownExact>(&model, &cfg, &dev, &prompt, 0, steps)?;
         }
         let c0 = m.pass_plan_counters().unwrap();
         let r0 = m.served_pass_pool_requests();
-        let ids = run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?;
+        let ids = run_prompt::<CrownExact>(&model, &cfg, &dev, &prompt, 0, steps)?;
         let c1 = m.pass_plan_counters().unwrap();
         let r1 = m.served_pass_pool_requests();
         Ok((

@@ -18,8 +18,10 @@
 
 use super::config::Config;
 use crate::nn::ops;
+use crate::profile::Profile;
 use lloom_tensor::quantized::{MoeArm, QMatMul};
 use lloom_tensor::{DType, Module, Result, Tensor, D};
+use std::marker::PhantomData;
 
 pub use crate::nn::expert_stream::{
     ExpertResidency, Resident, RoutedGroup, Streamed, WindowRecord,
@@ -118,7 +120,8 @@ impl WindowPlan {
 
 /// One layer's MoE, generic over the residency strategy (static dispatch).
 #[derive(Debug, Clone)]
-pub struct MoeLayer<R: ExpertResidency> {
+pub struct MoeLayer<P: Profile, R: ExpertResidency> {
+    profile: PhantomData<P>,
     /// Router `hidden -> n_experts` (`ffn_gate_inp`).
     router: QMatMul,
     /// The routed experts, behind the residency seam.
@@ -151,7 +154,7 @@ pub struct MoeLayer<R: ExpertResidency> {
     f16_fold: bool,
 }
 
-impl<R: ExpertResidency> MoeLayer<R> {
+impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: QMatMul,
@@ -163,6 +166,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
         cfg: &Config,
     ) -> Self {
         Self {
+            profile: PhantomData,
             router,
             experts,
             sh_gate,
@@ -728,7 +732,7 @@ pub struct PrefillRouted {
 /// SwiGLU, the routed down, the shared expert (its two stems, its SwiGLU,
 /// its down, its gate's logit), the combine. `In` is the bracket's output.
 #[cfg(not(target_arch = "wasm32"))]
-impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
+impl<P: Profile, R: ExpertResidency> crate::optimizer::Visit for MoeLayer<P, R> {
     type In = crate::optimizer::NodeId;
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, x: Self::In) -> Self::Out {
@@ -819,6 +823,7 @@ fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul) -> Result<Te
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::CrownExact;
     use lloom_tensor::quantized::{GgmlDType, QTensor};
     use lloom_tensor::Device;
     use std::sync::Arc;
@@ -864,7 +869,7 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = Config::tiny();
         let h = cfg.hidden_size;
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             lin(cfg.n_experts, h, 1.0, &dev), // router
             resident(&cfg, &dev),
             lin(cfg.shared_expert_intermediate_size, h, 2.0, &dev), // sh_gate
@@ -915,7 +920,7 @@ mod tests {
         // zero shared expert so only the routed half is compared
         let zero =
             |o: usize, i: usize| QMatMul::Tensor(Tensor::zeros((o, i), DType::F32, &dev).unwrap());
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             router.clone(),
             Resident::new(gate.clone(), up.clone(), down.clone()),
             zero(ff, h),
@@ -980,7 +985,7 @@ mod tests {
         cfg.n_experts = 6;
         cfg.n_experts_per_tok = 3;
         let (h, ff, ne) = (cfg.hidden_size, cfg.moe_intermediate_size, cfg.n_experts);
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             lin(ne, h, 1.0, &dev),
             Resident::new(
                 stacked(ne, ff, h, 1.0, &dev),
@@ -1032,7 +1037,7 @@ mod tests {
         let (h, ff) = (cfg.hidden_size, cfg.moe_intermediate_size);
         let zero =
             |o: usize, i: usize| QMatMul::Tensor(Tensor::zeros((o, i), DType::F32, &dev).unwrap());
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             lin(4, h, 1.0, &dev),
             resident(&cfg, &dev),
             zero(ff, h),
@@ -1059,7 +1064,7 @@ mod tests {
         let zero =
             |o: usize, i: usize| QMatMul::Tensor(Tensor::zeros((o, i), DType::F32, &dev).unwrap());
         let router = lin(8, h, 0.7, &dev);
-        let moe = MoeLayer::new(
+        let moe = MoeLayer::<CrownExact, _>::new(
             lin(8, h, 0.7, &dev),
             resident(&cfg, &dev),
             zero(ff, h),

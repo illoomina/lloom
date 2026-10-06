@@ -271,6 +271,53 @@ impl Draft {
 /// the target kept.
 pub type ObserveRow<'a, P> = (SeqId, &'a <P as TargetProbe>::Output, &'a [u32]);
 
+/// A speculation method as a type (`profiles-and-memory-design.md` §7.3,
+/// B4): what pairs a drafter with the probe it reads from the target. The
+/// probe stays the type the `Probes<P>` pairing checks; the family names
+/// the method, so a driver or a report can say which it ran without a
+/// string. Sealed: the methods are the engine's.
+pub trait SpecFamily: sealed::Sealed + 'static {
+    type Probe: TargetProbe;
+    const NAME: &'static str;
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Qwen4-exp's MTP head: a draft from the target's pre-final carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Mtp;
+/// LFM2's DSpark drafter: a draft from five layer-input taps.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DSpark;
+/// The n-gram proposer: reads nothing from the target.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ngram;
+/// No speculation: the identity proposer the plain loop runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Identity;
+
+impl sealed::Sealed for Mtp {}
+impl sealed::Sealed for DSpark {}
+impl sealed::Sealed for Ngram {}
+impl sealed::Sealed for Identity {}
+impl SpecFamily for Mtp {
+    type Probe = NextnHidden;
+    const NAME: &'static str = "mtp";
+}
+impl SpecFamily for DSpark {
+    type Probe = LayerTaps<5>;
+    const NAME: &'static str = "dspark";
+}
+impl SpecFamily for Ngram {
+    type Probe = NoProbe;
+    const NAME: &'static str = "ngram";
+}
+impl SpecFamily for Identity {
+    type Probe = NoProbe;
+    const NAME: &'static str = "identity";
+}
 /// A speculative proposer: one target, one drafter family.
 ///
 /// Constructed for a fixed number of sequences (server slots); per-seq state
@@ -284,6 +331,8 @@ pub trait Speculator {
     /// What this family reads from ONE target forward. Associated, not a field,
     /// so a family that reads nothing (n-gram) pays for nothing (B8 applied).
     type Probe: TargetProbe;
+    /// The method this drafter is (`SpecFamily`); its probe is `Probe`.
+    type Family: SpecFamily<Probe = Self::Probe>;
 
     /// The proposer's slot count. Per-seq state is private (`Vec<PerSeq>`).
     fn n_seq(&self) -> usize;
@@ -367,6 +416,7 @@ pub trait Speculator {
 /// handed `&mut S` for a closed run (`Session::decode_spec_batched`).
 impl<T: Speculator> Speculator for &mut T {
     type Probe = T::Probe;
+    type Family = T::Family;
     fn n_seq(&self) -> usize {
         T::n_seq(self)
     }
@@ -431,21 +481,23 @@ impl<T: Speculator> Speculator for &mut T {
 ///
 /// ```compile_fail
 /// use lloom::models::lfm2::Model;
+/// use lloom::profile::RewindableExact;
 /// use lloom::nn::speculator::{NextnHidden, Probes};
 /// // A target must satisfy the probe a drafter reads. LFM2 does not have an
 /// // `h_nextn` head, so it does not `impl Probes<NextnHidden>` — this bound is
 /// // unsatisfiable and the call does not compile.
 /// fn requires_nextn<M: Probes<NextnHidden>>() {}
-/// requires_nextn::<Model>();
+/// requires_nextn::<Model<RewindableExact>>();
 /// ```
 ///
 /// The matching probe compiles (`Model: Probes<LayerTaps<5>>`):
 ///
 /// ```
 /// use lloom::models::lfm2::Model;
+/// use lloom::profile::RewindableExact;
 /// use lloom::nn::speculator::{LayerTaps, Probes};
 /// fn requires_taps<M: Probes<LayerTaps<5>>>() {}
-/// requires_taps::<Model>();
+/// requires_taps::<Model<RewindableExact>>();
 /// ```
 pub trait Probes<P: TargetProbe>: CausalLM {
     /// Verify the drafts and extract the probe in one pass. Returns, per active
@@ -1286,7 +1338,10 @@ mod tests {
     fn dspark_pairs_with_lfm2() {
         // Only instantiating the bound matters — if `Model` did not satisfy
         // `Probes<LayerTaps<5>>` (DSpark's probe), this would not compile.
-        assert_pairs::<crate::models::lfm2::Model, crate::models::lfm2_dspark::DSparkSpeculator>();
+        assert_pairs::<
+            crate::models::lfm2::Model<crate::profile::RewindableExact>,
+            crate::models::lfm2_dspark::DSparkSpeculator,
+        >();
 
         // The reference tap side is `LayerOutput` — `target_layer_ids + 1`,
         // which `DSparkConfig::tap_layers()` already bakes in (so `--tap-shift 0`

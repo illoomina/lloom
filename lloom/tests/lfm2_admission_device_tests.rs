@@ -20,8 +20,9 @@
 
 #![cfg(feature = "metal")]
 
+use lloom::models::lfm2::{Config, LayerType, MemoryBudget, State};
+use lloom::profile::CrownExact;
 use lloom_tensor::{DType, Device};
-use lloom::models::lfm2::{Cache, Config, LayerType, MemoryBudget};
 
 /// §5.5's language-model weights, which is what a text-only LFM2 load carries.
 const WEIGHTS: usize = 5_394_397_184;
@@ -82,7 +83,7 @@ fn admits_what_fits_and_refuses_what_does_not_on_the_device() {
     // ADMITTED: B=1 at the shipped capacity. §9.5b puts this well inside.
     let mut ok = config(4096);
     ok.memory_budget = Some(MemoryBudget::new(WEIGHTS));
-    Cache::new_with(true, DType::F16, &ok, &device, 4096)
+    State::<CrownExact>::new_with(true, DType::F16, &ok, &device, 4096)
         .expect("the shipping configuration must be admitted");
 
     // REFUSED: B=32 at 128k, where §9.5b's KV alone is 68.719 GB -- more than
@@ -91,7 +92,7 @@ fn admits_what_fits_and_refuses_what_does_not_on_the_device() {
     let mut budget = MemoryBudget::new(WEIGHTS);
     budget.batch = 32;
     over.memory_budget = Some(budget);
-    let err = Cache::new_with(true, DType::F16, &over, &device, 131_072)
+    let err = State::<CrownExact>::new_with(true, DType::F16, &over, &device, 131_072)
         .expect_err("B=32 x 128k must be refused");
     let msg = err.to_string();
 
@@ -123,7 +124,7 @@ fn no_budget_means_no_refusal_on_the_device() {
     // A configuration admission would refuse outright -- if it were consulted.
     let cfg = config(131_072);
     assert!(cfg.memory_budget.is_none());
-    Cache::new_with(true, DType::F16, &cfg, &device, 131_072)
+    State::<CrownExact>::new_with(true, DType::F16, &cfg, &device, 131_072)
         .expect("with no budget set, nothing is refused however large");
 }
 
@@ -254,7 +255,7 @@ fn a_wrong_weight_figure_reports_without_refusing_a_model_that_fits() {
     // refusal to run a model that has room.
     let mut cfg = config(4096);
     cfg.memory_budget = Some(MemoryBudget::new(WEIGHTS + 825_299_424));
-    Cache::new_with(true, DType::F16, &cfg, &device, 4096)
+    State::<CrownExact>::new_with(true, DType::F16, &cfg, &device, 4096)
         .expect("an over-predicted weight figure that still fits must not refuse");
 
     // And the under-predicting direction likewise builds: the bytes are already
@@ -263,6 +264,6 @@ fn a_wrong_weight_figure_reports_without_refusing_a_model_that_fits() {
     let mut budget = MemoryBudget::new(0);
     budget.weight_tolerance = MemoryBudget::DEFAULT_WEIGHT_TOLERANCE;
     under.memory_budget = Some(budget);
-    Cache::new_with(true, DType::F16, &under, &device, 4096)
+    State::<CrownExact>::new_with(true, DType::F16, &under, &device, 4096)
         .expect("an under-predicted weight figure reports; it does not refuse");
 }

@@ -26,6 +26,7 @@ use super::ple::{CachedPleTable, MmapPleTable, NgramHash, PleLayer, PleTable};
 use super::qsa::{Indexer, QsaAttention};
 use crate::nn::expert_stream::{ExpertSource, LoaderArm};
 use crate::nn::RmsNorm;
+use crate::profile::Profile;
 use lloom_tensor::quantized::gguf_file::{Content, Value};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -898,7 +899,7 @@ fn open_shards(paths: &[PathBuf]) -> Result<(Vec<Content>, Vec<File>)> {
     Ok((contents, files))
 }
 
-impl Qwen4Exp<Resident> {
+impl<P: Profile> Qwen4Exp<P, Resident> {
     /// Load the model from an open GGUF shard, without the N-gram PLE (see
     /// [`Self::from_gguf_with`]).
     pub fn from_gguf<R: Read + Seek>(
@@ -996,7 +997,7 @@ impl Qwen4Exp<Resident> {
     }
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The model a checkpoint's headers describe, built by the loader's own
     /// assembly with every tensor a ghost (`testing::ghost`): the stacks,
     /// the brackets, the PLE, the kinds each stem is stored as — the
@@ -1059,7 +1060,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 }
 
-impl Qwen4Exp<Streamed> {
+impl<P: Profile> Qwen4Exp<P, Streamed> {
     /// Load from a sharded checkpoint with the routed experts streamed from the
     /// shards into a per-layer slot pool (`stream.slots` experts per
     /// projection); everything else resident as on the `Resident` path.
@@ -1204,12 +1205,12 @@ impl Qwen4Exp<Streamed> {
 
 /// The model from the opened shards, `experts(gg, l)` supplying layer `l`'s
 /// residency strategy.
-fn build<R: ExpertResidency, Rd: Read + Seek>(
+fn build<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
     gg: &mut Gguf<'_, Rd>,
     _device: &Device,
     opts: &LoadOptions,
     mut experts: impl FnMut(&mut Gguf<'_, Rd>, usize) -> Result<R>,
-) -> Result<Qwen4Exp<R>> {
+) -> Result<Qwen4Exp<P, R>> {
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
     let ple_hash = match (opts.ple_shard.is_some() || opts.ple, cfg.ple_layers.first()) {
         (true, Some(_)) => {
@@ -1260,7 +1261,7 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
         layers.push(load_layer(gg, l, cfg.layer_types[l], experts, &cfg)?);
     }
 
-    let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
+    let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone())?;
     if let Some(p) = opts.kv_precision {
         model.set_kv_precision(p)?;
     }
@@ -1369,13 +1370,13 @@ fn load_hc<Rd: Read + Seek>(
 
 /// Layer `blk.{l}` of `kind` around `experts` — the model's layers and the
 /// MTP layer (`blk.{n_layers}`) share this.
-fn load_layer<R: ExpertResidency, Rd: Read + Seek>(
+fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
     gg: &mut Gguf<'_, Rd>,
     l: usize,
     kind: LayerKind,
     experts: R,
     cfg: &Config,
-) -> Result<Layer<R>> {
+) -> Result<Layer<P, R>> {
     let p = format!("blk.{l}");
     let d = cfg.hidden_size;
     let hc_attn = load_hc(gg, &format!("{p}.hc_attn"), true, cfg)?;

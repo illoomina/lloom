@@ -20,8 +20,10 @@
 //! checkpoint's 2 051.
 use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
-use lloom::models::qwen4exp::{Cache, Config, ExpertResidency, LoadOptions, Qwen4Exp};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{Config, ExpertResidency, LoadOptions, Qwen4Exp, State};
 use lloom::nn::{ForwardObserver, HookPoint, LayerOutputPoint};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom::testing::fixture::Fixture;
 use lloom_tensor::{Device, Result, Tensor};
 
@@ -60,7 +62,7 @@ type Run = (Vec<Vec<f32>>, Vec<u32>, Vec<usize>);
 /// and every step's, the tokens chosen, and the observed layer's widths
 /// over the prefill.
 fn run<R: ExpertResidency>(
-    model: &mut Qwen4Exp<R>,
+    model: &mut Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     mode: PrefillMode,
@@ -77,7 +79,7 @@ fn run<R: ExpertResidency>(
         layer: full,
         seen: Vec::new(),
     };
-    let mut cache: Cache = Cache::new(cfg);
+    let mut cache: State<CrownExact> = State::<CrownExact>::new(cfg);
     let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), dev)?;
     cache.set_pending_tokens(prompt);
     let embeds = model.embed(&input)?;
@@ -115,7 +117,7 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 
 fn check<R: ExpertResidency>(
     tag: &str,
-    model: &mut Qwen4Exp<R>,
+    model: &mut Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
@@ -243,8 +245,9 @@ fn mtp_keys_its_layer_from_a_prompt_past_the_dense_range() -> Result<()> {
     let dev = Device::Cpu;
     let mut cfg = Config::tiny();
     cfg.eos_token_id = 127;
-    let model =
-        testing::model_with_indexer(&cfg, &dev, |l| Ok(testing::resident_experts(&cfg, l, &dev)))?;
+    let model = testing::model_with_indexer::<RewindableExact, _>(&cfg, &dev, |l| {
+        Ok(testing::resident_experts(&cfg, l, &dev))
+    })?;
     let limit = model.dense_limit().expect("an indexer");
     let indexer = || {
         let (h, ih, id) = (cfg.hidden_size, cfg.indexer_n_heads, cfg.indexer_head_dim);
@@ -263,9 +266,15 @@ fn mtp_keys_its_layer_from_a_prompt_past_the_dense_range() -> Result<()> {
         testing::lin(d, 2 * d, 21.0, &dev),
         Layer::new(
             testing::hc(&cfg, 300.0, &dev),
-            Mixer::Full(testing::qsa_seeded(&cfg, &dev, 11.0).with_indexer(indexer()?)),
+            Mixer::Full(
+                testing::qsa_seeded::<CrownExact>(&cfg, &dev, 11.0).with_indexer(indexer()?),
+            ),
             testing::hc(&cfg, 350.0, &dev),
-            testing::moe_with(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev)),
+            testing::moe_with::<CrownExact, _>(
+                &cfg,
+                &dev,
+                testing::resident_experts(&cfg, 7, &dev),
+            ),
         ),
         testing::hc_with(&cfg, 400.0, &dev, false),
         &cfg,
@@ -274,7 +283,7 @@ fn mtp_keys_its_layer_from_a_prompt_past_the_dense_range() -> Result<()> {
     let max = 12;
     let eos = [cfg.eos_token_id];
     let greedy = {
-        let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
+        let mut session = Session::new(&model, RewindableExact::single(&model, &dev, 1)?);
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         session
@@ -288,13 +297,14 @@ fn mtp_keys_its_layer_from_a_prompt_past_the_dense_range() -> Result<()> {
             )?
             .ids
     };
-    let mut cache = model.new_cache(&cfg, &dev)?;
+    let mut cache = RewindableExact::single(&model, &dev, 1)?;
     cache.want_nextn = true;
     let mut session = Session::new(&model, cache);
     let mut rb = Blocking::new(&eos, &dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         &mut mtp,
         &mut rb,
         &mut sampler,

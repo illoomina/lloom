@@ -67,7 +67,9 @@ use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackArms, ReadbackCounters,
     ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::models::lfm2::{
+    AttnImpl, Config, ConvState, KvAppend, Lfm2Config, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
 use serde_json::Value;
@@ -605,7 +607,12 @@ fn merged_unit_arm() -> &'static str {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key(&args)?;
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     if args.self_test {
         sha256::self_test().map_err(|e| anyhow::anyhow!("sha256 self-test failed: {e}"))?;
         println!("sha256 self-test: OK (NIST vectors + 1e6*'a' + streaming)");
@@ -780,8 +787,8 @@ fn main() -> Result<()> {
         vb
     };
 
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let model = Model::<P>::new(&config, vb).context("constructing LFM2 model")?;
+    let cache = State::<P>::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
@@ -1623,6 +1630,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The profile the run's axes name (`profiles-and-memory-design.md` §3):
+/// `--kv-append` and `--conv-state` as `run` resolves them, read off
+/// `Config::profile_key` at the contract in force; a divergence from `run`'s
+/// resolution is refused by `Model::new` (`Config::check_shape`).
+fn shape_key(args: &Args) -> Result<lloom::profile::ProfileKey> {
+    let mut config = lloom::models::lfm2::Config::default();
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => KvAppend::Cat,
+        "in-place" => KvAppend::InPlace,
+        "paged" => KvAppend::Paged,
+        other => anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"),
+    };
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    Ok(config.profile_key())
+}
+
 /// What one run produced, across every turn.
 struct Run {
     tokens: Vec<u32>,
@@ -1668,10 +1691,10 @@ struct Run {
 /// canonical pairs were taken in; `Session::decode` returns the ids without
 /// it. A turn that reaches the token budget ends the run.
 #[allow(clippy::too_many_arguments)]
-fn run_turns<R: ReadbackStrategy>(
+fn run_turns<R: ReadbackStrategy, P: Lfm2Shape>(
     args: &Args,
-    model: &Model,
-    cache: Cache,
+    model: &Model<P>,
+    cache: State<P>,
     mut rb: R,
     sampler: &mut LogitsProcessor,
     tokenizer: &Tokenizer,

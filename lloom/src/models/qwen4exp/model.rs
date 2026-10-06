@@ -20,33 +20,35 @@ use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
+use crate::profile::{NoRewind, One, Own, Paged, Profile, Rewind, Ring, Rows};
 #[cfg(feature = "metal")]
 use lloom_tensor::metal_backend::{PassKey, PassKind, PassOpener};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor, D};
+use std::marker::PhantomData;
 
 /// One layer's token-mixer (static dispatch — an enum, not `dyn`, per §3.6).
 #[derive(Debug, Clone)]
-pub enum Mixer {
-    Linear(GatedDeltaNet),
-    Full(QsaAttention),
+pub enum Mixer<P: Profile> {
+    Linear(GatedDeltaNet<P>),
+    Full(QsaAttention<P>),
 }
 
 /// One decoder layer: two HC brackets around the token-mixer and the MoE.
 #[derive(Debug, Clone)]
-pub struct Layer<R: ExpertResidency> {
+pub struct Layer<P: Profile, R: ExpertResidency> {
     hc_attn: HyperConnection,
-    mixer: Mixer,
+    mixer: Mixer<P>,
     hc_ffn: HyperConnection,
-    moe: MoeLayer<R>,
+    moe: MoeLayer<P, R>,
 }
 
-impl<R: ExpertResidency> Layer<R> {
+impl<P: Profile, R: ExpertResidency> Layer<P, R> {
     pub fn new(
         hc_attn: HyperConnection,
-        mixer: Mixer,
+        mixer: Mixer<P>,
         hc_ffn: HyperConnection,
-        moe: MoeLayer<R>,
+        moe: MoeLayer<P, R>,
     ) -> Self {
         Self {
             hc_attn,
@@ -56,15 +58,15 @@ impl<R: ExpertResidency> Layer<R> {
         }
     }
 
-    pub fn mixer(&self) -> &Mixer {
+    pub fn mixer(&self) -> &Mixer<P> {
         &self.mixer
     }
 
-    pub fn moe(&self) -> &MoeLayer<R> {
+    pub fn moe(&self) -> &MoeLayer<P, R> {
         &self.moe
     }
 
-    pub fn moe_mut(&mut self) -> &mut MoeLayer<R> {
+    pub fn moe_mut(&mut self) -> &mut MoeLayer<P, R> {
         &mut self.moe
     }
 
@@ -81,7 +83,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (a, b, c, _) = self.decode_parts_planned(res_hc, l, cache, false)?;
         Ok((a, b, c))
@@ -95,7 +97,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         let (a, b, c, r) = self.decode_parts_rows_with(
@@ -114,7 +116,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         device_plan: bool,
         hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
@@ -131,7 +133,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         let (a, b, c, r) =
@@ -143,7 +145,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
         plan: RowPlan,
         hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<WindowPlan>)> {
@@ -201,7 +203,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         real: bool,
         loaded: bool,
     ) -> Result<(Tensor, Option<WindowPlan>)> {
@@ -225,7 +227,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         plan: super::moe::WindowPlanKind,
     ) -> Result<SeqParts> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [T, 1, d]
@@ -247,13 +249,13 @@ impl<R: ExpertResidency> Layer<R> {
     }
 
     /// One position through the layer ([`Self::decode_parts`]'s carry).
-    pub fn decode(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
+    pub fn decode(&self, res_hc: &Tensor, l: usize, cache: &mut State<P>) -> Result<Tensor> {
         Ok(self.decode_parts(res_hc, l, cache)?.0)
     }
 
     /// A chunk through the layer: `res_hc [1, seq, n·d]` → the new carry
     /// (DeltaNet Kernel B / dense chunk attention, per-row MoE).
-    pub fn prefill(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
+    pub fn prefill(&self, res_hc: &Tensor, l: usize, cache: &mut State<P>) -> Result<Tensor> {
         let (res_hc, cur, inject) = self.prefill_mix(res_hc, l, cache)?;
         let moe_out = self.moe.forward(&cur)?;
         self.prefill_finish(&res_hc, &moe_out, &inject, l)
@@ -266,7 +268,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         kind: WindowPlanKind,
     ) -> Result<(Tensor, Option<WindowPlan>)> {
         let (res_hc, cur, inject) = self.prefill_mix(res_hc, l, cache)?;
@@ -282,7 +284,7 @@ impl<R: ExpertResidency> Layer<R> {
         &self,
         res_hc: &Tensor,
         l: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [1, seq, d]
         let mixed = match &self.mixer {
@@ -313,7 +315,7 @@ impl<R: ExpertResidency> Layer<R> {
 /// the MoE, its combine. `In` is the carry, the layer and the KV store's
 /// precision.
 #[cfg(not(target_arch = "wasm32"))]
-impl<R: ExpertResidency> crate::optimizer::Visit for Layer<R> {
+impl<P: Profile, R: ExpertResidency> crate::optimizer::Visit for Layer<P, R> {
     type In = (crate::optimizer::NodeId, usize, crate::nn::ops::KvPrecision);
     type Out = crate::optimizer::NodeId;
     fn visit(
@@ -364,7 +366,7 @@ impl RowPlan {
 /// A verify window's pass, run and read back, awaiting its accept
 /// (`Qwen4Exp::verify_window_run` → `verify_window_settle`).
 #[derive(Debug)]
-pub struct VerifyPass {
+pub struct VerifyPass<P: Profile> {
     /// Each window position's argmax.
     pub argmax: Vec<u32>,
     /// Per layer (in layer order), the plan record over the window's rows.
@@ -380,7 +382,7 @@ pub struct VerifyPass {
     drafts_loaded: bool,
     /// The MTP head run over every window row inside the pass
     /// (`QWEN4EXP_MTP_FOLD`), its per-row drafts read back with the argmax.
-    pub(crate) fold: Option<super::mtp::Folded>,
+    pub(crate) fold: Option<super::mtp::Folded<Own<P>>>,
 }
 
 /// What a settled verify window is worth (`Qwen4Exp::verify_window_settle`).
@@ -411,7 +413,8 @@ pub type SeqParts = (
 /// and per-QSA-layer growing KV. The recurrent channels carry the migrate/
 /// rollback/snapshot discipline; KV is a simple append cache (paged KV deferred).
 #[derive(Debug, Clone)]
-pub struct Cache {
+pub struct State<P: Profile> {
+    profile: PhantomData<P>,
     /// DeltaNet `S` state, one slot per layer (linear layers use it).
     pub s_state: RecurrentState,
     /// DeltaNet conv window, one slot per layer.
@@ -523,7 +526,7 @@ pub struct Cache {
 
 /// A sequence's PLE host fill: the run in progress, if a decode loop armed
 /// one — a single-position forward with no noted id then waits on the GPU for
-/// rows a producer fills, and `Cache::ngram` stays at the run's first decode
+/// rows a producer fills, and `State::<P>::ngram` stays at the run's first decode
 /// step until `host_feed_end` catches it up — and the staging slots and event
 /// it runs over, kept across runs. A clone of the cache shares neither: two
 /// sequences filling one ring would overwrite each other's rows.
@@ -551,39 +554,105 @@ struct CacheWindow {
     pos: usize,
     /// A verify window's bookkeeping per position: the tokens fed and every
     /// layer's KV lengths after each position (`Qwen4Exp::verify_window`),
-    /// for an accept by position (`Cache::accept_window`).
+    /// for an accept by position (`State::<P>::accept_window`).
     tokens: Vec<u32>,
     kv_after: Vec<Vec<(usize, usize)>>,
 }
 
-impl Cache {
+/// The one-sequence, no-rewind shape (`No × One`): every channel and the
+/// KV the state's own, the standing window a snapshot.
+impl<P: Profile<Rewind = NoRewind, Rows = One>> State<P> {
     pub fn new(cfg: &Config) -> Self {
         Self::with_layers(cfg, cfg.n_layers)
     }
+}
 
-    /// A cache whose DeltaNet `S` and conv window live in `pools` (a batch's
-    /// shared, slot-indexed state — `StatePool`s from
-    /// [`Qwen4Exp::state_pools`]); a slot of each is leased here and freed
-    /// when the cache drops. The PLE history and the KV stay the cache's own.
+/// The rewindable shape (`Ring × One`): the recurrent channels in `pools`'
+/// phase rings (`Qwen4Exp::spec_pools`, `k + 2` phases for a `k`-draft
+/// window), so a verify window is accepted by position; the KV the
+/// state's own slab.
+impl<P: Profile<Rewind = Ring, Rows = One>> State<P> {
+    pub fn in_ring(cfg: &Config, pools: &StatePools) -> Result<Self> {
+        if pools.kv.is_some() {
+            lloom_tensor::bail!(
+                "qwen4exp: a `Ring × One` state keeps its own KV; `pools` carries the rows' paged \
+                 KV pool (`Qwen4Exp::spec_pools(1, k, ..)` makes the rewindable one)"
+            )
+        }
+        if pools.s.phases() < 3 {
+            lloom_tensor::bail!(
+                "qwen4exp: a `Ring × One` state needs a ring of at least 3 phases (one draft), \
+                 `pools` has {} (`Qwen4Exp::spec_pools`)",
+                pools.s.phases()
+            )
+        }
+        Self::leased(cfg, pools)
+    }
+}
+
+/// The rows' shapes (`Paged`): the recurrent channels slot-indexed in
+/// `pools` and the KV a slot of the rows' paged pool. `No × Paged` is
+/// `Qwen4Exp::state_pools` (two phases: a decode's current and next);
+/// `Ring × Paged` is `Qwen4Exp::spec_pools` over the rows (`k + 2` phases,
+/// a verify window accepted by phase on every row).
+impl<P: Profile<Rows = Paged>> State<P> {
     pub fn in_pools(cfg: &Config, pools: &StatePools) -> Result<Self> {
-        if pools.kv.is_some() && cfg.kv_precision != super::config::DEFAULT_KV_PRECISION {
+        let Some(p) = &pools.kv else {
+            lloom_tensor::bail!(
+                "qwen4exp: a {} state is a slot of the rows' paged KV pool; `pools` \
+                 carries none (`Qwen4Exp::state_pools(rows > 1, ..)` makes it)",
+                P::KEY
+            )
+        };
+        let ring = pools.s.phases() >= 3;
+        if ring != P::Rewind::REWINDABLE {
+            lloom_tensor::bail!(
+                "qwen4exp: a {} state over pools of {} phases: a `Ring` shape takes \
+                 `spec_pools` (k + 2 phases), a `No` shape `state_pools` (two)",
+                P::KEY,
+                pools.s.phases()
+            )
+        }
+        if cfg.kv_precision != super::config::DEFAULT_KV_PRECISION {
             lloom_tensor::bail!(
                 "qwen4exp: kv-quant = {:?} has no arm on the rows' paged KV pool (f32): \
                  give every row its own cache (the unpooled rows) or keep kv-quant off",
                 cfg.kv_precision
             )
         }
-        let mut cache = Self::new(cfg);
+        let mut cache = Self::leased(cfg, pools)?;
+        let lease = p.lease()?;
+        for (l, kv) in cache.kv.iter_mut().enumerate() {
+            *kv = KvCache::in_pool(p, &lease, l);
+        }
+        Ok(cache)
+    }
+}
+
+impl<P: Profile> State<P> {
+    /// [`State::new`] where `P` is `No × One`; the other shapes are leased
+    /// from pools and refused here by name.
+    pub fn own(cfg: &Config) -> Result<Self> {
+        let key = P::KEY;
+        if key.rewind != NoRewind::NAME || key.rows != One::NAME {
+            lloom_tensor::bail!(
+                "qwen4exp: a {key} state is leased from the driver's pools \
+                 (`State::in_ring` over `spec_pools` on Ring, `State::in_pools` over \
+                 `state_pools` on Paged), not built on its own"
+            )
+        }
+        Ok(Self::with_layers(cfg, cfg.n_layers))
+    }
+
+    /// A state whose DeltaNet `S`, conv window and PLE history live in
+    /// `pools` (a slot of each leased here, freed when the state drops);
+    /// the KV its own until a shape says otherwise.
+    fn leased(cfg: &Config, pools: &StatePools) -> Result<Self> {
+        let mut cache = Self::with_layers(cfg, cfg.n_layers);
         cache.s_state = RecurrentState::in_pool(&pools.s)?;
         cache.conv_state = RecurrentState::in_pool(&pools.conv)?;
         if let Some(p) = &pools.ple {
             cache.ple_conv = RecurrentState::in_pool(p)?;
-        }
-        if let Some(p) = &pools.kv {
-            let lease = p.lease()?;
-            for (l, kv) in cache.kv.iter_mut().enumerate() {
-                *kv = KvCache::in_pool(p, &lease, l);
-            }
         }
         Ok(cache)
     }
@@ -646,7 +715,11 @@ impl Cache {
                 break;
             }
             let rows = t.dim(1)?;
-            kept.push(if rows <= left { t } else { t.narrow(1, 0, left)? });
+            kept.push(if rows <= left {
+                t
+            } else {
+                t.narrow(1, 0, left)?
+            });
             left -= rows.min(left);
         }
         self.nextn = kept;
@@ -655,8 +728,9 @@ impl Cache {
 
     /// A cache for `n_layers` layers of `cfg`'s geometry (an MTP head's single
     /// layer shares the model's shapes, not its depth).
-    pub fn with_layers(cfg: &Config, n_layers: usize) -> Self {
+    pub(crate) fn with_layers(cfg: &Config, n_layers: usize) -> Self {
         Self {
+            profile: PhantomData,
             s_state: RecurrentState::new(n_layers),
             conv_state: RecurrentState::new(n_layers),
             kv: (0..n_layers)
@@ -1082,17 +1156,17 @@ struct PleWindowMarks {
 
 /// The N-gram PLE at its one layer.
 #[derive(Debug)]
-pub struct Ple {
+pub struct Ple<P: Profile> {
     pub layer: usize,
     pub hash: NgramHash,
     /// Shared with a run's host-fill producer (`CausalLM::host_feed`).
     pub table: std::sync::Arc<PleTable>,
-    pub block: PleLayer,
+    pub block: PleLayer<P>,
 }
 
 /// The assembled model.
 /// The streamed expert pool as the ledger's elastic tenant
-/// (`profiles-and-memory-design.md` §4.2, class `Cache`): `topk + 1` slots
+/// (`profiles-and-memory-design.md` §4.2, class `State<P>`): `topk + 1` slots
 /// as the floor, every expert as the want, one slot as the unit — the one
 /// tenant type every weight-group tier is (`nn::group_tenant`, #892 A6b;
 /// the dense layers' tier claims the same way). `resize` records the grant
@@ -1102,18 +1176,18 @@ pub struct Ple {
 pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
 
 #[derive(Debug)]
-pub struct Qwen4Exp<R: ExpertResidency> {
+pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
     /// table is gathered by the quantized `get_rows` kernel, never dequantized
     /// whole (2.5 GB at f32).
     embed_tokens: QMatMul,
-    layers: Vec<Layer<R>>,
+    layers: Vec<Layer<P, R>>,
     /// Final HC collapse (the head mixer that carries the output norm).
     hc_head: HyperConnection,
     /// lm_head (`output.weight`, untied).
     lm_head: QMatMul,
     /// The N-gram PLE, when its table was loaded (`LoadOptions::ple_shard`).
-    ple: Option<Ple>,
+    ple: Option<Ple<P>>,
     /// The PLE-window instrument, when armed (`arm_ple_window`).
     ple_window: Option<parking_lot::Mutex<PleWindowMarks>>,
     /// Whether [`CausalLM::host_feed`] offers the PLE's host fill to a loop
@@ -1121,7 +1195,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     host_fill: bool,
     /// The MTP head, when loaded (`LoadOptions::mtp`); an `MtpDrafter`
     /// borrows it beside `embed_tokens` and `lm_head`.
-    mtp: Option<super::mtp::MtpHead<R>>,
+    mtp: Option<super::mtp::MtpHead<Own<P>, R>>,
     prefill_mode: PrefillMode,
     /// Some layer's residency plans on the device (`Streamed`): a decode
     /// pass runs under a window and settles at its end (`decode_embed`).
@@ -1254,16 +1328,19 @@ impl PassPlan {
     }
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     pub fn new(
         embed_tokens: QMatMul,
-        layers: Vec<Layer<R>>,
+        layers: Vec<Layer<P, R>>,
         hc_head: HyperConnection,
         lm_head: QMatMul,
         cfg: Config,
-    ) -> Self {
+    ) -> Result<Self> {
+        // The process is held to the regime the type names (`profile::hold`):
+        // a family at `Exact` never computes under an inherited `fast`.
+        crate::profile::hold::<P::Regime>("qwen4exp")?;
         let device_plan = layers.iter().any(|l| l.moe().experts().plans_on_device());
-        Self {
+        Ok(Self {
             embed_tokens,
             layers,
             hc_head,
@@ -1290,7 +1367,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             ple_rows: parking_lot::Mutex::new(None),
             fusion_report: None,
             cfg,
-        }
+        })
     }
 
     /// `qwen4exp.fusion = derived`: the optimizer's plan over the walk of the
@@ -1490,7 +1567,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// `20..28` its rows that complete a block, bit 28 its device plan,
     /// bits 29–30 its dense-range kind. Each is decided here as
     /// [`Self::verify_window_run`] decides it, before the pass.
-    pub(crate) fn verify_variant(&self, cache: &Cache, t: usize) -> u32 {
+    pub(crate) fn verify_variant(&self, cache: &State<P>, t: usize) -> u32 {
         let ratio = self.layers.iter().find_map(|l| match &l.mixer {
             Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
             Mixer::Linear(_) => None,
@@ -1668,7 +1745,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// `cache.pos` would make: every full-attention layer's KV grow (a slab
     /// widened, or the batch pool's next page slab) and the transient term.
     /// No side effects.
-    pub fn plan_pass(&self, cache: &Cache, seq: usize) -> PassPlan {
+    pub fn plan_pass(&self, cache: &State<P>, seq: usize) -> PassPlan {
         let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
         let mut kv_grow = 0usize;
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1712,14 +1789,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// step inside its slab reads nothing (§9.5e: no per-token Metal call).
     /// Idempotent per `(pos, seq)`: a driver prepares, then `forward`'s own
     /// chunk loop prepares the same pass and finds it done.
-    pub fn prepare_pass_inner(&self, cache: &mut Cache, seq: usize) -> Result<()> {
+    pub fn prepare_pass_inner(&self, cache: &mut State<P>, seq: usize) -> Result<()> {
         self.prepare_pass_as(cache, seq, false)
     }
 
     /// [`Self::prepare_pass_inner`] for the pass about to run: a driver's,
     /// or with `own` the one this model opens itself when no driver holds a
     /// pass — whose plan, if any, is a different key.
-    fn prepare_pass_as(&self, cache: &mut Cache, seq: usize, own: bool) -> Result<()> {
+    fn prepare_pass_as(&self, cache: &mut State<P>, seq: usize, own: bool) -> Result<()> {
         if seq == 0 || cache.prepared == Some((cache.pos, seq)) {
             return Ok(());
         }
@@ -1836,7 +1913,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 
     /// Attach the MTP head.
-    pub fn set_mtp(&mut self, head: super::mtp::MtpHead<R>) {
+    pub fn set_mtp(&mut self, head: super::mtp::MtpHead<Own<P>, R>) {
         self.mtp = Some(head);
     }
 
@@ -1856,7 +1933,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.device_plan
     }
 
-    pub fn mtp_head(&self) -> Option<&super::mtp::MtpHead<R>> {
+    pub fn mtp_head(&self) -> Option<&super::mtp::MtpHead<Own<P>, R>> {
         self.mtp.as_ref()
     }
 
@@ -1917,7 +1994,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 
     /// Apply the runtime axes (`--kv-quant`, …) to the model's config: every
-    /// `Cache` built from `config()` afterwards takes them. Refused on a
+    /// `State<P>` built from `config()` afterwards takes them. Refused on a
     /// device the arm has no kernels on (the quantized KV is Metal only).
     pub fn apply_axes(&mut self, args: &super::config::ConfigArgs) -> Result<()> {
         let mut cfg = self.cfg.clone();
@@ -1925,7 +2002,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.set_kv_precision(cfg.kv_precision)
     }
 
-    /// Set the KV store every `Cache` built from `config()` afterwards uses
+    /// Set the KV store every `State<P>` built from `config()` afterwards uses
     /// (`DESIGN.md` §10.7).
     pub fn set_kv_precision(&mut self, p: crate::nn::ops::KvPrecision) -> Result<()> {
         if p.quant().is_on() && !self.device().is_metal() {
@@ -1956,11 +2033,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         &self.lm_head
     }
 
-    pub fn layers(&self) -> &[Layer<R>] {
+    pub fn layers(&self) -> &[Layer<P, R>] {
         &self.layers
     }
 
-    pub fn layers_mut(&mut self) -> &mut [Layer<R>] {
+    pub fn layers_mut(&mut self) -> &mut [Layer<P, R>] {
         &mut self.layers
     }
 
@@ -1970,7 +2047,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         layer: usize,
         hash: NgramHash,
         table: PleTable,
-        block: PleLayer,
+        block: PleLayer<P>,
     ) -> Result<()> {
         if layer >= self.layers.len() {
             lloom_tensor::bail!("ple layer {layer} out of {} layers", self.layers.len())
@@ -2186,7 +2263,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// The PLE delta for the positions of `res_hc [1, seq, n·d]`: hash each
     /// position's token window, gather the rows, run the block against the
     /// carry. Consumes `seq` pending tokens and advances the window.
-    fn ple_delta(&self, ple: &Ple, res_hc: &Tensor, cache: &mut Cache) -> Result<Tensor> {
+    fn ple_delta(&self, ple: &Ple<P>, res_hc: &Tensor, cache: &mut State<P>) -> Result<Tensor> {
         self.ple_window_cut(res_hc)?;
         let seq = res_hc.dim(1)?;
         if seq == 1 && cache.pending_tokens.is_empty() {
@@ -2232,7 +2309,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// off Metal, or for a table that cannot gather into a slice.
     fn ple_rows_owned(
         &self,
-        ple: &Ple,
+        ple: &Ple<P>,
         ids: &[i64],
         dev: &lloom_tensor::Device,
     ) -> Result<Option<Tensor>> {
@@ -2302,7 +2379,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn decode<O: ForwardObserver>(
         &self,
         input_id: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         obs: &mut O,
     ) -> Result<Tensor> {
         let h = self.embed(input_id)?; // [1, 1, d]
@@ -2316,7 +2393,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn forward_embeds<O: ForwardObserver>(
         &self,
         embeds: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         obs: &mut O,
     ) -> Result<Tensor> {
         let (b, seq, _) = embeds.dims3()?;
@@ -2415,7 +2492,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn prefill_embeds<O: ForwardObserver>(
         &self,
         h: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         obs: &mut O,
     ) -> Result<Tensor> {
         let n = self.cfg.hc_count;
@@ -2499,7 +2576,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         &self,
         ha: &Tensor,
         hb: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         self.prefill_embeds_pipelined(&[ha.clone(), hb.clone()], cache)
     }
@@ -2525,7 +2602,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// — which is what an arm whose loads the GPU waits for (the `io` arm's
     /// DMA at the layer) needs to not stall. Off Metal the readback is a
     /// plain one and the tiles still interleave.
-    pub fn prefill_embeds_pipelined(&self, tiles: &[Tensor], cache: &mut Cache) -> Result<Tensor> {
+    pub fn prefill_embeds_pipelined(
+        &self,
+        tiles: &[Tensor],
+        cache: &mut State<P>,
+    ) -> Result<Tensor> {
         let n_tiles = tiles.len();
         if n_tiles == 0 {
             lloom_tensor::bail!("prefill_embeds_pipelined: no tiles")
@@ -2559,7 +2640,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             routed: super::moe::PrefillRouted,
             ids: Option<super::moe::StagedIds>,
         }
-        let stage_x = |res: &mut Tensor, l: usize, cache: &mut Cache| -> Result<Staged> {
+        let stage_x = |res: &mut Tensor, l: usize, cache: &mut State<P>| -> Result<Staged> {
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
                     let delta = self.ple_delta(ple, res, cache)?;
@@ -2632,7 +2713,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn decode_embed<O: ForwardObserver>(
         &self,
         h: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         obs: &mut O,
     ) -> Result<Tensor> {
         let planned = self.device_plan
@@ -3000,7 +3081,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn decode_embed_pass<O: ForwardObserver>(
         &self,
         h: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         obs: &mut O,
         plan: RowPlan,
     ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
@@ -3168,7 +3249,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 /// armed where the residency plans on the device. The decode loop's argmax
 /// is the driver's, not the model's.
 #[cfg(not(target_arch = "wasm32"))]
-impl<R: ExpertResidency> crate::optimizer::Visit for Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> crate::optimizer::Visit for Qwen4Exp<P, R> {
     type In = ();
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
@@ -3202,7 +3283,127 @@ impl<R: ExpertResidency> crate::optimizer::Visit for Qwen4Exp<R> {
     }
 }
 
-impl<R: ExpertResidency> ModelTrait for Qwen4Exp<R> {
+/// The state a driver builds for its shape, from the model it drives
+/// (`profiles-and-memory-design.md` §3): one method per thing a driver
+/// needs, implemented per shape, so generic code names the shape once
+/// (`P::single`, `P::rows`) and the shapes it cannot serve refuse by name.
+pub trait Shape: Profile {
+    /// One sequence's state: its own on `No × One`; on `Ring × One` the
+    /// recurrent channels in a `k`-draft verify ring (`spec_pools`). The
+    /// `Paged` shapes are rows (`rows`), not a single sequence.
+    fn single<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        k: usize,
+    ) -> Result<State<Self>>;
+    /// `rows` rows' states over one set of pools: `No × Paged` over
+    /// `state_pools`, `Ring × Paged` over `spec_pools(rows, k)`. The `One`
+    /// shapes have no rows.
+    fn rows<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        rows: usize,
+        k: usize,
+    ) -> Result<(StatePools, Vec<State<Self>>)>;
+}
+
+fn no_rows<P: Profile>() -> lloom_tensor::Error {
+    lloom_tensor::Error::msg(format!(
+        "qwen4exp: a {} model serves one sequence; rows are the `Paged` shapes",
+        P::KEY
+    ))
+}
+
+impl<G: crate::profile::Regime> Shape for crate::profile::P<G, NoRewind, One> {
+    fn single<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        _k: usize,
+    ) -> Result<State<Self>> {
+        model.new_cache(model.config(), dev)
+    }
+    fn rows<R: ExpertResidency>(
+        _model: &Qwen4Exp<Self, R>,
+        _dev: &lloom_tensor::Device,
+        _rows: usize,
+        _k: usize,
+    ) -> Result<(StatePools, Vec<State<Self>>)> {
+        Err(no_rows::<Self>())
+    }
+}
+
+impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, One> {
+    fn single<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        k: usize,
+    ) -> Result<State<Self>> {
+        let pools = model.spec_pools(1, k.max(1), dev);
+        State::<Self>::in_ring(model.config(), &pools)
+    }
+    fn rows<R: ExpertResidency>(
+        _model: &Qwen4Exp<Self, R>,
+        _dev: &lloom_tensor::Device,
+        _rows: usize,
+        _k: usize,
+    ) -> Result<(StatePools, Vec<State<Self>>)> {
+        Err(no_rows::<Self>())
+    }
+}
+
+impl<G: crate::profile::Regime> Shape for crate::profile::P<G, NoRewind, Paged> {
+    /// One row of a one-row pool (the engine's single sequence at
+    /// `--batch N` warms the rows' kernels on it).
+    fn single<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        _k: usize,
+    ) -> Result<State<Self>> {
+        let pools = model.row_pools(1, 2, dev);
+        State::<Self>::in_pools(model.config(), &pools)
+    }
+    fn rows<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        rows: usize,
+        _k: usize,
+    ) -> Result<(StatePools, Vec<State<Self>>)> {
+        let pools = model.row_pools(rows, 2, dev);
+        let states = (0..rows)
+            .map(|_| State::<Self>::in_pools(model.config(), &pools))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((pools, states))
+    }
+}
+
+impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, Paged> {
+    fn single<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        k: usize,
+    ) -> Result<State<Self>> {
+        let pools = model.row_pools(1, k.max(1) + 2, dev);
+        State::<Self>::in_pools(model.config(), &pools)
+    }
+    fn rows<R: ExpertResidency>(
+        model: &Qwen4Exp<Self, R>,
+        dev: &lloom_tensor::Device,
+        rows: usize,
+        k: usize,
+    ) -> Result<(StatePools, Vec<State<Self>>)> {
+        let pools = model.row_pools(rows, k.max(1) + 2, dev);
+        let states = (0..rows)
+            .map(|_| State::<Self>::in_pools(model.config(), &pools))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((pools, states))
+    }
+}
+
+impl<P: Profile, R: ExpertResidency> crate::profile::Shaped for Qwen4Exp<P, R> {
+    type Profile = P;
+}
+
+impl<P: Profile, R: ExpertResidency> ModelTrait for Qwen4Exp<P, R> {
     type Config = Config;
 
     /// The checkpoint is GGUF (a non-uniform per-tensor quant); the safetensors
@@ -3213,12 +3414,16 @@ impl<R: ExpertResidency> ModelTrait for Qwen4Exp<R> {
     }
 }
 
-impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
-    type Cache = Cache;
+impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
+    type Cache = State<P>;
 
+    /// The state of the family's shape: its own channels and KV on
+    /// `No × One`; a `Ring` or `Paged` state is leased from pools the
+    /// driver holds (`State::in_ring` over `spec_pools`, `State::in_pools`
+    /// over `state_pools`), so here it is refused by name.
     fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
         #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
-        let mut cache = Cache::new(cfg);
+        let mut cache = State::<P>::own(cfg)?;
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = dev {
             use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
@@ -3387,13 +3592,13 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     }
 }
 
-impl CacheReset for Cache {
+impl<P: Profile> CacheReset for State<P> {
     fn reset(&mut self) {
-        Cache::reset(self)
+        State::<P>::reset(self)
     }
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// One decode step for `B` independent sequences (`BatchedCausalLM::
     /// forward_rows`): `tokens [B, 1]`, row `r` fed to `rows[r]` at its
     /// position, → `[B, vocab]`. The weight-bearing ops run once over all
@@ -3408,7 +3613,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn forward_rows(
         &self,
         tokens: &Tensor,
-        rows: &mut [crate::nn::model::Row<'_, Cache>],
+        rows: &mut [crate::nn::model::Row<'_, State<P>>],
     ) -> Result<Tensor> {
         let (b, seq) = tokens.dims2()?;
         if seq != 1 {
@@ -3443,13 +3648,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             row.cache.set_pending_tokens(&[id]);
         }
         let h = self.embed(tokens)?; // [B, 1, hidden]
-        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
-        let planned =
-            self.device_plan
-                && plan_on_device()
-                && caches
-                    .iter()
-                    .all(|c| c.device_plan_armed && !c.armed_through_misses);
+        let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let planned = self.device_plan
+            && plan_on_device()
+            && caches
+                .iter()
+                .all(|c| c.device_plan_armed && !c.armed_through_misses);
         if !planned {
             let before = self.stream_misses();
             // Timed only where a tier streams (the miss regime's pass).
@@ -3499,7 +3703,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn decode_rows_pass(
         &self,
         h: &Tensor,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
         device_plan: bool,
     ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
         let n = self.cfg.hc_count;
@@ -3560,7 +3764,7 @@ pub struct StatePools {
     pub kv: Option<KvPool>,
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The pools for `rows` rows on `dev` (f32, the fused kernels' dtype),
     /// two phases (a decode's current and next).
     pub fn state_pools(&self, rows: usize, dev: &lloom_tensor::Device) -> StatePools {
@@ -3572,6 +3776,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// a phase.
     pub fn spec_pools(&self, rows: usize, k: usize, dev: &lloom_tensor::Device) -> StatePools {
         self.state_pools_with(rows, k + 2, dev)
+    }
+
+    /// The pools for `rows` rows of the `Paged` shapes: the recurrent
+    /// channels slot-indexed and the KV in the paged pool, whatever the
+    /// count — a `Paged` state of one row (the engine's single sequence at
+    /// `--batch N`) is a row of a one-row pool, never its own slab.
+    pub fn row_pools(&self, rows: usize, phases: usize, dev: &lloom_tensor::Device) -> StatePools {
+        let mut pools = self.state_pools_with(rows, phases, dev);
+        if pools.kv.is_none() {
+            let f32 = lloom_tensor::DType::F32;
+            pools.kv = Some(KvPool::new(
+                rows,
+                self.layers.len(),
+                self.cfg.n_kv_heads,
+                self.cfg.head_dim,
+                f32,
+                dev,
+            ));
+        }
+        pools
     }
 
     pub fn state_pools_with(
@@ -3621,7 +3845,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// over `T` rows), the state advanced position by position with every
     /// intermediate kept in the channels' phase rings — under an open
     /// window; returns each position's argmax. The caller accepts a prefix
-    /// with [`Cache::accept_window`] (no replay). Every step is the
+    /// with [`State::<P>::accept_window`] (no replay). Every step is the
     /// arithmetic of a decode step (the row gemvs, the per-position state
     /// kernels), so the argmaxes are the sequential decode's. Needs
     /// `cache.ring_holds(T, ple)`.
@@ -3631,7 +3855,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// window). A speculative verify, whose rows past the accept are not
     /// real, takes [`Self::verify_window_run`] and
     /// [`Self::verify_window_settle`] instead.
-    pub fn verify_window(&self, tokens: &[u32], cache: &mut Cache) -> Result<Vec<u32>> {
+    pub fn verify_window(&self, tokens: &[u32], cache: &mut State<P>) -> Result<Vec<u32>> {
         let t = tokens.len();
         let pass = self.verify_window_run(tokens, cache)?;
         let v = self.verify_window_settle(pass, |_| t, false, cache)?;
@@ -3645,7 +3869,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// row; a host-planned one loads row 0's (the real next token) and
     /// flags a draft row's instead of loading it (`QWEN4EXP_MTP_DRAFT_LOADS`
     /// loads those too, the A/B arm).
-    pub fn verify_window_run(&self, tokens: &[u32], cache: &mut Cache) -> Result<VerifyPass> {
+    pub fn verify_window_run(&self, tokens: &[u32], cache: &mut State<P>) -> Result<VerifyPass<P>> {
         let t = tokens.len();
         if t == 0 {
             lloom_tensor::bail!("qwen4exp verify_window: no tokens")
@@ -3653,7 +3877,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if !cache.ring_holds(t, self.ple.is_some()) {
             lloom_tensor::bail!(
                 "qwen4exp verify_window: {t} positions need pooled channels with {} phases \
-                 (`Cache::in_pools` over `spec_pools`)",
+                 (`State::<P>::in_pools` over `spec_pools`)",
                 t + 1
             )
         }
@@ -3810,10 +4034,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// was not cut arms the device plan for the windows after it.
     pub fn verify_window_settle(
         &self,
-        pass: VerifyPass,
+        pass: VerifyPass<P>,
         accept: impl Fn(&[u32]) -> usize,
         truncate: bool,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<WindowVerdict> {
         let VerifyPass {
             mut argmax,
@@ -3956,7 +4180,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn verify_rows_reference(
         &self,
         tokens: &[u32],
-        cache: &mut Cache,
+        cache: &mut State<P>,
         all_real: bool,
         all_loaded: bool,
     ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
@@ -4009,7 +4233,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn verify_pass(
         &self,
         h: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         kind: WindowPlanKind,
     ) -> Result<VerifyPassOut> {
         let n = self.cfg.hc_count;
@@ -4073,7 +4297,7 @@ type WindowRead = (Vec<u32>, Vec<(usize, WindowRecord)>, Vec<Vec<u32>>);
 /// `Qwen4Exp::verify_pass`: the logits, the layers' plan records, the carries.
 type VerifyPassOut = (Tensor, Vec<(usize, WindowPlan)>, Tensor);
 
-impl<R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<P, R> {
     fn forward_rows(
         &self,
         tokens: &Tensor,
@@ -4085,7 +4309,7 @@ impl<R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<R> {
 
 /// No prefix sharing between rows yet: every row prefills its own prompt
 /// (the recurrent channels have no page to share by reference).
-impl crate::nn::model::CacheShare for Cache {
+impl<P: Profile> crate::nn::model::CacheShare for State<P> {
     fn share_prefix_from(&mut self, _src: &Self, _n_tokens: usize) -> Result<usize> {
         Ok(0)
     }
@@ -4173,7 +4397,7 @@ fn mtp_draft_loads() -> DraftLoads {
     )
 }
 
-impl Cache {
+impl<P: Profile> State<P> {
     /// Whether the next host-planned verify window loads its draft rows'
     /// misses (`DraftLoads`): under `Auto`, while the real row's loads a
     /// window average 2 or more (off again under 1).
@@ -4200,7 +4424,7 @@ fn plan_on_device() -> bool {
 /// divergence of a reused prefix (`Session::prepare`). A prefill leaves no
 /// horizon (its tiles are not windowed), nor does a step run inside a
 /// verify's window; those reset, as before.
-impl crate::nn::model::CacheRewind for Cache {
+impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
     fn rewind_horizon(&self) -> usize {
         self.standing_horizon()
     }
@@ -4232,7 +4456,7 @@ mod tests {
         use lloom_tensor::DType;
         let dev = lloom_tensor::Device::Cpu;
         let cfg = Config::tiny();
-        let mut model = super::super::testing::resident_model(&cfg, &dev);
+        let mut model = super::super::testing::resident_model::<CrownExact>(&cfg, &dev);
         let int8 = KvPrecision::quantized(KvQuant::Int8).unwrap();
         let err = model.set_kv_precision(int8).unwrap_err().to_string();
         assert!(err.contains("Metal-only"), "{err}");
@@ -4243,7 +4467,7 @@ mod tests {
         model
             .set_kv_precision(KvPrecision::dense(DType::F16))
             .unwrap();
-        let cache = Cache::new(model.config());
+        let cache = State::<CrownExact>::new(model.config());
         let full = cfg
             .layer_types
             .iter()
@@ -4251,24 +4475,35 @@ mod tests {
             .unwrap();
         assert_eq!(cache.kv[full].precision(), KvPrecision::dense(DType::F16));
         let pools = model.state_pools(2, &dev);
-        let err = Cache::in_pools(model.config(), &pools)
+        let err = State::<PoolExact>::in_pools(model.config(), &pools)
             .unwrap_err()
             .to_string();
         assert!(err.contains("paged KV pool"), "{err}");
         let mut f32_cfg = model.config().clone();
         f32_cfg.kv_precision = super::super::config::DEFAULT_KV_PRECISION;
-        Cache::in_pools(&f32_cfg, &pools).unwrap();
-        // One row keeps its own caches: every store is served there.
-        let one = model.state_pools(1, &dev);
+        State::<PoolExact>::in_pools(&f32_cfg, &pools).unwrap();
+        // The rewindable shape keeps its own KV: every store is served there.
+        let one = model.spec_pools(1, 1, &dev);
         let mut q_cfg = f32_cfg.clone();
         q_cfg.kv_precision = int8;
-        Cache::in_pools(&q_cfg, &one).unwrap();
+        State::<RewindableExact>::in_ring(&q_cfg, &one).unwrap();
+        // The shapes are types: a `No × One` state is never leased from pools,
+        // a `Paged` one never built on its own.
+        let err = State::<PoolExact>::in_pools(&f32_cfg, &one)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("carries none"), "{err}");
+        let err = State::<RewindableExact>::in_ring(&f32_cfg, &pools)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("keeps its own KV"), "{err}");
     }
 
     use super::super::config::LayerKind;
     use super::super::moe::Resident;
     use super::super::testing::{deltanet, hc, lin, moe, ones, qsa, wt};
     use super::*;
+    use crate::profile::{CrownExact, PoolExact, RewindableExact};
     use lloom_tensor::quantized::QMatMul;
     use lloom_tensor::Device;
 
@@ -4284,30 +4519,31 @@ mod tests {
                                   // Non-zero embedding table (a zero table gives zero input → zero logits).
         let embed = QMatMul::Tensor(wt((cfg.vocab_size, cfg.hidden_size), 0.5, &dev));
 
-        let layers: Vec<Layer<Resident>> = (0..cfg.n_layers)
+        let layers: Vec<Layer<CrownExact, Resident>> = (0..cfg.n_layers)
             .map(|l| {
                 let mixer = match cfg.layer_types[l] {
-                    LayerKind::Linear => Mixer::Linear(deltanet(&cfg, &dev)),
-                    LayerKind::Full => Mixer::Full(qsa(&cfg, &dev)),
+                    LayerKind::Linear => Mixer::Linear(deltanet::<CrownExact>(&cfg, &dev)),
+                    LayerKind::Full => Mixer::Full(qsa::<CrownExact>(&cfg, &dev)),
                 };
                 Layer {
                     hc_attn: hc(&cfg, l as f32, &dev),
                     mixer,
                     hc_ffn: hc(&cfg, l as f32 + 50.0, &dev),
-                    moe: moe(&cfg, &dev),
+                    moe: moe::<CrownExact>(&cfg, &dev),
                 }
             })
             .collect();
 
-        let model = Qwen4Exp::new(
+        let model = Qwen4Exp::<CrownExact, _>::new(
             embed,
             layers,
             hc(&cfg, 999.0, &dev),                           // hc_head
             lin(cfg.vocab_size, cfg.hidden_size, 7.0, &dev), // lm_head
             cfg.clone(),
-        );
+        )
+        .unwrap();
 
-        let mut cache = Cache::new(&cfg);
+        let mut cache = State::<CrownExact>::new(&cfg);
         let id = Tensor::from_vec(vec![3u32], (1, 1), &dev).unwrap();
 
         // crown path: &mut () observer inlines to nothing.
@@ -4336,7 +4572,7 @@ mod tests {
             let ple_dim = head_dim * hash.n_heads();
             let table = super::super::ple::PleTable::Dense(wt((rows, head_dim), 3.0, &dev));
             let hc_dim = cfg.hc_dim();
-            let block = super::super::ple::PleLayer::new(
+            let block = super::super::ple::PleLayer::<CrownExact>::new(
                 lin(hc_dim, ple_dim, 21.0, &dev),
                 lin(cfg.hidden_size, ple_dim, 22.0, &dev),
                 ones(hc_dim, &dev),
@@ -4349,31 +4585,32 @@ mod tests {
                 cfg.norm_eps as f32,
             )
             .unwrap();
-            let mut with_ple = Qwen4Exp::new(
+            let mut with_ple = Qwen4Exp::<CrownExact, _>::new(
                 QMatMul::Tensor(wt((cfg.vocab_size, cfg.hidden_size), 0.5, &dev)),
                 (0..cfg.n_layers)
                     .map(|l| {
                         let mixer = match cfg.layer_types[l] {
-                            LayerKind::Linear => Mixer::Linear(deltanet(&cfg, &dev)),
-                            LayerKind::Full => Mixer::Full(qsa(&cfg, &dev)),
+                            LayerKind::Linear => Mixer::Linear(deltanet::<CrownExact>(&cfg, &dev)),
+                            LayerKind::Full => Mixer::Full(qsa::<CrownExact>(&cfg, &dev)),
                         };
                         Layer::new(
                             hc(&cfg, l as f32, &dev),
                             mixer,
                             hc(&cfg, l as f32 + 50.0, &dev),
-                            moe(&cfg, &dev),
+                            moe::<CrownExact>(&cfg, &dev),
                         )
                     })
                     .collect(),
                 hc(&cfg, 999.0, &dev),
                 lin(cfg.vocab_size, cfg.hidden_size, 7.0, &dev),
                 cfg.clone(),
-            );
+            )
+            .unwrap();
             with_ple.set_ple(ple_layer, hash, table, block).unwrap();
             let toks: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9];
             let mut run = |mode: PrefillMode| -> (Vec<f32>, Vec<f32>, usize) {
                 with_ple.set_prefill_mode(mode);
-                let mut cache = Cache::new(&cfg);
+                let mut cache = State::<CrownExact>::new(&cfg);
                 let input = Tensor::from_vec(toks.clone(), (1, toks.len()), &dev).unwrap();
                 let logits = with_ple.forward(&input, 0, &mut cache).unwrap();
                 // one decode step after the prompt, so the carried state matters
@@ -4434,7 +4671,7 @@ mod tests {
         // What makes an activation's buffer reusable at all: a plan cache.
         m.enable_pass_plans(lloom_tensor::metal_backend::ArenaLayout::Packed);
         let cfg = super::super::config::Config::tiny();
-        let model = super::super::testing::resident_model(&cfg, &dev);
+        let model = super::super::testing::resident_model::<CrownExact>(&cfg, &dev);
         let h = Tensor::ones((1, 1, cfg.hidden_size), DType::F32, &dev)?;
         let a = model.replay_input_owned(&h)?;
         model.replay_read_encoded(&a);

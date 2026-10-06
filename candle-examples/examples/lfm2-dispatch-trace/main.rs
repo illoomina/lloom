@@ -40,7 +40,7 @@ use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::models::lfm2::{AttnImpl, ConvState, KvAppend, Model, Shape as Lfm2Shape, State};
 use lloom::nn::VarBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -352,7 +352,12 @@ fn render(step: &Step) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key(&args)?;
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     // Before anything that needs a model or a GPU: did the feature arrive?
     // Checked first so the answer costs nothing and cannot be confused with a
     // load failure (issue #185).
@@ -490,8 +495,9 @@ fn main() -> Result<()> {
         vb
     };
 
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let model = Model::<P>::new(&config, vb).context("constructing LFM2 model")?;
+    let mut cache =
+        State::<P>::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
@@ -1216,4 +1222,20 @@ fn main() -> Result<()> {
             .join(",")
     );
     Ok(())
+}
+
+/// The profile the run's axes name (`profiles-and-memory-design.md` §3):
+/// `--kv-append` and `--conv-state` as `run` resolves them, read off
+/// `Config::profile_key` at the contract in force; a divergence from `run`'s
+/// resolution is refused by `Model::new` (`Config::check_shape`).
+fn shape_key(args: &Args) -> Result<lloom::profile::ProfileKey> {
+    let mut config = lloom::models::lfm2::Config::default();
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => KvAppend::Cat,
+        "in-place" => KvAppend::InPlace,
+        "paged" => KvAppend::Paged,
+        other => anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"),
+    };
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    Ok(config.profile_key())
 }

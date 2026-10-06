@@ -14,6 +14,7 @@ use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::{testing, Config, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::CrownExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKey, PassKind};
 use lloom_tensor::{Device, Result};
 
@@ -40,14 +41,14 @@ fn metal(dev: &Device) -> &MetalDevice {
 
 /// `steps` greedy ids for `PROMPT` through the driver (`Session::decode`),
 /// on a fresh session over `model`.
-fn decode(model: &Qwen4Exp<Resident>, dev: &Device, steps: usize) -> Result<Vec<u32>> {
+fn decode(model: &Qwen4Exp<CrownExact, Resident>, dev: &Device, steps: usize) -> Result<Vec<u32>> {
     let cfg = tiny();
     let mut session = Session::new(model, model.new_cache(&cfg, dev)?);
     decode_on(&mut session, dev, steps)
 }
 
 fn decode_on(
-    session: &mut Session<'_, Qwen4Exp<Resident>>,
+    session: &mut Session<'_, Qwen4Exp<CrownExact, Resident>>,
     dev: &Device,
     steps: usize,
 ) -> Result<Vec<u32>> {
@@ -64,7 +65,7 @@ fn decode_on(
 /// The pool path's ids: a fresh device, no plans, no warmup.
 fn pool_reference() -> Result<Vec<u32>> {
     let dev = Device::new_metal(0)?;
-    let model = testing::resident_model(&tiny(), &dev);
+    let model = testing::resident_model::<CrownExact>(&tiny(), &dev);
     let want = decode(&model, &dev, STEPS)?;
     assert_eq!(want.len(), STEPS);
     assert!(
@@ -83,7 +84,7 @@ fn a_warmup_under_the_paused_cache_records_nothing_and_decodes_the_pool_paths_id
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
     {
         let _paused = m.pause_pass_plans()?;
@@ -132,7 +133,7 @@ fn a_key_pending_at_the_pause_is_not_closed_by_the_paused_passes() -> Result<()>
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
     let cfg = tiny();
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, &dev);
     // A one-id run ends on a key's first sight: left pending, its recorder
     // installed.
     decode(&model, &dev, 1)?;

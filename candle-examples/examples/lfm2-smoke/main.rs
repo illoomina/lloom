@@ -111,7 +111,7 @@ use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::models::lfm2::{AttnImpl, ConvState, KvAppend, Model, Shape as Lfm2Shape, State};
 use lloom::nn::ops::KvQuant;
 use lloom::nn::VarBuilder;
 use std::path::PathBuf;
@@ -336,6 +336,12 @@ fn main() -> Result<()> {
     // A gate states its contract: deterministic, unless LLOOM_PROFILE names one.
     candle::tuning::pin_contract(candle::tuning::Contract::Deterministic)
         .map_err(anyhow::Error::msg)?;
+    let key = shape_key(&args)?;
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
+
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     let contract = candle::tuning::gate_contract("lfm2-smoke").map_err(anyhow::Error::msg)?;
     println!("CONTRACT {}", contract.report());
 
@@ -472,8 +478,9 @@ fn main() -> Result<()> {
         vb
     };
 
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let model = Model::<P>::new(&config, vb).context("constructing LFM2 model")?;
+    let mut cache =
+        State::<P>::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     // Greedy, and it is a constraint rather than a default (issue #121). Under
     // sampling the turn-2 substring check is a coin flip and this harness
@@ -651,4 +658,20 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The profile the run's axes name (`profiles-and-memory-design.md` §3):
+/// `--kv-append` and `--conv-state` as `run` resolves them, read off
+/// `Config::profile_key` at the contract in force; a divergence from `run`'s
+/// resolution is refused by `Model::new` (`Config::check_shape`).
+fn shape_key(args: &Args) -> Result<lloom::profile::ProfileKey> {
+    let mut config = lloom::models::lfm2::Config::default();
+    config.kv_append = match args.kv_append.as_str() {
+        "cat" => KvAppend::Cat,
+        "in-place" => KvAppend::InPlace,
+        "paged" => KvAppend::Paged,
+        other => anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"),
+    };
+    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    Ok(config.profile_key())
 }

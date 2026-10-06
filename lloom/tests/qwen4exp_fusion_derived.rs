@@ -14,6 +14,7 @@ use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
 use lloom::optimizer::Policy;
+use lloom::profile::CrownExact;
 use lloom_tensor::kernels::metal::profile;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -30,16 +31,16 @@ fn config() -> Config {
     cfg
 }
 
-fn model(dev: &Device) -> Qwen4Exp<Resident> {
+fn model(dev: &Device) -> Qwen4Exp<CrownExact, Resident> {
     testing::set_f16_stems(true);
-    testing::resident_model(&config(), dev)
+    testing::resident_model::<CrownExact>(&config(), dev)
 }
 
 /// A step's logits and its census, every label with its count.
 type Step = (Vec<f32>, Vec<(String, u64)>);
 
 /// Two decode steps from an empty cache; the second step's [`Step`].
-fn step(m: &Qwen4Exp<Resident>, dev: &Device) -> Result<Step> {
+fn step(m: &Qwen4Exp<CrownExact, Resident>, dev: &Device) -> Result<Step> {
     let cfg = config();
     let mut cache = m.new_cache(&cfg, dev)?;
     let first = Tensor::new(&[[3u32]], dev)?;

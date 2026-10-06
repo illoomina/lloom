@@ -44,12 +44,27 @@ pub fn var_builder(dtype: DType, dev: &Device) -> VarBuilder<'static> {
 }
 
 /// An LFM2 model of `cfg` built by `Model::new` over ghost weights.
-pub fn lfm2(
+pub fn lfm2<P: crate::profile::Profile>(
     cfg: &crate::models::lfm2::Config,
     dtype: DType,
     dev: &Device,
-) -> Result<crate::models::lfm2::Model> {
-    crate::models::lfm2::Model::new(cfg, var_builder(dtype, dev))
+) -> Result<crate::models::lfm2::Model<P>> {
+    crate::models::lfm2::Model::<P>::new(cfg, var_builder(dtype, dev))
+}
+
+/// The walk of `cfg`'s LFM2 model over ghost weights, at the profile the
+/// config's axes name (`Config::profile_key`, one `dispatch!` arm): what a
+/// test that walks many configs calls, naming no profile of its own.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn lfm2_graph(
+    cfg: &crate::models::lfm2::Config,
+    dtype: DType,
+    dev: &Device,
+) -> Result<crate::optimizer::Graph> {
+    let key = cfg.exact_key();
+    crate::profile::dispatch!(key, crate::profile::LFM2, P => {
+        lfm2::<P>(cfg, dtype, dev).map(|m| crate::optimizer::walk(&m))
+    })
 }
 
 #[cfg(test)]

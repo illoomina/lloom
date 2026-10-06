@@ -32,9 +32,10 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{BatchPool, Cache, Config, GateFusion, Model};
+use lloom::models::lfm2::{BatchPool, Config, GateFusion, Model, Shape as Lfm2Shape, State};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
+use lloom::profile::Profile;
 use lloom_macros::Options;
 use lloom_tensor::{DType, Device};
 use std::collections::HashMap;
@@ -200,8 +201,8 @@ fn prompt_set(n: usize) -> Vec<&'static str> {
 /// What `run` needs from the engine: the model it loaded, the config it was
 /// built from, the EOS set, the knobs, and — under `--rows pool*` — the pool
 /// every sequence's cache is a slot of.
-pub struct Ctx<'a> {
-    pub model: &'a Model,
+pub struct Ctx<'a, P: Profile> {
+    pub model: &'a Model<P>,
     pub config: &'a Config,
     pub device: &'a Device,
     pub dtype: DType,
@@ -274,8 +275,8 @@ struct Timed {
     ttft_ms: f64,
 }
 
-fn decode(
-    session: &mut Session<'_, Model>,
+fn decode<P: Lfm2Shape>(
+    session: &mut Session<'_, Model<P>>,
     arm: &mut Arm,
     prompt: &[u32],
     opts: &DecodeOptions,
@@ -299,8 +300,8 @@ fn decode(
 
 /// One prefill visit: feed `prompt` onto the session and produce nothing
 /// (`Session::prefill`, the CHUNK seam).
-fn prefill(
-    session: &mut Session<'_, Model>,
+fn prefill<P: Lfm2Shape>(
+    session: &mut Session<'_, Model<P>>,
     arm: &mut Arm,
     prompt: &[u32],
     opts: &DecodeOptions,
@@ -316,7 +317,7 @@ fn prefill(
 /// synthetic prompt of exactly `P` body tokens (the corpus's long-summarize
 /// text repeated, cut at `P`, inside the same chat template), so a long prompt
 /// arrives beside the short ones.
-fn prompt_ids(ctx: &Ctx<'_>, n: usize) -> Result<Vec<Vec<u32>>> {
+fn prompt_ids<P: Lfm2Shape>(ctx: &Ctx<'_, P>, n: usize) -> Result<Vec<Vec<u32>>> {
     let mut prompts: Vec<Vec<u32>> = prompt_set(n)
         .iter()
         .map(|p| (ctx.encode)(&user_turn_text(p)))
@@ -455,20 +456,34 @@ impl LiveStats {
     }
 }
 
+/// The evidence the speculative drivers take: the `Ring` shapes give it,
+/// the `No` shapes refuse by name (`profiles-and-memory-design.md` §7.3).
+fn rewindable<P: Profile>() -> Result<lloom::profile::RewindProof<P>> {
+    lloom::profile::RewindProof::<P>::ask().with_context(|| {
+        format!(
+            "the speculative mode on the {} shape: it needs `Ring`",
+            P::KEY
+        )
+    })
+}
+
 /// A sequence's cache: a slot of the pool under `--rows pool*`, else its own.
-fn new_cache(
+fn new_cache<P: Lfm2Shape>(
     pool: Option<&BatchPool>,
     dtype: DType,
     config: &Config,
     device: &Device,
-) -> Result<Cache> {
-    Ok(match pool {
-        Some(p) => Cache::for_batch(true, dtype, config, device, p)?,
-        None => Cache::new(true, dtype, config, device)?,
-    })
+) -> Result<State<P>> {
+    Ok(P::state(
+        config,
+        dtype,
+        device,
+        config.max_position_embeddings,
+        pool,
+    )?)
 }
 
-pub fn run(ctx: Ctx<'_>) -> Result<()> {
+pub fn run<P: Lfm2Shape>(ctx: Ctx<'_, P>) -> Result<()> {
     let budget = ctx.spec.commit_budget;
     let lookahead = if ctx.spec.readback == "blocking" {
         0
@@ -539,7 +554,12 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
 
 /// `--mode reuse`: turn 1, then turn 2 through `prepare` (reuse) vs a fresh
 /// prefill, and whether the two turn-2 streams agree.
-fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str) -> Result<()> {
+fn run_reuse<P: Lfm2Shape>(
+    ctx: &Ctx<'_, P>,
+    opts: &DecodeOptions,
+    capacity: usize,
+    common: &str,
+) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let turn1 = (ctx.encode)(&user_turn_text(TURN_1))?;
     let mut session = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
@@ -627,8 +647,8 @@ fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str)
 
 /// `--mode concurrent` (non-speculative): N sequences interleaved in `chunk`-token
 /// visits, live stats repainting per visit, then the RESULT line.
-fn run_concurrent(
-    ctx: &Ctx<'_>,
+fn run_concurrent<P: Lfm2Shape>(
+    ctx: &Ctx<'_, P>,
     opts: &DecodeOptions,
     capacity: usize,
     common: &str,
@@ -659,7 +679,7 @@ fn run_concurrent(
     // through `prepare`. Per-sequence stamps: the arrival, the first token,
     // and every visit that streamed a token (the inter-visit gap of a decoding
     // sequence is what another sequence's prefill stretches).
-    let mut sessions: Vec<Session<'_, Model>> = (0..n)
+    let mut sessions: Vec<Session<'_, Model<P>>> = (0..n)
         .map(|_| {
             Ok(Session::new(
                 model,
@@ -870,7 +890,7 @@ impl SpecArm {
 /// `--mode concurrent --dspark`: every prompt solo through the serial
 /// speculative loop, and all through the pipelined driver, with the live stats
 /// repainting on the pipelined arm's per-sequence callback.
-fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
+fn run_dspark_concurrent<P: Lfm2Shape>(ctx: &Ctx<'_, P>, common: &str) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let (draft_dir, dcfg) = ctx
         .dspark_setup
@@ -921,6 +941,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         let mut rb = Blocking::new(ctx.eos_ids, device)?;
         let warm = DecodeOptions::new(16);
         let _ = s.decode_speculative(
+            rewindable::<P>()?,
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -942,6 +963,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
             let mut rb = Blocking::new(ctx.eos_ids, device)?;
             let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
             let out = s.decode_speculative(
+                rewindable::<P>()?,
                 spec,
                 &mut rb,
                 &mut sampler,
@@ -965,7 +987,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         })
     };
     let run_pipelined = |spec: &mut DSparkSpeculator| -> Result<SpecArm> {
-        let mut sessions: Vec<Session<'_, Model>> = (0..n)
+        let mut sessions: Vec<Session<'_, Model<P>>> = (0..n)
             .map(|_| {
                 Ok(Session::new(
                     model,
@@ -980,6 +1002,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         let t = Instant::now();
         let outs = Session::decode_speculative_pipelined(
             &mut sessions,
+            rewindable::<P>()?,
             spec,
             &prompt_refs,
             &opts,
@@ -1175,7 +1198,7 @@ impl SoloKernels {
     /// `--force-gemm m` (or `both`) with every GEMV-only epilogue the model
     /// runs off — the model's, since `Fusion=Derived` decides them rather
     /// than the config.
-    fn of(model: &Model, config: &Config) -> Self {
+    fn of<P: Profile>(model: &Model<P>, config: &Config) -> Self {
         let forced = matches!(
             lloom_tensor::tuning::tuning().gemm.force.as_deref(),
             Some("m" | "both")
@@ -1495,17 +1518,17 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// One arm of a replay: its passes, and as many copies of the row's cache as
 /// its widest step, prefilled as every arm prefills (`forward` per
 /// `prefill_tile` of the prompt).
-struct ReplayArm<'p> {
+struct ReplayArm<'p, P: Profile> {
     passes: &'p [Pass],
-    caches: Vec<Cache>,
+    caches: Vec<State<P>>,
     /// The copies still in step with the row: a step of `m` rows advances the
     /// first `m`.
     live: usize,
 }
 
-impl<'p> ReplayArm<'p> {
+impl<'p, P: Lfm2Shape> ReplayArm<'p, P> {
     fn new(
-        ctx: &Ctx<'_>,
+        ctx: &Ctx<'_, P>,
         prompt: &[u32],
         passes: &'p [Pass],
         upto: usize,
@@ -1553,7 +1576,7 @@ impl<'p> ReplayArm<'p> {
     /// `t` and whether the copies agreed.
     fn step(
         &mut self,
-        ctx: &Ctx<'_>,
+        ctx: &Ctx<'_, P>,
         t: usize,
         token: u32,
         pos: usize,
@@ -1579,7 +1602,7 @@ impl<'p> ReplayArm<'p> {
                     CausalLM::prepare_pass(ctx.model, cache, 1)?;
                 }
                 let input = Tensor::new(vec![token; m].as_slice(), ctx.device)?.reshape((m, 1))?;
-                let mut rows: Vec<Row<'_, Cache>> = self.caches[..m]
+                let mut rows: Vec<Row<'_, State<P>>> = self.caches[..m]
                     .iter_mut()
                     .map(|cache| Row { pos, cache })
                     .collect();
@@ -1597,7 +1620,7 @@ impl<'p> ReplayArm<'p> {
 }
 
 /// The last position's logits, on the host, as f32.
-fn host_logits(ctx: &Ctx<'_>, t: &lloom_tensor::Tensor) -> Result<Vec<f32>> {
+fn host_logits<P: Lfm2Shape>(ctx: &Ctx<'_, P>, t: &lloom_tensor::Tensor) -> Result<Vec<f32>> {
     use lloom::nn::CausalLM;
     let vocab = CausalLM::vocab_size(ctx.model);
     let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -1610,8 +1633,8 @@ fn host_logits(ctx: &Ctx<'_>, t: &lloom_tensor::Tensor) -> Result<Vec<f32>> {
 }
 
 /// Replay one row through two arms to their parting at token `at` (`Parting`).
-fn replay_parting(
-    ctx: &Ctx<'_>,
+fn replay_parting<P: Lfm2Shape>(
+    ctx: &Ctx<'_, P>,
     prompt: &[u32],
     (a, pa): (&[u32], &[Pass]),
     (b, pb): (&[u32], &[Pass]),
@@ -1683,8 +1706,8 @@ fn replay_parting(
 /// forwards on the same route, and to tier 2 where one took the `m = 1` GEMV
 /// and the other the batch's GEMM (`row_verdict`); a parting there must
 /// replay as a near-tie. Anything else fails the run.
-fn run_batched_concurrent(
-    ctx: &Ctx<'_>,
+fn run_batched_concurrent<P: Lfm2Shape>(
+    ctx: &Ctx<'_, P>,
     opts: &DecodeOptions,
     capacity: usize,
     common: &str,
@@ -1711,7 +1734,7 @@ fn run_batched_concurrent(
     // pipelines `Session::warmup` compiled are the prefill's; a batched step at
     // `m = B` keys its own `align_m` variant (§13.1i).
     {
-        let mut sessions: Vec<Session<'_, Model>> = (0..n)
+        let mut sessions: Vec<Session<'_, Model<P>>> = (0..n)
             .map(|_| {
                 Ok(Session::new(
                     model,
@@ -1769,7 +1792,7 @@ fn run_batched_concurrent(
         })
     };
     let run_batched = |label: &'static str, rows: &[usize]| -> Result<BatchArm> {
-        let mut sessions: Vec<Session<'_, Model>> = rows
+        let mut sessions: Vec<Session<'_, Model<P>>> = rows
             .iter()
             .map(|_| {
                 Ok(Session::new(
@@ -2049,7 +2072,9 @@ fn run_batched_concurrent(
         "pass"
     };
     if fast && failures.is_empty() {
-        eprintln!("[rows gate: unverified under the fast contract; --profile deterministic to certify]");
+        eprintln!(
+            "[rows gate: unverified under the fast contract; --profile deterministic to certify]"
+        );
     }
 
     // The batched arm's step shape: median step, mean live rows per step.

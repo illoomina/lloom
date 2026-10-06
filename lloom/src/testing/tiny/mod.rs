@@ -187,7 +187,9 @@ impl Workload {
 /// A served model family at tiny geometry.
 pub trait TinyFamily: Sized {
     type Config: TinyConfig;
-    type Model: crate::nn::model::CausalLM<Config = Self::Config>;
+    /// The family at a profile: a checkpoint has no profile, a built model
+    /// names one (`profiles-and-memory-design.md` §3; #892 B3).
+    type Model<P: crate::profile::Profile>: crate::nn::model::CausalLM<Config = Self::Config>;
     /// The family's name (`lloom`'s family names).
     const NAME: &'static str;
     /// The kinds a dense matrix may be stored as.
@@ -208,16 +210,22 @@ pub trait TinyFamily: Sized {
     /// The workloads that reach the family's arms at `cfg`.
     fn workloads(cfg: &Self::Config) -> Vec<Workload>;
     /// The model in memory.
-    fn build(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Self::Model>;
+    fn build<P: crate::profile::Profile>(
+        ckpt: &TinyCheckpoint<Self>,
+        dev: &Device,
+    ) -> Result<Self::Model<P>>;
     /// The checkpoint's files in `dir`; the path `lloom --model` takes.
     fn write(ckpt: &TinyCheckpoint<Self>, dir: &Path) -> Result<PathBuf>;
     /// A written checkpoint, through the family's real loader.
-    fn load(path: &Path, dev: &Device) -> Result<Self::Model>;
+    fn load<P: crate::profile::Profile>(path: &Path, dev: &Device) -> Result<Self::Model<P>>;
 
     /// The CPU oracle for `ckpt`: the same values, every packed tensor
     /// dequantized, computed at f32.
-    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Self::Model> {
-        Self::build(&ckpt.dequantized().with_dtype(DType::F32), dev)
+    fn reference<P: crate::profile::Profile>(
+        ckpt: &TinyCheckpoint<Self>,
+        dev: &Device,
+    ) -> Result<Self::Model<P>> {
+        Self::build::<P>(&ckpt.dequantized().with_dtype(DType::F32), dev)
     }
 
     /// Runtime arms a campaign varies beside the geometry (an attention
@@ -293,9 +301,9 @@ impl<F: TinyFamily> TinyCheckpoint<F> {
         F::schema(self)
     }
 
-    /// The model in memory (unit tests).
-    pub fn model(&self, dev: &Device) -> Result<F::Model> {
-        F::build(self, dev)
+    /// The model in memory (unit tests), at the profile the test names.
+    pub fn model<P: crate::profile::Profile>(&self, dev: &Device) -> Result<F::Model<P>> {
+        F::build::<P>(self, dev)
     }
 
     /// The files (loader and e2e tests); the path `lloom --model` takes.

@@ -13,6 +13,7 @@ use lloom::models::qwen4exp::testing::{
     gguf_bytes, scale_config_of, scale_manifest_path, scale_roles, Qwen4ExpTiny,
 };
 use lloom::models::qwen4exp::{Config, Qwen4Exp};
+use lloom::profile::CrownExact;
 use lloom::testing::scale::{Bulk, Fill, ShapeManifest, ShardShape, Synthetic, TensorShape};
 use lloom::testing::tiny::{run, Role, TinyCheckpoint, Workload};
 use lloom_tensor::quantized::gguf_file::Content;
@@ -123,14 +124,14 @@ fn a_sparse_copy_is_the_checkpoint_where_filled_and_zeros_where_holed() -> Resul
     };
     let v = ckpt.cfg.vocab_size;
     let reference = run(
-        &Qwen4Exp::from_gguf_shards(&[real], &dev, &opts)?,
+        &Qwen4Exp::<CrownExact, _>::from_gguf_shards(&[real], &dev, &opts)?,
         &ckpt.cfg,
         v,
         &dev,
         &work,
     )?;
     let copy = run(
-        &Qwen4Exp::from_gguf_shards(&full, &dev, &opts)?,
+        &Qwen4Exp::<CrownExact, _>::from_gguf_shards(&full, &dev, &opts)?,
         &ckpt.cfg,
         v,
         &dev,
@@ -141,7 +142,7 @@ fn a_sparse_copy_is_the_checkpoint_where_filled_and_zeros_where_holed() -> Resul
         "the filled copy's model is the checkpoint's"
     );
     let holed_run = run(
-        &Qwen4Exp::from_gguf_shards(&hole, &dev, &opts)?,
+        &Qwen4Exp::<CrownExact, _>::from_gguf_shards(&hole, &dev, &opts)?,
         &ckpt.cfg,
         v,
         &dev,

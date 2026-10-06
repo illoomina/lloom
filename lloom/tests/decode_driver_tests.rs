@@ -23,6 +23,7 @@ use lloom::generation::{
 use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::speculator::{Draft, NoProbe, SeqId, TargetProbe};
 use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Speculator};
+use lloom::profile::RewindableExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;
@@ -796,6 +797,7 @@ fn the_refusals_refuse() -> Result<()> {
     struct Drafts;
     impl Speculator for Drafts {
         type Probe = NoProbe;
+        type Family = lloom::nn::speculator::Identity;
         fn n_seq(&self) -> usize {
             1
         }
@@ -1687,7 +1689,7 @@ mod tiny_lfm2 {
         }
     }
 
-    pub fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+    pub fn build<P: lloom::models::lfm2::Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
         let mut tensors = std::collections::HashMap::new();
         let mut fill = |name: &str, shape: Vec<usize>, salt: usize| -> Result<()> {
             let n: usize = shape.iter().product();
@@ -1740,14 +1742,17 @@ mod tiny_lfm2 {
             }
         }
         let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
-        Model::new(cfg, vb)
+        Model::<P>::new(cfg, vb)
     }
 
     /// Every conv block's live window — the `l_cache` columns the next decode
     /// step reads — as f32 bits. The whole state on `Shuffle`; on a rotating
     /// ring the slots ending at the phase, since the ring's other slots hold
     /// history a rewind has already stepped back over.
-    pub fn conv_windows(cache: &lloom::models::lfm2::Cache, cfg: &Config) -> Result<Vec<Vec<u32>>> {
+    pub fn conv_windows<P: lloom::profile::Profile>(
+        cache: &lloom::models::lfm2::State<P>,
+        cfg: &Config,
+    ) -> Result<Vec<Vec<u32>>> {
         let l = cfg.conv_l_cache;
         let mut out = Vec::new();
         for b in 0..cfg.num_hidden_layers {
@@ -1802,15 +1807,15 @@ struct GateCase {
 /// One run of the crown's flow on `model` from `cache`: the ring polled, the
 /// adaptive commit, the fused publish, the gate as asked.
 #[cfg(feature = "metal")]
-fn gated_flow<'m>(
-    model: &'m lloom::models::lfm2::Model,
-    cache: Result<lloom::models::lfm2::Cache>,
+fn gated_flow<'m, P: lloom::models::lfm2::Shape>(
+    model: &'m lloom::models::lfm2::Model<P>,
+    cache: Result<lloom::models::lfm2::State<P>>,
     eos: u32,
     dev: &Device,
     gate: bool,
     max_tokens: usize,
 ) -> Result<(
-    Session<'m, lloom::models::lfm2::Model>,
+    Session<'m, lloom::models::lfm2::Model<P>>,
     lloom::nn::DecodeOut,
 )> {
     let mut s = Session::new(model, cache?);
@@ -1842,15 +1847,26 @@ fn gate_cache_case(
     conv_state: lloom::models::lfm2::ConvState,
     conv_fused: bool,
 ) -> Result<GateCase> {
-    use lloom::models::lfm2::Cache;
+    use lloom::models::lfm2::State;
     const EXTRA: usize = 12;
     let dev = Device::new_metal(0).expect("metal");
     let cfg = tiny_lfm2::config(conv_state, conv_fused);
-    let model = tiny_lfm2::build(&cfg, &dev)?;
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => gate_cache_case_at::<P>(&cfg, &dev))
+}
+
+/// `gate_cache_case` at the profile the config names.
+fn gate_cache_case_at<P: lloom::models::lfm2::Shape>(
+    cfg: &lloom::models::lfm2::Config,
+    dev: &Device,
+) -> Result<GateCase> {
+    use lloom::models::lfm2::State;
+    const EXTRA: usize = 12;
     let prompt = [1u32, 2, 3, 4, 5];
-    let fresh = || Cache::new(true, DType::F16, &cfg, &dev);
+    let model = tiny_lfm2::build::<P>(&cfg, &dev)?;
+    let fresh = || State::<P>::new(true, DType::F16, &cfg, &dev);
     let never = [u32::MAX];
-    let greedy_blocking = |s: &mut Session<'_, lloom::models::lfm2::Model>,
+    let greedy_blocking = |s: &mut Session<'_, lloom::models::lfm2::Model<P>>,
                            eos: &[u32],
                            p: &[u32],
                            n: usize|
@@ -2321,17 +2337,17 @@ struct Conversation {
 }
 
 #[cfg(feature = "metal")]
-fn converse(
-    model: &lloom::models::lfm2::Model,
-    cache: lloom::models::lfm2::Cache,
+fn converse<P: lloom::models::lfm2::Shape>(
+    model: &lloom::models::lfm2::Model<P>,
+    cache: lloom::models::lfm2::State<P>,
     rb: &mut AnyArm,
     opts: &dyn Fn(usize) -> DecodeOptions,
     prompt: &[u32],
     eos: u32,
     user2: &[u32],
 ) -> Result<Conversation> {
-    fn turn(
-        s: &mut Session<'_, lloom::models::lfm2::Model>,
+    fn turn<P: lloom::models::lfm2::Shape>(
+        s: &mut Session<'_, lloom::models::lfm2::Model<P>>,
         rb: &mut AnyArm,
         prompt: &[u32],
         opts: DecodeOptions,
@@ -2380,13 +2396,13 @@ fn converse(
 #[cfg(feature = "metal")]
 #[test]
 fn the_flow_and_the_fixed_cadence_agree_on_the_real_decode_kernels_across_turns() -> Result<()> {
-    use lloom::models::lfm2::{Cache, ConvState};
+    use lloom::models::lfm2::{ConvState, State};
     use lloom::nn::ReuseAction;
     let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_metal(0).expect("metal");
     let cfg = tiny_lfm2::config(ConvState::Shuffle, true);
-    let model = tiny_lfm2::build(&cfg, &dev)?;
-    let fresh = || Cache::new(true, DType::F16, &cfg, &dev);
+    let model = tiny_lfm2::build::<lloom::profile::CrownExact>(&cfg, &dev)?;
+    let fresh = || State::<lloom::profile::CrownExact>::new(true, DType::F16, &cfg, &dev);
     let prompt = [1u32, 2, 3, 4, 5];
 
     // The EOS is the stream's first token not seen earlier, at least four in,

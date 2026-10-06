@@ -13,8 +13,9 @@
 //! a one-token open leaves is compared with the slot a multi-token open leaves,
 //! both read from the model rather than restated here.
 
-use lloom::models::lfm2::{Cache, Config, ConvState, Model};
+use lloom::models::lfm2::{Config, ConvState, Model, Shape as Lfm2Shape, State};
 use lloom::models::lfm2_testing::{run_dtype, Lfm2Tiny};
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -41,19 +42,19 @@ fn config(conv_state: ConvState) -> Config {
     cfg
 }
 
-fn model(cfg: &Config, dev: &Device) -> Result<Model> {
-    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default()).model(dev)
+fn model<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
+    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default()).model::<P>(dev)
 }
 
 /// Every logit of every pass of `work`, as bits, and the conv phase the
 /// one-token open left.
-fn run(
-    model: &Model,
+fn run<P: Lfm2Shape>(
+    model: &Model<P>,
     cfg: &Config,
     dev: &Device,
     work: &[(usize, usize)],
 ) -> Result<(Vec<u32>, usize)> {
-    let mut cache = Cache::new(true, run_dtype(dev), cfg, dev)?;
+    let mut cache = State::<P>::new(true, run_dtype(dev), cfg, dev)?;
     let mut out = Vec::new();
     let mut pos = 0usize;
     let mut id = 3u32;
@@ -91,8 +92,8 @@ fn push(out: &mut Vec<u32>, logits: &Tensor) -> Result<()> {
 
 /// The conv phase a multi-token first pass leaves: where a prefill seeds the
 /// newest column.
-fn prefill_seed(model: &Model, cfg: &Config, dev: &Device) -> Result<usize> {
-    let mut cache = Cache::new(true, run_dtype(dev), cfg, dev)?;
+fn prefill_seed<P: Lfm2Shape>(model: &Model<P>, cfg: &Config, dev: &Device) -> Result<usize> {
+    let mut cache = State::<P>::new(true, run_dtype(dev), cfg, dev)?;
     model.forward(
         &Tensor::from_vec(vec![5u32, 9], (1, 2), dev)?,
         0,
@@ -103,7 +104,7 @@ fn prefill_seed(model: &Model, cfg: &Config, dev: &Device) -> Result<usize> {
 
 fn opens_like_the_shuffle(dev: &Device) -> Result<()> {
     let shuffle_cfg = config(ConvState::Shuffle);
-    let shuffle = model(&shuffle_cfg, dev)?;
+    let shuffle = model::<CrownExact>(&shuffle_cfg, dev)?;
     for (w, work) in WORKLOADS.iter().enumerate() {
         let (reference, _) = run(&shuffle, &shuffle_cfg, dev, work)?;
         assert!(
@@ -112,7 +113,7 @@ fn opens_like_the_shuffle(dev: &Device) -> Result<()> {
         );
         for &(k, slack) in SLIDING {
             let cfg = config(ConvState::SlidingRing { k, slack });
-            let m = model(&cfg, dev)?;
+            let m = model::<CrownExact>(&cfg, dev)?;
             let (got, opened) = run(&m, &cfg, dev, work).map_err(|e| {
                 lloom_tensor::Error::Msg(format!(
                     "{dev:?} sliding:{k}:{slack} workload {w}: a one-token first pass failed: {e}"

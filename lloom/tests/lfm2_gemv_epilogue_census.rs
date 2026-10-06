@@ -23,8 +23,9 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{Cache, Config, GateFusion, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{Config, GateFusion, KvAppend, LayerType, Model, State};
 use lloom::nn::VarBuilder;
+use lloom::profile::CrownExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
@@ -70,7 +71,7 @@ fn tiny_config_with_gate(gemv_silu: bool, gemv_residual: bool, gemv_gate: GateFu
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<CrownExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -116,7 +117,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
-    Model::new(cfg, vb)
+    Model::<CrownExact>::new(cfg, vb)
 }
 
 /// The per-label dispatch census **of one decode step**, from `dev`'s own
@@ -127,7 +128,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
 /// and would put `gemv` names in the census that no decode step dispatched.
 fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
     let model = build(cfg, dev)?;
-    let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F16, cfg, dev)?;
 
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;

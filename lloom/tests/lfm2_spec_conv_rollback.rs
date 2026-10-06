@@ -13,9 +13,10 @@
 //! about a kernel, and the CPU backend is bit-stable and needs no GPU
 //! (`CONTRIBUTING.md` §3.1).
 
-use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
+use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::profile::RewindableExact;
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// A two-layer LFM2 — one conv layer, one attention layer — small enough to
 /// build from random weights and large enough to exercise both paths.
@@ -62,7 +63,7 @@ fn tiny_config(conv_state: ConvState) -> Config {
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<RewindableExact>> {
     // Deterministic weights: a fixed ramp, so two runs of this test agree and a
     // difference between two *paths* is attributable to the paths.
     let mut tensors = std::collections::HashMap::new();
@@ -110,7 +111,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<RewindableExact>::new(cfg, vb)
 }
 
 /// **The finding this test exists to pin.**
@@ -134,7 +135,7 @@ fn a_k_position_pass_then_resolve_matches_n_decode_steps() -> Result<()> {
     let seq: Vec<u32> = vec![6, 7, 8, 9];
 
     // --- reference: prefill, then n=2 separate decode steps -----------------
-    let mut ref_cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut ref_cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut ref_cache)?;
     let n = 2usize;
@@ -157,7 +158,7 @@ fn a_k_position_pass_then_resolve_matches_n_decode_steps() -> Result<()> {
         .to_vec1::<f32>()?;
 
     // --- speculative: prefill, one k-position pass, resolve(n) --------------
-    let mut spec_cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut spec_cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut spec_cache)?;
 
@@ -249,7 +250,7 @@ fn every_position_of_a_verify_pass_matches_its_decode_step() -> Result<()> {
     let seq: Vec<u32> = vec![6, 7, 8, 9];
     let k = seq.len();
 
-    let mut ref_cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut ref_cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut ref_cache)?;
     let mut want = Vec::new();
@@ -263,7 +264,7 @@ fn every_position_of_a_verify_pass_matches_its_decode_step() -> Result<()> {
         );
     }
 
-    let mut spec_cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut spec_cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut spec_cache)?;
     let tok = spec_cache.advance(k)?;
@@ -309,7 +310,7 @@ fn a_window_after_a_rejection_starts_from_the_rolled_back_state() -> Result<()> 
     let n = 2usize; // the first window accepts 2 of 4
 
     // Reference: n + k decode steps, one at a time.
-    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut rc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut rc)?;
     let mut want = Vec::new();
@@ -324,7 +325,7 @@ fn a_window_after_a_rejection_starts_from_the_rolled_back_state() -> Result<()> 
     }
 
     // Speculative: a k-window resolved to n, then a second k-window.
-    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut sc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut sc)?;
 
@@ -372,7 +373,7 @@ fn two_windows_on_a_conv_only_model() -> Result<()> {
     let k = 4usize;
     let n = 2usize;
 
-    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut rc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut rc)?;
     let mut want = Vec::new();
@@ -386,7 +387,7 @@ fn two_windows_on_a_conv_only_model() -> Result<()> {
         );
     }
 
-    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut sc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut sc)?;
     let tok = sc.advance(k)?;
@@ -429,7 +430,7 @@ fn two_full_windows_with_no_rejection() -> Result<()> {
     let seq: Vec<u32> = vec![6, 7, 8, 9, 10, 11, 12, 13];
     let k = 4usize;
 
-    let mut rc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut rc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut rc)?;
     let mut want = Vec::new();
@@ -443,7 +444,7 @@ fn two_full_windows_with_no_rejection() -> Result<()> {
         );
     }
 
-    let mut sc = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut sc = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut sc)?;
     let tok = sc.advance(k)?;

@@ -23,19 +23,20 @@
 
 use super::config::Config;
 use super::hc::HyperConnection;
-use super::model::{Cache, Layer, Qwen4Exp, VerifyPass};
+use super::model::{Layer, Qwen4Exp, State, VerifyPass};
 use super::moe::{ExpertResidency, WindowPlan, WindowPlanKind, WindowRecord};
 use crate::nn::speculator::{
     accept_prefix, Anchor, Draft, DraftTokens, KvSource, NextnHidden, Probes, SeqId, Speculator,
     VerifyRowRef,
 };
 use crate::nn::{CausalLM, RmsNorm};
+use crate::profile::{NoRewind, One, Own, Profile};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Device, Module, Result, Tensor, D};
 
 /// The one-layer MTP head.
 #[derive(Debug)]
-pub struct MtpHead<R: ExpertResidency> {
+pub struct MtpHead<P: Profile, R: ExpertResidency> {
     /// `pre_fc_norm_embedding` — RMS over `d` on the next token's embedding.
     norm_e: RmsNorm,
     /// `pre_fc_norm_hidden` — RMS over `n·d` on the target's carry.
@@ -44,7 +45,7 @@ pub struct MtpHead<R: ExpertResidency> {
     /// `[normed embedding | normed stream]`.
     eh_proj: QMatMul,
     /// `layers.0` — a full-attention layer with its own MoE.
-    layer: Layer<R>,
+    layer: Layer<P, R>,
     /// `hyper_connection_mixer` — the head collapse (no injection).
     head_mix: HyperConnection,
     n: usize,
@@ -53,23 +54,32 @@ pub struct MtpHead<R: ExpertResidency> {
     /// (`QWEN4EXP_MTP_FOLD`) hands the target its lane's cache, and the
     /// target hands back what the head drafted on every window row. The
     /// drafter and the target share this head.
-    fold: parking_lot::Mutex<FoldSlot>,
+    fold: parking_lot::Mutex<FoldSlot<P>>,
 }
 
 /// The lanes in flight between a drafter's `draft` and its `observe`.
-#[derive(Debug, Default)]
-struct FoldSlot {
+#[derive(Debug)]
+struct FoldSlot<P: Profile> {
     /// Lanes handed over for the next verify, the latest last.
-    pending: Vec<(SeqId, Cache)>,
+    pending: Vec<(SeqId, State<P>)>,
     /// Folded verifies awaiting their observe.
-    done: Vec<(SeqId, Folded)>,
+    done: Vec<(SeqId, Folded<P>)>,
+}
+
+impl<P: Profile> Default for FoldSlot<P> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            done: Vec::new(),
+        }
+    }
 }
 
 /// The head over a verify window's rows inside its pass, awaiting the
 /// window's readback ([`Qwen4Exp::fold_head`]).
-pub(crate) struct FoldRun {
+pub(crate) struct FoldRun<P: Profile> {
     seq: SeqId,
-    cache: Cache,
+    cache: State<P>,
     rows_before: usize,
     t: usize,
     /// The head's argmax per window row `[T]` u32, on the device.
@@ -81,7 +91,7 @@ pub(crate) struct FoldRun {
     misses_before: u64,
 }
 
-impl FoldRun {
+impl<P: Profile> FoldRun<P> {
     /// The tensors the window's readback carries for the fold: the drafts,
     /// then a device plan's record.
     pub(crate) fn read_tensors(&self) -> Vec<&Tensor> {
@@ -93,7 +103,7 @@ impl FoldRun {
     }
 
     /// The run with its readback (`read`, as [`Self::read_tensors`] laid it).
-    pub(crate) fn read(self, read: Vec<Vec<u32>>, topk: usize) -> Result<Folded> {
+    pub(crate) fn read(self, read: Vec<Vec<u32>>, topk: usize) -> Result<Folded<P>> {
         let mut read = read.into_iter();
         let drafts = read.next().unwrap_or_default();
         if drafts.len() != self.t {
@@ -123,9 +133,9 @@ impl FoldRun {
 
 /// A folded verify, read back: what its observe takes.
 #[derive(Debug)]
-pub(crate) struct Folded {
+pub(crate) struct Folded<P: Profile> {
     seq: SeqId,
-    cache: Cache,
+    cache: State<P>,
     rows_before: usize,
     drafts: Vec<u32>,
     multi: Tensor,
@@ -137,12 +147,12 @@ pub(crate) struct Folded {
     valid: bool,
 }
 
-impl<R: ExpertResidency> MtpHead<R> {
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpHead<P, R> {
     pub fn new(
         norm_e: RmsNorm,
         norm_h: RmsNorm,
         eh_proj: QMatMul,
-        layer: Layer<R>,
+        layer: Layer<P, R>,
         head_mix: HyperConnection,
         cfg: &Config,
     ) -> Self {
@@ -160,7 +170,7 @@ impl<R: ExpertResidency> MtpHead<R> {
 
     /// The head's lane cache handed over for a folded verify, and its
     /// sequence (`QWEN4EXP_MTP_FOLD`); `None` when no drafter handed one.
-    fn take_pending(&self) -> Option<(SeqId, Cache)> {
+    fn take_pending(&self) -> Option<(SeqId, State<P>)> {
         self.fold.lock().pending.pop()
     }
 
@@ -184,7 +194,7 @@ impl<R: ExpertResidency> MtpHead<R> {
         &self,
         hidden: &Tensor,
         embeds: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<(Tensor, Tensor)> {
         self.forward_with(hidden, embeds, cache, false)
     }
@@ -196,7 +206,7 @@ impl<R: ExpertResidency> MtpHead<R> {
         &self,
         hidden: &Tensor,
         embeds: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         swap_eh: bool,
     ) -> Result<(Tensor, Tensor)> {
         let (sample, multi, _) = self.forward_planned(hidden, embeds, cache, swap_eh, None)?;
@@ -211,7 +221,7 @@ impl<R: ExpertResidency> MtpHead<R> {
         &self,
         hidden: &Tensor,
         embeds: &Tensor,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         swap_eh: bool,
         kind: Option<WindowPlanKind>,
     ) -> Result<(Tensor, Tensor, Option<WindowPlan>)> {
@@ -247,11 +257,11 @@ impl<R: ExpertResidency> MtpHead<R> {
         Ok((sample, multi, record))
     }
 
-    pub fn layer(&self) -> &Layer<R> {
+    pub fn layer(&self) -> &Layer<P, R> {
         &self.layer
     }
 
-    pub fn layer_mut(&mut self) -> &mut Layer<R> {
+    pub fn layer_mut(&mut self) -> &mut Layer<P, R> {
         &mut self.layer
     }
 }
@@ -259,8 +269,8 @@ impl<R: ExpertResidency> MtpHead<R> {
 /// The MTP drafter: one token per round from the target's carry at the last
 /// accepted position, re-keyed from every accepted row. One [`MtpLane`] per
 /// sequence it drafts for.
-pub struct MtpDrafter<'a, R: ExpertResidency> {
-    head: &'a MtpHead<R>,
+pub struct MtpDrafter<'a, P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> {
+    head: &'a MtpHead<P, R>,
     /// The target's `token_embd` (shared, `mtp_use_dedicated_embeddings false`).
     embed: &'a QMatMul,
     /// The target's `lm_head` (shared).
@@ -276,7 +286,7 @@ pub struct MtpDrafter<'a, R: ExpertResidency> {
     /// The head's indexer keys per compressed block: a lane cut back to a
     /// reused prefix keeps the blocks complete within it.
     ratio: usize,
-    lanes: Vec<MtpLane>,
+    lanes: Vec<MtpLane<P>>,
     /// `QWEN4EXP_MTP_PROBE` over the generation rows of this drafter's run.
     probe: GenerationProbe,
 }
@@ -285,12 +295,12 @@ pub struct MtpDrafter<'a, R: ExpertResidency> {
 /// keeps its target cache across them (`MtpDrafter::with_lanes`,
 /// `MtpDrafter::into_lanes`): a lane keyed from a prefix the next request
 /// reuses carries that prefix's rows into it.
-pub struct MtpLanes(Vec<MtpLane>);
+pub struct MtpLanes<P: Profile>(Vec<MtpLane<P>>);
 
 /// What the drafter keeps for one sequence: the MTP layer's cache and where
 /// the sequence's drafting stands.
-struct MtpLane {
-    cache: Cache,
+struct MtpLane<P: Profile> {
+    cache: State<P>,
     prompt: Vec<u32>,
     /// The tokens the cache's rows were keyed from: row `j` pairs the
     /// target's carry at position `j` with the embedding of `keyed[j + 1]`,
@@ -315,20 +325,20 @@ struct MtpLane {
     observe_redos: u64,
     /// The cache the lane holds while its own is handed to a folded verify
     /// (`QWEN4EXP_MTP_FOLD`), swapped back by the observe.
-    spare: Option<Cache>,
+    spare: Option<State<P>>,
     /// Observes that took a folded verify's draft, and those that fell back
     /// to running the head (a redone window, a head row that missed).
     folded: u64,
     fold_fallbacks: u64,
 }
 
-impl MtpLane {
+impl<P: Profile<Rewind = NoRewind, Rows = One>> MtpLane<P> {
     fn new(cfg: &Config) -> Self {
         Self {
-            spare: Some(Cache::with_layers(cfg, 1)),
+            spare: Some(State::<P>::with_layers(cfg, 1)),
             folded: 0,
             fold_fallbacks: 0,
-            cache: Cache::with_layers(cfg, 1),
+            cache: State::<P>::with_layers(cfg, 1),
             prompt: Vec::new(),
             keyed: Vec::new(),
             resets: 0,
@@ -344,10 +354,10 @@ impl MtpLane {
     }
 }
 
-impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
+impl<'a, P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpDrafter<'a, P, R> {
     /// A drafter for one sequence (`SeqId(0)`).
     pub fn new(
-        head: &'a MtpHead<R>,
+        head: &'a MtpHead<P, R>,
         embed: &'a QMatMul,
         lm_head: &'a QMatMul,
         cfg: &Config,
@@ -359,7 +369,7 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     /// A drafter for `n` sequences, `SeqId(0..n)`, each with its own MTP
     /// cache — the batched speculative loop's drafter (`decode_spec_batched`).
     pub fn with_seqs(
-        head: &'a MtpHead<R>,
+        head: &'a MtpHead<P, R>,
         embed: &'a QMatMul,
         lm_head: &'a QMatMul,
         cfg: &Config,
@@ -381,7 +391,7 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     /// Draft over `lanes`, a previous drafter's state for as many
     /// sequences, in place of fresh ones: each lane is kept for the prefix
     /// its next `begin_at` reuses, or reset there.
-    pub fn with_lanes(mut self, lanes: Option<MtpLanes>) -> Self {
+    pub fn with_lanes(mut self, lanes: Option<MtpLanes<P>>) -> Self {
         if let Some(MtpLanes(l)) = lanes {
             if l.len() == self.lanes.len() {
                 self.lanes = l;
@@ -391,7 +401,7 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     }
 
     /// The lanes, for the next request's drafter.
-    pub fn into_lanes(mut self) -> MtpLanes {
+    pub fn into_lanes(mut self) -> MtpLanes<P> {
         MtpLanes(std::mem::take(&mut self.lanes))
     }
 
@@ -542,16 +552,14 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     }
 
     /// Sequence 0's MTP-layer cache (its KV), for a probe.
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &State<P> {
         &self.lanes[0].cache
     }
 
-    fn lane(&mut self, seq: SeqId) -> Result<&mut MtpLane> {
+    fn lane(&mut self, seq: SeqId) -> Result<&mut MtpLane<P>> {
         let n = self.lanes.len();
         self.lanes.get_mut(seq.0).ok_or_else(|| {
-            lloom_tensor::Error::msg(format!(
-                "MtpDrafter serves {n} sequence(s), got {seq:?}"
-            ))
+            lloom_tensor::Error::msg(format!("MtpDrafter serves {n} sequence(s), got {seq:?}"))
         })
     }
 
@@ -602,8 +610,11 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
     }
 }
 
-impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> Speculator
+    for MtpDrafter<'_, P, R>
+{
     type Probe = NextnHidden;
+    type Family = crate::nn::speculator::Mtp;
 
     fn n_seq(&self) -> usize {
         self.lanes.len()
@@ -882,14 +893,14 @@ impl GenerationProbe {
     }
 }
 
-impl<R: ExpertResidency> MtpDrafter<'_, R> {
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpDrafter<'_, P, R> {
     /// The generation-row probe so far (zeros unless `QWEN4EXP_MTP_PROBE`).
     pub fn generation_probe(&self) -> GenerationProbe {
         self.probe
     }
 }
 
-impl<R: ExpertResidency> Drop for MtpDrafter<'_, R> {
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> Drop for MtpDrafter<'_, P, R> {
     /// The generation-row probe's summary, once a run.
     fn drop(&mut self) {
         if mtp_probe() && self.probe != GenerationProbe::default() {
@@ -906,7 +917,7 @@ fn observe_on_device() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.mtp_observe_plan == "device")
 }
 
-impl<R: ExpertResidency> MtpDrafter<'_, R> {
+impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpDrafter<'_, P, R> {
     /// `QWEN4EXP_MTP_PROBE`: on the prompt rows, the head's teacher-forced
     /// hit rate under the shipping dataflow and under four ablations of it,
     /// each run under a window on the layer's cache and rewound (nothing is
@@ -965,7 +976,10 @@ impl<R: ExpertResidency> MtpDrafter<'_, R> {
 }
 
 /// Sequence `seq`'s hand-over and folded verify, taken out of the slot.
-fn take_fold<R: ExpertResidency>(head: &MtpHead<R>, seq: SeqId) -> (Option<Cache>, Option<Folded>) {
+fn take_fold<P: Profile, R: ExpertResidency>(
+    head: &MtpHead<P, R>,
+    seq: SeqId,
+) -> (Option<State<P>>, Option<Folded<P>>) {
     let mut f = head.fold.lock();
     let pending = f
         .pending
@@ -980,7 +994,7 @@ fn take_fold<R: ExpertResidency>(head: &MtpHead<R>, seq: SeqId) -> (Option<Cache
     (pending, done)
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The MTP head over every row of a verify window, inside the verify's
     /// pass, when a drafter handed it a lane (`QWEN4EXP_MTP_FOLD`):
     /// draft-for-every-prefix. Row `i` is keyed from the target's carry at
@@ -996,7 +1010,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         carries: &Tensor,
         argmax: &Tensor,
         t: usize,
-    ) -> Result<Option<FoldRun>> {
+    ) -> Result<Option<FoldRun<Own<P>>>> {
         let Some(head) = self.mtp_head() else {
             return Ok(None);
         };
@@ -1111,7 +1125,7 @@ fn mtp_trace() -> bool {
 
 /// A verify pass encoded and read back, awaiting the accept decision.
 #[derive(Debug)]
-pub struct MtpPending {
+pub struct MtpPending<P: Profile> {
     /// The target's argmax at each of the `k + 1` window positions.
     argmax: Vec<u32>,
     /// The window's input tokens `[anchor, proposed…]`.
@@ -1120,13 +1134,13 @@ pub struct MtpPending {
     /// The window ran as one pass over the phase rings
     /// (`verify_window_run`): the accept is by phase, and the streamed
     /// tier's plans are settled once it is known (`verify_window_settle`).
-    pass: Option<VerifyPass>,
+    pass: Option<VerifyPass<P>>,
 }
 
-impl<R: ExpertResidency> Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// One decode step of `tok` at the cache's position, returning the
     /// device-side argmax (no readback).
-    fn step_argmax(&self, tok: u32, cache: &mut Cache) -> Result<Tensor> {
+    fn step_argmax(&self, tok: u32, cache: &mut State<P>) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![tok], (1, 1), &self.device())?;
         let logits = CausalLM::forward(self, &input, cache.pos, cache)?; // [1, vocab]
         logits.flatten_all()?.argmax(D::Minus1)?.reshape(1)
@@ -1134,7 +1148,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
     /// Replay `tokens` from the cache's position (after a rewind), retaining
     /// the carries.
-    fn replay(&self, tokens: &[u32], cache: &mut Cache) -> Result<()> {
+    fn replay(&self, tokens: &[u32], cache: &mut State<P>) -> Result<()> {
         for &t in tokens {
             let _ = self.step_argmax(t, cache)?;
         }
@@ -1142,7 +1156,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 }
 
-impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
+impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
     fn verify_and_probe(
         &self,
         drafts: &[Draft],
@@ -1164,7 +1178,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
 
     /// Under `QWEN4EXP_MTP_VERIFY_KEY=variant` the window's pass key names
     /// the sequence it runs ([`Qwen4Exp::verify_variant`]).
-    fn prepare_verify(&self, cache: &mut Cache, t: usize) -> Result<()> {
+    fn prepare_verify(&self, cache: &mut State<P>, t: usize) -> Result<()> {
         #[cfg(feature = "metal")]
         if verify_keyed_by_variant() {
             if let Ok(m) = self.device().as_metal_device() {
@@ -1177,9 +1191,9 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         Ok(())
     }
 
-    type Pending = MtpPending;
+    type Pending = MtpPending<P>;
     /// One [`MtpPending`] per row, in row order.
-    type PendingRows = Vec<MtpPending>;
+    type PendingRows = Vec<MtpPending<P>>;
 
     /// Every row's window through [`Self::verify_enqueue`] against its own
     /// cache, one after another: a row verifies exactly as it would alone, so
@@ -1189,7 +1203,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
     fn verify_rows_enqueue(
         &self,
         rows: &mut [VerifyRowRef<'_, Self::Cache>],
-    ) -> Result<Vec<MtpPending>> {
+    ) -> Result<Vec<MtpPending<P>>> {
         if rows.is_empty() {
             lloom_tensor::bail!("qwen4exp verify_rows_enqueue: no rows")
         }
@@ -1200,7 +1214,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
 
     fn verify_rows_complete(
         &self,
-        pending: Vec<MtpPending>,
+        pending: Vec<MtpPending<P>>,
         caches: &mut [&mut Self::Cache],
         eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, Tensor)>> {
@@ -1227,7 +1241,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         draft: &Draft,
         anchor: &Anchor,
         cache: &mut Self::Cache,
-    ) -> Result<MtpPending> {
+    ) -> Result<MtpPending<P>> {
         if anchor.pos != cache.pos {
             lloom_tensor::bail!(
                 "qwen4exp verify: anchor pos {} != cache pos {}",
@@ -1280,7 +1294,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
     /// window (`expert-streaming.md` §20.16).
     fn verify_complete(
         &self,
-        pending: MtpPending,
+        pending: MtpPending<P>,
         cache: &mut Self::Cache,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Tensor)> {

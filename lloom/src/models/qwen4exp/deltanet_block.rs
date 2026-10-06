@@ -15,8 +15,10 @@ use super::deltanet::{
 use crate::nn::gdn::{GdnStepArm, GdnStepForm};
 use crate::nn::short_conv::{Shift, ShortConv};
 use crate::nn::{ops, RecurrentState};
+use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor, D};
+use std::marker::PhantomData;
 
 /// One Gated DeltaNet layer's weights.
 ///
@@ -24,7 +26,8 @@ use lloom_tensor::{Module, Result, Tensor, D};
 /// on the fly), so the block reaches quant weights through the one seam
 /// (`call_quantized_matmul_mv_t`), never a bespoke dequant.
 #[derive(Debug, Clone)]
-pub struct GatedDeltaNet {
+pub struct GatedDeltaNet<P: Profile> {
+    profile: PhantomData<P>,
     /// Fused QKV in-proj → `[conv_channels]` (`attn_qkv`).
     wqkv: QMatMul,
     /// Output-gate in-proj → `[value_dim]` (`attn_gate`).
@@ -60,7 +63,7 @@ pub struct GatedDeltaNet {
     norm_eps: f64,
 }
 
-impl GatedDeltaNet {
+impl<P: Profile> GatedDeltaNet<P> {
     /// The per-layer geometry, from the config.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -77,6 +80,7 @@ impl GatedDeltaNet {
     ) -> Self {
         let dims = cfg.deltanet_dims();
         Self {
+            profile: PhantomData,
             wqkv,
             wqkv_gate,
             conv: ShortConv::<Shift>::new(conv_weight, cfg.ssm_conv_kernel),
@@ -902,7 +906,7 @@ impl GatedDeltaNet {
 /// read and rewrite them are layer `l`'s recurrence. `In` is the bracket's
 /// output and the layer.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for GatedDeltaNet {
+impl<P: Profile> crate::optimizer::Visit for GatedDeltaNet<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (x, l): Self::In) -> Self::Out {
@@ -989,6 +993,7 @@ impl crate::optimizer::Visit for GatedDeltaNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::CrownExact;
     use lloom_tensor::{DType, Device};
 
     // A QMatMul over an f32 weight of shape [out, in] (a plain matmul), the shape
@@ -1016,7 +1021,7 @@ mod tests {
         let h_v = cfg.ssm_dt_rank;
         let d_v = cfg.ssm_state_size;
 
-        let blk = GatedDeltaNet::new(
+        let blk = GatedDeltaNet::<CrownExact>::new(
             lin(conv_ch, d, &dev),   // wqkv
             lin(value_dim, d, &dev), // wqkv_gate
             vecw(conv_ch * cfg.ssm_conv_kernel, &dev, |i| {
@@ -1081,7 +1086,7 @@ mod tests {
         let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
         let h_v = cfg.ssm_dt_rank;
         let d_v = cfg.ssm_state_size;
-        let blk = GatedDeltaNet::new(
+        let blk = GatedDeltaNet::<CrownExact>::new(
             lin(conv_ch, d, &dev),
             lin(value_dim, d, &dev),
             vecw(conv_ch * cfg.ssm_conv_kernel, &dev, |i| {
@@ -1220,7 +1225,7 @@ mod tests {
             Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap()
         };
         let build = |stack: Option<Tensor>| {
-            let blk = GatedDeltaNet::new(
+            let blk = GatedDeltaNet::<CrownExact>::new(
                 QMatMul::TensorF16(views[0].clone()),
                 QMatMul::TensorF16(views[1].clone()),
                 vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
@@ -1365,7 +1370,7 @@ mod tests {
             let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
                 Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
             };
-            GatedDeltaNet::new(
+            GatedDeltaNet::<CrownExact>::new(
                 lin(conv_ch, d, 1.0),
                 lin(value_dim, d, 2.0),
                 vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
@@ -1506,7 +1511,7 @@ mod tests {
             let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
                 Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
             };
-            GatedDeltaNet::new(
+            GatedDeltaNet::<CrownExact>::new(
                 lin(conv_ch, d, 1.0),
                 lin(value_dim, d, 2.0),
                 vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
@@ -1624,7 +1629,7 @@ mod tests {
             let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
                 Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
             };
-            GatedDeltaNet::new(
+            GatedDeltaNet::<CrownExact>::new(
                 lin(conv_ch, d, 1.0),
                 lin(value_dim, d, 2.0),
                 vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
@@ -1715,7 +1720,7 @@ mod tests {
         let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
             Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap()
         };
-        let blk = GatedDeltaNet::new(
+        let blk = GatedDeltaNet::<CrownExact>::new(
             lin(conv_ch, d, 1.0),
             lin(value_dim, d, 2.0),
             vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
@@ -1787,7 +1792,7 @@ mod tests {
         let d = cfg.hidden_size;
         let conv_ch = cfg.conv_channels();
         let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
-        let blk = GatedDeltaNet::new(
+        let blk = GatedDeltaNet::<CrownExact>::new(
             lin(conv_ch, d, &dev),
             lin(value_dim, d, &dev),
             Tensor::zeros((conv_ch, cfg.ssm_conv_kernel), DType::F32, &dev).unwrap(),

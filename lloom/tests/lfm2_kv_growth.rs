@@ -25,8 +25,11 @@
 //! backend is bit-stable (`CONTRIBUTING.md` §3.1). The memory refusal needs a
 //! device with a `recommendedMaxWorkingSetSize` and is `lfm2_kv_growth_metal`'s.
 
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::{Row, VarBuilder};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// A tiny LFM2: six layers, conv/attention interleaved, `hidden_size = 8`,
@@ -65,7 +68,7 @@ fn tiny_config(kv_append: KvAppend, conv_state: ConvState) -> Config {
 
 /// Fixed-ramp weights, so every arm agrees on the model and any divergence is
 /// the cache's.
-fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -114,7 +117,7 @@ fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 const PROMPT: [u32; 5] = [3, 11, 20, 5, 9];
@@ -131,9 +134,9 @@ fn argmax(v: &[f32]) -> u32 {
 
 /// Greedy decode: prefill `prompt`, then `steps` tokens each fed the argmax of
 /// the last. Returns every pass's logits, the prefill's first.
-fn decode(
-    model: &Model,
-    cache: &mut Cache,
+fn decode<P: Lfm2Shape>(
+    model: &Model<P>,
+    cache: &mut State<P>,
     prompt: &[u32],
     steps: usize,
     dev: &Device,
@@ -174,13 +177,13 @@ fn assert_same_stream(a: &[Vec<f32>], b: &[Vec<f32>], what: &str) {
 fn a_slab_grown_thirty_times_emits_the_stream_of_one_that_never_grew() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(KvAppend::InPlace, ConvState::Shuffle);
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<CrownExact>(&cfg, DType::F32, &dev)?;
     let steps = 60;
 
-    let mut wide = Cache::new(true, DType::F32, &cfg, &dev)?;
-    let mut narrow = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
-    let wide_stream = decode(&model, &mut wide, &PROMPT, steps, &dev)?;
-    let narrow_stream = decode(&model, &mut narrow, &PROMPT, steps, &dev)?;
+    let mut wide = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+    let mut narrow = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
+    let wide_stream = decode::<CrownExact>(&model, &mut wide, &PROMPT, steps, &dev)?;
+    let narrow_stream = decode::<CrownExact>(&model, &mut narrow, &PROMPT, steps, &dev)?;
     assert_same_stream(
         &wide_stream,
         &narrow_stream,
@@ -206,9 +209,9 @@ fn a_slab_grown_thirty_times_emits_the_stream_of_one_that_never_grew() -> Result
 
     // The arm with no slab at all is the second reference.
     let cat_cfg = tiny_config(KvAppend::Cat, ConvState::Shuffle);
-    let cat_model = build(&cat_cfg, DType::F32, &dev)?;
-    let mut cat = Cache::new(true, DType::F32, &cat_cfg, &dev)?;
-    let cat_stream = decode(&cat_model, &mut cat, &PROMPT, steps, &dev)?;
+    let cat_model = build::<CrownExact>(&cat_cfg, DType::F32, &dev)?;
+    let mut cat = State::<CrownExact>::new(true, DType::F32, &cat_cfg, &dev)?;
+    let cat_stream = decode::<CrownExact>(&cat_model, &mut cat, &PROMPT, steps, &dev)?;
     assert_same_stream(&cat_stream, &narrow_stream, "bucket 2 against `Cat`");
     assert_eq!(cat.kv_report().grows, 0);
     assert_eq!(cat.kv_report().kv_len, PROMPT.len() + steps);
@@ -227,80 +230,94 @@ fn the_ceiling_refuses_before_any_state_moves() -> Result<()> {
     for arm in [KvAppend::InPlace, KvAppend::Cat] {
         for conv in [ConvState::Shuffle, ConvState::RotatingRing { k: 2 }] {
             let cfg = tiny_config(arm, conv);
-            let model = build(&cfg, DType::F32, &dev)?;
-            let mut cache = Cache::new_with(true, DType::F32, &cfg, &dev, 8)?.with_kv_bucket(3)?;
-            // 5 prefilled + 3 decoded = 8 = the ceiling, admitted.
-            let stream = decode(&model, &mut cache, &PROMPT, 3, &dev)?;
-            let report = cache.kv_report();
-            assert_eq!(report.kv_len, 8);
-            assert_eq!(report.capacity, 8);
-            let phase = cache.conv_phase();
-            let states: Vec<Vec<f32>> = conv_layers
-                .iter()
-                .map(|&l| {
-                    cache
-                        .conv_state_for_test(l)
-                        .expect("a conv layer holds state after a pass")
-                        .flatten_all()?
-                        .to_vec1::<f32>()
-                })
-                .collect::<Result<_>>()?;
-            let next = argmax(stream.last().unwrap());
-            let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
-            for attempt in 0..2 {
-                let err = model
-                    .forward(&input, 8, &mut cache)
-                    .err()
-                    .unwrap_or_else(|| {
-                        panic!("{arm:?} x {conv:?}: the ninth position was admitted past a ceiling of 8")
-                    })
-                    .to_string();
-                assert!(
-                    err.contains("KV ceiling"),
-                    "{arm:?} x {conv:?} attempt {attempt}: {err}"
-                );
-                assert!(
-                    err.contains("8 + 1 = 9"),
-                    "the message names the arithmetic: {err}"
-                );
-                assert_eq!(
-                    cache.conv_phase(),
-                    phase,
-                    "{arm:?} x {conv:?}: the conv phase moved"
-                );
-                assert_eq!(cache.kv_len(), 8, "{arm:?} x {conv:?}: the KV length moved");
-                assert_eq!(
-                    cache.kv_report(),
-                    report,
-                    "{arm:?} x {conv:?}: the slab moved"
-                );
-                for (&l, before) in conv_layers.iter().zip(&states) {
-                    let after = cache
-                        .conv_state_for_test(l)
-                        .unwrap()
-                        .flatten_all()?
-                        .to_vec1::<f32>()?;
-                    assert!(
-                        &after == before,
-                        "{arm:?} x {conv:?}: conv layer {l}'s state moved on a refusal"
-                    );
-                }
-            }
+            let key = cfg.exact_key();
+            lloom::profile::dispatch!(key, lloom::profile::LFM2, P => ceiling_case::<P>(&cfg, arm, conv, &dev))?;
         }
     }
     // A ceiling past the RoPE tables is refused at construction, not at the
     // first narrow past them.
     let cfg = tiny_config(KvAppend::InPlace, ConvState::Shuffle);
-    let err = Cache::new_with(true, DType::F32, &cfg, &dev, 129)
+    let err = State::<CrownExact>::new_with(true, DType::F32, &cfg, &dev, 129)
         .err()
         .expect("a ceiling past max_position_embeddings")
         .to_string();
     assert!(err.contains("kv_capacity 129 is outside 1..=128"), "{err}");
-    let err = Cache::new_with(true, DType::F32, &cfg, &dev, 0)
+    let err = State::<CrownExact>::new_with(true, DType::F32, &cfg, &dev, 0)
         .err()
         .expect("a zero ceiling")
         .to_string();
     assert!(err.contains("outside 1..=128"), "{err}");
+    Ok(())
+}
+
+/// One cell of `the_ceiling_refuses_before_any_state_moves`, at the profile
+/// its config names.
+fn ceiling_case<P: Lfm2Shape>(
+    cfg: &Config,
+    arm: KvAppend,
+    conv: ConvState,
+    dev: &Device,
+) -> Result<()> {
+    let conv_layers = [0usize, 2, 4];
+    let model = build::<P>(&cfg, DType::F32, &dev)?;
+    let mut cache = State::<P>::new_with(true, DType::F32, &cfg, &dev, 8)?.with_kv_bucket(3)?;
+    // 5 prefilled + 3 decoded = 8 = the ceiling, admitted.
+    let stream = decode::<P>(&model, &mut cache, &PROMPT, 3, &dev)?;
+    let report = cache.kv_report();
+    assert_eq!(report.kv_len, 8);
+    assert_eq!(report.capacity, 8);
+    let phase = cache.conv_phase();
+    let states: Vec<Vec<f32>> = conv_layers
+        .iter()
+        .map(|&l| {
+            cache
+                .conv_state_for_test(l)
+                .expect("a conv layer holds state after a pass")
+                .flatten_all()?
+                .to_vec1::<f32>()
+        })
+        .collect::<Result<_>>()?;
+    let next = argmax(stream.last().unwrap());
+    let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+    for attempt in 0..2 {
+        let err = model
+            .forward(&input, 8, &mut cache)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{arm:?} x {conv:?}: the ninth position was admitted past a ceiling of 8")
+            })
+            .to_string();
+        assert!(
+            err.contains("KV ceiling"),
+            "{arm:?} x {conv:?} attempt {attempt}: {err}"
+        );
+        assert!(
+            err.contains("8 + 1 = 9"),
+            "the message names the arithmetic: {err}"
+        );
+        assert_eq!(
+            cache.conv_phase(),
+            phase,
+            "{arm:?} x {conv:?}: the conv phase moved"
+        );
+        assert_eq!(cache.kv_len(), 8, "{arm:?} x {conv:?}: the KV length moved");
+        assert_eq!(
+            cache.kv_report(),
+            report,
+            "{arm:?} x {conv:?}: the slab moved"
+        );
+        for (&l, before) in conv_layers.iter().zip(&states) {
+            let after = cache
+                .conv_state_for_test(l)
+                .unwrap()
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(
+                &after == before,
+                "{arm:?} x {conv:?}: conv layer {l}'s state moved on a refusal"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -310,7 +327,7 @@ fn the_ceiling_refuses_before_any_state_moves() -> Result<()> {
 fn forward_rows_grows_each_row_on_its_own() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(KvAppend::InPlace, ConvState::RotatingRing { k: 2 });
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<RewindableExact>(&cfg, DType::F32, &dev)?;
     let prompts: Vec<Vec<u32>> = vec![
         vec![3, 11, 20, 5, 9],
         vec![40, 2],
@@ -318,11 +335,11 @@ fn forward_rows_grows_each_row_on_its_own() -> Result<()> {
     ];
     let steps = 12;
 
-    let run = |bucket: Option<usize>| -> Result<(Vec<Vec<Vec<f32>>>, Vec<Cache>)> {
+    let run = |bucket: Option<usize>| -> Result<(Vec<Vec<Vec<f32>>>, Vec<State<RewindableExact>>)> {
         let mut caches = Vec::new();
         let mut nexts = Vec::new();
         for prompt in &prompts {
-            let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+            let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
             if let Some(b) = bucket {
                 cache = cache.with_kv_bucket(b)?;
             }
@@ -338,7 +355,7 @@ fn forward_rows_grows_each_row_on_its_own() -> Result<()> {
         let mut pos: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
         for _ in 0..steps {
             let input = Tensor::new(nexts.as_slice(), &dev)?.reshape((prompts.len(), 1))?;
-            let mut rows: Vec<Row<'_, Cache>> = caches
+            let mut rows: Vec<Row<'_, State<RewindableExact>>> = caches
                 .iter_mut()
                 .zip(pos.iter())
                 .map(|(cache, &pos)| Row { pos, cache })
@@ -375,11 +392,11 @@ fn forward_rows_grows_each_row_on_its_own() -> Result<()> {
 fn a_speculative_window_that_crosses_a_bucket_matches_one_that_does_not() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(KvAppend::InPlace, ConvState::RotatingRing { k: 4 });
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<RewindableExact>(&cfg, DType::F32, &dev)?;
     let proposed: [u32; 3] = [12, 33, 21];
 
-    let run = |bucket: Option<usize>| -> Result<(Vec<Vec<f32>>, Cache)> {
-        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let run = |bucket: Option<usize>| -> Result<(Vec<Vec<f32>>, State<RewindableExact>)> {
+        let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         if let Some(b) = bucket {
             cache = cache.with_kv_bucket(b)?;
         }
@@ -430,11 +447,13 @@ fn a_speculative_window_that_crosses_a_bucket_matches_one_that_does_not() -> Res
 fn forward_rows_refuses_before_any_rows_state_moves() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(KvAppend::InPlace, ConvState::RotatingRing { k: 2 });
-    let model = build(&cfg, DType::F32, &dev)?;
+    let model = build::<RewindableExact>(&cfg, DType::F32, &dev)?;
     // Row 0 has room; row 1's ceiling is exactly what its prompt plus three
     // steps reach.
-    let mut roomy = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
-    let mut tight = Cache::new_with(true, DType::F32, &cfg, &dev, 8)?.with_kv_bucket(2)?;
+    let mut roomy =
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
+    let mut tight =
+        State::<RewindableExact>::new_with(true, DType::F32, &cfg, &dev, 8)?.with_kv_bucket(2)?;
     let prompts: [&[u32]; 2] = [&[3, 11, 20, 5, 9, 4, 4], &PROMPT];
     let mut nexts = Vec::new();
     for (cache, prompt) in [(&mut roomy, prompts[0]), (&mut tight, prompts[1])] {
@@ -443,21 +462,24 @@ fn forward_rows_refuses_before_any_rows_state_moves() -> Result<()> {
         nexts.push(argmax(&logits));
     }
     let mut pos = [prompts[0].len(), prompts[1].len()];
-    let mut step =
-        |nexts: &[u32], pos: &[usize; 2], roomy: &mut Cache, tight: &mut Cache| -> Result<Tensor> {
-            let input = Tensor::new(nexts, &dev)?.reshape((2, 1))?;
-            let mut rows = [
-                Row {
-                    pos: pos[0],
-                    cache: roomy,
-                },
-                Row {
-                    pos: pos[1],
-                    cache: tight,
-                },
-            ];
-            model.forward_rows(&input, &mut rows)
-        };
+    let mut step = |nexts: &[u32],
+                    pos: &[usize; 2],
+                    roomy: &mut State<RewindableExact>,
+                    tight: &mut State<RewindableExact>|
+     -> Result<Tensor> {
+        let input = Tensor::new(nexts, &dev)?.reshape((2, 1))?;
+        let mut rows = [
+            Row {
+                pos: pos[0],
+                cache: roomy,
+            },
+            Row {
+                pos: pos[1],
+                cache: tight,
+            },
+        ];
+        model.forward_rows(&input, &mut rows)
+    };
     for _ in 0..3 {
         let logits = step(&nexts, &pos, &mut roomy, &mut tight)?;
         for r in 0..2 {

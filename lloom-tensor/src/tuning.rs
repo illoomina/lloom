@@ -95,8 +95,36 @@ impl Contract {
 /// parsed once. Every fast arm reads it here, so the contract is one value
 /// read once (a compile-time profile type would replace this function).
 pub fn contract() -> Contract {
-    static C: OnceLock<Contract> = OnceLock::new();
-    *C.get_or_init(|| Contract::parse(&tuning().contract.profile).expect("the parser accepted it"))
+    *CONTRACT.get_or_init(|| {
+        REGIME.get().copied().unwrap_or_else(|| {
+            Contract::parse(&tuning().contract.profile).expect("the parser accepted it")
+        })
+    })
+}
+
+static CONTRACT: OnceLock<Contract> = OnceLock::new();
+/// The contract a family's regime type stated ([`pin_regime`]) before the
+/// contract was first read: what [`contract`] takes ahead of the tuning's
+/// default, so a model built at `Exact` in a process that opened its device
+/// first (the tuning read, the pin refused) still states its regime.
+static REGIME: OnceLock<Contract> = OnceLock::new();
+
+/// A family built at regime `c` states it (`lloom::profile::hold`): the
+/// contract becomes `c` unless one is already in force — `LLOOM_PROFILE`
+/// named one, a harness pinned one, or [`contract`] was read — in which
+/// case that one is returned and the caller compares. Unlike
+/// [`pin_contract`] this does not need the tuning unread: the Metal device
+/// reads the tuning when it opens, which is before any model is built.
+pub fn pin_regime(c: Contract) -> Result<Contract, String> {
+    if let Some(v) = std::env::var_os("LLOOM_PROFILE") {
+        return Contract::parse(&v.to_string_lossy());
+    }
+    if let Some(read) = CONTRACT.get() {
+        return Ok(*read);
+    }
+    let _ = REGIME.set(c);
+    CONTRACT_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(contract())
 }
 
 static CONTRACT_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -214,7 +242,13 @@ fn optional(v: &str, f: impl Fn(&str) -> Result<String, String>) -> Result<Optio
     }
 }
 fn parse_tile(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| one_of(s, "gemm tile", &["32x32", "32x16", "16x32", "16x16", "64x32", "64x64"]))
+    optional(v, |s| {
+        one_of(
+            s,
+            "gemm tile",
+            &["32x32", "32x16", "16x32", "16x16", "64x32", "64x64"],
+        )
+    })
 }
 fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
@@ -223,7 +257,9 @@ fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
     match v.trim() {
         "4" => Ok(Some(4)),
         "8" => Ok(Some(8)),
-        other => Err(format!("gemv bm: `{other}` is not 4 or 8 (the two instantiated decode tiles)")),
+        other => Err(format!(
+            "gemv bm: `{other}` is not 4 or 8 (the two instantiated decode tiles)"
+        )),
     }
 }
 fn parse_force_gemm(v: &str) -> Result<Option<String>, String> {
@@ -247,7 +283,11 @@ fn parse_allow_emulated(v: &str) -> Result<Option<String>, String> {
     })
 }
 fn parse_eviction(v: &str) -> Result<String, String> {
-    one_of(v, "eviction order", &["age", "oldest", "off", "size", "largest"])
+    one_of(
+        v,
+        "eviction order",
+        &["age", "oldest", "off", "size", "largest"],
+    )
 }
 fn parse_hazard_key(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "hazard key", &["range", "pointer", "ptr"]))
@@ -260,7 +300,12 @@ fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return Ok(Some("none".to_string()));
     }
-    one_of(v, "mmap advice", &["willneed", "will_need", "sequential", "seq"]).map(Some)
+    one_of(
+        v,
+        "mmap advice",
+        &["willneed", "will_need", "sequential", "seq"],
+    )
+    .map(Some)
 }
 fn parse_profile(v: &str) -> Result<String, String> {
     Contract::parse(v).map(|c| c.name().to_string())
@@ -354,13 +399,25 @@ impl Default for GemmTuning {
 #[serde(default)]
 pub struct QmvTuning {
     /// Simdgroups a threadgroup on the IQ2_XS routed core (a function constant; 1..16).
-    #[opt(flag = "qmv-iq2xs-nsg", env = "LLOOM_QMV_IQ2XS_NSG", parser = "parse_nsg")]
+    #[opt(
+        flag = "qmv-iq2xs-nsg",
+        env = "LLOOM_QMV_IQ2XS_NSG",
+        parser = "parse_nsg"
+    )]
     pub iq2xs_nsg: usize,
     /// Simdgroups a threadgroup on the IQ4_NL core (a function constant; 1..16).
-    #[opt(flag = "qmv-iq4nl-nsg", env = "LLOOM_QMV_IQ4NL_NSG", parser = "parse_nsg")]
+    #[opt(
+        flag = "qmv-iq4nl-nsg",
+        env = "LLOOM_QMV_IQ4NL_NSG",
+        parser = "parse_nsg"
+    )]
     pub iq4nl_nsg: usize,
     /// Simdgroups a threadgroup on the IQ2_S core, its 8 KB grid staged per threadgroup (P31 (4); 1..16).
-    #[opt(flag = "qmv-iq2s-nsg", env = "LLOOM_QMV_IQ2S_NSG", parser = "parse_nsg")]
+    #[opt(
+        flag = "qmv-iq2s-nsg",
+        env = "LLOOM_QMV_IQ2S_NSG",
+        parser = "parse_nsg"
+    )]
     pub iq2s_nsg: usize,
     /// Rows a simdgroup on the Q4_K core: set, two simdgroups of that many rows (ggml master's 2 × 2); none = the incumbent one simdgroup of four (P31 (5)).
     #[opt(flag = "qmv-q4k-nr0", env = "LLOOM_QMV_Q4K_NR0", parser = "parse_opt_nr0_4", variants = ["none", "1", "2", "3", "4"])]
@@ -469,7 +526,11 @@ impl Default for MoeTuning {
 #[serde(default)]
 pub struct GdnTuning {
     /// The most `dk` slices a head's threads take in `gdn_step` (1..32; more slices, longer cross-slice reduction).
-    #[opt(flag = "gdn-split", env = "LLOOM_GDN_SPLIT", parser = "parse_gdn_split")]
+    #[opt(
+        flag = "gdn-split",
+        env = "LLOOM_GDN_SPLIT",
+        parser = "parse_gdn_split"
+    )]
     pub split: usize,
     /// The step's register form (the default): each thread's slice of `S` held in registers, the slab read once, not twice; `false` = the loop form, the A/B arm (`docs/models/qwen3.8-flash-next.md`).
     #[opt(flag = "gdn-step-reg", env = "LLOOM_GDN_STEP_REG", bool)]
@@ -495,10 +556,18 @@ pub struct MetalTuning {
     #[opt(flag = "completion-wait", env = "CANDLE_METAL_COMPLETION_WAIT", parser = "parse_completion_wait", variants = ["synchronize", "shared-event", "shared-event-sleep[:µs]", "shared-event-wait[:ms]", "shared-event-listener[:ms]"])]
     pub completion_wait: String,
     /// Dispatches per command buffer on the blocking loop and the prefill (the cut period).
-    #[opt(flag = "compute-per-buffer", env = "CANDLE_METAL_COMPUTE_PER_BUFFER", parser = "parse_positive")]
+    #[opt(
+        flag = "compute-per-buffer",
+        env = "CANDLE_METAL_COMPUTE_PER_BUFFER",
+        parser = "parse_positive"
+    )]
     pub compute_per_buffer: usize,
     /// Dispatches per command buffer on the pipelined loop (lookahead ≥ 1).
-    #[opt(flag = "pipelined-compute-per-buffer", env = "CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER", parser = "parse_positive")]
+    #[opt(
+        flag = "pipelined-compute-per-buffer",
+        env = "CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER",
+        parser = "parse_positive"
+    )]
     pub pipelined_compute_per_buffer: usize,
     /// Where a command buffer is cut: `counter` (every period), `node-aligned` (at a layer boundary once the period passed), `nodes:<k>` (a layer partition).
     #[opt(flag = "cut-policy", env = "CANDLE_METAL_CUT_POLICY", parser = "parse_cut_policy", variants = ["counter", "node-aligned", "nodes:<k>"])]
@@ -522,7 +591,11 @@ pub struct MetalTuning {
     #[opt(flag = "wire-weights", env = "LLOOM_WIRE_WEIGHTS", bool)]
     pub wire_weights: bool,
     /// The placement heap's chunk size in MiB (≥ 16).
-    #[opt(flag = "heap-chunk-mb", env = "LLOOM_HEAP_CHUNK_MB", parser = "parse_heap_mb")]
+    #[opt(
+        flag = "heap-chunk-mb",
+        env = "LLOOM_HEAP_CHUNK_MB",
+        parser = "parse_heap_mb"
+    )]
     pub heap_chunk_mb: usize,
     /// Serve pool misses from heap chunks instead of a buffer each (an A/B arm; #749 P26).
     #[opt(flag = "transient-heaps", env = "LLOOM_TRANSIENT_HEAPS", bool)]
@@ -531,7 +604,11 @@ pub struct MetalTuning {
     #[opt(flag = "io-lanes", env = "LLOOM_IO_LANES", parser = "parse_positive")]
     pub io_lanes: usize,
     /// Extra Metal compiler flags for the kernel library (an A/B arm; none = the default arm).
-    #[opt(flag = "metal-cflags", env = "LLOOM_434_METAL_CFLAGS", parser = "parse_cflags")]
+    #[opt(
+        flag = "metal-cflags",
+        env = "LLOOM_434_METAL_CFLAGS",
+        parser = "parse_cflags"
+    )]
     pub cflags: Option<String>,
     /// Compile the kernel sources as one translation unit (an A/B arm).
     #[opt(flag = "merged-unit", env = "LLOOM_477_MERGED_UNIT", bool)]
@@ -593,22 +670,38 @@ pub struct PoolTuning {
     /// nothing while the budget suffices (it runs on the refusal path
     /// alone) and is counted in the ledger's `drains`; this is the arm
     /// without it, for the maintainer's numbers (#892).
-    #[opt(flag = "pool-no-admission-drain", env = "LLOOM_POOL_NO_ADMISSION_DRAIN", bool)]
+    #[opt(
+        flag = "pool-no-admission-drain",
+        env = "LLOOM_POOL_NO_ADMISSION_DRAIN",
+        bool
+    )]
     pub no_admission_drain: bool,
     /// Completed command buffers a released buffer must outlive before reuse (0 ships; the #748 A/B).
     #[opt(flag = "pool-quarantine", env = "LLOOM_POOL_QUARANTINE")]
     pub quarantine: u64,
     /// Keep evicted buffers in the residency set (the pre-#206 arm).
-    #[opt(flag = "pool-retain-evicted", env = "CANDLE_METAL_RETAIN_EVICTED", bool)]
+    #[opt(
+        flag = "pool-retain-evicted",
+        env = "CANDLE_METAL_RETAIN_EVICTED",
+        bool
+    )]
     pub retain_evicted: bool,
     /// Every host upload takes the unpooled `newBufferWithBytes` path (an A/B instrument).
     #[opt(flag = "unpooled-uploads", env = "LLOOM_UNPOOLED_UPLOADS", bool)]
     pub unpooled_uploads: bool,
     /// Stage streamed weight loads through the Shared buffer pool instead of an unpooled buffer per load (the #748 A/B).
-    #[opt(flag = "stream-pooled-staging", env = "LLOOM_STREAM_POOLED_STAGING", bool)]
+    #[opt(
+        flag = "stream-pooled-staging",
+        env = "LLOOM_STREAM_POOLED_STAGING",
+        bool
+    )]
     pub stream_pooled_staging: bool,
     /// The pool's buffer alignment in bytes (a power of two ≥ 16; §9.2r).
-    #[opt(flag = "buffer-alignment", env = "LLOOM_586_BUFFER_ALIGNMENT", parser = "parse_pow2_align")]
+    #[opt(
+        flag = "buffer-alignment",
+        env = "LLOOM_586_BUFFER_ALIGNMENT",
+        parser = "parse_pow2_align"
+    )]
     pub buffer_alignment: usize,
 }
 
@@ -640,7 +733,11 @@ pub struct InstrumentTuning {
     #[opt(flag = "profile-counters", env = "CANDLE_METAL_PROFILE_COUNTERS", bool)]
     pub profile_counters: bool,
     /// Under `profile`: end the compute encoder after every dispatch, so each counter-sampled encoder is one kernel (an arm: a seam per dispatch).
-    #[opt(flag = "profile-encoder-per-dispatch", env = "CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH", bool)]
+    #[opt(
+        flag = "profile-encoder-per-dispatch",
+        env = "CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH",
+        bool
+    )]
     pub profile_encoder_per_dispatch: bool,
     /// The dispatch trace recorder (kernel, grid, threadgroup, barrier, encoder per dispatch).
     #[opt(flag = "trace", env = "CANDLE_METAL_TRACE", bool)]
@@ -649,7 +746,11 @@ pub struct InstrumentTuning {
     #[opt(flag = "pool-trace", env = "LLOOM_POOL_TRACE", bool)]
     pub pool_trace: bool,
     /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
-    #[opt(flag = "served-request-trace", env = "LLOOM_SERVED_REQUEST_TRACE", bool)]
+    #[opt(
+        flag = "served-request-trace",
+        env = "LLOOM_SERVED_REQUEST_TRACE",
+        bool
+    )]
     pub served_request_trace: bool,
     /// Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5).
     #[opt(flag = "readback-trace", env = "LLOOM_READBACK_TRACE", bool)]
@@ -781,7 +882,8 @@ mod tests {
         assert!(t.set("metal.allow_emulated", "f16").is_err());
         t.set("gemm.tile", "64x64").unwrap();
         t.set("metal.cut_policy", "nodes:15").unwrap();
-        t.set("metal.completion_wait", "shared-event-wait:5").unwrap();
+        t.set("metal.completion_wait", "shared-event-wait:5")
+            .unwrap();
         t.set("pool.reuse_oversize_bound", "1.5").unwrap();
         t.set("pool.reuse_oversize_bound", "off").unwrap();
         assert_eq!(t.pool.reuse_oversize_bound, None);
@@ -815,8 +917,16 @@ mod tests {
     #[test]
     fn every_knob_has_an_env_alias() {
         let aliases = crate::options::env_aliases(Tuning::META);
-        let rows = crate::options::rows("tuning", Tuning::META, &serde_json::to_value(Tuning::default()).unwrap());
-        assert_eq!(aliases.len(), rows.len(), "every leaf carries the variable it replaces");
+        let rows = crate::options::rows(
+            "tuning",
+            Tuning::META,
+            &serde_json::to_value(Tuning::default()).unwrap(),
+        );
+        assert_eq!(
+            aliases.len(),
+            rows.len(),
+            "every leaf carries the variable it replaces"
+        );
         let mut sorted = aliases.clone();
         sorted.sort_unstable();
         sorted.dedup();

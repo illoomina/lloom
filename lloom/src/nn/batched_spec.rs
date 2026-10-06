@@ -22,11 +22,11 @@ use crate::nn::decode::{
     begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, DecodeOut, DecodeStats,
     PassShape, RoundStats, StepPacer,
 };
-use crate::nn::RoundTiming;
 use crate::nn::model::BatchedCausalLM;
 use crate::nn::speculator::{
     readbacks, Anchor, ObserveRow, Probes, SeqId, Session, Speculator, VerifyRowRef,
 };
+use crate::nn::RoundTiming;
 use crate::nn::{RowDriver, RowId, StepReport};
 use lloom_tensor::{Device, Result};
 
@@ -67,7 +67,7 @@ struct Slot<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
 /// The speculative batched loop, one round at a time.
 pub struct SpecBatchDecoder<'m, M, S, R>
 where
-    M: BatchedCausalLM + Probes<S::Probe>,
+    M: BatchedCausalLM + Probes<S::Probe> + crate::profile::Shaped,
     S: Speculator,
     R: BorrowMut<Session<'m, M>>,
 {
@@ -88,7 +88,7 @@ where
 
 impl<'m, M, S, R> SpecBatchDecoder<'m, M, S, R>
 where
-    M: BatchedCausalLM + Probes<S::Probe>,
+    M: BatchedCausalLM + Probes<S::Probe> + crate::profile::Shaped,
     S: Speculator,
     R: BorrowMut<Session<'m, M>>,
 {
@@ -96,7 +96,12 @@ where
     /// is no batch-level EOS set: every row carries its own (`admit_with_eos`,
     /// which refuses an empty one) and the ragged verify reads it per window —
     /// the cells' never-EOS rows sit beside a request's.
-    pub fn new(spec: S, opts: DecodeOptions, device: Device) -> Result<Self> {
+    pub fn new(
+        _rewind: crate::profile::RewindProof<M::Profile>,
+        spec: S,
+        opts: DecodeOptions,
+        device: Device,
+    ) -> Result<Self> {
         if spec.max_draft() == 0 {
             lloom_tensor::bail!(
                 "decode_spec_batched: the proposer has max_draft 0 (the K=1 identity); it belongs \
@@ -150,7 +155,9 @@ where
         let mut joined = 0usize;
         let tile = self.opts.prefill_tile;
         for i in 0..self.slots.len() {
-            let Some(slot) = self.slots[i].as_mut() else { continue };
+            let Some(slot) = self.slots[i].as_mut() else {
+                continue;
+            };
             if slot.lane.joined || slot.lane.cancelled || slot.lane.done {
                 continue;
             }
@@ -162,13 +169,8 @@ where
             let s: &mut Session<'m, M> = slot.session.borrow_mut();
             s.seq.last_logits = None;
             self.pacer.before_forward(&self.device)?;
-            let (logits, probe, units) = s.prefill_streamed(
-                &mut self.spec,
-                slot.seq,
-                &slot.prompt,
-                tile,
-                &self.device,
-            )?;
+            let (logits, probe, units) =
+                s.prefill_streamed(&mut self.spec, slot.seq, &slot.prompt, tile, &self.device)?;
             self.pacer.after_forward(&self.device)?;
             let anchor = logits
                 .squeeze(0)?
@@ -228,7 +230,9 @@ where
         for &i in live {
             match taken[i].take() {
                 Some(s) => picked.push(s),
-                None => lloom_tensor::bail!("decode_spec_batched: row {i} appears twice in a round"),
+                None => {
+                    lloom_tensor::bail!("decode_spec_batched: row {i} appears twice in a round")
+                }
             }
         }
         let model = picked
@@ -362,9 +366,9 @@ where
                 lane.all_ids.extend_from_slice(&batch);
                 lane.produced += batch.len();
             }
-            lane.stats.step_ns.push(
-                (self.run_start.elapsed().as_nanos() as u64).saturating_sub(round_start_ns),
-            );
+            lane.stats
+                .step_ns
+                .push((self.run_start.elapsed().as_nanos() as u64).saturating_sub(round_start_ns));
             lane.done = lane.eos || lane.reached(lane.produced);
         }
         Ok(())
@@ -377,7 +381,10 @@ where
         let slot = self.slots[i].as_mut().expect("a retiring row is held");
         let lane = &mut slot.lane;
         let s: &mut Session<'m, M> = slot.session.borrow_mut();
-        let fed = s.seq.pos.saturating_sub(lane.pos_before + slot.prompt.len());
+        let fed = s
+            .seq
+            .pos
+            .saturating_sub(lane.pos_before + slot.prompt.len());
         let in_cache = fed.min(lane.all_ids.len());
         s.seq.tokens.extend_from_slice(&lane.all_ids[..in_cache]);
         s.seq.overrun = fed - in_cache;
@@ -399,7 +406,7 @@ where
 
 impl<'m, M, S, R> RowDriver<'m, M, R> for SpecBatchDecoder<'m, M, S, R>
 where
-    M: BatchedCausalLM + Probes<S::Probe> + 'm,
+    M: BatchedCausalLM + Probes<S::Probe> + crate::profile::Shaped + 'm,
     S: Speculator,
     R: BorrowMut<Session<'m, M>>,
 {
@@ -486,7 +493,10 @@ where
         })
     }
 
-    fn step(&mut self, on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>) -> Result<StepReport> {
+    fn step(
+        &mut self,
+        on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+    ) -> Result<StepReport> {
         let _pool = lloom_tensor::AutoreleaseScope::new();
         let joined = self.join_pending(on_tokens)?;
         let live: Vec<usize> = (0..self.slots.len())
@@ -632,6 +642,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn decode_spec_batched<S>(
         sessions: &mut [Self],
+        rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         prompts: &[&[u32]],
         opts: &DecodeOptions,
@@ -641,7 +652,7 @@ where
     ) -> Result<Vec<DecodeOut>>
     where
         S: Speculator,
-        M: Probes<S::Probe> + 'm,
+        M: Probes<S::Probe> + crate::profile::Shaped + 'm,
     {
         let n = sessions.len();
         if n == 0 {
@@ -655,7 +666,7 @@ where
             );
         }
         let mut dec: SpecBatchDecoder<'m, M, &mut S, &mut Session<'m, M>> =
-            SpecBatchDecoder::new(spec, opts.clone(), device.clone())?;
+            SpecBatchDecoder::new(rewind, spec, opts.clone(), device.clone())?;
         let mut ids = Vec::with_capacity(n);
         for (s, p) in sessions.iter_mut().zip(prompts) {
             ids.push(dec.admit_with_eos(
@@ -670,11 +681,17 @@ where
         let mut outs: Vec<Option<DecodeOut>> = (0..n).map(|_| None).collect();
         while !dec.is_idle() {
             dec.step(&mut |row, toks| {
-                let i = ids.iter().position(|&id| id == row).expect("an admitted row");
+                let i = ids
+                    .iter()
+                    .position(|&id| id == row)
+                    .expect("an admitted row");
                 on_tokens(i, toks)
             })?;
             for (row, _session, out) in dec.take_finished() {
-                let i = ids.iter().position(|&id| id == row).expect("an admitted row");
+                let i = ids
+                    .iter()
+                    .position(|&id| id == row)
+                    .expect("an admitted row");
                 outs[i] = Some(out);
             }
         }

@@ -28,6 +28,7 @@
 use lloom::models::qwen4exp::{Config, GatedDeltaNet};
 use lloom::nn::gdn::GdnStepForm;
 use lloom::nn::{RecurrentState, StatePool};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -163,7 +164,7 @@ fn lin(out: usize, inp: usize, seed: usize, dev: &Device) -> Result<QMatMul> {
     )?))
 }
 
-fn gdn_block(cfg: &Config, form: GdnStepForm, dev: &Device) -> Result<GatedDeltaNet> {
+fn gdn_block(cfg: &Config, form: GdnStepForm, dev: &Device) -> Result<GatedDeltaNet<CrownExact>> {
     let d = cfg.hidden_size;
     let conv_ch = cfg.conv_channels();
     let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
@@ -171,7 +172,7 @@ fn gdn_block(cfg: &Config, form: GdnStepForm, dev: &Device) -> Result<GatedDelta
     let ramp = |n: usize, f: &dyn Fn(usize) -> f32| {
         Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev)
     };
-    Ok(GatedDeltaNet::new(
+    Ok(GatedDeltaNet::<CrownExact>::new(
         lin(conv_ch, d, 1, dev)?,
         lin(value_dim, d, 2, dev)?,
         tensor(&[conv_ch, cfg.ssm_conv_kernel], 3, 0.3, DType::F32, dev)?,

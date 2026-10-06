@@ -109,13 +109,13 @@ pub trait Scaled: TinyFamily {
     /// The model at `cfg` from `source`, computing in `dtype` (`None`: the
     /// family's rule for the device). A synthetic one draws its values from
     /// `weights`' law and seed.
-    fn scale_model(
+    fn scale_model<P: crate::profile::Profile>(
         source: &Source,
         cfg: &Self::Config,
         dtype: Option<DType>,
         weights: &Weights,
         dev: &Device,
-    ) -> Result<Self::Model>;
+    ) -> Result<Self::Model<P>>;
 }
 
 /// One test's model: its need, the backend the switch chose, and the
@@ -243,17 +243,21 @@ impl<F: Scaled> Fixture<F> {
 
     /// The model at `cfg` on `dev`, computing in the family's dtype for the
     /// device.
-    pub fn model(&self, cfg: &F::Config, dev: &Device) -> Result<F::Model> {
-        self.model_in(cfg, None, dev)
+    pub fn model<P: crate::profile::Profile>(
+        &self,
+        cfg: &F::Config,
+        dev: &Device,
+    ) -> Result<F::Model<P>> {
+        self.model_in::<P>(cfg, None, dev)
     }
 
     /// The model at `cfg` on `dev`, computing in `dtype`.
-    pub fn model_in(
+    pub fn model_in<P: crate::profile::Profile>(
         &self,
         cfg: &F::Config,
         dtype: Option<DType>,
         dev: &Device,
-    ) -> Result<F::Model> {
+    ) -> Result<F::Model<P>> {
         self.watch(dev);
         match &self.source {
             None => {
@@ -261,9 +265,9 @@ impl<F: Scaled> Fixture<F> {
                 if let Some(d) = dtype {
                     ckpt = ckpt.with_dtype(d);
                 }
-                ckpt.model(dev)
+                ckpt.model::<P>(dev)
             }
-            Some(s) => F::scale_model(s, cfg, dtype, &self.weights, dev),
+            Some(s) => F::scale_model::<P>(s, cfg, dtype, &self.weights, dev),
         }
     }
 

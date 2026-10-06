@@ -22,11 +22,12 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{
-    Cache, Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident,
+    Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident, State,
 };
 use lloom::nn::model::{CausalLM, Model};
 use lloom::nn::ngram_memory::{HostFeed, NgramWindow, RowTable};
 use lloom::nn::{DecodeOptions, DecodeOut, FeedWait, IdentityProposer, Session, VarBuilder};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -73,9 +74,9 @@ fn tiny() -> Config {
 
 /// A resident tiny model on Metal with the PLE attached at layer 1 over the
 /// table at `path` (the fixture of `qwen4exp_engine_identity`).
-fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<Resident>> {
+fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<CrownExact, Resident>> {
     let dev = metal();
-    let mut model = testing::resident_model(cfg, &dev);
+    let mut model = testing::resident_model::<CrownExact>(cfg, &dev);
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
         vec![13, 17, 19, 23],
@@ -85,7 +86,7 @@ fn model_with_ple(cfg: &Config, path: &Path) -> Result<Qwen4Exp<Resident>> {
     )?;
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<CrownExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, &dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
         testing::ones(hc_dim, &dev),
@@ -631,7 +632,7 @@ fn a_forward_whose_token_was_not_fed_is_refused() -> Result<()> {
 
 /// The tiny model with a producer that cannot fill: its table has no host
 /// read (`RowTable::Dense`), so the first fill fails.
-struct FailingFill<'a>(&'a Qwen4Exp<Resident>);
+struct FailingFill<'a>(&'a Qwen4Exp<CrownExact, Resident>);
 
 impl Model for FailingFill<'_> {
     type Config = Config;
@@ -641,26 +642,36 @@ impl Model for FailingFill<'_> {
 }
 
 impl CausalLM for FailingFill<'_> {
-    type Cache = Cache;
-    fn new_cache(&self, cfg: &Config, dev: &Device) -> Result<Cache> {
+    type Cache = State<CrownExact>;
+    fn new_cache(&self, cfg: &Config, dev: &Device) -> Result<State<CrownExact>> {
         self.0.new_cache(cfg, dev)
     }
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         CausalLM::embed(self.0, tokens)
     }
-    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut State<CrownExact>,
+    ) -> Result<Tensor> {
         CausalLM::forward_embeds(self.0, embeds, pos, cache)
     }
-    fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn forward(
+        &self,
+        tokens: &Tensor,
+        pos: usize,
+        cache: &mut State<CrownExact>,
+    ) -> Result<Tensor> {
         self.0.forward(tokens, pos, cache)
     }
-    fn prepare_pass(&self, cache: &mut Cache, seq_len: usize) -> Result<()> {
+    fn prepare_pass(&self, cache: &mut State<CrownExact>, seq_len: usize) -> Result<()> {
         self.0.prepare_pass(cache, seq_len)
     }
-    fn note_input_ids(&self, cache: &mut Cache, ids: &[u32]) -> Result<()> {
+    fn note_input_ids(&self, cache: &mut State<CrownExact>, ids: &[u32]) -> Result<()> {
         self.0.note_input_ids(cache, ids)
     }
-    fn host_feed(&self, cache: &mut Cache) -> Result<Option<HostFeed>> {
+    fn host_feed(&self, cache: &mut State<CrownExact>) -> Result<Option<HostFeed>> {
         let Some(real) = self.0.host_feed(cache)? else {
             return Ok(None);
         };
@@ -674,7 +685,7 @@ impl CausalLM for FailingFill<'_> {
             window,
         )))
     }
-    fn host_feed_end(&self, cache: &mut Cache, published: &[u32]) -> Result<()> {
+    fn host_feed_end(&self, cache: &mut State<CrownExact>, published: &[u32]) -> Result<()> {
         self.0.host_feed_end(cache, published)
     }
     fn vocab_size(&self) -> usize {

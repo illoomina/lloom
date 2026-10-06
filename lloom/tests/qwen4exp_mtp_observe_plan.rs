@@ -10,10 +10,12 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, MtpDrafter, Qwen4Exp, Resident, Streamed};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{Config, MtpDrafter, Qwen4Exp, Resident, State, Streamed};
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result};
@@ -29,13 +31,13 @@ fn config() -> Config {
 }
 
 fn greedy(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     prompt: &[u32],
     max: usize,
 ) -> Result<Vec<u32>> {
     let dev = Device::Cpu;
-    let cache = model.new_cache(cfg, &dev)?;
+    let cache = RewindableExact::single(&model, &dev, 8)?;
     let mut session = Session::new(model, cache);
     let eos = [cfg.eos_token_id];
     let mut rb = Blocking::new(&eos, &dev)?;
@@ -56,7 +58,7 @@ fn the_observe_on_the_heads_device_plan_is_greedy_and_keys_every_row_once() -> R
     std::env::set_var("QWEN4EXP_MTP_OBSERVE_PLAN", "device");
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let max = 24;
     let mut found = None;
     for seed in 0..8u32 {
@@ -94,16 +96,18 @@ fn the_observe_on_the_heads_device_plan_is_greedy_and_keys_every_row_once() -> R
             LoaderArm::Pread,
             &dev,
         )?;
-        let head = testing::mtp_head(&cfg, &dev, experts);
+        let head = testing::mtp_head::<CrownExact, _>(&cfg, &dev, experts);
         let mut mtp =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
-        let mut cache: Cache = Cache::in_pools(&cfg, &model.spec_pools(1, k, &dev))?;
+        let mut cache: State<RewindableExact> =
+            State::<RewindableExact>::in_ring(&cfg, &model.spec_pools(1, k, &dev))?;
         cache.want_nextn = true;
         let mut session = Session::new(&model, cache);
         let eos = [cfg.eos_token_id];
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut mtp,
             &mut rb,
             &mut sampler,

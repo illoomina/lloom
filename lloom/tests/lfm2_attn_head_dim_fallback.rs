@@ -12,8 +12,9 @@
 //! instantiated head dim on each arm is the control: its fused kernel is in
 //! the census, so a census that could not see the kernel would fail there.
 
-use lloom::models::lfm2::{AttnImpl, Config, DecodeAttn, Model, PrefillAttn};
+use lloom::models::lfm2::{AttnImpl, Config, DecodeAttn, Model, PrefillAttn, Shape as Lfm2Shape};
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::profile::{CrownExact, PoolExact, PoolSpecExact};
 use lloom::testing::tiny::{TinyCheckpoint, TinyFamily, Weights};
 use lloom_tensor::{DType, Device, Result};
 
@@ -33,10 +34,10 @@ fn config(attn_impl: AttnImpl, head_dim: usize) -> Config {
     cfg
 }
 
-fn build(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model<P>> {
     TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(dtype)
-        .model(dev)
+        .model::<P>(dev)
 }
 
 /// On the CPU the fused arms do not exist, whatever the head dim: every phase
@@ -46,7 +47,7 @@ fn build(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model> {
 fn the_cpu_takes_the_composed_attention_without_a_warning() -> Result<()> {
     for arm in [AttnImpl::Sdpa, AttnImpl::FlashDecoding] {
         let cfg = config(arm, 48);
-        let model = build(&cfg, &Device::Cpu, DType::F32)?;
+        let model = build::<CrownExact>(&cfg, &Device::Cpu, DType::F32)?;
         let route = model.attn_route();
         assert_eq!(
             (route.decode, route.prefill),
@@ -65,7 +66,7 @@ fn the_cpu_takes_the_composed_attention_without_a_warning() -> Result<()> {
 #[cfg(feature = "metal")]
 mod metal {
     use super::*;
-    use lloom::models::lfm2::{AttnRoute, BatchPool, Cache, ConvState, KvAppend};
+    use lloom::models::lfm2::{AttnRoute, BatchPool, ConvState, KvAppend, State};
     use lloom::nn::Row;
     use lloom_tensor::quantized::GgmlDType;
     use lloom_tensor::Tensor;
@@ -82,7 +83,7 @@ mod metal {
     }
 
     /// The CPU model at f32 over the weights a `dtype` Metal model holds.
-    fn cpu_model(cfg: &Config, dtype: DType) -> Result<Model> {
+    fn cpu_model<P: Lfm2Shape>(cfg: &Config, dtype: DType) -> Result<Model<P>> {
         let dense = match dtype {
             DType::F16 => GgmlDType::F16,
             DType::BF16 => GgmlDType::BF16,
@@ -96,7 +97,7 @@ mod metal {
             },
         )
         .with_dtype(DType::F32)
-        .model(&Device::Cpu)
+        .model::<P>(&Device::Cpu)
     }
 
     fn logits(t: &Tensor) -> Result<Vec<f32>> {
@@ -107,7 +108,11 @@ mod metal {
     /// the cache (§10.9) and one more decode step: the logits of each pass.
     const PASSES: [&[u32]; 5] = [&[1, 2, 3, 4, 5], &[7], &[9], &[11, 13, 17], &[19]];
 
-    fn passes(model: &Model, cache: &mut Cache, dev: &Device) -> Result<Vec<Vec<f32>>> {
+    fn passes<P: Lfm2Shape>(
+        model: &Model<P>,
+        cache: &mut State<P>,
+        dev: &Device,
+    ) -> Result<Vec<Vec<f32>>> {
         let mut pos = 0;
         let mut out = Vec::new();
         for toks in PASSES {
@@ -183,15 +188,23 @@ mod metal {
     /// the decode steps and of the second prefill, each read in its own
     /// window on `dev`.
     struct Run {
-        model: Model,
+        /// The route the model resolved and its load warnings: what the
+        /// cases read (the model itself is one profile per case).
+        route: lloom::models::lfm2::AttnRoute,
+        warnings: Vec<lloom::load_warning::LoadWarning>,
         logits: Vec<Vec<f32>>,
         decode_census: Vec<(String, u64)>,
         prefill_census: Vec<(String, u64)>,
     }
 
     fn run_on_metal(cfg: &Config, dev: &Device, dtype: DType) -> Result<Run> {
-        let model = build(cfg, dev, dtype)?;
-        let mut cache = Cache::new(true, dtype, cfg, dev)?;
+        let key = cfg.exact_key();
+        lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run_on_metal_at::<P>(cfg, dev, dtype))
+    }
+
+    fn run_on_metal_at<P: Lfm2Shape>(cfg: &Config, dev: &Device, dtype: DType) -> Result<Run> {
+        let model = build::<P>(cfg, dev, dtype)?;
+        let mut cache = State::<P>::new(true, dtype, cfg, dev)?;
         let census = dev.as_metal_device()?.dispatch_census().clone();
         let mut out = Vec::new();
         let mut decode = Vec::new();
@@ -214,7 +227,8 @@ mod metal {
             pos += toks.len();
         }
         Ok(Run {
-            model,
+            route: model.attn_route(),
+            warnings: model.load_warnings().to_vec(),
             logits: out,
             decode_census: decode,
             prefill_census: prefill,
@@ -223,8 +237,8 @@ mod metal {
 
     fn reference(cfg: &Config, dtype: DType) -> Result<Vec<Vec<f32>>> {
         let cpu = cpu_config(cfg);
-        let model = cpu_model(cfg, dtype)?;
-        let mut cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
+        let model = cpu_model::<CrownExact>(cfg, dtype)?;
+        let mut cache = State::<CrownExact>::new(true, DType::F32, &cpu, &Device::Cpu)?;
         passes(&model, &mut cache, &Device::Cpu)
     }
 
@@ -412,7 +426,7 @@ mod metal {
             };
             assert_close(&what, &run.logits, &reference(&cfg, c.dtype)?, tol);
 
-            let route = run.model.attn_route();
+            let route = run.route;
             assert_eq!(
                 (
                     route.decode,
@@ -451,7 +465,7 @@ mod metal {
                 "{what}: the second prefill's census"
             );
 
-            let warnings = run.model.load_warnings();
+            let warnings = &run.warnings;
             if c.decode_refused.is_none() && c.prefill_refused.is_none() {
                 assert!(warnings.is_empty(), "{what}: {warnings:?}");
                 continue;
@@ -518,7 +532,7 @@ mod metal {
             (AttnImpl::FlashDecoding, DecodeAttn::FlashDecoding),
         ] {
             let cfg = config(arm, 512);
-            let model = build(&cfg, &dev, DType::F32)?;
+            let model = build::<CrownExact>(&cfg, &dev, DType::F32)?;
             let route = model.attn_route();
             assert_eq!(
                 (
@@ -541,19 +555,19 @@ mod metal {
                 "{:?}",
                 model.load_warnings()
             );
-            let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
-            let got = passes(&model, &mut cache, &dev)?;
+            let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+            let got = passes::<CrownExact>(&model, &mut cache, &dev)?;
             let cpu = cpu_config(&cfg);
-            let reference_model = cpu_model(&cfg, DType::F32)?;
-            let mut cpu_cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
-            let want = passes(&reference_model, &mut cpu_cache, &Device::Cpu)?;
+            let reference_model = cpu_model::<CrownExact>(&cfg, DType::F32)?;
+            let mut cpu_cache = State::<CrownExact>::new(true, DType::F32, &cpu, &Device::Cpu)?;
+            let want = passes::<CrownExact>(&reference_model, &mut cpu_cache, &Device::Cpu)?;
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 let r = rel(g, w);
                 eprintln!("{arm:?} head_dim 512 f32: pass {i}: {r:e}");
                 assert!(r <= 1e-4, "{arm:?}: pass {i} is {r:e} from the CPU");
             }
             // At f16 the same head dim is covered by the requested kernel.
-            let f16 = build(&cfg, &dev, DType::F16)?.attn_route();
+            let f16 = build::<CrownExact>(&cfg, &dev, DType::F16)?.attn_route();
             assert_eq!(
                 (f16.decode, f16.prefill),
                 (wanted, PrefillAttn::Steel),
@@ -586,19 +600,20 @@ mod metal {
             cfg.flash_page_size = 32;
             cfg.flash_pages_per_chunk = 1;
             let what = format!("pool head_dim {head_dim}");
-            let model = build(&cfg, &dev, DType::F16)?;
+            let model = build::<PoolSpecExact>(&cfg, &dev, DType::F16)?;
             let pool = BatchPool::new(&cfg, &dev, 4, 64)?;
             pool.set_batched_arms(true);
             let mut caches = Vec::new();
             for (prompt, _) in rows {
-                let mut cache = Cache::for_batch(true, DType::F16, &cfg, &dev, &pool)?;
+                let mut cache =
+                    State::<PoolSpecExact>::for_batch(true, DType::F16, &cfg, &dev, &pool)?;
                 let inp = Tensor::new(prompt, &dev)?.unsqueeze(0)?;
                 model.forward(&inp, 0, &mut cache)?;
                 caches.push(cache);
             }
             let nexts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
             let inp = Tensor::new(nexts.as_slice(), &dev)?.reshape((rows.len(), 1))?;
-            let mut refs: Vec<Row<'_, Cache>> = caches
+            let mut refs: Vec<Row<'_, State<PoolSpecExact>>> = caches
                 .iter_mut()
                 .zip(rows)
                 .map(|(cache, (prompt, _))| Row {
@@ -629,9 +644,9 @@ mod metal {
             );
 
             let cpu = cpu_config(&cfg);
-            let reference_model = cpu_model(&cfg, DType::F16)?;
+            let reference_model = cpu_model::<CrownExact>(&cfg, DType::F16)?;
             for (r, (prompt, next)) in rows.iter().enumerate() {
-                let mut cache = Cache::new(true, DType::F32, &cpu, &Device::Cpu)?;
+                let mut cache = State::<CrownExact>::new(true, DType::F32, &cpu, &Device::Cpu)?;
                 let inp = Tensor::new(*prompt, &Device::Cpu)?.unsqueeze(0)?;
                 reference_model.forward(&inp, 0, &mut cache)?;
                 let inp = Tensor::new(&[*next], &Device::Cpu)?.unsqueeze(0)?;

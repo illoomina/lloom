@@ -12,7 +12,9 @@
 //! that skips its fill and reads a recycled buffer's sentinel shows too.
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Model};
+use lloom::models::lfm2::{
+    AttnImpl, Config, ConvState, KvAppend, Model, Shape as Lfm2Shape, State,
+};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::nn::ops::KvQuant;
 use lloom::nn::zeros;
@@ -128,16 +130,16 @@ const WORKLOADS: &[Workload] = &[
     },
 ];
 
-fn model(cfg: &Config, dev: &Device) -> Result<Model> {
-    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default()).model(dev)
+fn model<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
+    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default()).model::<P>(dev)
 }
 
 /// Every logit of every workload, as bits.
-fn run(model: &Model, cfg: &Config, dev: &Device) -> Result<Vec<u32>> {
+fn run<P: Lfm2Shape>(model: &Model<P>, cfg: &Config, dev: &Device) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut id = 1u32;
     for w in WORKLOADS {
-        let mut cache = Cache::new(true, DType::F16, cfg, dev)?.with_kv_bucket(8)?;
+        let mut cache = State::<P>::new(true, DType::F16, cfg, dev)?.with_kv_bucket(8)?;
         let mut pos = 0usize;
         for &(tiles, decode) in w.turns {
             for &n in tiles {
@@ -171,8 +173,8 @@ fn push(out: &mut Vec<u32>, logits: &Tensor) -> Result<()> {
 
 /// `(moved, fills)` for one site under one sentinel, after checking that the
 /// unpoisoned run still reproduces `reference`.
-fn poisoned(
-    model: &Model,
+fn poisoned<P: Lfm2Shape>(
+    model: &Model<P>,
     cfg: &Config,
     dev: &Device,
     reference: &[u32],
@@ -181,11 +183,11 @@ fn poisoned(
 ) -> Result<(bool, u64)> {
     zeros::set_poison(site, value)?;
     let before = zeros::poisoned();
-    let got = run(model, cfg, dev);
+    let got = run::<P>(model, cfg, dev);
     let fills = zeros::poisoned() - before;
     zeros::set_poison("", "nan")?;
     let got = got?;
-    let again = run(model, cfg, dev)?;
+    let again = run::<P>(model, cfg, dev)?;
     assert!(
         again == reference,
         "the unpoisoned run moved after poisoning {site} with {value}: a site that skips \
@@ -199,7 +201,18 @@ fn classify(arm: &Arm, dev: &Device) -> Result<Vec<(&'static str, Verdict)>> {
     (arm.set)(&mut cfg);
     // A multi-tile prefill carries the conv context, as the engine runs it.
     cfg.conv_prefill_ctx = true;
-    let model = model(&cfg, dev)?;
+    let key = cfg.exact_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => classify_at::<P>(arm, &cfg, dev))
+}
+
+/// `classify` at the profile the arm's config names.
+fn classify_at<P: Lfm2Shape>(
+    arm: &Arm,
+    cfg: &Config,
+    dev: &Device,
+) -> Result<Vec<(&'static str, Verdict)>> {
+    let cfg = cfg.clone();
+    let model = model::<P>(&cfg, dev)?;
     zeros::set_poison("", "nan")?;
     let reference = run(&model, &cfg, dev)?;
     assert_eq!(
@@ -286,9 +299,14 @@ fn every_zero_site_reads_its_zeros_as_the_table_says() -> Result<()> {
 /// Logits of: a prompt and some decode steps, then, for each warm tile, the
 /// conv state filled with NaN when `stale_nan` (what a recycled buffer may
 /// hold), the tile, and more decode steps. Only the warm half is returned.
-fn warm_run(model: &Model, cfg: &Config, dev: &Device, stale_nan: bool) -> Result<Vec<u32>> {
-    let mut cache = Cache::new(true, DType::F16, cfg, dev)?.with_kv_bucket(8)?;
-    let feed = |cache: &mut Cache, ids: Vec<u32>, pos: usize| -> Result<Tensor> {
+fn warm_run<P: Lfm2Shape>(
+    model: &Model<P>,
+    cfg: &Config,
+    dev: &Device,
+    stale_nan: bool,
+) -> Result<Vec<u32>> {
+    let mut cache = State::<P>::new(true, DType::F16, cfg, dev)?.with_kv_bucket(8)?;
+    let feed = |cache: &mut State<P>, ids: Vec<u32>, pos: usize| -> Result<Tensor> {
         let n = ids.len();
         model.forward(&Tensor::from_vec(ids, (1, n), dev)?, pos, cache)
     };
@@ -338,28 +356,36 @@ fn a_warm_prefill_lets_no_stale_conv_column_reach_the_output() -> Result<()> {
         let mut cfg = TinyCheckpoint::<Lfm2Tiny>::template().cfg;
         (arm.set)(&mut cfg);
         cfg.conv_prefill_ctx = false;
-        let model = model(&cfg, &dev)?;
-        let clean = warm_run(&model, &cfg, &dev, false)?;
-        assert!(
-            clean.iter().all(|b| f32::from_bits(*b).is_finite()),
-            "{}: the clean run has a non-finite logit",
-            arm.name
-        );
-        let stale = warm_run(&model, &cfg, &dev, true)?;
-        let bad = stale
-            .iter()
-            .filter(|b| !f32::from_bits(**b).is_finite())
-            .count();
-        eprintln!(
-            "[warm prefill] {:<20} non-finite logits after a NaN-filled state: {bad}",
-            arm.name
-        );
-        assert!(
-            stale == clean,
-            "{}: a column of the previous conv state reached the output after a warm \
-             prefill ({bad} non-finite logits)",
-            arm.name
-        );
+        let key = cfg.exact_key();
+        lloom::profile::dispatch!(key, lloom::profile::LFM2, P => warm_case::<P>(&arm, &cfg, &dev))?;
     }
+    Ok(())
+}
+
+/// One arm of `a_warm_prefill_lets_no_stale_conv_column_reach_the_output`,
+/// at the profile its config names.
+fn warm_case<P: Lfm2Shape>(arm: &Arm, cfg: &Config, dev: &Device) -> Result<()> {
+    let model = model::<P>(&cfg, &dev)?;
+    let clean = warm_run::<P>(&model, &cfg, &dev, false)?;
+    assert!(
+        clean.iter().all(|b| f32::from_bits(*b).is_finite()),
+        "{}: the clean run has a non-finite logit",
+        arm.name
+    );
+    let stale = warm_run::<P>(&model, &cfg, &dev, true)?;
+    let bad = stale
+        .iter()
+        .filter(|b| !f32::from_bits(**b).is_finite())
+        .count();
+    eprintln!(
+        "[warm prefill] {:<20} non-finite logits after a NaN-filled state: {bad}",
+        arm.name
+    );
+    assert!(
+        stale == clean,
+        "{}: a column of the previous conv state reached the output after a warm \
+         prefill ({bad} non-finite logits)",
+        arm.name
+    );
     Ok(())
 }

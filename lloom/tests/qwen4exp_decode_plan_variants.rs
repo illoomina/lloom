@@ -20,6 +20,7 @@ use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
 use lloom::nn::expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Streamed};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::CrownExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKind, PassOpener};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::GgmlDType;
@@ -59,8 +60,8 @@ fn metal(dev: &Device) -> &MetalDevice {
     }
 }
 
-fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
-    testing::model_with_indexer(cfg, dev, |l| {
+fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<CrownExact, Resident>> {
+    testing::model_with_indexer::<CrownExact, _>(cfg, dev, |l| {
         let [g, u, d] = testing::expert_stacks(cfg, l, dev, GgmlDType::F32);
         Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
     })
@@ -86,9 +87,9 @@ fn write_experts(cfg: &Config, path: &Path) -> Result<()> {
 
 /// Every expert fits its layer's pool: after the first loads nothing
 /// misses, so the device plan arms and stays armed.
-fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Streamed>> {
+fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<CrownExact, Streamed>> {
     let content = Content::read(&mut File::open(path)?)?;
-    testing::model_with_indexer(cfg, dev, |l| {
+    testing::model_with_indexer::<CrownExact, _>(cfg, dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
         Streamed::new(
             src("ffn_gate_exps.weight")?,
@@ -103,7 +104,7 @@ fn streamed(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Streamed
 
 /// `STEPS` greedy ids for `PROMPT` through the driver (`Session::decode`),
 /// which prepares and brackets every decode step.
-fn decode<R: ExpertResidency>(model: &Qwen4Exp<R>, dev: &Device) -> Result<Vec<u32>> {
+fn decode<R: ExpertResidency>(model: &Qwen4Exp<CrownExact, R>, dev: &Device) -> Result<Vec<u32>> {
     let mut session = Session::new(model, model.new_cache(&tiny(), dev)?);
     let mut spec = IdentityProposer;
     let mut rb = Blocking::new(&[u32::MAX], dev)?;

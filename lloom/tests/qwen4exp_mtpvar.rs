@@ -24,12 +24,14 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{qsa, Cache, Config, MtpDrafter, Qwen4Exp, Resident, Streamed};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{qsa, Config, MtpDrafter, Qwen4Exp, Resident, State, Streamed};
 use lloom::models::qwen4exp::{ExpertResidency, MtpHead};
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
 use lloom::nn::speculator::{Draft, KvSource, NextnHidden, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::{CrownExact, Own, RewindableExact};
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
@@ -65,10 +67,11 @@ fn incumbent() {
 
 /// The resident tiny model with the QSA indexer, and an MTP head it shares
 /// with its drafter.
-fn model(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
-    let mut m =
-        testing::model_with_indexer(cfg, dev, |l| Ok(testing::resident_experts(cfg, l, dev)))?;
-    m.set_mtp(testing::mtp_head(
+fn model(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<RewindableExact, Resident>> {
+    let mut m = testing::model_with_indexer::<RewindableExact, _>(cfg, dev, |l| {
+        Ok(testing::resident_experts(cfg, l, dev))
+    })?;
+    m.set_mtp(testing::mtp_head::<CrownExact, _>(
         cfg,
         dev,
         testing::resident_experts(cfg, 7, dev),
@@ -77,13 +80,13 @@ fn model(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
 }
 
 fn greedy<R: ExpertResidency>(
-    m: &Qwen4Exp<R>,
+    m: &Qwen4Exp<RewindableExact, R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
     max: usize,
 ) -> Result<Vec<u32>> {
-    let mut session = Session::new(m, m.new_cache(cfg, dev)?);
+    let mut session = Session::new(m, RewindableExact::single(&m, &dev, 8)?);
     let eos = [cfg.eos_token_id];
     let mut rb = Blocking::new(&eos, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -100,7 +103,7 @@ fn greedy<R: ExpertResidency>(
 
 /// A prompt of `len` tokens whose greedy stream is at least `want` long.
 fn prompt_with_stream<R: ExpertResidency>(
-    m: &Qwen4Exp<R>,
+    m: &Qwen4Exp<RewindableExact, R>,
     cfg: &Config,
     dev: &Device,
     len: u32,
@@ -143,6 +146,7 @@ impl Scripted {
 
 impl Speculator for Scripted {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         1
     }
@@ -190,6 +194,7 @@ struct Recording<S> {
 
 impl<S: Speculator<Probe = NextnHidden>> Speculator for Recording<S> {
     type Probe = NextnHidden;
+    type Family = S::Family;
     fn n_seq(&self) -> usize {
         self.inner.n_seq()
     }
@@ -236,7 +241,7 @@ struct Run {
 }
 
 fn speculate<R: ExpertResidency, S: Speculator<Probe = NextnHidden>>(
-    m: &Qwen4Exp<R>,
+    m: &Qwen4Exp<RewindableExact, R>,
     cfg: &Config,
     dev: &Device,
     spec: &mut S,
@@ -244,16 +249,22 @@ fn speculate<R: ExpertResidency, S: Speculator<Probe = NextnHidden>>(
     opts: &DecodeOptions,
 ) -> Result<Run> {
     let k = spec.max_draft();
-    let mut cache = Cache::in_pools(cfg, &m.spec_pools(1, k, dev))?;
+    let mut cache = State::<RewindableExact>::in_ring(cfg, &m.spec_pools(1, k, dev))?;
     cache.want_nextn = true;
     let mut session = Session::new(m, cache);
     let eos = [cfg.eos_token_id];
     let mut rb = Blocking::new(&eos, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-    let out =
-        session.decode_speculative(spec, &mut rb, &mut sampler, prompt, opts, &eos, &mut |_| {
-            Ok(())
-        })?;
+    let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
+        spec,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        opts,
+        &eos,
+        &mut |_| Ok(()),
+    )?;
     Ok(Run {
         ids: out.ids,
         accepted: out.stats.rounds.iter().map(|r| r.accepted).collect(),
@@ -471,10 +482,10 @@ fn streamed(
     path: &std::path::Path,
     slots: usize,
     dev: &Device,
-) -> Result<(Qwen4Exp<Streamed>, Content)> {
+) -> Result<(Qwen4Exp<RewindableExact, Streamed>, Content)> {
     let content = Content::read(&mut File::open(path)?)?;
     let src = |l: usize, n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
-    let mut m = testing::model_with_indexer(cfg, dev, |l| {
+    let mut m = testing::model_with_indexer::<RewindableExact, _>(cfg, dev, |l| {
         Streamed::new(
             src(l, "ffn_gate_exps.weight")?,
             src(l, "ffn_up_exps.weight")?,
@@ -484,7 +495,7 @@ fn streamed(
             dev,
         )
     })?;
-    let head: MtpHead<Streamed> = testing::mtp_head(
+    let head: MtpHead<CrownExact, Streamed> = testing::mtp_head::<CrownExact, _>(
         cfg,
         dev,
         Streamed::new(
@@ -611,7 +622,7 @@ fn a_planned_verify_under_f16_routing_reads_its_routing() -> Result<()> {
         io_hints: false,
     };
     // Every window host-planned: its ids read back at each layer.
-    let build = |dev: &Device| -> Result<Qwen4Exp<Streamed>> {
+    let build = |dev: &Device| -> Result<Qwen4Exp<RewindableExact, Streamed>> {
         let mut m = fx.streamed(&cfg, dev, &LoadOptions::default(), &stream)?;
         m.set_routed_act(lloom_tensor::DType::F16);
         m.set_device_plan(false);

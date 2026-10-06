@@ -80,7 +80,7 @@ impl Outcome {
 
 /// The logits of the model `make` builds on `dev`, over `w`.
 fn run_model<F: TinyFamily>(
-    make: impl FnOnce(&Device) -> lloom_tensor::Result<F::Model>,
+    make: impl FnOnce(&Device) -> lloom_tensor::Result<F::Model<lloom::profile::CrownExact>>,
     cfg: &F::Config,
     vocab: usize,
     dev: &Device,
@@ -208,7 +208,7 @@ fn judge<F: TinyFamily>(
                 if as_reference {
                     F::reference(&ckpt, d)
                 } else {
-                    ckpt.model(d)
+                    ckpt.model::<lloom::profile::CrownExact>(d)
                 }
             },
             &ckpt.cfg,

@@ -16,12 +16,14 @@ use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
+use crate::profile::{Profile, Regime as _, Rewind as _, Rows as _};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::metal::{GpuClock, PageError, PageIdx};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
 use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
@@ -313,6 +315,18 @@ pub enum ConvState {
 const DEFAULT_RING_SLACK: usize = 16;
 
 impl ConvState {
+    /// The verify window a rewind can reach on this arm: the rotating
+    /// ring's history, less the one slot the rows' shared pool lays its
+    /// state out in (`lfm2_presets::pool`: `RotatingRing { k: 1 }` is the
+    /// pooled rows' layout, not a window). The sliding arm never rewinds
+    /// (`Cache::rewind_horizon`).
+    pub fn verify_depth(&self, paged: bool) -> usize {
+        match self {
+            ConvState::RotatingRing { k } => k.saturating_sub(paged as usize),
+            ConvState::Shuffle | ConvState::SlidingRing { .. } => 0,
+        }
+    }
+
     /// Extra history slots beyond the live window.
     fn history(&self) -> usize {
         match self {
@@ -1572,6 +1586,72 @@ pub fn parse_silu_impl(s: &str) -> std::result::Result<SiluImpl, String> {
 }
 
 impl Config {
+    /// The shape this config's axes name, as the profile's `(rewind, rows)`
+    /// (`profiles-and-memory-design.md` §3): `Paged` rows are the paged KV
+    /// (`KvAppend::Paged`); a `Ring` rewind is a rotating conv ring with a
+    /// verify window's depth beyond the one slot the rows' pool lays its
+    /// state out in (`ConvState::verify_depth`), over a KV with a length to
+    /// rewind (`Cat` has none).
+    pub fn shape(&self) -> (&'static str, &'static str) {
+        let paged = self.kv_append == KvAppend::Paged;
+        let rewindable =
+            self.kv_append != KvAppend::Cat && self.conv_state.verify_depth(paged) >= 1;
+        (
+            if rewindable {
+                crate::profile::Ring::NAME
+            } else {
+                crate::profile::NoRewind::NAME
+            },
+            if paged {
+                crate::profile::Paged::NAME
+            } else {
+                crate::profile::One::NAME
+            },
+        )
+    }
+
+    /// The profile `P` a model of this config is built at: the shape from
+    /// the axes (`shape`), the regime from the contract in force.
+    pub fn profile_key(&self) -> crate::profile::ProfileKey {
+        let (rewind, rows) = self.shape();
+        crate::profile::ProfileKey {
+            regime: match lloom_tensor::tuning::contract() {
+                lloom_tensor::tuning::Contract::Deterministic => crate::profile::Exact::NAME,
+                lloom_tensor::tuning::Contract::Fast => crate::profile::Free::NAME,
+            },
+            rewind,
+            rows,
+        }
+    }
+
+    /// The key at `Exact`, the regime stated here if none is in force yet
+    /// (`tuning::pin_regime`): what a test asks, which never inherits the
+    /// default (RESTRUCTURING §2). The engine and the harnesses, whose
+    /// contract is installed before any model, take `profile_key`.
+    pub fn exact_key(&self) -> crate::profile::ProfileKey {
+        let _ = lloom_tensor::tuning::pin_regime(lloom_tensor::tuning::Contract::Deterministic);
+        self.profile_key()
+    }
+
+    /// Refuse a config whose axes are not `P`'s shape: the profile names
+    /// which state exists, the axes must agree (a mismatch is the shape the
+    /// type was meant to rule out, caught at construction rather than
+    /// silently served).
+    pub fn check_shape<P: Profile>(&self) -> Result<()> {
+        let (rewind, rows) = self.shape();
+        let key = P::KEY;
+        if key.rewind != rewind || key.rows != rows {
+            lloom_tensor::bail!(
+                "lfm2: a {key} model on a config whose axes name `{rewind} × {rows}` \
+                 (kv_append {:?}, conv_state {:?}): the profile and the preset must agree \
+                 (profiles-and-memory-design.md §3; `lfm2_presets`)",
+                self.kv_append,
+                self.conv_state
+            )
+        }
+        Ok(())
+    }
+
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
@@ -3064,7 +3144,8 @@ pub fn kv_grow_fits(allocated: usize, working_set: usize, fraction: f64, grow: u
 const MASK_CACHE_ENTRIES: usize = 16;
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
-pub struct Cache {
+pub struct State<P: Profile> {
+    profile: PhantomData<P>,
     masks: HashMap<(usize, usize), Tensor>,
     pub use_kv_cache: bool,
     // KV cache for attention layers: (key, value) per layer
@@ -3503,9 +3584,9 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
         .collect()
 }
 
-impl crate::nn::model::CacheShare for Cache {
+impl<P: Profile> crate::nn::model::CacheShare for State<P> {
     fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize> {
-        Cache::share_prefix_from(self, src, n_tokens)
+        State::<P>::share_prefix_from(self, src, n_tokens)
     }
 
     fn share_granularity(&self) -> usize {
@@ -3580,7 +3661,7 @@ fn dump_logits(logits: &Tensor, pos: usize) -> Result<()> {
     Ok(())
 }
 
-impl CacheReset for Cache {
+impl<P: Profile> CacheReset for State<P> {
     /// Delegates to [`Cache::clear`] — the tested total reset (kvs, kv/quant
     /// slots, conv states, conv phase and compaction flag). This is what lets
     /// `Session::warmup` run a real forward for its compilation side effect and
@@ -3590,7 +3671,7 @@ impl CacheReset for Cache {
     }
 }
 
-impl Cache {
+impl<P: Profile> State<P> {
     /// What this cache's verify completions did with the publish event
     /// (`VerifyWaits`); all zero before the first verify, or off Metal.
     pub fn verify_waits(&self) -> VerifyWaits {
@@ -3601,7 +3682,7 @@ impl Cache {
     }
 }
 
-impl Cache {
+impl<P: Profile> State<P> {
     /// A cache whose KV grows in buckets toward the model's positional
     /// ceiling: `kv_capacity` is `max_position_embeddings`. See
     /// [`Cache::new_with`] for the ceiling and [`DEFAULT_KV_BUCKET`] for the
@@ -3796,6 +3877,7 @@ impl Cache {
             _ => None,
         };
         Ok(Self {
+            profile: PhantomData,
             masks: HashMap::new(),
             use_kv_cache,
             kvs: vec![None; num_layers],
@@ -3854,66 +3936,6 @@ impl Cache {
             cos,
             sin,
         })
-    }
-
-    /// Take this pass's layer-input residuals, leaving the cache empty
-    /// (`DESIGN.md` §10.2m, issue #363).
-    ///
-    /// One entry per [`Config::tap_layers`] index, **in that slice's order**,
-    /// each `[b_sz, seq_len, hidden_size]` at [`Config::tap_dtype`]. Empty
-    /// unless the preceding forward pass ran with a non-empty `tap_layers`.
-    ///
-    /// **It drains rather than borrows**, which is the property that matters:
-    /// a tap belongs to the pass that produced it, so reading one pass's taps
-    /// twice — or reading a rolled-back speculative window's taps as though
-    /// they described the committed state — is impossible by construction
-    /// rather than by the caller remembering. The alternative (a `&[Tensor]`
-    /// accessor) makes both of those a caller discipline, and §6.7 L4's whole
-    /// lesson is that a discipline nothing enforces is a defect waiting for a
-    /// second consumer.
-    /// Returns empty if the preceding pass did not tap. **Every slot is filled
-    /// or none is**: the indices are range-checked at construction, so a slot
-    /// can only be empty if no pass has run, and a partially-filled vector
-    /// would mean a layer index the loop never reached — which the constructor
-    /// has already refused.
-    /// A cache whose KV pages and conv ring live in `pool`, at a slot leased
-    /// here and returned when the cache drops (`batched-decode-design.md`
-    /// §12.2). `config` must be the pool's (`Paged × FlashDecoding ×
-    /// RotatingRing`); everything else — positions, taps, the token log's
-    /// owner — is the row's own, as on any cache.
-    #[allow(unused_variables)]
-    pub fn for_batch(
-        use_kv_cache: bool,
-        dtype: DType,
-        config: &Config,
-        device: &Device,
-        pool: &BatchPool,
-    ) -> Result<Self> {
-        #[cfg(not(feature = "metal"))]
-        {
-            lloom_tensor::bail!("lfm2 Cache::for_batch is Metal-only")
-        }
-        #[cfg(feature = "metal")]
-        {
-            if !use_kv_cache {
-                lloom_tensor::bail!("lfm2 Cache::for_batch: a batch row keeps its KV")
-            }
-            let mut cache = Self::new_with(true, dtype, config, device, pool.kv_capacity())?;
-            // The per-cache pool `new_with` built for the `Paged` arm is not
-            // this row's: its pages are the shared pool's.
-            cache.paged = None;
-            let lease = pool.lease()?;
-            let page_size = pool.page_size();
-            cache.batch = Some(BatchSlot {
-                pool: pool.clone(),
-                lease: Arc::new(lease),
-                pass: None,
-                pass_start: 0,
-                page_size,
-                staged_snaps: Vec::new(),
-            });
-            Ok(cache)
-        }
     }
 
     /// The row's slot in its [`BatchPool`], if it has one.
@@ -4141,7 +4163,7 @@ impl Cache {
     /// `batched-decode-design.md` §12.3). The caller then feeds the tokens
     /// after them at that position, with the conv's left context restored.
     #[allow(unused_variables)]
-    pub fn share_prefix_from(&mut self, src: &Cache, n_tokens: usize) -> Result<usize> {
+    pub fn share_prefix_from(&mut self, src: &State<P>, n_tokens: usize) -> Result<usize> {
         #[cfg(not(feature = "metal"))]
         {
             Ok(0)
@@ -4256,6 +4278,26 @@ impl Cache {
         Ok(())
     }
 
+    /// Take this pass's layer-input residuals, leaving the cache empty
+    /// (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// One entry per [`Config::tap_layers`] index, **in that slice's order**,
+    /// each `[b_sz, seq_len, hidden_size]` at [`Config::tap_dtype`]. Empty
+    /// unless the preceding forward pass ran with a non-empty `tap_layers`.
+    ///
+    /// **It drains rather than borrows**, which is the property that matters:
+    /// a tap belongs to the pass that produced it, so reading one pass's taps
+    /// twice — or reading a rolled-back speculative window's taps as though
+    /// they described the committed state — is impossible by construction
+    /// rather than by the caller remembering. The alternative (a `&[Tensor]`
+    /// accessor) makes both of those a caller discipline, and §6.7 L4's whole
+    /// lesson is that a discipline nothing enforces is a defect waiting for a
+    /// second consumer.
+    /// Returns empty if the preceding pass did not tap. **Every slot is filled
+    /// or none is**: the indices are range-checked at construction, so a slot
+    /// can only be empty if no pass has run, and a partially-filled vector
+    /// would mean a layer index the loop never reached — which the constructor
+    /// has already refused.
     pub fn take_taps(&mut self) -> Vec<Tensor> {
         let slots = std::mem::take(&mut self.taps);
         slots.into_iter().flatten().collect()
@@ -5655,6 +5697,101 @@ impl Cache {
     }
 }
 
+/// The state a driver builds for its shape (`profiles-and-memory-design.md`
+/// §3), named once in generic code (`P::state`): the `One` shapes a
+/// sequence's own cache, the `Paged` shapes a row of the shared pool when
+/// one is given (`--batch N --rows pool`) and a single sequence on its own
+/// page pool when none is (`lfm2-determinism --preset pool`).
+pub trait Shape: Profile {
+    fn state(
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        kv_capacity: usize,
+        pool: Option<&BatchPool>,
+    ) -> Result<State<Self>>;
+}
+
+impl<G: crate::profile::Regime, W: crate::profile::Rewind> Shape
+    for crate::profile::P<G, W, crate::profile::One>
+{
+    fn state(
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        kv_capacity: usize,
+        pool: Option<&BatchPool>,
+    ) -> Result<State<Self>> {
+        if pool.is_some() {
+            lloom_tensor::bail!(
+                "lfm2: a {} state is a sequence's own; the shared pool's rows are the `Paged` shapes",
+                Self::KEY
+            )
+        }
+        State::<Self>::new_with(true, dtype, config, device, kv_capacity)
+    }
+}
+
+impl<G: crate::profile::Regime, W: crate::profile::Rewind> Shape
+    for crate::profile::P<G, W, crate::profile::Paged>
+{
+    fn state(
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+        kv_capacity: usize,
+        pool: Option<&BatchPool>,
+    ) -> Result<State<Self>> {
+        match pool {
+            Some(p) => State::<Self>::for_batch(true, dtype, config, device, p),
+            None => State::<Self>::new_with(true, dtype, config, device, kv_capacity),
+        }
+    }
+}
+
+/// The rows' shape (`Paged`): a row of a shared [`BatchPool`].
+impl<P: Profile<Rows = crate::profile::Paged>> State<P> {
+    /// A cache whose KV pages and conv ring live in `pool`, at a slot leased
+    /// here and returned when the cache drops (`batched-decode-design.md`
+    /// §12.2). `config` must be the pool's (`Paged × FlashDecoding ×
+    /// RotatingRing`); everything else — positions, taps, the token log's
+    /// owner — is the row's own, as on any cache.
+    #[allow(unused_variables)]
+    pub fn for_batch(
+        use_kv_cache: bool,
+        dtype: DType,
+        config: &Config,
+        device: &Device,
+        pool: &BatchPool,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "metal"))]
+        {
+            lloom_tensor::bail!("lfm2 State::<P>::for_batch is Metal-only")
+        }
+        #[cfg(feature = "metal")]
+        {
+            if !use_kv_cache {
+                lloom_tensor::bail!("lfm2 State::<P>::for_batch: a batch row keeps its KV")
+            }
+            let mut cache = Self::new_with(true, dtype, config, device, pool.kv_capacity())?;
+            // The per-cache pool `new_with` built for the `Paged` arm is not
+            // this row's: its pages are the shared pool's.
+            cache.paged = None;
+            let lease = pool.lease()?;
+            let page_size = pool.page_size();
+            cache.batch = Some(BatchSlot {
+                pool: pool.clone(),
+                lease: Arc::new(lease),
+                pass: None,
+                pass_start: 0,
+                page_size,
+                staged_snaps: Vec::new(),
+            });
+            Ok(cache)
+        }
+    }
+}
+
 /// The receipt for an open speculative window — `DESIGN.md` §10.2a.
 ///
 /// **`#[must_use]` and not `Copy`, and both are load-bearing.** A caller who
@@ -5990,7 +6127,8 @@ impl crate::optimizer::Visit for Mlp {
 
 /// Attention layer with per-head QK normalization and RoPE.
 #[derive(Debug, Clone)]
-struct Attention {
+struct Attention<P: Profile> {
+    profile: PhantomData<P>,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -6022,7 +6160,7 @@ struct Attention {
     span_rot: tracing::Span,
 }
 
-impl Attention {
+impl<P: Profile> Attention<P> {
     /// `streamed`: the projections live in the weight-group tier (§4.8);
     /// the fields are placeholders and `LayerWeights` carries the views.
     fn new(cfg: &Config, route: AttnRoute, vb: VarBuilder, streamed: bool) -> Result<Self> {
@@ -6055,6 +6193,7 @@ impl Attention {
         let k_norm = RmsNorm::new(head_dim, cfg.norm_eps, vb.pp("k_layernorm"))?;
 
         Ok(Self {
+            profile: PhantomData,
             q_proj,
             k_proj,
             v_proj,
@@ -6119,7 +6258,7 @@ impl Attention {
             && matches!(q.dtype(), DType::F16 | DType::F32)
     }
 
-    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &Cache) -> Result<Tensor> {
+    fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize, cache: &State<P>) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (_, _, seq_len, _) = x.dims4()?;
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
@@ -6143,7 +6282,7 @@ impl Attention {
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let y = self.attend(w, x, index_pos, block_idx, cache)?;
         w.o.forward(&y)
@@ -6159,7 +6298,7 @@ impl Attention {
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
@@ -6182,7 +6321,7 @@ impl Attention {
         norm: &RmsNorm,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         residual: &Tensor,
     ) -> Result<Tensor> {
         let y = self.attend_normed(w, x, Some(norm), index_pos, block_idx, cache)?;
@@ -6202,7 +6341,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
         residual: &Tensor,
     ) -> Result<Tensor> {
         let y = self.attend_rows(w, x, block_idx, rows)?;
@@ -6220,7 +6359,7 @@ impl Attention {
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         self.attend_normed(w, x, None, index_pos, block_idx, cache)
     }
@@ -6233,7 +6372,7 @@ impl Attention {
         norm: Option<&RmsNorm>,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -6253,7 +6392,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -6291,7 +6430,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
         residual: &Tensor,
     ) -> Result<Tensor> {
         let y = self.attend_ragged(w, x, block_idx, rows)?;
@@ -6313,7 +6452,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (_, total, _) = x.dims3()?;
@@ -6363,11 +6502,15 @@ impl Attention {
     /// pool, keeping their KV, unquantized, untapped, and the dtype and head
     /// dim the flash kernels instantiate.
     #[cfg(feature = "metal")]
-    fn rows_share_a_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>, dtype: DType) -> bool {
+    fn rows_share_a_pool<'a>(
+        &self,
+        caches: impl Iterator<Item = &'a State<P>>,
+        dtype: DType,
+    ) -> bool {
         if self.route.decode != DecodeAttn::FlashDecoding {
             return false;
         }
-        let mut first: Option<&Cache> = None;
+        let mut first: Option<&State<P>> = None;
         for c in caches {
             if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() {
                 return false;
@@ -6402,7 +6545,7 @@ impl Attention {
     #[cfg(feature = "metal")]
     fn shared_pass(
         pool: &BatchPool,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
         rows: &[(usize, usize)],
         device: &Device,
     ) -> Result<Arc<RowsPass>> {
@@ -6445,7 +6588,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
     ) -> Result<Option<Tensor>> {
         if !self.rows_share_a_pool(rows.iter().map(|r| &*r.cache), x.dtype()) {
             return Ok(None);
@@ -6475,7 +6618,7 @@ impl Attention {
             .iter()
             .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), 1))
             .collect();
-        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
         let reserve_chunks = caches[0]
             .kv_capacity
@@ -6526,7 +6669,7 @@ impl Attention {
         k: &Tensor,
         v: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Option<Tensor>> {
         if !self.rows_share_a_pool(rows.iter().map(|r| &*r.cache), q.dtype()) {
             return Ok(None);
@@ -6554,7 +6697,7 @@ impl Attention {
             .iter()
             .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), r.len))
             .collect();
-        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
         let reserve_chunks = caches[0]
             .kv_capacity
@@ -6733,7 +6876,7 @@ impl Attention {
         &self,
         w: &AttnWeights<'_>,
         x: &Tensor,
-        rope_at: Option<(usize, &Cache)>,
+        rope_at: Option<(usize, &State<P>)>,
     ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         self.project_normed(w, x, None, rope_at)
     }
@@ -6745,7 +6888,7 @@ impl Attention {
         w: &AttnWeights<'_>,
         x: &Tensor,
         norm: Option<&RmsNorm>,
-        rope_at: Option<(usize, &Cache)>,
+        rope_at: Option<(usize, &State<P>)>,
     ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -6813,7 +6956,7 @@ impl Attention {
         rotated: bool,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let (b_sz, _, seq_len, _) = q.dims4()?;
 
@@ -7227,7 +7370,7 @@ impl Attention {
 /// the decode kernel the route took, the output projection. The cache, the
 /// appends and the attention over `kv_len` are layer `l`'s KV recurrence.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for Attention {
+impl<P: Profile> crate::optimizer::Visit for Attention<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (xn, l): Self::In) -> Self::Out {
@@ -7307,7 +7450,8 @@ impl crate::optimizer::Visit for Attention {
 }
 
 #[derive(Debug, Clone)]
-struct ShortConv {
+struct ShortConv<P: Profile> {
+    profile: PhantomData<P>,
     in_proj: Linear,
     out_proj: Linear,
     conv_weight: Tensor,
@@ -7349,7 +7493,7 @@ fn conv_c_fusion_disabled() -> bool {
     *DISABLED.get_or_init(|| crate::tuning::tuning().lfm2.skip_conv_c_fusion)
 }
 
-impl ShortConv {
+impl<P: Profile> ShortConv<P> {
     /// `streamed`: the two projections live in the weight-group tier
     /// (§4.8); the fields are placeholders and `LayerWeights` carries the
     /// views. The taps are resident either way.
@@ -7387,6 +7531,7 @@ impl ShortConv {
         let shift = ShortConv::<Shift>::new(taps, l_cache);
 
         Ok(Self {
+            profile: PhantomData,
             in_proj,
             out_proj,
             conv_weight,
@@ -7650,7 +7795,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let conv_out = self.convolve(w, x, block_idx, cache)?;
         w.out_proj.forward(&conv_out)
@@ -7665,7 +7810,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         residual: &Tensor,
     ) -> Result<Tensor> {
         if self.gemv_residual {
@@ -7686,7 +7831,7 @@ impl ShortConv {
         x: &Tensor,
         norm: &RmsNorm,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         residual: &Tensor,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
@@ -7707,7 +7852,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
         residual: &Tensor,
     ) -> Result<Tensor> {
         let conv_out = self.convolve_rows(w, x, block_idx, rows)?;
@@ -7724,7 +7869,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         // Project input to B, C, X components
@@ -7741,7 +7886,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let bcx = w.in_proj.forward(x)?.transpose(1, 2)?;
@@ -7764,7 +7909,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
         residual: &Tensor,
     ) -> Result<Tensor> {
         let conv_out = self.convolve_ragged(w, x, block_idx, rows)?;
@@ -7785,7 +7930,7 @@ impl ShortConv {
         w: &ConvWeights<'_>,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let bcx = w.in_proj.forward(x)?;
@@ -7810,7 +7955,7 @@ impl ShortConv {
     /// can write in one dispatch (§12.2): the fused `RotatingRing` arm, every
     /// row on the same pool, none speculating.
     #[cfg(feature = "metal")]
-    fn rows_share_a_ring_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>) -> bool {
+    fn rows_share_a_ring_pool<'a>(&self, caches: impl Iterator<Item = &'a State<P>>) -> bool {
         if !matches!(self.conv_state, ConvState::RotatingRing { .. })
             || !self.conv_fused
             || conv_c_fusion_disabled()
@@ -7818,7 +7963,7 @@ impl ShortConv {
         {
             return false;
         }
-        let mut first: Option<&Cache> = None;
+        let mut first: Option<&State<P>> = None;
         for c in caches {
             if c.batch.is_none() || !c.use_kv_cache {
                 return false;
@@ -7854,7 +7999,7 @@ impl ShortConv {
         &self,
         bcx: &Tensor,
         block_idx: usize,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
     ) -> Result<Tensor> {
         let width = self.conv_state.width(self.l_cache);
         let dtype = bcx.dtype();
@@ -7903,12 +8048,12 @@ impl ShortConv {
         &self,
         bcx: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
     ) -> Result<Option<Tensor>> {
         if !self.rows_share_a_ring_pool(rows.iter().map(|r| &*r.cache)) {
             return Ok(None);
         }
-        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         Ok(Some(self.ring_rows_shared(bcx, block_idx, &mut caches)?))
     }
 
@@ -7920,7 +8065,7 @@ impl ShortConv {
         &self,
         bcx: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Option<Tensor>> {
         if !self.rows_share_a_ring_pool(rows.iter().map(|r| &*r.cache)) {
             return Ok(None);
@@ -7946,8 +8091,8 @@ impl ShortConv {
             // `[1, nd, 3·hidden]` contiguous is `[nd, 3·hidden, 1]` with the
             // strides a batch of one-token rows has.
             let bcx_d = bcx_d.contiguous()?.reshape((nd, 3 * self.hidden_size, 1))?;
-            let mut caches: Vec<&mut Cache> = Vec::with_capacity(nd);
-            let mut taken: Vec<Option<&mut RaggedRow<'_, Cache>>> =
+            let mut caches: Vec<&mut State<P>> = Vec::with_capacity(nd);
+            let mut taken: Vec<Option<&mut RaggedRow<'_, State<P>>>> =
                 rows.iter_mut().map(Some).collect();
             for &r in &dec {
                 caches.push(&mut *taken[r].take().expect("each row once").cache);
@@ -7978,7 +8123,7 @@ impl ShortConv {
 
     /// The conv block after `in_proj`: `bcx` is `[b, 3·hidden, seq]` and the
     /// result `[b, seq, hidden]` with the `*C` gate applied.
-    fn convolve_bcx(&self, bcx: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn convolve_bcx(&self, bcx: &Tensor, block_idx: usize, cache: &mut State<P>) -> Result<Tensor> {
         let (b_sz, _, seq_len) = bcx.dims3()?;
         // A batch row's ring is a row of the pool: bound before any arm below
         // reads `conv_states`, so what they read and write is the pool's row.
@@ -8108,7 +8253,7 @@ impl ShortConv {
             let ConvState::RotatingRing { .. } = self.conv_state else {
                 lloom_tensor::bail!(
                     "lfm2 speculative conv: only `RotatingRing` can rewind \
-                     (`DESIGN.md` §10.2a). `Cache::advance` refuses the other arms."
+                     (`DESIGN.md` §10.2a). `State::<P>::advance` refuses the other arms."
                 )
             };
             let width = self.conv_state.width(self.l_cache);
@@ -8450,7 +8595,7 @@ impl ShortConv {
 /// `l`'s conv recurrence; the `*c` gate reads the fold's result and is
 /// straight-line.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for ShortConv {
+impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (xn, l): Self::In) -> Self::Out {
@@ -8545,17 +8690,17 @@ impl crate::optimizer::Visit for ShortConv {
 }
 
 #[derive(Debug, Clone)]
-enum LayerKind {
-    Attention(Box<Attention>),
-    ShortConv(ShortConv),
+enum LayerKind<P: Profile> {
+    Attention(Box<Attention<P>>),
+    ShortConv(ShortConv<P>),
 }
 
 #[derive(Debug, Clone)]
-struct DecoderLayer {
+struct DecoderLayer<P: Profile> {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     mlp: Mlp,
-    kind: LayerKind,
+    kind: LayerKind<P>,
     /// `Some`: this layer's matrices stream through the tier (§4.8).
     streamed: Option<StreamedLayer>,
     span: tracing::Span,
@@ -8689,7 +8834,7 @@ fn ablate_norms() -> bool {
     })
 }
 
-impl DecoderLayer {
+impl<P: Profile> DecoderLayer<P> {
     /// The layer's RMSNorm, or `x` itself under the `norm` ablation at a
     /// one-token step.
     fn norm(&self, n: &RmsNorm, x: &Tensor) -> Result<Tensor> {
@@ -8814,7 +8959,7 @@ impl DecoderLayer {
         x: &Tensor,
         index_pos: usize,
         block_idx: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let w = self.weights()?;
@@ -8871,7 +9016,7 @@ impl DecoderLayer {
         &self,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [Row<'_, Cache>],
+        rows: &mut [Row<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let w = self.weights()?;
@@ -8898,7 +9043,7 @@ impl DecoderLayer {
         &self,
         x: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let w = self.weights()?;
@@ -8923,7 +9068,7 @@ impl DecoderLayer {
 /// the FFN norm, the MLP, its residual add — the adds unfused, as the MLP's
 /// epilogues are. `In` is the hidden state and the layer's index.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for DecoderLayer {
+impl<P: Profile> crate::optimizer::Visit for DecoderLayer<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (hidden, l): Self::In) -> Self::Out {
@@ -8948,9 +9093,10 @@ impl crate::optimizer::Visit for DecoderLayer {
 
 /// LFM2 model for causal language modeling.
 #[derive(Debug, Clone)]
-pub struct Model {
+pub struct Model<P: Profile> {
+    profile: PhantomData<P>,
     embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
+    layers: Vec<DecoderLayer<P>>,
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
     fusion_report: Option<FusionReport>,
     /// The attention kernels every attention layer takes, decided once here.
@@ -8982,7 +9128,10 @@ struct EpilogueFlags {
 /// approximated — that would be a finding about the catalogue or the model,
 /// and it is reported as an error naming the sites.
 #[cfg(not(target_arch = "wasm32"))]
-fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
+fn derive_fusion<P: Profile>(
+    model: &Model<P>,
+    cfg: &Config,
+) -> Result<(EpilogueFlags, FusionReport)> {
     use crate::optimizer::{
         derive, exclusions, numeric, ExclusionSet, Lookup, Policy, RegionKind, TargetFpModel,
         Verdict,
@@ -9216,7 +9365,7 @@ fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionRe
 /// The conv fold's ∞-norm gain per channel over every conv layer's loaded
 /// weights (`FusionReport::conv_fold_gain`). Once, at construction, under
 /// `Fusion=Derived` only.
-fn conv_fold_gain(layers: &[DecoderLayer]) -> Result<Option<ConvFoldGain>> {
+fn conv_fold_gain<P: Profile>(layers: &[DecoderLayer<P>]) -> Result<Option<ConvFoldGain>> {
     let mut gain = ConvFoldGain {
         layers: 0,
         taps: 0,
@@ -9253,7 +9402,10 @@ fn conv_fold_gain(layers: &[DecoderLayer]) -> Result<Option<ConvFoldGain>> {
 /// A browser build has no optimizer (`egglog` is host-only); the arm is
 /// refused rather than silently manual.
 #[cfg(target_arch = "wasm32")]
-fn derive_fusion(_model: &Model, _cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
+fn derive_fusion<P: Profile>(
+    _model: &Model<P>,
+    _cfg: &Config,
+) -> Result<(EpilogueFlags, FusionReport)> {
     lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
 }
 
@@ -9294,8 +9446,10 @@ fn mark_graph_node(device: &Device, index: usize) {
 #[cfg(not(feature = "metal"))]
 fn mark_graph_node(_: &Device, _: usize) {}
 
-impl Model {
+impl<P: Profile> Model<P> {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        crate::profile::hold::<P::Regime>("lfm2")?;
+        cfg.check_shape::<P>()?;
         // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING
         // §1.6). The value is a `#[axis]` field on `Config` so a run records it;
         // the atomic in `lloom-tensor::kernels` is its cache, set once here at
@@ -9401,6 +9555,7 @@ impl Model {
         };
 
         let mut model = Self {
+            profile: PhantomData,
             embed_tokens,
             layers,
             fusion_report: None,
@@ -9474,7 +9629,7 @@ impl Model {
 
     /// Hand the cache the tier's handle (once), so its admission can apply
     /// the arbiter's pledge to the slots and ask again.
-    fn attach_layer_tier(&self, cache: &mut Cache) {
+    fn attach_layer_tier(&self, cache: &mut State<P>) {
         if let Some(st) = self.layers.first().and_then(|l| l.streamed.as_ref()) {
             cache.attach_layer_tier(&st.tier);
         }
@@ -9504,7 +9659,7 @@ impl Model {
         &self,
         input_ids: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         self.attach_layer_tier(cache);
@@ -9581,7 +9736,11 @@ impl Model {
     /// [`Self::forward`] per sequence. Refused: a cache that taps (the taps are
     /// per pass and a batched pass would have to split them) and one with an
     /// open speculative window.
-    pub fn forward_rows(&self, input_ids: &Tensor, rows: &mut [Row<'_, Cache>]) -> Result<Tensor> {
+    pub fn forward_rows(
+        &self,
+        input_ids: &Tensor,
+        rows: &mut [Row<'_, State<P>>],
+    ) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids.dims2()?;
         if seq_len != 1 {
             lloom_tensor::bail!(
@@ -9671,7 +9830,7 @@ impl Model {
     pub fn forward_ragged(
         &self,
         input_ids: &Tensor,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
         self.forward_ragged_impl(input_ids, rows, false, false)
     }
@@ -9685,7 +9844,7 @@ impl Model {
     pub fn forward_ragged_all(
         &self,
         input_ids: &Tensor,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<Tensor> {
         self.forward_ragged_impl(input_ids, rows, true, true)
     }
@@ -9693,7 +9852,7 @@ impl Model {
     fn forward_ragged_impl(
         &self,
         input_ids: &Tensor,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
         all_positions: bool,
         speculative: bool,
     ) -> Result<Tensor> {
@@ -9818,7 +9977,7 @@ impl Model {
         &self,
         embeds: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let (_, seq_len, _) = embeds.dims3()?;
         self.attach_layer_tier(cache);
@@ -9877,7 +10036,7 @@ impl Model {
         &self,
         input_ids: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         cache.prepare_pass(seq_len)?;
@@ -9999,7 +10158,7 @@ impl Model {
         &self,
         input_ids: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<Vec<Tensor>> {
         let (_, seq_len) = input_ids.dims2()?;
         self.advance_conv_phase(seq_len, cache);
@@ -10036,7 +10195,7 @@ impl Model {
     /// `tap_order_follows_tap_layers_and_the_layers_are_distinguishable` caught
     /// — the §10.2h shape, where a permutation is algebraically valid and
     /// silently pairs every slice with the wrong block of `W_c`.
-    fn begin_taps(cache: &mut Cache) {
+    fn begin_taps(cache: &mut State<P>) {
         // A set still here was written by the previous forward and taken by
         // nobody: counted, because dropping it silently is how a drafter ends
         // up seeded from part of a prompt.
@@ -10082,7 +10241,7 @@ impl Model {
     fn tap_layer_input_rows(
         hidden: &Tensor,
         block_idx: usize,
-        rows: &mut [RaggedRow<'_, Cache>],
+        rows: &mut [RaggedRow<'_, State<P>>],
     ) -> Result<()> {
         let mut off = 0usize;
         for row in rows.iter_mut() {
@@ -10095,7 +10254,7 @@ impl Model {
         Ok(())
     }
 
-    fn tap_layer_input(hidden: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<()> {
+    fn tap_layer_input(hidden: &Tensor, block_idx: usize, cache: &mut State<P>) -> Result<()> {
         if cache.tap_layers.is_empty() {
             return Ok(());
         }
@@ -10134,7 +10293,7 @@ impl Model {
     /// argument the body already carries for keeping the wrap decision in one
     /// place: two owners of one decision is a shape that cannot be right, and it
     /// has already been wrong here once.
-    fn advance_conv_phase(&self, seq_len: usize, cache: &mut Cache) {
+    fn advance_conv_phase(&self, seq_len: usize, cache: &mut State<P>) {
         // The page pool allocates this pass's pages at the first attention
         // layer; this is the once-per-pass point that says a new pass began.
         cache.paged_pass_pending = true;
@@ -10248,7 +10407,7 @@ impl Model {
         last: u32,
         proposed: &[u32],
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         eos_ids: &[u32],
     ) -> Result<Vec<u32>> {
         if proposed.is_empty() {
@@ -10278,7 +10437,7 @@ impl Model {
         last: u32,
         proposed: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         eos_ids: &[u32],
     ) -> Result<Vec<u32>> {
         let k = proposed.dims1()?;
@@ -10346,7 +10505,7 @@ impl Model {
 /// — what a `seq_len == 1`, `B == 1` forward dispatches on Metal at the arms
 /// this model was built with, the epilogue chain unfused.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for Model {
+impl<P: Profile> crate::optimizer::Visit for Model<P> {
     type In = ();
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
@@ -10402,7 +10561,7 @@ pub struct PendingVerify {
     taps: Vec<Tensor>,
 }
 
-impl Model {
+impl<P: Profile> Model<P> {
     /// The encode half of [`Self::verify_tokens`]: open the window, run the
     /// pass over `[last, proposed…]`, and leave `[argmax, proposed]` on the
     /// device behind a marker. Nothing here waits for the GPU.
@@ -10411,7 +10570,7 @@ impl Model {
         last: u32,
         proposed: &Tensor,
         index_pos: usize,
-        cache: &mut Cache,
+        cache: &mut State<P>,
     ) -> Result<PendingVerify> {
         let k = proposed.dims1()?;
         if k == 0 {
@@ -10458,7 +10617,7 @@ impl Model {
     pub fn verify_tokens_complete(
         &self,
         pending: PendingVerify,
-        cache: &mut Cache,
+        cache: &mut State<P>,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
         let PendingVerify {
@@ -10534,14 +10693,14 @@ pub struct PendingRows {
 /// One row of a ragged verify: its cache, the anchor (last committed token
 /// and the window's position) and the proposed ids (`[k]`, U32, on the
 /// device).
-pub struct VerifyRow<'a> {
-    pub cache: &'a mut Cache,
+pub struct VerifyRow<'a, P: Profile> {
+    pub cache: &'a mut State<P>,
     pub last: u32,
     pub pos: usize,
     pub proposed: &'a Tensor,
 }
 
-impl Model {
+impl<P: Profile> Model<P> {
     /// The verify of several rows' windows as ONE ragged pass
     /// (`batched-decode-design.md` §12.4): every row's window opened, the
     /// `[last, proposed…]` runs laid end to end, one forward over all of
@@ -10549,7 +10708,7 @@ impl Model {
     /// the pass. Nothing waits for the GPU; [`Self::verify_rows_complete`]
     /// reads back. Per row it is [`Self::verify_tokens_enqueue`]'s
     /// arithmetic — the same window against the same cache.
-    pub fn verify_rows_enqueue(&self, rows: &mut [VerifyRow<'_>]) -> Result<PendingRows> {
+    pub fn verify_rows_enqueue(&self, rows: &mut [VerifyRow<'_, P>]) -> Result<PendingRows> {
         if rows.is_empty() {
             lloom_tensor::bail!("lfm2 verify_rows_enqueue: no rows")
         }
@@ -10576,7 +10735,7 @@ impl Model {
             proposed_all.push(row.proposed.clone());
         }
         let input = Tensor::cat(&pieces, 0)?.unsqueeze(0)?;
-        let mut ragged: Vec<RaggedRow<'_, Cache>> = rows
+        let mut ragged: Vec<RaggedRow<'_, State<P>>> = rows
             .iter_mut()
             .zip(ks.iter())
             .map(|(row, &k)| RaggedRow {
@@ -10616,7 +10775,7 @@ impl Model {
     pub fn verify_rows_complete(
         &self,
         pending: PendingRows,
-        caches: &mut [&mut Cache],
+        caches: &mut [&mut State<P>],
         eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, Vec<Tensor>)>> {
         let PendingRows {
@@ -10683,7 +10842,11 @@ pub use crate::nn::speculator::accept_prefix;
 // `embed`+`forward_embeds` default: the inherent `forward` is on the per-token
 // path and its shape is what every recorded digest belongs to (`DESIGN.md`
 // §2.3.8c), so it stays byte-identical rather than routing through two calls.
-impl ModelTrait for Model {
+impl<P: Profile> crate::profile::Shaped for Model<P> {
+    type Profile = P;
+}
+
+impl<P: Profile> ModelTrait for Model<P> {
     type Config = Config;
 
     fn from_weights(vb: VarBuilder, cfg: &Self::Config) -> Result<Self> {
@@ -10691,11 +10854,11 @@ impl ModelTrait for Model {
     }
 }
 
-impl CausalLM for Model {
-    type Cache = Cache;
+impl<P: Profile> CausalLM for Model<P> {
+    type Cache = State<P>;
 
     fn new_cache(&self, cfg: &Self::Config, dev: &Device) -> Result<Self::Cache> {
-        Cache::new(true, self.dtype, cfg, dev)
+        State::<P>::new(true, self.dtype, cfg, dev)
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -10727,7 +10890,7 @@ impl CausalLM for Model {
     }
 }
 
-impl BatchedCausalLM for Model {
+impl<P: Profile> BatchedCausalLM for Model<P> {
     fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Self::Cache>]) -> Result<Tensor> {
         Model::forward_rows(self, tokens, rows)
     }
@@ -10741,29 +10904,29 @@ impl BatchedCausalLM for Model {
     }
 }
 
-impl crate::nn::model::CacheRewind for Cache {
+impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
     fn rewind_horizon(&self) -> usize {
-        Cache::rewind_horizon(self)
+        State::<P>::rewind_horizon(self)
     }
 
     fn rewind(&mut self, n: usize) -> Result<()> {
-        Cache::rewind(self, n)
+        State::<P>::rewind(self, n)
     }
 
     fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
-        Cache::rewind_unwritten(self, n)
+        State::<P>::rewind_unwritten(self, n)
     }
 
     fn can_restore(&self, pos: usize) -> bool {
-        Cache::can_restore(self, pos)
+        State::<P>::can_restore(self, pos)
     }
 
     fn restore(&mut self, pos: usize) -> Result<()> {
-        Cache::restore(self, pos)
+        State::<P>::restore(self, pos)
     }
 }
 
-impl Speculative for Model {
+impl<P: Profile> Speculative for Model<P> {
     type Window = SpecToken;
 
     fn forward_all(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
@@ -10789,7 +10952,7 @@ impl Speculative for Model {
 /// adding no computation. LFM2's cache is one sequence (B=1), so `anchors`/
 /// `drafts` carry exactly one entry; a second is a shape the cache cannot hold
 /// today and is refused rather than silently ignored.
-impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
+impl<P: Profile> crate::nn::Probes<crate::nn::LayerTaps<5>> for Model<P> {
     fn verify_and_probe(
         &self,
         drafts: &[crate::nn::Draft],
@@ -10885,7 +11048,7 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
                 crate::nn::DraftTokens::Device(t) => Ok(t.clone()),
             })
             .collect::<Result<_>>()?;
-        let mut vrows: Vec<VerifyRow<'_>> = rows
+        let mut vrows: Vec<VerifyRow<'_, P>> = rows
             .iter_mut()
             .zip(ids.iter())
             .map(|(r, t)| VerifyRow {
@@ -10976,7 +11139,7 @@ pub mod kv_slot_fuzz {
         /// promising more than its assertions deliver is the sentence a reader
         /// trusts (§3.1b rule 3).
         FillToCapacityThenOne,
-        /// Widen the slab by `by` positions: `Cache::prepare_pass`'s grow, at
+        /// Widen the slab by `by` positions: `State::<CrownExact>::prepare_pass`'s grow, at
         /// slot level. The model's capacity moves with it and nothing else
         /// does, which is the whole contract — every live position and every
         /// rewound one stays where it was, and the boundary the fill symbol
@@ -10986,7 +11149,7 @@ pub mod kv_slot_fuzz {
         ///
         /// **The head count is carried on the symbol deliberately.** `reset`'s
         /// contract is that the *buffer* is dropped and not merely the length,
-        /// and `Cache::clear`'s doc gives the reason in as many words: *"a new
+        /// and `State::<CrownExact>::clear`'s doc gives the reason in as many words: *"a new
         /// sequence may have a different batch size, so keeping the allocation
         /// would pin `b_sz` from the previous one."* A fixture whose every turn
         /// has the same shape cannot see that -- the stale buffer is the right
@@ -11257,7 +11420,7 @@ pub mod kv_slot_fuzz {
                             return Err(format!(
                                 "op {i} ({op:?}): live view has dims {dims:?}, expected \
                                  [1, {}, {}, 3]. A buffer kept across a turn boundary pins \
-                                 the previous turn's shape -- `Cache::clear`'s doc gives \
+                                 the previous turn's shape -- `State::<CrownExact>::clear`'s doc gives \
                                  exactly this reason for dropping the allocation rather \
                                  than rewinding the length.",
                                 model.heads,
@@ -11318,6 +11481,7 @@ pub mod kv_slot_fuzz {
 mod tests {
     use super::kv_slot_fuzz::*;
     use super::*;
+    use crate::profile::CrownExact;
 
     /// The trait impls dispatch to the inherent entry points, checked at the
     /// bound rather than at a forward pass.
@@ -11325,8 +11489,8 @@ mod tests {
     /// A keystone-trait PR earns its reachability the way §3.1c asks — the
     /// production consumers (`KvCache`, `VisionEncoder`, `candle-hub`, llumos)
     /// arrive in PRs 4–10, so here the callable-through-the-trait property is
-    /// what a generic bound proves: this function only compiles if `Model`
-    /// satisfies `Model`/`CausalLM`/`Speculative` and the associated types line
+    /// what a generic bound proves: this function only compiles if `Model<CrownExact>`
+    /// satisfies `Model<CrownExact>`/`CausalLM`/`Speculative` and the associated types line
     /// up. The end-to-end computation is the digest gate's, not a unit test's.
     #[allow(dead_code)]
     fn assert_bounds<M>()
@@ -11338,11 +11502,11 @@ mod tests {
 
     #[test]
     fn lfm2_implements_the_model_traits() {
-        assert_bounds::<Model>();
+        assert_bounds::<Model<CrownExact>>();
         // The associated types resolve to LFM2's own state, not a placeholder:
         // each closure only typechecks if the two sides are the same type.
-        let _cache: fn(<Model as CausalLM>::Cache) -> Cache = |c| c;
-        let _window: fn(<Model as Speculative>::Window) -> SpecToken = |w| w;
+        let _cache: fn(<Model<CrownExact> as CausalLM>::Cache) -> State<CrownExact> = |c| c;
+        let _window: fn(<Model<CrownExact> as Speculative>::Window) -> SpecToken = |w| w;
     }
 
     /// The accept rule, pinned on values: the longest agreeing prefix plus the
@@ -11544,7 +11708,7 @@ mod tests {
     /// `crate::nn::kv_cache::Cache` grows by `Tensor::cat` here; this declines,
     /// because growing would put back the reallocation this change removes and
     /// would move the buffer identity, both at the moment the cache is largest.
-    /// See `Cache::new_with` for why no policy is chosen.
+    /// See `State::<CrownExact>::new_with` for why no policy is chosen.
     #[test]
     fn exceeding_capacity_fails_loudly() -> Result<()> {
         let dev = Device::Cpu;

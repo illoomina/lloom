@@ -274,7 +274,7 @@ fn main() -> Result<()> {
         prefetch: true,
         io_hints: false,
     };
-    let mut model: Qwen4Exp<Streamed> =
+    let mut model: Qwen4Exp<lloom::profile::Crown, Streamed> =
         Qwen4Exp::from_gguf_streamed(&shards(&gguf), &device, &opts, &stream)?;
     model.set_memory_fraction(args.memory_fraction);
     model.set_host_fill(args.host_fill);

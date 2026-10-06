@@ -11,8 +11,9 @@
 //! logits' pinned fingerprint and, on Metal, the CPU backend within a
 //! tolerance (CONTRIBUTING §3.1b) — a defect every arm shares moves both.
 
-use lloom::models::lfm2::{AttnImpl, Cache, Config, KvAppend, LayerType, Model, QkvLayout};
+use lloom::models::lfm2::{AttnImpl, Config, KvAppend, LayerType, Model, QkvLayout, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::init::splitmix64;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::quantized::GgmlDType;
@@ -58,10 +59,10 @@ fn tiny_config(qkv_layout: QkvLayout, attn_impl: AttnImpl) -> Config {
 }
 
 /// The tiny LFM2 at `cfg`'s geometry and arms, computing in `dtype`.
-fn build(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model<CrownExact>> {
     TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
         .with_dtype(dtype)
-        .model(dev)
+        .model::<CrownExact>(dev)
 }
 
 /// The CPU backend's logits for `cfg` at f32, over the weights a `dtype`
@@ -82,7 +83,7 @@ fn cpu_reference(cfg: &Config, dtype: DType) -> Result<Vec<Vec<f32>>> {
         },
     )
     .with_dtype(DType::F32)
-    .model(&Device::Cpu)?;
+    .model::<CrownExact>(&Device::Cpu)?;
     Ok(steps(&model, &cpu, &Device::Cpu, DType::F32)?
         .into_iter()
         .map(|s| s.into_iter().map(f32::from_bits).collect())
@@ -111,8 +112,13 @@ fn run(cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<Vec<u32>>> {
     steps(&model, cfg, dev, dtype)
 }
 
-fn steps(model: &Model, cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<Vec<u32>>> {
-    let mut cache = Cache::new(true, dtype, cfg, dev)?;
+fn steps(
+    model: &Model<CrownExact>,
+    cfg: &Config,
+    dev: &Device,
+    dtype: DType,
+) -> Result<Vec<Vec<u32>>> {
+    let mut cache = State::<CrownExact>::new(true, dtype, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let mut out = Vec::new();
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
@@ -217,8 +223,8 @@ fn the_rows_path_agrees_with_the_single_path_on_every_arm() -> Result<()> {
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
         // Two caches, same prefill, then one decode step through each path.
-        let mut c1 = Cache::new(true, DType::F16, &cfg, &dev)?;
-        let mut c2 = Cache::new(true, DType::F16, &cfg, &dev)?;
+        let mut c1 = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
+        let mut c2 = State::<CrownExact>::new(true, DType::F16, &cfg, &dev)?;
         model.forward(&inp, 0, &mut c1)?;
         model.forward(&inp, 0, &mut c2)?;
         let step = Tensor::new(&[7u32], &dev)?.reshape((1, 1))?;
@@ -255,7 +261,7 @@ mod census {
     ) -> Result<Vec<(String, u64)>> {
         let mut meet = both.map(|b| lloom_tensor::test_utils::Rendezvous::new(b, 2));
         let model = build(cfg, dev, DType::F16)?;
-        let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
+        let mut cache = State::<CrownExact>::new(true, DType::F16, cfg, dev)?;
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
         model.forward(&inp, 0, &mut cache)?;

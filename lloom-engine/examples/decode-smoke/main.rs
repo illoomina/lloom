@@ -11,7 +11,7 @@
 //! cache — the shape that makes turn 2 a test of the accumulated cache.
 
 use anyhow::{Context, Result};
-use lloom::models::lfm2::{self, AttnImpl, Cache, Model};
+use lloom::models::lfm2::{self, AttnImpl, Model, State};
 use lloom::nn::VarBuilder;
 use lloom_engine::{DecodeParams, DecodeSession, ReadbackArm};
 use lloom_tensor::{DType, Device};
@@ -57,8 +57,10 @@ fn main() -> Result<()> {
         vb
     };
 
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let model =
+        Model::<lloom::profile::Crown>::new(&config, vb).context("constructing LFM2 model")?;
+    let cache = State::<lloom::profile::Crown>::new(true, dtype, &config, &device)
+        .context("allocating KV cache")?;
 
     let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
     for tok in ["<|im_end|>", "<|endoftext|>"] {

@@ -20,9 +20,11 @@
 #![cfg(feature = "metal")]
 
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident, State};
 use lloom::nn::expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Streamed};
 use lloom::nn::model::{CausalLM, Row};
+use lloom::profile::RewindableExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKey, PassKind};
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
@@ -70,9 +72,14 @@ fn write_experts(cfg: &Config, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn streamed(cfg: &Config, dev: &Device, path: &Path, slots: usize) -> Result<Qwen4Exp<Streamed>> {
+fn streamed(
+    cfg: &Config,
+    dev: &Device,
+    path: &Path,
+    slots: usize,
+) -> Result<Qwen4Exp<RewindableExact, Streamed>> {
     let content = Content::read(&mut File::open(path)?)?;
-    testing::model_with(cfg, dev, |l| {
+    testing::model_with::<RewindableExact, _>(cfg, dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
         Streamed::new(
             src("ffn_gate_exps.weight")?,
@@ -85,8 +92,8 @@ fn streamed(cfg: &Config, dev: &Device, path: &Path, slots: usize) -> Result<Qwe
     })
 }
 
-fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<Resident>> {
-    testing::model_with(cfg, dev, |l| {
+fn resident(cfg: &Config, dev: &Device) -> Result<Qwen4Exp<RewindableExact, Resident>> {
+    testing::model_with::<RewindableExact, _>(cfg, dev, |l| {
         let [g, u, d] = testing::expert_stacks(cfg, l, dev, GgmlDType::F32);
         Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
     })
@@ -244,8 +251,8 @@ fn a_pass_that_diverged_is_never_a_plan() -> Result<()> {
 /// One request through the single-sequence decode: reset, the prefill and
 /// `STEPS` greedy steps.
 fn decode_request<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
-    cache: &mut Cache,
+    model: &Qwen4Exp<RewindableExact, R>,
+    cache: &mut State<RewindableExact>,
     dev: &Device,
     plans: bool,
 ) -> Result<Run> {
@@ -282,7 +289,7 @@ fn a_replay_inside_a_served_decode_step_is_on_neither_side_of_its_plan() -> Resu
 
     let dev = Device::new_metal(0)?;
     let model = resident(&cfg, &dev)?;
-    let mut cache = model.new_cache(&cfg, &dev)?;
+    let mut cache = RewindableExact::single(&model, &dev, 8)?;
     let want = decode_request(&model, &mut cache, &dev, false)?.ids;
     assert!(
         want[0].iter().any(|&t| t != want[0][0]),
@@ -297,7 +304,7 @@ fn a_replay_inside_a_served_decode_step_is_on_neither_side_of_its_plan() -> Resu
         // is the tier's own.
         let dev = Device::new_metal(0)?;
         let model = streamed(&cfg, &dev, &path, slots)?;
-        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut cache = RewindableExact::single(&model, &dev, 8)?;
         let control = decode_request(&model, &mut cache, &dev, false)?;
         assert_eq!(
             control.ids, want,
@@ -307,7 +314,7 @@ fn a_replay_inside_a_served_decode_step_is_on_neither_side_of_its_plan() -> Resu
         let dev = Device::new_metal(0)?;
         metal(&dev).enable_pass_plans(ArenaLayout::Packed);
         let model = streamed(&cfg, &dev, &path, slots)?;
-        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut cache = RewindableExact::single(&model, &dev, 8)?;
         let (s, p) = check_requests("decode", slots, &want, || {
             decode_request(&model, &mut cache, &dev, true)
         })?;
@@ -324,8 +331,8 @@ const ROW_PROMPTS: [&[u32]; 3] = [&[3, 5, 2, 8, 8, 1, 9], &[7, 1, 4], &[2, 2, 6,
 /// One request through the batched rows: every row reset and prefilled
 /// alone, then `STEPS` steps of all rows as one `forward_rows`.
 fn rows_request<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
-    caches: &mut [Cache],
+    model: &Qwen4Exp<RewindableExact, R>,
+    caches: &mut [State<RewindableExact>],
     dev: &Device,
     plans: bool,
 ) -> Result<Run> {
@@ -347,7 +354,7 @@ fn rows_request<R: ExpertResidency>(
         }
         let redos: u64 = caches.iter().map(|c| c.redos).sum();
         let tokens = Tensor::from_vec(next.clone(), (b, 1), dev)?;
-        let mut rows: Vec<Row<'_, Cache>> = caches
+        let mut rows: Vec<Row<'_, State<RewindableExact>>> = caches
             .iter_mut()
             .map(|c| Row {
                 pos: c.pos,
@@ -374,9 +381,11 @@ fn a_replay_inside_a_served_rows_step_is_on_neither_side_of_its_plan() -> Result
     cfg.head_dim = 32;
     let path = temp_gguf("rows");
     write_experts(&cfg, &path)?;
-    let new_caches = |model: &Qwen4Exp<Streamed>, dev: &Device| -> Result<Vec<Cache>> {
+    let new_caches = |model: &Qwen4Exp<RewindableExact, Streamed>,
+                      dev: &Device|
+     -> Result<Vec<State<RewindableExact>>> {
         (0..ROW_PROMPTS.len())
-            .map(|_| model.new_cache(&cfg, dev))
+            .map(|_| RewindableExact::single(&model, &dev, 8))
             .collect()
     };
 
@@ -412,8 +421,8 @@ const ROUNDS: usize = 12;
 /// One request through the verify window: reset, the prefill, then `ROUNDS`
 /// windows of the next id and `DRAFTS`, each accepted whole.
 fn verify_request<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
-    cache: &mut Cache,
+    model: &Qwen4Exp<RewindableExact, R>,
+    cache: &mut State<RewindableExact>,
     dev: &Device,
     plans: bool,
 ) -> Result<Run> {
@@ -448,9 +457,11 @@ fn a_replay_inside_a_served_verify_window_is_on_neither_side_of_its_plan() -> Re
     cfg.head_dim = 32;
     let path = temp_gguf("verify");
     write_experts(&cfg, &path)?;
-    let spec_cache = |model: &Qwen4Exp<Streamed>, dev: &Device| -> Result<Cache> {
+    let spec_cache = |model: &Qwen4Exp<RewindableExact, Streamed>,
+                      dev: &Device|
+     -> Result<State<RewindableExact>> {
         let pools = model.spec_pools(1, DRAFTS.len(), dev);
-        Cache::in_pools(&cfg, &pools)
+        State::<RewindableExact>::in_ring(&cfg, &pools)
     };
 
     let mut reached = (0, 0);

@@ -3135,7 +3135,9 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 let (os, ol) = t.storage_and_layout();
                 let os = match &*os {
                     lloom_tensor::Storage::Metal(m) => m,
-                    _ => lloom_tensor::bail!("slot_map: the record slot must be on the metal device"),
+                    _ => {
+                        lloom_tensor::bail!("slot_map: the record slot must be on the metal device")
+                    }
                 };
                 if ol.shape().elem_count() != 3 * n
                     || !ol.is_contiguous()

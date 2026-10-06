@@ -5,11 +5,12 @@
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::Config;
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom_tensor::{Device, Result, Tensor};
 
 fn check_on(dev: &Device, tag: &str) -> Result<()> {
     let cfg = Config::tiny();
-    let model = testing::resident_model(&cfg, dev);
+    let model = testing::resident_model::<CrownExact>(&cfg, dev);
     let mut cache = model.new_cache(&cfg, dev)?;
     let prompt = Tensor::from_vec(vec![3u32, 5, 2, 8, 8, 1, 9], (1, 7), dev)?;
     let _ = model.forward(&prompt, 0, &mut cache)?;

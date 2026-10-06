@@ -17,10 +17,12 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, MtpDrafter, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::Shape as _;
+use lloom::models::qwen4exp::{Config, MtpDrafter, Qwen4Exp, Resident, State};
 use lloom::nn::model::CausalLM;
 use lloom::nn::speculator::{Anchor, Draft, KvSource, NextnHidden, Probes, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+use lloom::profile::{CrownExact, Own, RewindableExact};
 use lloom_tensor::{Device, Result, Tensor};
 
 fn config() -> Config {
@@ -35,7 +37,7 @@ fn config() -> Config {
 
 /// A prompt whose greedy stream is long enough to span several rounds.
 fn long_prompt(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     max: usize,
 ) -> Result<(Vec<u32>, Vec<u32>, bool)> {
@@ -50,13 +52,13 @@ fn long_prompt(
 }
 
 fn greedy(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     prompt: &[u32],
     max: usize,
 ) -> Result<(Vec<u32>, bool)> {
     let dev = Device::Cpu;
-    let cache = model.new_cache(cfg, &dev)?;
+    let cache = RewindableExact::single(&model, &dev, 8)?;
     let mut session = Session::new(model, cache);
     let mut spec = IdentityProposer;
     let eos = [cfg.eos_token_id];
@@ -70,7 +72,7 @@ fn greedy(
 }
 
 fn speculative<S: Speculator<Probe = NextnHidden>>(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     spec: &mut S,
     prompt: &[u32],
@@ -82,7 +84,7 @@ fn speculative<S: Speculator<Probe = NextnHidden>>(
 /// `ring`: the cache over `spec_pools(1, k)` — the verify as one pass with
 /// the accept by phase (`verify_window`); `None`: the sequential verify.
 fn speculative_on<S: Speculator<Probe = NextnHidden>>(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     spec: &mut S,
     prompt: &[u32],
@@ -90,9 +92,9 @@ fn speculative_on<S: Speculator<Probe = NextnHidden>>(
     ring: Option<usize>,
 ) -> Result<(Vec<u32>, bool, usize)> {
     let dev = Device::Cpu;
-    let mut cache: Cache = match ring {
-        Some(k) => Cache::in_pools(cfg, &model.spec_pools(1, k, &dev))?,
-        None => model.new_cache(cfg, &dev)?,
+    let mut cache: State<RewindableExact> = match ring {
+        Some(k) => State::<RewindableExact>::in_ring(cfg, &model.spec_pools(1, k, &dev))?,
+        None => RewindableExact::single(&model, &dev, 8)?,
     };
     cache.want_nextn = true;
     let mut session = Session::new(model, cache);
@@ -101,11 +103,19 @@ fn speculative_on<S: Speculator<Probe = NextnHidden>>(
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let opts = DecodeOptions::new(max);
     let mut streamed = Vec::new();
-    let out =
-        session.decode_speculative(spec, &mut rb, &mut sampler, prompt, &opts, &eos, &mut |b| {
+    let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
+        spec,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        &opts,
+        &eos,
+        &mut |b| {
             streamed.extend_from_slice(b);
             Ok(())
-        })?;
+        },
+    )?;
     assert_eq!(
         out.ids, streamed,
         "the callback stream must equal the returned ids"
@@ -122,6 +132,7 @@ struct Oracle {
 
 impl Speculator for Oracle {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         1
     }
@@ -153,6 +164,7 @@ struct Garbage {
 
 impl Speculator for Garbage {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         1
     }
@@ -174,12 +186,13 @@ impl Speculator for Garbage {
 fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let max = 24;
     let (prompt, ref_ids, ref_eos) = long_prompt(&model, &cfg, max)?;
 
     // (a) the real MTP drafter on a synthetic one-layer head
-    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let head =
+        testing::mtp_head::<CrownExact, _>(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
     let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
     let (ids, eos, _) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
     assert_eq!(ids, ref_ids, "MTP drafter: not the greedy stream");
@@ -196,7 +209,11 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
     // drafts — the greedy stream still, and the drafter's cache keyed only
     // with the observed rows (the re-applications are rewound).
     for k in [2usize, 3] {
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut mtp =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let (ids, eos, accepted) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
@@ -224,11 +241,19 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
     // phase (no replay): the greedy stream at every K, the rounds' accepted
     // counts equal to the sequential verify's.
     for k in [1usize, 2, 3] {
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut seq =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let (ids_s, eos_s, acc_s) = speculative_on(&model, &cfg, &mut seq, &prompt, max, None)?;
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut ring =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let (ids_r, eos_r, acc_r) = speculative_on(&model, &cfg, &mut ring, &prompt, max, Some(k))?;
@@ -274,7 +299,7 @@ fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
     use lloom::models::qwen4exp::{NgramHash, PleLayer, PleTable};
     let cfg = config();
     let dev = Device::Cpu;
-    let mut model = testing::resident_model(&cfg, &dev);
+    let mut model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
         vec![13, 17, 19, 23],
@@ -286,7 +311,7 @@ fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
     let table = PleTable::Dense(testing::wt((rows, cfg.ple_head_dim), 3.0, &dev));
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<RewindableExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, &dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
         testing::ones(hc_dim, &dev),
@@ -311,7 +336,8 @@ fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
     );
     assert_eq!(eos, ref_eos);
     assert_eq!(accepted, 0);
-    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let head =
+        testing::mtp_head::<CrownExact, _>(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
     let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
     let (ids, _, _) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
     assert_eq!(ids, ref_ids, "MTP drafter with PLE: not the greedy stream");
@@ -327,7 +353,7 @@ fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
 fn mtp_identity_holds_with_a_prompt_past_the_dense_range() -> Result<()> {
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     // `Indexer::dense_limit` = budget + ratio − 1 (19 on the tiny template).
     let limit = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
     let prompt: Vec<u32> = (0..limit + 11).map(|i| (i as u32 * 7 + 1) % 120).collect();
@@ -335,7 +361,11 @@ fn mtp_identity_holds_with_a_prompt_past_the_dense_range() -> Result<()> {
     let (ref_ids, ref_eos) = greedy(&model, &cfg, &prompt, max)?;
     assert!(ref_ids.len() >= 6, "a stream of {} tokens", ref_ids.len());
     for k in [1usize, 2] {
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut mtp =
             MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let (ids, eos, accepted) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
@@ -365,7 +395,7 @@ fn mtp_identity_holds_with_a_prompt_past_the_dense_range() -> Result<()> {
 fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> {
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let (prompt, ref_ids, _) = long_prompt(&model, &cfg, 6)?;
     assert!(ref_ids.len() >= 3);
     let anchor_tok = ref_ids[0]; // the prefill's own argmax
@@ -373,14 +403,14 @@ fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> 
     let wrong = if right == 0 { 1 } else { 0 };
 
     let checksums_after = |tokens: &[u32]| -> Result<Vec<(String, u64, usize)>> {
-        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut cache = RewindableExact::single(&model, &dev, 8)?;
         let input = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &dev)?;
         model.forward(&input, 0, &mut cache)?;
         cache.checksums()
     };
 
     for (draft, expect_accepted) in [(wrong, 1usize), (right, 2usize)] {
-        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut cache = RewindableExact::single(&model, &dev, 8)?;
         cache.want_nextn = true;
         let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &dev)?;
         model.forward(&input, 0, &mut cache)?;
@@ -418,7 +448,7 @@ fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> 
         // verify did (a chunk pass reorders fp32 — the reference must take the
         // same route for the checksums to be comparable)
         let want = {
-            let mut c = model.new_cache(&cfg, &dev)?;
+            let mut c = RewindableExact::single(&model, &dev, 8)?;
             let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &dev)?;
             model.forward(&input, 0, &mut c)?;
             for &t in &consumed[prompt.len()..] {
@@ -450,20 +480,24 @@ fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> 
 fn mtp_rows_are_each_their_greedy_stream() -> Result<()> {
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let max = 16;
     let (p0, r0, _) = long_prompt(&model, &cfg, max)?;
     let p1: Vec<u32> = p0.iter().map(|t| (t + 13) % 120).collect();
     let (r1, _) = greedy(&model, &cfg, &p1, max)?;
     assert_ne!(r0, r1, "the two prompts must give two streams");
     for k in [1usize, 2] {
-        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let head = testing::mtp_head::<CrownExact, _>(
+            &cfg,
+            &dev,
+            testing::resident_experts(&cfg, 7, &dev),
+        );
         let mut mtp =
             MtpDrafter::with_seqs(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev, 2)
                 .with_k(k);
-        let mut sessions: Vec<Session<'_, Qwen4Exp<Resident>>> = (0..2)
+        let mut sessions: Vec<Session<'_, Qwen4Exp<RewindableExact, Resident>>> = (0..2)
             .map(|_| {
-                let mut cache = model.new_cache(&cfg, &dev)?;
+                let mut cache = RewindableExact::single(&model, &dev, 8)?;
                 cache.want_nextn = true;
                 Ok(Session::new(&model, cache))
             })
@@ -471,6 +505,7 @@ fn mtp_rows_are_each_their_greedy_stream() -> Result<()> {
         let prompts: Vec<&[u32]> = vec![&p0, &p1];
         let outs = Session::decode_spec_batched(
             &mut sessions,
+            lloom::profile::RewindProof::of(),
             &mut mtp,
             &prompts,
             &DecodeOptions::new(max),
@@ -504,8 +539,8 @@ type Turn = (Vec<u32>, bool, Option<(usize, usize)>);
 /// One turn of the speculative body on a kept session: the stream, whether
 /// it ended on EOS, and the drafter's context against the target's position.
 fn turn(
-    session: &mut Session<'_, Qwen4Exp<Resident>>,
-    spec: &mut MtpDrafter<'_, Resident>,
+    session: &mut Session<'_, Qwen4Exp<RewindableExact, Resident>>,
+    spec: &mut MtpDrafter<'_, CrownExact, Resident>,
     cfg: &Config,
     prompt: &[u32],
     max: usize,
@@ -515,6 +550,7 @@ fn turn(
     let mut rb = Blocking::new(&eos, &dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         spec,
         &mut rb,
         &mut sampler,
@@ -527,15 +563,22 @@ fn turn(
 }
 
 /// The engine's cache: the verify's states in phase rings, carries kept.
-fn engine_cache(model: &Qwen4Exp<Resident>, cfg: &Config) -> Result<Cache> {
-    let mut cache = Cache::in_pools(cfg, &model.spec_pools(1, 1, &Device::Cpu))?;
+fn engine_cache(
+    model: &Qwen4Exp<RewindableExact, Resident>,
+    cfg: &Config,
+) -> Result<State<RewindableExact>> {
+    let mut cache = State::<RewindableExact>::in_ring(cfg, &model.spec_pools(1, 1, &Device::Cpu))?;
     cache.want_nextn = true;
     Ok(cache)
 }
 
 /// A prompt whose `max`-token stream runs to the length cap (no EOS): its
 /// last id is the anchor the target has not fed, the re-render's next token.
-fn capped_prompt(model: &Qwen4Exp<Resident>, cfg: &Config, max: usize) -> Result<Vec<u32>> {
+fn capped_prompt(
+    model: &Qwen4Exp<RewindableExact, Resident>,
+    cfg: &Config,
+    max: usize,
+) -> Result<Vec<u32>> {
     for seed in 0..16u32 {
         let prompt: Vec<u32> = (0..6).map(|i| (seed * 13 + i * 5 + 2) % 120).collect();
         let (ids, eos) = greedy(model, cfg, &prompt, max)?;
@@ -559,8 +602,9 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
     use lloom::nn::ReuseAction;
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
-    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
+    let head =
+        testing::mtp_head::<CrownExact, _>(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
     let drafter = || MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
     let n = 8;
     let prompt1 = capped_prompt(&model, &cfg, n)?;
@@ -680,8 +724,9 @@ fn the_drafter_follows_the_targets_reuse() -> Result<()> {
 fn a_lane_is_cut_back_to_a_reused_prefix_it_was_keyed_from() -> Result<()> {
     let cfg = config();
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
-    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
+    let head =
+        testing::mtp_head::<CrownExact, _>(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
     let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
     // Past one indexer block, so the cut drops a compressed block.
     let prompt: Vec<u32> = (0..13).map(|i| (i * 7 + 3) % 120).collect();

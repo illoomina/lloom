@@ -26,8 +26,9 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{kv_grow_budget, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{kv_grow_budget, Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::nn::VarBuilder;
+use lloom::profile::RewindableExact;
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn tiny_config() -> Config {
@@ -64,7 +65,7 @@ fn tiny_config() -> Config {
     }
 }
 
-fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model<RewindableExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -113,7 +114,7 @@ fn build(cfg: &Config, dtype: DType, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    Model::<RewindableExact>::new(cfg, vb)
 }
 
 const PROMPT: [u32; 5] = [3, 11, 20, 5, 9];
@@ -130,8 +131,8 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 fn step(
-    model: &Model,
-    cache: &mut Cache,
+    model: &Model<RewindableExact>,
+    cache: &mut State<RewindableExact>,
     token: u32,
     pos: usize,
     dev: &Device,
@@ -163,7 +164,7 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
 
     // The subject: bucket 2, so the pass after the prefill's grow has to grow
     // again — the one this test holds the memory against.
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?
+    let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?
         .with_kv_bucket(2)?
         .with_kv_grow_fraction(fraction)?;
     let input = Tensor::new(&PROMPT, &dev)?.unsqueeze(0)?;
@@ -227,7 +228,8 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     // The control: the same model and tokens with nothing ever held. The
     // refused-then-admitted run emitted exactly its stream — the refusal left
     // no trace in the cache.
-    let mut control = Cache::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
+    let mut control =
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?.with_kv_bucket(2)?;
     let c_first = model
         .forward(&input, 0, &mut control)?
         .i(0)?

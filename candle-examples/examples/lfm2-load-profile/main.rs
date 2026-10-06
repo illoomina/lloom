@@ -67,9 +67,9 @@
 
 use anyhow::{Context, Result};
 use candle::{DType, Device};
-use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Config, Lfm2Config, Model};
 use clap::Parser;
+use lloom::models::lfm2::{Config, Lfm2Config, Model, Shape as Lfm2Shape, State};
+use lloom::nn::VarBuilder;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -226,7 +226,9 @@ fn read_floor(paths: &[PathBuf]) -> Result<(f64, u64)> {
                 break;
             }
             total += n as u64;
-            acc = acc.wrapping_add(buf[0] as u64).wrapping_add(buf[n - 1] as u64);
+            acc = acc
+                .wrapping_add(buf[0] as u64)
+                .wrapping_add(buf[n - 1] as u64);
         }
     }
     std::hint::black_box(acc);
@@ -235,7 +237,12 @@ fn read_floor(paths: &[PathBuf]) -> Result<(f64, u64)> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     let model_dir = args
         .model_dir
         .clone()
@@ -305,12 +312,12 @@ fn main() -> Result<()> {
 
     // ---- phase 3: model construction (to_dtype + allocations) -------------
     let t_model = now();
-    let model = Model::new(&config, vb).context("constructing LFM2 model")?;
+    let model = Model::<P>::new(&config, vb).context("constructing LFM2 model")?;
     let model_s = t_model.elapsed().as_secs_f64();
 
     // ---- phase 4: cache ---------------------------------------------------
     let t_cache = now();
-    let _cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let _cache = State::<P>::new(true, dtype, &config, &device).context("allocating KV cache")?;
     let cache_s = t_cache.elapsed().as_secs_f64();
 
     // Keep the model alive across the cache phase so nothing is dropped early.
@@ -341,6 +348,16 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }
 
 fn parse_config(raw: &str) -> Result<Config> {

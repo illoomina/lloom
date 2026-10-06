@@ -12,11 +12,12 @@
 
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{
-    Cache, CachedPleTable, Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident,
+    CachedPleTable, Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident, State,
     Streamed,
 };
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -49,11 +50,15 @@ fn write_checkpoint(cfg: &Config, ple_rows: usize, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn streamed_model(cfg: &Config, path: &Path, slots: usize) -> Result<Qwen4Exp<Streamed>> {
+fn streamed_model(
+    cfg: &Config,
+    path: &Path,
+    slots: usize,
+) -> Result<Qwen4Exp<CrownExact, Streamed>> {
     let mut f = File::open(path)?;
     let content = Content::read(&mut f)?;
     let dev = Device::Cpu;
-    testing::model_with(cfg, &dev, |l| {
+    testing::model_with::<CrownExact, _>(cfg, &dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
         Streamed::new(
             src("ffn_gate_exps.weight")?,
@@ -68,11 +73,11 @@ fn streamed_model(cfg: &Config, path: &Path, slots: usize) -> Result<Qwen4Exp<St
 
 /// Prompt (chunk prefill) + decode steps; every logits row.
 fn run<R: lloom::nn::ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     prompt: &[u32],
     steps: usize,
-) -> Result<(Vec<Vec<f32>>, Cache)> {
+) -> Result<(Vec<Vec<f32>>, State<CrownExact>)> {
     let dev = Device::Cpu;
     let mut cache = model.new_cache(cfg, &dev)?;
     let mut rows = Vec::new();
@@ -88,7 +93,7 @@ fn run<R: lloom::nn::ExpertResidency>(
     Ok((rows, cache))
 }
 
-fn ple_parts(cfg: &Config, path: &Path) -> Result<(NgramHash, MmapPleTable, PleLayer)> {
+fn ple_parts(cfg: &Config, path: &Path) -> Result<(NgramHash, MmapPleTable, PleLayer<CrownExact>)> {
     let dev = Device::Cpu;
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
@@ -100,7 +105,7 @@ fn ple_parts(cfg: &Config, path: &Path) -> Result<(NgramHash, MmapPleTable, PleL
     let table = MmapPleTable::open(path)?;
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<CrownExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, &dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
         testing::ones(hc_dim, &dev),
@@ -124,7 +129,7 @@ fn streamed_model_is_byte_identical_to_resident() -> Result<()> {
     write_checkpoint(&cfg, 80, &path)?;
     let dev = Device::Cpu;
 
-    let resident = testing::resident_model(&cfg, &dev);
+    let resident = testing::resident_model::<CrownExact>(&cfg, &dev);
     // 5 slots: a 7-row chunk's union (up to 12) needs several groups, and
     // decode churns the pool.
     let streamed = streamed_model(&cfg, &path, 5)?;
@@ -208,10 +213,10 @@ fn ple_hot_row_cache_gathers_the_same_rows() -> Result<()> {
     );
 
     // through the model: cached PLE == mmap PLE
-    let mut with_mmap = testing::resident_model(&cfg, &dev);
+    let mut with_mmap = testing::resident_model::<CrownExact>(&cfg, &dev);
     let (hash, table, block) = ple_parts(&cfg, &path)?;
     with_mmap.set_ple(1, hash, PleTable::Mmap(table), block)?;
-    let mut with_cache = testing::resident_model(&cfg, &dev);
+    let mut with_cache = testing::resident_model::<CrownExact>(&cfg, &dev);
     let (hash, table, block) = ple_parts(&cfg, &path)?;
     with_cache.set_ple(
         1,
@@ -235,8 +240,8 @@ fn ple_hot_row_cache_gathers_the_same_rows() -> Result<()> {
 fn resident_reference_is_deterministic() -> Result<()> {
     let cfg = Config::tiny();
     let dev = Device::Cpu;
-    let a = testing::resident_model(&cfg, &dev);
-    let b: Qwen4Exp<Resident> = testing::resident_model(&cfg, &dev);
+    let a = testing::resident_model::<CrownExact>(&cfg, &dev);
+    let b: Qwen4Exp<CrownExact, Resident> = testing::resident_model::<CrownExact>(&cfg, &dev);
     let prompt: Vec<u32> = vec![1, 2, 3];
     let (x, _) = run(&a, &cfg, &prompt, 2)?;
     let (y, _) = run(&b, &cfg, &prompt, 2)?;

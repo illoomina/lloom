@@ -27,21 +27,33 @@ mod sealed {
 /// bit-identical for a given build and §2.3.5a-attributed; `Free` is the
 /// fastest arms with no cross-run claim. `Reproducible` is the sampler's,
 /// not a compile-time regime.
-pub trait Regime: sealed::Regime + Copy + Default + std::fmt::Debug + 'static {
+pub trait Regime:
+    sealed::Regime + Copy + Default + std::fmt::Debug + Send + Sync + 'static
+{
     const NAME: &'static str;
     /// The CLI's `--profile` word.
     const PROFILE: &'static str;
+    /// The run-time contract this regime is (`lloom_tensor::tuning`): what
+    /// [`hold`] pins the process to when a family is built at this regime.
+    const CONTRACT: lloom_tensor::tuning::Contract;
 }
 
 /// Whether per-position state can be rolled back (a speculative verify's
 /// requirement — `State<P>: CacheRewind` by construction when `Ring`).
-pub trait Rewind: sealed::Rewind + Copy + Default + std::fmt::Debug + 'static {
+pub trait Rewind:
+    sealed::Rewind + Copy + Default + std::fmt::Debug + Send + Sync + 'static
+{
     const NAME: &'static str;
     const REWINDABLE: bool;
+    /// The evidence a speculative driver takes (`RewindProof<P>`): `Some`
+    /// on `Ring`, `None` on `No` — so generic code over any `P` asks the
+    /// axis and the `No` shapes refuse by name, while the driver's signature
+    /// cannot be called without the evidence at all.
+    fn rewindable<Q: Profile<Rewind = Self>>() -> Option<RewindProof<Q>>;
 }
 
 /// One sequence, or paged KV with row pools.
-pub trait Rows: sealed::Rows + Copy + Default + std::fmt::Debug + 'static {
+pub trait Rows: sealed::Rows + Copy + Default + std::fmt::Debug + Send + Sync + 'static {
     const NAME: &'static str;
     const PAGED: bool;
 }
@@ -64,20 +76,92 @@ impl sealed::Regime for Free {}
 impl Regime for Exact {
     const NAME: &'static str = "Exact";
     const PROFILE: &'static str = "deterministic";
+    const CONTRACT: lloom_tensor::tuning::Contract = lloom_tensor::tuning::Contract::Deterministic;
 }
 impl Regime for Free {
     const NAME: &'static str = "Free";
     const PROFILE: &'static str = "fast";
+    const CONTRACT: lloom_tensor::tuning::Contract = lloom_tensor::tuning::Contract::Fast;
+}
+
+/// The process held to `G`: a family built at a regime states the contract
+/// (`tuning::pin_regime`), or — when one is already in force (named by
+/// `LLOOM_PROFILE`, pinned by a harness, read by a kernel) — is refused
+/// unless that one is `G`'s. A model's regime is
+/// what its type names, never what the process inherited (the trap #898
+/// found: a suite computing `Exact`'s bits under an inherited `fast`).
+///
+/// ```
+/// use lloom::profile::{hold, Exact, Free};
+/// use lloom_tensor::tuning::{pin_contract, Contract};
+/// // The process is pinned to `fast`; a family built at `Exact` is refused,
+/// // one at `Free` is held.
+/// let _ = pin_contract(Contract::Fast);
+/// assert!(hold::<Free>("doc").is_ok());
+/// let err = hold::<Exact>("doc").unwrap_err().to_string();
+/// assert!(err.contains("built at the Exact regime"), "{err}");
+/// ```
+pub fn hold<G: Regime>(who: &str) -> lloom_tensor::Result<()> {
+    let held = lloom_tensor::tuning::pin_regime(G::CONTRACT).map_err(lloom_tensor::Error::msg)?;
+    if held != G::CONTRACT {
+        lloom_tensor::bail!(
+            "{who}: built at the {} regime (`--profile {}`) in a process whose contract is `{}`: \
+             a family runs at the regime its type names (profiles-and-memory-design.md §3)",
+            G::NAME,
+            G::PROFILE,
+            held.name()
+        )
+    }
+    Ok(())
 }
 impl sealed::Rewind for NoRewind {}
 impl sealed::Rewind for Ring {}
 impl Rewind for NoRewind {
     const NAME: &'static str = "No";
     const REWINDABLE: bool = false;
+    fn rewindable<Q: Profile<Rewind = Self>>() -> Option<RewindProof<Q>> {
+        None
+    }
 }
 impl Rewind for Ring {
     const NAME: &'static str = "Ring";
     const REWINDABLE: bool = true;
+    fn rewindable<Q: Profile<Rewind = Self>>() -> Option<RewindProof<Q>> {
+        Some(RewindProof(PhantomData))
+    }
+}
+
+/// Evidence that `Q` rewinds — a per-position state a speculative verify
+/// can roll back exists by construction (`profiles-and-memory-design.md`
+/// §7.3). The speculative drivers (`Session::decode_speculative`,
+/// `decode_spec_batched`, `SpecBatchDecoder::new`) take one, and it is only
+/// made for `Rewind = Ring` (`RewindProof::of`, `Rewind::rewindable`): a
+/// driver on a `No` shape does not compile.
+///
+/// ```compile_fail
+/// use lloom::profile::{Crown, RewindProof};
+/// let _ = RewindProof::<Crown>::of(); // `Crown` is `No × One`: no `of`
+/// ```
+///
+/// ```
+/// use lloom::profile::{RewindProof, RewindableExact};
+/// let _ = RewindProof::<RewindableExact>::of();
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct RewindProof<Q: Profile>(PhantomData<Q>);
+
+impl<Q: Profile<Rewind = Ring>> RewindProof<Q> {
+    pub fn of() -> Self {
+        RewindProof(PhantomData)
+    }
+}
+
+impl<Q: Profile> RewindProof<Q> {
+    /// The evidence for `Q`, when its rewind axis gives it; the caller
+    /// refuses by name when it does not.
+    pub fn ask() -> Option<Self> {
+        <Q::Rewind as Rewind>::rewindable::<Q>()
+    }
 }
 impl sealed::Rows for One {}
 impl sealed::Rows for Paged {}
@@ -91,7 +175,9 @@ impl Rows for Paged {
 }
 
 /// A profile: the three axes as one type parameter.
-pub trait Profile: sealed::Profile + Copy + Default + std::fmt::Debug + 'static {
+pub trait Profile:
+    sealed::Profile + Copy + Default + std::fmt::Debug + Send + Sync + 'static
+{
     type Regime: Regime;
     type Rewind: Rewind;
     type Rows: Rows;
@@ -118,6 +204,10 @@ impl<G: Regime, W: Rewind, R: Rows> Profile for P<G, W, R> {
     type Rows = R;
 }
 
+/// The single-sequence, no-rewind shape at `Q`'s regime: the shape of a
+/// state a block keeps for itself beside the family's (the MTP head's lane).
+pub type Own<Q> = P<<Q as Profile>::Regime, NoRewind, One>;
+
 /// The preset names stay; `Free` is the default (maintainer 2026-10-01).
 pub type Crown = P<Free, NoRewind, One>;
 pub type Rewindable = P<Free, Ring, One>;
@@ -128,6 +218,104 @@ pub type CrownExact = P<Exact, NoRewind, One>;
 pub type RewindableExact = P<Exact, Ring, One>;
 pub type PoolExact = P<Exact, NoRewind, Paged>;
 pub type PoolSpecExact = P<Exact, Ring, Paged>;
+
+/// The boundary (§7.4): one `match` from a [`ProfileKey`] to the type it
+/// names, running `$body` with `P` bound to that `P<G, W, R>`. Every arm is
+/// written once here; a key outside `$bound` is refused by name before any
+/// arm runs, so a family instantiates only the shapes its `Capabilities`
+/// ship. `$body` is an expression generic in `P` (a turbofish call, a block
+/// naming `P`); its value is the macro's.
+///
+/// ```ignore
+/// let key = ProfileKey::from_mode("deterministic", false, false).unwrap();
+/// let n = lloom::profile::dispatch!(key, lloom::profile::LFM2, P => { run::<P>(args) })?;
+/// ```
+#[macro_export]
+macro_rules! dispatch {
+    ($key:expr, $bound:expr, $p:ident => $body:expr) => {{
+        let key: $crate::profile::ProfileKey = $key;
+        let bound: $crate::profile::Bound = $bound;
+        if !bound.admits(key) {
+            Err(::core::convert::From::from($crate::profile::Error::msg(format!(
+                "{}: the {key} profile is outside what the family ships (rewind {:?}, rows {:?}{})",
+                bound.family,
+                bound.rewind,
+                bound.rows,
+                if bound.except.is_empty() {
+                    String::new()
+                } else {
+                    format!(", except {:?}", bound.except)
+                }
+            ))))
+        } else {
+            match (key.regime, key.rewind, key.rows) {
+                ("Exact", "No", "One") => {
+                    type $p = $crate::profile::CrownExact;
+                    $body
+                }
+                ("Exact", "Ring", "One") => {
+                    type $p = $crate::profile::RewindableExact;
+                    $body
+                }
+                ("Exact", "No", "Paged") => {
+                    type $p = $crate::profile::PoolExact;
+                    $body
+                }
+                ("Exact", "Ring", "Paged") => {
+                    type $p = $crate::profile::PoolSpecExact;
+                    $body
+                }
+                ("Free", "No", "One") => {
+                    type $p = $crate::profile::Crown;
+                    $body
+                }
+                ("Free", "Ring", "One") => {
+                    type $p = $crate::profile::Rewindable;
+                    $body
+                }
+                ("Free", "No", "Paged") => {
+                    type $p = $crate::profile::Pool;
+                    $body
+                }
+                ("Free", "Ring", "Paged") => {
+                    type $p = $crate::profile::PoolSpec;
+                    $body
+                }
+                _ => unreachable!("a ProfileKey names one of the eight profiles"),
+            }
+        }
+    }};
+}
+pub use dispatch;
+/// The error the boundary refuses with (`dispatch!`), re-exported so the
+/// macro resolves it from any crate.
+pub use lloom_tensor::Error;
+
+/// A model built at a profile: what a driver reads the profile off
+/// (`RewindProof<M::Profile>` — a speculative driver needs a rewindable
+/// state by construction, §7.3).
+///
+/// A family names its profile at construction and nowhere defaults it,
+/// so a model built without one does not compile (#898's trap, closed at
+/// the compiler rather than by convention):
+///
+/// ```compile_fail
+/// use lloom::models::qwen4exp::{testing, Config};
+/// let cfg = Config::tiny();
+/// let model = testing::resident_model(&cfg, &lloom_tensor::Device::Cpu); // which profile?
+/// let _ = model.config();
+/// ```
+///
+/// ```no_run
+/// use lloom::models::qwen4exp::{testing, Config};
+/// use lloom::profile::CrownExact;
+/// let cfg = Config::tiny();
+/// let model = testing::resident_model::<CrownExact>(&cfg, &lloom_tensor::Device::Cpu);
+/// let _ = model.config();
+/// ```
+pub trait Shaped {
+    type Profile: Profile;
+}
 
 /// A profile as a value: the three axes' names. What a family's
 /// `Capabilities` lists as its bound (§3 "which combinations a family
@@ -160,6 +348,21 @@ impl ProfileKey {
             },
             rows: if paged { Paged::NAME } else { One::NAME },
         })
+    }
+
+    /// The key at the contract in force (`lloom_tensor::tuning::contract`)
+    /// for the shape `(rewind, rows)`: what a family reads off a resolved
+    /// config to pick its type.
+    pub fn at_contract(rewind: &'static str, rows: &'static str) -> Self {
+        let regime = match lloom_tensor::tuning::contract() {
+            lloom_tensor::tuning::Contract::Deterministic => Exact::NAME,
+            lloom_tensor::tuning::Contract::Fast => Free::NAME,
+        };
+        Self {
+            regime,
+            rewind,
+            rows,
+        }
     }
 
     /// Today's preset name for the shape (the regime aside).
@@ -198,28 +401,46 @@ pub struct Bound {
     pub family: &'static str,
     pub rewind: &'static [&'static str],
     pub rows: &'static [&'static str],
+    /// Shapes inside the product the family does not ship, by key.
+    pub except: &'static [ProfileKey],
 }
 
 impl Bound {
     pub fn admits(&self, key: ProfileKey) -> bool {
-        self.rewind.contains(&key.rewind) && self.rows.contains(&key.rows)
+        self.rewind.contains(&key.rewind)
+            && self.rows.contains(&key.rows)
+            && !self.except.contains(&key)
     }
     pub fn profiles(&self) -> Vec<ProfileKey> {
         ALL.iter().copied().filter(|k| self.admits(*k)).collect()
     }
 }
 
-/// LFM2 ships all four shapes (§3); Qwen4-exp `Ring × One` and `No × One`
-/// until its rows work lands.
+/// LFM2 ships all four shapes (§3). Qwen4-exp ships `No × One` (a chat),
+/// `Ring × One` (the MTP drafter's verify window on the recurrent rings)
+/// and `No × Paged` (`--batch N`: the rows' slot-indexed state and paged
+/// KV pool); `Ring × Paged` it does not — the batched loop is the K = 1
+/// driver, the MTP head speculates at `--batch 1`.
 pub const LFM2: Bound = Bound {
     family: "lfm2",
     rewind: &["No", "Ring"],
     rows: &["One", "Paged"],
+    except: &[],
 };
 pub const QWEN4EXP: Bound = Bound {
     family: "qwen4exp",
     rewind: &["No", "Ring"],
-    rows: &["One"],
+    rows: &["One", "Paged"],
+    except: &[PoolSpec::KEY, PoolSpecExact::KEY],
+};
+/// Every shape Qwen4-exp can be instantiated at (`Ring × Paged` included:
+/// the harness's MTP over rows, `qwen4exp-chat --mtp --rows N`); the engine
+/// serves `QWEN4EXP`.
+pub const QWEN4EXP_ANY: Bound = Bound {
+    family: "qwen4exp",
+    rewind: &["No", "Ring"],
+    rows: &["One", "Paged"],
+    except: &[],
 };
 
 /// The families' default dtype triples (§5): a block declares its own or
@@ -260,10 +481,12 @@ mod tests {
     fn a_familys_bound_is_drawn_from_the_eight_not_listed() {
         assert_eq!(LFM2.profiles().len(), 8);
         let q = QWEN4EXP.profiles();
-        assert_eq!(q.len(), 4);
-        assert!(q.iter().all(|k| k.rows == "One"));
+        assert_eq!(q.len(), 6);
+        assert!(q.iter().all(|k| !(k.rows == "Paged" && k.rewind == "Ring")));
         assert!(QWEN4EXP.admits(RewindableExact::KEY));
-        assert!(!QWEN4EXP.admits(Pool::KEY));
+        assert!(QWEN4EXP.admits(Pool::KEY));
+        assert!(!QWEN4EXP.admits(PoolSpec::KEY));
+        assert!(!QWEN4EXP.admits(PoolSpecExact::KEY));
     }
 
     fn needs_rewind<Q: Profile<Rewind = Ring>>() -> &'static str {

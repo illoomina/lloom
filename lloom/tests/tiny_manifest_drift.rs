@@ -15,6 +15,7 @@
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::{self, Geometry, TinyConfig, TinyFamily, ValueLaw, Weights};
 use lloom_tensor::kernels::metal::profile;
 use lloom_tensor::shape_probe;
@@ -35,13 +36,16 @@ fn replay<F: TinyFamily>(g: &Geometry, weights: Weights, gpu: &Device) -> (BTree
         .checkpoint::<F>(weights)
         .unwrap_or_else(|| panic!("{}: the geometry drops a layer kind", g.describe::<F>()));
     let vocab = ckpt.cfg.axis("vocab_size").unwrap_or(1);
-    let reference = F::reference(&ckpt, &Device::Cpu).expect("the CPU reference builds");
+    let reference =
+        F::reference::<CrownExact>(&ckpt, &Device::Cpu).expect("the CPU reference builds");
     let want = tiny::run(&reference, &ckpt.cfg, vocab, &Device::Cpu, &g.work)
         .expect("the CPU reference runs");
     let armed = shape_probe::arm();
     gpu.synchronize().unwrap();
     profile::reset();
-    let model = ckpt.model(gpu).expect("the Metal model builds");
+    let model = ckpt
+        .model::<CrownExact>(gpu)
+        .expect("the Metal model builds");
     let got = tiny::run(&model, &ckpt.cfg, vocab, gpu, &g.work).expect("the Metal model runs");
     gpu.synchronize().unwrap();
     let events = armed.take();

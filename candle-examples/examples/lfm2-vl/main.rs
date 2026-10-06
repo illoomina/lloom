@@ -62,7 +62,7 @@ use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{Cache, Model};
+use lloom::models::lfm2::{Model, Shape as Lfm2Shape, State};
 use lloom::models::lfm2_vl::{merge_image_features, ImageProcessor, Lfm2VlConfig, VisionEncoder};
 use lloom::nn::var_builder::RecordingBackend;
 use lloom::nn::VarBuilder;
@@ -1010,13 +1010,13 @@ struct Run {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate_with_image(
+fn generate_with_image<P: Lfm2Shape>(
     label: &str,
     image_path: &str,
     args: &Args,
     device: &Device,
     dtype: DType,
-    model: &Model,
+    model: &Model<P>,
     encoder: &VisionEncoder,
     cfg: &Lfm2VlConfig,
     proc: &ImageProcessor,
@@ -1067,7 +1067,7 @@ fn generate_with_image(
         cfg.image_token_id
     );
 
-    let mut cache = Cache::new(true, dtype, config, device).context("allocating KV cache")?;
+    let mut cache = State::<P>::new(true, dtype, config, device).context("allocating KV cache")?;
     let mut logits_processor = LogitsProcessor::from_sampling(args.seed, Sampling::ArgMax);
 
     let input = Tensor::new(ids.as_slice(), device)?.unsqueeze(0)?;
@@ -1201,7 +1201,12 @@ fn extract_svg(text: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     // The recorder reads its switch once, on first use, so it is set before
     // the device exists.
     if args.census {
@@ -1292,7 +1297,8 @@ fn main() -> Result<()> {
         });
 
     let live_before = pool_live(&device)?;
-    let model = Model::new(&config, vb_lang).context("constructing the LFM2 language model")?;
+    let model =
+        Model::<P>::new(&config, vb_lang).context("constructing the LFM2 language model")?;
     let live_text = pool_live(&device)?;
     let encoder = VisionEncoder::new(&vl_cfg, config.hidden_size, vb_raw_vision)
         .context("constructing the vision tower + projector")?;
@@ -1441,4 +1447,14 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }

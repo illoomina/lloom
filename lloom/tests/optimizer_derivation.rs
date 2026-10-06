@@ -22,8 +22,8 @@ use lloom::optimizer::Graph;
 /// The decode step's IR: the walk of `cfg`'s model on Metal, ghost weights.
 fn decode_step(cfg: &Config, dtype: DType) -> Graph {
     let dev = lloom_tensor::Device::new_metal(0).expect("metal");
-    let model = lloom::testing::ghost::lfm2(cfg, dtype, &dev).expect("ghost build");
-    lloom::optimizer::walk(&model)
+    // At the profile the config's axes name: the arms here span every shape.
+    lloom::testing::ghost::lfm2_graph(cfg, dtype, &dev).expect("ghost build")
 }
 use lloom::optimizer::{derive, NumericClass, Op, Policy, Region, Seam};
 

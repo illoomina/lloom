@@ -69,10 +69,10 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
-use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Model};
-use lloom::models::lfm2_dspark::{DSparkProjection, CHECKPOINT_DTYPE};
 use clap::Parser;
+use lloom::models::lfm2::{Model, Shape as Lfm2Shape, State};
+use lloom::models::lfm2_dspark::{DSparkProjection, CHECKPOINT_DTYPE};
+use lloom::nn::VarBuilder;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -161,7 +161,12 @@ fn drafter_tap_layers(draft_dir: &Path) -> Result<(Vec<usize>, usize, f64)> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
 
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     // The hasher is checked before anything is hashed. A digest is only an
     // anchor if the thing producing it is known good, and this is the same
     // self-test `lfm2-determinism` runs (NIST vectors + 1e6*'a' + streaming).
@@ -248,8 +253,8 @@ fn main() -> Result<()> {
 
     let files = weight_files(&target_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
-    let model = Model::new(&cfg, vb)?;
-    let mut cache = Cache::new(true, DType::F16, &cfg, &device)?;
+    let model = Model::<P>::new(&cfg, vb)?;
+    let mut cache = State::<P>::new(true, DType::F16, &cfg, &device)?;
 
     // ---- the drafter's projection, from its own checkpoint ------------------
     let draft_files = vec![draft_dir.join("model.safetensors")];
@@ -348,4 +353,14 @@ fn main() -> Result<()> {
          the same input, and llama.cpp's H_ctx is not in this tree (§10.2o)."
     );
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }

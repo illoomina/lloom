@@ -18,6 +18,7 @@
 use lloom::models::qwen4exp::{Config, GatedDeltaNet};
 use lloom::nn::short_conv::{Ring, Shift, ShortConv};
 use lloom::nn::{RecurrentState, StatePool};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -204,7 +205,7 @@ fn lin(out: usize, inp: usize, seed: usize, dev: &Device) -> Result<QMatMul> {
     Ok(QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev)?))
 }
 
-fn gdn(cfg: &Config, dev: &Device) -> Result<GatedDeltaNet> {
+fn gdn(cfg: &Config, dev: &Device) -> Result<GatedDeltaNet<CrownExact>> {
     let d = cfg.hidden_size;
     let conv_ch = cfg.conv_channels();
     let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
@@ -216,7 +217,7 @@ fn gdn(cfg: &Config, dev: &Device) -> Result<GatedDeltaNet> {
         .into_iter()
         .map(|x| x * 0.3)
         .collect();
-    Ok(GatedDeltaNet::new(
+    Ok(GatedDeltaNet::<CrownExact>::new(
         lin(conv_ch, d, 1, dev)?,
         lin(value_dim, d, 2, dev)?,
         Tensor::from_vec(conv_w, (conv_ch, cfg.ssm_conv_kernel), dev)?,

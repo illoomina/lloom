@@ -19,9 +19,10 @@
 //! are reported and the eviction is what is asserted.
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::models::qwen4exp::{
-    Cache, Config, ExpertResidency, LoadOptions, Qwen4Exp, SlotBudget, StreamLoader, StreamOptions,
+    Config, ExpertResidency, LoadOptions, Qwen4Exp, SlotBudget, State, StreamLoader, StreamOptions,
 };
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::{Backend, Fixture};
 use lloom_tensor::{Device, Result, Tensor};
 
@@ -34,10 +35,10 @@ fn stream(slots: usize, prefetch: bool) -> StreamOptions {
     }
 }
 
-type Decoded = (Vec<u32>, Vec<Vec<f32>>, Cache);
+type Decoded = (Vec<u32>, Vec<Vec<f32>>, State<CrownExact>);
 
 fn decode<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],

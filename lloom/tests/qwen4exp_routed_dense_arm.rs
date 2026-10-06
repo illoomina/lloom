@@ -9,6 +9,7 @@
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{Config, Resident};
+use lloom::profile::CrownExact;
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{Device, Tensor};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ fn probe(cfg: &Config, dtype: GgmlDType, tag: &str) {
     let gpu = Device::new_metal(0).unwrap();
     let mk = |dev: &Device| {
         let [g, u, d] = testing::expert_stacks(cfg, 0, dev, dtype);
-        testing::moe_with(
+        testing::moe_with::<CrownExact, _>(
             cfg,
             dev,
             Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)),

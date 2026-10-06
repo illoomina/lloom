@@ -779,7 +779,8 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         None | Some(Value::Null) => shared.sampling.top_k,
         Some(k) => Some(
             k.as_u64()
-                .ok_or_else(|| bad("field 'top_k' must be a positive integer"))? as usize,
+                .ok_or_else(|| bad("field 'top_k' must be a positive integer"))?
+                as usize,
         ),
     };
     let gumbel = v
@@ -1972,7 +1973,10 @@ pub struct BenchArgs {
 
     /// The cells, comma-separated: `prefill:P`, `decode:P:D`, `e2e:P:D`, `memory:P:D`
     /// (P prompt tokens, D decode tokens).
-    #[arg(long, default_value = "prefill:512,decode:512:100,e2e:8:64,memory:512:100")]
+    #[arg(
+        long,
+        default_value = "prefill:512,decode:512:100,e2e:8:64,memory:512:100"
+    )]
     pub cells: String,
 
     /// Runs per cell (the first is the cold one).
@@ -2092,9 +2096,18 @@ impl Cell {
         };
         Ok(match parts[0] {
             "prefill" => Cell::Prefill { p: num(1)? },
-            "decode" => Cell::Decode { p: num(1)?, d: num(2)? },
-            "e2e" | "end_to_end" => Cell::EndToEnd { p: num(1)?, d: num(2)? },
-            "memory" | "max_memory" => Cell::Memory { p: num(1)?, d: num(2)? },
+            "decode" => Cell::Decode {
+                p: num(1)?,
+                d: num(2)?,
+            },
+            "e2e" | "end_to_end" => Cell::EndToEnd {
+                p: num(1)?,
+                d: num(2)?,
+            },
+            "memory" | "max_memory" => Cell::Memory {
+                p: num(1)?,
+                d: num(2)?,
+            },
             other => anyhow::bail!("cell `{other}`: prefill:P | decode:P:D | e2e:P:D | memory:P:D"),
         })
     }
@@ -2185,7 +2198,9 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         for cell in &cells {
             let started = Instant::now();
             let out = match cell {
-                Cell::Prefill { p } => prefill_throughput(&shared, &json!({ "prompt_tokens": p, "batch": batch })),
+                Cell::Prefill { p } => {
+                    prefill_throughput(&shared, &json!({ "prompt_tokens": p, "batch": batch }))
+                }
                 Cell::Decode { p, d } => decode_throughput(
                     &shared,
                     &json!({ "prompt_tokens": p, "decode_tokens": d, "batch": batch }),
@@ -2601,7 +2616,8 @@ mod bench_cells_tests {
 
     #[test]
     fn the_cells_parse_and_name_themselves() {
-        let cells = Cell::parse_list("prefill:512, decode:512:100,e2e:8:64,memory:512:100").unwrap();
+        let cells =
+            Cell::parse_list("prefill:512, decode:512:100,e2e:8:64,memory:512:100").unwrap();
         assert_eq!(
             cells.iter().map(Cell::name).collect::<Vec<_>>(),
             vec![

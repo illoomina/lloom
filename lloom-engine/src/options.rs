@@ -53,7 +53,9 @@ impl std::str::FromStr for ReadbackKind {
             "auto" => Ok(Self::Auto),
             "blocking" => Ok(Self::Blocking),
             "ring" => Ok(Self::Ring),
-            other => Err(format!("`{other}` is not a readback kind (auto, blocking, ring)")),
+            other => Err(format!(
+                "`{other}` is not a readback kind (auto, blocking, ring)"
+            )),
         }
     }
 }
@@ -402,7 +404,9 @@ pub fn parse_spark(s: &str) -> Result<(Vec<usize>, usize), String> {
                 .map_err(|_| format!("spark progressive STOP must be an integer, got {b:?}"))?,
         )?;
         if start > stop {
-            return Err(format!("spark progressive:{start},{stop}: START must be <= STOP"));
+            return Err(format!(
+                "spark progressive:{start},{stop}: START must be <= STOP"
+            ));
         }
         SPARK_BUCKETS
             .iter()
@@ -472,7 +476,9 @@ impl Default for PrefillConfig {
 impl PrefillConfig {
     /// The spark's `(schedule, bulk)`, if one is set.
     pub fn schedule(&self) -> Option<(Vec<usize>, usize)> {
-        self.spark.as_deref().map(|s| parse_spark(s).expect("validated when set"))
+        self.spark
+            .as_deref()
+            .map(|s| parse_spark(s).expect("validated when set"))
     }
 }
 
@@ -638,10 +644,12 @@ impl TuningOptions {
     /// already been read (a knob a `OnceLock` site took is fixed; the report
     /// line would otherwise lie about it).
     pub fn install(&self) -> Result<(), String> {
-        lloom_tensor::tuning::install(self.tensor())
-            .map_err(|_| "tuning: the tensor crate's knobs were already read before install".to_string())?;
-        lloom::tuning::install(self.lloom())
-            .map_err(|_| "tuning: the model crate's knobs were already read before install".to_string())
+        lloom_tensor::tuning::install(self.tensor()).map_err(|_| {
+            "tuning: the tensor crate's knobs were already read before install".to_string()
+        })?;
+        lloom::tuning::install(self.lloom()).map_err(|_| {
+            "tuning: the model crate's knobs were already read before install".to_string()
+        })
     }
 }
 
@@ -705,7 +713,10 @@ impl ModelConfig {
         if key == "cache" {
             let v = value.trim().to_ascii_lowercase();
             if !CACHE_PRESETS.contains(&v.as_str()) {
-                return Err(format!("cache: `{value}` is not one of {}", CACHE_PRESETS.join(", ")));
+                return Err(format!(
+                    "cache: `{value}` is not one of {}",
+                    CACHE_PRESETS.join(", ")
+                ));
             }
             self.cache = v;
             return Ok(());
@@ -730,7 +741,9 @@ impl ModelConfig {
                         self.set(ak, &json_scalar(ak, av)?)?;
                     }
                 }
-                ("axes", other) => return Err(format!("model.axes: expected an object, got {other}")),
+                ("axes", other) => {
+                    return Err(format!("model.axes: expected an object, got {other}"))
+                }
                 (k, v) => self.set(k, &json_scalar(k, v)?)?,
             }
         }
@@ -788,7 +801,11 @@ impl ModelConfigArgs {
 // ---- sampling -------------------------------------------------------------------
 
 fn parse_stop(v: &str) -> Result<Vec<String>, String> {
-    Ok(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+    Ok(v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 /// `id:bias[,id:bias…]` — OpenAI's `logit_bias` map as a flag.
 fn parse_logit_bias(v: &str) -> Result<std::collections::BTreeMap<u32, f64>, String> {
@@ -984,7 +1001,12 @@ impl SamplingConfig {
     }
 
     /// The per-run parameters for `eos_ids` on `readback`, the prefill tile.
-    pub fn params(&self, eos_ids: &[u32], readback: ReadbackArm, prefill_tile: usize) -> DecodeParams {
+    pub fn params(
+        &self,
+        eos_ids: &[u32],
+        readback: ReadbackArm,
+        prefill_tile: usize,
+    ) -> DecodeParams {
         DecodeParams {
             seed: self.seed_or_random(),
             temperature: self.temperature,
@@ -993,7 +1015,11 @@ impl SamplingConfig {
             gumbel: self.gumbel,
             processors: self.processors(),
             max_tokens: self.max_tokens,
-            eos_ids: if self.ignore_eos { vec![u32::MAX] } else { eos_ids.to_vec() },
+            eos_ids: if self.ignore_eos {
+                vec![u32::MAX]
+            } else {
+                eos_ids.to_vec()
+            },
             stop_strings: self.stop.clone(),
             readback,
             prefill_tile,
@@ -1010,7 +1036,9 @@ pub(crate) fn parse_method(v: &str) -> Result<String, String> {
         "dspark" => Ok("dspark".into()),
         "mtp" => Ok("mtp".into()),
         "auto" => Ok("auto".into()),
-        other => Err(format!("`{other}` is not a speculation method (none, dspark, mtp, auto)")),
+        other => Err(format!(
+            "`{other}` is not a speculation method (none, dspark, mtp, auto)"
+        )),
     }
 }
 
@@ -1052,21 +1080,27 @@ fn parse_arena_layout(v: &str) -> Result<String, String> {
     match v.trim() {
         "packed" => Ok("packed".into()),
         "non-aliasing" | "nonaliasing" | "reference" => Ok("non-aliasing".into()),
-        other => Err(format!("`{other}` is not an arena layout (packed, non-aliasing)")),
+        other => Err(format!(
+            "`{other}` is not an arena layout (packed, non-aliasing)"
+        )),
     }
 }
 fn parse_replay_barriers(v: &str) -> Result<String, String> {
     match v.trim() {
         "always" => Ok("always".into()),
         "skip-replayed" => Ok("skip-replayed".into()),
-        other => Err(format!("`{other}` is not a replay-barriers arm (always, skip-replayed)")),
+        other => Err(format!(
+            "`{other}` is not a replay-barriers arm (always, skip-replayed)"
+        )),
     }
 }
 fn parse_barrier_scope(v: &str) -> Result<String, String> {
     match v.trim() {
         "run-start" => Ok("run-start".into()),
         "since-barrier" => Ok("since-barrier".into()),
-        other => Err(format!("`{other}` is not a barrier scope (run-start, since-barrier)")),
+        other => Err(format!(
+            "`{other}` is not a barrier scope (run-start, since-barrier)"
+        )),
     }
 }
 
@@ -1124,7 +1158,11 @@ impl ExecutorConfig {
     pub fn line(&self) -> String {
         format!(
             "arena={} packed={} replay={} pass_plans={}",
-            if self.arena || self.replay { self.arena_layout.as_str() } else { "off" },
+            if self.arena || self.replay {
+                self.arena_layout.as_str()
+            } else {
+                "off"
+            },
             self.packed || self.replay,
             if self.replay {
                 format!("{}/{}", self.replay_barriers, self.replay_barrier_scope)
@@ -1285,23 +1323,30 @@ mod tests {
         let mut cfg = DecodeConfig::default();
         cfg.set("readback", "ring-hostdrain").unwrap();
         cfg.set("readback.wake_cadence", "2").unwrap();
-        cfg.set("prefill.spark", "progressive:1,64/tile:64").unwrap();
+        cfg.set("prefill.spark", "progressive:1,64/tile:64")
+            .unwrap();
         cfg.set("in_flight", "3").unwrap();
         assert_eq!(cfg.readback.eos, EosKind::HostDrain);
         assert_eq!(cfg.readback.ring_arm().wake, 2);
         assert_eq!(cfg.prefill.schedule(), Some((vec![1, 16, 32, 64], 64)));
         assert!(cfg.set("prefill.spark", "8").is_err());
-        cfg.merge_json(&serde_json::json!({"readback": {"eos": "gpu-batched", "commit_budget": "steps:4"}}))
-            .unwrap();
+        cfg.merge_json(
+            &serde_json::json!({"readback": {"eos": "gpu-batched", "commit_budget": "steps:4"}}),
+        )
+        .unwrap();
         assert_eq!(cfg.readback.eos, EosKind::GpuBatched);
         assert_eq!(cfg.readback.commit_budget.period(), 4);
-        cfg.merge_json(&serde_json::json!({"readback": "blocking"})).unwrap();
+        cfg.merge_json(&serde_json::json!({"readback": "blocking"}))
+            .unwrap();
         assert_eq!(cfg.readback.kind, ReadbackKind::Blocking);
         let dumped = serde_json::to_value(&cfg).unwrap();
         let mut back = DecodeConfig::default();
         back.merge_json(&dumped).unwrap();
         assert_eq!(back, cfg);
-        assert!(cfg.check().is_ok(), "the cadence knobs are ignored on the blocking arm, not refused");
+        assert!(
+            cfg.check().is_ok(),
+            "the cadence knobs are ignored on the blocking arm, not refused"
+        );
         cfg.set("readback.eos_gate", "true").unwrap();
         cfg.set("readback.adaptive_commit", "false").unwrap();
         assert!(

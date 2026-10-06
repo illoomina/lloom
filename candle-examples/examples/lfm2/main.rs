@@ -22,26 +22,26 @@ use clap::Parser;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{Cache, LayerType, Lfm2Config, Model};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{LayerType, Lfm2Config, Model, Shape as Lfm2Shape, State};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
-struct TextGeneration {
-    model: Model,
+struct TextGeneration<P: Lfm2Shape> {
+    model: Model<P>,
     device: Device,
     tokenizer: TokenOutputStream,
     logits_processor: LogitsProcessor,
     repeat_penalty: f32,
     repeat_last_n: usize,
-    cache: Cache,
+    cache: State<P>,
 }
 
-impl TextGeneration {
+impl<P: Lfm2Shape> TextGeneration<P> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        model: Model,
+        model: Model<P>,
         tokenizer: Tokenizer,
         seed: u64,
         temp: Option<f64>,
@@ -50,7 +50,7 @@ impl TextGeneration {
         repeat_penalty: f32,
         repeat_last_n: usize,
         device: &Device,
-        cache: Cache,
+        cache: State<P>,
     ) -> Self {
         let logits_processor = {
             let temperature = temp.unwrap_or(0.);
@@ -243,10 +243,15 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+    let key = shape_key();
+    println!("PROFILE {key}");
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => run::<P>(args))
+}
+
+fn run<P: Lfm2Shape>(args: Args) -> Result<()> {
     use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;
-
-    let args = Args::parse();
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -321,8 +326,8 @@ fn main() -> Result<()> {
     };
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
-    let model = Model::new(&config, vb)?;
-    let cache = Cache::new(true, dtype, &config, &device)?;
+    let model = Model::<P>::new(&config, vb)?;
+    let cache = State::<P>::new(true, dtype, &config, &device)?;
 
     println!("loaded the model in {:?}", start.elapsed());
     println!("model: {model_id}");
@@ -355,4 +360,14 @@ fn main() -> Result<()> {
     );
     pipeline.run(&args.prompt, args.sample_len)?;
     Ok(())
+}
+
+/// The profile this harness runs at: the config's default axes name the
+/// one-sequence, no-rewind shape (`profiles-and-memory-design.md` §3), at
+/// the contract in force.
+fn shape_key() -> lloom::profile::ProfileKey {
+    lloom::profile::ProfileKey::at_contract(
+        <lloom::profile::NoRewind as lloom::profile::Rewind>::NAME,
+        <lloom::profile::One as lloom::profile::Rows>::NAME,
+    )
 }

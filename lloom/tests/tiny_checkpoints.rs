@@ -15,6 +15,7 @@ use lloom::models::lfm2::Config as LfmConfig;
 use lloom::models::lfm2_testing::{self, Lfm2Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::models::qwen4exp::Config as QwenConfig;
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::{self, TinyCheckpoint, TinyFamily, ValueLaw, Weights, Workload};
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{Device, Result};
@@ -38,7 +39,7 @@ const W: Workload = Workload {
 };
 
 fn lfm2_logits(ckpt: &TinyCheckpoint<Lfm2Tiny>) -> Result<Vec<Vec<f32>>> {
-    let m = ckpt.model(&Device::Cpu)?;
+    let m = ckpt.model::<CrownExact>(&Device::Cpu)?;
     tiny::run(&m, &ckpt.cfg, ckpt.cfg.vocab_size, &Device::Cpu, &W)
 }
 
@@ -66,7 +67,7 @@ fn lfm2_memory_and_files_agree() -> Result<()> {
 
         let dir = scratch(&format!("lfm2-{dense:?}"));
         let path = ckpt.write(&dir)?;
-        let (model, record) = lfm2_testing::load_recorded(&path, &Device::Cpu, None)?;
+        let (model, record) = lfm2_testing::load_recorded::<CrownExact>(&path, &Device::Cpu, None)?;
         let loaded: LfmConfig = ckpt.cfg.clone();
         let files = tiny::run(&model, &loaded, loaded.vocab_size, &Device::Cpu, &W)?;
         assert_eq!(bits(&files), bits(&mem), "{dense:?}: files != memory");
@@ -162,14 +163,14 @@ fn qwen4exp_memory_and_files_agree() -> Result<()> {
                 ..Weights::default()
             },
         );
-        let m = ckpt.model(&Device::Cpu)?;
+        let m = ckpt.model::<CrownExact>(&Device::Cpu)?;
         let mem = tiny::run(&m, &ckpt.cfg, ckpt.cfg.vocab_size, &Device::Cpu, &W)?;
         assert!(mem.iter().flatten().all(|x| x.is_finite()), "{dense:?}");
         assert_ne!(bits(&mem[1..2]), bits(&mem[2..3]));
 
         let dir = scratch(&format!("qwen-{dense:?}"));
         let path = ckpt.write(&dir)?;
-        let f = Qwen4ExpTiny::load(&path, &Device::Cpu)?;
+        let f = Qwen4ExpTiny::load::<CrownExact>(&path, &Device::Cpu)?;
         let files = tiny::run(&f, &ckpt.cfg, ckpt.cfg.vocab_size, &Device::Cpu, &W)?;
         assert_eq!(bits(&files), bits(&mem), "{dense:?}: files != memory");
 
@@ -234,7 +235,11 @@ fn qwen4exp_drift_from_the_schema_is_refused_by_name() -> Result<()> {
     let mut r = std::io::Cursor::new(bytes);
     let mut content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
     content.tensor_infos.remove("blk.1.ssm_a");
-    let e = match lloom::models::qwen4exp::Qwen4Exp::from_gguf(content, &mut r, &Device::Cpu) {
+    let e = match lloom::models::qwen4exp::Qwen4Exp::<CrownExact, _>::from_gguf(
+        content,
+        &mut r,
+        &Device::Cpu,
+    ) {
         Ok(_) => panic!("a checkpoint without blk.1.ssm_a loaded"),
         Err(e) => e.to_string(),
     };
@@ -264,7 +269,7 @@ fn qwen4exp_packed_experts_have_a_cpu_reference() -> Result<()> {
             },
         );
         let reference = ckpt.dequantized();
-        let m = reference.model(&Device::Cpu)?;
+        let m = reference.model::<CrownExact>(&Device::Cpu)?;
         let out = tiny::run(
             &m,
             &reference.cfg,

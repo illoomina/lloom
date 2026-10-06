@@ -24,6 +24,7 @@
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+use lloom::profile::CrownExact;
 use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, TinyTokenizer, Weights};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

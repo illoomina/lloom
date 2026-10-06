@@ -11,9 +11,11 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
+use lloom::models::qwen4exp::Shape as _;
 use lloom::models::qwen4exp::{Config, MtpDrafter};
 use lloom::nn::model::CausalLM;
 use lloom::nn::{DecodeOptions, Session};
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{Device, Result};
 
 #[test]
@@ -24,20 +26,22 @@ fn the_generation_probe_scores_every_round_and_agrees_with_the_verify() -> Resul
     cfg.n_experts_per_tok = 2;
     cfg.eos_token_id = 127;
     let dev = Device::Cpu;
-    let model = testing::resident_model(&cfg, &dev);
-    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
+    let head =
+        testing::mtp_head::<CrownExact, _>(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
     let eos = [cfg.eos_token_id];
     let max = 24;
     let mut checked = 0;
     for seed in 0..8u32 {
         let prompt: Vec<u32> = (0..6).map(|i| (seed * 13 + i * 5 + 2) % 120).collect();
-        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut cache = RewindableExact::single(&model, &dev, 1)?;
         cache.want_nextn = true;
         let mut session = Session::new(&model, cache);
         let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
         let mut rb = Blocking::new(&eos, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut mtp,
             &mut rb,
             &mut sampler,

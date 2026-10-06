@@ -5,6 +5,7 @@
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::Config;
+use lloom::profile::CrownExact;
 use lloom_tensor::{Device, Result, Tensor};
 
 fn row(cfg: &Config, seed: f32, seq: usize, dev: &Device) -> Tensor {
@@ -49,8 +50,8 @@ fn tiny_blocks_metal_vs_cpu() -> Result<()> {
         let xc = row(&cfg, 0.0, seq, &cpu);
         let xg = xc.to_device(&gpu)?;
         // MoE (resident, f32 stacks as the tiny model's)
-        let mc = testing::moe(&cfg, &cpu);
-        let mg = testing::moe(&cfg, &gpu);
+        let mc = testing::moe::<CrownExact>(&cfg, &cpu);
+        let mg = testing::moe::<CrownExact>(&cfg, &gpu);
         compare(
             &format!("moe seq={seq}"),
             &mc.forward(&xc)?,

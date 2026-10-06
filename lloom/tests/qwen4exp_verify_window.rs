@@ -6,10 +6,12 @@
 //! too). CPU (the composed per-position path) and Metal (the multi-step
 //! kernels).
 use lloom::models::qwen4exp::testing;
+use lloom::models::qwen4exp::Shape as _;
 use lloom::models::qwen4exp::{
-    Cache, Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident,
+    Config, MmapPleTable, NgramHash, PleLayer, PleTable, Qwen4Exp, Resident, State,
 };
 use lloom::nn::model::CausalLM;
+use lloom::profile::RewindableExact;
 use lloom_tensor::quantized::gguf_file::{self, Content};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
@@ -33,8 +35,12 @@ fn write_table(cfg: &Config, ple_rows: usize, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn model_with_ple(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Resident>> {
-    let mut model = testing::resident_model(cfg, dev);
+fn model_with_ple(
+    cfg: &Config,
+    dev: &Device,
+    path: &Path,
+) -> Result<Qwen4Exp<RewindableExact, Resident>> {
+    let mut model = testing::resident_model::<RewindableExact>(cfg, dev);
     let hash = NgramHash::new(
         vec![1_000_003, 999_983, 7],
         vec![13, 17, 19, 23],
@@ -45,7 +51,7 @@ fn model_with_ple(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Re
     let table = MmapPleTable::open(path)?;
     let hc_dim = cfg.hc_dim();
     let ple_dim = cfg.ple_head_dim * hash.n_heads();
-    let block = PleLayer::new(
+    let block = PleLayer::<RewindableExact>::new(
         testing::lin(hc_dim, ple_dim, 21.0, dev),
         testing::lin(cfg.hidden_size, ple_dim, 22.0, dev),
         testing::ones(hc_dim, dev),
@@ -62,9 +68,9 @@ fn model_with_ple(cfg: &Config, dev: &Device, path: &Path) -> Result<Qwen4Exp<Re
 }
 
 fn step_argmax(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     tok: u32,
-    cache: &mut Cache,
+    cache: &mut State<RewindableExact>,
     dev: &Device,
 ) -> Result<u32> {
     let input = Tensor::from_vec(vec![tok], (1, 1), dev)?;
@@ -95,13 +101,13 @@ fn check_on(dev: &Device, tag: &str, with_ple: bool) -> Result<()> {
         write_table(&cfg, 80, &path)?;
         model_with_ple(&cfg, dev, &path)?
     } else {
-        testing::resident_model(&cfg, dev)
+        testing::resident_model::<RewindableExact>(&cfg, dev)
     };
     let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9];
     let window: Vec<u32> = vec![4, 11, 7, 2];
     let t = window.len();
     let k = t - 1;
-    let prefill = |cache: &mut Cache| -> Result<()> {
+    let prefill = |cache: &mut State<RewindableExact>| -> Result<()> {
         let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), dev)?;
         model.forward(&input, 0, cache)?;
         // one decode step so every slab is written by the decode path
@@ -113,7 +119,7 @@ fn check_on(dev: &Device, tag: &str, with_ple: bool) -> Result<()> {
     let mut seq_sums: Vec<Vec<(String, u64, usize)>> = Vec::with_capacity(t + 1);
     let mut seq_pos = Vec::with_capacity(t + 1);
     {
-        let mut c = model.new_cache(&cfg, dev)?;
+        let mut c = RewindableExact::single(&model, &dev, 8)?;
         c.want_nextn = true;
         prefill(&mut c)?;
         let _ = c.take_nextn()?;
@@ -128,7 +134,7 @@ fn check_on(dev: &Device, tag: &str, with_ple: bool) -> Result<()> {
     // The window pass, then an accept of every a — each from a fresh run.
     for a in 0..=t {
         let pools = model.spec_pools(1, k, dev);
-        let mut c = Cache::in_pools(&cfg, &pools)?;
+        let mut c = State::<RewindableExact>::in_ring(&cfg, &pools)?;
         c.want_nextn = true;
         assert!(
             c.ring_holds(t, with_ple),
@@ -158,7 +164,7 @@ fn check_on(dev: &Device, tag: &str, with_ple: bool) -> Result<()> {
         );
         // And the cache decodes on from there as the sequential one does.
         let next_seq = {
-            let mut s = model.new_cache(&cfg, dev)?;
+            let mut s = RewindableExact::single(&model, &dev, 8)?;
             prefill(&mut s)?;
             for &tok in &window[..a] {
                 step_argmax(&model, tok, &mut s, dev)?;

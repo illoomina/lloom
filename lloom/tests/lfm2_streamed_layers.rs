@@ -9,8 +9,9 @@
 //! On Metal when a device is there, else on the CPU (the tier copies with
 //! `slice_set` there; on Metal the host writes the Shared slots).
 
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model, StreamLayers};
+use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State, StreamLayers};
 use lloom::nn::VarBuilder;
+use lloom::profile::RewindableExact;
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn tiny_config() -> Config {
@@ -102,10 +103,15 @@ fn write_checkpoint(cfg: &Config, dtype: DType, path: &std::path::Path) -> Resul
     lloom_tensor::safetensors::save(&tensors, path)
 }
 
-fn build(cfg: &Config, dtype: DType, dev: &Device, path: &std::path::Path) -> Result<Model> {
+fn build(
+    cfg: &Config,
+    dtype: DType,
+    dev: &Device,
+    path: &std::path::Path,
+) -> Result<Model<RewindableExact>> {
     // SAFETY: the file is written above and not modified while mapped.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, dev)? };
-    Model::new(cfg, vb)
+    Model::<RewindableExact>::new(cfg, vb)
 }
 
 const PROMPT: [u32; 5] = [3, 11, 20, 5, 9];
@@ -122,13 +128,13 @@ fn argmax(v: &[f32]) -> u32 {
 
 /// A prefill and `steps` greedy decode steps: the logits of each.
 fn run(
-    model: &Model,
+    model: &Model<RewindableExact>,
     cfg: &Config,
     dtype: DType,
     dev: &Device,
     steps: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    let mut cache = Cache::new(true, dtype, cfg, dev)?.with_kv_bucket(2)?;
+    let mut cache = State::<RewindableExact>::new(true, dtype, cfg, dev)?.with_kv_bucket(2)?;
     let input = Tensor::new(&PROMPT, dev)?.unsqueeze(0)?;
     let mut out = Vec::new();
     let first = model

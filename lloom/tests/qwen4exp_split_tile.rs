@@ -22,9 +22,10 @@
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::models::qwen4exp::{
-    Cache, Config, ExpertResidency, LoadOptions, Qwen4Exp, SlotBudget, StreamLoader, StreamOptions,
+    Config, ExpertResidency, LoadOptions, Qwen4Exp, SlotBudget, State, StreamLoader, StreamOptions,
 };
 use lloom::nn::model::CausalLM;
+use lloom::profile::CrownExact;
 use lloom::testing::fixture::Fixture;
 use lloom_tensor::quantized::metal::{moe_mm_from, set_moe_mm_from};
 use lloom_tensor::{Device, Result, Tensor};
@@ -41,13 +42,13 @@ fn stream(slots: usize) -> StreamOptions {
 /// The prompt's prefill, then `steps` greedy tokens: every step's logits,
 /// the first being the prefill's.
 fn run<R: ExpertResidency>(
-    model: &Qwen4Exp<R>,
+    model: &Qwen4Exp<CrownExact, R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
     steps: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    let mut cache: Cache = model.new_cache(cfg, dev)?;
+    let mut cache: State<CrownExact> = model.new_cache(cfg, dev)?;
     let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), dev)?;
     let mut logits = model.forward(&input, 0, &mut cache)?;
     let mut rows = Vec::with_capacity(steps + 1);

@@ -29,8 +29,10 @@
 
 use super::hc::grouped_rms_norm;
 use crate::nn::{ops, RecurrentState};
+use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor};
+use std::marker::PhantomData;
 
 /// The table's storage is the engine's n-gram memory (`nn::ngram_memory`),
 /// under the names this model's code has always used.
@@ -41,7 +43,8 @@ pub use crate::nn::ngram_memory::{
 
 /// The PLE block's weights for its one layer.
 #[derive(Debug, Clone)]
-pub struct PleLayer {
+pub struct PleLayer<P: Profile> {
+    profile: PhantomData<P>,
     /// `ple_key.weight` `[hc_dim, ple_dim]`.
     key: QMatMul,
     /// `ple_value.weight` `[hidden, ple_dim]`.
@@ -64,7 +67,7 @@ pub struct PleLayer {
     gate_scalars: std::sync::OnceLock<(Tensor, Tensor, Tensor)>,
 }
 
-impl PleLayer {
+impl<P: Profile> PleLayer<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: QMatMul,
@@ -84,6 +87,7 @@ impl PleLayer {
         }
         let unit_d = Tensor::ones(d, norm_key.dtype(), norm_key.device())?;
         Ok(Self {
+            profile: PhantomData,
             key,
             value,
             norm_key,
@@ -232,7 +236,7 @@ impl PleLayer {
 /// next history are layer `l`'s conv recurrence. `In` is the carry and the
 /// layer; the position's rows, gathered on the host, are the step's input.
 #[cfg(not(target_arch = "wasm32"))]
-impl crate::optimizer::Visit for PleLayer {
+impl<P: Profile> crate::optimizer::Visit for PleLayer<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (hidden, l): Self::In) -> Self::Out {
@@ -326,6 +330,7 @@ impl crate::optimizer::Visit for PleLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::CrownExact;
     use lloom_tensor::{DType, Device};
 
     /// The checkpoint's recorded hash constants (`qwen4exp.ple.*`, read from the
@@ -484,7 +489,7 @@ mod tests {
         let w = Tensor::from_vec(vec![1f32, 2., 3., 4., 0., 0., 0., 1.], (ch, k), &dev).unwrap();
         let zero =
             |o: usize, i: usize| QMatMul::Tensor(Tensor::zeros((o, i), DType::F32, &dev).unwrap());
-        let layer = PleLayer::new(
+        let layer = PleLayer::<CrownExact>::new(
             zero(ch, 4),
             zero(d, 4),
             Tensor::ones(ch, DType::F32, &dev).unwrap(),
@@ -551,7 +556,7 @@ mod tests {
             let vecw = |k: usize, f: &dyn Fn(usize) -> f32| {
                 Tensor::from_vec((0..k).map(f).collect::<Vec<f32>>(), k, dev).unwrap()
             };
-            PleLayer::new(
+            PleLayer::<CrownExact>::new(
                 lin(ch, ple_dim, 1.0),
                 lin(d, ple_dim, 2.0),
                 vecw(ch, &|i| 1.0 + 0.001 * (i % 9) as f32),
@@ -636,7 +641,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        let layer = PleLayer::new(
+        let layer = PleLayer::<CrownExact>::new(
             lin(ch, ple_dim, 1.0),
             lin(d, ple_dim, 2.0),
             Tensor::ones(ch, DType::F32, &dev).unwrap(),

@@ -18,9 +18,10 @@
 //! CPU only: the question is which bytes survive a call, not what a kernel
 //! computes, and the CPU backend is bit-stable (`CONTRIBUTING.md` §3.1).
 
-use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
+use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::profile::RewindableExact;
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 fn tiny_config(conv_state: ConvState) -> Config {
     Config {
@@ -65,7 +66,7 @@ fn tiny_config(conv_state: ConvState) -> Config {
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<RewindableExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -111,7 +112,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<RewindableExact>::new(cfg, vb)
 }
 
 /// **The finding: a multi-position pass does not ring-write, it rebuilds.**
@@ -142,7 +143,7 @@ fn the_multi_position_conv_path_seeds_the_phase_rather_than_advancing_it() -> Re
     let l_cache = 3usize;
     let cfg = tiny_config(ConvState::RotatingRing { k: 4 });
     let model = build(&cfg, &dev)?;
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
 
     // Prefill, then a k-position pass.
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
@@ -190,7 +191,7 @@ fn the_multi_position_conv_path_discards_the_pre_pass_history() -> Result<()> {
     let mut states = Vec::new();
     // Two different prompts, so two different pre-pass conv histories.
     for prompt in [vec![1u32, 2, 3, 4, 5], vec![11u32, 12, 13, 14, 15]] {
-        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let inp = Tensor::new(prompt.as_slice(), &dev)?.reshape((1, prompt.len()))?;
         model.forward(&inp, 0, &mut cache)?;
         let w = Tensor::new(window.as_slice(), &dev)?.reshape((1, window.len()))?;
@@ -254,7 +255,7 @@ fn only_the_rotating_ring_admits_a_speculative_window() -> Result<()> {
         (ConvState::SlidingRing { k: 4, slack: 16 }, "compacts"),
     ] {
         let cfg = tiny_config(arm);
-        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let err = cache.advance(2).unwrap_err().to_string();
         assert!(
             err.contains(needle),
@@ -279,7 +280,7 @@ fn only_the_rotating_ring_admits_a_speculative_window() -> Result<()> {
 fn a_window_wider_than_the_rings_history_is_refused() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(ConvState::RotatingRing { k: 2 });
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
 
     // Inside the reserve: admitted, and a real pass runs between the `advance`
     // and the `resolve`, because `resolve` checks that the phase moved by `k`.
@@ -311,7 +312,7 @@ fn a_window_wider_than_the_rings_history_is_refused() -> Result<()> {
     // And the default ring admits nothing, which is the case a caller is most
     // likely to hit first.
     let cfg0 = tiny_config(ConvState::RotatingRing { k: 0 });
-    let mut cache0 = Cache::new(true, DType::F32, &cfg0, &dev)?;
+    let mut cache0 = State::<RewindableExact>::new(true, DType::F32, &cfg0, &dev)?;
     assert!(cache0.advance(1).is_err(), "k = 0 reserves no history");
     Ok(())
 }

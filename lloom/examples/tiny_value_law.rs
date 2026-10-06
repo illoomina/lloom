@@ -64,7 +64,11 @@ fn margin(v: &[f32]) -> f32 {
     (s[0] - s[1]) / scale
 }
 
-fn greedy(model: &lloom::models::lfm2::Model, c: &Config, dev: &Device) -> Result<Vec<u32>> {
+fn greedy(
+    model: &lloom::models::lfm2::Model<lloom::profile::CrownExact>,
+    c: &Config,
+    dev: &Device,
+) -> Result<Vec<u32>> {
     let mut cache = model.new_cache(c, dev)?;
     let (prompt, _) = FIXED.tokens(c.vocab_size);
     let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), dev)?;
@@ -117,7 +121,7 @@ fn main() -> Result<()> {
                 }
                 for (arm, dev, dt) in arms {
                     let c = ckpt.clone().with_dtype(dt);
-                    let model = c.model(&dev)?;
+                    let model = c.model::<lloom::profile::CrownExact>(&dev)?;
                     let steps = tiny::run(&model, &c.cfg, c.cfg.vocab_size, &dev, &FIXED)?;
                     for (i, s) in steps.iter().enumerate() {
                         println!(

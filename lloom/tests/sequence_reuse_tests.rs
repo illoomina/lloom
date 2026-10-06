@@ -14,11 +14,14 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
+};
 use lloom::nn::{
     CacheReset, CacheRewind, CausalLM, DecodeOptions, IdentityProposer, Model as ModelTrait,
     ReuseAction, Session, VarBuilder,
 };
+use lloom::profile::{CrownExact, RewindableExact};
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ fn tiny_config(conv_state: ConvState, kv_append: KvAppend, conv_prefill_ctx: boo
     }
 }
 
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build<P: Lfm2Shape>(cfg: &Config, dev: &Device) -> Result<Model<P>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -103,7 +106,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<P>::new(cfg, vb)
 }
 
 fn greedy() -> LogitsProcessor {
@@ -149,29 +152,9 @@ fn a_pass_onto_a_warm_cache_matches_one_pass_over_the_concatenation_iff_the_cont
         let mut deltas = Vec::new();
         for carry in [false, true] {
             let cfg = tiny_config(arm, kv, carry);
-            let model = build(&cfg, &dev)?;
-
-            // Reference: one pass over the concatenation, every position's
-            // logits, of which `b`'s positions are compared.
-            let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
-            let inp = Tensor::new(full.as_slice(), &dev)?.unsqueeze(0)?;
-            let one_pass = model
-                .forward_all(&inp, 0, &mut cache)?
-                .narrow(1, a.len(), b.len())?
-                .contiguous()?;
-
-            // Subject: `a` (prefill), then a decode step so the ring has
-            // moved off its seed, then `b` onto the warm cache.
-            let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
-            let (head, tail) = a.split_at(a.len() - 1);
-            let inp = Tensor::new(head, &dev)?.unsqueeze(0)?;
-            model.forward(&inp, 0, &mut cache)?;
-            let inp = Tensor::new(tail, &dev)?.unsqueeze(0)?;
-            model.forward(&inp, head.len(), &mut cache)?;
-            let inp = Tensor::new(b.as_slice(), &dev)?.unsqueeze(0)?;
-            let two_pass = model.forward_all(&inp, a.len(), &mut cache)?;
-
-            deltas.push(max_abs_diff(&one_pass, &two_pass)?);
+            let key = cfg.exact_key();
+            let delta = lloom::profile::dispatch!(key, lloom::profile::LFM2, P => warm_case::<P>(&cfg, &dev, &a, &b, &full))?;
+            deltas.push(delta);
         }
         let (off, on) = (deltas[0], deltas[1]);
         eprintln!("{arm:?} x {kv:?}: max|Δlogit| off={off:.3e} on={on:.3e}");
@@ -189,6 +172,40 @@ fn a_pass_onto_a_warm_cache_matches_one_pass_over_the_concatenation_iff_the_cont
     Ok(())
 }
 
+/// One cell of the warm-cache test, at the profile its config names: the
+/// max |Δlogit| between one pass over the concatenation and `a` then `b`.
+fn warm_case<P: Lfm2Shape>(
+    cfg: &Config,
+    dev: &Device,
+    a: &[u32],
+    b: &[u32],
+    full: &[u32],
+) -> Result<f32> {
+    let model = build::<P>(&cfg, &dev)?;
+
+    // Reference: one pass over the concatenation, every position's
+    // logits, of which `b`'s positions are compared.
+    let mut cache = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+    let inp = Tensor::new(full, &dev)?.unsqueeze(0)?;
+    let one_pass = model
+        .forward_all(&inp, 0, &mut cache)?
+        .narrow(1, a.len(), b.len())?
+        .contiguous()?;
+
+    // Subject: `a` (prefill), then a decode step so the ring has
+    // moved off its seed, then `b` onto the warm cache.
+    let mut cache = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+    let (head, tail) = a.split_at(a.len() - 1);
+    let inp = Tensor::new(head, &dev)?.unsqueeze(0)?;
+    model.forward(&inp, 0, &mut cache)?;
+    let inp = Tensor::new(tail, &dev)?.unsqueeze(0)?;
+    model.forward(&inp, head.len(), &mut cache)?;
+    let inp = Tensor::new(b, &dev)?.unsqueeze(0)?;
+    let two_pass = model.forward_all(&inp, a.len(), &mut cache)?;
+
+    max_abs_diff(&one_pass, &two_pass)
+}
+
 /// The conv state itself after the second pass equals the state after the
 /// single pass — the hand-over half §13.2f says must be preserved — on the
 /// shuffle arm where the state is the window.
@@ -203,14 +220,14 @@ fn the_state_after_a_warm_pass_is_the_single_pass_state_when_the_context_is_carr
     // "columns differ" sanity check below needs ids that do not.)
     let b: Vec<u32> = vec![11, 5];
     let cfg = tiny_config(ConvState::Shuffle, KvAppend::InPlace, true);
-    let model = build(&cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
 
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new([a.clone(), b.clone()].concat().as_slice(), &dev)?.unsqueeze(0)?;
     model.forward(&inp, 0, &mut cache)?;
     let one = cache.conv_state_for_test(0).unwrap();
 
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     let inp = Tensor::new(a.as_slice(), &dev)?.unsqueeze(0)?;
     model.forward(&inp, 0, &mut cache)?;
     let inp = Tensor::new(b.as_slice(), &dev)?.unsqueeze(0)?;
@@ -466,13 +483,16 @@ fn prepare_extends_resumes_rewinds_or_resets_by_prefix_length() -> Result<()> {
 fn an_eos_overrun_is_rewound_and_the_continuation_is_byte_identical() -> Result<()> {
     let dev = Device::Cpu;
     let cfg = tiny_config(ConvState::RotatingRing { k: 8 }, KvAppend::InPlace, true);
-    let model = build(&cfg, &dev)?;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let never: Vec<u32> = vec![47];
 
     // The reference stream, with no EOS reachable, to pick an EOS from.
     let stream = {
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut s = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut rb = Blocking::new(&never, &dev)?;
         s.decode(
             &mut IdentityProposer,
@@ -500,7 +520,10 @@ fn an_eos_overrun_is_rewound_and_the_continuation_is_byte_identical() -> Result<
     // The conservative reference: lookahead 0 on the blocking arm, turn 1 to
     // EOS, then turn 2 appended (the cache ends at the last kept token).
     let reference = {
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut s = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut rb = Blocking::new(&eos_ids, &dev)?;
         let t1 = s.decode(
             &mut IdentityProposer,
@@ -543,7 +566,10 @@ fn an_eos_overrun_is_rewound_and_the_continuation_is_byte_identical() -> Result<
             CommitBudget::steps(4)?,
         ),
     ] {
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut s = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut rb = Ring::new(&eos_ids, &dev, 128, eos_read)?.with_poll_budget(20_000);
         let opts = DecodeOptions {
             lookahead: 1,
@@ -612,8 +638,11 @@ fn an_eos_overrun_is_rewound_and_the_continuation_is_byte_identical() -> Result<
     // overrun and refuses the rewind, so `prepare` starts fresh.
     {
         let cfg = tiny_config(ConvState::Shuffle, KvAppend::Cat, true);
-        let model = build(&cfg, &dev)?;
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let model = build::<CrownExact>(&cfg, &dev)?;
+        let mut s = Session::new(
+            &model,
+            State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut rb = Ring::new(&eos_ids, &dev, 128, EosRead::Poll(PollMechanism::default()))?
             .with_poll_budget(20_000);
         let opts = DecodeOptions {
@@ -646,7 +675,7 @@ fn two_sequences_interleaved_are_byte_identical_to_their_solo_runs() -> Result<(
     // The crown-shaped cache: `Resume` needs no rewind, so this works on the
     // unrewindable arms too.
     let cfg = tiny_config(ConvState::Shuffle, KvAppend::Cat, false);
-    let model = build(&cfg, &dev)?;
+    let model = build::<CrownExact>(&cfg, &dev)?;
     let never: Vec<u32> = vec![47];
     let prompts: Vec<Vec<u32>> = vec![
         vec![1, 2, 3, 4, 5],
@@ -659,7 +688,10 @@ fn two_sequences_interleaved_are_byte_identical_to_their_solo_runs() -> Result<(
     let solo: Vec<Vec<u32>> = prompts
         .iter()
         .map(|p| -> Result<Vec<u32>> {
-            let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+            let mut s = Session::new(
+                &model,
+                State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?,
+            );
             let mut rb = Ring::new(&never, &dev, 64, EosRead::Poll(PollMechanism::default()))?
                 .with_poll_budget(20_000);
             let opts = DecodeOptions {
@@ -682,12 +714,12 @@ fn two_sequences_interleaved_are_byte_identical_to_their_solo_runs() -> Result<(
 
     // Interleaved: one session and one ring per sequence, `chunk` tokens at a
     // time, round-robin, continuing through `prepare` on each visit.
-    let mut sessions: Vec<Session<'_, Model>> = prompts
+    let mut sessions: Vec<Session<'_, Model<CrownExact>>> = prompts
         .iter()
         .map(|_| {
             Ok(Session::new(
                 &model,
-                Cache::new(true, DType::F32, &cfg, &dev)?,
+                State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?,
             ))
         })
         .collect::<Result<_>>()?;

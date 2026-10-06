@@ -32,9 +32,10 @@
 //! a kernel, and the CPU backend is bit-stable (`CONTRIBUTING.md` §3.1).
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
-use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model, State};
 use lloom::nn::speculator::{Draft, DraftTokens, LayerTaps, SeqId, Speculator, TargetProbe};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
+use lloom::profile::RewindableExact;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A tiny LFM2 whose layer count leaves room for a five-layer tap. Six layers
@@ -92,7 +93,7 @@ fn tiny_config(k: usize) -> Config {
 
 /// The same fixed-ramp weights the conv-rollback test uses — deterministic, so
 /// the two decode arms agree on the model and any divergence is the paths'.
-fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+fn build(cfg: &Config, dev: &Device) -> Result<Model<RewindableExact>> {
     let mut tensors = std::collections::HashMap::new();
     let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
         let n: usize = shape.iter().product();
@@ -138,7 +139,7 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         }
     }
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    Model::new(cfg, vb)
+    Model::<RewindableExact>::new(cfg, vb)
 }
 
 /// A deliberately wrong proposer: it proposes `k` copies of a fixed token every
@@ -155,6 +156,7 @@ struct GarbageDrafter {
 
 impl Speculator for GarbageDrafter {
     type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         1
@@ -197,6 +199,7 @@ struct RecordingDrafter {
 
 impl Speculator for RecordingDrafter {
     type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         1
@@ -250,7 +253,7 @@ fn decode_speculative_seeds_the_drafter_from_every_prompt_position() -> Result<(
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7 + 1, 9];
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
 
-    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let mut session = Session::new(&model, cache);
     let mut spec = RecordingDrafter {
         k,
@@ -261,6 +264,7 @@ fn decode_speculative_seeds_the_drafter_from_every_prompt_position() -> Result<(
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let opts = DecodeOptions::new(24);
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &mut rb,
         &mut sampler,
@@ -318,7 +322,7 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
 
     // --- reference: greedy K=1 decode (the identity proposer, blocking) ------
     let (ref_ids, ref_eos) = {
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = IdentityProposer;
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -355,7 +359,7 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
 
     // --- subject: speculative decode with a GARBAGE drafter ------------------
     let (spec_ids, spec_eos) = {
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = GarbageDrafter { k, token: 0 };
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -363,6 +367,7 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
         let opts = DecodeOptions::new(max_tokens);
         let mut ids = Vec::new();
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -413,7 +418,7 @@ fn decode_speculative_identity_across_block_sizes() -> Result<()> {
     let ref_model = build(&ref_cfg, &dev)?;
     let eos_ids: Vec<u32> = ref_cfg.eos_token_id.into_iter().collect();
     let ref_ids = {
-        let cache = Cache::new(true, DType::F32, &ref_cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &ref_cfg, &dev)?;
         let mut session = Session::new(&ref_model, cache);
         let mut spec = IdentityProposer;
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -438,7 +443,7 @@ fn decode_speculative_identity_across_block_sizes() -> Result<()> {
     for k in [1usize, 2, 3, 5, 8] {
         let cfg = tiny_config(k);
         let model = build(&cfg, &dev)?;
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = GarbageDrafter { k, token: 0 };
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -446,6 +451,7 @@ fn decode_speculative_identity_across_block_sizes() -> Result<()> {
         let opts = DecodeOptions::new(max_tokens);
         let ids = session
             .decode_speculative(
+                lloom::profile::RewindProof::of(),
                 &mut spec,
                 &mut rb,
                 &mut sampler,
@@ -496,7 +502,7 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
 
     let ref_ids = {
-        let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = IdentityProposer;
         let mut rb = Blocking::new(&eos_ids, dev)?;
@@ -524,19 +530,20 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
     let pos = prompt.len();
     let last = ref_ids[0];
     let truth = &ref_ids[1..1 + k];
-    let prefill = || -> Result<Cache> {
-        let mut cache = Cache::new(true, DType::F32, &cfg, dev)?;
+    let prefill = || -> Result<State<RewindableExact>> {
+        let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?;
         let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
         model.forward(&input, 0, &mut cache)?;
         Ok(cache)
     };
-    let next_logits = |cache: &mut Cache, tail: u32, at: usize| -> Result<Vec<f32>> {
-        let input = Tensor::new(&[tail], dev)?.unsqueeze(0)?;
-        model
-            .forward(&input, at, cache)?
-            .flatten_all()?
-            .to_vec1::<f32>()
-    };
+    let next_logits =
+        |cache: &mut State<RewindableExact>, tail: u32, at: usize| -> Result<Vec<f32>> {
+            let input = Tensor::new(&[tail], dev)?.unsqueeze(0)?;
+            model
+                .forward(&input, at, cache)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
     let argmax = |logits: &[f32]| -> u32 {
         let mut best = 0usize;
         for (i, &v) in logits.iter().enumerate() {
@@ -668,6 +675,7 @@ struct DeviceGarbageDrafter {
 
 impl Speculator for DeviceGarbageDrafter {
     type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         self.n
@@ -718,7 +726,7 @@ fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result
     let ref_model = build(&ref_cfg, &dev)?;
     let eos_ids: Vec<u32> = ref_cfg.eos_token_id.into_iter().collect();
     let ref_ids = {
-        let cache = Cache::new(true, DType::F32, &ref_cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &ref_cfg, &dev)?;
         let mut session = Session::new(&ref_model, cache);
         let mut spec = IdentityProposer;
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -743,7 +751,7 @@ fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result
     for k in [1usize, 3, 8] {
         let cfg = tiny_config(k);
         let model = build(&cfg, &dev)?;
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = DeviceGarbageDrafter {
             k,
@@ -755,6 +763,7 @@ fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions::new(max_tokens);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -786,6 +795,7 @@ struct SlotRecordingDrafter {
 
 impl Speculator for SlotRecordingDrafter {
     type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         self.n
@@ -848,7 +858,7 @@ fn pipelined_matches_solo_on(
     let greedy: Vec<Vec<u32>> = PIPELINE_PROMPTS
         .iter()
         .map(|prompt| -> Result<Vec<u32>> {
-            let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+            let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?;
             let mut session = Session::new(&model, cache);
             let mut spec = IdentityProposer;
             let mut rb = Blocking::new(&eos_ids, dev)?;
@@ -875,7 +885,7 @@ fn pipelined_matches_solo_on(
     let solo: Vec<lloom::nn::DecodeOut> = PIPELINE_PROMPTS
         .iter()
         .map(|prompt| -> Result<lloom::nn::DecodeOut> {
-            let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+            let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?;
             let mut session = Session::new(&model, cache);
             let mut spec = DeviceGarbageDrafter {
                 k,
@@ -887,6 +897,7 @@ fn pipelined_matches_solo_on(
             let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
             let opts = DecodeOptions::new(max_tokens);
             session.decode_speculative(
+                lloom::profile::RewindProof::of(),
                 &mut spec,
                 &mut rb,
                 &mut sampler,
@@ -917,11 +928,12 @@ fn pipelined_matches_solo_on(
     }
 
     // Subject: the three sequences pipelined through one drafter with three slots.
-    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model>> = (0..PIPELINE_PROMPTS.len())
+    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model<RewindableExact>>> = (0
+        ..PIPELINE_PROMPTS.len())
         .map(|_| {
             Ok(Session::new(
                 &model,
-                Cache::new(true, DType::F32, &cfg, dev)?,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?,
             ))
         })
         .collect::<Result<_>>()?;
@@ -935,6 +947,7 @@ fn pipelined_matches_solo_on(
     let mut streamed: Vec<Vec<u32>> = vec![Vec::new(); PIPELINE_PROMPTS.len()];
     let outs = Session::decode_speculative_pipelined(
         &mut sessions,
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &PIPELINE_PROMPTS,
         &opts,
@@ -1022,11 +1035,11 @@ fn pipelined_observe_is_keyed_per_sequence() -> Result<()> {
     let model = build(&cfg, &dev)?;
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
     let n = PIPELINE_PROMPTS.len();
-    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model>> = (0..n)
+    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model<RewindableExact>>> = (0..n)
         .map(|_| {
             Ok(Session::new(
                 &model,
-                Cache::new(true, DType::F32, &cfg, &dev)?,
+                State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
             ))
         })
         .collect::<Result<_>>()?;
@@ -1038,6 +1051,7 @@ fn pipelined_observe_is_keyed_per_sequence() -> Result<()> {
     let opts = DecodeOptions::new(max_tokens);
     let outs = Session::decode_speculative_pipelined(
         &mut sessions,
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &PIPELINE_PROMPTS,
         &opts,
@@ -1102,7 +1116,7 @@ fn decode_speculative_streamed_prefill_seeds_every_unit() -> Result<()> {
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 8, 9];
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
 
-    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let mut session = Session::new(&model, cache);
     let mut spec = RecordingDrafter {
         k,
@@ -1116,6 +1130,7 @@ fn decode_speculative_streamed_prefill_seeds_every_unit() -> Result<()> {
         ..DecodeOptions::new(24)
     };
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &mut rb,
         &mut sampler,
@@ -1181,7 +1196,7 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
     let ubatch = 4usize;
 
     let ref_ids = {
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = IdentityProposer;
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -1210,7 +1225,7 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
     );
 
     let spec_ids = {
-        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         let mut session = Session::new(&model, cache);
         let mut spec = GarbageDrafter { k, token: 0 };
         let mut rb = Blocking::new(&eos_ids, &dev)?;
@@ -1220,6 +1235,7 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
             ..DecodeOptions::new(max_tokens)
         };
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -1243,7 +1259,7 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
 /// — the shape a streamed prefill that skipped a unit's probe would have. It
 /// delegates everything else to the tiny LFM2, so the only thing it changes
 /// is that one drop per forward.
-struct TwiceForward<'a>(&'a lloom::models::lfm2::Model);
+struct TwiceForward<'a>(&'a lloom::models::lfm2::Model<RewindableExact>);
 
 impl lloom::nn::Model for TwiceForward<'_> {
     type Config = Config;
@@ -1252,15 +1268,24 @@ impl lloom::nn::Model for TwiceForward<'_> {
     }
 }
 
+impl lloom::profile::Shaped for TwiceForward<'_> {
+    type Profile = RewindableExact;
+}
+
 impl lloom::nn::CausalLM for TwiceForward<'_> {
-    type Cache = Cache;
-    fn new_cache(&self, cfg: &Config, dev: &Device) -> Result<Cache> {
+    type Cache = State<RewindableExact>;
+    fn new_cache(&self, cfg: &Config, dev: &Device) -> Result<State<RewindableExact>> {
         self.0.new_cache(cfg, dev)
     }
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         self.0.embed(tokens)
     }
-    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
+    fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut State<RewindableExact>,
+    ) -> Result<Tensor> {
         // The second pass appends the same tokens AFTER the first's, so the
         // cache stays well-formed (the driver's refusal must be the drop, not
         // a shape error) and the second pass's `begin_taps` drops the first's.
@@ -1280,7 +1305,7 @@ impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
         &self,
         drafts: &[Draft],
         anchors: &[lloom::nn::speculator::Anchor],
-        cache: &mut Cache,
+        cache: &mut State<RewindableExact>,
         eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
         self.0.verify_and_probe(drafts, anchors, cache, eos_ids)
@@ -1289,22 +1314,22 @@ impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
         &self,
         draft: &Draft,
         anchor: &lloom::nn::speculator::Anchor,
-        cache: &mut Cache,
+        cache: &mut State<RewindableExact>,
     ) -> Result<Self::Pending> {
         self.0.verify_enqueue(draft, anchor, cache)
     }
     fn verify_complete(
         &self,
         pending: Self::Pending,
-        cache: &mut Cache,
+        cache: &mut State<RewindableExact>,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
         self.0.verify_complete(pending, cache, eos_ids)
     }
-    fn take_probe(&self, cache: &mut Cache) -> Result<Vec<Tensor>> {
+    fn take_probe(&self, cache: &mut State<RewindableExact>) -> Result<Vec<Tensor>> {
         self.0.take_probe(cache)
     }
-    fn probe_drops(&self, cache: &Cache) -> u64 {
+    fn probe_drops(&self, cache: &State<RewindableExact>) -> u64 {
         self.0.probe_drops(cache)
     }
 }
@@ -1323,7 +1348,7 @@ fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
     let model = build(&cfg, &dev)?;
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
 
-    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     assert_eq!(cache.taps_dropped(), 0);
     let taint = Tensor::new(&[1u32, 2, 3], &dev)?.unsqueeze(0)?;
     model.forward(&taint, 0, &mut cache)?;
@@ -1338,7 +1363,7 @@ fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
 
     // Stale taps before the seed are drained, not refused: a warmup's leftovers.
     {
-        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
         model.forward(&taint, 0, &mut cache)?;
         cache.clear();
         let mut session = Session::new(&model, cache);
@@ -1346,6 +1371,7 @@ fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
         let mut rb = Blocking::new(&eos_ids, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -1362,13 +1388,14 @@ fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
 
     // A forward between two of the seed's own probes is refused.
     let twice = TwiceForward(&model);
-    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
     let mut session = Session::new(&twice, cache);
     let mut spec = GarbageDrafter { k, token: 0 };
     let mut rb = Blocking::new(&eos_ids, &dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let err = session
         .decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -1405,6 +1432,7 @@ struct StreamOracle {
 
 impl Speculator for StreamOracle {
     type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
 
     fn n_seq(&self) -> usize {
         1
@@ -1441,14 +1469,14 @@ impl Speculator for StreamOracle {
 
 /// The target's greedy stream with NO reachable stop, `n` tokens long.
 fn unstopped_stream(
-    model: &Model,
+    model: &Model<RewindableExact>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
     n: usize,
 ) -> Result<Vec<u32>> {
     let never = vec![u32::MAX];
-    let cache = Cache::new(true, DType::F32, cfg, dev)?;
+    let cache = State::<RewindableExact>::new(true, DType::F32, cfg, dev)?;
     let mut session = Session::new(model, cache);
     let mut rb = Blocking::new(&never, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -1493,7 +1521,7 @@ const EOS_FIXTURE_CUT: usize = 14;
 /// eight tokens, so a two-turn comparison compares something.
 const EOS_FIXTURE_TURN2: [u32; 5] = [1, 2, 3, 4, 5];
 
-fn eos_fixture(dev: &Device) -> Result<(Config, Model, Vec<u32>)> {
+fn eos_fixture(dev: &Device) -> Result<(Config, Model<RewindableExact>, Vec<u32>)> {
     let cfg = tiny_config(EOS_FIXTURE_K);
     let model = build(&cfg, dev)?;
     let stream = unstopped_stream(&model, &cfg, dev, &EOS_FIXTURE_PROMPT, 40)?;
@@ -1529,7 +1557,10 @@ fn eos_mid_block_on(dev: &Device) -> Result<()> {
     let eos_ids = vec![eos];
 
     // The absolute reference: greedy K=1, blocking (lookahead 0 — no overrun).
-    let mut reference = Session::new(&model, Cache::new(true, DType::F32, &cfg, dev)?);
+    let mut reference = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?,
+    );
     let ref_out = {
         let mut rb = Blocking::new(&eos_ids, dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -1548,7 +1579,10 @@ fn eos_mid_block_on(dev: &Device) -> Result<()> {
     assert_eq!(reference.pos(), prompt.len() + cut);
 
     // The subject: the oracle through the serial speculative driver.
-    let mut subject = Session::new(&model, Cache::new(true, DType::F32, &cfg, dev)?);
+    let mut subject = Session::new(
+        &model,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, dev)?,
+    );
     let mut spec = StreamOracle {
         k,
         stream: stream.clone(),
@@ -1559,6 +1593,7 @@ fn eos_mid_block_on(dev: &Device) -> Result<()> {
         let mut rb = Blocking::new(&eos_ids, dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         subject.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut sampler,
@@ -1647,7 +1682,7 @@ fn eos_mid_block_on(dev: &Device) -> Result<()> {
         subject.cache_mut().conv_phase(),
         reference.cache_mut().conv_phase()
     );
-    let next = |session: &mut Session<'_, Model>| -> Result<Vec<f32>> {
+    let next = |session: &mut Session<'_, Model<RewindableExact>>| -> Result<Vec<f32>> {
         let at = session.pos();
         let input = Tensor::new(&[turn2[0]], dev)?.unsqueeze(0)?;
         model
@@ -1705,7 +1740,7 @@ fn decode_speculative_pipelined_stops_at_a_mid_block_eos() -> Result<()> {
     let eos_ids = vec![eos];
     let mut sessions = vec![Session::new(
         &model,
-        Cache::new(true, DType::F32, &cfg, &dev)?,
+        State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
     )];
     let mut spec = StreamOracle {
         k,
@@ -1716,6 +1751,7 @@ fn decode_speculative_pipelined_stops_at_a_mid_block_eos() -> Result<()> {
     let prompts: [&[u32]; 1] = [&prompt];
     let outs = Session::decode_speculative_pipelined(
         &mut sessions,
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &prompts,
         &DecodeOptions::new(40),
@@ -1757,7 +1793,10 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
 
     // Reference: K=1 blocking, turn 1 to the EOS, turn 2 appended.
     let reference = {
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut s = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut rb = Blocking::new(&eos_ids, &dev)?;
         let t1 = s.decode(
             &mut IdentityProposer,
@@ -1787,7 +1826,10 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
     // Subject: speculative turn 1 (the oracle, EOS mid-block), then turn 2 on
     // the K=1 arm and, separately, speculative again with a garbage drafter.
     for speculative_turn2 in [false, true] {
-        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut s = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?,
+        );
         let mut spec = StreamOracle {
             k,
             stream: stream.clone(),
@@ -1796,6 +1838,7 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
         };
         let mut rb = Blocking::new(&eos_ids, &dev)?;
         let t1 = s.decode_speculative(
+            lloom::profile::RewindProof::of(),
             &mut spec,
             &mut rb,
             &mut greedy(),
@@ -1816,6 +1859,7 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
         let t2 = if speculative_turn2 {
             let mut garbage = GarbageDrafter { k, token: 0 };
             s.decode_speculative(
+                lloom::profile::RewindProof::of(),
                 &mut garbage,
                 &mut rb,
                 &mut greedy(),

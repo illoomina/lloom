@@ -11,6 +11,7 @@ use super::moe::{ExpertResidency, MoeLayer, Resident};
 use super::mtp::MtpHead;
 use super::qsa::{Indexer, QsaAttention};
 use crate::nn::RmsNorm;
+use crate::profile::{NoRewind, One, Profile};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::sync::Arc;
@@ -105,7 +106,7 @@ pub fn hc_with(cfg: &Config, seed: f32, dev: &Device, inject: bool) -> HyperConn
     .unwrap()
 }
 
-pub fn deltanet(cfg: &Config, dev: &Device) -> GatedDeltaNet {
+pub fn deltanet<P: Profile>(cfg: &Config, dev: &Device) -> GatedDeltaNet<P> {
     let d = cfg.hidden_size;
     let cc = cfg.conv_channels();
     let vd = cfg.ssm_state_size * cfg.ssm_dt_rank;
@@ -124,11 +125,11 @@ pub fn deltanet(cfg: &Config, dev: &Device) -> GatedDeltaNet {
     )
 }
 
-pub fn qsa(cfg: &Config, dev: &Device) -> QsaAttention {
+pub fn qsa<P: Profile>(cfg: &Config, dev: &Device) -> QsaAttention<P> {
     qsa_seeded(cfg, dev, 0.0)
 }
 
-pub fn qsa_seeded(cfg: &Config, dev: &Device, seed: f32) -> QsaAttention {
+pub fn qsa_seeded<P: Profile>(cfg: &Config, dev: &Device, seed: f32) -> QsaAttention<P> {
     let d = cfg.hidden_size;
     let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
     QsaAttention::new(
@@ -143,7 +144,11 @@ pub fn qsa_seeded(cfg: &Config, dev: &Device, seed: f32) -> QsaAttention {
 }
 
 /// One layer's MoE around `experts`.
-pub fn moe_with<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> MoeLayer<R> {
+pub fn moe_with<P: Profile, R: ExpertResidency>(
+    cfg: &Config,
+    dev: &Device,
+    experts: R,
+) -> MoeLayer<P, R> {
     let d = cfg.hidden_size;
     let ne = cfg.n_experts;
     let sh = cfg.shared_expert_intermediate_size;
@@ -164,27 +169,27 @@ pub fn resident_experts(cfg: &Config, l: usize, dev: &Device) -> Resident {
     Resident::new(Arc::new(g), Arc::new(u), Arc::new(dn))
 }
 
-pub fn moe(cfg: &Config, dev: &Device) -> MoeLayer<Resident> {
+pub fn moe<P: Profile>(cfg: &Config, dev: &Device) -> MoeLayer<P, Resident> {
     moe_with(cfg, dev, resident_experts(cfg, 0, dev))
 }
 
 /// A whole model with `experts(l)` supplying layer `l`'s residency strategy.
-pub fn model_with<R: ExpertResidency>(
+pub fn model_with<P: Profile, R: ExpertResidency>(
     cfg: &Config,
     dev: &Device,
     experts: impl FnMut(usize) -> Result<R>,
-) -> Result<Qwen4Exp<R>> {
+) -> Result<Qwen4Exp<P, R>> {
     build(cfg, dev, experts, false)
 }
 
 /// [`model_with`] with every full-attention layer carrying the QSA indexer
 /// (`cfg.indexer_*`), as the checkpoint's do: a decode step that completes a
 /// block of `indexer_compress_ratio` keys runs the block's compression.
-pub fn model_with_indexer<R: ExpertResidency>(
+pub fn model_with_indexer<P: Profile, R: ExpertResidency>(
     cfg: &Config,
     dev: &Device,
     experts: impl FnMut(usize) -> Result<R>,
-) -> Result<Qwen4Exp<R>> {
+) -> Result<Qwen4Exp<P, R>> {
     build(cfg, dev, experts, true)
 }
 
@@ -199,12 +204,12 @@ fn indexer(cfg: &Config, dev: &Device) -> Result<Indexer> {
     )
 }
 
-fn build<R: ExpertResidency>(
+fn build<P: Profile, R: ExpertResidency>(
     cfg: &Config,
     dev: &Device,
     mut experts: impl FnMut(usize) -> Result<R>,
     indexed: bool,
-) -> Result<Qwen4Exp<R>> {
+) -> Result<Qwen4Exp<P, R>> {
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let mixer = match cfg.layer_types[l] {
@@ -221,13 +226,13 @@ fn build<R: ExpertResidency>(
             moe_with(cfg, dev, experts(l)?),
         ));
     }
-    Ok(Qwen4Exp::new(
+    Qwen4Exp::new(
         QMatMul::Tensor(wt((cfg.vocab_size, cfg.hidden_size), 0.5, dev)),
         layers,
         hc(cfg, 999.0, dev),
         lin(cfg.vocab_size, cfg.hidden_size, 7.0, dev),
         cfg.clone(),
-    ))
+    )
 }
 
 /// A walked model's routed experts (`Qwen4Exp::ghost_of_manifest`): they
@@ -268,7 +273,7 @@ impl ExpertResidency for GhostExperts {
 /// ghost weights by the loader's own assembly, with the PLE: the structure
 /// the decode step's walk reads.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn ghost_model(dev: &Device) -> Result<Qwen4Exp<GhostExperts>> {
+pub fn ghost_model<P: Profile>(dev: &Device) -> Result<Qwen4Exp<P, GhostExperts>> {
     let manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
     let opts = super::loader::LoadOptions {
         ple: true,
@@ -278,14 +283,18 @@ pub fn ghost_model(dev: &Device) -> Result<Qwen4Exp<GhostExperts>> {
 }
 
 /// A whole model, every expert resident.
-pub fn resident_model(cfg: &Config, dev: &Device) -> Qwen4Exp<Resident> {
+pub fn resident_model<P: Profile>(cfg: &Config, dev: &Device) -> Qwen4Exp<P, Resident> {
     model_with(cfg, dev, |l| Ok(resident_experts(cfg, l, dev))).expect("resident build")
 }
 
 /// A one-layer MTP head around `experts` (a full-attention layer, with the
 /// QSA indexer as the loader builds it: a fixture's prompt past the dense
 /// range runs the head's selection and its chunk prefill past the range).
-pub fn mtp_head<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> MtpHead<R> {
+pub fn mtp_head<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency>(
+    cfg: &Config,
+    dev: &Device,
+    experts: R,
+) -> MtpHead<P, R> {
     let d = cfg.hidden_size;
     let nd = cfg.hc_dim();
     let layer = Layer::new(
@@ -321,7 +330,7 @@ use lloom_tensor::quantized::gguf_file::Value;
 
 impl TinyFamily for Qwen4ExpTiny {
     type Config = Config;
-    type Model = Qwen4Exp<Resident>;
+    type Model<P: Profile> = Qwen4Exp<P, Resident>;
     const NAME: &'static str = "qwen4exp";
     const DENSE_KINDS: &'static [GgmlDType] = &[
         GgmlDType::F32,
@@ -391,7 +400,10 @@ impl TinyFamily for Qwen4ExpTiny {
         ]
     }
 
-    fn build(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+    fn build<P: Profile>(
+        ckpt: &TinyCheckpoint<Self>,
+        dev: &Device,
+    ) -> Result<Qwen4Exp<P, Resident>> {
         let bytes = gguf_bytes(ckpt, None)?;
         let mut r = std::io::Cursor::new(bytes);
         let content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
@@ -413,7 +425,7 @@ impl TinyFamily for Qwen4ExpTiny {
         Ok(path)
     }
 
-    fn load(path: &std::path::Path, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+    fn load<P: Profile>(path: &std::path::Path, dev: &Device) -> Result<Qwen4Exp<P, Resident>> {
         Qwen4Exp::from_gguf_shards(
             &[path.to_path_buf()],
             dev,
@@ -424,7 +436,10 @@ impl TinyFamily for Qwen4ExpTiny {
     /// The loader's f32 arm over the dequantized checkpoint: f32
     /// activations over the stems' stored values, where the served load's
     /// `TensorF16` stems would cast the activations to f16 on the CPU.
-    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+    fn reference<P: Profile>(
+        ckpt: &TinyCheckpoint<Self>,
+        dev: &Device,
+    ) -> Result<Qwen4Exp<P, Resident>> {
         let bytes = gguf_bytes(&ckpt.dequantized(), None)?;
         let mut r = std::io::Cursor::new(bytes);
         let content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
@@ -675,13 +690,13 @@ mod scaled {
         /// Every expert resident, through the loader — which refuses it at
         /// the default memory fraction on a 64 GB machine (the load is 47 GB,
         /// `memory.md` §9.5q). A test at scale takes [`Fixture::streamed`].
-        fn scale_model(
+        fn scale_model<P: Profile>(
             source: &Source,
             _cfg: &Config,
             _dtype: Option<DType>,
             weights: &Weights,
             dev: &Device,
-        ) -> Result<Qwen4Exp<Resident>> {
+        ) -> Result<Qwen4Exp<P, Resident>> {
             Qwen4Exp::from_gguf_shards(
                 &scale_shards(source, weights)?,
                 dev,
@@ -725,24 +740,24 @@ mod scaled {
         }
 
         /// Every expert resident, through the loader.
-        pub fn resident(
+        pub fn resident<P: Profile>(
             &self,
             cfg: &Config,
             dev: &Device,
             opts: &super::super::loader::LoadOptions,
-        ) -> Result<Qwen4Exp<Resident>> {
+        ) -> Result<Qwen4Exp<P, Resident>> {
             self.watch(dev);
             Qwen4Exp::from_gguf_shards(&self.shards(cfg)?, dev, opts)
         }
 
         /// The routed experts streamed from the shards into a slot pool.
-        pub fn streamed(
+        pub fn streamed<P: Profile>(
             &self,
             cfg: &Config,
             dev: &Device,
             opts: &super::super::loader::LoadOptions,
             stream: &super::super::loader::StreamOptions,
-        ) -> Result<Qwen4Exp<super::super::moe::Streamed>> {
+        ) -> Result<Qwen4Exp<P, super::super::moe::Streamed>> {
             self.watch(dev);
             Qwen4Exp::from_gguf_streamed(&self.shards(cfg)?, dev, opts, stream)
         }

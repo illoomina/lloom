@@ -23,9 +23,10 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Cache, Config, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident, State};
 use lloom::nn::speculator::{Draft, NextnHidden, SeqId, Speculator};
 use lloom::nn::{DecodeOptions, Session};
+use lloom::profile::RewindableExact;
 use lloom_tensor::metal_backend::{ArenaLayout, MetalDevice, PassKind};
 use lloom_tensor::{Device, Result, Tensor};
 
@@ -97,6 +98,7 @@ impl Recorder {
 
 impl Speculator for Recorder {
     type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
     fn n_seq(&self) -> usize {
         self.seen.len()
     }
@@ -127,8 +129,12 @@ impl Speculator for Recorder {
     }
 }
 
-fn spec_cache(model: &Qwen4Exp<Resident>, cfg: &Config, dev: &Device) -> Result<Cache> {
-    let mut cache = Cache::in_pools(cfg, &model.spec_pools(1, K, dev))?;
+fn spec_cache(
+    model: &Qwen4Exp<RewindableExact, Resident>,
+    cfg: &Config,
+    dev: &Device,
+) -> Result<State<RewindableExact>> {
+    let mut cache = State::<RewindableExact>::in_ring(cfg, &model.spec_pools(1, K, dev))?;
     cache.want_nextn = true;
     Ok(cache)
 }
@@ -136,7 +142,7 @@ fn spec_cache(model: &Qwen4Exp<Resident>, cfg: &Config, dev: &Device) -> Result<
 /// One request through the serial speculative round on a fresh cache: the
 /// stream and every probe the drafter read.
 fn serial(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
@@ -149,6 +155,7 @@ fn serial(
     let mut rb = Blocking::new(&eos, dev)?;
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
     let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
         &mut spec,
         &mut rb,
         &mut sampler,
@@ -166,19 +173,20 @@ type Probes = Vec<Vec<f32>>;
 
 /// Two requests through the pipelined driver, one lane each.
 fn pipelined(
-    model: &Qwen4Exp<Resident>,
+    model: &Qwen4Exp<RewindableExact, Resident>,
     cfg: &Config,
     dev: &Device,
     prompts: &[&[u32]],
     token: u32,
 ) -> Result<(Vec<Vec<u32>>, Vec<Probes>)> {
-    let mut sessions: Vec<Session<'_, Qwen4Exp<Resident>>> = prompts
+    let mut sessions: Vec<Session<'_, Qwen4Exp<RewindableExact, Resident>>> = prompts
         .iter()
         .map(|_| Ok(Session::new(model, spec_cache(model, cfg, dev)?)))
         .collect::<Result<_>>()?;
     let mut spec = Recorder::new(Read::Now, token, prompts.len());
     let outs = Session::decode_speculative_pipelined(
         &mut sessions,
+        lloom::profile::RewindProof::of(),
         &mut spec,
         prompts,
         &DecodeOptions::new(MAX),
@@ -234,7 +242,7 @@ fn a_planned_verify_keeps_the_mtp_carries() -> Result<()> {
     let token = 0u32;
     for read in [Read::Now, Read::Late] {
         let dev = Device::new_metal(0)?;
-        let model = testing::resident_model(&cfg, &dev);
+        let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
         let (want_ids, want) = serial(&model, &cfg, &dev, &p, read, token)?;
         let one_carry = want.iter().filter(|v| v.len() == cfg.hc_dim()).count();
         assert!(
@@ -247,7 +255,7 @@ fn a_planned_verify_keeps_the_mtp_carries() -> Result<()> {
         let dev = Device::new_metal(0)?;
         let m = metal(&dev);
         m.enable_pass_plans(ArenaLayout::Packed);
-        let model = testing::resident_model(&cfg, &dev);
+        let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
         let mut served = 0;
         for round in 0..ROUNDS {
             let ((ids, got), s) = served_over(m, || serial(&model, &cfg, &dev, &p, read, token))?;
@@ -289,7 +297,7 @@ fn a_second_lanes_verify_does_not_overwrite_the_firsts_carries() -> Result<()> {
     let prompts: Vec<&[u32]> = vec![&p0, &p1];
     let token = 0u32;
     let dev = Device::new_metal(0)?;
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let (want_ids, want) = pipelined(&model, &cfg, &dev, &prompts, token)?;
     assert_ne!(
         want[0], want[1],
@@ -299,7 +307,7 @@ fn a_second_lanes_verify_does_not_overwrite_the_firsts_carries() -> Result<()> {
     let dev = Device::new_metal(0)?;
     let m = metal(&dev);
     m.enable_pass_plans(ArenaLayout::Packed);
-    let model = testing::resident_model(&cfg, &dev);
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
     let mut served = 0;
     for round in 0..ROUNDS {
         let ((ids, got), s) = served_over(m, || pipelined(&model, &cfg, &dev, &prompts, token))?;

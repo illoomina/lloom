@@ -11,10 +11,11 @@
 use lloom::models::qwen4exp::testing::{ghost_model, GhostExperts};
 use lloom::models::qwen4exp::Qwen4Exp;
 use lloom::optimizer::{derive, walk, Graph, NumericClass, Op, Policy};
+use lloom::profile::CrownExact;
 use lloom_tensor::{DType, Device};
 
-fn model() -> Qwen4Exp<GhostExperts> {
-    ghost_model(&Device::Cpu).expect("the ghost of the committed manifest")
+fn model() -> Qwen4Exp<CrownExact, GhostExperts> {
+    ghost_model::<CrownExact>(&Device::Cpu).expect("the ghost of the committed manifest")
 }
 
 /// The blocking decode loop's two launches, the driver's and not the
@@ -190,7 +191,7 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
 fn the_plan_is_set_on_the_brackets_it_decides() {
     let mut m = model();
     assert!(m.fusion_report().is_none());
-    let brackets = |m: &Qwen4Exp<GhostExperts>| m.bracket_epilogues();
+    let brackets = |m: &Qwen4Exp<CrownExact, GhostExperts>| m.bracket_epilogues();
     assert!(brackets(&m).iter().all(|&e| e == (true, true)));
     let line = m.derive_fusion().expect("derive");
     assert!(line.starts_with("qwen4exp fusion=derived: "), "{line}");

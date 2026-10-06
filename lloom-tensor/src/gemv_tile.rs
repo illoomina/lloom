@@ -89,7 +89,7 @@ pub fn gemv_tile(out_vec_size: usize, in_vec_size: usize) -> GemvTile {
 /// determinism run, and the whole point of this knob is to be A/B'd. Engagement
 /// is nonetheless proved from the **kernel name** rather than from the flag, per
 /// that same rule: the tile is in the `[[host_name]]` the census reports.
-fn forced_gemv_bm() -> Option<usize> {
+pub(crate) fn forced_gemv_bm() -> Option<usize> {
     crate::tuning::tuning().gemm.gemv_bm
 }
 

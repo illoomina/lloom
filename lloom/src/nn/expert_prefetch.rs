@@ -182,6 +182,8 @@ struct Assembly {
     left: usize,
     /// A piece failed to read, or was cancelled before it ran.
     failed: bool,
+    /// A `load_now`'s (`Req::now`): filed under `done_now` when complete.
+    now: bool,
 }
 
 impl Assembly {
@@ -199,6 +201,13 @@ struct State {
     next_asm: u64,
     reqs: VecDeque<Req>,
     done: HashMap<usize, Vec<Staged>>,
+    /// A `load_now`'s results, per tier: the layer is waiting for them, so
+    /// they never expire with the hints' leftovers (`take_needed_with`'s
+    /// "behind the pass" rule gave a batched settle's landed reads back to
+    /// the ring before their layer's wait took them — every layer then
+    /// waited `wait_now`'s deadline out: #892's follow-up, the armed
+    /// replay's settle with loads, the first the batch ever carried).
+    done_now: HashMap<usize, Vec<Staged>>,
     generation: HashMap<usize, u64>,
     staged_bytes: usize,
     /// `take_needed` calls so far, and per tier the count at its last one:
@@ -339,6 +348,7 @@ impl Prefetcher {
                 next_asm: 0,
                 reqs: VecDeque::new(),
                 done: HashMap::new(),
+                done_now: HashMap::new(),
                 generation: HashMap::new(),
                 staged_bytes: 0,
                 takes: 0,
@@ -634,7 +644,8 @@ impl Prefetcher {
                     .values()
                     .any(|a| a.key == key && a.generation == gen && missing.contains(&a.expert));
             let in_flight = g.staged_bytes > 0;
-            let staged_here = g.done.get(&key).is_some_and(|v| !v.is_empty());
+            let staged_here = g.done.get(&key).is_some_and(|v| !v.is_empty())
+                || g.done_now.get(&key).is_some_and(|v| !v.is_empty());
             if (!pending && !in_flight && !staged_here) || std::time::Instant::now() > deadline {
                 return have;
             }
@@ -684,16 +695,20 @@ impl Prefetcher {
                 g.staged_bytes = g.staged_bytes.saturating_sub(s.bytes());
             }
             let mut out = Vec::new();
-            if let Some(done) = g.done.get_mut(&key) {
-                let mut keep = Vec::with_capacity(done.len());
-                for s in done.drain(..) {
+            let State { done, done_now, .. } = &mut *g;
+            for list in [done_now.get_mut(&key), done.get_mut(&key)]
+                .into_iter()
+                .flatten()
+            {
+                let mut keep = Vec::with_capacity(list.len());
+                for s in list.drain(..) {
                     if needed.contains(&s.expert) {
                         out.push(s);
                     } else {
                         keep.push(s);
                     }
                 }
-                *done = keep;
+                *list = keep;
             }
             for s in &out {
                 g.staged_bytes = g.staged_bytes.saturating_sub(s.bytes());
@@ -712,8 +727,10 @@ impl Prefetcher {
             let g = self.shared.state.lock();
             g.done
                 .get(&key)
-                .map(|v| v.iter().map(|s| s.expert).collect())
-                .unwrap_or_default()
+                .into_iter()
+                .chain(g.done_now.get(&key))
+                .flat_map(|v| v.iter().map(|s| s.expert))
+                .collect()
         };
         self.take_needed(key, &all)
     }
@@ -788,9 +805,18 @@ impl Drop for Prefetcher {
             let mut g = self.shared.state.lock();
             g.staged_bytes = 0;
             g.reqs.clear();
+            let State {
+                done,
+                done_now,
+                assembling,
+                ..
+            } = &mut *g;
             (
-                g.done.drain().flat_map(|(_, v)| v).collect(),
-                g.assembling.drain().map(|(_, a)| a).collect(),
+                done.drain()
+                    .chain(done_now.drain())
+                    .flat_map(|(_, v)| v)
+                    .collect(),
+                assembling.drain().map(|(_, a)| a).collect(),
             )
         };
         let mut ring = self.shared.ring.lock();
@@ -980,6 +1006,7 @@ fn worker(w: Arc<Shared>) {
                                     bufs,
                                     left: pieces,
                                     failed: false,
+                                    now: req.now,
                                 };
                                 g.staged_bytes += a.bytes();
                                 g.assembling.insert(asm, a);
@@ -1097,7 +1124,8 @@ fn piece_landed(w: &Shared, asm: u64, failed: bool) {
     let current = g.generation.get(&a.key).copied().unwrap_or(0) == a.generation;
     if !a.failed && current {
         let bytes = a.bytes() as u64;
-        g.done.entry(a.key).or_default().push(Staged {
+        let filed = if a.now { &mut g.done_now } else { &mut g.done };
+        filed.entry(a.key).or_default().push(Staged {
             expert: a.expert,
             planes: a.bufs,
         });
@@ -1124,7 +1152,8 @@ fn stage_whole(w: &Shared, req: &Req) {
             let bytes = staged.bytes() as u64;
             let mut g = w.state.lock();
             if g.generation.get(&req.key).copied().unwrap_or(0) == req.generation {
-                g.done.entry(req.key).or_default().push(staged);
+                let filed = if req.now { &mut g.done_now } else { &mut g.done };
+                filed.entry(req.key).or_default().push(staged);
                 drop(g);
                 w.counters.staged.fetch_add(1, Ordering::Relaxed);
                 w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);

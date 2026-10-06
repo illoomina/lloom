@@ -4820,6 +4820,63 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// Metal: a batched settle's reads — three tiers' `load_now`s submitted
+    /// before any is waited for (`settle_batch`) — all land for their
+    /// layers: a `load_now`'s results never expire with the hints' leftovers
+    /// (the "behind the pass" rule gave a landed read back to the ring
+    /// before its layer's wait took it; every layer then waited the
+    /// deadline out — #892's follow-up, the armed replay's settle with
+    /// loads). Nothing wasted, every wait complete at once.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_batched_settles_reads_land_for_every_layer() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let p = Prefetcher::new(&m, Arc::clone(&ring));
+        let planes = [
+            open(&path, "gate").plane_source(),
+            open(&path, "up").plane_source(),
+            open(&path, "down").plane_source(),
+        ];
+        // Three tiers' reads, submitted as the batched settle submits them,
+        // then a pause for the threads to land them all.
+        let tickets: Vec<_> = (0..3usize)
+            .map(|key| p.submit_now(key, &[key as u32 * 3, key as u32 * 3 + 1], &planes))
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        for (key, t) in tickets.into_iter().enumerate() {
+            let have = p.wait_now(t);
+            let mut got: Vec<u32> = have.iter().map(|s| s.expert).collect();
+            got.sort_unstable();
+            assert_eq!(
+                got,
+                vec![key as u32 * 3, key as u32 * 3 + 1],
+                "tier {key}'s reads did not all land for its wait: {:?}",
+                p.stats()
+            );
+            p.release(have);
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "a wait ran to its deadline: {:?}",
+            p.stats()
+        );
+        std::fs::remove_file(path).ok();
+    }
+
     /// Metal, the `io` arm under a device plan (#849's D on that arm): a
     /// hint's loads in flight when the plan is made are waited for once on
     /// the queue — a wait encoded for the largest value, every entry

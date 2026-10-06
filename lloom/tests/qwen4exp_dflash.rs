@@ -489,6 +489,67 @@ fn a_verify_drops_the_taps_left_before_it() -> Result<()> {
     Ok(())
 }
 
+/// A bounded run keeps nothing past its budget: every round's draft is cut
+/// to what the run may still publish, the last one to the anchor alone, so
+/// a cap falling mid-block leaves no overrun, the cache one position behind
+/// the stream, and the next request extends the sequence rather than
+/// re-prefilling it (a settled window cannot be rewound). Every budget from
+/// 5 to 12 under an oracle that is always right at K = 3 puts the cap at
+/// every offset of a block.
+#[test]
+fn a_bounded_run_keeps_nothing_past_its_budget() -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model: Qwen4Exp<Resident> = testing::resident_model(&cfg, &dev);
+    let (prompt, want) = long_prompt(&model, &cfg, &dev, 24)?;
+    for max in 5..=12usize {
+        let k = 3;
+        let mut cache = Cache::in_pools(&cfg, &model.spec_pools(1, k, &dev))?;
+        cache.set_tap_layers(&TARGET_IDS.iter().map(|l| l + 1).collect::<Vec<_>>())?;
+        let mut session = Session::new(&model, cache);
+        let mut oracle = Scripted {
+            stream: Some(want.clone()),
+            k,
+            produced: 0,
+            rows: 0,
+            seeded: false,
+        };
+        let eos = [cfg.eos_token_id];
+        let mut rb = Blocking::new(&eos, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let out = session.decode_speculative(
+            &mut oracle,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &DecodeOptions::new(max),
+            &eos,
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(out.ids, want[..max], "max {max}: the stream");
+        assert_eq!(
+            out.stats.overrun, 0,
+            "max {max}: the run fed the cache past its budget"
+        );
+        assert_eq!(
+            session.pos(),
+            prompt.len() + max - 1,
+            "max {max}: the cache is not one position behind the stream"
+        );
+        let mut next = prompt.clone();
+        next.extend_from_slice(&out.ids);
+        next.push(7);
+        let prepared = session.prepare(&next)?;
+        assert_eq!(
+            prepared.action,
+            ReuseAction::Extend,
+            "max {max}: {prepared:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The released DFlash drafter's config (PixelML/Qwen3.8-Flash-Next-NVFP4-
 /// DFlash), when the HF cache holds it: the reader takes its `rope_parameters`
 /// and its class's neox rotation, and the parameter count derived from the

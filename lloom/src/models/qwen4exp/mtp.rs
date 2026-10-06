@@ -1325,6 +1325,11 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
     fn probe_drops(&self, cache: &Self::Cache) -> u64 {
         cache.nextn_drops()
     }
+
+    /// The window `[anchor]` is a decode step over the phase rings.
+    fn verifies_anchor_alone(&self) -> bool {
+        true
+    }
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
@@ -1351,9 +1356,6 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             DraftTokens::Host(v) => v.clone(),
             DraftTokens::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
         };
-        if proposed.is_empty() {
-            lloom_tensor::bail!("qwen4exp verify: no proposed tokens")
-        }
         let mut tokens = Vec::with_capacity(proposed.len() + 1);
         tokens.push(anchor.last);
         tokens.extend_from_slice(&proposed);

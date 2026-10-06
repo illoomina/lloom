@@ -143,4 +143,9 @@ impl<R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qwen4Exp<R> {
     fn probe_drops(&self, cache: &Cache) -> u64 {
         cache.tap_drops()
     }
+
+    /// The window `[anchor]` is a decode step over the phase rings.
+    fn verifies_anchor_alone(&self) -> bool {
+        true
+    }
 }

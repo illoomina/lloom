@@ -257,13 +257,25 @@ pub struct StreamTuning {
     #[opt(flag = "expert-fetch", env = "QWEN4EXP_FETCH", parser = "parse_fetch", variants = ["off", "inside"])]
     pub fetch: String,
     /// Microseconds the fetch worker sleeps between looks at a layer's routing (it never spins).
-    #[opt(flag = "fetch-poll-us", env = "QWEN4EXP_FETCH_POLL_US", parser = "parse_at_least_one")]
+    #[opt(
+        flag = "fetch-poll-us",
+        env = "QWEN4EXP_FETCH_POLL_US",
+        parser = "parse_at_least_one"
+    )]
     pub fetch_poll_us: usize,
     /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
-    #[opt(flag = "fetch-exit", env = "QWEN4EXP_FETCH_EXIT", parser = "parse_at_least_one")]
+    #[opt(
+        flag = "fetch-exit",
+        env = "QWEN4EXP_FETCH_EXIT",
+        parser = "parse_at_least_one"
+    )]
     pub fetch_exit: usize,
     /// The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`.
-    #[opt(flag = "fetch-qos", env = "QWEN4EXP_FETCH_QOS", parser = "parse_spawned_qos")]
+    #[opt(
+        flag = "fetch-qos",
+        env = "QWEN4EXP_FETCH_QOS",
+        parser = "parse_spawned_qos"
+    )]
     pub fetch_qos: String,
 }
 

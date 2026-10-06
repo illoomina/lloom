@@ -3348,8 +3348,7 @@ impl Streamed {
                 Some(s) => {
                     inner.map.touch(s, tick);
                     if !prior.contains(&e) {
-                        inner.map.usage[e as usize] =
-                            inner.map.usage[e as usize].saturating_add(1);
+                        inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
                     }
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 }

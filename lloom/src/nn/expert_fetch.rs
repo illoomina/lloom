@@ -85,7 +85,6 @@ pub struct FetchCounters {
     pub serve_ns: AtomicU64,
 }
 
-
 struct Lane {
     event: HostEvent,
     state: parking_lot::Mutex<State>,

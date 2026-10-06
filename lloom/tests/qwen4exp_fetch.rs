@@ -120,7 +120,10 @@ fn a_fetching_decode_is_the_resident_stream_with_no_replay_metal() -> Result<()>
         assert_eq!(a, b, "step {t}: the fetching decode's logits differ");
     }
     assert!(cache.fetch_passes > 0, "no step fetched");
-    assert!(f.loads > 0, "the worker loaded nothing: the pool never missed");
+    assert!(
+        f.loads > 0,
+        "the worker loaded nothing: the pool never missed"
+    );
     assert_eq!(
         (cache.redos, cache.host_plan_passes, f.short, f.timeouts),
         (0, 0, 0, 0),

@@ -440,6 +440,19 @@ pub struct Cache {
     /// missed (the cold phase runs the host plan — one token and its loads,
     /// no replay — and the warm phase the device plan).
     pub device_plan_armed: bool,
+    /// The plan armed by the arm (`QWEN4EXP_REPLAY=device`) after a
+    /// host-planned pass that loaded, not by a clean one: the decode's
+    /// tokens run the device plan and replay there; a verify window keeps
+    /// the default's rule (a window planned on a pool that misses is cut
+    /// or redone, and its accounting is the host plan's — the MTP tests
+    /// pin it), so the forced arming does not reach it.
+    pub armed_through_misses: bool,
+    /// The tier's miss count at the last device-planned token's hint: the
+    /// hotlist's prediction (`QWEN4EXP_PREDICT=hotlist`) stages only after
+    /// a token that loaded — a warm pool stages nothing (the third A/B:
+    /// eight spare slots a layer, always free, had the hint stage 384
+    /// experts a token on a pool that missed nothing, +10 % warm).
+    pub predict_misses_seen: u64,
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
@@ -623,6 +636,8 @@ impl Cache {
             standing: false,
             redos: 0,
             device_plan_armed: false,
+            armed_through_misses: false,
+            predict_misses_seen: 0,
             device_replays: 0,
             replay_fallbacks: 0,
             host_plan_passes: 0,
@@ -2459,8 +2474,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // resident; its plan lands them before it maps the pool (#849's D
         // with the prediction the hotlist gives).
         if cache.device_plan_armed && predict_hot() {
-            for layer in &self.layers {
-                layer.moe().experts().prefetch_hot()?;
+            let misses = self.stream_misses();
+            if misses != cache.predict_misses_seen {
+                cache.predict_misses_seen = misses;
+                for layer in &self.layers {
+                    layer.moe().experts().prefetch_hot()?;
+                }
             }
         }
         // The cold phase: a pool that missed on the last pass runs the host
@@ -2482,8 +2501,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             // never arms and every token is host-planned (48 drains); the
             // arm puts those tokens on the device plan, their misses
             // settled and replayed there.
-            if self.stream_misses() == before || replay_on_device() {
+            let clean = self.stream_misses() == before;
+            if clean || replay_on_device() {
                 cache.device_plan_armed = true;
+                cache.armed_through_misses = !clean;
             }
             return Ok(logits);
         }
@@ -3197,7 +3218,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let h = self.embed(tokens)?; // [B, 1, hidden]
         let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let planned =
-            self.device_plan && plan_on_device() && caches.iter().all(|c| c.device_plan_armed);
+            self.device_plan
+                && plan_on_device()
+                && caches
+                    .iter()
+                    .all(|c| c.device_plan_armed && !c.armed_through_misses);
         if !planned {
             let before = self.stream_misses();
             // Timed only where a tier streams (the miss regime's pass).
@@ -3431,7 +3456,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
-        let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let planned = self.device_plan
+            && plan_on_device()
+            && cache.device_plan_armed
+            && !cache.armed_through_misses;
         let h = if planned { Self::replay_input(&h)? } else { h };
         let drafts = !planned && cache.window_loads_drafts();
         let kind = if planned {

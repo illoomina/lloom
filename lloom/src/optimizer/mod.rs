@@ -259,7 +259,7 @@ pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Re
     if let Some(model) = &policy.barrier_model {
         let names: Vec<&str> = admitted.iter().map(|f| f.name).collect();
         loop {
-            let m = cost::marginals(model, &derived, &names);
+            let m = cost::marginals_in(model, &derived, &names, catalogue);
             let worst = m
                 .iter()
                 .filter(|x| x.sites > 0 && x.delta_us > 0.0)
@@ -280,7 +280,7 @@ pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Re
                             w.sites
                         ),
                     ));
-                    derived = cost::unfuse(&derived, &w.fragment);
+                    derived = cost::unfuse_in(&derived, &w.fragment, catalogue);
                     marginals.push(w);
                 }
                 None => {

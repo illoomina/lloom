@@ -322,72 +322,60 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
     }
     p.push_str("(rewrite (Add a b) (Add b a))\n");
     p.push_str("(rewrite (Mul a b) (Mul b a))\n");
-    for f in epilogues.iter().filter(|f| f.core != Core::Gemv) {
-        // A block on another core: an activation riding that core's store,
-        // absorbing the constant scale between them when it scales.
+    // An epilogue rides its core's store; the rule is read off the block's
+    // semantics and operand, the same for every core (the constructors carry
+    // the core's tag).
+    for f in &epilogues {
         let (name, tag) = (f.name, f.core.tag());
-        let act = match (f.semantics, f.operand) {
-            (Semantics::Silu, OperandKind::None) => "Silu",
-            (Semantics::Sigmoid, OperandKind::None) => "Sigmoid",
-            _ => continue,
-        };
-        let ok = at(name, "w");
-        let _ = writeln!(
-            p,
-            "(rule ((= e ({act} g)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
-             ((union e (Fused{tag} w x (Epi_{name})))))"
-        );
-        if f.scales {
-            let _ = writeln!(
-                p,
-                "(rule ((= e ({act} s)) (= s (Scale c g)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
-                 ((union e (Fused{tag} w x (EpiS_{name} c)))))"
-            );
-        }
-    }
-    for f in epilogues.iter().filter(|f| f.core == Core::Gemv) {
-        let name = f.name;
         match (f.semantics, f.operand) {
-            (Semantics::Silu, OperandKind::None) => {
+            (Semantics::Silu | Semantics::Sigmoid, OperandKind::None) => {
+                let act = if f.semantics == Semantics::Silu { "Silu" } else { "Sigmoid" };
+                let ok = at(name, "w");
                 let _ = writeln!(
                     p,
-                    "(rule ((= e (Silu g)) (= g (Gemv w x)) (= (rows g) 1){ok})\n      \
-                     ((union e (Fused w x (Epi_{name})))))",
-                    ok = at(name, "w")
+                    "(rule ((= e ({act} g)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
+                     ((union e (Fused{tag} w x (Epi_{name})))))"
                 );
+                // A scaling block absorbs the constant scale between them.
+                if f.scales {
+                    let _ = writeln!(
+                        p,
+                        "(rule ((= e ({act} s)) (= s (Scale c g)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
+                         ((union e (Fused{tag} w x (EpiS_{name} c)))))"
+                    );
+                }
             }
             (Semantics::AddOperand, OperandKind::RowIndexed) => {
                 let _ = writeln!(
                     p,
-                    "(rule ((= e (Add g r)) (= g (Gemv w x)) (= (rows g) 1){ok})\n      \
-                     ((union e (Fused w x (Epi_{name} r)))))",
+                    "(rule ((= e (Add g r)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
+                     ((union e (Fused{tag} w x (Epi_{name} r)))))",
                     ok = at(name, "w")
                 );
             }
-            // The product of a GEMV store with a row-indexed operand: on the
-            // SwiGLU `mul(silu(w1·x), w3·x)` the bare `Gemv` child is `w3`'s
-            // (the gate side is `Silu(..)`, or `Fused` once its own rule has
-            // fired), so the operand is the gate and the fusion rides `w3`.
-            // `Mul`'s commutativity rewrite lets either operand order match.
+            // The product of a store with a row-indexed operand: on the
+            // SwiGLU `mul(silu(w1·x), w3·x)` the bare product child is `w3`'s
+            // (the gate side is `Silu(..)`, or a fused block once its own rule
+            // has fired), so the operand is the gate and the block rides
+            // `w3`. `Mul`'s commutativity rewrite lets either order match.
             (Semantics::MulOperand, OperandKind::RowIndexed) => {
                 let _ = writeln!(
                     p,
-                    "(rule ((= e (Mul g r)) (= g (Gemv w x)) (= (rows g) 1){ok})\n      \
-                     ((union e (Fused w x (Epi_{name} r)))))",
+                    "(rule ((= e (Mul g r)) (= g (Gemv{tag} w x)) (= (rows g) 1){ok})\n      \
+                     ((union e (Fused{tag} w x (Epi_{name} r)))))",
                     ok = at(name, "w")
                 );
             }
-            // The two-weight SwiGLU: the product of a SiLU'd GEMV and a bare
-            // GEMV over ONE input becomes the bare GEMV with the other's
-            // weight as its operand. Both GEMVs are single-use by the cut
-            // (a multi-use store is a leaf and does not match `Gemv`), and
-            // the SiLU side matches whether it is still `Silu(Gemv ..)` or
-            // already the fused `gemv_silu` — one e-class.
+            // The two-weight SwiGLU: the product of a SiLU'd product and a
+            // bare one over ONE input becomes the bare product with the
+            // other's weight as its operand. Both products are single-use by
+            // the cut, and the SiLU side matches whether it is still
+            // `Silu(..)` or already fused — one e-class.
             (Semantics::SwigluGate, OperandKind::Weight) => {
                 let _ = writeln!(
                     p,
-                    "(rule ((= e (Mul s u)) (= s (Silu g)) (= g (Gemv w1 x)) (= u (Gemv w3 x)) \
-                     (= (rows u) 1){ok})\n      ((union e (Fused w3 x (Epi_{name} w1)))))",
+                    "(rule ((= e (Mul s u)) (= s (Silu g)) (= g (Gemv{tag} w1 x)) (= u (Gemv{tag} w3 x)) \
+                     (= (rows u) 1){ok})\n      ((union e (Fused{tag} w3 x (Epi_{name} w1)))))",
                     ok = at(name, "w3")
                 );
             }

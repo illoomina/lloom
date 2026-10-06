@@ -273,6 +273,7 @@ fn main() -> Result<()> {
         loader: StreamLoader::Pread,
         prefetch: true,
         io_hints: false,
+        drafter_bytes: 0,
     };
     let mut model: Qwen4Exp<Streamed> =
         Qwen4Exp::from_gguf_streamed(&shards(&gguf), &device, &opts, &stream)?;

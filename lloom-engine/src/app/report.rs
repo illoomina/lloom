@@ -389,6 +389,19 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
         }
         return;
     }
+    // Acceptance over every round (the warm-up's included: it is the
+    // drafter's, not the timing's), `hist[a]` the rounds that kept `a`
+    // tokens, the bonus counted.
+    let widest = rounds.iter().map(|r| r.accepted).max().unwrap_or(0);
+    let hist: Vec<usize> = (0..=widest)
+        .map(|a| rounds.iter().filter(|r| r.accepted == a).count())
+        .collect();
+    let all: usize = rounds.iter().map(|r| r.accepted).sum();
+    eprintln!(
+        "DSPARK_ACCEPT rounds={} tokens={all} tokens_per_round={:.4} accepted_hist={hist:?}",
+        rounds.len(),
+        all as f64 / rounds.len() as f64
+    );
     let timed = &rounds[WARMUP_ROUNDS..];
     let n = timed.len() as f64;
     let ms = |ns: u64| ns as f64 / 1e6;

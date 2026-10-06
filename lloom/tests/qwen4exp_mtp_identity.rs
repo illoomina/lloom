@@ -384,12 +384,13 @@ fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> 
         cache.want_nextn = true;
         let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &dev)?;
         model.forward(&input, 0, &mut cache)?;
-        let _ = model.take_probe(&mut cache)?;
+        let _ = Probes::<NextnHidden>::take_probe(&model, &mut cache)?;
         let anchor = Anchor {
             last: anchor_tok,
             pos: cache.pos,
         };
-        let (accepted, probe) = model.verify_and_probe(
+        let (accepted, probe) = Probes::<NextnHidden>::verify_and_probe(
+            &model,
             &[Draft::host(vec![draft])],
             &[anchor],
             &mut cache,
@@ -691,7 +692,7 @@ fn a_lane_is_cut_back_to_a_reused_prefix_it_was_keyed_from() -> Result<()> {
         0,
         &mut cache,
     )?;
-    let probe = model.take_probe(&mut cache)?;
+    let probe = Probes::<NextnHidden>::take_probe(&model, &mut cache)?;
     let anchor = logits
         .squeeze(0)?
         .argmax(lloom_tensor::D::Minus1)?

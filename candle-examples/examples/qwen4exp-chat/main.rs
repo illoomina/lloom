@@ -95,7 +95,7 @@ fn profile_line(run: usize, phase: &str, tokens: usize, wall_ms: f64) {
     #[cfg(not(feature = "metal"))]
     let _ = (run, phase, tokens, wall_ms);
 }
-use lloom::nn::speculator::{Anchor, Draft, Probes};
+use lloom::nn::speculator::{Anchor, Draft, NextnHidden, Probes};
 use lloom::nn::{DecodeOptions, Session};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -142,6 +142,27 @@ struct Args {
     /// verify runs `K + 1` positions; byte-identical to greedy whatever `K`.
     #[arg(long, default_value_t = 1)]
     mtp_k: usize,
+
+    /// A DFlash drafter checkpoint directory (the DSpark family's block
+    /// drafter on the target's tapped HC residuals). After the greedy runs
+    /// the prompt is decoded through `Session::decode_speculative` once per
+    /// `--dflash-k` × `--dflash-arm`; each stream must equal the greedy
+    /// stream, and the acceptance per position is printed (`DFLASH …`).
+    #[arg(long)]
+    dflash: Option<PathBuf>,
+
+    /// Draft widths for `--dflash` (the block predicted whole, its first K
+    /// proposed).
+    #[arg(long, value_delimiter = ',', default_value = "7")]
+    dflash_k: Vec<usize>,
+
+    /// The `--dflash` wiring arms: `ship` (the checkpoint's own), and the
+    /// ablations a wrong wiring would be — `early` / `late` (every tap one
+    /// layer off), `interleaved` (the other RoPE pairing), `slot1` (the
+    /// predictions read one block slot late). The identity gate is blind to
+    /// all of them; only the acceptance moves, and `ship` must beat each.
+    #[arg(long, value_delimiter = ',', default_value = "ship")]
+    dflash_arm: Vec<String>,
 
     /// Rollback probe: after the prompt, run N verify rounds whose draft is
     /// always wrong (each round rewinds and replays its anchor), then compare
@@ -817,6 +838,7 @@ fn main() -> Result<()> {
                 loader,
                 prefetch: args.prefetch,
                 io_hints: args.io_hints,
+                drafter_bytes: 0,
             };
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
@@ -1466,6 +1488,127 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             anyhow::bail!("the MTP run's tokens differ from the greedy run's");
         }
     }
+    if let Some(dir) = &args.dflash {
+        dflash_runs(
+            model,
+            args,
+            &cfg,
+            device,
+            dir,
+            prompt_ids,
+            eos_ids,
+            tile,
+            greedy_digest.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// `--dflash`: the prompt through the speculative body with the DFlash
+/// drafter, per width and wiring arm; each stream against greedy's.
+#[allow(clippy::too_many_arguments)]
+fn dflash_runs<R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    cfg: &lloom::models::qwen4exp::Config,
+    device: &Device,
+    dir: &std::path::Path,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+    tile: usize,
+    greedy_digest: Option<&str>,
+) -> Result<()> {
+    use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
+    use lloom::models::qwen4exp::QwenHead;
+    let base = DSparkConfig::read_from_dir(dir)?;
+    let file = dir.join("model.safetensors");
+    for arm in &args.dflash_arm {
+        let mut dcfg = base.clone();
+        match arm.as_str() {
+            "ship" => {}
+            "early" => {
+                dcfg.target_layer_ids = base.target_layer_ids.iter().map(|l| l - 1).collect()
+            }
+            "late" => dcfg.target_layer_ids = base.target_layer_ids.iter().map(|l| l + 1).collect(),
+            "interleaved" => dcfg.rope_is_neox_style = !base.rope_is_neox_style,
+            "slot1" => dcfg.logits_start = 1,
+            other => {
+                anyhow::bail!("--dflash-arm {other}: ship | early | late | interleaved | slot1")
+            }
+        }
+        for &k in &args.dflash_k {
+            let vb = unsafe {
+                lloom::nn::VarBuilder::from_mmaped_safetensors(
+                    &[&file],
+                    candle::DType::F16,
+                    device,
+                )?
+            };
+            let drafter = DSparkDrafter::new(
+                dcfg.clone(),
+                prompt_ids.len() + args.max_tokens + dcfg.block_size + 64,
+                vb,
+            )?;
+            let mut spec = DSparkSpeculator::with_head(drafter, QwenHead::of(model), 1)?;
+            spec.set_max_draft(k);
+            let k = lloom::nn::Speculator::max_draft(&spec);
+            let pools = model.spec_pools(1, k, device);
+            let mut cache: Cache = Cache::in_pools(cfg, &pools)?;
+            cache.set_tap_layers(&dcfg.tap_layers())?;
+            let mut session = Session::new(model, cache);
+            let mut rb = Blocking::new(eos_ids, device)?;
+            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let opts = DecodeOptions {
+                prefill_tile: tile,
+                ..DecodeOptions::new(args.max_tokens)
+            };
+            let t = std::time::Instant::now();
+            let out = session.decode_speculative(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                prompt_ids,
+                &opts,
+                eos_ids,
+                &mut |_| Ok(()),
+            )?;
+            let wall_ms = t.elapsed().as_millis();
+            let mut h = sha256::Sha256::new();
+            for t in &out.ids {
+                h.update(&t.to_le_bytes());
+            }
+            let digest = sha256::hex(&h.finalize());
+            let same = greedy_digest == Some(digest.as_str());
+            let rounds = out.stats.rounds.len();
+            let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
+            let hist: Vec<usize> = (0..=k + 1)
+                .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
+                .collect();
+            // P(draft position j accepted | its round reached it): the
+            // rounds that kept more than j drafts over those that kept at
+            // least j.
+            let reach = |j: usize| out.stats.rounds.iter().filter(|r| r.accepted > j).count();
+            let per_pos: Vec<String> = (1..=k)
+                .map(|j| format!("{:.3}", reach(j) as f64 / reach(j - 1).max(1) as f64))
+                .collect();
+            let ms = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
+                out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
+            };
+            println!(
+                "DFLASH arm={arm} k={k} tokens_sha256={digest} identical_to_greedy={same} generated={} rounds={rounds} tokens_per_round={:.3} accepted_hist={hist:?} accept_by_position=[{}] wall_ms={wall_ms} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} taps={:?}",
+                out.ids.len(),
+                tokens as f64 / rounds.max(1) as f64,
+                per_pos.join(","),
+                ms(&|t| t.draft_ns),
+                ms(&|t| t.verify_ns),
+                ms(&|t| t.observe_ns),
+                dcfg.tap_layers(),
+            );
+            if !same {
+                anyhow::bail!("the DFlash run ({arm}, k {k}) differs from the greedy run");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1828,7 +1971,7 @@ fn rollback_probe<R: ExpertResidency>(
     sub.want_nextn = true;
     let input = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), device)?;
     let logits = model.forward(&input, 0, &mut sub)?;
-    let _ = model.take_probe(&mut sub)?;
+    let _ = Probes::<NextnHidden>::take_probe(model, &mut sub)?;
     let mut anchor = argmax(&logits)?;
     let mut consumed: Vec<u32> = Vec::new();
     if mode == "roundtrip" {
@@ -1868,7 +2011,8 @@ fn rollback_probe<R: ExpertResidency>(
         return Ok(());
     }
     for r in 0..rounds {
-        let (acc, _probe) = model.verify_and_probe(
+        let (acc, _probe) = Probes::<NextnHidden>::verify_and_probe(
+            model,
             &[Draft::host(vec![wrong])],
             &[Anchor {
                 last: anchor,

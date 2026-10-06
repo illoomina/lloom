@@ -10,6 +10,7 @@
 pub mod config;
 pub mod deltanet;
 pub mod deltanet_block;
+pub mod dflash;
 pub mod hc;
 pub mod hotlist;
 pub(crate) mod kernels;
@@ -37,6 +38,7 @@ pub use model::{
     PREFILL_TRANSIENT_BYTES_PER_TOKEN,
 };
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
+pub use dflash::QwenHead;
 pub use mtp::{GenerationProbe, MtpDrafter, MtpHead, MtpLanes};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
 pub use qsa::{Indexer, KvCache, KvPool, QsaAttention};

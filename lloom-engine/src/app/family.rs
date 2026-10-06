@@ -177,7 +177,7 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     ring: "full: the PLE fed by the driver's host fill where the arm stamps each token (Metal); the fed id read back on a deferred read at the fixed cadence",
     batch: true,
     prefix_share: false,
-    speculation: &["mtp"],
+    speculation: &["mtp", "dflash"],
     model_axes: false,
     rewind: "one decode step (the standing window)",
     executor_arms: false,
@@ -405,6 +405,12 @@ impl Family for Qwen4ExpFamily {
                 );
             }
         }
+        if s.speculative.method == "dflash" && s.batch > 1 {
+            anyhow::bail!(
+                "--batch {} with speculative.method = dflash on Qwen4-exp: the batched loop is the K = 1 driver; the DFlash drafter speculates at --batch 1",
+                s.batch
+            );
+        }
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen4exp has no such arm");
         }
@@ -456,6 +462,8 @@ impl Family for Qwen4ExpFamily {
             ple: !model.no_ple,
             moe_act: model.moe_act.clone(),
             mtp: (spec.method == "mtp").then(|| spec.drafter.clone()).flatten(),
+            dflash: (spec.method == "dflash").then(|| spec.drafter.clone().unwrap_or_default()),
+            spec_k: spec.k,
             hotlist: model.hotlist.clone(),
             batch: shape.batch,
             mtp_k: spec.k.unwrap_or(1),
@@ -488,9 +496,10 @@ fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<Strin
 /// `speculative.method = auto` resolved for `family`: LFM2's DSpark when
 /// `speculative.drafter` names a checkpoint or the HF cache holds one;
 /// Qwen4-exp's MTP when it names the head's sidecar or
-/// `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, at `--batch 1` (the head
-/// speculates at one row); else `none`. The note names the choice, so a run
-/// records which arm it took.
+/// `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, else its DFlash drafter
+/// when it names a checkpoint directory or the HF cache holds the PixelML
+/// one, at `--batch 1` (either drafter speculates at one row); else
+/// `none`. The note names the choice, so a run records which arm it took.
 fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
     if shape.speculative.method != "auto" {
         return None;
@@ -508,7 +517,16 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
                     .map(|h| PathBuf::from(h).join(".cache/lloom/qwen4exp-mtp-q8.gguf"))
                     .filter(|p| p.is_file());
             }
-            (spec.drafter.is_some() && batch <= 1).then_some("mtp")
+            let dflash = match &spec.drafter {
+                Some(d) => d.is_dir(),
+                None => super::common::newest_snapshot(super::qwen4exp::DFLASH_SNAPSHOT).is_some(),
+            };
+            match (batch <= 1, dflash, spec.drafter.is_some()) {
+                (false, ..) => None,
+                (true, true, _) => Some("dflash"),
+                (true, false, true) => Some("mtp"),
+                (true, false, false) => None,
+            }
         }
         _ => None,
     };
@@ -646,6 +664,36 @@ mod tests {
         let mut s = auto(2, Some(&drafter));
         resolve_auto_speculation("qwen4exp", &mut s);
         assert_eq!(s.speculative.method, "none", "the MTP head speculates at one row");
+        // A directory names a DFlash checkpoint on Qwen4-exp, at one row.
+        let dir = std::env::temp_dir().join(format!("lloom-auto-dflash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = auto(1, Some(&dir));
+        let note = resolve_auto_speculation("qwen4exp", &mut s).expect("a note");
+        assert_eq!(s.speculative.method, "dflash", "{note}");
+        Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap();
+        let mut s = auto(2, Some(&dir));
+        resolve_auto_speculation("qwen4exp", &mut s);
+        assert_eq!(
+            s.speculative.method, "none",
+            "the DFlash drafter speculates at one row"
+        );
+        let mut s = shape();
+        s.batch = 2;
+        s.speculative.method = "dflash".into();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("speculates at --batch 1"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
         let mut s = auto(1, Some(&drafter));
         resolve_auto_speculation("lfm2", &mut s);
         assert_eq!(s.speculative.method, "dspark");

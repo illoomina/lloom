@@ -80,7 +80,7 @@ fn no_undeclared(r: &Remarks) {
 fn the_qwen4exp_step_remarks() {
     let model = lloom::models::qwen4exp::testing::ghost_model(&Device::Cpu).expect("ghost build");
     let g = lloom::optimizer::walk(&model);
-    let d = derive(&g, &Policy::default()).expect("derive");
+    let d = derive(&g, &model.switches_policy()).expect("derive");
     let r = remarks(&d, &CostModel::default());
     eprintln!("{r}");
     no_undeclared(&r);
@@ -95,11 +95,18 @@ fn the_qwen4exp_step_remarks() {
         r.rows.iter().map(|x| x.stateful).sum::<u64>(),
         36 * 4 + 12 * 7 + 7
     );
-    // The routed and shared SwiGLU products ride no store: the quantized
-    // matvec takes no block (step (c)'s hooks).
+    // The shared experts' SwiGLU on their quantized projections' stores is
+    // the store blocks' (`quant_silu`, `quant_mul`), refused by the switch
+    // that is off by default.
     assert_eq!(
         class(&r, "mul_mv", "silu_mul"),
-        [(&Why::NewBody("no store hook on mul_mv".to_string()), 96)]
+        [(
+            &Why::Refused {
+                fragment: "quant_silu".to_string(),
+                reason: "the switch qwen4exp.shared_store is off".to_string()
+            },
+            96
+        )]
     );
     // The bracket's grouped norm feeds the projections' load. The
     // catalogue's grouped-norm prologue computes it there at any tile (its
@@ -201,7 +208,7 @@ fn the_lfm2_step_remarks() {
 fn the_qwen4exp_step_remarks_match_the_committed_table() {
     let model = lloom::models::qwen4exp::testing::ghost_model(&Device::Cpu).expect("ghost build");
     let g = lloom::optimizer::walk(&model);
-    let d = derive(&g, &Policy::default()).expect("derive");
+    let d = derive(&g, &model.switches_policy()).expect("derive");
     remarks_gate(
         "qwen4exp-iq3xxs",
         &d.graph,
@@ -223,7 +230,7 @@ fn the_qwen4exp_position_remarks() {
     assert_eq!(dense, 2051);
     for (name, pos) in [("block", 47), ("past-dense", 4001)] {
         let g = walk_at(&model, pos);
-        let d = derive(&g, &Policy::default()).expect("derive");
+        let d = derive(&g, &model.switches_policy()).expect("derive");
         let r = remarks(&d, &CostModel::default());
         eprintln!("{name} (position {pos}): {r}");
         no_undeclared(&r);
@@ -239,7 +246,7 @@ fn the_qwen4exp_mtp_head_remarks() {
         .expect("ghost build with the head");
     let head = model.mtp_head().expect("the head was asked for");
     let g = lloom::optimizer::walk(head);
-    let d = derive(&g, &Policy::default()).expect("derive");
+    let d = derive(&g, &model.switches_policy()).expect("derive");
     let r = remarks(&d, &CostModel::default());
     eprintln!("mtp head: {r}");
     eprintln!("plan: {}", d.plan);

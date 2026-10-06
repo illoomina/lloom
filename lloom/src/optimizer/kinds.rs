@@ -57,12 +57,15 @@ const fn facts(role: Role, store_hook: bool, load_hook: bool) -> Facts {
 /// A product on `core`: `gemv.metal`'s `GEMVKernel` takes a `Prologue` and an
 /// `Epilogue` (`PrologueRmsNorm`, `PrologueNormInline`, `EpilogueSilu`, …);
 /// the mixed arm the `MixedEpilogue` blocks at its store; the quantized
-/// matvec (`quantized.metal`'s `kernel_mul_mv_*`) neither.
+/// matvec (`quantized.metal`'s `kernel_mul_mv_*`) its store type
+/// (`quantized_store.metal`).
 fn product(core: Core) -> Facts {
     match core {
         Core::Gemv => facts(Role::Product, true, true),
         Core::Mixed => facts(Role::Product, true, false),
-        Core::Quant => facts(Role::Product, false, false),
+        // The quantized matvec's store blocks (`MvStore`), on its packed
+        // kinds' cores.
+        Core::Quant => facts(Role::Product, true, false),
     }
 }
 
@@ -194,7 +197,7 @@ mod tests {
         let f = g.fused("silu", crate::optimizer::NumericClass::Rounding, w, x, None);
         let hc = g.opaque("hc_collapse", &[x], Shape::of(&[1, 1, 8]), DType::F32);
         let unknown = g.opaque("no_such_kernel", &[x], Shape::of(&[1, 1, 8]), DType::F32);
-        assert_eq!(of(g.node(q)), Some(facts(Role::Product, false, false)));
+        assert_eq!(of(g.node(q)), Some(facts(Role::Product, true, false)));
         assert_eq!(of(g.node(m)), Some(facts(Role::Product, true, false)));
         assert_eq!(of(g.node(f)), Some(facts(Role::Product, false, true)));
         // A prologue alone: the load taken, the store free.

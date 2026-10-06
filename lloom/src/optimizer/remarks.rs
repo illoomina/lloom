@@ -226,6 +226,10 @@ fn semantics(node: &Node) -> Option<(Semantics, bool)> {
         Op::Sigmoid => (Semantics::Sigmoid, false),
         Op::Add => (Semantics::AddOperand, true),
         Op::Mul => (Semantics::MulOperand, true),
+        // The SwiGLU's activation and product as one kernel (a kernel
+        // fragment): on a product's store it is the SiLU block on the gate's
+        // (and the product on the up's).
+        Op::Opaque if node.name == "silu_mul" => (Semantics::Silu, false),
         _ => return None,
     })
 }
@@ -308,7 +312,10 @@ fn classify(
                     Why::MultiUse
                 } else if pn.op == Op::Fused {
                     Why::NewBody(format!("the store carries {}", pn.name))
-                } else if !pf.store_hook {
+                } else if !pf.store_hook
+                    || (pn.core == super::ir::Core::Quant
+                        && graph.node(pn.inputs[0]).dtype != lloom_tensor::DType::U8)
+                {
                     Why::NewBody(format!("no store hook on {}", fam(pn)))
                 } else {
                     store_fragment(pn, cn, catalogue, refused)
@@ -380,7 +387,11 @@ fn store_fragment(
     match catalogue
         .iter()
         .find(|f| {
-            f.side == Side::Store && f.core == pn.core && f.semantics == sem && f.operand == operand
+            f.side == Side::Store
+                && f.core == pn.core
+                && f.semantics == sem
+                && (f.operand == operand
+                    || (operand == OperandKind::RowIndexed && f.operand == OperandKind::Into))
         })
     {
         Some(f) => Why::Refused {
@@ -519,7 +530,8 @@ mod tests {
         let wg = g.weight("wg", Shape::of(&[8, 8]), DType::F32);
         // A norm into a product's load: cross-threadgroup (load).
         let xn = g.rms_norm(nw, x);
-        // A quantized product into a SiLU: no store hook on the core.
+        // A dense quantized product (an f32 `QTensor`) into a SiLU: the store
+        // blocks ride the packed kinds' cores only.
         let q = g.gemv_on(Core::Quant, wq, xn);
         let qs = g.silu(q);
         // An elementwise value into the mixed product's load (no load hook),

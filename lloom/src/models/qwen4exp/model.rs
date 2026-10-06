@@ -1490,8 +1490,9 @@ impl PassPlan {
 
 /// What Qwen4-exp's switches can express, added to `policy`: the bracket
 /// epilogues ride the brackets' own products only (`mixed_silu` the `down`
-/// projection, `mixed_sigmoid` the `up`), and no switch puts a norm in a
-/// product's load. A derivation over the walk under this policy proposes
+/// projection, `mixed_sigmoid` the `up`), the quantized store blocks the
+/// shared expert's (`quant_silu` its gate, `quant_mul` its up), and no
+/// switch puts a norm in a product's load. A derivation over the walk under this policy proposes
 /// only what [`Qwen4Exp::derive_fusion_with`] can set.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fusion_policy(policy: &crate::optimizer::Policy) -> crate::optimizer::Policy {
@@ -1503,7 +1504,12 @@ pub fn fusion_policy(policy: &crate::optimizer::Policy) -> crate::optimizer::Pol
                 .push((f.to_string(), "no Qwen4-exp switch selects it".to_string()));
         }
     }
-    for (f, site) in [("mixed_silu", "_down.weight"), ("mixed_sigmoid", "_up.weight")] {
+    for (f, site) in [
+        ("mixed_silu", "_down.weight"),
+        ("mixed_sigmoid", "_up.weight"),
+        ("quant_silu", "ffn_gate_shexp.weight"),
+        ("quant_mul", "ffn_up_shexp.weight"),
+    ] {
         if !policy.sites.iter().any(|(n, _)| n == f) {
             policy.sites.push((f.to_string(), vec![site.to_string()]));
         }
@@ -1619,11 +1625,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             swiglus(lloom_tensor::DType::F32),
             swiglus(lloom_tensor::DType::F16),
         );
-        if placed("silu_mul_f32") != f32_sites {
+        // The shared experts' SwiGLUs on their projections' stores: every
+        // layer's, or none (one switch).
+        let shared_sites = self.layers.len();
+        let store_pairs = d.plan.sites_of("quant_mul").len();
+        let shared_store = match (d.plan.sites_of("quant_silu").len(), store_pairs) {
+            (0, 0) => false,
+            (g, u) if g == shared_sites && u == shared_sites => true,
+            (g, u) => lloom_tensor::bail!(
+                "qwen4exp fusion=derived: the plan puts the shared SwiGLU on {g} gate and {u} up \
+                 stores of {shared_sites} layers, which the one switch cannot express; plan: {}",
+                d.plan
+            ),
+        };
+        if placed("silu_mul_f32") + store_pairs != f32_sites {
             lloom_tensor::bail!(
                 "qwen4exp fusion=derived: the plan leaves {} of {f32_sites} f32 SwiGLUs composed, \
                  which no switch selects; plan: {}",
-                f32_sites - placed("silu_mul_f32"),
+                f32_sites - placed("silu_mul_f32") - store_pairs,
                 d.plan
             )
         }
@@ -1639,7 +1658,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         };
         for (site, fragment) in sites {
             let known = (fragment == "mixed_silu" && site.ends_with("_down.weight"))
-                || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"));
+                || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"))
+                || (fragment == "quant_silu" && site.ends_with("ffn_gate_shexp.weight"))
+                || (fragment == "quant_mul" && site.ends_with("ffn_up_shexp.weight"));
             if !known {
                 lloom_tensor::bail!(
                     "qwen4exp fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site \
@@ -1664,6 +1685,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if let Some(on) = f16_fuse {
             self.set_f16_fuse(on);
         }
+        self.set_shared_store(shared_store);
         let refused: Vec<String> = d
             .refused
             .iter()
@@ -1686,6 +1708,39 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         );
         self.fusion_report = Some(line.clone());
         Ok(line)
+    }
+
+    /// The composition the model as configured runs, as a policy: the
+    /// model's own ([`fusion_policy`]) with every block whose switch is off
+    /// refused by that switch — the bracket epilogues where every bracket's
+    /// is off, the shared expert's store blocks under
+    /// `qwen4exp.shared_store` off (admitted, their measured loss
+    /// notwithstanding, with it on), the f16 routed step's compositions under
+    /// `qwen4exp.f16_fuse` off. A derivation over the walk under it is the
+    /// step the forward dispatches (the census tests hold the two equal).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn switches_policy(&self) -> crate::optimizer::Policy {
+        let mut p = fusion_policy(&crate::optimizer::Policy::default());
+        let mut off = |f: &str, why: &str| p.unavailable.push((f.to_string(), why.to_string()));
+        let epi = self.bracket_epilogues();
+        if epi.iter().all(|e| !e.0) {
+            off("mixed_silu", "every bracket's down epilogue is off");
+        }
+        if epi.iter().all(|e| !e.1) {
+            off("mixed_sigmoid", "every bracket's up epilogue is off");
+        }
+        if self.layers.iter().all(|l| !l.moe().shared_store()) {
+            off("quant_silu", "the switch qwen4exp.shared_store is off");
+            off("quant_mul", "the switch qwen4exp.shared_store is off");
+        } else {
+            // The switch runs the blocks whatever their measurement.
+            p.admit.extend(["quant_silu".to_string(), "quant_mul".to_string()]);
+        }
+        if self.layers.iter().all(|l| !l.moe().f16_fuse()) {
+            off("silu_mul_f16", "the switch qwen4exp.f16_fuse is off");
+            off("combine_cast", "the switch qwen4exp.f16_fuse is off");
+        }
+        p
     }
 
     /// Every HyperConnection bracket of the decode step: each layer's attn
@@ -2230,6 +2285,18 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         if let Some(m) = &mut self.mtp {
             m.layer_mut().moe_mut().set_f16_fuse(on);
+        }
+    }
+
+    /// Select whether every layer's shared expert runs its SwiGLU on its
+    /// quantized projections' stores (`MoeLayer::set_shared_store`;
+    /// `qwen4exp.shared_store` by default).
+    pub fn set_shared_store(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_shared_store(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_shared_store(on);
         }
     }
 

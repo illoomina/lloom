@@ -26,8 +26,16 @@ use lloom_tensor::{Error, Result};
 use crate::nn::fusion::{OperandKind, Semantics};
 
 use super::fragments::Fragment;
-use super::ir::{Graph, Node, NodeId, Op};
+use super::ir::{Core, Graph, Node, NodeId, Op};
 use super::Policy;
+
+/// Every core, in the order the program declares their constructors.
+const CORES: [Core; 3] = [Core::Gemv, Core::Mixed, Core::Quant];
+
+/// A scale constant as the program carries it: the f32's bits, exactly.
+fn scale_bits(c: f32) -> i64 {
+    i64::from(c.to_bits())
+}
 
 /// The largest opaque arity the program declares a constructor for.
 const MAX_OPAQUE_ARITY: usize = 6;
@@ -90,11 +98,18 @@ fn prelude(fragments: &[Fragment]) -> String {
     // the pair it replaces by exactly one dispatch, never a tie. The extractor
     // prices a literal child at 1, so a marker carries NO literal: one
     // constructor per fragment, its operand (if any) as an `Expr` child.
+    // A scaling block carries its constant as a literal, which the extractor
+    // prices at 1; it gets a second marker, `EpiS_`, used only when a
+    // `Scale` was absorbed — whose own literal priced the unfused side the
+    // same — so the fusion stays one cheaper than what it replaces either way.
     p.push_str("(datatype* (Epi");
     for f in fragments {
         match f.operand {
             OperandKind::None => {
                 let _ = write!(p, " (Epi_{} :cost 0)", f.name);
+                if f.scales {
+                    let _ = write!(p, " (EpiS_{} i64 :cost 0)", f.name);
+                }
             }
             OperandKind::RowIndexed | OperandKind::Weight => {
                 let _ = write!(p, " (Epi_{} Expr :cost 0)", f.name);
@@ -104,7 +119,11 @@ fn prelude(fragments: &[Fragment]) -> String {
     p.push_str(")\n (Expr\n");
     p.push_str("  (In String :cost 0)\n  (W String :cost 0)\n");
     p.push_str("  (View String i64 Expr :cost 0)\n");
-    p.push_str("  (Gemv Expr Expr :cost 1)\n  (Silu Expr :cost 1)\n");
+    for core in CORES {
+        let _ = writeln!(p, "  (Gemv{} Expr Expr :cost 1)", core.tag());
+    }
+    p.push_str("  (Silu Expr :cost 1)\n  (Sigmoid Expr :cost 1)\n");
+    p.push_str("  (Scale i64 Expr :cost 1)\n");
     p.push_str("  (Mul Expr Expr :cost 1)\n  (Add Expr Expr :cost 1)\n");
     p.push_str("  (Norm Expr Expr :cost 1)\n");
     for arity in 1..=MAX_OPAQUE_ARITY {
@@ -114,11 +133,36 @@ fn prelude(fragments: &[Fragment]) -> String {
         }
         p.push_str(" :cost 1)\n");
     }
-    p.push_str("  (Fused Expr Expr Epi :cost 1)))\n");
+    for (i, core) in CORES.iter().enumerate() {
+        let close = if i + 1 == CORES.len() { "))" } else { "" };
+        let _ = writeln!(p, "  (Fused{} Expr Expr Epi :cost 1){close}", core.tag());
+    }
     p.push_str("(function rows (Expr) i64 :merge (max old new))\n");
     p.push_str("(rewrite (Add a b) (Add b a))\n");
     p.push_str("(rewrite (Mul a b) (Mul b a))\n");
-    for f in fragments {
+    for f in fragments.iter().filter(|f| f.core != Core::Gemv) {
+        // A block on another core: an activation riding that core's store,
+        // absorbing the constant scale between them when it scales.
+        let (name, tag) = (f.name, f.core.tag());
+        let act = match (f.semantics, f.operand) {
+            (Semantics::Silu, OperandKind::None) => "Silu",
+            (Semantics::Sigmoid, OperandKind::None) => "Sigmoid",
+            _ => continue,
+        };
+        let _ = writeln!(
+            p,
+            "(rule ((= e ({act} g)) (= g (Gemv{tag} w x)) (= (rows g) 1))\n      \
+             ((union e (Fused{tag} w x (Epi_{name})))))"
+        );
+        if f.scales {
+            let _ = writeln!(
+                p,
+                "(rule ((= e ({act} s)) (= s (Scale c g)) (= g (Gemv{tag} w x)) (= (rows g) 1))\n      \
+                 ((union e (Fused{tag} w x (EpiS_{name} c)))))"
+            );
+        }
+    }
+    for f in fragments.iter().filter(|f| f.core == Core::Gemv) {
         let name = f.name;
         match (f.semantics, f.operand) {
             (Semantics::Silu, OperandKind::None) => {
@@ -225,8 +269,19 @@ fn lower(graph: &Graph) -> Result<String> {
             // one value are two different values, and without the ordinal the
             // e-graph would hash-cons them into one.
             Op::View => format!("(View {} {id} {})", quote(&node.name), n(node.inputs[0])),
-            Op::Gemv => format!("(Gemv {} {})", n(node.inputs[0]), n(node.inputs[1])),
+            Op::Gemv => format!(
+                "(Gemv{} {} {})",
+                node.core.tag(),
+                n(node.inputs[0]),
+                n(node.inputs[1])
+            ),
             Op::Silu => format!("(Silu {})", n(node.inputs[0])),
+            Op::Sigmoid => format!("(Sigmoid {})", n(node.inputs[0])),
+            Op::Scale => format!(
+                "(Scale {} {})",
+                scale_bits(node.scalar.unwrap_or(1.0)),
+                n(node.inputs[0])
+            ),
             Op::Mul => format!("(Mul {} {})", n(node.inputs[0]), n(node.inputs[1])),
             Op::Add => format!("(Add {} {})", n(node.inputs[0]), n(node.inputs[1])),
             Op::RmsNorm => format!("(Norm {} {})", n(node.inputs[0]), n(node.inputs[1])),
@@ -378,6 +433,14 @@ pub fn derive(graph: &Graph, fragments: &[Fragment], iterations: usize) -> Resul
     })
 }
 
+/// The core a constructor's suffix names.
+fn core_of(tag: &str) -> Result<Core> {
+    CORES
+        .into_iter()
+        .find(|c| c.tag() == tag)
+        .ok_or_else(|| Error::Msg(format!("optimizer: unknown core tag `{tag}`")))
+}
+
 /// Rebuilds a [`Graph`] from an extracted term DAG, hash-consing on the
 /// term id so a value shared in the source is shared in the result.
 struct Rebuild<'a> {
@@ -423,6 +486,18 @@ impl<'a> Rebuild<'a> {
             egglog::Term::Lit(egglog::ast::Literal::String(s)) => Ok(s.clone()),
             other => Err(Error::Msg(format!(
                 "optimizer: expected a string literal in the extracted term, got {other:?}"
+            ))),
+        }
+    }
+
+    /// A scale constant from its literal bits.
+    fn scale(dag: &egglog::TermDag, id: egglog::TermId) -> Result<f32> {
+        match dag.get(id) {
+            egglog::Term::Lit(egglog::ast::Literal::Int(i)) => u32::try_from(*i)
+                .map(f32::from_bits)
+                .map_err(|_| Error::Msg(format!("optimizer: scale literal {i} is not f32 bits"))),
+            other => Err(Error::Msg(format!(
+                "optimizer: expected a scale literal in the extracted term, got {other:?}"
             ))),
         }
     }
@@ -506,14 +581,24 @@ impl<'a> Rebuild<'a> {
                 let x = self.term(dag, children[2])?;
                 self.graph.view(&name, x, shape)
             }
-            "Gemv" => {
+            head if head.starts_with("Gemv") => {
+                let core = core_of(&head["Gemv".len()..])?;
                 let w = self.term(dag, children[0])?;
                 let x = self.term(dag, children[1])?;
-                self.graph.gemv(w, x)
+                self.graph.gemv_on(core, w, x)
             }
             "Silu" => {
                 let x = self.term(dag, children[0])?;
                 self.graph.silu(x)
+            }
+            "Sigmoid" => {
+                let x = self.term(dag, children[0])?;
+                self.graph.sigmoid(x)
+            }
+            "Scale" => {
+                let c = Self::scale(dag, children[0])?;
+                let x = self.term(dag, children[1])?;
+                self.graph.scale(x, c)
             }
             "Mul" => {
                 let a = self.term(dag, children[0])?;
@@ -530,32 +615,44 @@ impl<'a> Rebuild<'a> {
                 let x = self.term(dag, children[1])?;
                 self.graph.rms_norm(w, x)
             }
-            "Fused" => {
+            head if head.starts_with("Fused") => {
+                let core = core_of(&head["Fused".len()..])?;
                 let w = self.term(dag, children[0])?;
                 let x = self.term(dag, children[1])?;
                 let egglog::Term::App(ehead, echildren) = dag.get(children[2]) else {
                     return Err(Error::Msg("optimizer: malformed epilogue term".to_string()));
                 };
                 let echildren = echildren.clone();
-                let name = ehead.strip_prefix("Epi_").ok_or_else(|| {
-                    Error::Msg(format!("optimizer: unknown epilogue constructor `{ehead}`"))
-                })?;
+                let (name, scaled) = match ehead.strip_prefix("EpiS_") {
+                    Some(name) => (name, true),
+                    None => (
+                        ehead.strip_prefix("Epi_").ok_or_else(|| {
+                            Error::Msg(format!("optimizer: unknown epilogue constructor `{ehead}`"))
+                        })?,
+                        false,
+                    ),
+                };
                 let fragment = self
                     .fragments
                     .iter()
-                    .find(|f| f.name == name)
+                    .find(|f| f.name == name && f.core == core)
                     .ok_or_else(|| {
                         Error::Msg(format!(
                             "optimizer: extracted fragment `{name}` not in the catalogue"
                         ))
                     })?
                     .clone();
-                let operand = match echildren.first() {
-                    Some(&r) => Some(self.term(dag, r)?),
-                    None => None,
+                let (operand, scale) = if scaled {
+                    (None, Some(Self::scale(dag, echildren[0])?))
+                } else {
+                    let operand = match echildren.first() {
+                        Some(&r) => Some(self.term(dag, r)?),
+                        None => None,
+                    };
+                    (operand, fragment.scales.then_some(1.0))
                 };
                 self.graph
-                    .fused(fragment.name, fragment.class(), w, x, operand)
+                    .fused_on(core, fragment.name, fragment.class(), w, x, operand, scale)
             }
             op if op.starts_with("Op") => {
                 let name = Self::string(dag, children[0])?;

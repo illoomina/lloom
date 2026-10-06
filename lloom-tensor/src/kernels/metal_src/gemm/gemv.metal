@@ -63,27 +63,60 @@ struct GemvDefaultAccT {
 // round-trip §12.2 #2 is about, and §12.1 is explicit that the round-trip is
 // the win rather than the dispatch count.
 //
-// WHAT A PROLOGUE CANNOT DO, and it decides this entry's shape. A functor here
-// sees one thread's `TN` elements at offset `bn`. It cannot see the whole
-// vector, because a GEMV partitions the OUTPUT across `n_tgp` threadgroups
-// (336 of them for w1 at LFM2's geometry) and Metal has no cross-threadgroup
-// barrier inside a dispatch. So a reduction over all of `K` -- which is what
-// RMSNorm's `rsqrt(mean(x^2))` is -- cannot be computed here; it can only be
-// *recomputed*, once per threadgroup. `measurements/issue-266-raw/prediction.py`
-// prices that at 432x the reduction work and 106.2 MB/token of re-reads
-// against a 0.492 MB/token saving.
-//
-// Hence the split: the reduction stays its own dispatch and produces a scale,
-// and the prologue applies the scale and the norm weight. What disappears is
-// the normalized vector's write and the consumer's read of it.
+// A functor here sees one thread's `TN` elements at offset `bn`; a reduction
+// over all of `K` -- RMSNorm's `rsqrt(mean(x^2))` -- is not visible to it.
+// Two shapes follow. `PrologueRmsNorm` imports the reduction as a scale a
+// separate dispatch computed: a GEMV partitions its OUTPUT across `n_tgp`
+// threadgroups with no barrier between them, and at a tile whose simdgroups
+// split K a per-threadgroup recompute re-reads the input `n_tgp` times
+// (`measurements/issue-266-raw/prediction.py`: 432x the reduction work).
+// `PrologueNormInline` recomputes it in every
+// simdgroup from the coefficients the K-walk already loads, which at the
+// decode tiles (`bn1 sm1 sn32`: one simdgroup spans K) costs no read, and
+// applies `1/rms` at the store (`docs/tuning.md` §13.5t).
 
 // The identity. Selected when no fusion is asked for, and byte-for-byte what
 // shipped: it holds no state and its `operator()` returns its argument, so it
 // inlines away entirely.
 template <typename T, typename AccT>
 struct PrologueNone {
+  MLX_MTL_CONST bool kInlineNorm = false;
+  MLX_MTL_CONST bool kGroupNorm = false;
+  template <typename S>
+  METAL_FUNC void prepare(const device S*, uint, uint, uint3, int) const {}
   METAL_FUNC PrologueNone(const device T*, const device float*) {}
   METAL_FUNC AccT operator()(AccT x, int) const { return x; }
+  METAL_FUNC AccT scale(AccT, int) const { return AccT(1); }
+};
+
+// RMSNorm computed INSIDE the GEMV, reduction included (`DESIGN.md` §12.2
+// row 2, `docs/tuning.md` §13.5t). At the decode tiles (`bn1 sm1 sn32`) each
+// simdgroup's 32 lanes walk the whole of K for the dot product, so the same
+// loaded coefficients give `sum(x^2)` for one more FMA per element and one
+// more shuffle tree, with no extra read: the reduction the separate
+// `rmsnorm` dispatch exists for is already in every simdgroup's registers.
+// `y = (W (x * w)) * rsqrt(mean(x^2) + eps)`: the weight rides the prologue,
+// the 1/rms the store. Not bit-identical to norm-then-GEMV (no f16 rounding
+// of the normalized vector, a different summation tree).
+template <typename T, typename AccT>
+struct PrologueNormInline {
+  MLX_MTL_CONST bool kInlineNorm = true;
+  MLX_MTL_CONST bool kGroupNorm = false;
+  template <typename S>
+  METAL_FUNC void prepare(const device S*, uint, uint, uint3, int) const {}
+  const device T* w;
+  AccT eps;
+
+  METAL_FUNC PrologueNormInline(const device T* w_, float eps_)
+      : w(w_), eps(static_cast<AccT>(eps_)) {}
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x * static_cast<AccT>(w[i]);
+  }
+
+  METAL_FUNC AccT scale(AccT ssq, int k) const {
+    return metal::precise::rsqrt(ssq / static_cast<AccT>(k) + eps);
+  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -294,6 +327,10 @@ struct EpilogueMul {
 // test uses a non-constant weight.
 template <typename T, typename AccT>
 struct PrologueRmsNorm {
+  MLX_MTL_CONST bool kInlineNorm = false;
+  MLX_MTL_CONST bool kGroupNorm = false;
+  template <typename S>
+  METAL_FUNC void prepare(const device S*, uint, uint, uint3, int) const {}
   const device T* w;
   AccT inv_rms;
 
@@ -303,6 +340,86 @@ struct PrologueRmsNorm {
   METAL_FUNC AccT operator()(AccT x, int i) const {
     return x * inv_rms * static_cast<AccT>(w[i]);
   }
+  METAL_FUNC AccT scale(AccT, int) const { return AccT(1); }
+};
+
+// A GROUPED RMSNorm computed inside the GEMV (`docs/tuning.md` §13.5u): the
+// input `[groups · group]` is normalized per group of `group` elements, then
+// scaled by the `[groups · group]` weight — Qwen4-exp's HyperConnection norm
+// (`hc_norm_f32`: per stream, then γ), whose consumers are mixed GEMVs whose
+// simdgroups SPLIT K (`bn8`), so `PrologueNormInline`'s per-simdgroup sum
+// cannot be had. Two phases instead. `prepare`, before the K-walk, reduces
+// every group's sum of squares across the whole threadgroup — thread `t`
+// strides by the threadgroup's width, `simd_sum`, the simdgroups' partials
+// summed in index order, `metal::rsqrt(total / group + eps)`: `hc_norm_f32`'s
+// own tree when the threadgroup is its 256 threads, so the scale is the same
+// number — into threadgroup memory; the K-walk then transforms each loaded
+// coefficient to `(x · s_g) · w`, `hc_norm_f32`'s product in its order, and
+// accumulates as `PrologueNone` would. The input is re-read from cache once a
+// threadgroup (it is tens of kB against the weight's MB). With `scales_out`
+// the first threadgroup also writes the `groups` scales (per batch row), for a
+// later consumer of the same normalized input that is not a GEMV.
+MLX_MTL_CONST int kGroupNormMaxGroups = 8;
+MLX_MTL_CONST int kGroupNormMaxSimd = 8;
+MLX_MTL_CONST int kGroupNormScratch =
+    kGroupNormMaxGroups * kGroupNormMaxSimd + kGroupNormMaxGroups;
+
+template <typename VT, typename AccT>
+struct PrologueGroupNorm {
+  MLX_MTL_CONST bool kInlineNorm = false;
+  MLX_MTL_CONST bool kGroupNorm = true;
+  const device VT* w;
+  float eps;
+  int group;
+  int groups;
+  device float* scales_out;
+  threadgroup AccT* scratch;
+
+  METAL_FUNC PrologueGroupNorm(
+      const device VT* w_, float eps_, int group_, int groups_,
+      device float* scales_out_, threadgroup AccT* scratch_)
+      : w(w_), eps(eps_), group(group_), groups(groups_),
+        scales_out(scales_out_), scratch(scratch_) {}
+
+  template <typename S>
+  METAL_FUNC void prepare(
+      const device S* x, uint simd_gid, uint simd_lid, uint3 tid,
+      int n_threads) const {
+    const int t = int(simd_gid) * 32 + int(simd_lid);
+    const int n_simd = n_threads / 32;
+    threadgroup AccT* scale = scratch + kGroupNormMaxGroups * kGroupNormMaxSimd;
+    for (int g = 0; g < groups; g++) {
+      const device S* xs = x + g * group;
+      AccT acc = 0;
+      for (int i = t; i < group; i += n_threads) {
+        const AccT v = static_cast<AccT>(xs[i]);
+        acc += v * v;
+      }
+      acc = simd_sum(acc);
+      if (simd_lid == 0) {
+        scratch[g * kGroupNormMaxSimd + simd_gid] = acc;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < groups) {
+      AccT total = 0;
+      for (int k = 0; k < n_simd; k++) {
+        total += scratch[t * kGroupNormMaxSimd + k];
+      }
+      const AccT s = metal::rsqrt(total / static_cast<AccT>(group) + static_cast<AccT>(eps));
+      scale[t] = s;
+      if (scales_out != nullptr && tid.x == 0) {
+        scales_out[tid.z * groups + t] = static_cast<float>(s);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x * scratch[kGroupNormMaxGroups * kGroupNormMaxSimd + i / group] *
+        static_cast<AccT>(w[i]);
+  }
+  METAL_FUNC AccT scale(AccT, int) const { return AccT(1); }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -345,6 +462,11 @@ struct GEMVKernel {
 
   MLX_MTL_CONST short tgp_mem_size = BN > 1 ? BN * (blockM + TM) : 0;
   MLX_MTL_CONST bool needs_tgp_reduction = BN > 1;
+
+  // The inline norm's reduction is complete in one simdgroup only when the
+  // simdgroup spans K by itself.
+  static_assert(!Prologue::kInlineNorm || (BN == 1 && SN == 32),
+                "the inline norm needs a tile whose simdgroup walks all of K");
 
   template <typename U = T>
   static METAL_FUNC void load_unsafe(
@@ -428,9 +550,17 @@ struct GEMVKernel {
       uint simd_lid) {
     (void)lid;
 
+    // The grouped norm's first phase: every thread of the threadgroup takes
+    // part (it has threadgroup barriers), so it runs before any thread can
+    // leave on the row bound below. Compiled out for every other prologue.
+    if (Prologue::kGroupNorm) {
+      prologue.prepare(in_vec, simd_gid, simd_lid, tid, BM * BN * 32);
+    }
+
     thread AccT result[TM] = {0};
     thread T inter[TN];
     thread AccT v_coeff[TN];
+    AccT ssq = 0;
 
     const int thrM = SN != 32 ? (int)(simd_lid / SN) : 0;
     const int thrN = SN != 32 ? (int)(simd_lid % SN) : (int)simd_lid;
@@ -460,6 +590,13 @@ struct GEMVKernel {
     for (int i = 0; i < n_iter; ++i) {
       load_vec_unsafe<VT, AccT>(in_vec, v_coeff, bn);
 
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
+
       // The prologue transforms the input vector in registers, so a fused
       // producer's output is never written to memory (issue #266). Under
       // `PrologueNone` this is the identity and inlines away, which is what
@@ -484,6 +621,12 @@ struct GEMVKernel {
 
     if (leftover > 0) {
       load_vec_safe<VT, AccT>(in_vec, v_coeff, bn, in_size);
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
       // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
       // and the prologue must not index its weight out of bounds there. A
       // zero times anything is zero, so skipping the transform on the padding
@@ -509,6 +652,12 @@ struct GEMVKernel {
       MLX_MTL_PRAGMA_UNROLL
       for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
         result[tm] += simd_shuffle_down(result[tm], sn);
+      }
+    }
+    if (Prologue::kInlineNorm) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        ssq += simd_shuffle_down(ssq, sn);
       }
     }
 
@@ -549,6 +698,13 @@ struct GEMVKernel {
     // one way that is arithmetically defensible rather than left to whichever
     // order fell out.
     if (simdN == 0 && thrN == 0) {
+      if (Prologue::kInlineNorm) {
+        const AccT inv_rms = prologue.scale(ssq, in_vec_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          result[tm] *= inv_rms;
+        }
+      }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         const AccT y = epilogue(result[tm], out_row + tm);
@@ -1103,17 +1259,9 @@ void gemv_mul(
 // swappable.
 //
 // The scale buffer is produced by a separate reduction dispatch
-// (`reduce.metal`'s `rmsnorm_scale`). That is not a concession: it is forced.
-// A GEMV partitions the output across `n_tgp` threadgroups and Metal has no
-// cross-threadgroup barrier inside a dispatch, so no prologue can compute a
-// reduction over the whole input vector -- it can only recompute it per
-// threadgroup, which `measurements/issue-266-raw/prediction.py` prices at 432x
-// the reduction work.
-//
-// So this removes the normalized vector's ROUND-TRIP and not the norm's
-// dispatch. §12.1 is explicit that the round-trip is the win and the dispatch
-// count is the visible number; here the two come apart, and this arm collects
-// only the first.
+// (`reduce.metal`'s `rmsnorm_scale`), so this removes the normalized vector's
+// round-trip and not the norm's dispatch. `gemv_norm` (below) removes both by
+// recomputing the reduction in the K-walk.
 template <
     typename T,
     const int BM, const int BN,
@@ -1165,6 +1313,62 @@ void gemv_rmsnorm(
       prologue, epilogue_t(),
       tid, lid, simd_gid, simd_lid);
 }
+
+// `gemv_rmsnorm` without the imported scale: the RMSNorm's reduction is
+// computed in the GEMV (`PrologueNormInline`), so the norm is not its own
+// dispatch. The norm weight at 15 and `eps` at 16; `EPI` the output end.
+#define gemv_norm_wrapper(func, EPI)                                              \
+template <                                                                        \
+    typename T,                                                                   \
+    const int BM, const int BN,                                                   \
+    const int SM, const int SN,                                                   \
+    const int TM, const int TN,                                                   \
+    const bool kDoNCBatch,                                                        \
+    const bool kDoAxpby>                                                          \
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]                       \
+void func(                                                                        \
+    const device T* mat [[buffer(0)]],                                            \
+    const device T* in_vec [[buffer(1)]],                                         \
+    const device T* bias [[buffer(2)]],                                           \
+    device T* out_vec [[buffer(3)]],                                              \
+    const constant int& in_vec_size [[buffer(4)]],                                \
+    const constant int& out_vec_size [[buffer(5)]],                               \
+    const constant int& matrix_ld [[buffer(6)]],                                  \
+    const constant float& alpha [[buffer(7)]],                                    \
+    const constant float& beta [[buffer(8)]],                                     \
+    const constant int& batch_ndim [[buffer(9)]],                                 \
+    const constant int* batch_shape [[buffer(10)]],                               \
+    const constant int64_t* vector_batch_stride [[buffer(11)]],                   \
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],                   \
+    const constant int64_t* bias_batch_stride [[buffer(13)]],                     \
+    const constant int& bias_stride [[buffer(14)]],                               \
+    const device T* norm_weight [[buffer(15)]],                                   \
+    const constant float& norm_eps [[buffer(16)]],                                \
+    uint3 tid [[threadgroup_position_in_grid]],                                   \
+    uint3 lid [[thread_position_in_threadgroup]],                                 \
+    uint simd_gid [[simdgroup_index_in_threadgroup]],                             \
+    uint simd_lid [[thread_index_in_simdgroup]],                                  \
+    EOS_GATE_ARG) {                                                               \
+    EOS_GATE_CHECK                                                                \
+  using acc_t = typename GemvDefaultAccT<T>::type;                                \
+  using prologue_t = PrologueNormInline<T, acc_t>;                                \
+  using epilogue_t = EPI<T, acc_t>;                                               \
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;               \
+  gemv_tgp_memory(kernel_t);                                                      \
+  const prologue_t prologue(norm_weight, norm_eps);                               \
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,          \
+                 epilogue_t>(                                                     \
+      mat, in_vec, bias, out_vec,                                                 \
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,                          \
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,          \
+      bias_batch_stride, bias_stride,                                             \
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,                         \
+      prologue, epilogue_t(),                                                     \
+      tid, lid, simd_gid, simd_lid);                                              \
+}
+
+gemv_norm_wrapper(gemv_norm, EpilogueNone)
+gemv_norm_wrapper(gemv_norm_silu, EpilogueSilu)
 
 // The ICB-expressible sibling: one `device const GemvParams*` in place of the
 // seven `constant &` scalars, everything else unchanged.
@@ -1391,15 +1595,27 @@ void gemv_mul_packed(
 // Only the two decode tiles are instantiated, both `bn1`, so the threadgroup
 // reduction is compiled out; it is written for the general tile anyway with
 // a second region of threadgroup memory, so a third tile is one macro line.
+//
+// `Prologue` is `GEMVKernel`'s seam, applied the same way: `PrologueNone`
+// (what `gemv_swiglu` instantiates) inlines away, and `PrologueNormInline`
+// (`gemv_norm_swiglu`) takes `sum(x^2)` off the coefficients both sweeps
+// already share and scales BOTH accumulators by `1/rms` before the product —
+// `silu(s·g) * (s·u)` for the normalized input, the norm's dispatch removed
+// (`docs/tuning.md` §13.5t). It needs every simdgroup to walk all of K, as
+// `GEMVKernel`'s does.
 template <
     typename T,
     const int BM, const int BN,
     const int SM, const int SN,
     const int TM, const int TN,
-    typename AccT = typename GemvDefaultAccT<T>::type>
+    typename AccT = typename GemvDefaultAccT<T>::type,
+    typename Prologue = PrologueNone<T, AccT>>
 struct GEMVSwigluKernel {
   using acc_type = AccT;
   using base_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, false>;
+
+  static_assert(!Prologue::kInlineNorm || (BN == 1 && SN == 32),
+                "the inline norm needs each simdgroup to walk all of K");
 
   MLX_MTL_CONST int threadsM = BM * SM;
   MLX_MTL_CONST int threadsN = BN * SN;
@@ -1417,11 +1633,13 @@ struct GEMVSwigluKernel {
       const int out_vec_size,
       const int matrix_ld,
       threadgroup AccT* tgp_memory,
+      thread const Prologue& prologue,
       uint3 tid,
       uint simd_gid,
       uint simd_lid) {
     thread AccT up[TM] = {0};
     thread AccT gate[TM] = {0};
+    AccT ssq = 0;
     thread T inter[TN];
     thread AccT v_coeff[TN];
 
@@ -1448,6 +1666,16 @@ struct GEMVSwigluKernel {
 
     for (int i = 0; i < n_iter; ++i) {
       base_t::template load_unsafe<AccT>(in_vec, v_coeff, bn);
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
+      }
       int mat_offset = 0;
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
@@ -1468,6 +1696,20 @@ struct GEMVSwigluKernel {
 
     if (leftover > 0) {
       base_t::template load_safe<AccT>(in_vec, v_coeff, bn, in_size);
+      if (Prologue::kInlineNorm) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          ssq += v_coeff[tn] * v_coeff[tn];
+        }
+      }
+      // Past the end `load_safe` zero-fills, and the prologue must not index
+      // its weight there (`GEMVKernel::run`'s guard).
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        if (bn + tn < in_size) {
+          v_coeff[tn] = prologue(v_coeff[tn], bn + tn);
+        }
+      }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         base_t::load_safe(&mat_up[tm * matrix_ld], inter, bn, in_size);
@@ -1489,6 +1731,12 @@ struct GEMVSwigluKernel {
       for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
         up[tm] += simd_shuffle_down(up[tm], sn);
         gate[tm] += simd_shuffle_down(gate[tm], sn);
+      }
+    }
+    if (Prologue::kInlineNorm) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        ssq += simd_shuffle_down(ssq, sn);
       }
     }
 
@@ -1518,6 +1766,14 @@ struct GEMVSwigluKernel {
     // The product on the two accumulators, one thread per output element,
     // one rounding at the store.
     if (simdN == 0 && thrN == 0) {
+      if (Prologue::kInlineNorm) {
+        const AccT inv_rms = prologue.scale(ssq, in_vec_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          up[tm] *= inv_rms;
+          gate[tm] *= inv_rms;
+        }
+      }
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
         out_vec[out_row + tm] = static_cast<T>(silu(gate[tm]) * up[tm]);
@@ -1534,6 +1790,7 @@ template <
     const int SM, const int SN,
     const int TM, const int TN,
     const bool kDoNCBatch,
+    typename Prologue,
     typename ShapeP, typename StrideP>
 METAL_FUNC void gemv_swiglu_body(
     const device T* mat_up,
@@ -1548,10 +1805,12 @@ METAL_FUNC void gemv_swiglu_body(
     StrideP vector_batch_stride,
     StrideP matrix_batch_stride,
     threadgroup typename GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>::acc_type* tgp_memory,
+    thread const Prologue& prologue,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  using kernel_t = GEMVSwigluKernel<
+      T, BM, BN, SM, SN, TM, TN, typename GemvDefaultAccT<T>::type, Prologue>;
   if (kDoNCBatch) {
     in_vec   += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
     mat_up   += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
@@ -1564,7 +1823,7 @@ METAL_FUNC void gemv_swiglu_body(
   out_vec += tid.z * out_vec_size;
   kernel_t::run(mat_up, mat_gate, in_vec, out_vec,
                 in_vec_size, out_vec_size, matrix_ld,
-                tgp_memory, tid, simd_gid, simd_lid);
+                tgp_memory, prologue, tid, simd_gid, simd_lid);
 }
 
 // `gemv`'s classical signature — `mat` is the UP weight at 0 — with the gate
@@ -1602,13 +1861,65 @@ void gemv_swiglu(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)bias; (void)alpha; (void)beta; (void)bias_batch_stride; (void)bias_stride; (void)lid;
   using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
-  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch>(
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, prologue_t>(
       mat, mat_gate, in_vec, out_vec,
       in_vec_size, out_vec_size, matrix_ld,
       batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
-      tid, simd_gid, simd_lid);
+      prologue, tid, simd_gid, simd_lid);
+}
+
+// `gemv_swiglu` with the RMSNorm computed inside it (`PrologueNormInline`):
+// `silu(gate·n(x)) * (up·n(x))`, `n(x) = x * w / sqrt(mean(x^2) + eps)`. The
+// classical layout, the gate weight at 15 as `gemv_swiglu` binds it, the
+// norm's weight and epsilon after it at 16 and 17 (`gemv_norm` binds them at
+// 15 and 16; 15 is taken here).
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_norm_swiglu(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    const device T* mat_gate [[buffer(15)]],
+    const device T* norm_weight [[buffer(16)]],
+    const constant float& norm_eps [[buffer(17)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)bias; (void)alpha; (void)beta; (void)bias_batch_stride; (void)bias_stride; (void)lid;
+  using acc_t = typename GemvDefaultAccT<T>::type;
+  using prologue_t = PrologueNormInline<T, acc_t>;
+  using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN, acc_t, prologue_t>;
+  gemv_tgp_memory(kernel_t);
+  const prologue_t prologue(norm_weight, norm_eps);
+  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, prologue_t>(
+      mat, mat_gate, in_vec, out_vec,
+      in_vec_size, out_vec_size, matrix_ld,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, tid, simd_gid, simd_lid);
 }
 
 template <
@@ -1636,14 +1947,16 @@ void gemv_swiglu_packed(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   (void)bias; (void)bias_batch_stride; (void)lid;
   using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
   GemvParams p = *pp;
-  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch>(
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, prologue_t>(
       mat, mat_gate, in_vec, out_vec,
       p.in_vec_size, p.out_vec_size, p.matrix_ld,
       p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
-      tid, simd_gid, simd_lid);
+      prologue, tid, simd_gid, simd_lid);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1947,6 +2260,18 @@ void gemv_t_packed(
   instantiate_gemv_swiglu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_swiglu_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
+// `gemv_norm_swiglu`: the dispatcher builds `_norm` then the epilogue's
+// `_swiglu`, the order `gemv_norm_silu` takes; the same two tiles.
+#define instantiate_gemv_norm_swiglu_helper(nm, itype, bm, bn, sm, sn, tm, tn)      \
+  template [[host_name("gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn          \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_norm_swiglu")]]                              \
+  [[kernel]] decltype(gemv_norm_swiglu<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_norm_swiglu<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_norm_swiglu_blocks(nm, itype)              \
+  instantiate_gemv_norm_swiglu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_norm_swiglu_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
 // The packed siblings of the two epilogue arms (issue #732 P3), named as every
 // packed name is: `_packed` LAST, `…_nc0_axpby0_silu_packed` — the replay
 // executor classifies a position by that suffix (`icb.rs` `is_packed`), so a
@@ -2098,6 +2423,77 @@ gemv_mixed_wrapper(gemv_mixed_sigmoid, EpilogueSigmoidScale, epilogue_t(alpha))
   instantiate_gemv_mixed_helper(gemv_mixed_silu, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, "_silu") \
   instantiate_gemv_mixed_helper(gemv_mixed_sigmoid, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, "_sigmoid")
 
+// The mixed GEMV with the grouped norm inside it (`PrologueGroupNorm`): the
+// classical layout, then the norm weight (`VT`, `[groups · group]`) at 15, its
+// epsilon at 16, the group size and count at 17 and 18, the scales' output at
+// 19 and whether to write it at 20.
+#define gemv_mixed_gnorm_wrapper(func, EPI, EPI_CTOR)                             \
+template <                                                                        \
+    typename T, typename VT,                                                      \
+    const int BM, const int BN,                                                   \
+    const int SM, const int SN,                                                   \
+    const int TM, const int TN,                                                   \
+    const bool kDoNCBatch,                                                        \
+    const bool kDoAxpby>                                                          \
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]                       \
+void func(                                                                        \
+    const device T* mat [[buffer(0)]],                                            \
+    const device VT* in_vec [[buffer(1)]],                                        \
+    const device VT* bias [[buffer(2)]],                                          \
+    device VT* out_vec [[buffer(3)]],                                             \
+    const constant int& in_vec_size [[buffer(4)]],                                \
+    const constant int& out_vec_size [[buffer(5)]],                               \
+    const constant int& matrix_ld [[buffer(6)]],                                  \
+    const constant float& alpha [[buffer(7)]],                                    \
+    const constant float& beta [[buffer(8)]],                                     \
+    const constant int& batch_ndim [[buffer(9)]],                                 \
+    const constant int* batch_shape [[buffer(10)]],                               \
+    const constant int64_t* vector_batch_stride [[buffer(11)]],                   \
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],                   \
+    const constant int64_t* bias_batch_stride [[buffer(13)]],                     \
+    const constant int& bias_stride [[buffer(14)]],                               \
+    const device VT* norm_weight [[buffer(15)]],                                  \
+    const constant float& norm_eps [[buffer(16)]],                                \
+    const constant int& norm_group [[buffer(17)]],                                \
+    const constant int& norm_groups [[buffer(18)]],                               \
+    device float* scales_out [[buffer(19)]],                                      \
+    const constant int& write_scales [[buffer(20)]],                              \
+    uint3 tid [[threadgroup_position_in_grid]],                                   \
+    uint3 lid [[thread_position_in_threadgroup]],                                 \
+    uint simd_gid [[simdgroup_index_in_threadgroup]],                             \
+    uint simd_lid [[thread_index_in_simdgroup]],                                  \
+    EOS_GATE_ARG) {                                                               \
+    EOS_GATE_CHECK                                                                \
+  static_assert(BM * BN <= kGroupNormMaxSimd, "the scratch holds 8 simdgroups");  \
+  using acc_t = typename GemvDefaultAccT<T>::type;                                \
+  using prologue_t = PrologueGroupNorm<VT, acc_t>;                                \
+  using epilogue_t = EPI<T, acc_t>;                                               \
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby, acc_t,         \
+                              prologue_t, epilogue_t, VT>;                        \
+  gemv_tgp_memory(kernel_t);                                                      \
+  threadgroup acc_t gn_scratch[kGroupNormScratch];                                \
+  const prologue_t prologue(norm_weight, norm_eps, norm_group, norm_groups,       \
+                            write_scales != 0 ? scales_out : nullptr, gn_scratch);\
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,          \
+                 epilogue_t>(                                                     \
+      mat, in_vec, bias, out_vec,                                                 \
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,                          \
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,          \
+      bias_batch_stride, bias_stride,                                             \
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,                         \
+      prologue, EPI_CTOR,                                                         \
+      tid, lid, simd_gid, simd_lid);                                              \
+}
+
+gemv_mixed_gnorm_wrapper(gemv_mixed_gnorm, EpilogueNone, epilogue_t())
+gemv_mixed_gnorm_wrapper(gemv_mixed_gnorm_silu, EpilogueSiluScale, epilogue_t(alpha))
+
+// Only the tile Qwen4-exp's HyperConnection GEMVs select (`[320, 10240]` and
+// `[4, 10240]`: `k >= 16 n`, `bm1 bn8 sm1 sn32 tm4`): 256 threads, the
+// threadgroup `hc_norm_f32` reduces with. The host refuses any other.
+instantiate_gemv_mixed_helper(gemv_mixed_gnorm, f16w_f32, half, float, 1, 8, 1, 32, 4, 4, "_gnorm")
+instantiate_gemv_mixed_helper(gemv_mixed_gnorm_silu, f16w_f32, half, float, 1, 8, 1, 32, 4, 4, "_silu_gnorm")
+
 // The seven `gemv` tiles `derive_gemv_tile` can select, at `tm` 4 and 1.
 #define instantiate_gemv_mixed_blocks(nm, wtype, vtype)                  \
   instantiate_gemv_mixed_tile(nm, wtype, vtype, 1,  8, 1, 32, 4, 4)      \
@@ -2129,6 +2525,24 @@ instantiate_gemv_rmsnorm_blocks(bfloat16, bfloat)
 
 // The fused-epilogue tiles. `bm8` is the one w1 selects and therefore the only
 // one decode reaches; `bm4` is the fixture's second tile (see the helper).
+// The inline-norm arms (`gemv_norm_wrapper`), at the two decode tiles: the
+// only tiles whose simdgroup walks all of K.
+#define instantiate_gemv_norm_helper(func, nm, itype, bm, suffix)               \
+  template [[host_name(                                                        \
+      "gemv_" #nm "_bm" #bm "_bn1_sm1_sn32_tm4_tn4_nc0_axpby0" suffix)]]        \
+  [[kernel]] decltype(func<itype, bm, 1, 1, 32, 4, 4, false, false>)           \
+             func<itype, bm, 1, 1, 32, 4, 4, false, false>;
+
+#define instantiate_gemv_norm_blocks(nm, itype)                                \
+  instantiate_gemv_norm_helper(gemv_norm, nm, itype, 4, "_norm")               \
+  instantiate_gemv_norm_helper(gemv_norm, nm, itype, 8, "_norm")               \
+  instantiate_gemv_norm_helper(gemv_norm_silu, nm, itype, 4, "_norm_silu")     \
+  instantiate_gemv_norm_helper(gemv_norm_silu, nm, itype, 8, "_norm_silu")
+
+instantiate_gemv_norm_blocks(float32, float)
+instantiate_gemv_norm_blocks(float16, half)
+instantiate_gemv_norm_blocks(bfloat16, bfloat)
+
 #define instantiate_gemv_silu_blocks(nm, itype)              \
   instantiate_gemv_silu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_silu_helper(nm, itype, 8, 1, 1, 32, 4, 4)
@@ -2152,6 +2566,9 @@ instantiate_gemv_mul_blocks(bfloat16, bfloat)
 instantiate_gemv_swiglu_blocks(float32, float)
 instantiate_gemv_swiglu_blocks(float16, half)
 instantiate_gemv_swiglu_blocks(bfloat16, bfloat)
+instantiate_gemv_norm_swiglu_blocks(float32, float)
+instantiate_gemv_norm_swiglu_blocks(float16, half)
+instantiate_gemv_norm_swiglu_blocks(bfloat16, bfloat)
 
 // Their packed siblings (issue #732 P3): twelve names, the same two tiles.
 instantiate_gemv_epilogue_packed_blocks(float32, float)

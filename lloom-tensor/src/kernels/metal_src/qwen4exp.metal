@@ -75,6 +75,35 @@ kernel void hc_collapse_f32(
   out[idx] = acc * (1.0f / (float)n);
 }
 
+// `hc_collapse_f32` over the carry itself: `xn` recomputed from `h`, the
+// stream scales a grouped-norm GEMV wrote (`PrologueGroupNorm`'s side output,
+// `scales[r·n + s]`) and γ, as `hc_norm_f32` forms it — `(h · scale) · γ` —
+// so `hc_norm_f32`'s launch and its `[n·d]` write are not needed
+// (`docs/tuning.md` §13.5u). One thread per output element.
+kernel void hc_collapse_scaled_f32(
+    const device float* h [[buffer(0)]],
+    const device float* gamma [[buffer(1)]],
+    const device float* scales [[buffer(2)]],
+    const device float* gate [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& d [[buffer(6)]],
+    constant uint& rows [[buffer(7)]],
+    uint idx [[thread_position_in_grid]]) {
+  if (idx >= rows * d) {
+    return;
+  }
+  const uint r = idx / d;
+  const uint i = idx % d;
+  const size_t base = (size_t)r * n * d + i;
+  float acc = 0.0f;
+  for (uint s = 0; s < n; s++) {
+    const float xn = h[base + (size_t)s * d] * scales[r * n + s] * gamma[(size_t)s * d + i];
+    acc += xn * gate[base + (size_t)s * d];
+  }
+  out[idx] = acc * (1.0f / (float)n);
+}
+
 // `out[r, s·d + i] = h[r, s·d + i] + bo[r, i] · 2·sigmoid(inject[r, s] / n)`
 // — the epilogue's scatter of the block output across the streams, weighted
 // by the prediction, centred on 1. One thread per output element.

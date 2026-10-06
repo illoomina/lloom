@@ -139,6 +139,11 @@ impl ConstantValues {
         Self(values)
     }
 
+    /// The `(index, value)` pairs, to extend into another set.
+    pub fn into_values(self) -> Vec<(usize, Value)> {
+        self.0
+    }
+
     fn function_constant_values(&self) -> FunctionConstantValues {
         let f = FunctionConstantValues::new();
         for (index, value) in &self.0 {

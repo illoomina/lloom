@@ -189,6 +189,47 @@ pub fn call_hc_collapse(
     Ok(())
 }
 
+/// `hc_collapse_scaled_f32`: [`call_hc_collapse`] with `xn` recomputed from
+/// the carry `h`, γ and the per-row stream `scales` (`rows · n` f32) a
+/// grouped-norm GEMV wrote — `(h · scale) · γ`, `hc_norm_f32`'s form.
+#[allow(clippy::too_many_arguments)]
+pub fn call_hc_collapse_scaled(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    n: usize,
+    d: usize,
+    h: BufferOffset,
+    gamma: BufferOffset,
+    scales: BufferOffset,
+    gate: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "hc_collapse_scaled_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "hc_collapse_scaled rows={rows} n={n} d={d}");
+    set_params!(
+        encoder,
+        (
+            &h,
+            &gamma,
+            &scales,
+            &gate,
+            Output::new(out),
+            n as u32,
+            d as u32,
+            rows as u32
+        )
+    );
+    let total = rows * d;
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, total.div_ceil(width), width);
+    Ok(())
+}
+
 /// `hc_combine_f32`: `out [rows, n·d] = h + bo ⊗ 2·sigmoid(inject / n)`.
 #[allow(clippy::too_many_arguments)]
 pub fn call_hc_combine(

@@ -241,6 +241,12 @@ pub struct CommonArgs {
     #[arg(long, value_name = "JSON")]
     pub generation_config: Option<String>,
 
+    /// The speculative body by name (`speculative.method`): `none`, `dspark`,
+    /// `mtp`, or `auto` — the family's own drafter when one is at hand.
+    /// `--dspark` and `--mtp` override it.
+    #[arg(long, value_name = "METHOD")]
+    pub speculate: Option<String>,
+
     /// LFM2: the speculative body (`speculative.method = dspark`): a DSpark
     /// drafter proposes a block per round, the target verifies it in one
     /// pass. Loads the newest LFM2.5-2.6B-DSpark snapshot in the HF cache,
@@ -360,6 +366,10 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
     // The speculation shorthands (the harnesses' spellings), over the group.
     if common.dspark && common.mtp.is_some() {
         anyhow::bail!("--dspark is LFM2's drafter and --mtp Qwen4-exp's; one speculative body per run");
+    }
+    if let Some(m) = &common.speculate {
+        o.speculative.method =
+            crate::options::parse_method(m).map_err(|e| anyhow::anyhow!("--speculate: {e}"))?;
     }
     if common.dspark {
         o.speculative.method = "dspark".into();

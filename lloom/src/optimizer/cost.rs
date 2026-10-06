@@ -240,8 +240,22 @@ pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
             .collect();
         let new = match n.op {
             Op::Fused if n.name == fragment => {
-                let g = out.gemv(inputs[0], inputs[1]);
+                let g = out.gemv_on(n.core, inputs[0], inputs[1]);
+                // A scaling block stands for its constant's `affine` too,
+                // unless the constant is 1 (nothing was absorbed).
+                let scaled = |out: &mut Graph, g: NodeId| match n.scalar {
+                    Some(c) if c != 1.0 => out.scale(g, c),
+                    _ => g,
+                };
                 match (n.name.as_str(), inputs.get(2)) {
+                    ("mixed_silu", None) => {
+                        let s = scaled(&mut out, g);
+                        out.silu(s)
+                    }
+                    ("mixed_sigmoid", None) => {
+                        let s = scaled(&mut out, g);
+                        out.sigmoid(s)
+                    }
                     ("silu", None) => out.silu(g),
                     ("residual", Some(&r)) => out.add(g, r),
                     // The emitter's operand order: `mul(gate, up)`, the gate

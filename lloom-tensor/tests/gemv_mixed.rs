@@ -132,3 +132,88 @@ fn tensor_f16_forward_takes_the_mixed_arm_for_a_decode_row() -> Result<()> {
     assert_eq!(out8.dtype(), DType::F32);
     Ok(())
 }
+
+/// The mixed GEMV with a grouped RMSNorm of its input inside it
+/// (`QMatMul::gemv_mixed_gnorm`, `PrologueGroupNorm`): against an f64
+/// reference of the norm then the GEMV at the HyperConnection shapes it is
+/// instantiated for (`[320, 10240]` with SiLU and the scales written,
+/// `[4, 10240]` plain), four groups of 2 560; the scales it writes against the
+/// reference's; and `gemv_mixed_gnorm_serves` exactly where the kernel runs.
+#[test]
+fn mixed_gemv_with_a_grouped_norm_matches_the_reference() -> Result<()> {
+    let Ok(gpu) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let (groups, eps) = (4usize, 1e-6f32);
+    for &(n_out, k, epi, scale, scales) in &[
+        (320usize, 10240usize, MixedEpilogue::Silu, 0.25f32, true),
+        (4, 10240, MixedEpilogue::None, 1.0, false),
+    ] {
+        let group = k / groups;
+        let w = weight(n_out, k, 1.3, &gpu)?;
+        let x = input(1, k, 0.4, &gpu)?;
+        let gamma: Vec<f32> = (0..k).map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin()).collect();
+        let g = Tensor::from_vec(gamma.clone(), k, &gpu)?;
+        let wv: Vec<f32> = w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let xv: Vec<f32> = x.flatten_all()?.to_vec1()?;
+        let mut xn = vec![0f64; k];
+        let mut want_s = vec![0f64; groups];
+        for gi in 0..groups {
+            let seg = &xv[gi * group..(gi + 1) * group];
+            let ms = seg.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / group as f64;
+            want_s[gi] = 1.0 / (ms + eps as f64).sqrt();
+            for j in 0..group {
+                xn[gi * group + j] = seg[j] as f64 * want_s[gi] * gamma[gi * group + j] as f64;
+            }
+        }
+        let want: Vec<f64> = (0..n_out)
+            .map(|r| {
+                let y: f64 = (0..k).map(|c| wv[r * k + c] as f64 * xn[c]).sum();
+                match epi {
+                    MixedEpilogue::None => y,
+                    MixedEpilogue::Silu => {
+                        let v = scale as f64 * y;
+                        v / (1.0 + (-v).exp())
+                    }
+                    MixedEpilogue::Sigmoid => unreachable!(),
+                }
+            })
+            .collect();
+        let qm = QMatMul::TensorF16(w.clone());
+        let got: Vec<f32> = qm
+            .gemv_mixed_gnorm(&x, &g, eps, groups, epi, scale, scales)
+            .expect("the kernel is instantiated for this shape")?
+            .flatten_all()?
+            .to_vec1()?;
+        assert_eq!(got.len(), n_out + if scales { groups } else { 0 });
+        // `f64::max` drops a NaN, so a non-finite output would read as no error.
+        assert!(got.iter().all(|v| v.is_finite()), "gemv_mixed_gnorm [{n_out}, {k}]: a non-finite output");
+        let mag = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+        let err = got[..n_out]
+            .iter()
+            .zip(&want)
+            .fold(0f64, |m, (a, b)| m.max((*a as f64 - b).abs()))
+            / mag;
+        println!("gemv_mixed_gnorm [{n_out}, {k}] {epi:?} rel_err {err:.3e}");
+        assert!(err < 1e-5, "gemv_mixed_gnorm [{n_out}, {k}]: rel_err {err}");
+        if scales {
+            for gi in 0..groups {
+                let e = (got[n_out + gi] as f64 - want_s[gi]).abs() / want_s[gi];
+                assert!(e < 1e-5, "scale {gi}: {} against {}", got[n_out + gi], want_s[gi]);
+            }
+        }
+    }
+    use lloom_tensor::kernels::gemv_mixed_gnorm_serves as serves;
+    assert!(serves(320, 10240, 4) && serves(4, 10240, 4));
+    assert!(!serves(10240, 320, 4), "the up projection takes the bm8 tile");
+    assert!(!serves(320, 10240, 3), "10240 does not split into 3");
+    assert!(!serves(320, 10240, 9), "more groups than the scratch holds");
+    let qm = QMatMul::TensorF16(weight(10240, 320, 0.2, &gpu)?);
+    let g = Tensor::ones(320, DType::F32, &gpu)?;
+    assert!(
+        qm.gemv_mixed_gnorm(&input(1, 320, 0.1, &gpu)?, &g, eps, 4, MixedEpilogue::None, 1.0, false)
+            .is_none(),
+        "declined where the tile is not instantiated"
+    );
+    Ok(())
+}

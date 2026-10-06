@@ -266,7 +266,9 @@ fn qwen_kv_precision(
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
-    if !cap.speculation.contains(&s.speculative.method.as_str()) && s.speculative.method != "none" {
+    if !cap.speculation.contains(&s.speculative.method.as_str())
+        && !matches!(s.speculative.method.as_str(), "none" | "auto")
+    {
         anyhow::bail!(
             "speculative.method = {} is not {}'s (its methods: [{}])",
             s.speculative.method,
@@ -483,6 +485,41 @@ fn clamp_ungated_eos_gate(cap: &Capabilities, shape: &mut Shape) -> Option<Strin
     rides.then(|| format!("eos_gate is off on {}: {}", cap.family, cap.eos_gate_missing))
 }
 
+/// `speculative.method = auto` resolved for `family`: LFM2's DSpark when
+/// `speculative.drafter` names a checkpoint or the HF cache holds one;
+/// Qwen4-exp's MTP when it names the head's sidecar or
+/// `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, at `--batch 1` (the head
+/// speculates at one row); else `none`. The note names the choice, so a run
+/// records which arm it took.
+fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
+    if shape.speculative.method != "auto" {
+        return None;
+    }
+    let batch = shape.batch;
+    let spec = &mut shape.speculative;
+    let chosen = match family {
+        "lfm2" => (spec.drafter.is_some()
+            || super::common::newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").is_some())
+        .then_some("dspark"),
+        "qwen4exp" => {
+            if spec.drafter.is_none() {
+                spec.drafter = std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".cache/lloom/qwen4exp-mtp-q8.gguf"))
+                    .filter(|p| p.is_file());
+            }
+            (spec.drafter.is_some() && batch <= 1).then_some("mtp")
+        }
+        _ => None,
+    };
+    spec.method = chosen.unwrap_or("none").into();
+    Some(match (&spec.drafter, chosen) {
+        (Some(d), Some(m)) => format!("auto -> {m} (drafter {})", d.display()),
+        (_, Some(m)) => format!("auto -> {m} (the HF cache's drafter)"),
+        _ => format!("auto -> none (no {family} drafter at hand, or --batch {batch})"),
+    })
+}
+
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
 pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     let path = match &model.model {
@@ -492,6 +529,9 @@ pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf
     };
     let (family, checkpoint) = detect(&path)?;
     let mut shape = shape;
+    if let Some(note) = resolve_auto_speculation(family.name(), &mut shape) {
+        eprintln!("[speculate: {note}]");
+    }
     let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
     if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
@@ -583,6 +623,44 @@ mod tests {
         s.speculative.method = "mtp".into();
         s.speculative.drafter = Some("/x.gguf".into());
         Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap();
+    }
+
+    /// `auto` resolves to the family's own drafter when one is named, to
+    /// `none` at `--batch` > 1 on Qwen4-exp and for a family with none, and
+    /// passes `resolve` as a method of every family.
+    #[test]
+    fn auto_speculation_takes_the_familys_drafter_when_one_is_at_hand() {
+        let m = model_args(&[]);
+        let drafter = std::env::temp_dir().join(format!("lloom-auto-{}.gguf", std::process::id()));
+        std::fs::write(&drafter, b"x").unwrap();
+        let auto = |batch: usize, drafter: Option<&Path>| {
+            let mut s = shape();
+            s.batch = batch;
+            s.speculative.method = "auto".into();
+            s.speculative.drafter = drafter.map(Path::to_path_buf);
+            s
+        };
+        let mut s = auto(1, Some(&drafter));
+        let note = resolve_auto_speculation("qwen4exp", &mut s).expect("a note");
+        assert_eq!(s.speculative.method, "mtp", "{note}");
+        let mut s = auto(2, Some(&drafter));
+        resolve_auto_speculation("qwen4exp", &mut s);
+        assert_eq!(s.speculative.method, "none", "the MTP head speculates at one row");
+        let mut s = auto(1, Some(&drafter));
+        resolve_auto_speculation("lfm2", &mut s);
+        assert_eq!(s.speculative.method, "dspark");
+        let mut s = auto(1, Some(&drafter));
+        resolve_auto_speculation("gemma", &mut s);
+        assert_eq!(s.speculative.method, "none");
+        // A named method is left as it is.
+        let mut s = shape();
+        s.speculative.method = "mtp".into();
+        assert!(resolve_auto_speculation("qwen4exp", &mut s).is_none());
+        assert_eq!(s.speculative.method, "mtp");
+        // Unresolved, `auto` is a method every family's `resolve` takes.
+        Lfm2Family.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
+        Qwen4ExpFamily.resolve(&Requested { model: &m, shape: auto(1, None) }).unwrap();
+        std::fs::remove_file(&drafter).ok();
     }
 
     fn with_kv_quant(value: &str) -> Shape {

@@ -56,7 +56,6 @@ pub mod jina_bert;
 pub mod lfm2;
 pub mod lfm2_dspark;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod lfm2_ir;
 pub mod lfm2_presets;
 pub mod lfm2_testing;
 pub mod lfm2_vl;
@@ -120,7 +119,6 @@ pub mod qwen3_moe;
 pub mod qwen3_vl;
 pub mod qwen4exp;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod qwen4exp_ir;
 pub mod recurrent_gemma;
 pub mod repvgg;
 pub mod resnet;

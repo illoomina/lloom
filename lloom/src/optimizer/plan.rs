@@ -45,6 +45,8 @@ pub struct Regions {
     pub conv_ring: usize,
     /// Attention layers with a KV cache.
     pub kv: usize,
+    /// Linear-attention layers with a recurrent state.
+    pub ssm: usize,
     /// Nodes marked stateful, over all regions.
     pub nodes: usize,
     /// Fused sites whose GEMV, or the elementwise dispatch it absorbed, was
@@ -120,9 +122,15 @@ impl fmt::Display for FusionPlan {
         }
         write!(
             f,
-            " regions[conv-ring={} kv={} nodes={} fused-in-stateful={}",
-            self.regions.conv_ring,
-            self.regions.kv,
+            " regions[conv-ring={} kv={}",
+            self.regions.conv_ring, self.regions.kv
+        )?;
+        if self.regions.ssm > 0 {
+            write!(f, " ssm={}", self.regions.ssm)?;
+        }
+        write!(
+            f,
+            " nodes={} fused-in-stateful={}",
             self.regions.nodes,
             self.regions.fused_in_stateful.len()
         )?;
@@ -154,6 +162,10 @@ pub fn regions(source: &Graph, sites: &Sites) -> Regions {
             .filter(|r| matches!(r, Region::ConvRing(_)))
             .count(),
         kv: marked.keys().filter(|r| matches!(r, Region::Kv(_))).count(),
+        ssm: marked
+            .keys()
+            .filter(|r| matches!(r, Region::Ssm(_)))
+            .count(),
         nodes: marked.values().map(Vec::len).sum(),
         fused_in_stateful: Vec::new(),
     };

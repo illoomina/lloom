@@ -1029,6 +1029,18 @@ impl QTensor {
         Self::new(storage, shape)
     }
 
+    /// A tensor of `shape` and `dtype` over ONE block of storage: what a
+    /// model's structure says about a weight (its kind and extents) with
+    /// none of its bytes — `lloom::testing::ghost`, a model built to be
+    /// walked. No kernel may read it: a dispatch would read past its block.
+    #[doc(hidden)]
+    pub fn ghost<S: Into<Shape>>(shape: S, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        check_shape(&shape, dtype.block_size())?;
+        let storage = device.qzeros(dtype.block_size(), dtype)?;
+        Self::new(storage, shape)
+    }
+
     /// [`Self::zeros`] in storage that is not a pool bucket — a persistent
     /// Private allocation on Metal (`QMetalStorage::persistent`), the CPU
     /// storage as it is. The slot pool of a streamed weight tier.
@@ -1659,6 +1671,20 @@ impl QMatMul {
         epilogue: gemv_mixed::MixedEpilogue,
         scale: f32,
     ) -> Option<Result<Tensor>> {
+        let w = self.mixed_weight(xs)?;
+        Some(xs.apply_op1_no_bwd(&gemv_mixed::GemvMixed {
+            w: w.clone(),
+            epilogue,
+            scale,
+            gnorm: None,
+        }))
+    }
+
+    /// The f16 weight when the mixed arm serves `xs`: Metal, an f32 `xs` whose
+    /// last dim is the weight's `k`, contiguous, at most
+    /// [`gemv_mixed::GEMV_MIXED_MAX_ROWS`] rows. One predicate for both mixed
+    /// entry points, so they cannot disagree on what they take.
+    fn mixed_weight(&self, xs: &Tensor) -> Option<&Tensor> {
         let w = match self {
             Self::TensorF16(w) => w,
             _ => return None,
@@ -1681,11 +1707,78 @@ impl QMatMul {
         if rows == 0 || rows > gemv_mixed::GEMV_MIXED_MAX_ROWS {
             return None;
         }
+        Some(w)
+    }
+
+    /// [`Self::gemv_mixed`] over `norm(xs)`, the grouped RMSNorm computed
+    /// inside the launch (`docs/tuning.md` §13.5u): `xs` `[.., k]` normalized
+    /// per group of `k / groups`, then scaled by `gamma` `[k]` f32. With
+    /// `scales`, the `groups` scales `rsqrt(mean(x_g^2) + eps)` follow the
+    /// `n_out` outputs (`[.., n_out + groups]`, one row only). `None` where
+    /// [`Self::gemv_mixed_gnorm_applies`] is false — the caller composes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mixed_gnorm(
+        &self,
+        xs: &Tensor,
+        gamma: &Tensor,
+        eps: f32,
+        groups: usize,
+        epilogue: gemv_mixed::MixedEpilogue,
+        scale: f32,
+        scales: bool,
+    ) -> Option<Result<Tensor>> {
+        if !self.gemv_mixed_gnorm_applies(xs, gamma, groups, epilogue, scales) {
+            return None;
+        }
+        let w = self.mixed_weight(xs)?;
         Some(xs.apply_op1_no_bwd(&gemv_mixed::GemvMixed {
             w: w.clone(),
             epilogue,
             scale,
+            gnorm: Some(gemv_mixed::GroupNorm {
+                gamma: gamma.clone(),
+                eps,
+                groups,
+                scales,
+            }),
         }))
+    }
+
+    /// Whether [`Self::gemv_mixed_gnorm`] serves these arguments, decided
+    /// without dispatching anything: [`Self::gemv_mixed`]'s conditions, the
+    /// instantiated tile (`kernels::gemv_mixed_gnorm_serves`), an epilogue
+    /// other than the sigmoid, one row when the scales are asked for, and a
+    /// contiguous f32 `gamma` of `k` on Metal. A caller fusing several
+    /// consumers of one normalized input checks them all first.
+    pub fn gemv_mixed_gnorm_applies(
+        &self,
+        xs: &Tensor,
+        gamma: &Tensor,
+        groups: usize,
+        epilogue: gemv_mixed::MixedEpilogue,
+        scales: bool,
+    ) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            let Some(w) = self.mixed_weight(xs) else {
+                return false;
+            };
+            let Ok((n_out, k)) = w.dims2() else {
+                return false;
+            };
+            crate::kernels::gemv_mixed_gnorm_serves(n_out, k, groups)
+                && epilogue != gemv_mixed::MixedEpilogue::Sigmoid
+                && (!scales || xs.elem_count() == k)
+                && gamma.dtype() == DType::F32
+                && gamma.device().is_metal()
+                && gamma.is_contiguous()
+                && gamma.elem_count() == k
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (xs, gamma, groups, epilogue, scales);
+            false
+        }
     }
 }
 

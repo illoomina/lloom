@@ -19,21 +19,25 @@
 //! reports the step's recurrences and which fused sites sit in one.
 
 pub mod cost;
+pub mod diff;
 pub mod egraph;
 pub mod exclusions;
 pub mod fragments;
 pub mod ir;
 pub mod numeric;
 pub mod plan;
+pub mod walk;
 
 use lloom_tensor::Result;
 
 pub use cost::{CostModel, Marginal, StepCost};
+pub use diff::{diff, listing, IrDiff};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
-pub use ir::{Census, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape};
+pub use ir::{Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape};
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
+pub use walk::{walk, Visit, Walker};
 
 /// What the derivation may do.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,9 +98,30 @@ impl Policy {
     /// different facts. Each with the reason: no entry, or an entry recorded
     /// under another model.
     pub fn unvalidated(&self) -> Vec<(String, String)> {
-        let set = exclusions::embedded();
-        catalogue()
+        self.unvalidated_of(&catalogue())
+    }
+
+    /// [`Self::unvalidated`] for the fragments a derivation over `graph` can
+    /// place: those on a core the graph runs a product on.
+    pub fn unvalidated_in(&self, graph: &Graph) -> Vec<(String, String)> {
+        let cores: std::collections::BTreeSet<Core> = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.op == Op::Gemv)
+            .map(|n| n.core)
+            .collect();
+        let fragments: Vec<Fragment> = catalogue()
             .into_iter()
+            .filter(|f| cores.contains(&f.core))
+            .collect();
+        self.unvalidated_of(&fragments)
+    }
+
+    fn unvalidated_of(&self, fragments: &[Fragment]) -> Vec<(String, String)> {
+        let set = exclusions::embedded();
+        fragments
+            .iter()
+            .cloned()
             .filter_map(|f| {
                 let t = ExclusionSet::fragment_transform(f.name);
                 match set.lookup(&t, &f.model) {
@@ -467,18 +492,23 @@ mod tests {
 
     /// The default policy asks the set under each fragment's own model; a
     /// fragment the set only knows under another model is unvalidated, with
-    /// the two models named.
+    /// the two models named. The GEMV's four were swept offline (P2); the
+    /// mixed GEMV's two were not — the sweep is LFM2's harness — and are
+    /// reported as such, and only where a graph has a mixed product.
     #[test]
     fn a_fragment_validated_under_another_model_is_unvalidated_here() {
         let policy = Policy::default();
-        assert!(
-            policy.unvalidated().is_empty(),
-            "{:?}",
-            policy.unvalidated()
+        assert_eq!(
+            policy.unvalidated(),
+            vec![
+                ("mixed_silu".to_string(), "no entry".to_string()),
+                ("mixed_sigmoid".to_string(), "no entry".to_string())
+            ]
         );
+        assert!(policy.unvalidated_in(&mlp(1)).is_empty());
         let set = exclusions::embedded();
         let other = TargetFpModel::of_family("shortconv_step").unwrap();
-        for f in catalogue() {
+        for f in catalogue().into_iter().filter(|f| f.core == Core::Gemv) {
             let t = ExclusionSet::fragment_transform(f.name);
             assert!(matches!(set.lookup(&t, &f.model), Lookup::Validated(_)));
             assert!(matches!(set.lookup(&t, &other), Lookup::ModelMismatch(_)));
@@ -494,7 +524,7 @@ mod tests {
         };
         let d = derive(&g, &policy).unwrap();
         assert!(d.plan.sites.is_empty());
-        assert_eq!(d.refused.len(), 4);
+        assert_eq!(d.refused.len(), 6);
         assert_eq!(d.plan.dispatches_after(), 7);
         assert_eq!(d.plan.class, NumericClass::BitExact);
     }
@@ -523,6 +553,132 @@ mod tests {
                 )
             ]
         );
+    }
+
+    /// A HyperConnection bracket's two projections at Qwen4-exp's shape:
+    /// `silu(down·xn / n)` and `sigmoid(up·lo)` on the mixed GEMV, then the
+    /// collapse. `quant` puts the down projection on a quantized weight.
+    fn hc_bracket(quant: bool, scale_reused: bool) -> Graph {
+        let mut g = Graph::new();
+        let xn = g.input("xn", Shape::of(&[1, 1, 10240]), DType::F32);
+        let down = g.weight("hc_down", Shape::of(&[320, 10240]), DType::F16);
+        let up = g.weight("hc_up", Shape::of(&[10240, 320]), DType::F16);
+        let core = if quant { Core::Quant } else { Core::Mixed };
+        let lo = g.gemv_on(core, down, xn);
+        let lo_s = g.scale(lo, 0.25);
+        let lo = g.silu(lo_s);
+        let gate = g.gemv_on(Core::Mixed, up, lo);
+        let gate = g.sigmoid(gate);
+        let out = g.opaque(
+            "hc_collapse",
+            &[xn, gate],
+            Shape::of(&[1, 1, 2560]),
+            DType::F32,
+        );
+        g.mark_root(out);
+        if scale_reused {
+            g.mark_root(lo_s);
+        }
+        g
+    }
+
+    /// The mixed GEMV's two epilogues are derived over the bracket: the
+    /// scale is absorbed with the SiLU, the sigmoid rides `up` at scale 1 —
+    /// five dispatches become three, the trace's `gemv_mixed_silu` and
+    /// `gemv_mixed_sigmoid`. The fused node carries the constant.
+    #[test]
+    fn the_mixed_epilogues_absorb_the_scale_and_ride_the_store() {
+        let d = derive(&hc_bracket(false, false), &Policy::default()).unwrap();
+        assert_eq!(
+            d.plan.sites.get("hc_down").map(String::as_str),
+            Some("mixed_silu")
+        );
+        assert_eq!(
+            d.plan.sites.get("hc_up").map(String::as_str),
+            Some("mixed_sigmoid")
+        );
+        assert_eq!(d.plan.dispatches_before(), 6);
+        assert_eq!(d.plan.dispatches_after(), 3);
+        assert_eq!(d.plan.before.get("affine"), Some(&1));
+        assert_eq!(d.plan.after.get("gemv_mixed_silu"), Some(&1));
+        assert_eq!(d.plan.after.get("gemv_mixed_sigmoid"), Some(&1));
+        assert!(!d.plan.after.contains_key("affine"));
+        assert!(!d.plan.after.contains_key("gemv_mixed"));
+        assert_eq!(d.plan.class, NumericClass::Rounding);
+        let scales: Vec<(String, Option<f32>)> = d
+            .graph
+            .nodes()
+            .iter()
+            .filter(|n| n.op == Op::Fused)
+            .map(|n| (n.name.clone(), n.scalar))
+            .collect();
+        assert_eq!(
+            scales,
+            vec![
+                ("mixed_silu".to_string(), Some(0.25)),
+                ("mixed_sigmoid".to_string(), Some(1.0))
+            ]
+        );
+        assert!(d.refused.is_empty(), "{:?}", d.refused);
+        // Neither has an offline verdict: admitted by class, named.
+        assert_eq!(
+            Policy::default()
+                .unvalidated_in(&hc_bracket(false, false))
+                .len(),
+            2
+        );
+        // And the inverse: unfusing both restores the six.
+        let u = cost::unfuse(&cost::unfuse(&d.graph, "mixed_silu"), "mixed_sigmoid");
+        assert_eq!(u.census(), d.plan.before);
+    }
+
+    /// A scale another node reads is a fusion boundary (G3): the SiLU still
+    /// rides `down` on the mixed side only when it reads the product
+    /// directly, so here it does not fuse — and a product on a quantized
+    /// weight has no fragment at all.
+    #[test]
+    fn a_shared_scale_and_a_quantized_core_are_left_alone() {
+        let d = derive(&hc_bracket(false, true), &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("hc_down"), None, "{:?}", d.plan.sites);
+        assert_eq!(
+            d.plan.sites.get("hc_up").map(String::as_str),
+            Some("mixed_sigmoid")
+        );
+        let d = derive(&hc_bracket(true, false), &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("hc_down"), None, "{:?}", d.plan.sites);
+        assert_eq!(d.plan.after.get("mul_mv"), Some(&1));
+        assert_eq!(d.plan.after.get("affine"), Some(&1));
+        assert_eq!(
+            d.plan.seams,
+            vec![
+                Seam {
+                    producer: "affine".into(),
+                    consumer: "silu".into(),
+                    count: 1
+                },
+                Seam {
+                    producer: "mul_mv".into(),
+                    consumer: "affine".into(),
+                    count: 1
+                }
+            ]
+        );
+    }
+
+    /// The exclusion set refuses a mixed fragment by name as it does a GEMV
+    /// one, and the bracket keeps its composed chain there.
+    #[test]
+    fn an_excluded_mixed_fragment_leaves_its_chain() {
+        let policy = Policy {
+            excluded: vec!["mixed_silu".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&hc_bracket(false, false), &policy).unwrap();
+        assert_eq!(d.plan.sites.get("hc_down"), None);
+        assert_eq!(d.plan.after.get("gemv_mixed"), Some(&1));
+        assert_eq!(d.plan.after.get("affine"), Some(&1));
+        assert_eq!(d.plan.after.get("silu"), Some(&1));
+        assert_eq!(d.plan.dispatches_after(), 5);
     }
 
     #[test]

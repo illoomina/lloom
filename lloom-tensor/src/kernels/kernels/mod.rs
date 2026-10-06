@@ -57,11 +57,12 @@ pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{
     call_mlx_gemm, call_mlx_gemm_out, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full,
-    call_mlx_gemv_mixed, call_mlx_gemv_with, GemmDType, GemvEpilogue, GemvRmsNorm, MixedEpilogue,
-    SKINNY_TILE_MAX_M,
+    call_mlx_gemv_mixed, call_mlx_gemv_mixed_gnorm, call_mlx_gemv_norm, call_mlx_gemv_with,
+    gemv_mixed_gnorm_serves, gemv_norm_serves, GemmDType, GemvEpilogue, GemvGroupNorm,
+    GemvNormInline, GemvRmsNorm, MixedEpilogue, GEMV_GROUP_NORM_MAX_GROUPS, SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::{
-    call_hc_collapse, call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm,
+    call_hc_collapse, call_hc_collapse_scaled, call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm,
     call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch,
     call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
 };

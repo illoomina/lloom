@@ -377,6 +377,9 @@ pub struct QmvTuning {
     /// Rows from which a quantized stem takes the mm kernel instead of the row gemvs (none = 9: up to 8 rows on the gemv).
     #[opt(flag = "qmv-mm-from", env = "LLOOM_QMV_MM_FROM")]
     pub mm_from: Option<usize>,
+    /// The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic; a function constant).
+    #[opt(flag = "qmv-id-union", env = "LLOOM_QMV_ID_UNION", bool)]
+    pub id_union: bool,
 }
 
 impl Default for QmvTuning {
@@ -390,6 +393,7 @@ impl Default for QmvTuning {
             q6k_nr0: 2,
             rows: false,
             mm_from: None,
+            id_union: false,
         }
     }
 }

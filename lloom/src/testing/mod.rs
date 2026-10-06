@@ -5,6 +5,7 @@
 // host-only.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fixture;
+pub mod ghost;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scale;
 pub mod tiny;

@@ -132,6 +132,12 @@ pub fn to_cpu_staged_count() -> u64 {
 pub static TO_CPU_STAGED_READBACK: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Of `TO_CPU_STAGED_READBACK`, the reads that waited on their blit's
+/// command buffer: a host sync. A deferred stage reads after a drain some
+/// other readback already waited for, and is not one.
+pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Reads of a host-read slot ([`HostSlot::read`]): the producing kernel
 /// wrote a Shared, persistent buffer the host reads in place, so there is no
 /// copy and no staging allocation (#814 part 5).
@@ -156,6 +162,9 @@ pub struct ReadbackCounts {
     pub staged: u64,
     /// `stage_readback` reads.
     pub staged_readback: u64,
+    /// Of `staged_readback`, the ones that waited on their blit (not a
+    /// deferred stage).
+    pub staged_wait: u64,
     /// Host-read slot reads.
     pub slot: u64,
     /// Staging buffers allocated for readbacks.
@@ -171,6 +180,7 @@ pub fn readback_counts() -> ReadbackCounts {
         null_after_wait: TO_CPU_NULL_AFTER_WAIT.load(Relaxed),
         staged: TO_CPU_STAGED.load(Relaxed),
         staged_readback: TO_CPU_STAGED_READBACK.load(Relaxed),
+        staged_wait: TO_CPU_STAGED_WAIT.load(Relaxed),
         slot: TO_CPU_SLOT.load(Relaxed),
         staging_allocs: TO_CPU_STAGING_ALLOCS.load(Relaxed),
     }
@@ -185,6 +195,7 @@ impl ReadbackCounts {
             null_after_wait: self.null_after_wait - before.null_after_wait,
             staged: self.staged - before.staged,
             staged_readback: self.staged_readback - before.staged_readback,
+            staged_wait: self.staged_wait - before.staged_wait,
             slot: self.slot - before.slot,
             staging_allocs: self.staging_allocs - before.staging_allocs,
         }
@@ -305,6 +316,7 @@ impl StagedReadback {
     pub fn finish<T: Clone>(self) -> Result<Vec<T>> {
         if let Some(marker) = &self.marker {
             self.device.wait_marker(marker)?;
+            TO_CPU_STAGED_WAIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         TO_CPU_STAGED_READBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(read_to_vec(&self.buffer, self.count))

@@ -38,12 +38,36 @@ pub struct HyperConnection {
     /// head mixer (`output_hc_*` has no inject: its collapse feeds `lm_head`
     /// and nothing is scattered back).
     inject: Option<QMatMul>,
+    /// Whether the down and up projections may carry their activation at
+    /// the store (`QMatMul::gemv_mixed`'s epilogue): both on unless a
+    /// derived plan says otherwise (`qwen4exp.fusion = derived`).
+    down_epilogue: bool,
+    up_epilogue: bool,
     /// `n = hc_count`.
     n: usize,
     /// `d = hidden_size`.
     d: usize,
     /// RMS epsilon.
     eps: f32,
+}
+
+/// `QWEN4EXP_HC_NORM_GEMV`: [`HyperConnection::mix_parts_norm_gemv`]. Read once.
+fn hc_norm_gemv_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.hc_norm_gemv)
+}
+
+/// `QWEN4EXP_ABLATE` names `hcnorm`: a one-row step skips the HC brackets'
+/// grouped norm (an instrument pricing a fusion's upper bound). Read once.
+fn ablate_hc_norm() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::tuning::tuning()
+            .qwen4exp
+            .ablate
+            .split(',')
+            .any(|s| s.trim() == "hcnorm")
+    })
 }
 
 /// Grouped RMSNorm over an n-stream carry `x [b, seq, n·d]`: normalize PER
@@ -81,10 +105,23 @@ impl HyperConnection {
             down,
             up,
             inject,
+            down_epilogue: true,
+            up_epilogue: true,
             n,
             d,
             eps,
         })
+    }
+
+    /// Whether the down and up projections may carry their activations at
+    /// the store (a derived plan's per-bracket verdict).
+    pub fn set_epilogues(&mut self, down: bool, up: bool) {
+        self.down_epilogue = down;
+        self.up_epilogue = up;
+    }
+
+    pub fn epilogues(&self) -> (bool, bool) {
+        (self.down_epilogue, self.up_epilogue)
     }
 
     /// Prologue: collapse the `n` streams of `h [b, seq, n*d]` to the sub-block's
@@ -109,6 +146,11 @@ impl HyperConnection {
 
     fn mix_parts(&self, h: &Tensor, want_inject: bool) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, _) = h.dims3()?;
+        if b * seq == 1 && hc_norm_gemv_on() {
+            if let Some(out) = self.mix_parts_norm_gemv(h, want_inject)? {
+                return Ok(out);
+            }
+        }
         // The whole prologue as two launches on Metal at a decode's rows
         // (`kernels::hc_mix_fused`: norm + down·SiLU + inject, then
         // up·sigmoid + collapse), opt-in: measured slower than the five
@@ -127,9 +169,16 @@ impl HyperConnection {
         }
         // The grouped norm as one launch on Metal (`kernels::HcNorm`); the
         // composed pair (`rms_norm` per stream, `broadcast_mul` γ) elsewhere.
-        let xn = match super::kernels::hc_norm(h, &self.norm_w, self.n, self.d, self.eps) {
-            Some(xn) => xn?,
-            None => grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?,
+        // Under the `hcnorm` ablation at a one-row step the carry is passed
+        // through instead (an instrument: the output is wrong, every other
+        // launch is unchanged).
+        let xn = if b * seq == 1 && ablate_hc_norm() {
+            h.clone()
+        } else {
+            match super::kernels::hc_norm(h, &self.norm_w, self.n, self.d, self.eps) {
+                Some(xn) => xn?,
+                None => grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?,
+            }
         }; // [b, seq, n*d]
 
         // Low-rank gate prediction on the normed carry. On Metal at decode
@@ -137,11 +186,19 @@ impl HyperConnection {
         // and the activation as the store's epilogue (`QMatMul::gemv_mixed`:
         // one launch each, f32 in and out); elsewhere the composed chain.
         let inv_n = 1.0 / self.n as f64;
-        let lo = match self.down.gemv_mixed(&xn, MixedEpilogue::Silu, inv_n as f32) {
+        let lo = match self
+            .down_epilogue
+            .then(|| self.down.gemv_mixed(&xn, MixedEpilogue::Silu, inv_n as f32))
+            .flatten()
+        {
             Some(lo) => lo?,
             None => ops::silu(&(self.down.forward(&xn)? * inv_n)?)?,
         }; // [b, seq, hc_lr]
-        let gate = match self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0) {
+        let gate = match self
+            .up_epilogue
+            .then(|| self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0))
+            .flatten()
+        {
             Some(g) => g?,
             None => ops::sigmoid(&self.up.forward(&lo)?)?,
         }; // [b, seq, n*d]
@@ -168,6 +225,90 @@ impl HyperConnection {
         Ok((mixed, Some(inject)))
     }
 
+    /// [`Self::mix_parts`] with the grouped norm computed inside its consumers
+    /// (`QWEN4EXP_HC_NORM_GEMV`, `docs/tuning.md` §13.5u): `down` and `inject`
+    /// normalize `h` in their own launches (`QMatMul::gemv_mixed_gnorm`),
+    /// `down` also writing the `n` stream scales, and the collapse forms
+    /// `xn` from `h`, γ and those scales — `hc_norm_f32`'s launch and its
+    /// `[n·d]` round trip removed. `Ok(None)` when any of the three would not
+    /// take its fused form: decided before anything is dispatched, so the
+    /// bracket is fused whole or composed whole.
+    fn mix_parts_norm_gemv(
+        &self,
+        h: &Tensor,
+        want_inject: bool,
+    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        let (b, seq, _) = h.dims3()?;
+        let inject_ok = !want_inject
+            || self.inject.as_ref().is_none_or(|w| {
+                w.gemv_mixed_gnorm_applies(h, &self.norm_w, self.n, MixedEpilogue::None, false)
+            });
+        if !(self
+            .down
+            .gemv_mixed_gnorm_applies(h, &self.norm_w, self.n, MixedEpilogue::Silu, true)
+            && inject_ok
+            && super::kernels::hc_collapse_scaled_applies(h, &self.norm_w))
+        {
+            return Ok(None);
+        }
+        let checked = || lloom_tensor::Error::Msg("hc_norm_gemv: an applicability check passed and the op declined".into());
+        // `down` with the norm, `silu(lo / n)` as the composed path's scale,
+        // and the stream scales after its `hc_lowrank` outputs.
+        let inv_n = 1.0 / self.n as f64;
+        let lo_s = self
+            .down
+            .gemv_mixed_gnorm(
+                h,
+                &self.norm_w,
+                self.eps,
+                self.n,
+                MixedEpilogue::Silu,
+                inv_n as f32,
+                true,
+            )
+            .ok_or_else(checked)??;
+        let lr = lo_s.dim(lloom_tensor::D::Minus1)? - self.n;
+        let lo = lo_s.narrow(lloom_tensor::D::Minus1, 0, lr)?;
+        let scales = lo_s.narrow(lloom_tensor::D::Minus1, lr, self.n)?;
+        let gate = match self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0) {
+            Some(g) => g?,
+            None => ops::sigmoid(&self.up.forward(&lo)?)?,
+        };
+        let mixed =
+            super::kernels::hc_collapse_scaled(h, &self.norm_w, &scales, &gate, self.n, self.d)
+                .ok_or_else(checked)??;
+        if !want_inject {
+            return Ok(Some((mixed, None)));
+        }
+        let inject = match &self.inject {
+            Some(w) => w
+                .gemv_mixed_gnorm(h, &self.norm_w, self.eps, self.n, MixedEpilogue::None, 1.0, false)
+                .ok_or_else(checked)??,
+            None => Tensor::zeros((b, seq, self.n), h.dtype(), h.device())?,
+        };
+        Ok(Some((mixed, Some(inject))))
+    }
+
+    /// [`Self::combine`]'s decode step for the walk: one `hc_combine` over the
+    /// carry, the block's output and the injection.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn visit_combine(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        carry: crate::optimizer::NodeId,
+        block: crate::optimizer::NodeId,
+        inject: crate::optimizer::NodeId,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        let nd = self.n * self.d;
+        w.opaque(
+            "hc_combine",
+            &[carry, block, inject],
+            Shape::of(&[1, 1, nd]),
+            lloom_tensor::DType::F32,
+        )
+    }
+
     /// Epilogue: scatter `block_out [b, seq, d]` back across the `n` streams of
     /// the carry `h [b, seq, n*d]`, weighted by the prediction from `mix`.
     ///
@@ -190,6 +331,46 @@ impl HyperConnection {
         let scattered = scattered.reshape((b, seq, self.n * self.d))?;
 
         h + scattered
+    }
+}
+
+/// One bracket's prologue at a decode step ([`HyperConnection::mix`] when
+/// the injection is wanted, [`HyperConnection::collapse`] when not): the
+/// grouped norm; `silu(down·xn / n)` and `sigmoid(up·lo)` unfused — the
+/// products' epilogues are what a derivation over the walk decides; the
+/// collapse; the injection's product. `In` is the carry, the bracket's
+/// checkpoint name (`hc_attn`, `output_hc`) and whether the injection is
+/// wanted; `Out` the collapsed input and the injection.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for HyperConnection {
+    type In = (crate::optimizer::NodeId, &'static str, bool);
+    type Out = (crate::optimizer::NodeId, Option<crate::optimizer::NodeId>);
+    fn visit(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        (carry, name, want_inject): Self::In,
+    ) -> Self::Out {
+        use crate::optimizer::Shape;
+        let (n, d) = (self.n, self.d);
+        let f32 = lloom_tensor::DType::F32;
+        let gamma = w.weight(
+            &format!("{name}_norm.weight"),
+            Shape::of(&[n * d]),
+            self.norm_w.dtype(),
+        );
+        let xn = w.opaque("hc_norm", &[carry, gamma], Shape::of(&[1, 1, n * d]), f32);
+        let lo = w.project_qmat(&format!("{name}_down.weight"), &self.down, xn);
+        let lo = w.scale(lo, (1.0 / n as f64) as f32);
+        let lo = w.silu(lo);
+        let gate = w.project_qmat(&format!("{name}_up.weight"), &self.up, lo);
+        let gate = w.sigmoid(gate);
+        let mixed = w.opaque("hc_collapse", &[xn, gate], Shape::of(&[1, 1, d]), f32);
+        let inject = want_inject.then(|| match &self.inject {
+            Some(q) => w.project_qmat(&format!("{name}_inject.weight"), q, xn),
+            // `Tensor::zeros`: a fresh zero buffer, no kernel.
+            None => w.input(&format!("{name}.zero_inject"), Shape::of(&[1, 1, n]), f32),
+        });
+        (mixed, inject)
     }
 }
 
@@ -433,6 +614,121 @@ mod tests {
         }
     }
 
+    /// The bracket with its grouped norm inside its consumers
+    /// (`mix_parts_norm_gemv`, `QWEN4EXP_HC_NORM_GEMV`) against the composed
+    /// chain on the device (`hc_norm_f32`, the mixed GEMVs, `hc_collapse_f32`)
+    /// and the CPU's, at the checkpoint's shapes: the per-stream scales are
+    /// reduced in `hc_norm_f32`'s tree and the coefficients formed in its
+    /// order, so the outputs are the composed chain's, bit for bit (asserted),
+    /// and within the CPU tolerance of the CPU's chain. One row only (the
+    /// scales' form); three rows decline. Bit-stable run to run.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn norm_gemv_bracket_matches_composed() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let (n, d, lr) = (4usize, 2560usize, 320usize);
+        let f16_rounded = |out: usize, inp: usize, seed: f32| -> Tensor {
+            Tensor::from_vec(
+                (0..out * inp)
+                    .map(|i| ((i as f32 * 0.0117 + seed).sin()) * 0.03)
+                    .collect::<Vec<_>>(),
+                (out, inp),
+                &cpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let gamma = Tensor::from_vec(
+            (0..n * d)
+                .map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin())
+                .collect::<Vec<f32>>(),
+            n * d,
+            &cpu,
+        )
+        .unwrap();
+        for with_inject in [true, false] {
+            let (wd, wu, wi) = (
+                f16_rounded(lr, n * d, 1.0),
+                f16_rounded(n * d, lr, 2.0),
+                f16_rounded(n, n * d, 3.0),
+            );
+            let hc_cpu = HyperConnection::new(
+                gamma.clone(),
+                QMatMul::Tensor(wd.to_dtype(DType::F32).unwrap()),
+                QMatMul::Tensor(wu.to_dtype(DType::F32).unwrap()),
+                with_inject.then(|| QMatMul::Tensor(wi.to_dtype(DType::F32).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            let hc_gpu = HyperConnection::new(
+                gamma.to_device(&gpu).unwrap(),
+                QMatMul::TensorF16(wd.to_device(&gpu).unwrap()),
+                QMatMul::TensorF16(wu.to_device(&gpu).unwrap()),
+                with_inject.then(|| QMatMul::TensorF16(wi.to_device(&gpu).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            for &seq in &[1usize, 3] {
+                let h = Tensor::from_vec(
+                    (0..seq * n * d)
+                        .map(|i| ((i as f32 * 0.021).cos()) * 0.8)
+                        .collect::<Vec<f32>>(),
+                    (1, seq, n * d),
+                    &cpu,
+                )
+                .unwrap();
+                let h_gpu = h.to_device(&gpu).unwrap();
+                let fused = hc_gpu.mix_parts_norm_gemv(&h_gpu, true).unwrap();
+                if seq != 1 {
+                    assert!(fused.is_none(), "seq {seq}: the scales' form is one row; it must decline");
+                    continue;
+                }
+                let (m_f, i_f) = fused.expect("one row: the fused bracket must take it");
+                let i_f = i_f.unwrap();
+                // The composed chain on the device (the arm is off in tests).
+                let (m_c, i_c) = hc_gpu.mix(&h_gpu).unwrap();
+                let (m_cpu, i_cpu) = hc_cpu.mix(&h).unwrap();
+                let v = |t: &Tensor| -> Vec<f32> {
+                    t.to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap()
+                };
+                for (name, f, c, r) in [
+                    ("mixed", v(&m_f), v(&m_c), v(&m_cpu)),
+                    ("inject", v(&i_f), v(&i_c), v(&i_cpu)),
+                ] {
+                    assert_eq!(f.len(), c.len(), "{name}");
+                    assert!(f.iter().all(|x| x.is_finite()), "{name}: a non-finite output");
+                    let differ = f.iter().zip(&c).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    let scale = r.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+                    let d_dev = f.iter().zip(&c).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    let d_cpu = f.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    println!(
+                        "norm_gemv bracket inject={with_inject} {name}: {differ} of {} differ from the composed chain bit-wise, max |d| {d_dev:.3e}; vs CPU {d_cpu:.3e} at scale {scale:.3e}",
+                        f.len()
+                    );
+                    // The scales are `hc_norm_f32`'s own tree and the
+                    // coefficients its own product, so the GEMVs and the
+                    // collapse see the composed chain's inputs exactly:
+                    // measured 0 differing elements, pinned here.
+                    assert_eq!(differ, 0, "{name} inject={with_inject}: {differ} elements differ from the device's composed chain (max |d| {d_dev})");
+                    assert!(d_cpu <= 3e-5 * scale, "{name} inject={with_inject}: {d_cpu} from the CPU");
+                    if name == "inject" && !with_inject {
+                        assert!(f.iter().all(|x| *x == 0.0), "no-inject rows must be zero");
+                    } else {
+                        assert!(scale > 1e-3, "{name}: degenerate");
+                    }
+                }
+                let (m2, _) = hc_gpu.mix_parts_norm_gemv(&h_gpu, true).unwrap().unwrap();
+                assert_eq!(v(&m_f), v(&m2), "the fused bracket is not bit-stable");
+            }
+        }
+    }
+
     /// Past eight streams the fused prologue must decline: `hc_mix_a` keeps
     /// one scale per stream in a threadgroup array of eight, and a carry of
     /// more streams wrote past it and returned the wrong mix (the shape
@@ -533,10 +829,14 @@ mod tests {
                 .fold(0f32, f32::max);
             eprintln!("n {n}: fused pair taken {took}, |gpu - cpu| {diff:e} at scale {scale:e}");
             if diff > 3e-5 * scale {
-                bad.push(format!("n {n} (pair taken: {took}): {diff:e} at scale {scale:e}"));
+                bad.push(format!(
+                    "n {n} (pair taken: {took}): {diff:e} at scale {scale:e}"
+                ));
             }
             if took != (n <= super::super::kernels::HC_MIX_MAX_N) {
-                bad.push(format!("n {n}: pair taken {took}; it takes up to HC_MIX_MAX_N streams"));
+                bad.push(format!(
+                    "n {n}: pair taken {took}; it takes up to HC_MIX_MAX_N streams"
+                ));
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
@@ -597,10 +897,22 @@ mod tests {
             let h = Tensor::randn(0f32, 0.8, (1, rows, n * d), &gpu).unwrap();
             let composed = |k: usize| -> Tensor {
                 let hc = &brackets[k].3;
-                let xn = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap();
-                let lo = hc.down.gemv_mixed(&xn, MixedEpilogue::Silu, 0.25).unwrap().unwrap();
-                let gate = hc.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap();
-                let mixed = super::super::kernels::hc_collapse(&xn, &gate, n, d).unwrap().unwrap();
+                let xn = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6)
+                    .unwrap()
+                    .unwrap();
+                let lo = hc
+                    .down
+                    .gemv_mixed(&xn, MixedEpilogue::Silu, 0.25)
+                    .unwrap()
+                    .unwrap();
+                let gate = hc
+                    .up
+                    .gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0)
+                    .unwrap()
+                    .unwrap();
+                let mixed = super::super::kernels::hc_collapse(&xn, &gate, n, d)
+                    .unwrap()
+                    .unwrap();
                 let _inject = hc.inject.as_ref().unwrap().forward(&xn).unwrap();
                 mixed
             };
@@ -654,15 +966,57 @@ mod tests {
                 let _ = last;
                 println!("HCBENCH rows={rows} {name} wall {us:.1} us/call gpu {gpu_us:.1} us/call ({SETS} brackets cycled)");
             };
-            let xn0 = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap();
-            let lo0 = brackets[0].3.down.gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25).unwrap().unwrap();
-            let gate0 = brackets[0].3.up.gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap();
+            let xn0 = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6)
+                .unwrap()
+                .unwrap();
+            let lo0 = brackets[0]
+                .3
+                .down
+                .gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25)
+                .unwrap()
+                .unwrap();
+            let gate0 = brackets[0]
+                .3
+                .up
+                .gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0)
+                .unwrap()
+                .unwrap();
             time("composed(5 launches)", &composed);
-            time("  hc_norm", &|_k| super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap());
-            time("  down gemv+silu", &|k| brackets[k].3.down.gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25).unwrap().unwrap());
-            time("  up gemv+sigmoid", &|k| brackets[k].3.up.gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap());
-            time("  hc_collapse", &|_k| super::super::kernels::hc_collapse(&xn0, &gate0, n, d).unwrap().unwrap());
-            time("  inject", &|k| brackets[k].3.inject.as_ref().unwrap().forward(&xn0).unwrap());
+            time("  hc_norm", &|_k| {
+                super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6)
+                    .unwrap()
+                    .unwrap()
+            });
+            time("  down gemv+silu", &|k| {
+                brackets[k]
+                    .3
+                    .down
+                    .gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25)
+                    .unwrap()
+                    .unwrap()
+            });
+            time("  up gemv+sigmoid", &|k| {
+                brackets[k]
+                    .3
+                    .up
+                    .gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0)
+                    .unwrap()
+                    .unwrap()
+            });
+            time("  hc_collapse", &|_k| {
+                super::super::kernels::hc_collapse(&xn0, &gate0, n, d)
+                    .unwrap()
+                    .unwrap()
+            });
+            time("  inject", &|k| {
+                brackets[k]
+                    .3
+                    .inject
+                    .as_ref()
+                    .unwrap()
+                    .forward(&xn0)
+                    .unwrap()
+            });
             time("fused(2 launches)", &fused);
             time("mix_a", &a_only);
             time("mix_b", &b_only);
@@ -690,6 +1044,8 @@ mod tests {
             down: qmm(1, 1, &dev),
             up: qmm(1, 1, &dev),
             inject: Some(qmm(1, 1, &dev)),
+            down_epilogue: true,
+            up_epilogue: true,
             n,
             d,
             eps: 1e-6,
@@ -717,6 +1073,8 @@ mod tests {
             down: qmm(2, n * d, &dev), // hc_lr=2, out zeros
             up: qmm(n * d, 2, &dev),
             inject: Some(qmm(n, n * d, &dev)),
+            down_epilogue: true,
+            up_epilogue: true,
             n,
             d,
             eps: 1e-6,

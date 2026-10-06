@@ -7265,28 +7265,132 @@ impl crate::optimizer::Visit for Attention {
         ]);
         let k_cache = w.input(&format!("kv.k@{l}"), kv_shape.clone(), dt);
         let v_cache = w.input(&format!("kv.v@{l}"), kv_shape.clone(), dt);
-        let append = match self.kv_append {
-            KvAppend::InPlace => "copy2d",
-            KvAppend::Cat => "kv_cat",
-            KvAppend::Paged => "flash_kv_scatter",
+        // The appends: in place, one strided write each; `Cat`, a
+        // `Tensor::cat` of the cache and the row (two copies each); `Paged`,
+        // the pool's scatter (named from the arm).
+        let mut ring = vec![k_cache, v_cache];
+        let mut append = |w: &mut crate::optimizer::Walker, row, cache| match self.kv_append {
+            KvAppend::InPlace => w.opaque("copy2d", &[row, cache], kv_shape.clone(), dt),
+            KvAppend::Cat => {
+                let old = w.opaque("copy2d", &[cache], kv_shape.clone(), dt);
+                ring.push(old);
+                w.opaque("copy2d", &[row, old], kv_shape.clone(), dt)
+            }
+            KvAppend::Paged => w.opaque("flash_kv_scatter", &[row, cache], kv_shape.clone(), dt),
         };
-        let k_all = w.opaque(append, &[kr, k_cache], kv_shape.clone(), dt);
-        let v_all = w.opaque(append, &[v, v_cache], kv_shape, dt);
+        let k_all = append(w, kr, k_cache);
+        let v_all = append(w, v, v_cache);
+        ring.extend([k_all, v_all]);
         let kernel = match self.route.decode {
             DecodeAttn::SdpaVector => "sdpa_vector",
             DecodeAttn::FlashDecoding => "flash_decoding",
             DecodeAttn::Generic => "attention_generic",
         };
-        let y = w.opaque(
-            kernel,
-            &[qr, k_all, v_all],
-            Shape::of(&[1, heads, 1, hd]),
-            dt,
-        );
-        w.mark(&[k_cache, v_cache, k_all, v_all, y], Region::Kv(l));
+        let out = Shape::of(&[1, heads, 1, hd]);
+        // At a position whose keys reach the 2-pass length, the vector
+        // kernel is two launches: the partials, then their merge.
+        let two_pass = self.route.decode == DecodeAttn::SdpaVector
+            && w
+                .position()
+                .is_some_and(|p| crate::nn::ops::sdpa_vector_two_pass(p + 1, hd, dt));
+        let y = if two_pass {
+            let partial = w.opaque("sdpa_vector_2pass_1", &[qr, k_all, v_all], out.clone(), dt);
+            ring.push(partial);
+            w.opaque("sdpa_vector_2pass_2", &[partial], out, dt)
+        } else if self.route.decode == DecodeAttn::Generic {
+            self.visit_generic(w, qr, k_all, v_all, dt, &mut ring)
+        } else {
+            w.opaque(kernel, &[qr, k_all, v_all], out, dt)
+        };
+        ring.push(y);
+        w.mark(&ring, Region::Kv(l));
         let y = w.view("reshape", y, Shape::of(&[1, 1, h]));
         let wo = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
         w.gemv(wo, y)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Attention {
+    /// The generic arm's decode attention, composed: the KV heads expanded
+    /// to the query heads (`repeat_kv`, a `cat` of `n_rep` copies each), all
+    /// three read up to f32, the scores (a batched GEMV), the scale, the
+    /// softmax, the product with `v` (the transposed GEMV), the result read
+    /// back to the model's dtype. Every node that reads the cache's values
+    /// joins `ring`, as the fused kernel does on the other arms; the query's
+    /// own cast does not.
+    fn visit_generic(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        q: crate::optimizer::NodeId,
+        k: crate::optimizer::NodeId,
+        v: crate::optimizer::NodeId,
+        dt: DType,
+        ring: &mut Vec<crate::optimizer::NodeId>,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::{Dim, Shape};
+        let (heads, kvh, hd) = (
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        );
+        let rep = heads / kvh;
+        let expanded = Shape(vec![
+            Dim::Const(1),
+            Dim::Const(heads),
+            Dim::Sym("kv_len"),
+            Dim::Const(hd),
+        ]);
+        let mut expand = |w: &mut crate::optimizer::Walker, x| {
+            if rep == 1 {
+                return x;
+            }
+            let mut c = w.opaque("copy2d", &[x], expanded.clone(), dt);
+            ring.push(c);
+            for _ in 1..rep {
+                c = w.opaque("copy2d", &[x, c], expanded.clone(), dt);
+                ring.push(c);
+            }
+            c
+        };
+        let k = expand(w, k);
+        let v = expand(w, v);
+        let up = |w: &mut crate::optimizer::Walker, x: crate::optimizer::NodeId| {
+            if dt == DType::F32 {
+                return x;
+            }
+            let shape = w.node(x).shape.clone();
+            w.opaque("cast", &[x], shape, DType::F32)
+        };
+        let q = up(w, q);
+        let (k, v) = (up(w, k), up(w, v));
+        if dt != DType::F32 {
+            ring.extend([k, v]);
+        }
+        let scores = Shape(vec![
+            Dim::Const(1),
+            Dim::Const(heads),
+            Dim::Const(1),
+            Dim::Sym("kv_len"),
+        ]);
+        let raw = w.opaque("gemv", &[q, k], scores, DType::F32);
+        let scaled = w.scale(raw, (1.0 / (hd as f64).sqrt()) as f32);
+        let att_shape = w.node(scaled).shape.clone();
+        let att = w.opaque("softmax", &[scaled], att_shape, DType::F32);
+        ring.extend([raw, scaled]);
+        let y = w.opaque(
+            "gemv_t",
+            &[att, v],
+            Shape::of(&[1, heads, 1, hd]),
+            DType::F32,
+        );
+        ring.extend([att, y]);
+        if dt == DType::F32 {
+            return y;
+        }
+        let y = w.opaque("cast", &[y], Shape::of(&[1, heads, 1, hd]), dt);
+        ring.push(y);
+        y
     }
 }
 
@@ -8491,11 +8595,16 @@ impl crate::optimizer::Visit for ShortConv {
                 let bx = w.mul(b, x);
                 let window = match arm {
                     ConvState::Shuffle => {
-                        // `cat([state[1..], bx])`: two copies into the new state.
+                        // The shift in place (`window_tail`, `docs/dispatch.md`
+                        // §11.5z-x): the tail gathered to a scratch (a strided
+                        // copy), written back to the first columns, `bx` to the
+                        // last — two strided writes into the state.
                         let tail = w.view("narrow", state, Shape::of(&[1, h, lc - 1]));
-                        let shifted = w.opaque("copy2d", &[tail], Shape::of(&[1, h, lc]), dt);
+                        let gathered =
+                            w.opaque("copy_strided", &[tail], Shape::of(&[1, h, lc - 1]), dt);
+                        let shifted = w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
                         let next = w.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dt);
-                        ring.extend([tail, shifted, next]);
+                        ring.extend([tail, gathered, shifted, next]);
                         next
                     }
                     ConvState::RotatingRing { .. } | ConvState::SlidingRing { .. } => {

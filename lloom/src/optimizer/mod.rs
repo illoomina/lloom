@@ -34,10 +34,12 @@ pub use cost::{CostModel, Marginal, StepCost};
 pub use diff::{diff, listing, IrDiff};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
-pub use ir::{Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape};
+pub use ir::{
+    census_of_labels, kernel_family, Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape,
+};
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
-pub use walk::{walk, Visit, Walker};
+pub use walk::{walk, walk_at, Visit, Walker};
 
 /// What the derivation may do.
 #[derive(Debug, Clone, PartialEq)]

@@ -207,6 +207,111 @@ pub fn family(node: &Node) -> Option<String> {
     })
 }
 
+/// The family a Metal pipeline label is counted under in the IR's census, so
+/// a dispatch census taken on the device (a census window, a
+/// `CANDLE_METAL_TRACE` step) compares with a walk's: a product by its core
+/// and the block on its store, every other kernel by what it does — never by
+/// its dtype, which the IR's node carries (a `copy2d_f32` and a `copy2d_u32`
+/// are both `copy2d`, every cast is `cast`).
+pub fn kernel_family(label: &str) -> String {
+    const PRODUCT_BLOCKS: [&str; 5] = ["_silu", "_sigmoid", "_residual", "_mul", "_swiglu"];
+    let block = |l: &str| {
+        let l = l.strip_suffix("_packed").unwrap_or(l);
+        PRODUCT_BLOCKS
+            .iter()
+            .find(|b| l.ends_with(*b))
+            .copied()
+            .unwrap_or("")
+    };
+    for (prefix, family) in [
+        ("kernel_mul_mv_id2_", "mul_mv_id2"),
+        ("kernel_mul_mv_id_", "mul_mv_id"),
+        ("kernel_mul_mv_", "mul_mv"),
+        ("kernel_get_rows_", "get_rows"),
+    ] {
+        if label.starts_with(prefix) {
+            return family.to_string();
+        }
+    }
+    if label.starts_with("gemv_mixed_") {
+        return format!("gemv_mixed{}", block(label));
+    }
+    if label.starts_with("gemv_float") || label.starts_with("gemv_bfloat") {
+        return format!("gemv{}", block(label));
+    }
+    if label.starts_with("gemv_t_") {
+        return "gemv_t".to_string();
+    }
+    for conv in ["shortconv_step", "shortconv_ring", "conv1d_depthwise"] {
+        if label.starts_with(conv) {
+            return conv.to_string();
+        }
+    }
+    if label.starts_with("copy2d") {
+        return "copy2d".to_string();
+    }
+    if label.starts_with("copy_") && label.ends_with("_strided") {
+        return "copy_strided".to_string();
+    }
+    if label.starts_with("cast_") {
+        return "cast".to_string();
+    }
+    if label.starts_with("gemm_") || label.starts_with("steel_gemm") {
+        return "gemm".to_string();
+    }
+    // `mlx_sort.metal`: the arg-sorts (`carg_*`) and the value sorts.
+    if label.starts_with("carg_") {
+        return "arg_sort".to_string();
+    }
+    if label.starts_with("gdn_step_") {
+        return "gdn_step".to_string();
+    }
+    if label.starts_with("sdpa_vector_quant") {
+        return if label.contains("sel") {
+            "sdpa_quant_selected".to_string()
+        } else {
+            "sdpa_quant".to_string()
+        };
+    }
+    if label.starts_with("quantize_kv") {
+        return "quantize_kv".to_string();
+    }
+    if label.starts_with("sdpa_vector") {
+        return if label.contains("2pass_1") {
+            "sdpa_vector_2pass_1".to_string()
+        } else if label.contains("2pass_2") {
+            "sdpa_vector_2pass_2".to_string()
+        } else {
+            "sdpa_vector".to_string()
+        };
+    }
+    // An index kernel is named by its index type (`is_u32_f16` → `is_u32`);
+    // the slot map without it.
+    if label.starts_with("moe_slot_map") {
+        return "moe_slot_map".to_string();
+    }
+    let mut f = label;
+    loop {
+        let before = f;
+        for suffix in ["_strided", "_lstrided", "_rstrided", "_cs", "_f32", "_f16", "_bf16"] {
+            f = f.strip_suffix(suffix).unwrap_or(f);
+        }
+        if f == before {
+            break;
+        }
+    }
+    f.to_string()
+}
+
+/// A device census (`label → count`) in the IR's families.
+pub fn census_of_labels<'a>(labels: impl IntoIterator<Item = (&'a str, u64)>) -> Census {
+    let mut c = Census::new();
+    for (label, n) in labels {
+        *c.entry(kernel_family(label)).or_insert(0) += n;
+    }
+    c
+}
+
 /// A per-family dispatch count.
 pub type Census = BTreeMap<String, u64>;
 
@@ -605,6 +710,49 @@ mod tests {
             p.widths.iter().map(|&w| w as u64).sum::<u64>(),
             g.dispatches()
         );
+    }
+
+    /// The labels of a traced Qwen4-exp step and an LFM2 step, in the IR's
+    /// families.
+    #[test]
+    fn a_kernel_label_is_counted_under_its_family() {
+        for (label, family) in [
+            ("kernel_mul_mv_id2_iq3_xxs_f32", "mul_mv_id2"),
+            ("kernel_mul_mv_id_q2_0_f32", "mul_mv_id"),
+            ("kernel_mul_mv_q4_K_f32", "mul_mv"),
+            ("kernel_get_rows_iq3_s", "get_rows"),
+            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0", "gemv_mixed"),
+            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu", "gemv_mixed_silu"),
+            ("gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid", "gemv_mixed_sigmoid"),
+            ("gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0", "gemv"),
+            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_residual_packed", "gemv_residual"),
+            ("gdn_step_r16_f32", "gdn_step"),
+            ("sdpa_vector_float_256", "sdpa_vector"),
+            ("copy2d_f32", "copy2d"),
+            ("copy2d_u32", "copy2d"),
+            ("copy_f32_strided", "copy_strided"),
+            ("cast_u8_f32", "cast"),
+            ("cast_f32_u32", "cast"),
+            ("gemm_nn_f32_f32_16_32_16_2_2", "gemm"),
+            ("carg_block_sort_float32_uint32_bn128_tn8", "arg_sort"),
+            ("bmaximum_f32_cs", "bmaximum"),
+            ("bmul_f32_strided", "bmul"),
+            ("fast_sum_f32_strided", "fast_sum"),
+            ("rmsnorm_f32", "rmsnorm"),
+            ("hc_norm_f32", "hc_norm"),
+            ("silu_mul_f32", "silu_mul"),
+            ("moe_slot_map_u32", "moe_slot_map"),
+            ("is_u32_f16", "is_u32"),
+            ("bmul_f16_lstrided", "bmul"),
+            ("shortconv_step_f16_k3", "shortconv_step"),
+            ("gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0", "gemv_t"),
+            ("softmax_f32", "softmax"),
+            ("quantize_kv_float_64_8", "quantize_kv"),
+            ("sdpa_vector_quant_float_64_8", "sdpa_quant"),
+            ("is_u32_f32", "is_u32"),
+        ] {
+            assert_eq!(kernel_family(label), family, "{label}");
+        }
     }
 
     #[test]

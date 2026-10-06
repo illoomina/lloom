@@ -628,6 +628,22 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
     type In = crate::optimizer::NodeId;
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, x: Self::In) -> Self::Out {
+        self.visit_planned(w, x, self.experts.plans_on_device())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> MoeLayer<R> {
+    /// The visit with the routed experts planned on the device
+    /// (`device_plan`: the slot map, one launch) or on the host (the ids
+    /// read back, no launch) — a pass that plans on the host whatever the
+    /// residency can (`Self::forward`, the MTP head's prefill) says so.
+    pub(crate) fn visit_planned(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        x: crate::optimizer::NodeId,
+        device_plan: bool,
+    ) -> crate::optimizer::NodeId {
         use crate::optimizer::{Dim, Shape};
         let f32 = DType::F32;
         let h = match w.node(x).shape.last() {
@@ -642,14 +658,14 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
         let route = w.opaque("moe_topk", &[logits], Shape::of(&[1, topk]), f32);
         let act = self.tile_act(1);
         let x3 = if act != f32 && !self.folds(f32, act) {
-            w.opaque("cast_f32_f16", &[x1], Shape::of(&[1, h]), act)
+            w.opaque("cast", &[x1], Shape::of(&[1, h]), act)
         } else {
             x1
         };
         let x3 = w.view("reshape", x3, Shape::of(&[1, 1, h]));
         // The device plan's slot map writes its record into the tier's
         // host-read slot in place (`Streamed::plan_device`): one launch.
-        let slots = if self.experts.plans_on_device() {
+        let slots = if device_plan {
             let plan = w.opaque("moe_slot_map", &[route], Shape::of(&[3 * topk]), DType::U32);
             w.view("narrow", plan, Shape::of(&[1, topk]))
         } else {
@@ -679,7 +695,7 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
             act,
         );
         let y = if act == DType::F16 && !self.f16_fuse {
-            w.opaque("cast_f16_f32", &[y], Shape::of(&[1, topk, h]), f32)
+            w.opaque("cast", &[y], Shape::of(&[1, topk, h]), f32)
         } else {
             y
         };

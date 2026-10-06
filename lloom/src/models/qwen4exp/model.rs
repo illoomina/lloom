@@ -335,6 +335,35 @@ impl<R: ExpertResidency> crate::optimizer::Visit for Layer<R> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> Layer<R> {
+    /// One row through [`Self::prefill`] (the MTP head's pass): the brackets
+    /// as the decode step's, the attention's prefill row
+    /// ([`QsaAttention::visit_row`]), the MoE planned on the host
+    /// ([`MoeLayer::forward`]). A full-attention layer's; a linear layer's
+    /// prefill row is not walked.
+    pub(crate) fn visit_row(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        carry: crate::optimizer::NodeId,
+        l: usize,
+        precision: crate::nn::ops::KvPrecision,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Visit;
+        let Mixer::Full(qsa) = &self.mixer else {
+            unreachable!("only a full-attention layer's prefill row is walked")
+        };
+        let (cur, inject) = self.hc_attn.visit(w, (carry, "hc_attn", true));
+        let inject = inject.expect("the injection was asked for");
+        let mixed = qsa.visit_row(w, cur, l, precision);
+        let carry = self.hc_attn.visit_combine(w, carry, mixed, inject);
+        let (cur, inject) = self.hc_ffn.visit(w, (carry, "hc_ffn", true));
+        let moe = self.moe.visit_planned(w, cur, false);
+        let inject = inject.expect("the injection was asked for");
+        self.hc_ffn.visit_combine(w, carry, moe, inject)
+    }
+}
+
 /// How one decode position's routed experts are planned
 /// (`Layer::decode_parts_rows_with`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3089,10 +3118,16 @@ impl<R: ExpertResidency> crate::optimizer::Visit for Qwen4Exp<R> {
         let ids = w.input("input_ids", Shape::of(&[1, 1]), DType::U32);
         let (_, table, dt) = crate::optimizer::walk::qmat_operand(&self.embed_tokens);
         let table = w.weight("token_embd.weight", table, dt);
-        let h = w.opaque("get_rows", &[table, ids], Shape::of(&[1, 1, d]), DType::F32);
+        // A packed table's rows are gathered by the quantized kernel; a dense
+        // one's by `index_select`.
+        let gather = match &self.embed_tokens {
+            lloom_tensor::quantized::QMatMul::QTensor(_) => "get_rows",
+            _ => "is_u32",
+        };
+        let h = w.opaque(gather, &[table, ids], Shape::of(&[1, 1, d]), DType::F32);
         // `broadcast_as((1, 1, n, d)).reshape(..)`: one strided copy.
         let mut carry = w.opaque(
-            "copy_f32_strided",
+            "copy_strided",
             &[h],
             Shape::of(&[1, 1, n * d]),
             DType::F32,

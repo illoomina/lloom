@@ -9,35 +9,13 @@
 //! On Metal the attention kernel a layer takes is the route its
 //! construction resolved on the device, which is what a walk reads.
 
-use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
+use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, QkvLayout};
 use lloom::optimizer::{walk, Graph};
-use lloom::testing::ghost;
+use lloom::testing::ghost::{self, lfm2_2_6b};
 use lloom_tensor::{DType, Device};
-
-/// `LFM2.5-2.6B`'s `config.json` (as `tests/optimizer_derivation.rs`).
-fn lfm2_2_6b() -> Config {
-    use LayerType::{Conv as C, FullAttention as A};
-    Config {
-        vocab_size: 128000,
-        hidden_size: 2048,
-        intermediate_size: 10752,
-        num_hidden_layers: 30,
-        num_attention_heads: 32,
-        num_key_value_heads: 8,
-        conv_l_cache: 3,
-        conv_bias: false,
-        layer_types: vec![
-            C, C, A, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, A, C, C, A, C,
-            C,
-        ],
-        tie_embedding: true,
-        ..Default::default()
-    }
-}
 
 /// The configuration of the committed trace (`issue-727-raw/pass-plan/
 /// runs/trace-arena-shuffle.txt`): `Shuffle × Sdpa × InPlace × Contiguous`.
-#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 fn traced() -> Config {
     let mut c = lfm2_2_6b();
     c.attn_impl = AttnImpl::Sdpa;
@@ -48,17 +26,24 @@ fn traced() -> Config {
 }
 
 /// Off Metal every attention arm resolves to the composed attention at
-/// construction, and the walk says so: the eight attention layers take
-/// `attention_generic`, whatever was requested — the route the model took,
-/// not the arm the config named.
+/// construction, and the walk says so: the eight attention layers take the
+/// generic arm's launches, whatever was requested — the route the model
+/// took, not the arm the config named. Each is 16 launches where the vector
+/// kernel is one (`repeat_kv`'s 2 × 4 copies, 4 casts, the scores, the
+/// scale, the softmax, the product with `v`): the Metal step's 560 and
+/// 8 × 15 more.
 #[test]
 fn off_metal_the_walk_reads_the_route_the_model_took() {
-    let mut cfg = lfm2_2_6b();
+    let mut cfg = traced();
     cfg.attn_impl = AttnImpl::Sdpa;
     let walked = walk(&ghost::lfm2(&cfg, DType::F16, &Device::Cpu).expect("ghost build"));
-    assert_eq!(walked.census().get("attention_generic"), Some(&8));
-    assert_eq!(walked.census().get("sdpa_vector"), None);
-    assert_eq!(walked.dispatches(), 538);
+    let census = walked.census();
+    assert_eq!(
+        (census.get("softmax"), census.get("gemv_t")),
+        (Some(&8), Some(&8))
+    );
+    assert_eq!(census.get("sdpa_vector"), None);
+    assert_eq!(walked.dispatches(), 560 + 8 * 15);
 }
 
 /// The IR-diff gate (`profiles-and-memory-design.md` §11 item 1): today's

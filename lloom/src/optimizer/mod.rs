@@ -24,8 +24,10 @@ pub mod egraph;
 pub mod exclusions;
 pub mod fragments;
 pub mod ir;
+pub mod kinds;
 pub mod numeric;
 pub mod plan;
+pub mod remarks;
 pub mod walk;
 
 use lloom_tensor::Result;
@@ -34,10 +36,13 @@ pub use cost::{CostModel, Marginal, StepCost};
 pub use diff::{diff, listing, IrDiff};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
-pub use ir::{Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape};
+pub use ir::{
+    census_of_labels, kernel_family, Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape,
+};
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
-pub use walk::{walk, Visit, Walker};
+pub use remarks::{remarks, remarks_of, Remark, Remarks, Side, Why};
+pub use walk::{walk, walk_at, Visit, Walker};
 
 /// What the derivation may do.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +61,13 @@ pub struct Policy {
     /// refused with the marginal named. `None` prices by dispatch count
     /// alone, which is what the extractor does.
     pub barrier_model: Option<CostModel>,
+    /// Blocks the model cannot run whatever the plan says — no switch of its
+    /// forward selects them — each with that reason. Refused by name.
+    pub unavailable: Vec<(String, String)>,
+    /// Blocks the model's switches select at some sites only: the block
+    /// rides a product whose weight name ends with one of the suffixes, and
+    /// no other.
+    pub sites: Vec<(String, Vec<String>)>,
 }
 
 impl Default for Policy {
@@ -87,6 +99,8 @@ impl Default for Policy {
             excluded,
             iterations: 8,
             barrier_model: Some(CostModel::default()),
+            unavailable: Vec::new(),
+            sites: Vec::new(),
         }
     }
 }
@@ -119,8 +133,12 @@ impl Policy {
 
     fn unvalidated_of(&self, fragments: &[Fragment]) -> Vec<(String, String)> {
         let set = exclusions::embedded();
+        // A block the derivation can never place under this policy — refused
+        // by its measurement or its form, or beyond the budget — has no
+        // validation state worth reporting.
         fragments
             .iter()
+            .filter(|f| f.refusal.is_none() && f.class().within(self.budget))
             .cloned()
             .filter_map(|f| {
                 let t = ExclusionSet::fragment_transform(f.name);
@@ -155,6 +173,55 @@ pub struct Derivation {
     pub elapsed: std::time::Duration,
 }
 
+/// Whether the block `name` could apply in `graph`: a product block whose
+/// core runs a product here; a prologue whose producer feeds such a product
+/// at a tile it admits; a kernel fragment whose pair occurs.
+fn applies(graph: &Graph, name: &str, catalogue: &[Fragment], kernels: &[fragments::KernelFragment]) -> bool {
+    use crate::nn::fusion::{Semantics, TileNeed};
+    let nodes = graph.nodes();
+    let products = |core: Core| {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(move |(_, n)| matches!(n.op, Op::Gemv | Op::Fused) && n.core == core)
+    };
+    if let Some(f) = catalogue.iter().find(|f| f.name == name) {
+        if f.side == fragments::Side::Store {
+            return products(f.core).next().is_some();
+        }
+        return products(f.core).any(|(id, n)| {
+            let x = &nodes[n.inputs[1]];
+            let tile = f.needs == TileNeed::Any || graph.gemv_walks_k(id);
+            tile && match f.semantics {
+                Semantics::RmsNorm | Semantics::RmsNormScaled => x.op == Op::RmsNorm,
+                Semantics::GroupRmsNorm => x.op == Op::Opaque && x.name == "hc_norm",
+                _ => false,
+            }
+        });
+    }
+    if let Some(k) = kernels.iter().find(|k| k.name == name) {
+        return match k.form {
+            fragments::KernelForm::SiluMul => nodes.iter().any(|n| {
+                n.op == Op::Mul
+                    && n.inputs.iter().any(|&i| {
+                        nodes[i].op == Op::Silu && k.dtypes.contains(&nodes[i].dtype)
+                    })
+            }),
+            fragments::KernelForm::LoadCast { into, operand } => nodes.iter().any(|n| {
+                n.op == Op::Opaque
+                    && n.name == into
+                    && n.inputs.get(operand).is_some_and(|&c| {
+                        let c = &nodes[c];
+                        c.op == Op::Opaque
+                            && c.name == "cast"
+                            && k.dtypes.contains(&nodes[c.inputs[0]].dtype)
+                    })
+            }),
+        };
+    }
+    true
+}
+
 /// Derive over `graph` under `policy` with the shipped catalogue.
 pub fn derive(graph: &Graph, policy: &Policy) -> Result<Derivation> {
     derive_with(graph, policy, &catalogue())
@@ -162,9 +229,25 @@ pub fn derive(graph: &Graph, policy: &Policy) -> Result<Derivation> {
 
 /// Derive over `graph` under `policy` with an explicit catalogue.
 pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Result<Derivation> {
+    let all_kernels = fragments::kernels();
     let (admitted, mut refused) = egraph::admitted(policy, catalogue);
-    let sat = egraph::derive(graph, &admitted, policy.iterations)?;
+    let (kernels, refused_kernels) = egraph::admitted_kernels(policy, &all_kernels);
+    refused.extend(refused_kernels);
+    // A refusal is reported where the block could have applied: its product
+    // core runs here, and for a prologue or a kernel fragment its pattern
+    // occurs.
+    refused.retain(|(name, _)| applies(graph, name, catalogue, &all_kernels));
+    let sat = egraph::derive(graph, &admitted, &kernels, &policy.sites, policy.iterations)?;
     let mut derived = sat.graph;
+    for (prologue, n) in &sat.reverted {
+        refused.push((
+            prologue.clone(),
+            format!(
+                "at {n} sites: the norm has another reader that does not take it, so it stays \
+                 a dispatch and the prologue would remove nothing"
+            ),
+        ));
+    }
 
     // The barrier term, over the extracted step in emission order (§10e):
     // a fragment whose marginal is positive is unfused — the dispatch it
@@ -216,6 +299,7 @@ pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Re
         .map(|m| (cost::step_cost(m, graph), cost::step_cost(m, &derived)));
     let plan = FusionPlan {
         sites,
+        kernels: sat.kernels.clone(),
         class: derived.numeric(),
         before: graph.census(),
         after: derived.census(),
@@ -411,14 +495,20 @@ mod tests {
         };
         let d = derive(&g, &none).unwrap();
         assert_eq!(d.plan.sites.len(), 3);
-        assert_eq!(d.refused.len(), 1);
+        // The exclusion, and at this shape — `w1`/`w3`'s tile walks K — the
+        // two norm prologues: the inline one beyond the default budget, the
+        // imported-scale one by its measurement.
+        let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(refused, ["swiglu", "norm", "rmsnorm"]);
         assert!(d.marginals.is_empty());
         assert!(d.plan.cost.is_none());
 
         let d = derive(&g, &Policy::default()).unwrap();
         assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("swiglu"));
         assert_eq!(d.plan.dispatches_after(), 3);
-        assert!(d.refused.is_empty(), "{:?}", d.refused);
+        let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(refused, ["norm", "rmsnorm"], "{:?}", d.refused);
+        assert_eq!(d.refused[0].1, "class reorder exceeds the budget rounding");
         let sw = d.marginals.iter().find(|m| m.fragment == "swiglu").unwrap();
         assert!(sw.delta_us < -80.0, "{sw:?}");
     }
@@ -508,7 +598,10 @@ mod tests {
         assert!(policy.unvalidated_in(&mlp(1)).is_empty());
         let set = exclusions::embedded();
         let other = TargetFpModel::of_family("shortconv_step").unwrap();
-        for f in catalogue().into_iter().filter(|f| f.core == Core::Gemv) {
+        for f in catalogue()
+            .into_iter()
+            .filter(|f| f.core == Core::Gemv && f.side == fragments::Side::Store)
+        {
             let t = ExclusionSet::fragment_transform(f.name);
             assert!(matches!(set.lookup(&t, &f.model), Lookup::Validated(_)));
             assert!(matches!(set.lookup(&t, &other), Lookup::ModelMismatch(_)));
@@ -550,6 +643,10 @@ mod tests {
                 (
                     "swiglu".to_string(),
                     "excluded by the exclusion set".to_string()
+                ),
+                (
+                    "rmsnorm".to_string(),
+                    fragments::RMSNORM_REFUSAL.to_string()
                 )
             ]
         );
@@ -691,6 +788,132 @@ mod tests {
         );
     }
 
+    /// LFM2-2.6B's MLP at its own shape: the norm into `w1` and `w3`, whose
+    /// tile walks K in one simdgroup (`bm8 bn1 sm1 sn32`).
+    fn mlp_at_lfm2_shape() -> Graph {
+        let (h, f) = (2048, 10752);
+        let mut g = Graph::new();
+        let r = g.input("h", Shape::of(&[1, 1, h]), DType::F16);
+        let nw = g.weight("ffn_norm", Shape::of(&[h]), DType::F16);
+        let x = g.rms_norm(nw, r);
+        let w1 = g.weight("w1", Shape::of(&[f, h]), DType::F16);
+        let w3 = g.weight("w3", Shape::of(&[f, h]), DType::F16);
+        let w2 = g.weight("w2", Shape::of(&[h, f]), DType::F16);
+        let gate = g.gemv(w1, x);
+        let gate = g.silu(gate);
+        let up = g.gemv(w3, x);
+        let gated = g.mul(gate, up);
+        let down = g.gemv(w2, gated);
+        let out = g.add(r, down);
+        g.mark_root(out);
+        g
+    }
+
+    /// The tile fact proposes the norm in its products' load: under a
+    /// `reorder` budget the derivation takes `gemv_norm_swiglu` (the norm,
+    /// both weights and the gate in one launch) and the residual — the
+    /// hand-built composition `--lfm2-norm-gemv --gemv-gate swiglu
+    /// --gemv-residual` runs, derived — 7 dispatches to 2. Under the default
+    /// `rounding` budget it is refused by class, by name.
+    #[test]
+    fn the_norm_is_derived_into_its_products_load_where_the_tile_walks_k() {
+        let g = mlp_at_lfm2_shape();
+        let policy = Policy {
+            budget: NumericClass::ReorderEquiv,
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("norm_swiglu"));
+        assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.sites.len(), 2, "{:?}", d.plan.sites);
+        assert_eq!(d.plan.dispatches_before(), 7);
+        assert_eq!(d.plan.dispatches_after(), 2);
+        assert_eq!(d.plan.after.get("gemv_norm_swiglu"), Some(&1));
+        assert!(!d.plan.after.contains_key("rmsnorm"));
+        assert_eq!(d.plan.class, NumericClass::ReorderEquiv);
+        // The fused node: `w3`, the norm's input, the gate weight, the norm
+        // weight last.
+        let n = d.graph.nodes().iter().find(|n| n.op == Op::Fused).unwrap();
+        let names: Vec<&str> = n.inputs.iter().map(|&i| d.graph.node(i).name.as_str()).collect();
+        assert_eq!(names, ["w3", "h", "w1", "ffn_norm"]);
+        assert_eq!(n.prologue.as_deref(), Some("norm"));
+
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("swiglu"));
+        assert_eq!(d.plan.after.get("rmsnorm"), Some(&1));
+        assert!(d
+            .refused
+            .contains(&("norm".to_string(), "class reorder exceeds the budget rounding".to_string())));
+    }
+
+    /// A norm one of whose products cannot take it (a tile whose simdgroups
+    /// split K) stays a dispatch, so the product that could is reverted: it
+    /// would remove nothing. Named in the refusals.
+    #[test]
+    fn a_norm_one_reader_cannot_take_stays_whole() {
+        let mut g = Graph::new();
+        let r = g.input("h", Shape::of(&[1, 1, 2048]), DType::F16);
+        let nw = g.weight("norm", Shape::of(&[2048]), DType::F16);
+        let x = g.rms_norm(nw, r);
+        let wa = g.weight("wa", Shape::of(&[2048, 2048]), DType::F16);
+        // K >= 16 N: the long-K tile, `bn8`.
+        let wb = g.weight("wb", Shape::of(&[64, 2048]), DType::F16);
+        let a = g.gemv(wa, x);
+        let b = g.gemv(wb, x);
+        assert!(g.gemv_walks_k(a) && !g.gemv_walks_k(b));
+        g.mark_root(a);
+        g.mark_root(b);
+        let policy = Policy {
+            budget: NumericClass::ReorderEquiv,
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
+        assert!(d.plan.sites.is_empty(), "{:?}", d.plan.sites);
+        assert_eq!(d.plan.dispatches_after(), 3);
+        assert_eq!(d.plan.after.get("rmsnorm"), Some(&1));
+        let why = d.refused.iter().find(|(n, _)| n == "norm").map(|(_, w)| w.as_str());
+        assert!(why.is_some_and(|w| w.starts_with("at 1 sites:")), "{:?}", d.refused);
+    }
+
+    /// The kernel fragments: the SwiGLU of two quantized products (no block
+    /// on either end of `mul_mv`) as `silu_mul`, and the combine reading an
+    /// f16 routed output through the widening cast.
+    #[test]
+    fn the_kernel_fragments_compose_the_pairs_they_name() {
+        let mut g = Graph::new();
+        let x = g.input("x", Shape::of(&[1, 1, 64]), DType::F32);
+        let wg = g.weight("wg", Shape::of(&[32, 64]), DType::U8);
+        let wu = g.weight("wu", Shape::of(&[32, 64]), DType::U8);
+        let a = g.gemv_on(Core::Quant, wg, x);
+        let b = g.gemv_on(Core::Quant, wu, x);
+        let s = g.silu(a);
+        let h = g.mul(s, b);
+        let y = g.opaque("mul_mv_id", &[h], Shape::of(&[1, 4, 64]), DType::F16);
+        let y32 = g.opaque("cast", &[y], Shape::of(&[1, 4, 64]), DType::F32);
+        let route = g.input("route", Shape::of(&[1, 4]), DType::F32);
+        let out = g.opaque("moe_combine", &[y32, route], Shape::of(&[1, 64]), DType::F32);
+        g.mark_root(out);
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&1));
+        assert_eq!(d.plan.kernels.get("combine_cast"), Some(&1));
+        assert_eq!(d.plan.after.get("silu_mul"), Some(&1));
+        for gone in ["silu", "bmul", "cast"] {
+            assert!(!d.plan.after.contains_key(gone), "{gone}: {:?}", d.plan.after);
+        }
+        // The combine reads the f16 store itself.
+        let c = d.graph.nodes().iter().find(|n| n.name == "moe_combine").unwrap();
+        assert_eq!(d.graph.node(c.inputs[0]).name, "mul_mv_id");
+        assert!(d.plan.to_string().contains(" combine_cast=1 silu_mul_f32=1"), "{}", d.plan);
+        // Excluded by name, both pairs stay.
+        let policy = Policy {
+            excluded: vec!["silu_mul_f32".to_string(), "combine_cast".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
+        assert!(d.plan.kernels.is_empty());
+        assert_eq!(d.plan.after.get("cast"), Some(&1));
+    }
+
     #[test]
     fn a_store_with_two_readers_is_not_fused() {
         // silu(gemv(w1, x)) where gemv(w1, x) is ALSO read by a second add:
@@ -706,6 +929,16 @@ mod tests {
         g.mark_root(out);
         let d = derive(&g, &Policy::default()).unwrap();
         assert!(d.plan.sites.is_empty(), "{:?}", d.plan.sites);
+        // The SiLU and the product in one kernel do not hide the store: the
+        // SiLU reads it, as the add does.
+        assert_eq!(d.plan.kernels.get("silu_mul_f16"), Some(&1));
+        assert_eq!(d.plan.dispatches_after(), 3);
+        let policy = Policy {
+            excluded: vec!["silu_mul_f16".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
+        assert!(d.plan.sites.is_empty() && d.plan.kernels.is_empty());
         assert_eq!(d.plan.dispatches_after(), 4);
     }
 

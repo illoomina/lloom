@@ -38,30 +38,7 @@ fn by_dispatch_count() -> Policy {
 }
 use lloom_tensor::DType;
 
-/// `LFM2.5-2.6B`'s `config.json`
-/// (`models--LiquidAI--LFM2.5-2.6B/snapshots/654f9463…/config.json`): 30
-/// layers, 22 conv and 8 attention in the listed order, hidden 2048,
-/// intermediate 10752, 32 heads over 8 KV heads, `conv_L_cache` 3, tied
-/// embeddings over a 128000 vocabulary.
-fn lfm2_2_6b() -> Config {
-    use LayerType::{Conv as C, FullAttention as A};
-    Config {
-        vocab_size: 128000,
-        hidden_size: 2048,
-        intermediate_size: 10752,
-        num_hidden_layers: 30,
-        num_attention_heads: 32,
-        num_key_value_heads: 8,
-        conv_l_cache: 3,
-        conv_bias: false,
-        layer_types: vec![
-            C, C, A, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, C, A, C, C, A, C, C, A, C,
-            C,
-        ],
-        tie_embedding: true,
-        ..Default::default()
-    }
-}
+use lloom::testing::ghost::lfm2_2_6b;
 
 /// The arms of the committed trace
 /// `design/measurements/issue-727-raw/pass-plan/runs/trace-arena-shuffle.txt`:
@@ -82,32 +59,47 @@ fn census_of(cfg: &Config) -> (u64, Vec<(String, u64)>) {
     (g.dispatches(), census)
 }
 
+/// The committed re-take of #727's trace at its arms on this branch's tree
+/// (`issue-732-raw/remarks/lfm2-trace-arena-shuffle-branch.txt`,
+/// `lfm2-dispatch-trace --arena --attn sdpa --kv-append in-place
+/// --conv-state shuffle --param-style split --hazard-key pointer`): its
+/// `== kernels per decode token (step 1) ==` block in the IR's families
+/// (`optimizer::kernel_family`), and its `dispatches per decode token`.
+fn traced_census() -> (u64, Vec<(String, u64)>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../../design/measurements/issue-732-raw/remarks/lfm2-trace-arena-shuffle-branch.txt",
+    );
+    let text = std::fs::read_to_string(&path).expect("the committed trace");
+    let mut lines = text.lines();
+    lines
+        .by_ref()
+        .find(|l| l.starts_with("== kernels per decode token (step 1) =="))
+        .expect("the trace's census block");
+    let census = lloom::optimizer::census_of_labels(lines.map_while(|l| {
+        let mut words = l.split_whitespace();
+        let n = words.next()?.parse().ok()?;
+        Some((words.next()?, n))
+    }));
+    let total = text
+        .lines()
+        .find_map(|l| l.strip_prefix("dispatches per decode token: "))
+        .and_then(|n| n.parse().ok())
+        .expect("the trace's total");
+    (total, census.into_iter().collect())
+}
+
 /// The IR's dispatch census on the Shuffle arm equals the trace's, family by
-/// family: `== kernels per decode token (step 1) ==` of
-/// `trace-arena-shuffle.txt`, 538 dispatches. The trace names the GEMV by its
-/// tile (`gemv_float16_bm4…` 84 + `bm8…` 83), the norm by dtype, the cast and
-/// the embedding gather by their kernels; the IR names families.
+/// family — 560: #727's 538 (`issue-727-raw/pass-plan/runs/
+/// trace-arena-shuffle.txt`) and the in-place shift's strided gather a conv
+/// layer since (`docs/dispatch.md` §11.5z-x, +22).
 #[test]
 fn the_shuffle_ir_reconciles_with_the_committed_trace() {
     let mut cfg = lfm2_2_6b();
     traced_arms(&mut cfg, ConvState::Shuffle);
     let (total, census) = census_of(&cfg);
-    let expected: Vec<(&str, u64)> = vec![
-        ("badd", 60),
-        ("bmul", 96),
-        ("cast", 1),
-        ("copy2d", 60),
-        ("fast_sum", 22),
-        ("gemv", 84 + 83),
-        ("is_u32", 1),
-        ("rmsnorm", 77),
-        ("rope", 16),
-        ("sdpa_vector", 8),
-        ("silu", 30),
-    ];
-    let got: Vec<(&str, u64)> = census.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    assert_eq!(got, expected, "the IR's census against the trace's");
-    assert_eq!(total, 538, "`dispatches per decode token: 538`");
+    let (traced_total, traced) = traced_census();
+    assert_eq!(census, traced, "the IR's census against the trace's");
+    assert_eq!((total, traced_total), (560, 560));
 }
 
 /// The rotating-ring arm: `trace-arena-rotating:16.txt`, 516 dispatches —
@@ -123,18 +115,18 @@ fn the_rotating_ring_ir_reconciles_with_the_committed_trace() {
     assert_eq!(total, 516, "`dispatches per decode token: 516`");
 }
 
-/// The elementwise family is 186 of the 538: 96 `bmul` + 60 `badd` + 30
+/// The elementwise family is 186 of the 560: 96 `bmul` + 60 `badd` + 30
 /// `silu`. The issue quotes "186 of 652"; the 186 is this count, the 652 is
 /// a different harness's total (§20 of `issue-727-pass-plans.md`, not a
 /// committed trace) — see the PR's premise check.
 #[test]
-fn the_elementwise_family_is_186_of_538() {
+fn the_elementwise_family_is_186_of_560() {
     let mut cfg = lfm2_2_6b();
     traced_arms(&mut cfg, ConvState::Shuffle);
     let g = decode_step(&cfg, DType::F16);
     let elementwise = g.nodes().iter().filter(|n| n.op.is_elementwise()).count();
     assert_eq!(elementwise, 186);
-    assert_eq!(g.dispatches(), 538);
+    assert_eq!(g.dispatches(), 560);
 }
 
 /// **The P1 gate.** The derivation over the unfused step independently
@@ -142,8 +134,8 @@ fn the_elementwise_family_is_186_of_538() {
 /// `Config::gemv_silu`), the residual onto every `w2`, `out_proj` and
 /// `conv.out_proj` (30 + 8 + 22 = 60 sites, `Config::gemv_residual`), and —
 /// since the gate fragment (#732, §12.2e row 3b) — the SwiGLU product onto
-/// every `w3` (30 sites, `Config::gemv_gate`); onto nothing else. 538
-/// dispatches become 418: the 30 `silu_f16`, 60 `badd_f16` and 30 MLP
+/// every `w3` (30 sites, `Config::gemv_gate`); onto nothing else. 560
+/// dispatches become 440: the 30 `silu_f16`, 60 `badd_f16` and 30 MLP
 /// `bmul_f16` the fused arms replace, in the `Rounding` class. This is the
 /// e-graph's extraction by dispatch count (`barrier_model: None`); the
 /// default policy's barrier term then refuses the gate on this shape —
@@ -197,8 +189,8 @@ fn the_derivation_reproduces_the_hand_written_composition() {
         plan.sites
     );
 
-    assert_eq!(plan.dispatches_before(), 538);
-    assert_eq!(plan.dispatches_after(), 418);
+    assert_eq!(plan.dispatches_before(), 560);
+    assert_eq!(plan.dispatches_after(), 440);
     assert_eq!(plan.after.get("silu"), None);
     assert_eq!(plan.after.get("badd"), None);
     // The 30 MLP `bmul`s are gone; the 66 conv `bmul`s remain.
@@ -208,14 +200,11 @@ fn the_derivation_reproduces_the_hand_written_composition() {
     assert_eq!(plan.after.get("gemv_residual"), Some(&60));
     assert_eq!(plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(plan.class, NumericClass::Rounding);
-    // Only the two-weight kernel is refused, by the policy that excludes it.
-    assert_eq!(
-        d.refused,
-        vec![(
-            "swiglu".to_string(),
-            "excluded by the exclusion set".to_string()
-        )]
-    );
+    // The two-weight kernel is refused by the policy that excludes it; the
+    // norm prologues by the default budget and by their measurement.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(refused, ["swiglu", "norm", "rmsnorm"], "{:?}", d.refused);
+    assert_eq!(d.refused[0].1, "excluded by the exclusion set");
 
     // The derived graph carries 120 fused nodes and no standalone silu/add.
     let fused = d.graph.nodes().iter().filter(|n| n.op == Op::Fused).count();
@@ -271,7 +260,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
             seam("fast_sum", "bmul", 22),
         ]
     );
-    assert_eq!(d.plan.dispatches_after(), 448);
+    assert_eq!(d.plan.dispatches_after(), 470);
 }
 
 /// **The barrier term on the real step** (`optimizer-design.md` §10e): the
@@ -282,7 +271,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
 /// the smaller neighbour's sweep (55.8 µs) against the one 49 µs dispatch
 /// removed: **+62.4 µs per site, +1.87 ms per token** — and keeps SiLU and
 /// the residual, whose barriers sit beside a 2 µs kernel either way. So the
-/// plan is the crown's hand composition again (90 sites, 448), with the
+/// plan is the crown's hand composition again (90 sites, 470), with the
 /// refusal and the marginal on the line. The crown measured −0.74 %
 /// (+0.13–0.16 ms/step) for the gate on: the SIGN the model predicts, at a
 /// magnitude it over-predicts ~12× (both constants predate the measurement;
@@ -300,7 +289,7 @@ fn the_barrier_term_refuses_the_gate_on_the_real_step() {
     eprintln!("plan: {}", d.plan);
     assert_eq!(d.plan.sites.len(), 90);
     assert_eq!(d.plan.sites_of("mul").len(), 0);
-    assert_eq!(d.plan.dispatches_after(), 448);
+    assert_eq!(d.plan.dispatches_after(), 470);
     let (_, why) = d.refused.iter().find(|(n, _)| n == "mul").unwrap();
     assert!(
         why.contains("re-seated between gemv_silu and gemv_mul"),
@@ -341,7 +330,7 @@ fn the_barrier_term_refuses_the_gate_on_the_real_step() {
         assert!(m.delta_us < 0.0, "{f}: {m:?}");
     }
     let (before, after) = d.plan.cost.as_ref().unwrap();
-    assert_eq!((before.dispatches, after.dispatches), (538, 448));
+    assert_eq!((before.dispatches, after.dispatches), (560, 470));
     assert!(after.total_us() < before.total_us());
     // The seams the refusal leaves are P1's four.
     assert_eq!(d.plan.seams.len(), 4, "{:?}", d.plan.seams);
@@ -349,7 +338,7 @@ fn the_barrier_term_refuses_the_gate_on_the_real_step() {
 
 /// The budget refuses what it cannot admit: at `BitExact` neither shipped
 /// epilogue is derivable (both compute on the accumulator), the step is left
-/// at 538, and the refusal names the class. This is the premise correction
+/// at 560, and the refusal names the class. This is the premise correction
 /// the PR records — the issue calls the elementwise family's class
 /// `BitExact`; the shipped fusions are `Rounding`.
 #[test]
@@ -363,18 +352,28 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     };
     let d = derive(&g, &policy).expect("derivation");
     assert!(d.plan.sites.is_empty());
-    assert_eq!(d.plan.dispatches_after(), 538);
+    assert_eq!(d.plan.dispatches_after(), 560);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    // The catalogue's six: the GEMV's four and the mixed GEMV's two, each
-    // refused by the budget before its rule exists.
-    assert_eq!(d.refused.len(), 6, "{:?}", d.refused);
-    assert!(
-        d.refused
-            .iter()
-            .all(|(_, why)| why.contains("class rounding exceeds the budget bit-exact")),
+    // Every block that applies here, each refused before its rule exists:
+    // the GEMV's four epilogues and the SwiGLU kernel by the budget, the
+    // inline norm by the budget (its class is `reorder`), the imported-scale
+    // norm by its measurement. The mixed GEMV's blocks do not apply: no
+    // product here runs on that core.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        refused,
+        ["silu", "residual", "mul", "swiglu", "norm", "rmsnorm", "silu_mul_f16"],
         "{:?}",
         d.refused
     );
+    for (name, why) in &d.refused {
+        let budget = match name.as_str() {
+            "norm" => "class reorder exceeds the budget bit-exact",
+            "rmsnorm" => continue,
+            _ => "class rounding exceeds the budget bit-exact",
+        };
+        assert_eq!(why, budget, "{name}");
+    }
 }
 
 /// The fused arms (`conv_fused`, `QkvLayout::Fused`) change what the block
@@ -414,8 +413,9 @@ fn the_other_arms_derive_the_same_sites() {
 /// 90 fused sites sits in one: the epilogues ride `w1`, `w2` and the two
 /// `out_proj`s, all straight-line, and the fold's result never re-enters the
 /// window. Absolute references, per arm — the nodes of one conv layer's
-/// region: unfused Shuffle = the state, its `narrow`, the two copies, the
-/// window·weight product and the `fast_sum` (6); fused Shuffle = the state
+/// region: unfused Shuffle = the state, its `narrow`, the strided gather of
+/// the in-place shift, the two copies, the window·weight product and the
+/// `fast_sum` (7); fused Shuffle = the state
 /// and `shortconv_step` (2); unfused rotating = the state, the ring write,
 /// the product, the sum (4); fused rotating = the state and `shortconv_ring`
 /// (2); unfused sliding = the rotating count plus the live `narrow` (5);
@@ -424,7 +424,7 @@ fn the_other_arms_derive_the_same_sites() {
 #[test]
 fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
     for (conv_state, conv_fused, per_conv) in [
-        (ConvState::Shuffle, false, 6usize),
+        (ConvState::Shuffle, false, 7usize),
         (ConvState::Shuffle, true, 2),
         (ConvState::RotatingRing { k: 16 }, false, 4),
         (ConvState::RotatingRing { k: 16 }, true, 2),
@@ -492,8 +492,8 @@ fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
 /// on every `w3` — one dispatch where `gemv_silu` + `gemv_mul` were two and
 /// the unfused chain four — and the barrier term admits it: its one barrier
 /// is the residual's beside `w2`, and it removes three dispatches per site.
-/// 90 sites (30 `w3` + 60 residual; `w1` never dispatched alone), **538 →
-/// 388**, nothing refused, the seams left the conv chain's.
+/// 90 sites (30 `w3` + 60 residual; `w1` never dispatched alone), **560 →
+/// 410**, nothing refused, the seams left the conv chain's.
 #[test]
 fn the_two_weight_kernel_is_derived_on_the_real_step() {
     let mut cfg = lfm2_2_6b();
@@ -511,19 +511,62 @@ fn the_two_weight_kernel_is_derived_on_the_real_step() {
     assert_eq!(d.plan.sites_of("silu").len(), 0);
     assert_eq!(d.plan.sites_of("mul").len(), 0);
     assert_eq!(d.plan.sites.len(), 90);
-    assert_eq!(d.plan.dispatches_before(), 538);
-    assert_eq!(d.plan.dispatches_after(), 388);
+    assert_eq!(d.plan.dispatches_before(), 560);
+    assert_eq!(d.plan.dispatches_after(), 410);
     assert_eq!(d.plan.after.get("gemv_swiglu"), Some(&30));
     assert_eq!(d.plan.after.get("gemv_residual"), Some(&60));
     // Both `w1` and `w3` leave the plain count (60), and the 60 residual sites.
     assert_eq!(d.plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(d.plan.after.get("silu"), None);
     assert_eq!(d.plan.after.get("bmul"), Some(&66));
-    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    // The norm prologues apply here and are refused: by the default budget,
+    // by their measurement.
+    let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(refused, ["norm", "rmsnorm"], "{:?}", d.refused);
     let sw = d.marginals.iter().find(|m| m.fragment == "swiglu").unwrap();
     assert_eq!(sw.sites, 30);
     assert!(sw.delta_us < 0.0, "{sw:?}");
     assert_eq!(d.plan.seams.len(), 2, "{:?}", d.plan.seams);
     let (before, after) = d.plan.cost.as_ref().unwrap();
-    assert_eq!((before.dispatches, after.dispatches), (538, 388));
+    assert_eq!((before.dispatches, after.dispatches), (560, 410));
+}
+
+/// **The derivation reaches the norm arm (#912, #915) at the `reorder`
+/// budget.** On the traced arms' step the tile fact admits the norm in the
+/// load of every product it feeds — the attention's three projections, the
+/// conv's in-projection, the MLP's two weights (inside the two-weight
+/// kernel) and the head — and the plan is the hand-built composition
+/// `--lfm2-norm-gemv --gemv-gate swiglu --gemv-residual` runs: 410 → 349,
+/// the 61 layer and final norms gone, the 16 QK norms (they feed the
+/// rotation, not a product) left.
+#[test]
+fn the_norm_prologue_is_derived_on_the_real_step_at_the_reorder_budget() {
+    let mut cfg = lfm2_2_6b();
+    traced_arms(&mut cfg, ConvState::Shuffle);
+    let g = decode_step(&cfg, DType::F16);
+    let policy = Policy {
+        budget: NumericClass::ReorderEquiv,
+        ..Default::default()
+    };
+    let d = derive(&g, &policy).expect("derivation");
+    eprintln!("plan: {}", d.plan);
+    let norm = d.plan.sites_of("norm");
+    assert_eq!(norm.len(), 8 * 3 + 22 + 1, "{norm:?}");
+    for kind in ["q_proj", "k_proj", "v_proj", "conv.in_proj", "embed_tokens"] {
+        assert!(norm.iter().any(|s| s.contains(kind)), "{kind}: {norm:?}");
+    }
+    let swiglu = d.plan.sites_of("norm_swiglu");
+    assert_eq!(swiglu.len(), 30);
+    assert!(swiglu.iter().all(|s| s.ends_with(".feed_forward.w3.weight")));
+    assert_eq!(d.plan.sites_of("residual").len(), 60);
+    assert_eq!(d.plan.sites.len(), 47 + 30 + 60);
+    assert_eq!(d.plan.dispatches_after(), 410 - 61);
+    assert_eq!(d.plan.after.get("rmsnorm"), Some(&16));
+    assert_eq!(d.plan.after.get("gemv_norm"), Some(&47));
+    assert_eq!(d.plan.after.get("gemv_norm_swiglu"), Some(&30));
+    assert_eq!(d.plan.class, NumericClass::ReorderEquiv);
+    let m = d.marginals.iter().find(|m| m.fragment == "norm").unwrap();
+    assert_eq!(m.sites, 77);
+    assert!(m.delta_us < 0.0, "{m:?}");
+    assert!(d.refused.iter().all(|(n, _)| n != "norm"), "{:?}", d.refused);
 }

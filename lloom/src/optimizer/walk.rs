@@ -46,11 +46,29 @@ pub struct Walker {
     /// reads (an indexer's key append, a conv history's next window): the
     /// step's outputs beside its result.
     state: Vec<NodeId>,
+    /// The position the step decodes, when the walk describes one; `None`
+    /// is the steady step, at which no position-dependent launch runs.
+    position: Option<usize>,
 }
 
 impl Walker {
     pub fn new() -> Walker {
         Walker::default()
+    }
+
+    /// A walker for the decode step at `position` (the token's index in the
+    /// sequence, so the cache holds `position` tokens before it): a block
+    /// reads it to emit the launches only some positions take.
+    pub fn at(position: usize) -> Walker {
+        Walker {
+            position: Some(position),
+            ..Walker::default()
+        }
+    }
+
+    /// The position the step decodes, if the walk names one.
+    pub fn position(&self) -> Option<usize> {
+        self.position
     }
 
     /// Run `f` with `part` appended to the name scope.
@@ -143,10 +161,19 @@ pub fn qmat_operand(q: &QMatMul) -> (Core, Shape, DType) {
     }
 }
 
-/// The IR of `model`'s decode step: its visit from nothing to its output,
-/// which becomes the graph's root.
+/// The IR of `model`'s steady decode step: its visit from nothing to its
+/// output, which becomes the graph's root.
 pub fn walk<M: Visit<In = (), Out = NodeId> + ?Sized>(model: &M) -> Graph {
-    let mut w = Walker::new();
+    walk_with(model, Walker::new())
+}
+
+/// The IR of `model`'s decode step at `position`, with the launches that
+/// position takes and the steady step does not.
+pub fn walk_at<M: Visit<In = (), Out = NodeId> + ?Sized>(model: &M, position: usize) -> Graph {
+    walk_with(model, Walker::at(position))
+}
+
+fn walk_with<M: Visit<In = (), Out = NodeId> + ?Sized>(model: &M, mut w: Walker) -> Graph {
     let out = model.visit(&mut w, ());
     w.mark_root(out);
     for id in std::mem::take(&mut w.state) {

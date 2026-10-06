@@ -260,8 +260,8 @@ pub struct CommonArgs {
     pub draft_dir: Option<PathBuf>,
 
     /// Under `--dspark` (LFM2) or `--speculate dflash` (Qwen4-exp): propose
-    /// this many positions per round instead of the drafter's block width (9
-    /// and 7), clamped to it (`speculative.k`).
+    /// this many positions per round (default: LFM2 the block, 9; Qwen4-exp
+    /// 3 of its 7), clamped to the block (`speculative.k`).
     #[arg(long)]
     pub dspark_k: Option<usize>,
 

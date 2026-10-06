@@ -125,6 +125,13 @@ pub fn routed_act(
 /// The HF cache directory of the DFlash drafter trained for this target.
 pub const DFLASH_SNAPSHOT: &str = "models--PixelML--Qwen3.8-Flash-Next-NVFP4-DFlash";
 
+/// DFlash's tokens a round when `speculative.k` names none: three of the
+/// block's seven. Measured through `lloom chat` (`speculation.md`
+/// §10.2z-vi): the verify window's rows cost more than the deeper drafts
+/// return on this target, and K = 3 is at or above K = 7 on every prompt
+/// and turn taken.
+const DFLASH_DEFAULT_K: usize = 3;
+
 /// The DFlash drafter's directory: `dir`, or the newest [`DFLASH_SNAPSHOT`]
 /// when `dir` is empty.
 fn dflash_dir(dir: &Path) -> Result<PathBuf> {
@@ -320,7 +327,8 @@ fn discover_shards(first: &Path) -> Vec<PathBuf> {
 /// The DFlash speculator over `model` from the checkpoint in `dir`, and the
 /// layers the target's cache taps for it: the drafter's own weights (f16 on
 /// Metal, f32 on the CPU), the target's `token_embd` and `lm_head` shared,
-/// `speculative.k` clamping the block, its pipelines warmed off the clock.
+/// `speculative.k` (else [`DFLASH_DEFAULT_K`]) clamping the block, its
+/// pipelines warmed off the clock.
 fn load_dflash<R: ExpertResidency>(
     model: &Qwen4Exp<R>,
     dir: &Path,
@@ -360,9 +368,7 @@ fn load_dflash<R: ExpertResidency>(
         .context("constructing the DFlash drafter")?;
     let mut spec = DSparkSpeculator::with_head(drafter, QwenHead::of(model), 1)
         .context("constructing the DFlash speculator")?;
-    if let Some(k) = spec_k {
-        spec.set_max_draft(k);
-    }
+    spec.set_max_draft(spec_k.unwrap_or(DFLASH_DEFAULT_K));
     let k = lloom::nn::Speculator::max_draft(&spec);
     eprintln!(
         "[dflash: drafter loaded from {} in {:.1} ms, {} layers at {dtype:?}, K={k} of the block \

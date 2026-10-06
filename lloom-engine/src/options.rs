@@ -1025,15 +1025,16 @@ pub(crate) fn parse_method(v: &str) -> Result<String, String> {
 /// GGUF `qwen4exp-mtp-quantize write` produces). Both byte-identical to
 /// greedy. `dflash` is Qwen4-exp's block drafter (the DSpark family's
 /// backbone over the target's tapped HC residuals; `drafter` its checkpoint
-/// directory, `k` clamps its block of 7). The drafter's context KV is
-/// `tuning.dspark.ctx_kv`; the phase drain is `decode.phase_sync`.
+/// directory, `k` its tokens a round, 3 of its block of 7 by default). The
+/// drafter's context KV is `tuning.dspark.ctx_kv`; the phase drain is
+/// `decode.phase_sync`.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct SpeculativeConfig {
     /// `none`, `dspark` (LFM2), `mtp` (Qwen4-exp), `dflash` (Qwen4-exp), or `auto`: the family's own drafter when one is at hand (DSpark when `drafter` names one or the HF cache holds one; on Qwen4-exp MTP when `drafter` names the sidecar or `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, else DFlash when `drafter` names its directory or the HF cache holds the PixelML drafter, at `--batch 1`), else none.
     #[opt(flag = "spec-method", parser = "parse_method", variants = ["none", "dspark", "mtp", "dflash", "auto"])]
     pub method: String,
-    /// Tokens the drafter proposes per round (none = the drafter's own: DSpark's block of 9, DFlash's 7, MTP 1).
+    /// Tokens the drafter proposes per round (none = the drafter's own: DSpark's block of 9, DFlash 3 of its block of 7, MTP 1).
     #[opt(flag = "spec-k")]
     pub k: Option<usize>,
     /// The drafter's weights: a DSpark checkpoint directory (none = the newest LFM2.5-2.6B-DSpark snapshot in the HF cache), a DFlash checkpoint directory (none = the newest PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash snapshot), or the MTP sidecar GGUF (required).

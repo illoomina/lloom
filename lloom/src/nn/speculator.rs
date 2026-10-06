@@ -465,6 +465,17 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
 
+    /// Called by a driver just before it opens the planned pass of a verify
+    /// window of `t` positions on `cache` (`PassShape::Verify`): a model
+    /// whose verify windows of one length run several allocation sequences
+    /// it can tell apart before the pass names which one as the pass key's
+    /// variant (`PassKey::variant`), as its `prepare_pass` does for a decode
+    /// step. The default names one sequence.
+    fn prepare_verify(&self, cache: &mut Self::Cache, t: usize) -> Result<()> {
+        let _ = (cache, t);
+        Ok(())
+    }
+
     /// The receipt of a verify pass that has been encoded and not read back.
     type Pending;
 
@@ -656,13 +667,14 @@ impl RoundTiming {
     }
 }
 
-/// Host readbacks performed so far by this process (Metal's two `to_cpu`
-/// paths summed); 0 on other backends.
+/// Host readbacks performed so far by this process: every read that waits
+/// on the GPU (`to_cpu`'s two paths, `stage_read`, a `stage_readback` that
+/// waits on its blit); 0 on other backends.
 pub(crate) fn readbacks() -> u64 {
     #[cfg(feature = "metal")]
     {
-        let (fast, blit) = lloom_tensor::metal_backend::to_cpu_counts();
-        fast + blit + lloom_tensor::metal_backend::to_cpu_staged_count()
+        let c = lloom_tensor::metal_backend::readback_counts();
+        c.fast + c.blit + c.staged + c.staged_wait
     }
     #[cfg(not(feature = "metal"))]
     {
@@ -1206,6 +1218,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let t = std::time::Instant::now();
         let rb = readbacks();
         if let Some((device, shape)) = verify_key {
+            if let (crate::nn::decode::PassShape::Verify { k }, [_]) = (shape, anchors) {
+                self.model.prepare_verify(&mut self.seq.cache, k)?;
+            }
             crate::nn::decode::begin_pass(device, shape)?;
         }
         let verified = self

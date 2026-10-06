@@ -1464,10 +1464,11 @@ pub struct Config {
     ///
     /// **Defaults to `Manual`** (§7.1a): the derivation is a mechanism, and
     /// every recorded digest belongs to the flag-selected arms. Under
-    /// `Derived` the plan is derived once in [`Model::new`] from
-    /// [`crate::models::lfm2_ir::decode_step`] — nothing runs per token — and
-    /// `gemv_silu`/`gemv_residual` are set from it, so a `Derived` run and the
-    /// `Manual` run whose flags match the plan compute the same bits.
+    /// `Derived` the plan is derived once in [`Model::new`] over the walk of
+    /// the model as built (`crate::optimizer::walk`) — nothing runs per
+    /// token — and the blocks' epilogue arms are set from it, so a `Derived`
+    /// run and the `Manual` run whose flags match the plan compute the same
+    /// bits.
     #[axis(
         name = "Fusion",
         flag = "fusion",
@@ -1652,12 +1653,7 @@ impl Default for Config {
 type KvSlot = crate::nn::slab::Slab;
 
 fn kv_slot(capacity: usize) -> KvSlot {
-    crate::nn::slab::Slab::new(
-        2,
-        capacity,
-        crate::nn::slab::Grow::Fixed,
-        zs::LFM2_KV_SLAB,
-    )
+    crate::nn::slab::Slab::new(2, capacity, crate::nn::slab::Grow::Fixed, zs::LFM2_KV_SLAB)
 }
 
 /// One attention layer's K or V, stored as integer codes plus a (scale, bias)
@@ -2215,15 +2211,13 @@ impl PagedKv {
             .max(self.table.len());
         let fresh = match &self.table_t {
             Some(t) => {
-                t.elem_count() < self.table.len()
-                    || self.table_written > self.table.len()
-                    || {
-                        // The written prefix must still be the table's prefix
-                        // (a host compare against what was written; never a
-                        // device read on the step).
-                        let written = self.table_written.min(self.table.len());
-                        self.table_shadow[..written] != self.table[..written]
-                    }
+                t.elem_count() < self.table.len() || self.table_written > self.table.len() || {
+                    // The written prefix must still be the table's prefix
+                    // (a host compare against what was written; never a
+                    // device read on the step).
+                    let written = self.table_written.min(self.table.len());
+                    self.table_shadow[..written] != self.table[..written]
+                }
             }
             None => true,
         };
@@ -2411,7 +2405,8 @@ impl PagedKv {
     /// the tables the read walks. Runs once per pass, at its first attention
     /// layer; every layer of the pass reuses the result.
     fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
-        let (pool_pages, page_size, ppc) = (self.pool_pages(), self.page_size, self.pages_per_chunk);
+        let (pool_pages, page_size, ppc) =
+            (self.pool_pages(), self.page_size, self.pages_per_chunk);
         let pool = self
             .pool
             .as_mut()
@@ -2519,7 +2514,13 @@ impl PagedKv {
     /// (the rows' tokens end to end in the pass's row order) or
     /// `[B, H_kv, 1, D]` (a decode batch, one token per row): the scatter's
     /// row `r` is `(r / t, r % t)`, which is the pass's row order either way.
-    fn write_rows(&mut self, block_idx: usize, k: &Tensor, v: &Tensor, pass: &RowsPass) -> Result<()> {
+    fn write_rows(
+        &mut self,
+        block_idx: usize,
+        k: &Tensor,
+        v: &Tensor,
+        pass: &RowsPass,
+    ) -> Result<()> {
         let (b, n_kv_heads, t, head_dim) = k.dims4()?;
         let want = pass.slots.dim(0)?;
         if b * t != want {
@@ -2537,8 +2538,22 @@ impl PagedKv {
             ));
         }
         let (pk, pv) = self.pools[block_idx].as_ref().expect("allocated above");
-        k.kv_scatter_into(pk, &pass.slots, pass.max_slot, 0, tokens * head_dim, head_dim)?;
-        v.kv_scatter_into(pv, &pass.slots, pass.max_slot, 0, tokens * head_dim, head_dim)?;
+        k.kv_scatter_into(
+            pk,
+            &pass.slots,
+            pass.max_slot,
+            0,
+            tokens * head_dim,
+            head_dim,
+        )?;
+        v.kv_scatter_into(
+            pv,
+            &pass.slots,
+            pass.max_slot,
+            0,
+            tokens * head_dim,
+            head_dim,
+        )?;
         Ok(())
     }
 
@@ -2551,7 +2566,10 @@ impl PagedKv {
         n_prev: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let pool = self.pool.as_ref().expect("a shared pool exists from construction");
+        let pool = self
+            .pool
+            .as_ref()
+            .expect("a shared pool exists from construction");
         let (pk, pv) = self.pools[block_idx]
             .as_ref()
             .expect("the layer has a pool once a token was written");
@@ -2797,7 +2815,14 @@ impl BatchPool {
             };
             let kv_capacity = kv_capacity.min(config.max_position_embeddings).max(1);
             let slab = DEFAULT_KV_BUCKET.min(kv_capacity);
-            let kv = PagedKv::new_shared(config, kv_capacity, slab, config.num_hidden_layers, clock, slots)?;
+            let kv = PagedKv::new_shared(
+                config,
+                kv_capacity,
+                slab,
+                config.num_hidden_layers,
+                clock,
+                slots,
+            )?;
             Ok(Self {
                 inner: Arc::new(parking_lot::Mutex::new(BatchInner {
                     kv,
@@ -3946,7 +3971,8 @@ impl Cache {
                 let mut g = b.pool.inner.lock();
                 let slots = g.slots;
                 if g.conv[layer].is_none() {
-                    g.conv[layer] = Some(Tensor::zeros((slots, hidden, width), dtype, &self.device)?);
+                    g.conv[layer] =
+                        Some(Tensor::zeros((slots, hidden, width), dtype, &self.device)?);
                 }
                 g.conv[layer]
                     .as_ref()
@@ -4123,7 +4149,9 @@ impl Cache {
         #[cfg(feature = "metal")]
         {
             let (Some(d), Some(s)) = (&self.batch, &src.batch) else {
-                lloom_tensor::bail!("lfm2 share_prefix_from: both rows must be slots of a BatchPool")
+                lloom_tensor::bail!(
+                    "lfm2 share_prefix_from: both rows must be slots of a BatchPool"
+                )
             };
             if !d.pool.same(&s.pool) {
                 lloom_tensor::bail!("lfm2 share_prefix_from: the rows are in different pools")
@@ -4549,8 +4577,7 @@ impl Cache {
                         v.grow_to(slab)?;
                     }
                 }
-                KvAppend::Paged =>
-                {
+                KvAppend::Paged => {
                     #[cfg(feature = "metal")]
                     if let Some(p) = self.paged.as_mut() {
                         p.grow_to(slab)?;
@@ -5739,6 +5766,9 @@ struct Mlp {
     gemv_residual: bool,
     /// How the gate product is dispatched (§12.2e row 3b, §12.2 row 5, #732).
     gemv_gate: GateFusion,
+    /// `(hidden, intermediate)`: the projections' extents, which a streamed
+    /// layer's placeholders do not carry (its walk reads them here).
+    dims: (usize, usize),
     span: tracing::Span,
 }
 
@@ -5757,6 +5787,7 @@ impl Mlp {
             gemv_silu: cfg.gemv_silu,
             gemv_residual: cfg.gemv_residual,
             gemv_gate: cfg.gemv_gate,
+            dims: (cfg.hidden_size, cfg.intermediate_size),
             span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
     }
@@ -5773,6 +5804,7 @@ impl Mlp {
             gemv_silu: cfg.gemv_silu,
             gemv_residual: cfg.gemv_residual,
             gemv_gate: cfg.gemv_gate,
+            dims: (cfg.hidden_size, cfg.intermediate_size),
             span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
     }
@@ -5934,6 +5966,28 @@ impl Mlp {
     }
 }
 
+/// The SwiGLU MLP's decode step: `w2(silu(w1(x)) * w3(x))`, the down
+/// projection unadded — the unfused chain, whichever epilogue arms are set:
+/// those are what a derivation over it decides.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for Mlp {
+    type In = crate::optimizer::NodeId;
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, xn: Self::In) -> Self::Out {
+        use crate::optimizer::Shape;
+        let (h, i) = self.dims;
+        let dt = self.down_proj.weight().dtype();
+        let w1 = w.weight("w1.weight", Shape::of(&[i, h]), dt);
+        let w3 = w.weight("w3.weight", Shape::of(&[i, h]), dt);
+        let w2 = w.weight("w2.weight", Shape::of(&[h, i]), dt);
+        let gate = w.gemv(w1, xn);
+        let gate = w.silu(gate);
+        let up = w.gemv(w3, xn);
+        let gated = w.mul(gate, up);
+        w.gemv(w2, gated)
+    }
+}
+
 /// Attention layer with per-head QK normalization and RoPE.
 #[derive(Debug, Clone)]
 struct Attention {
@@ -5959,6 +6013,11 @@ struct Attention {
     /// How the projections' `transpose` views reach the norms and the append
     /// (`Config::qkv_layout`).
     qkv_layout: QkvLayout,
+    /// The model width, which a streamed layer's placeholders do not carry.
+    hidden_size: usize,
+    /// How the cache this model is configured for grows (`Config::kv_append`):
+    /// the cache's choice, read by the walk only.
+    kv_append: KvAppend,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -6012,6 +6071,8 @@ impl Attention {
             flash_scratch_sizing: cfg.flash_scratch_sizing,
             gemv_residual: cfg.gemv_residual,
             qkv_layout: cfg.qkv_layout,
+            hidden_size,
+            kv_append: cfg.kv_append,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
@@ -6323,7 +6384,13 @@ impl Attention {
         match first {
             Some(f) => {
                 matches!(dtype, DType::F16 | DType::F32)
-                    && f.batch.as_ref().expect("checked").pool.inner.lock().batched_arms
+                    && f.batch
+                        .as_ref()
+                        .expect("checked")
+                        .pool
+                        .inner
+                        .lock()
+                        .batched_arms
             }
             None => false,
         }
@@ -6521,10 +6588,12 @@ impl Attention {
             } else {
                 q_t.index_select(&Tensor::new(idx.as_slice(), &device)?, 2)?
             };
-            let q_d = q_d
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((nd, self.num_attention_heads, 1, self.head_dim))?;
+            let q_d = q_d.transpose(1, 2)?.contiguous()?.reshape((
+                nd,
+                self.num_attention_heads,
+                1,
+                self.head_dim,
+            ))?;
             // Borrowed from the pass: no `Vec` clone per layer per step.
             let (tables, n_keys, tables_t, n_keys_t) = match &pass.dec {
                 Some(d) => (&d.tables[..], &d.n_keys[..], &d.tables_t, &d.n_keys_t),
@@ -6909,10 +6978,12 @@ impl Attention {
                             let pass = if pending {
                                 let slot = cache.batch.as_ref().expect("checked").slot();
                                 let pool = cache.batch.as_ref().expect("checked").pool.clone();
-                                let pass = Arc::new(pool.inner.lock().kv.begin_rows(
-                                    &[(slot, seq_len)],
-                                    &device,
-                                )?);
+                                let pass = Arc::new(
+                                    pool.inner
+                                        .lock()
+                                        .kv
+                                        .begin_rows(&[(slot, seq_len)], &device)?,
+                                );
                                 cache.batch.as_mut().expect("checked").pass = Some(pass.clone());
                                 pass
                             } else {
@@ -6948,39 +7019,39 @@ impl Attention {
                                 (k, v)
                             }
                         } else {
-                        let Some(paged) = cache.paged.as_mut() else {
-                            lloom_tensor::bail!("lfm2 `KvAppend::Paged` with no page pool")
-                        };
-                        if pending {
-                            paged.begin_pass(b_sz, seq_len, &device)?;
-                        }
-                        let n_prev = paged.len - paged.pass_len;
-                        // The write: this pass's tokens to the slots the table
-                        // names, one dispatch for K and one for V.
-                        paged.write_layer(block_idx, &k, &v)?;
-                        if reads_pool {
-                            // Decode reads the pool through the table below;
-                            // the tensors handed on are the pool itself.
-                            let (pk, pv) = paged.pools[block_idx]
-                                .as_ref()
-                                .expect("write_layer allocates the layer's pool");
-                            (pk.clone(), pv.clone())
-                        } else if n_prev == 0 {
-                            // A first pass attends over its own tokens.
-                            (k, v)
-                        } else {
-                            // A turn-boundary prefill (§10.9), or a decode step
-                            // whose shape FlashDecoding does not instantiate,
-                            // attends over the accumulated cache: gathered from
-                            // the pool by physical slot, then this pass's
-                            // tokens. O(kv_len) per pass, and on the decode path
-                            // only on that fallback (`AttnRoute`).
-                            let (prev_k, prev_v) =
-                                paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
-                            let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
-                            let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
-                            (k, v)
-                        }
+                            let Some(paged) = cache.paged.as_mut() else {
+                                lloom_tensor::bail!("lfm2 `KvAppend::Paged` with no page pool")
+                            };
+                            if pending {
+                                paged.begin_pass(b_sz, seq_len, &device)?;
+                            }
+                            let n_prev = paged.len - paged.pass_len;
+                            // The write: this pass's tokens to the slots the table
+                            // names, one dispatch for K and one for V.
+                            paged.write_layer(block_idx, &k, &v)?;
+                            if reads_pool {
+                                // Decode reads the pool through the table below;
+                                // the tensors handed on are the pool itself.
+                                let (pk, pv) = paged.pools[block_idx]
+                                    .as_ref()
+                                    .expect("write_layer allocates the layer's pool");
+                                (pk.clone(), pv.clone())
+                            } else if n_prev == 0 {
+                                // A first pass attends over its own tokens.
+                                (k, v)
+                            } else {
+                                // A turn-boundary prefill (§10.9), or a decode step
+                                // whose shape FlashDecoding does not instantiate,
+                                // attends over the accumulated cache: gathered from
+                                // the pool by physical slot, then this pass's
+                                // tokens. O(kv_len) per pass, and on the decode path
+                                // only on that fallback (`AttnRoute`).
+                                let (prev_k, prev_v) =
+                                    paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
+                                let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
+                                let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
+                                (k, v)
+                            }
                         }
                     }
                 }
@@ -7042,22 +7113,22 @@ impl Attention {
                         pass.n_keys.clone(),
                     )?
                 } else {
-                let paged = cache.paged.as_ref().expect("checked above");
-                crate::nn::ops::flash_decoding_paged_resident(
-                    &q,
-                    &k,
-                    &v,
-                    1f32 / (self.head_dim as f32).sqrt(),
-                    1.0,
-                    self.flash_page_size,
-                    self.flash_pages_per_chunk,
-                    self.flash_scratch_sizing,
-                    reserve_chunks,
-                    &paged.table,
-                    paged.table_stride,
-                    paged.len,
-                    paged.table_t.as_ref(),
-                )?
+                    let paged = cache.paged.as_ref().expect("checked above");
+                    crate::nn::ops::flash_decoding_paged_resident(
+                        &q,
+                        &k,
+                        &v,
+                        1f32 / (self.head_dim as f32).sqrt(),
+                        1.0,
+                        self.flash_page_size,
+                        self.flash_pages_per_chunk,
+                        self.flash_scratch_sizing,
+                        reserve_chunks,
+                        &paged.table,
+                        paged.table_stride,
+                        paged.len,
+                        paged.table_t.as_ref(),
+                    )?
                 }
             }
         } else if self.flash_decoding_applies(&q, seq_len) {
@@ -7151,6 +7222,90 @@ impl Attention {
 }
 
 /// Short convolution layer for efficient sequence processing.
+/// The attention block's decode step, the output projection unadded: three
+/// projections, the QK norms and RoPE (or the fused pair), the two appends,
+/// the decode kernel the route took, the output projection. The cache, the
+/// appends and the attention over `kv_len` are layer `l`'s KV recurrence.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for Attention {
+    type In = (crate::optimizer::NodeId, usize);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (xn, l): Self::In) -> Self::Out {
+        use crate::optimizer::{Dim, Region, Shape};
+        let (h, hd) = (self.hidden_size, self.head_dim);
+        let (heads, kvh) = (self.num_attention_heads, self.num_key_value_heads);
+        let kv = kvh * hd;
+        let dt = self.o_proj.weight().dtype();
+        let wq = w.weight("q_proj.weight", Shape::of(&[h, h]), dt);
+        let wk = w.weight("k_proj.weight", Shape::of(&[kv, h]), dt);
+        let wv = w.weight("v_proj.weight", Shape::of(&[kv, h]), dt);
+        let q = w.gemv(wq, xn);
+        let k = w.gemv(wk, xn);
+        let v = w.gemv(wv, xn);
+        let q = w.view("reshape", q, Shape::of(&[1, heads, 1, hd]));
+        let k = w.view("reshape", k, Shape::of(&[1, kvh, 1, hd]));
+        let v = w.view("reshape", v, Shape::of(&[1, kvh, 1, hd]));
+        let qn_w = w.weight("q_layernorm.weight", Shape::of(&[hd]), dt);
+        let kn_w = w.weight("k_layernorm.weight", Shape::of(&[hd]), dt);
+        let cos = w.input(&format!("rope.cos@{l}"), Shape::of(&[1, hd / 2]), dt);
+        let sin = w.input(&format!("rope.sin@{l}"), Shape::of(&[1, hd / 2]), dt);
+        let (qr, kr) = match self.qkv_layout {
+            QkvLayout::Contiguous | QkvLayout::Strided => {
+                let qn = w.rms_norm(qn_w, q);
+                let kn = w.rms_norm(kn_w, k);
+                let qr = w.opaque("rope", &[qn, cos, sin], Shape::of(&[1, heads, 1, hd]), dt);
+                let kr = w.opaque("rope", &[kn, cos, sin], Shape::of(&[1, kvh, 1, hd]), dt);
+                (qr, kr)
+            }
+            QkvLayout::Fused => {
+                let qr = w.opaque(
+                    "rmsnorm_rope",
+                    &[qn_w, q, cos, sin],
+                    Shape::of(&[1, heads, 1, hd]),
+                    dt,
+                );
+                let kr = w.opaque(
+                    "rmsnorm_rope",
+                    &[kn_w, k, cos, sin],
+                    Shape::of(&[1, kvh, 1, hd]),
+                    dt,
+                );
+                (qr, kr)
+            }
+        };
+        let kv_shape = Shape(vec![
+            Dim::Const(1),
+            Dim::Const(kvh),
+            Dim::Sym("kv_len"),
+            Dim::Const(hd),
+        ]);
+        let k_cache = w.input(&format!("kv.k@{l}"), kv_shape.clone(), dt);
+        let v_cache = w.input(&format!("kv.v@{l}"), kv_shape.clone(), dt);
+        let append = match self.kv_append {
+            KvAppend::InPlace => "copy2d",
+            KvAppend::Cat => "kv_cat",
+            KvAppend::Paged => "flash_kv_scatter",
+        };
+        let k_all = w.opaque(append, &[kr, k_cache], kv_shape.clone(), dt);
+        let v_all = w.opaque(append, &[v, v_cache], kv_shape, dt);
+        let kernel = match self.route.decode {
+            DecodeAttn::SdpaVector => "sdpa_vector",
+            DecodeAttn::FlashDecoding => "flash_decoding",
+            DecodeAttn::Generic => "attention_generic",
+        };
+        let y = w.opaque(
+            kernel,
+            &[qr, k_all, v_all],
+            Shape::of(&[1, heads, 1, hd]),
+            dt,
+        );
+        w.mark(&[k_cache, v_cache, k_all, v_all, y], Region::Kv(l));
+        let y = w.view("reshape", y, Shape::of(&[1, 1, h]));
+        let wo = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
+        w.gemv(wo, y)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ShortConv {
     in_proj: Linear,
@@ -7678,7 +7833,15 @@ impl ShortConv {
             }
         }
         match first {
-            Some(f) => f.batch.as_ref().expect("checked").pool.inner.lock().batched_arms,
+            Some(f) => {
+                f.batch
+                    .as_ref()
+                    .expect("checked")
+                    .pool
+                    .inner
+                    .lock()
+                    .batched_arms
+            }
             None => false,
         }
     }
@@ -7795,7 +7958,12 @@ impl ShortConv {
         let mut j = 0usize;
         for (r, row) in rows.iter_mut().enumerate() {
             if row.len == 1 {
-                outs.push(out_dec.as_ref().expect("a decode row was written").narrow(0, j, 1)?);
+                outs.push(
+                    out_dec
+                        .as_ref()
+                        .expect("a decode row was written")
+                        .narrow(0, j, 1)?,
+                );
                 j += 1;
             } else {
                 let bcx_r = bcx.narrow(1, offs[r], row.len)?.transpose(1, 2)?;
@@ -8275,6 +8443,107 @@ impl ShortConv {
 }
 
 /// Unified decoder layer supporting both attention and convolution.
+/// The short-conv block's decode step, the output projection unadded, at
+/// the state arm and fold the block was built with: the fused kernels as one
+/// node each, the unfused arms as their copies, products and fold. The state
+/// window, whatever writes the next window and the fold over it are layer
+/// `l`'s conv recurrence; the `*c` gate reads the fold's result and is
+/// straight-line.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for ShortConv {
+    type In = (crate::optimizer::NodeId, usize);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (xn, l): Self::In) -> Self::Out {
+        use crate::optimizer::{Dim, NodeId, Region, Shape};
+        let (h, lc) = (self.hidden_size, self.l_cache);
+        let width = self.conv_state.width(lc);
+        let dt = self.conv_weight.dtype();
+        let w_in = w.weight("in_proj.weight", Shape::of(&[3 * h, h]), dt);
+        let bcx = w.gemv(w_in, xn);
+        let bcx = w.view("transpose", bcx, Shape::of(&[1, 3 * h, 1]));
+        let b = w.view("narrow", bcx, Shape::of(&[1, h, 1]));
+        let c = w.view("narrow", bcx, Shape::of(&[1, h, 1]));
+        let x = w.view("narrow", bcx, Shape::of(&[1, h, 1]));
+        let w_conv = w.weight("conv.weight", Shape::of(&[h, 1, lc]), dt);
+        let w_conv = w.view("squeeze", w_conv, Shape::of(&[h, lc]));
+        let state = w.input(&format!("conv.state@{l}"), Shape::of(&[1, h, width]), dt);
+        let mut ring: Vec<NodeId> = vec![state];
+        let out = match (self.conv_state, self.conv_fused) {
+            (ConvState::Shuffle, true) => {
+                let step = w.opaque(
+                    "shortconv_step",
+                    &[b, x, c, state, w_conv],
+                    Shape::of(&[1, h, 1]),
+                    dt,
+                );
+                ring.push(step);
+                step
+            }
+            // The ring writer's output arrives transposed with `*c` applied.
+            (ConvState::RotatingRing { .. }, true) => {
+                let out = w.opaque(
+                    "shortconv_ring",
+                    &[b, x, c, state, w_conv],
+                    Shape::of(&[1, 1, h]),
+                    dt,
+                );
+                ring.push(out);
+                w.mark(&ring, Region::ConvRing(l));
+                let w_out = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
+                return w.gemv(w_out, out);
+            }
+            (arm, fused) => {
+                let bx = w.mul(b, x);
+                let window = match arm {
+                    ConvState::Shuffle => {
+                        // `cat([state[1..], bx])`: two copies into the new state.
+                        let tail = w.view("narrow", state, Shape::of(&[1, h, lc - 1]));
+                        let shifted = w.opaque("copy2d", &[tail], Shape::of(&[1, h, lc]), dt);
+                        let next = w.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dt);
+                        ring.extend([tail, shifted, next]);
+                        next
+                    }
+                    ConvState::RotatingRing { .. } | ConvState::SlidingRing { .. } => {
+                        // `slice_set` at the write slot: one copy into the ring.
+                        let written =
+                            w.opaque("copy2d", &[bx, state], Shape::of(&[1, h, width]), dt);
+                        ring.push(written);
+                        if matches!(arm, ConvState::SlidingRing { .. }) {
+                            let live = w.view("narrow", written, Shape::of(&[1, h, lc]));
+                            ring.push(live);
+                            live
+                        } else {
+                            written
+                        }
+                    }
+                };
+                let taps = match w.node(window).shape.last() {
+                    Some(Dim::Const(t)) => t,
+                    _ => lc,
+                };
+                let conv = if fused {
+                    let wt = w.view("unsqueeze", w_conv, Shape::of(&[h, 1, taps]));
+                    let conv =
+                        w.opaque("conv1d_depthwise", &[window, wt], Shape::of(&[1, h, 1]), dt);
+                    ring.push(conv);
+                    conv
+                } else {
+                    let wt = w.view("unsqueeze", w_conv, Shape::of(&[1, h, taps]));
+                    let prod = w.mul(window, wt);
+                    let sum = w.opaque("fast_sum", &[prod], Shape::of(&[1, h, 1]), dt);
+                    ring.extend([prod, sum]);
+                    sum
+                };
+                w.mul(c, conv)
+            }
+        };
+        w.mark(&ring, Region::ConvRing(l));
+        let out = w.view("transpose", out, Shape::of(&[1, 1, h]));
+        let w_out = w.weight("out_proj.weight", Shape::of(&[h, h]), dt);
+        w.gemv(w_out, out)
+    }
+}
+
 #[derive(Debug, Clone)]
 enum LayerKind {
     Attention(Box<Attention>),
@@ -8650,6 +8919,33 @@ impl DecoderLayer {
     }
 }
 
+/// One layer's decode step: the operator norm, the mixer, its residual add,
+/// the FFN norm, the MLP, its residual add — the adds unfused, as the MLP's
+/// epilogues are. `In` is the hidden state and the layer's index.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for DecoderLayer {
+    type In = (crate::optimizer::NodeId, usize);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (hidden, l): Self::In) -> Self::Out {
+        use crate::optimizer::Shape;
+        let h = self.mlp.dims.0;
+        let dt = self.mlp.down_proj.weight().dtype();
+        let residual = hidden;
+        let norm_w = w.weight("operator_norm.weight", Shape::of(&[h]), dt);
+        let xn = w.rms_norm(norm_w, residual);
+        let block = match &self.kind {
+            LayerKind::Attention(attn) => w.scoped("self_attn", |w| attn.visit(w, (xn, l))),
+            LayerKind::ShortConv(conv) => w.scoped("conv", |w| conv.visit(w, (xn, l))),
+        };
+        let hidden = w.add(block, residual);
+        let residual = hidden;
+        let ffn_w = w.weight("ffn_norm.weight", Shape::of(&[h]), dt);
+        let xn = w.rms_norm(ffn_w, residual);
+        let down = w.scoped("feed_forward", |w| self.mlp.visit(w, xn));
+        w.add(down, residual)
+    }
+}
+
 /// LFM2 model for causal language modeling.
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -8668,17 +8964,25 @@ pub struct Model {
     l_cache: usize,
 }
 
-/// Derive the epilogue plan for `cfg` and return the config with the two
-/// epilogue flags set from it, with the report (`crate::optimizer`, issue
-/// #732 P1/P2).
+/// The epilogue arms a derivation sets on the built model's blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpilogueFlags {
+    silu: bool,
+    residual: bool,
+    gate: GateFusion,
+}
+
+/// Derive the epilogue plan over the walk of `model` as built
+/// (`crate::optimizer::walk`), and return the flags it sets with the report
+/// (`crate::optimizer`, issue #732 P1/P2). `cfg` is what the model was
+/// built from: the arms the exclusion set is consulted about.
 ///
-/// The plan is per site; the runtime seam is two model-wide bools. A plan
-/// that fuses some sites of a kind and not others cannot be expressed by the
-/// bools, so it is refused rather than approximated — that would be a
-/// finding about the catalogue or the model, and it is reported as an error
-/// naming the sites.
+/// The plan is per site; the flags are uniform over a kind. A plan that
+/// fuses some sites of a kind and not others is refused rather than
+/// approximated — that would be a finding about the catalogue or the model,
+/// and it is reported as an error naming the sites.
 #[cfg(not(target_arch = "wasm32"))]
-fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
+fn derive_fusion(model: &Model, cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
     use crate::optimizer::{
         derive, exclusions, numeric, ExclusionSet, Lookup, Policy, RegionKind, TargetFpModel,
         Verdict,
@@ -8833,7 +9137,7 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
         }
     }
 
-    let graph = crate::models::lfm2_ir::decode_step(cfg, dtype);
+    let graph = crate::optimizer::walk(model);
     let policy = Policy::default();
     let d = derive(&graph, &policy)?;
     let plan = &d.plan;
@@ -8885,7 +9189,7 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
             )
         }
     }
-    for (name, why) in policy.unvalidated() {
+    for (name, why) in policy.unvalidated_in(&graph) {
         report
             .unvalidated
             .push((ExclusionSet::fragment_transform(&name), why));
@@ -8901,11 +9205,12 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
         .iter()
         .map(|s| (s.site.clone(), s.fragment.clone(), s.region.to_string()))
         .collect();
-    let mut out = cfg.clone();
-    out.gemv_silu = gemv_silu;
-    out.gemv_residual = gemv_residual;
-    out.gemv_gate = gemv_gate;
-    Ok((out, report))
+    let flags = EpilogueFlags {
+        silu: gemv_silu,
+        residual: gemv_residual,
+        gate: gemv_gate,
+    };
+    Ok((flags, report))
 }
 
 /// The conv fold's ∞-norm gain per channel over every conv layer's loaded
@@ -8948,7 +9253,7 @@ fn conv_fold_gain(layers: &[DecoderLayer]) -> Result<Option<ConvFoldGain>> {
 /// A browser build has no optimizer (`egglog` is host-only); the arm is
 /// refused rather than silently manual.
 #[cfg(target_arch = "wasm32")]
-fn derive_fusion(_cfg: &Config, _dtype: DType) -> Result<(Config, FusionReport)> {
+fn derive_fusion(_model: &Model, _cfg: &Config) -> Result<(EpilogueFlags, FusionReport)> {
     lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
 }
 
@@ -8991,22 +9296,6 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        // Under `Fusion=Derived` the optimizer decides the epilogue sites
-        // once, here, and the layers below read the same bools they always
-        // did: the derivation is construction-tier, the token path is
-        // untouched (`CONTRIBUTING.md` §3.3a).
-        let derived;
-        let mut report = None;
-        let cfg = match cfg.fusion {
-            FusionPolicy::Manual => cfg,
-            FusionPolicy::Derived => {
-                let (d, r) = derive_fusion(cfg, vb.dtype())?;
-                derived = d;
-                report = Some(r);
-                &derived
-            }
-        };
-
         // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING
         // §1.6). The value is a `#[axis]` field on `Config` so a run records it;
         // the atomic in `lloom-tensor::kernels` is its cache, set once here at
@@ -9111,17 +9400,10 @@ impl Model {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
-        // The closed-form gain §5a names wants the loaded weights, so it is
-        // read here, once, and the report is printed complete.
-        if let Some(r) = report.as_mut() {
-            r.conv_fold_gain = conv_fold_gain(&layers)?;
-            eprintln!("{r}");
-        }
-
-        Ok(Self {
+        let mut model = Self {
             embed_tokens,
             layers,
-            fusion_report: report,
+            fusion_report: None,
             attn_route,
             load_warnings,
             embedding_norm,
@@ -9129,7 +9411,35 @@ impl Model {
             dtype: vb.dtype(),
             conv_state: cfg.conv_state,
             l_cache: cfg.conv_l_cache,
-        })
+        };
+        // Under `Fusion=Derived` the optimizer decides the epilogue sites
+        // once, here, over the walk of the model as built, and sets them on
+        // the blocks, which read them per call as they always did: the
+        // derivation is construction-tier, the token path is untouched
+        // (`CONTRIBUTING.md` §3.3a). The closed-form gain §5a names wants
+        // the loaded weights, so it is read here too and the report printed
+        // complete.
+        if cfg.fusion == FusionPolicy::Derived {
+            let (flags, mut r) = derive_fusion(&model, cfg)?;
+            model.set_epilogues(flags);
+            r.conv_fold_gain = conv_fold_gain(&model.layers)?;
+            eprintln!("{r}");
+            model.fusion_report = Some(r);
+        }
+        Ok(model)
+    }
+
+    /// Set every block's epilogue arms (`Fusion=Derived`'s plan).
+    fn set_epilogues(&mut self, f: EpilogueFlags) {
+        for layer in &mut self.layers {
+            layer.mlp.gemv_silu = f.silu;
+            layer.mlp.gemv_residual = f.residual;
+            layer.mlp.gemv_gate = f.gate;
+            match &mut layer.kind {
+                LayerKind::Attention(attn) => attn.gemv_residual = f.residual,
+                LayerKind::ShortConv(conv) => conv.gemv_residual = f.residual,
+            }
+        }
     }
 
     /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
@@ -9407,8 +9717,16 @@ impl Model {
                 lloom_tensor::bail!(
                     "lfm2 forward_ragged: row {r}'s cache {} an open speculative window; this \
                      pass is {}",
-                    if row.cache.speculative { "has" } else { "has not" },
-                    if speculative { "a verify (open every row first)" } else { "not a verify" }
+                    if row.cache.speculative {
+                        "has"
+                    } else {
+                        "has not"
+                    },
+                    if speculative {
+                        "a verify (open every row first)"
+                    } else {
+                        "not a verify"
+                    }
                 )
             }
             plans.push(row.cache.plan_pass(row.len)?);
@@ -10023,6 +10341,44 @@ impl Model {
     }
 }
 
+/// The decode step's IR (`optimizer::walk`): the token's embedding gather,
+/// every layer, the final norm, the head and the cast of the logits to f32
+/// — what a `seq_len == 1`, `B == 1` forward dispatches on Metal at the arms
+/// this model was built with, the epilogue chain unfused.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for Model {
+    type In = ();
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (): ()) -> Self::Out {
+        use crate::optimizer::Shape;
+        let table = self.embed_tokens.embeddings();
+        let (vocab, h) = (table.dims()[0], table.dims()[1]);
+        let dt = self.dtype;
+        let ids = w.input("input_ids", Shape::of(&[1, 1]), DType::U32);
+        let embed = w.scoped("model", |w| {
+            w.weight("embed_tokens.weight", Shape::of(&[vocab, h]), dt)
+        });
+        let mut hidden = w.opaque("is_u32", &[embed, ids], Shape::of(&[1, 1, h]), dt);
+        for (l, layer) in self.layers.iter().enumerate() {
+            hidden = w.scoped(format!("model.layers.{l}"), |w| layer.visit(w, (hidden, l)));
+        }
+        let norm_w = w.scoped("model", |w| {
+            w.weight("embedding_norm.weight", Shape::of(&[h]), dt)
+        });
+        let hn = w.rms_norm(norm_w, hidden);
+        // `i((.., seq_len - 1, ..)).contiguous()`: at `seq_len == 1` a view.
+        let last = w.view("index", hn, Shape::of(&[1, h]));
+        let tied = self.lm_head.weight().id() == table.id();
+        let lm_head = if tied {
+            embed
+        } else {
+            w.weight("lm_head.weight", Shape::of(&[vocab, h]), dt)
+        };
+        let logits = w.gemv(lm_head, last);
+        w.opaque("cast", &[logits], Shape::of(&[1, vocab]), DType::F32)
+    }
+}
+
 /// A verify pass that has been encoded and not yet read back —
 /// [`Model::verify_tokens_enqueue`]'s receipt, consumed by
 /// [`Model::verify_tokens_complete`].
@@ -10244,10 +10600,7 @@ impl Model {
         } else {
             Some(both_t.stage_read()?)
         };
-        let taps = rows
-            .iter_mut()
-            .map(|row| row.cache.take_taps())
-            .collect();
+        let taps = rows.iter_mut().map(|row| row.cache.take_taps()).collect();
         Ok(PendingRows {
             toks,
             ks,

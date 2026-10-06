@@ -81,6 +81,42 @@ impl fmt::Display for Shape {
     }
 }
 
+/// The matrix-vector kernel a product runs on at a decode step — what the
+/// weight's storage selects, and so which fragments can ride its store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Core {
+    /// `gemv.metal`'s GEMV, activation and weight in one dtype (`gemv_float16`,
+    /// `gemv_float32`): LFM2's projections, Qwen4-exp's f32 shared-expert gate.
+    Gemv,
+    /// `gemv.metal`'s mixed arm: an f16 weight, an f32 activation and store
+    /// (`gemv_mixed_f16w_f32`): Qwen4-exp's f16 stems.
+    Mixed,
+    /// A packed quantized weight (`kernel_mul_mv_<kind>`).
+    Quant,
+}
+
+impl Core {
+    /// The census family of a bare product on this core.
+    pub fn family(self) -> &'static str {
+        match self {
+            Core::Gemv => "gemv",
+            Core::Mixed => "gemv_mixed",
+            Core::Quant => "mul_mv",
+        }
+    }
+
+    /// The egglog constructor suffix of this core's product and fused node:
+    /// empty for [`Core::Gemv`], so a program over a graph of one core
+    /// reads as it did before cores existed.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Core::Gemv => "",
+            Core::Mixed => "Mixed",
+            Core::Quant => "Quant",
+        }
+    }
+}
+
 /// What a node computes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -93,7 +129,8 @@ pub enum Op {
     /// contiguous at this shape. Not a dispatch. Its `name` says which.
     View,
     /// `x @ w.t()`. Inputs `[w, x]`; `w` is `[n, k]`, `x` is `[.., rows, k]`.
-    /// One dispatch; the GEMV route when `rows == 1`.
+    /// One dispatch on the node's [`Node::core`]; the GEMV route when
+    /// `rows == 1`.
     Gemv,
     /// `silu(x)`. One dispatch.
     Silu,
@@ -101,6 +138,10 @@ pub enum Op {
     Mul,
     /// `a + b`. One dispatch.
     Add,
+    /// `c · x` for the node's [`Node::scalar`] `c` (`affine`). One dispatch.
+    Scale,
+    /// `sigmoid(x)`. One dispatch.
+    Sigmoid,
     /// RMS norm over the last extent. Inputs `[w, x]`. One dispatch.
     RmsNorm,
     /// A dispatch of some other kernel family, named by `name`. Opaque to
@@ -108,7 +149,8 @@ pub enum Op {
     Opaque,
     /// A GEMV with an [`Elementwise`](crate::nn::fusion::Elementwise) block
     /// riding its store. Inputs `[w, x]`, plus the block's operand if it binds
-    /// one. `name` is the fragment's name. One dispatch.
+    /// one. `name` is the fragment's name, `core` the product's kernel,
+    /// `scalar` the scale a scaling block applies first. One dispatch.
     Fused,
 }
 
@@ -119,9 +161,9 @@ impl Op {
     }
 
     /// Whether this node is a standalone elementwise dispatch — the family
-    /// P1's derivations fuse.
+    /// the derivations fuse.
     pub fn is_elementwise(&self) -> bool {
-        matches!(self, Op::Silu | Op::Mul | Op::Add)
+        matches!(self, Op::Silu | Op::Mul | Op::Add | Op::Scale | Op::Sigmoid)
     }
 }
 
@@ -141,16 +183,24 @@ pub struct Node {
     /// Where the node computes: straight-line unless the emitter marked it
     /// as part of a recurrence ([`Graph::mark_region`]).
     pub region: Region,
+    /// The kernel a `Gemv` or `Fused` node's product runs on; [`Core::Gemv`]
+    /// for every other op.
+    pub core: Core,
+    /// A `Scale`'s constant, or the scale a `Fused` scaling block applies
+    /// before its transform; `None` otherwise.
+    pub scalar: Option<f32>,
 }
 
 /// The kernel family a node's dispatch is counted under — the census key.
 pub fn family(node: &Node) -> Option<String> {
     Some(match &node.op {
         Op::Input | Op::Weight | Op::View => return None,
-        Op::Gemv => "gemv".to_string(),
+        Op::Gemv => node.core.family().to_string(),
         Op::Silu => "silu".to_string(),
         Op::Mul => "bmul".to_string(),
         Op::Add => "badd".to_string(),
+        Op::Scale => "affine".to_string(),
+        Op::Sigmoid => "sigmoid".to_string(),
         Op::RmsNorm => "rmsnorm".to_string(),
         Op::Opaque => node.name.clone(),
         Op::Fused => format!("gemv_{}", node.name),
@@ -238,6 +288,8 @@ impl Graph {
             dtype,
             numeric: NumericClass::BitExact,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
@@ -250,6 +302,8 @@ impl Graph {
             dtype,
             numeric: NumericClass::BitExact,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
@@ -265,12 +319,19 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
-    /// `x @ w.t()`: the output takes `x`'s shape with the last extent `w`'s
-    /// row count.
+    /// `x @ w.t()` on [`Core::Gemv`]: the output takes `x`'s shape with the
+    /// last extent `w`'s row count.
     pub fn gemv(&mut self, w: NodeId, x: NodeId) -> NodeId {
+        self.gemv_on(Core::Gemv, w, x)
+    }
+
+    /// `x @ w.t()` on `core`.
+    pub fn gemv_on(&mut self, core: Core, w: NodeId, x: NodeId) -> NodeId {
         let n = self.nodes[w].shape.0[0];
         let shape = self.nodes[x].shape.with_last(n);
         let dtype = self.nodes[x].dtype;
@@ -283,6 +344,8 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core,
+            scalar: None,
         })
     }
 
@@ -298,6 +361,8 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
@@ -313,6 +378,8 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
@@ -328,6 +395,17 @@ impl Graph {
         self.binary(Op::Add, a, b)
     }
 
+    /// `c · x`.
+    pub fn scale(&mut self, x: NodeId, c: f32) -> NodeId {
+        let id = self.unary(Op::Scale, x);
+        self.nodes[id].scalar = Some(c);
+        id
+    }
+
+    pub fn sigmoid(&mut self, x: NodeId) -> NodeId {
+        self.unary(Op::Sigmoid, x)
+    }
+
     pub fn rms_norm(&mut self, w: NodeId, x: NodeId) -> NodeId {
         let shape = self.nodes[x].shape.clone();
         let dtype = self.nodes[x].dtype;
@@ -340,6 +418,8 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
@@ -363,11 +443,13 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core: Core::Gemv,
+            scalar: None,
         })
     }
 
-    /// A GEMV with fragment `fragment` riding its store. `operand` is the
-    /// fragment's second buffer, if it binds one.
+    /// A GEMV with fragment `fragment` riding its store, on [`Core::Gemv`].
+    /// `operand` is the fragment's second buffer, if it binds one.
     pub fn fused(
         &mut self,
         fragment: &str,
@@ -375,6 +457,22 @@ impl Graph {
         w: NodeId,
         x: NodeId,
         operand: Option<NodeId>,
+    ) -> NodeId {
+        self.fused_on(Core::Gemv, fragment, class, w, x, operand, None)
+    }
+
+    /// [`Self::fused`] on `core`, the block applying `scale` first when it
+    /// scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_on(
+        &mut self,
+        core: Core,
+        fragment: &str,
+        class: NumericClass,
+        w: NodeId,
+        x: NodeId,
+        operand: Option<NodeId>,
+        scale: Option<f32>,
     ) -> NodeId {
         let n = self.nodes[w].shape.0[0];
         let shape = self.nodes[x].shape.with_last(n);
@@ -393,6 +491,8 @@ impl Graph {
             dtype,
             numeric,
             region: Region::Straight,
+            core,
+            scalar: scale,
         })
     }
 
@@ -501,7 +601,10 @@ mod tests {
         let p = g.depth_profile();
         assert_eq!(p.widths, vec![2, 2, 1]);
         assert_eq!((p.depth(), p.max_width()), (3, 2));
-        assert_eq!(p.widths.iter().map(|&w| w as u64).sum::<u64>(), g.dispatches());
+        assert_eq!(
+            p.widths.iter().map(|&w| w as u64).sum::<u64>(),
+            g.dispatches()
+        );
     }
 
     #[test]

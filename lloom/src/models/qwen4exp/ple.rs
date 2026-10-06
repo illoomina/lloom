@@ -224,6 +224,105 @@ impl PleLayer {
     }
 }
 
+/// The PLE block's decode step ([`PleLayer::forward`] at one position,
+/// f32): the key and value projections of the gathered rows, the grouped
+/// norms, the per-stream signed-sqrt gate, the gated value, its norm, the
+/// dilated conv over the history channel, the SiLU and the sum — the delta
+/// the model adds to the carry. The history read, its two copies and the
+/// next history are layer `l`'s conv recurrence. `In` is the carry and the
+/// layer; the position's rows, gathered on the host, are the step's input.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for PleLayer {
+    type In = (crate::optimizer::NodeId, usize);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (hidden, l): Self::In) -> Self::Out {
+        use crate::optimizer::{Region, Shape};
+        let f32 = lloom_tensor::DType::F32;
+        let (n, d) = (self.n, self.d);
+        let nd = n * d;
+        let (_, key_shape, _) = crate::optimizer::walk::qmat_operand(&self.key);
+        let width = key_shape.0.last().map_or(0, |k| match k {
+            crate::optimizer::Dim::Const(k) => *k,
+            crate::optimizer::Dim::Sym(_) => 0,
+        });
+        let emb = w.input("ple.rows", Shape::of(&[1, 1, width]), f32);
+        let unit = w.weight("ple_unit_d", Shape::of(&[d]), self.unit_d.dtype());
+        let norm = |w: &mut crate::optimizer::Walker, x, gamma: &Tensor, leaf: &str| {
+            let g = w.weight(leaf, Shape::of(gamma.dims()), gamma.dtype());
+            let xs = w.view("reshape", x, Shape::of(&[1, 1, n, d]));
+            let normed = w.rms_norm(unit, xs);
+            let normed = w.view("reshape", normed, Shape::of(&[1, 1, nd]));
+            w.mul(normed, g)
+        };
+        let key = w.project_qmat("ple_key.weight", &self.key, emb);
+        let value = w.project_qmat("ple_value.weight", &self.value, emb);
+        let key_n = norm(w, key, &self.norm_key, "ple_norm_key.weight");
+        let query_n = norm(w, hidden, &self.norm_query, "ple_norm_query.weight");
+        let a = w.view("reshape", key_n, Shape::of(&[1, 1, n, d]));
+        let b = w.view("reshape", query_n, Shape::of(&[1, 1, n, d]));
+        let prod = w.mul(a, b);
+        let s3 = Shape::of(&[1, 1, n]);
+        let s = w.opaque("fast_sum", &[prod], s3.clone(), f32);
+        let s = w.scale(s, (1.0 / (d as f64).sqrt()) as f32);
+        // The gate's scalars, made once and kept (`gate_scalars`).
+        let lo = w.input("ple.gate.lo", Shape::of(&[]), f32);
+        let hi = w.input("ple.gate.hi", Shape::of(&[]), f32);
+        let zero = w.input("ple.gate.zero", Shape::of(&[]), f32);
+        let mag = w.opaque("abs", &[s], s3.clone(), f32);
+        let mag = w.opaque("bmaximum", &[mag, lo], s3.clone(), f32);
+        let mag = w.opaque("bminimum", &[mag, hi], s3.clone(), f32);
+        let mag = w.opaque("sqrt", &[mag], s3.clone(), f32);
+        let gt = w.opaque("gt", &[s, zero], s3.clone(), lloom_tensor::DType::U8);
+        let gt = w.opaque("cast_u8", &[gt], s3.clone(), f32);
+        let lt = w.opaque("lt", &[s, zero], s3.clone(), lloom_tensor::DType::U8);
+        let lt = w.opaque("cast_u8", &[lt], s3.clone(), f32);
+        let sgn = w.opaque("bsub", &[gt, lt], s3, f32);
+        let gate = w.mul(sgn, mag);
+        let gate = w.sigmoid(gate);
+        let v4 = w.view("reshape", value, Shape::of(&[1, 1, 1, d]));
+        let g4 = w.view("reshape", gate, Shape::of(&[1, 1, n, 1]));
+        let gated = w.mul(v4, g4);
+        let gated = w.view("reshape", gated, Shape::of(&[1, 1, nd]));
+        let normed = norm(w, gated, &self.norm_conv, "ple_norm_conv.weight");
+        // The dilated conv: the history and this position as one padded
+        // window (a `cat`: two copies), the taps' products summed, the next
+        // history copied out.
+        let hist = self.history_len();
+        let x_t = w.view("transpose", normed, Shape::of(&[nd, 1]));
+        let history = w.input(&format!("ple.conv@{l}"), Shape::of(&[nd, hist]), f32);
+        let h_copy = w.opaque("copy2d_f32", &[history], Shape::of(&[nd, hist]), f32);
+        let x_copy = w.opaque(
+            "copy2d_f32",
+            &[x_t, h_copy],
+            Shape::of(&[nd, hist + 1]),
+            f32,
+        );
+        let cw = w.weight(
+            "ple_conv1d.weight",
+            Shape::of(self.conv_weight.dims()),
+            self.conv_weight.dtype(),
+        );
+        let mut acc = None;
+        for _ in 0..self.k {
+            let cols = w.view("narrow", x_copy, Shape::of(&[nd, 1]));
+            let wt = w.view("narrow", cw, Shape::of(&[nd, 1]));
+            let term = w.mul(cols, wt);
+            acc = Some(match acc {
+                Some(a) => w.add(a, term),
+                None => term,
+            });
+        }
+        let next = w.opaque("copy2d_f32", &[x_copy], Shape::of(&[nd, hist]), f32);
+        // The next step's history: written here, read there.
+        w.state_out(next);
+        w.mark(&[history, h_copy, x_copy, next], Region::ConvRing(l));
+        let conv = acc.expect("k >= 1");
+        let conv = w.view("transpose", conv, Shape::of(&[1, 1, nd]));
+        let conv = w.silu(conv);
+        w.add(gated, conv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

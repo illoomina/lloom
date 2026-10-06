@@ -41,7 +41,10 @@ fn one_of(v: &str, what: &str, arms: &[&str]) -> Result<String, String> {
     }
 }
 fn parse_at_least_one(v: &str) -> Result<usize, String> {
-    let n: usize = v.trim().parse().map_err(|_| format!("`{v}` is not an integer"))?;
+    let n: usize = v
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{v}` is not an integer"))?;
     if n == 0 {
         return Err("must be >= 1".into());
     }
@@ -79,7 +82,11 @@ fn parse_ctx_kv(v: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 fn parse_hot_thread(v: &str) -> Result<String, String> {
-    one_of(v, "hot thread", &["interactive", "default", "demote", "off", "0", "none"])
+    one_of(
+        v,
+        "hot thread",
+        &["interactive", "default", "demote", "off", "0", "none"],
+    )
 }
 fn parse_spike0(v: &str) -> Result<String, String> {
     one_of(v, "spike 0", &["off", "wait"])
@@ -94,6 +101,15 @@ fn parse_draft_loads(v: &str) -> Result<String, String> {
     }
 }
 
+fn parse_fusion(v: &str) -> Result<String, String> {
+    one_of(v, "fusion", &["manual", "derived"])
+}
+fn parse_verify_key(v: &str) -> Result<String, String> {
+    one_of(v, "verify key", &["kind", "variant"])
+}
+fn parse_qsa_window(v: &str) -> Result<String, String> {
+    one_of(v, "QSA window", &["rows", "batched"])
+}
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
@@ -190,16 +206,28 @@ pub struct StreamTuning {
     #[opt(flag = "pread-direct", env = "LLOOM_PREAD_DIRECT", bool)]
     pub pread_direct: bool,
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
-    #[opt(flag = "prefetch-threads", env = "LLOOM_PREFETCH_THREADS", parser = "parse_at_least_one")]
+    #[opt(
+        flag = "prefetch-threads",
+        env = "LLOOM_PREFETCH_THREADS",
+        parser = "parse_at_least_one"
+    )]
     pub prefetch_threads: usize,
     /// The prefetcher's reader threads' QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
-    #[opt(flag = "prefetch-qos", env = "LLOOM_PREFETCH_QOS", parser = "parse_spawned_qos")]
+    #[opt(
+        flag = "prefetch-qos",
+        env = "LLOOM_PREFETCH_QOS",
+        parser = "parse_spawned_qos"
+    )]
     pub prefetch_qos: String,
     /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
     #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
     pub prefetch_split: usize,
     /// Layers of lead the prefill's prefetcher runs ahead of the layer being computed (≥ 1).
-    #[opt(flag = "prefetch-lead", env = "QWEN4EXP_PREFETCH_LEAD", parser = "parse_at_least_one")]
+    #[opt(
+        flag = "prefetch-lead",
+        env = "QWEN4EXP_PREFETCH_LEAD",
+        parser = "parse_at_least_one"
+    )]
     pub prefetch_lead: usize,
     /// Where the routed experts are planned: `device` (the settle once a token) or `host` (a readback per layer, the A/B arm).
     #[opt(flag = "expert-plan", env = "QWEN4EXP_PLAN", parser = "parse_plan", variants = ["device", "host"])]
@@ -248,6 +276,9 @@ impl Default for StreamTuning {
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Qwen4ExpTuning {
+    /// Who decides the bracket epilogues a decode step takes: `manual` (every one the forward can fuse, the incumbent) or `derived` (the optimizer's plan over the model's walk, once at load; issue #732).
+    #[opt(flag = "qwen-fusion", env = "QWEN4EXP_FUSION", parser = "parse_fusion", variants = ["manual", "derived"])]
+    pub fusion: String,
     /// The fused HyperConnection prologue pair instead of the composed chain (measured +3.6 % slower in situ, P29 (4); the arm the next bracket kernel is measured against).
     #[opt(flag = "hc-mix", env = "QWEN4EXP_HC_MIX", bool)]
     pub hc_mix: bool,
@@ -276,7 +307,11 @@ pub struct Qwen4ExpTuning {
     #[opt(flag = "prefill-pair", env = "QWEN4EXP_PREFILL_PAIR", bool)]
     pub prefill_pair: bool,
     /// Pipelined prefill tiles in flight (≥ 2; the reserve and admission follow).
-    #[opt(flag = "prefill-tiles", env = "QWEN4EXP_PREFILL_TILES", parser = "parse_at_least_two")]
+    #[opt(
+        flag = "prefill-tiles",
+        env = "QWEN4EXP_PREFILL_TILES",
+        parser = "parse_at_least_two"
+    )]
     pub prefill_tiles: usize,
     /// Speculate the next layer's routing ahead: 0 (off) or 1.
     #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"])]
@@ -320,11 +355,21 @@ pub struct Qwen4ExpTuning {
     /// Skip a decode step's work by name, comma-separated (`hcnorm`: each HC bracket's grouped RMSNorm, its input passed through) — an instrument pricing a fusion's bound; the output is wrong.
     #[opt(flag = "qwen-ablate", env = "QWEN4EXP_ABLATE")]
     pub ablate: String,
+    /// How a verify window's planned pass is keyed: `kind` (one key per window length, the incumbent) or `variant` (also by the sequence the window runs: the rows that complete an indexer block, the device or host plan, the drafts' loads, the dense range — so each is served its own plan instead of evicting another's).
+    #[opt(flag = "mtp-verify-key", env = "QWEN4EXP_MTP_VERIFY_KEY", parser = "parse_verify_key", variants = ["kind", "variant"])]
+    pub mtp_verify_key: String,
+    /// The QSA layers of a verify window: `rows` (each position's prep, append, indexer and attention launched one after another, the incumbent) or `batched` (the window's positions in one launch per kernel, each row's arithmetic unchanged).
+    #[opt(flag = "qsa-window", env = "QWEN4EXP_QSA_WINDOW", parser = "parse_qsa_window", variants = ["rows", "batched"])]
+    pub qsa_window: String,
+    /// Run the MTP head on every verify window row inside the verify's pass (draft-for-every-prefix) and take the accepted row's draft after the accept, in place of the observe's own submission and readback.
+    #[opt(flag = "mtp-fold", env = "QWEN4EXP_MTP_FOLD", bool)]
+    pub mtp_fold: bool,
 }
 
 impl Default for Qwen4ExpTuning {
     fn default() -> Self {
         Qwen4ExpTuning {
+            fusion: "manual".into(),
             hc_mix: false,
             fused_off: false,
             f16_fuse: true,
@@ -349,6 +394,9 @@ impl Default for Qwen4ExpTuning {
             mtp_observe_plan: "host".into(),
             hc_norm_gemv: false,
             ablate: String::new(),
+            mtp_verify_key: "kind".into(),
+            qsa_window: "rows".into(),
+            mtp_fold: false,
         }
     }
 }
@@ -364,10 +412,18 @@ pub struct RingTuning {
     #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"])]
     pub hot_thread: String,
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
-    #[opt(flag = "host-feed-qos", env = "LLOOM_HOST_FEED_QOS", parser = "parse_spawned_qos")]
+    #[opt(
+        flag = "host-feed-qos",
+        env = "LLOOM_HOST_FEED_QOS",
+        parser = "parse_spawned_qos"
+    )]
     pub feed_qos: String,
     /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (`WFE` while a forward waits on an unfilled value, else a µs sleep: measured fastest), `event[:<µs>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
-    #[opt(flag = "host-feed-poll", env = "LLOOM_HOST_FEED_POLL", parser = "parse_poll")]
+    #[opt(
+        flag = "host-feed-poll",
+        env = "LLOOM_HOST_FEED_POLL",
+        parser = "parse_poll"
+    )]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
     #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool)]

@@ -1,20 +1,30 @@
-//! The optimizer on the real LFM2 decode step (issue #732, P1), on the CPU:
-//! the IR `lfm2_ir::decode_step` emits reconciles against a committed
-//! dispatch trace of the real model, and the derivation over it produces
-//! exactly the composition that was hand-written — the same 90 sites, the
-//! same two epilogues, nothing more.
+//! The optimizer on the real LFM2 decode step (issue #732, P1; the walk
+//! since PR 1 of the reopened scope): the IR the walk of the model reads
+//! (`optimizer::walk` over the 2.6B checkpoint's model, built by its own
+//! constructor over ghost weights, `testing::ghost`) reconciles against a
+//! committed dispatch trace of the real model, and the derivation over it
+//! produces exactly the composition that was hand-written — the same 90
+//! sites, the same two epilogues, nothing more.
 //!
-//! No GPU, no model weights: the IR is emitted from the configuration and the
-//! derivation is symbolic. The Metal half — that a `Fusion=Derived` model
-//! computes the bits the flag-selected model computes — is
-//! `lfm2_fusion_derived.rs`.
+//! On Metal: the attention kernel is the route the model's construction
+//! resolved on the device, as the traced run's was. No model weights; the
+//! derivation is symbolic. The half that a `Fusion=Derived` model computes
+//! the bits the flag-selected model computes is `lfm2_fusion_derived.rs`.
 //!
 //! Every count below is an ABSOLUTE reference (`CONTRIBUTING.md` §3.1b rule
 //! 1), read from the artifact it cites rather than from this crate's own
 //! output.
+#![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
-use lloom::models::lfm2_ir::decode_step;
+use lloom::optimizer::Graph;
+
+/// The decode step's IR: the walk of `cfg`'s model on Metal, ghost weights.
+fn decode_step(cfg: &Config, dtype: DType) -> Graph {
+    let dev = lloom_tensor::Device::new_metal(0).expect("metal");
+    let model = lloom::testing::ghost::lfm2(cfg, dtype, &dev).expect("ghost build");
+    lloom::optimizer::walk(&model)
+}
 use lloom::optimizer::{derive, NumericClass, Op, Policy, Region, Seam};
 
 /// The extractor's own count, no barrier term, the two-weight kernel out of
@@ -355,7 +365,9 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     assert!(d.plan.sites.is_empty());
     assert_eq!(d.plan.dispatches_after(), 538);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    assert_eq!(d.refused.len(), 4, "{:?}", d.refused);
+    // The catalogue's six: the GEMV's four and the mixed GEMV's two, each
+    // refused by the budget before its rule exists.
+    assert_eq!(d.refused.len(), 6, "{:?}", d.refused);
     assert!(
         d.refused
             .iter()

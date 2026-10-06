@@ -2303,6 +2303,12 @@ fn resolve_mode(
     options: &mut crate::EngineOptions,
     gate: &super::modes::GateConfig,
 ) -> Result<super::modes::ModeSpec> {
+    if options.speculative.method == "auto" {
+        anyhow::bail!(
+            "speculative.method = auto is resolved when the model loads; lloom bench's modes \
+             are chosen before that, so name the method (dspark | mtp | none)"
+        );
+    }
     let dspark = options.speculative.method == "dspark";
     let decode = &options.decode;
     // The flag only: the env alias is process-wide, set once for a gate

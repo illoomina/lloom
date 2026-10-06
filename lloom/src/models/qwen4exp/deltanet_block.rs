@@ -895,6 +895,97 @@ impl GatedDeltaNet {
     }
 }
 
+/// A linear-attention layer's decode step ([`GatedDeltaNet::decode_rows`]'s
+/// launches at one row): the input stems as the loader stacked them, the
+/// prologue over the conv window, the recurrence step over `S`, the gated
+/// norm, the output projection. The window, `S` and the two kernels that
+/// read and rewrite them are layer `l`'s recurrence. `In` is the bracket's
+/// output and the layer.
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::optimizer::Visit for GatedDeltaNet {
+    type In = (crate::optimizer::NodeId, usize);
+    type Out = crate::optimizer::NodeId;
+    fn visit(&self, w: &mut crate::optimizer::Walker, (x, l): Self::In) -> Self::Out {
+        use crate::optimizer::{Region, Shape};
+        let f32 = lloom_tensor::DType::F32;
+        let (d, h_v) = (self.dims.d_k, self.dims.h_v);
+        let (c, v) = (self.conv_channels, self.value_dim);
+        let narrow =
+            |w: &mut crate::optimizer::Walker, t, n: usize| w.view("narrow", t, Shape::of(&[1, n]));
+        let (qkv, z, alpha, beta) = if let Some(cat) = &self.stem_cat {
+            let all = w.project_qmat(
+                "attn_qkv.weight+attn_gate.weight+ssm_alpha.weight+ssm_beta.weight",
+                cat,
+                x,
+            );
+            (
+                narrow(w, all, c),
+                narrow(w, all, v),
+                narrow(w, all, h_v),
+                narrow(w, all, h_v),
+            )
+        } else {
+            let qkv = w.project_qmat("attn_qkv.weight", &self.wqkv, x);
+            let z = w.project_qmat("attn_gate.weight", &self.wqkv_gate, x);
+            let (qkv, z) = (
+                w.view("reshape", qkv, Shape::of(&[1, c])),
+                w.view("reshape", z, Shape::of(&[1, v])),
+            );
+            match &self.gate_stems_cat {
+                Some(ab) => {
+                    let ab = w.project_qmat("ssm_alpha.weight+ssm_beta.weight", ab, x);
+                    (qkv, z, narrow(w, ab, h_v), narrow(w, ab, h_v))
+                }
+                None => {
+                    let a = w.project_qmat("ssm_alpha.weight", &self.ssm_alpha, x);
+                    let b = w.project_qmat("ssm_beta.weight", &self.ssm_beta, x);
+                    (
+                        qkv,
+                        z,
+                        w.view("reshape", a, Shape::of(&[1, h_v])),
+                        w.view("reshape", b, Shape::of(&[1, h_v])),
+                    )
+                }
+            }
+        };
+        let taps = self.conv.weight();
+        let conv_w = w.weight("ssm_conv1d.weight", Shape::of(taps.dims()), taps.dtype());
+        let window = w.input(
+            &format!("gdn.conv@{l}"),
+            Shape::of(&[c, self.conv.k()]),
+            f32,
+        );
+        let heads = w.opaque(
+            "gdn_prologue",
+            &[qkv, conv_w, window],
+            Shape::of(&[3, h_v, d]),
+            f32,
+        );
+        let s_in = w.input(&format!("gdn.s@{l}"), Shape::of(&[d, d, h_v]), f32);
+        let dt = w.weight(
+            "ssm_dt.bias",
+            Shape::of(self.ssm_dt.dims()),
+            self.ssm_dt.dtype(),
+        );
+        let a = w.weight("ssm_a", Shape::of(self.ssm_a.dims()), self.ssm_a.dtype());
+        let o = w.opaque(
+            "gdn_step",
+            &[heads, alpha, beta, s_in, dt, a],
+            Shape::of(&[h_v, d]),
+            f32,
+        );
+        w.mark(&[window, heads, s_in, o], Region::Ssm(l));
+        let gamma = w.weight(
+            "ssm_norm.weight",
+            Shape::of(self.ssm_norm.dims()),
+            self.ssm_norm.dtype(),
+        );
+        let gated = w.opaque("gdn_gated_norm", &[o, gamma, z], Shape::of(&[v]), f32);
+        let gated = w.view("reshape", gated, Shape::of(&[1, 1, v]));
+        w.project_qmat("ssm_out.weight", &self.ssm_out, gated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

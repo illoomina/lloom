@@ -298,6 +298,7 @@ impl TargetFpModel {
     /// | family | source |
     /// |---|---|
     /// | `gemv`, `gemv_silu`, `gemv_residual` | `gemv.metal`: `AccT = float` (`GemvDefaultAccT`), per-lane serial over `K`, `simd_shuffle_down` over `SN`, serial over `BN` simdgroups; the epilogue reads the accumulator |
+    /// | `gemv_mixed`, `gemv_mixed_silu`, `gemv_mixed_sigmoid` | `gemv.metal` `gemv_mixed_wrapper`: the same `GEMVKernel` at `T = half`, `VT = float`, `acc_t = GemvDefaultAccT<half>` = `float`; the epilogue reads the accumulator |
     /// | `shortconv_step`, `conv1d_depthwise` | `conv.metal`: `A = float`, taps in window order, one thread |
     /// | `shortconv_ring` | `conv.metal` `shortconv_ring_body`: `A = float`, slots in slot order against the phase-permuted weight, the loop pinned serial |
     /// | `fast_sum` | `reduce.metal` `init_reduce`: `R = T` — the store type — through `block_reducer`'s shuffle tree |
@@ -307,6 +308,9 @@ impl TargetFpModel {
     pub fn of_family(family: &str) -> Option<TargetFpModel> {
         let (accum, tree) = match family {
             "gemv" | "gemv_silu" | "gemv_residual" => (Accum::F32, ReductionTree::Simd),
+            "gemv_mixed" | "gemv_mixed_silu" | "gemv_mixed_sigmoid" => {
+                (Accum::F32, ReductionTree::Simd)
+            }
             "shortconv_step" | "conv1d_depthwise" => (Accum::F32, ReductionTree::Serial),
             "shortconv_ring" => (Accum::F32, ReductionTree::SerialRotated),
             "fast_sum" => (Accum::Store, ReductionTree::Simd),
@@ -498,6 +502,10 @@ pub enum Region {
     /// `kv_len` by every later token. Data-dependent gain, growing length —
     /// the case §5a can only mark, not bound.
     Kv(usize),
+    /// The recurrent state of linear-attention layer `l` (a Gated DeltaNet's
+    /// `S` and its conv window): rewritten every token by the step and read
+    /// by the next, under a data-dependent decay — marked, not bounded.
+    Ssm(usize),
 }
 
 impl Region {
@@ -512,6 +520,7 @@ impl Region {
             Region::Straight => RegionKind::Straight,
             Region::ConvRing(_) => RegionKind::ConvRing,
             Region::Kv(_) => RegionKind::Kv,
+            Region::Ssm(_) => RegionKind::Ssm,
         }
     }
 }
@@ -522,6 +531,7 @@ impl fmt::Display for Region {
             Region::Straight => f.write_str("straight"),
             Region::ConvRing(l) => write!(f, "conv-ring@{l}"),
             Region::Kv(l) => write!(f, "kv@{l}"),
+            Region::Ssm(l) => write!(f, "ssm@{l}"),
         }
     }
 }
@@ -532,6 +542,7 @@ pub enum RegionKind {
     Straight,
     ConvRing,
     Kv,
+    Ssm,
 }
 
 impl RegionKind {
@@ -540,6 +551,7 @@ impl RegionKind {
             RegionKind::Straight => "straight",
             RegionKind::ConvRing => "conv-ring",
             RegionKind::Kv => "kv",
+            RegionKind::Ssm => "ssm",
         }
     }
 
@@ -548,8 +560,9 @@ impl RegionKind {
             "straight" => Ok(RegionKind::Straight),
             "conv-ring" => Ok(RegionKind::ConvRing),
             "kv" => Ok(RegionKind::Kv),
+            "ssm" => Ok(RegionKind::Ssm),
             other => Err(format!(
-                "region must be straight|conv-ring|kv, got `{other}`"
+                "region must be straight|conv-ring|kv|ssm, got `{other}`"
             )),
         }
     }

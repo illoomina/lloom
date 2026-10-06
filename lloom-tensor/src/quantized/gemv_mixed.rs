@@ -21,6 +21,18 @@ pub enum MixedEpilogue {
     Sigmoid,
 }
 
+#[cfg(not(feature = "metal"))]
+impl MixedEpilogue {
+    /// The `[[host_name]]` suffix the Metal build instantiates for it.
+    pub fn name_suffix(self) -> &'static str {
+        match self {
+            MixedEpilogue::None => "",
+            MixedEpilogue::Silu => "_silu",
+            MixedEpilogue::Sigmoid => "_sigmoid",
+        }
+    }
+}
+
 /// The op: `w` is `[n_out, k]` f16, contiguous; the input is `[.., k]` f32 with
 /// every leading dim folded into the batch; the output `[.., n_out]` f32 —
 /// `[.., n_out + groups]` with a grouped norm that writes its scales.

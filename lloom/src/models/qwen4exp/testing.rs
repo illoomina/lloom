@@ -230,6 +230,53 @@ fn build<R: ExpertResidency>(
     ))
 }
 
+/// A walked model's routed experts (`Qwen4Exp::ghost_of_manifest`): they
+/// plan on the device, as the streamed tier does, and refuse to compute.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GhostExperts;
+
+impl ExpertResidency for GhostExperts {
+    fn plan(&self, _ids: &Tensor) -> Result<Vec<crate::nn::expert_stream::RoutedGroup>> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn ensure(&self, _group: &crate::nn::expert_stream::RoutedGroup) -> Result<Tensor> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn gate_up(
+        &self,
+        _x: &Tensor,
+        _slot_ids: &Tensor,
+        _arm: lloom_tensor::quantized::MoeArm,
+        _act: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn down(
+        &self,
+        _h: &Tensor,
+        _slot_ids: &Tensor,
+        _arm: lloom_tensor::quantized::MoeArm,
+    ) -> Result<Tensor> {
+        lloom_tensor::bail!("ghost experts are walked, never run")
+    }
+    fn plans_on_device(&self) -> bool {
+        true
+    }
+}
+
+/// The committed real checkpoint's model (`scale_manifest_path`) built over
+/// ghost weights by the loader's own assembly, with the PLE: the structure
+/// the decode step's walk reads.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ghost_model(dev: &Device) -> Result<Qwen4Exp<GhostExperts>> {
+    let manifest = crate::testing::scale::ShapeManifest::read(&scale_manifest_path())?;
+    let opts = super::loader::LoadOptions {
+        ple: true,
+        ..Default::default()
+    };
+    Qwen4Exp::ghost_of_manifest(&manifest, dev, &opts, |_| GhostExperts)
+}
+
 /// A whole model, every expert resident.
 pub fn resident_model(cfg: &Config, dev: &Device) -> Qwen4Exp<Resident> {
     model_with(cfg, dev, |l| Ok(resident_experts(cfg, l, dev))).expect("resident build")

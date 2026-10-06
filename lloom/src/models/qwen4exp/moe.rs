@@ -37,6 +37,19 @@ pub trait PlanHook {
     fn at_join(&mut self) -> Result<()> {
         Ok(())
     }
+    /// The fetch inside the token (`QWEN4EXP_FETCH=inside`): this pass
+    /// fetches its misses — each layer's slot map and routed experts wait
+    /// on the device for a worker that loads what the router chose.
+    fn fetching(&self) -> bool {
+        false
+    }
+    /// At a fetching layer, after the router and the shared expert: hand
+    /// the worker this layer's routing `ids` and encode the device's wait
+    /// for it (`ExpertResidency::fetch_register`). `false` when nothing was
+    /// encoded (the tier does not fetch).
+    fn fetch_join<R: ExpertResidency>(&mut self, _experts: &R, _ids: &Tensor) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 impl PlanHook for () {}
@@ -273,6 +286,9 @@ impl<R: ExpertResidency> MoeLayer<R> {
         hook: &mut H,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let r = self.prefill_route(x)?;
+        if hook.fetching() {
+            return self.decode_fetched(&r, hook);
+        }
         let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
             let groups = self.experts.plan(&r.ids)?;
             let y = self.routed_groups(&r.x3, &groups)?;
@@ -285,6 +301,34 @@ impl<R: ExpertResidency> MoeLayer<R> {
         let flags = self.mask_flags(&r, &rec)?;
         Ok((
             self.combine(&r, &y, &shared, &sh_logit, flags.as_ref())?,
+            Some(rec),
+        ))
+    }
+
+    /// A fetching step's MoE (`QWEN4EXP_FETCH=inside`,
+    /// `expert-streaming.md` §20.14c): the router, the shared expert, then
+    /// the device's wait for the worker that loads what the router chose
+    /// (`PlanHook::fetch_join`), and only after it the slot map and the
+    /// routed experts — so they read the pool the worker filled. The record
+    /// is settled after the pass as the device plan's is; a flag in it is
+    /// an expert the worker found no slot for, and the step is redone. A
+    /// tier that does not fetch takes the plain device plan.
+    fn decode_fetched<H: PlanHook>(
+        &self,
+        r: &PrefillRouted,
+        hook: &mut H,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let (shared, sh_logit) = self.shared_expert(r)?;
+        hook.fetch_join(&self.experts, &r.ids)?;
+        let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
+            let groups = self.experts.plan(&r.ids)?;
+            let y = self.routed_groups(&r.x3, &groups)?;
+            return Ok((self.combine(r, &y, &shared, &sh_logit, None)?, None));
+        };
+        let y = self.routed_one_group(&r.x3, &slot_ids)?;
+        let flags = self.mask_flags(r, &rec)?;
+        Ok((
+            self.combine(r, &y, &shared, &sh_logit, flags.as_ref())?,
             Some(rec),
         ))
     }
@@ -732,6 +776,22 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
     type In = crate::optimizer::NodeId;
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, x: Self::In) -> Self::Out {
+        self.visit_planned(w, x, self.experts.plans_on_device())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<R: ExpertResidency> MoeLayer<R> {
+    /// The visit with the routed experts planned on the device
+    /// (`device_plan`: the slot map, one launch) or on the host (the ids
+    /// read back, no launch) — a pass that plans on the host whatever the
+    /// residency can (`Self::forward`, the MTP head's prefill) says so.
+    pub(crate) fn visit_planned(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        x: crate::optimizer::NodeId,
+        device_plan: bool,
+    ) -> crate::optimizer::NodeId {
         use crate::optimizer::{Dim, Shape};
         let f32 = DType::F32;
         let h = match w.node(x).shape.last() {
@@ -746,14 +806,14 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
         let route = w.opaque("moe_topk", &[logits], Shape::of(&[1, topk]), f32);
         let act = self.tile_act(1);
         let x3 = if act != f32 && !self.folds(f32, act) {
-            w.opaque("cast_f32_f16", &[x1], Shape::of(&[1, h]), act)
+            w.opaque("cast", &[x1], Shape::of(&[1, h]), act)
         } else {
             x1
         };
         let x3 = w.view("reshape", x3, Shape::of(&[1, 1, h]));
         // The device plan's slot map writes its record into the tier's
         // host-read slot in place (`Streamed::plan_device`): one launch.
-        let slots = if self.experts.plans_on_device() {
+        let slots = if device_plan {
             let plan = w.opaque("moe_slot_map", &[route], Shape::of(&[3 * topk]), DType::U32);
             w.view("narrow", plan, Shape::of(&[1, topk]))
         } else {
@@ -770,30 +830,26 @@ impl<R: ExpertResidency> crate::optimizer::Visit for MoeLayer<R> {
         );
         let g = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
         let u = w.view("narrow", gu, Shape::of(&[1, topk, mi]));
-        let hmid = if act != DType::F16 || self.f16_fuse {
-            w.opaque("silu_mul", &[g, u], Shape::of(&[1, topk, mi]), act)
-        } else {
-            let s = w.silu(g);
-            w.mul(s, u)
-        };
+        // The SwiGLU and, at f16, the combine's widening, as what they
+        // compute: the derivation composes them (`silu_mul`, the combine
+        // reading f16) where the step's switch does.
+        let s = w.silu(g);
+        let hmid = w.mul(s, u);
         let y = w.opaque(
             "mul_mv_id",
             &[wd, hmid, slots],
             Shape::of(&[1, topk, h]),
             act,
         );
-        let y = if act == DType::F16 && !self.f16_fuse {
-            w.opaque("cast_f16_f32", &[y], Shape::of(&[1, topk, h]), f32)
+        let y = if act == DType::F16 {
+            w.opaque("cast", &[y], Shape::of(&[1, topk, h]), f32)
         } else {
             y
         };
         let sg = w.project_qmat("ffn_gate_shexp.weight", &self.sh_gate, x1);
         let su = w.project_qmat("ffn_up_shexp.weight", &self.sh_up, x1);
-        let si = match w.node(sg).shape.last() {
-            Some(Dim::Const(n)) => n,
-            _ => unreachable!(),
-        };
-        let sm = w.opaque("silu_mul", &[sg, su], Shape::of(&[1, si]), f32);
+        let ss = w.silu(sg);
+        let sm = w.mul(ss, su);
         let shared = w.project_qmat("ffn_down_shexp.weight", &self.sh_down, sm);
         let sh_logit = w.project_qmat("ffn_gate_inp_shexp.weight", &self.sh_router, x1);
         let out = w.opaque(

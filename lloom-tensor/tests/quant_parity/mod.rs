@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Every `GgmlDType`. [`stem`] matches exhaustively, so a new variant does
 /// not compile until it is named there and here.
-pub const ALL: [GgmlDType; 23] = [
+pub const ALL: [GgmlDType; 25] = [
     GgmlDType::F32,
     GgmlDType::F16,
     GgmlDType::BF16,
@@ -59,6 +59,8 @@ pub const ALL: [GgmlDType; 23] = [
     GgmlDType::IQ4NL,
     GgmlDType::IQ4XS,
     GgmlDType::Q2_0,
+    GgmlDType::MXFP4,
+    GgmlDType::FP8E4M3,
 ];
 
 /// The kernel-name stem of a format.
@@ -87,6 +89,8 @@ pub fn stem(d: GgmlDType) -> &'static str {
         GgmlDType::IQ4NL => "iq4_nl",
         GgmlDType::IQ4XS => "iq4_xs",
         GgmlDType::Q2_0 => "q2_0",
+        GgmlDType::MXFP4 => "mxfp4",
+        GgmlDType::FP8E4M3 => "fp8_e4m3",
     }
 }
 
@@ -225,6 +229,10 @@ pub struct Cell {
     pub tol: f64,
     pub fails: Vec<String>,
     pub notes: Vec<String>,
+    /// FNV-1a over the bits of every output the cell's cases produced, in
+    /// case order: equal digests are equal outputs, so two builds compare
+    /// cell for cell without either being the reference.
+    pub digest: u64,
 }
 
 impl Cell {
@@ -238,6 +246,15 @@ impl Cell {
             tol,
             fails: Vec::new(),
             notes: Vec::new(),
+            digest: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+
+    fn absorb(&mut self, bits: impl IntoIterator<Item = u32>) {
+        for b in bits {
+            for byte in b.to_le_bytes() {
+                self.digest = (self.digest ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
+            }
         }
     }
 
@@ -854,6 +871,7 @@ impl Matrix {
                     };
                     self.check_census(&key, &at, &census, &[expect]);
                     let got = to_f32(&out)?;
+                    self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
                     self.score_rows(
                         &key,
                         &at,
@@ -905,6 +923,7 @@ impl Matrix {
                     };
                     self.check_census(&key, &at, &census, &expect);
                     let got = to_f32(&out)?;
+                    self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
                     self.score_rows(
                         &key,
                         &at,
@@ -995,6 +1014,7 @@ impl Matrix {
                             self.check_census(&key, &at, &census, &[expect]);
                             let gv = to_f32(&go)?;
                             let uv = to_f32(&uo)?;
+                            self.cell(&key).absorb(gv.iter().chain(&uv).map(|v| v.to_bits()));
                             self.score_rows(
                                 &key,
                                 &format!("{at} gate"),
@@ -1064,6 +1084,7 @@ impl Matrix {
                                 format!("kernel_mul_mv_id_{}_{}", stem(d), act.mv_suffix());
                             self.check_census(&key, &at, &census, &[expect]);
                             let got = to_f32(&out)?;
+                            self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
                             self.score_rows(
                                 &key,
                                 &at,
@@ -1180,6 +1201,7 @@ impl Matrix {
                         };
                         self.check_census(&key, &at, &census, &[format!("{name}_{}_f32", stem(d))]);
                         let got = to_f32(&out)?;
+                        self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
                         let x_row = |r: usize| if in1 == 1 { r / topk } else { r };
                         self.score_rows(
                             &key,
@@ -1225,6 +1247,7 @@ impl Matrix {
                     &[format!("kernel_get_rows_{}", stem(d))],
                 );
                 let got = to_f32(&out)?;
+                self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
                 let mut worst = 0f64;
                 let mut where_ = String::new();
                 for (i, &id) in ids.iter().enumerate() {
@@ -1277,6 +1300,7 @@ impl Matrix {
                     &[format!("kernel_dequant_rows_f16_{}", stem(d))],
                 );
                 let got = out.to_device(&Device::Cpu)?.to_vec1::<f16>()?;
+                self.cell(&key).absorb(got.iter().map(|v| v.to_bits() as u32));
                 let mut worst = 0f64;
                 let mut where_ = String::new();
                 for (i, g) in got.iter().enumerate() {
@@ -1413,6 +1437,7 @@ impl Matrix {
                 &[format!("dequantize_kv_{t}_{dim}_{}", bits.name())],
             );
             let got = to_f32(&out)?;
+            self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
             let mut worst = 0f64;
             let mut where_ = String::new();
             for h in 0..heads {
@@ -1539,6 +1564,7 @@ impl Matrix {
                 &[format!("{name}_{t}_{dim}_{}", bits.name())],
             );
             let got = to_f32(&out)?;
+            self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
             let mut worst = 0f64;
             let mut where_ = String::new();
             for h in 0..hq {
@@ -1803,11 +1829,12 @@ impl Matrix {
                 c.tol,
             );
             println!(
-                "CELL entry={} fmt={f} act={} worst={:e} at=[{}] verdict={verdict}",
+                "CELL entry={} fmt={f} act={} worst={:e} at=[{}] digest={:016x} verdict={verdict}",
                 e.label(),
                 a.label(),
                 c.worst,
-                c.worst_at
+                c.worst_at,
+                c.digest
             );
             if !c.passed() {
                 if c.cases == 0 {

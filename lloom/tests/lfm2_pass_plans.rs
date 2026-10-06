@@ -1129,9 +1129,11 @@ fn a_ramped_prefill_has_no_escapes_under_eviction_on_either_attention_arm() -> R
 /// The shuffle cannot write in place (it reads column `j + 1` while it writes
 /// `j`), which is why its state was a fresh tensor per step: one escape per
 /// conv layer per step, the 22 a token the real model's `--pass-plans` line
-/// carried (`pass-plan-design.md` §17). The stream is the pool path's, and
-/// the unfused shuffle arm — which still allocates its state per step — is
-/// the control that the zero is the spare's, not a detector gone blind.
+/// carried (`pass-plan-design.md` §17). The stream is the pool path's. The
+/// unfused shuffle arm, which shifts in place and takes no spare, is the
+/// control: the counter sees the fused arm's spares (one a conv layer, on
+/// its first step) and nothing on the unfused one, so the zero per step is
+/// the swap's, not a detector gone blind.
 #[test]
 fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> Result<()> {
     let _serial = SERIAL.lock();
@@ -1195,17 +1197,18 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
          session state: a per-step state allocation is back"
     );
 
-    // The control: the unfused shuffle still builds its state per step
-    // (`cat`), one Shared-pool request per conv layer per served step on top
-    // of the same session state, so the counter sees what the spare removed.
+    // The unfused shuffle shifts its state in place and takes no spare: the
+    // same session state, without the fused arm's spares, and nothing per
+    // step. (A step that takes a spare it does not write asks the pool once
+    // per conv layer per served step, `conv_layers * steps` on top of this.)
     let (want_u, ..) = run(false, false)?;
     let (ids_u, escapes_u, served_u, requests_u) = run(false, true)?;
     eprintln!("[unfused shuffle] escapes={escapes_u} served={served_u} requests={requests_u:?}");
     assert_eq!(ids_u, want_u);
     assert_eq!(
         requests_u,
-        (4 + turn_ring + conv_layers * steps as u64, 0),
-        "the unfused shuffle's per-step state is the request the counter must see"
+        (4 + turn_ring, 0),
+        "the unfused shuffle asked the pools for state per step"
     );
     Ok(())
 }

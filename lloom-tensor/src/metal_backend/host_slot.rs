@@ -235,4 +235,44 @@ impl HostSlot {
         let marker = self.device.flush_marker()?;
         self.read_after(&marker, n)
     }
+
+    /// Store `v` into the first `n` u32 words from the host. For a slot a
+    /// poller watches while its producer runs ([`Self::peek_u32`]): the
+    /// caller writes only while no command that writes the slot is pending,
+    /// so the producer's next write is the one the poller sees.
+    pub fn fill_u32(&self, v: u32, n: usize) -> Result<()> {
+        self.check_u32(n)?;
+        let ptr = self.buffer.contents() as *mut u32;
+        for i in 0..n {
+            // SAFETY: a CPU-mapped Shared buffer of `cap >= n` u32 (checked).
+            unsafe { ptr.add(i).write_volatile(v) }
+        }
+        Ok(())
+    }
+
+    /// The first `n` u32 words as the host sees them now, into `out`: no
+    /// wait and no readback counted — a poll of a value the GPU may be
+    /// writing. Each word is the old value or the new one (an aligned u32
+    /// store); which words are new is the caller's to decide.
+    pub fn peek_u32(&self, n: usize, out: &mut Vec<u32>) -> Result<()> {
+        self.check_u32(n)?;
+        let ptr = self.buffer.contents() as *const u32;
+        out.clear();
+        // SAFETY: as `fill_u32`; reads only.
+        out.extend((0..n).map(|i| unsafe { ptr.add(i).read_volatile() }));
+        Ok(())
+    }
+
+    fn check_u32(&self, n: usize) -> Result<()> {
+        if self.dtype != DType::U32 {
+            crate::bail!("HostSlot: a u32 access to a {:?} slot", self.dtype)
+        }
+        if n > self.cap {
+            crate::bail!("HostSlot: {n} words of a slot of {}", self.cap)
+        }
+        if self.buffer.contents().is_null() {
+            crate::bail!("HostSlot: the slot lost its CPU mapping")
+        }
+        Ok(())
+    }
 }

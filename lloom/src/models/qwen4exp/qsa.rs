@@ -995,6 +995,140 @@ impl Indexer {
         self.budget / self.ratio
     }
 
+    /// [`partial_rope_seq`] over `rows` heads of `x` (`[rows, head_dim]`
+    /// values): four products, a difference and a sum on the rotated halves,
+    /// then the halves and the pass-through copied into one row each. `cos`
+    /// and `sin` are the host's tables, uploaded; every node joins `ring`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn visit_rope(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        x: crate::optimizer::NodeId,
+        rows: usize,
+        tables: &str,
+        ring: &mut Vec<crate::optimizer::NodeId>,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        let f32 = DType::F32;
+        let (hd, half) = (self.head_dim, self.n_rot / 2);
+        let rot = Shape::of(&[1, rows, half]);
+        let table = Shape::of(&[1, 1, half]);
+        let cos = w.input(&format!("{tables}.cos"), table.clone(), f32);
+        let sin = w.input(&format!("{tables}.sin"), table, f32);
+        let lo = w.view("narrow", x, rot.clone());
+        let hi = w.view("narrow", x, rot.clone());
+        let a = w.mul(lo, cos);
+        let b = w.mul(hi, sin);
+        let y_lo = w.opaque("bsub", &[a, b], rot.clone(), f32);
+        let c = w.mul(lo, sin);
+        let d = w.mul(hi, cos);
+        let y_hi = w.add(c, d);
+        let row = Shape::of(&[1, rows, hd]);
+        let mut roped = w.opaque("copy2d", &[y_lo], row.clone(), f32);
+        roped = w.opaque("copy2d", &[y_hi, roped], row.clone(), f32);
+        ring.extend([a, b, y_lo, c, d, y_hi, roped]);
+        if self.n_rot < hd {
+            let pass = w.view("narrow", x, Shape::of(&[1, rows, hd - self.n_rot]));
+            roped = w.opaque("copy2d", &[pass, roped], row, f32);
+            ring.push(roped);
+        }
+        roped
+    }
+
+    /// The launches a decode step takes when its key completes a block
+    /// ([`Self::observe_keys`] at one new block): the block's raw keys
+    /// pooled (`fast_sum`, the `1/ratio` scale), `k_norm`, the partial rope
+    /// at the block's first position, and the row appended to the compressed
+    /// cache `blocks` — which this step's selection, past the dense range,
+    /// and every later one read. `raw` is the step's raw-key append; every
+    /// node joins `ring`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn visit_block(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        raw: crate::optimizer::NodeId,
+        blocks: crate::optimizer::NodeId,
+        l: usize,
+        ring: &mut Vec<crate::optimizer::NodeId>,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        let f32 = DType::F32;
+        let hd = self.head_dim;
+        let members = w.view("narrow", raw, Shape::of(&[1, self.ratio, hd]));
+        let pooled = w.opaque("fast_sum", &[members], Shape::of(&[1, hd]), f32);
+        let pooled = w.scale(pooled, (1.0 / self.ratio as f64) as f32);
+        let g = self.k_norm.weight();
+        let g = w.weight("indexer.k_norm.weight", Shape::of(g.dims()), g.dtype());
+        let normed = w.rms_norm(g, pooled);
+        ring.extend([pooled, normed]);
+        let roped = self.visit_rope(w, normed, 1, &format!("qsa.indexer_block_rope@{l}"), ring);
+        let shape = w.node(blocks).shape.clone();
+        let appended = w.opaque("copy2d", &[roped, blocks], shape, f32);
+        ring.push(appended);
+        appended
+    }
+
+    /// The launches the selection takes at `pos`, past the dense range
+    /// ([`Self::select`] and [`Self::score_one`]): the query's indexer heads
+    /// (`q_proj`, `q_norm`, the partial rope at `pos`, transposed into a
+    /// copy), every visible block's score (one product against the
+    /// compressed cache `blocks`, `relu`, the sum over heads), the order
+    /// (`neg`, the arg-sort), the top blocks widened to cells (`cast`, the
+    /// `ratio` scale, the offsets added, narrowed back to `u32`), and the
+    /// incomplete tail copied after them when there is one. `x1` is the
+    /// layer's input row; the selection's cells are returned, every node
+    /// joining `ring`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn visit_select(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        x1: crate::optimizer::NodeId,
+        pos: usize,
+        blocks: crate::optimizer::NodeId,
+        l: usize,
+        ring: &mut Vec<crate::optimizer::NodeId>,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        let (f32, u32) = (DType::F32, DType::U32);
+        let (nh, hd, r) = (self.n_heads, self.head_dim, self.ratio);
+        let n_kv = pos + 1;
+        let visible = n_kv / r;
+        let topk = self.block_topk().min(visible);
+        let q = w.project_qmat("indexer.q_proj.weight", &self.q_proj, x1);
+        let q = w.view("reshape", q, Shape::of(&[nh, hd]));
+        let g = self.q_norm.weight();
+        let g = w.weight("indexer.q_norm.weight", Shape::of(g.dims()), g.dtype());
+        let q = w.rms_norm(g, q);
+        ring.push(q);
+        let q = self.visit_rope(w, q, nh, &format!("qsa.indexer_query_rope@{l}"), ring);
+        let qt = w.opaque("copy_strided", &[q], Shape::of(&[hd, nh]), f32);
+        let k_c = w.view("narrow", blocks, Shape::of(&[visible, hd]));
+        let score = w.opaque("gemm", &[k_c, qt], Shape::of(&[visible, nh]), f32);
+        let score = w.opaque("relu", &[score], Shape::of(&[visible, nh]), f32);
+        let score = w.opaque("fast_sum", &[score], Shape::of(&[visible]), f32);
+        let neg = w.opaque("neg", &[score], Shape::of(&[visible]), f32);
+        let order = w.opaque("arg_sort", &[neg], Shape::of(&[visible]), u32);
+        let top = w.view("narrow", order, Shape::of(&[topk]));
+        let base = w.opaque("cast", &[top], Shape::of(&[topk]), f32);
+        let base = w.scale(base, r as f32);
+        let base = w.view("broadcast", base, Shape::of(&[topk, r]));
+        // `Tensor::arange`: made on the host and uploaded, no kernel.
+        let offs = w.input(&format!("qsa.indexer_offsets@{l}"), Shape::of(&[topk, r]), f32);
+        let cells = w.add(base, offs);
+        let cells = w.opaque("cast", &[cells], Shape::of(&[topk * r]), u32);
+        ring.extend([qt, score, neg, order, base, cells]);
+        let tail = n_kv - visible * r;
+        if tail == 0 {
+            return cells;
+        }
+        let tail_ids = w.input(&format!("qsa.indexer_tail@{l}"), Shape::of(&[tail]), u32);
+        let n_sel = Shape::of(&[topk * r + tail]);
+        let sel = w.opaque("copy2d", &[cells], n_sel.clone(), u32);
+        let sel = w.opaque("copy2d", &[tail_ids, sel], n_sel, u32);
+        ring.push(sel);
+        sel
+    }
+
     /// Append the raw indexer keys of `x2 [seq, hidden]` and complete every
     /// block the new tokens finish: pooled raw keys → `k_norm` → rope at the
     /// block's first position → the compressed cache. O(new blocks), never a
@@ -2817,6 +2951,24 @@ fn causal_mask(
     Tensor::from_vec(m, (seq, kv_len), dev)
 }
 
+impl QsaAttention {
+    /// The keys the decode step at `pos` attends: every cached one inside
+    /// the indexer's dense range, past it the selection — the top
+    /// `budget / ratio` complete blocks and the incomplete tail
+    /// ([`Indexer::select`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keys_at(&self, pos: usize) -> usize {
+        let n_kv = pos + 1;
+        match &self.indexer {
+            Some(ix) if n_kv > ix.dense_limit() => {
+                let visible = n_kv / ix.ratio;
+                ix.block_topk().min(visible) * ix.ratio + (n_kv - visible * ix.ratio)
+            }
+            _ => n_kv,
+        }
+    }
+}
+
 /// A full-attention layer's decode step ([`QsaAttention::decode_rows`]'s
 /// launches at one row, inside the indexer's dense range, no block
 /// completing): the input stems as the loader stacked them, the prologue
@@ -2826,22 +2978,21 @@ fn causal_mask(
 /// `kv_len` are layer `l`'s KV recurrence. `In` is the bracket's output, the
 /// layer, and the KV store's precision (the cache's, which the model knows).
 ///
-/// Not walked: the step that completes an indexer block (every `ratio`-th
-/// position: the pooled keys' norm, rope and append), the step past the
-/// dense range (the selection), and the two-pass attention past
-/// `sdpa_vector`'s single-pass length — each adds launches at a position.
+/// At a position ([`crate::optimizer::Walker::at`]) the step whose key
+/// completes an indexer block (every `ratio`-th position) adds the block's
+/// pooling, norm, rope and append ([`Indexer::visit_block`]); the step past
+/// the dense range adds the selection and the gather of its cells
+/// ([`Indexer::visit_select`]); and the attention over keys that reach the
+/// 2-pass length is two launches.
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::optimizer::Visit for QsaAttention {
     type In = (crate::optimizer::NodeId, usize, KvPrecision);
     type Out = crate::optimizer::NodeId;
     fn visit(&self, w: &mut crate::optimizer::Walker, (x, l, precision): Self::In) -> Self::Out {
-        use crate::optimizer::{Dim, Region, Shape};
+        use crate::optimizer::Shape;
         let f32 = DType::F32;
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
-        let h = match w.node(x).shape.last() {
-            Some(Dim::Const(h)) => h,
-            _ => unreachable!("a decode step's input has a constant width"),
-        };
+        let h = Self::width(w, x);
         let (nq, nk) = (nh * 2 * hd, nkv * hd);
         let xb = w.view("reshape", x, Shape::of(&[1, h]));
         let (qg, k, v) = match &self.stem_cat {
@@ -2853,19 +3004,12 @@ impl crate::optimizer::Visit for QsaAttention {
                     w.view("narrow", all, Shape::of(&[1, nk])),
                 )
             }
-            None => (
-                w.project_qmat("attn_q.weight", &self.wq, xb),
-                w.project_qmat("attn_k.weight", &self.wk, xb),
-                w.project_qmat("attn_v.weight", &self.wv, xb),
-            ),
+            None => self.visit_stems(w, xb),
         };
         let qg = w.view("reshape", qg, Shape::of(&[nh, 2 * hd]));
         let k = w.view("reshape", k, Shape::of(&[nkv, hd]));
         let v = w.view("reshape", v, Shape::of(&[nkv, 1, hd]));
-        let qn = self.q_norm.weight();
-        let kn = self.k_norm.weight();
-        let qn = w.weight("attn_q_norm.weight", Shape::of(qn.dims()), qn.dtype());
-        let kn = w.weight("attn_k_norm.weight", Shape::of(kn.dims()), kn.dtype());
+        let (qn, kn) = self.visit_norm_weights(w);
         let prep = w.opaque(
             "qsa_prep",
             &[qg, k, qn, kn],
@@ -2875,6 +3019,69 @@ impl crate::optimizer::Visit for QsaAttention {
         let q = w.view("narrow", prep, Shape::of(&[nh, hd]));
         let gate = w.view("narrow", prep, Shape::of(&[nh, hd]));
         let k_step = w.view("narrow", prep, Shape::of(&[nkv, 1, hd]));
+        let ctx = self.visit_kv(w, xb, q, k_step, v, l, precision);
+        self.visit_out(w, gate, ctx, h)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl QsaAttention {
+    fn width(w: &crate::optimizer::Walker, x: crate::optimizer::NodeId) -> usize {
+        match w.node(x).shape.last() {
+            Some(crate::optimizer::Dim::Const(h)) => h,
+            _ => unreachable!("a step's input has a constant width"),
+        }
+    }
+
+    /// The three stems as three products.
+    fn visit_stems(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        xb: crate::optimizer::NodeId,
+    ) -> (
+        crate::optimizer::NodeId,
+        crate::optimizer::NodeId,
+        crate::optimizer::NodeId,
+    ) {
+        (
+            w.project_qmat("attn_q.weight", &self.wq, xb),
+            w.project_qmat("attn_k.weight", &self.wk, xb),
+            w.project_qmat("attn_v.weight", &self.wv, xb),
+        )
+    }
+
+    fn visit_norm_weights(
+        &self,
+        w: &mut crate::optimizer::Walker,
+    ) -> (crate::optimizer::NodeId, crate::optimizer::NodeId) {
+        use crate::optimizer::Shape;
+        let qn = self.q_norm.weight();
+        let kn = self.k_norm.weight();
+        (
+            w.weight("attn_q_norm.weight", Shape::of(qn.dims()), qn.dtype()),
+            w.weight("attn_k_norm.weight", Shape::of(kn.dims()), kn.dtype()),
+        )
+    }
+
+    /// The step's cache half, the same whichever path prepared the row: the
+    /// append at the store's precision, the indexer's observe (its key, a
+    /// completed block, the selection past the dense range), the store's
+    /// read and the attention over it — layer `l`'s KV recurrence, marked.
+    /// `q` is `[nh, hd]`, `k_step` / `v` the row's `[nkv, 1, hd]`.
+    #[allow(clippy::too_many_arguments)]
+    fn visit_kv(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        xb: crate::optimizer::NodeId,
+        q: crate::optimizer::NodeId,
+        k_step: crate::optimizer::NodeId,
+        v: crate::optimizer::NodeId,
+        l: usize,
+        precision: KvPrecision,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::{Dim, Region, Shape};
+        let f32 = DType::F32;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let cache = || Shape(vec![Dim::Const(nkv), Dim::Sym("kv_len"), Dim::Const(hd)]);
         let mut ring = Vec::new();
         let (k_all, v_all) = match precision.dense_dtype() {
@@ -2882,77 +3089,176 @@ impl crate::optimizer::Visit for QsaAttention {
                 let shape = cache();
                 let kc = w.input(&format!("qsa.k@{l}"), shape.clone(), dt);
                 let vc = w.input(&format!("qsa.v@{l}"), shape.clone(), dt);
-                let (copy, cast_in, cast_out) = if dt == f32 {
-                    ("copy2d_f32", None, None)
-                } else {
-                    ("copy2d_f16", Some("cast_f32_f16"), Some("cast_f16_f32"))
-                };
+                // A 16-bit store takes the step's row narrowed to its dtype.
                 let (mut ks, mut vs) = (k_step, v);
-                if let Some(c) = cast_in {
-                    ks = w.opaque(c, &[ks], Shape::of(&[nkv, 1, hd]), dt);
-                    vs = w.opaque(c, &[vs], Shape::of(&[nkv, 1, hd]), dt);
+                if dt != f32 {
+                    ks = w.opaque("cast", &[ks], Shape::of(&[nkv, 1, hd]), dt);
+                    vs = w.opaque("cast", &[vs], Shape::of(&[nkv, 1, hd]), dt);
                     ring.extend([ks, vs]);
                 }
-                let mut ka = w.opaque(copy, &[ks, kc], shape.clone(), dt);
-                let mut va = w.opaque(copy, &[vs, vc], shape.clone(), dt);
+                let ka = w.opaque("copy2d", &[ks, kc], shape.clone(), dt);
+                let va = w.opaque("copy2d", &[vs, vc], shape, dt);
                 ring.extend([kc, vc, ka, va]);
-                if let Some(c) = cast_out {
-                    ka = w.opaque(c, &[ka], shape.clone(), f32);
-                    va = w.opaque(c, &[va], shape, f32);
-                    ring.extend([ka, va]);
-                }
                 (ka, va)
             }
-            // A quantized store's append and its read are its own kernels,
-            // named here from the arm and reconciled against no trace.
+            // A quantized store: the row's k and v each quantized into its
+            // codes (`QuantKvSlab::append`).
             None => {
                 let shape = cache();
                 let store = w.input(&format!("qsa.kv@{l}"), shape.clone(), DType::U8);
-                let appended = w.opaque("kv_quant_append", &[k_step, v, store], shape, DType::U8);
-                ring.extend([store, appended]);
-                (appended, appended)
+                let k = w.opaque("quantize_kv", &[k_step, store], shape.clone(), DType::U8);
+                let both = w.opaque("quantize_kv", &[v, k], shape, DType::U8);
+                ring.extend([store, k, both]);
+                (both, both)
             }
         };
+        let mut sel = None;
         if let Some(ix) = &self.indexer {
+            let keys = Shape(vec![
+                Dim::Const(1),
+                Dim::Sym("kv_len"),
+                Dim::Const(ix.head_dim),
+            ]);
             let k_raw = w.project_qmat("indexer.k_proj.weight", &ix.k_proj, xb);
             let k_raw = w.view("reshape", k_raw, Shape::of(&[1, 1, ix.head_dim]));
-            let raw = w.input(
-                &format!("qsa.indexer_keys@{l}"),
-                Shape(vec![
-                    Dim::Const(1),
-                    Dim::Sym("kv_len"),
-                    Dim::Const(ix.head_dim),
-                ]),
-                f32,
-            );
-            let appended = w.opaque(
-                "copy2d_f32",
-                &[k_raw, raw],
-                Shape(vec![
-                    Dim::Const(1),
-                    Dim::Sym("kv_len"),
-                    Dim::Const(ix.head_dim),
-                ]),
-                f32,
-            );
+            let raw = w.input(&format!("qsa.indexer_keys@{l}"), keys.clone(), f32);
+            let appended = w.opaque("copy2d", &[k_raw, raw], keys, f32);
             // Read by a later step's selection, not by this one.
             w.state_out(appended);
             ring.extend([raw, appended]);
+            let pos = w.position();
+            let block = pos.is_some_and(|p| (p + 1).is_multiple_of(ix.ratio));
+            let past = pos.filter(|&p| p + 1 > ix.dense_limit());
+            if block || past.is_some() {
+                let cache = Shape(vec![
+                    Dim::Const(1),
+                    Dim::Sym("n_blocks"),
+                    Dim::Const(ix.head_dim),
+                ]);
+                let mut blocks = w.input(&format!("qsa.indexer_blocks@{l}"), cache, f32);
+                ring.push(blocks);
+                if block {
+                    blocks = ix.visit_block(w, appended, blocks, l, &mut ring);
+                    w.state_out(blocks);
+                }
+                if let Some(p) = past {
+                    sel = Some(ix.visit_select(w, xb, p, blocks, l, &mut ring));
+                }
+            }
         }
         let qv = w.view("reshape", q, Shape::of(&[1, nh, 1, hd]));
-        let kernel = if precision.dense_dtype().is_some() {
-            "sdpa_vector"
-        } else {
-            "sdpa_quant"
+        let out = Shape::of(&[1, nh, 1, hd]);
+        // The dense store's read (`KvCache::attend`): past the dense range
+        // the selected cells, gathered (`index_select`); a 16-bit store's
+        // read up to the query's f32.
+        let (k_all, v_all) = match precision.dense_dtype() {
+            Some(dt) => {
+                let (mut k, mut v) = (k_all, v_all);
+                if let Some(sel) = sel {
+                    let n_sel = match w.node(sel).shape.0.first() {
+                        Some(&d) => d,
+                        None => unreachable!("a selection has one extent"),
+                    };
+                    let cells = Shape(vec![Dim::Const(nkv), n_sel, Dim::Const(hd)]);
+                    k = w.opaque("is_u32", &[k, sel], cells.clone(), dt);
+                    v = w.opaque("is_u32", &[v, sel], cells, dt);
+                    ring.extend([k, v]);
+                }
+                if dt != f32 {
+                    let shape = w.node(k).shape.clone();
+                    k = w.opaque("cast", &[k], shape.clone(), f32);
+                    v = w.opaque("cast", &[v], shape, f32);
+                    ring.extend([k, v]);
+                }
+                (k, v)
+            }
+            None => (k_all, v_all),
         };
-        let ctx = w.opaque(kernel, &[qv, k_all, v_all], Shape::of(&[1, nh, 1, hd]), f32);
+        let ctx = match precision.dense_dtype() {
+            // At a position whose keys reach the 2-pass length, the vector
+            // kernel is two launches: the partials, then their merge.
+            Some(_)
+                if w
+                    .position()
+                    .is_some_and(|p| ops::sdpa_vector_two_pass(self.keys_at(p), hd, f32)) =>
+            {
+                let partial = w.opaque("sdpa_vector_2pass_1", &[qv, k_all, v_all], out.clone(), f32);
+                ring.push(partial);
+                w.opaque("sdpa_vector_2pass_2", &[partial], out, f32)
+            }
+            Some(_) => w.opaque("sdpa_vector", &[qv, k_all, v_all], out, f32),
+            // The quantized store's own attention reads its codes, over the
+            // live cells or the selected ones (`QuantKvSlab::attend`).
+            None => match sel {
+                Some(sel) => w.opaque("sdpa_quant_selected", &[qv, k_all, sel], out, f32),
+                None => w.opaque("sdpa_quant", &[qv, k_all], out, f32),
+            },
+        };
         ring.push(ctx);
         w.mark(&ring, Region::Kv(l));
-        let ctx = w.view("reshape", ctx, Shape::of(&[1, nh * hd]));
-        let gate = w.view("reshape", gate, Shape::of(&[1, nh * hd]));
-        let gated = w.opaque("sigmoid_mul", &[gate, ctx], Shape::of(&[1, nh * hd]), f32);
+        ctx
+    }
+
+    /// The output gate and projection over the attention's `[1, nh, 1, hd]`.
+    fn visit_out(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        gate: crate::optimizer::NodeId,
+        ctx: crate::optimizer::NodeId,
+        h: usize,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        let width = self.n_heads * self.head_dim;
+        let ctx = w.view("reshape", ctx, Shape::of(&[1, width]));
+        let gate = w.view("reshape", gate, Shape::of(&[1, width]));
+        let gated = w.opaque(
+            "sigmoid_mul",
+            &[gate, ctx],
+            Shape::of(&[1, width]),
+            DType::F32,
+        );
         let out = w.project_qmat("attn_output.weight", &self.wo, gated);
         w.view("reshape", out, Shape::of(&[1, 1, h]))
+    }
+
+    /// One row through the prefill path ([`Self::prefill`]'s fused arm at a
+    /// sequence of one, the MTP head's pass): the three stems as products
+    /// whatever the loader stacked, the rows prologue (`qsa_prep_rows`),
+    /// then the cache half and the gate as the decode step's. Inside the
+    /// dense range only: past it a prefill's rows take the chunk's sparse
+    /// attention (`sparse_rows`), which is not walked.
+    pub(crate) fn visit_row(
+        &self,
+        w: &mut crate::optimizer::Walker,
+        x: crate::optimizer::NodeId,
+        l: usize,
+        precision: KvPrecision,
+    ) -> crate::optimizer::NodeId {
+        use crate::optimizer::Shape;
+        if let (Some(ix), Some(p)) = (&self.indexer, w.position()) {
+            assert!(
+                p < ix.dense_limit(),
+                "a prefill row past the dense range takes sparse_rows, which is not walked"
+            );
+        }
+        let f32 = DType::F32;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let h = Self::width(w, x);
+        let xb = w.view("reshape", x, Shape::of(&[1, h]));
+        let (qg, k, v) = self.visit_stems(w, xb);
+        let (qn, kn) = self.visit_norm_weights(w);
+        let flat = w.opaque(
+            "qsa_prep_rows",
+            &[qg, k, v, qn, kn],
+            Shape::of(&[(2 * nh + 2 * nkv) * hd]),
+            f32,
+        );
+        let q = w.view("narrow", flat, Shape::of(&[nh, hd]));
+        let gate = w.view("narrow", flat, Shape::of(&[nh, hd]));
+        let k_new = w.view("narrow", flat, Shape::of(&[nkv, 1, hd]));
+        let v_new = w.view("narrow", flat, Shape::of(&[nkv, 1, hd]));
+        let ctx = self.visit_kv(w, xb, q, k_new, v_new, l, precision);
+        self.visit_out(w, gate, ctx, h)
     }
 }
 

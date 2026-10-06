@@ -4,18 +4,41 @@
 //!
 //! Read off the runtime seams, not written down again: for the GEMV a
 //! fragment's semantics, precision and operand are associated consts of the
-//! `Elementwise`/`Epilogue` impl that already selects its `[[host_name]]`
-//! (`nn::fusion`); for the mixed GEMV, the `MixedEpilogue` arm that selects
-//! its suffix. So the optimizer and the runtime cannot disagree about what a
-//! block does or what it is called.
+//! `Elementwise`/`Epilogue`/`Prologue` impl that already selects its
+//! `[[host_name]]` (`nn::fusion`); for the mixed GEMV, the `MixedEpilogue`
+//! arm that selects its suffix. So the optimizer and the runtime cannot
+//! disagree about what a block does or what it is called.
+//!
+//! A block rides one END of a product ([`Side`]): an epilogue its store, a
+//! prologue its load. A prologue carrying a reduction over `K` says which
+//! tile it needs ([`TileNeed`]), and the derivation reads the product's tile
+//! off the dispatcher's own selection (`lloom_tensor::gemv_tile`). A block
+//! whose measurement is a loss, or whose composition the rules cannot
+//! express, is still catalogued — with the reason, so the derivation refuses
+//! it by name and the remarks can say so.
+//!
+//! [`kernels`] are the other shape: two dispatches an existing kernel that is
+//! not a product computes in one launch.
 
-use crate::nn::fusion::{Epilogue, Operand, OperandKind, Precision, Semantics};
+use crate::nn::fusion::{
+    Epilogue, Operand, OperandKind, Precision, Prologue, PrologueGroupNorm, PrologueNormInline,
+    PrologueRmsNorm, Semantics, TileNeed,
+};
 use lloom_tensor::quantized::gemv_mixed::MixedEpilogue;
 
 use super::ir::Core;
 use super::numeric::{NumericClass, TargetFpModel};
 
-/// One admissible epilogue block.
+/// Which end of a product a block rides, or a seam is at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Side {
+    /// The product's store: the consumer rides the producer product.
+    Store,
+    /// The product's load: the producer rides the consumer product.
+    Load,
+}
+
+/// One block a product kernel instantiates at one of its ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
     /// The name a derivation and an exclusion set refer to it by: the
@@ -39,6 +62,17 @@ pub struct Fragment {
     /// rides its store), under this build. A verdict the exclusion set
     /// records for this fragment counts only under this model (§5a).
     pub model: TargetFpModel,
+    /// The end of the product it rides.
+    pub side: Side,
+    /// The tile it needs of the product (a prologue's reduction over `K`).
+    pub needs: TileNeed,
+    /// Why the derivation never places it, when it must not: a measured
+    /// loss, or a composition its rules cannot express. Refused by name.
+    pub refusal: Option<&'static str>,
+    /// For a prologue, the epilogues the kernel instantiates beside it (the
+    /// prologue alone always): `gemv.metal`'s `_norm`, `_norm_silu`,
+    /// `_norm_swiglu`. Empty for an epilogue.
+    pub composes_with: &'static [&'static str],
 }
 
 impl Fragment {
@@ -49,9 +83,13 @@ impl Fragment {
     /// ([`NumericClass::Rounding`]). A block at store precision would be
     /// bit-exact.
     pub fn class(&self) -> NumericClass {
-        match self.precision {
-            Precision::Accumulator => NumericClass::Rounding,
-            Precision::Store => NumericClass::BitExact,
+        match (self.semantics, self.precision) {
+            // The sum of squares in the K-walk's shuffle tree where the norm
+            // took its own: the same products in another order, a bound that
+            // grows with `K` (and one rounding fewer besides).
+            (Semantics::RmsNorm, _) => NumericClass::ReorderEquiv,
+            (_, Precision::Accumulator) => NumericClass::Rounding,
+            (_, Precision::Store) => NumericClass::BitExact,
         }
     }
 }
@@ -65,6 +103,41 @@ fn describe<E: Epilogue>() -> Fragment {
         operand: <E::Operand as Operand>::KIND,
         scales: false,
         model: TargetFpModel::of_family("gemv").expect("the GEMV's model is declared"),
+        side: Side::Store,
+        needs: TileNeed::Any,
+        refusal: None,
+        composes_with: &[],
+    }
+}
+
+/// A GEMV prologue, read off its `impl Prologue`. The fused node's census
+/// family is `gemv_` + the name, then the epilogue's when one rides too
+/// (`gemv_norm_silu`, the kernels' `_norm` + `_silu` suffixes).
+fn describe_prologue<P: Prologue>(
+    core: Core,
+    refusal: Option<&'static str>,
+    composes_with: &'static [&'static str],
+) -> Fragment {
+    let name = P::SUFFIX.strip_prefix('_').unwrap_or(P::SUFFIX);
+    let family = match core {
+        Core::Mixed => "gemv_mixed",
+        _ => "gemv",
+    };
+    Fragment {
+        name: match core {
+            Core::Mixed => "mixed_gnorm",
+            _ => name,
+        },
+        core,
+        semantics: P::SEMANTICS,
+        precision: P::PRECISION,
+        operand: OperandKind::None,
+        scales: false,
+        model: TargetFpModel::of_family(family).expect("the product's model is declared"),
+        side: Side::Load,
+        needs: P::NEEDS,
+        refusal,
+        composes_with,
     }
 }
 
@@ -89,14 +162,30 @@ fn describe_mixed(e: MixedEpilogue) -> Option<Fragment> {
         operand: OperandKind::None,
         scales: true,
         model: TargetFpModel::of_family("gemv_mixed").expect("the mixed GEMV's model is declared"),
+        side: Side::Store,
+        needs: TileNeed::Any,
+        refusal: None,
+        composes_with: &[],
     })
 }
 
-/// Every epilogue the runtime seams admit: the GEMV's `FusedArm` set
-/// (`EpilogueNone` excluded, being the unfused arm itself) and the mixed
-/// GEMV's `MixedEpilogue` arms (`None` excluded likewise). A new
-/// `impl Epilogue` or `MixedEpilogue` arm is added here, and nowhere else, to
-/// become derivable.
+/// Why the imported-scale norm prologue is never placed.
+pub const RMSNORM_REFUSAL: &str = "a measured loss (fusion.md §12.2a): the reduction stays a \
+     dispatch, and every threadgroup re-applies the transform to the whole input, 216-432x \
+     the work it moves";
+
+/// Why the mixed GEMV's grouped-norm prologue is never placed.
+pub const MIXED_GNORM_REFUSAL: &str = "not expressible: the grouped norm's readers include \
+     hc_collapse, which is not a product; the hand-built arm (QWEN4EXP_HC_NORM_GEMV) has the \
+     collapse read the stream scales `down` writes, a side output no fragment declares \
+     (measured +6.61 % end to end, tuning.md §13.5u)";
+
+/// Every block the runtime seams admit: the GEMV's `FusedArm` epilogues
+/// (`EpilogueNone` excluded, being the unfused arm itself), the mixed GEMV's
+/// `MixedEpilogue` arms (`None` excluded likewise), then the prologues — the
+/// GEMV's inline norm and imported-scale norm, the mixed GEMV's grouped norm.
+/// A new `impl Epilogue`, `impl Prologue` or `MixedEpilogue` arm is added
+/// here, and nowhere else, to become derivable.
 pub fn catalogue() -> Vec<Fragment> {
     use crate::nn::fusion::{Gate, Residual, Silu, Swiglu};
     let mut cat = vec![
@@ -114,7 +203,97 @@ pub fn catalogue() -> Vec<Fragment> {
         .into_iter()
         .filter_map(describe_mixed),
     );
+    cat.push(describe_prologue::<PrologueNormInline>(
+        Core::Gemv,
+        None,
+        &["silu", "swiglu"],
+    ));
+    cat.push(describe_prologue::<PrologueRmsNorm>(
+        Core::Gemv,
+        Some(RMSNORM_REFUSAL),
+        &[],
+    ));
+    cat.push(describe_prologue::<PrologueGroupNorm>(
+        Core::Mixed,
+        Some(MIXED_GNORM_REFUSAL),
+        &["mixed_silu"],
+    ));
     cat
+}
+
+/// The form of a [`KernelFragment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelForm {
+    /// `mul(silu(a), b)` — both operands of one extent — as the kernel
+    /// `silu_mul(a, b)` (`qwen4exp.metal`: `utils.metal`'s `silu<T>` then
+    /// the product, in `T`).
+    SiluMul,
+    /// `into(.., cast(y), ..)` as `into(.., y, ..)`: the kernel `into` is
+    /// instantiated on its operand's type and reads `y` where it is, the
+    /// widening the cast stored done in its load (exact: an f16 is an f32).
+    LoadCast {
+        into: &'static str,
+        /// Which operand of `into` the cast feeds.
+        operand: usize,
+    },
+}
+
+/// Two dispatches an existing kernel that is not a product computes in one
+/// launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelFragment {
+    /// The name a derivation and an exclusion set refer to it by: the
+    /// kernel's `[[host_name]]` for a fused pair (`silu_mul_f16`).
+    pub name: &'static str,
+    /// The kernel family the composition dispatches (`silu_mul`), or the
+    /// consumer it is read through (`moe_combine`).
+    pub family: &'static str,
+    pub form: KernelForm,
+    /// The dtypes the kernel is instantiated at, for the value it reads.
+    pub dtypes: &'static [lloom_tensor::DType],
+    pub class: NumericClass,
+}
+
+/// The kernel fragments: the SwiGLU's activation and product in one launch
+/// (`silu_mul`, one fragment per instantiation, as the f16 routed step's
+/// switch decides the f16 one alone), and the combine reading the routed
+/// output at its own type
+/// (`combine_cast`) — the two compositions the f16 routed step's hand-built
+/// arm runs (`expert-streaming.md` §20.15d).
+///
+/// `silu_mul` is declared `Rounding`, the bound covering both dtypes: at f16
+/// the product rounds the SiLU `silu_f16` would have stored (reassociation
+/// off), so it is the pair bit for bit and the f16 arm's digests were
+/// measured unmoved; at f32 nothing pins the reassociation. `combine_cast` is
+/// exact by construction: an f16 widens to f32 on load as the cast did.
+pub fn kernels() -> Vec<KernelFragment> {
+    use lloom_tensor::DType;
+    vec![
+        KernelFragment {
+            name: "silu_mul_f32",
+            family: "silu_mul",
+            form: KernelForm::SiluMul,
+            dtypes: &[DType::F32],
+            class: NumericClass::Rounding,
+        },
+        KernelFragment {
+            name: "silu_mul_f16",
+            family: "silu_mul",
+            form: KernelForm::SiluMul,
+            dtypes: &[DType::F16],
+            class: NumericClass::Rounding,
+        },
+        KernelFragment {
+            name: "combine_cast",
+            family: "moe_combine",
+            form: KernelForm::LoadCast {
+                into: "moe_combine",
+                operand: 0,
+            },
+            dtypes: &[DType::F16],
+            class: NumericClass::BitExact,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -127,7 +306,7 @@ mod tests {
     #[test]
     fn the_catalogue_is_the_shipped_epilogues_of_both_cores() {
         let cat = catalogue();
-        assert_eq!(cat.len(), 6);
+        assert_eq!(cat.len(), 9);
         assert_eq!(cat[0].name, "silu");
         assert_eq!(cat[0].semantics, Semantics::Silu);
         assert_eq!(cat[0].operand, OperandKind::None);
@@ -161,7 +340,7 @@ mod tests {
         assert_eq!(cat[5].name, "mixed_sigmoid");
         assert_eq!(cat[5].semantics, Semantics::Sigmoid);
         let mixed = TargetFpModel::of_family("gemv_mixed").unwrap();
-        for f in &cat[4..] {
+        for f in &cat[4..6] {
             assert_eq!(
                 (f.core, f.model, f.scales, f.operand, f.class()),
                 (
@@ -175,5 +354,42 @@ mod tests {
                 f.name
             );
         }
+        for f in &cat[..6] {
+            assert_eq!(
+                (f.side, f.needs, f.refusal, f.composes_with.len()),
+                (Side::Store, TileNeed::Any, None, 0)
+            );
+        }
+        // The prologues: the inline norm proposable at a simdgroup-K tile,
+        // in the reorder class; the imported-scale norm and the grouped norm
+        // catalogued with the reason they are refused.
+        assert_eq!(
+            (cat[6].name, cat[6].core, cat[6].side, cat[6].needs, cat[6].class()),
+            (
+                "norm",
+                Core::Gemv,
+                Side::Load,
+                TileNeed::SimdgroupKWalk,
+                NumericClass::ReorderEquiv
+            )
+        );
+        assert_eq!(cat[6].refusal, None);
+        assert_eq!(cat[6].composes_with, ["silu", "swiglu"]);
+        assert_eq!((cat[7].name, cat[7].side), ("rmsnorm", Side::Load));
+        assert_eq!(cat[7].refusal, Some(RMSNORM_REFUSAL));
+        assert_eq!(
+            (cat[8].name, cat[8].core, cat[8].semantics, cat[8].class()),
+            ("mixed_gnorm", Core::Mixed, Semantics::GroupRmsNorm, NumericClass::BitExact)
+        );
+        assert_eq!(cat[8].refusal, Some(MIXED_GNORM_REFUSAL));
+        let k = kernels();
+        assert_eq!(
+            k.iter().map(|k| (k.name, k.class)).collect::<Vec<_>>(),
+            [
+                ("silu_mul_f32", NumericClass::Rounding),
+                ("silu_mul_f16", NumericClass::Rounding),
+                ("combine_cast", NumericClass::BitExact)
+            ]
+        );
     }
 }

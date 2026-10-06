@@ -9,6 +9,9 @@ use crate::kernels::{
 };
 use objc2_metal::MTLSize;
 
+pub use crate::gemv_tile::{gemv_mixed_gnorm_serves, gemv_norm_serves, GEMV_GROUP_NORM_MAX_GROUPS};
+use crate::gemv_tile::{derive_gemv_tile, gemv_tile_dims};
+
 /// Trailing alignment of the packed block, so its length matches the `sizeof`
 /// the kernel sees. Taken from the Rust mirror rather than written as a
 /// literal, and `gemv_params_layout_matches_metal` is what proves that mirror
@@ -98,102 +101,6 @@ fn forced_tile() -> Option<TileConfig> {
     })
 }
 
-/// Issue #492's GEMV-tile arm: pin the `bm` the GEMV path derives from
-/// `out_vec_size`, so **N and the tile stop moving together**.
-///
-/// **Unset is what ships** and selects byte-for-byte what shipped: the override
-/// is read only where the derived `bm` would otherwise be used, and an unset
-/// variable returns `None` before any branch changes.
-///
-/// It exists because `select_tile_config` is **never consulted on this path**
-/// (`call_mlx_gemm` returns into `call_mlx_gemv` before reaching it), so
-/// `LLOOM_383_TILE` — which forces the GEMM tile — cannot reach a GEMV. The
-/// GEMV's tile is derived inline from `out_vec_size`:
-///
-/// ```text
-/// out_vec_size >= 4096  ->  bm8      (256 threads/tgp, 32 outputs/tgp)
-/// else                  ->  bm4      (128 threads/tgp, 16 outputs/tgp)
-/// ```
-///
-/// **That boundary sits inside #488's sweep**, between its N=2048 and N=6144
-/// points — which is exactly where its effect curve bends. So the two steep
-/// small-N points are the only `bm4` points in that sweep, and *"the effect
-/// falls with N"* and *"the effect is larger at `bm4`"* are the same two
-/// observations. A sweep in N alone cannot separate them; this knob is what
-/// makes N the variable with the tile held (`DESIGN.md` §12.2d, issue #492).
-///
-/// Only `bm` is overridable, and deliberately: `bn`/`sm`/`sn`/`tn` are fixed at
-/// `1/1/32/4` for both instantiated decode tiles, and `tm` follows
-/// `out_vec_size < 4`. `bm` is the whole difference between them, so it is the
-/// whole axis.
-///
-/// An unparseable or unknown value **panics** rather than falling back:
-/// `DESIGN.md` §2.4 — an arm that silently ran the baseline is #69's vacuous
-/// determinism run, and the whole point of this knob is to be A/B'd. Engagement
-/// is nonetheless proved from the **kernel name** rather than from the flag, per
-/// that same rule: the tile is in the `[[host_name]]` the census reports.
-fn forced_gemv_bm() -> Option<usize> {
-    crate::tuning::tuning().gemm.gemv_bm
-}
-
-/// The non-transposed GEMV's tile, derived from the two vector lengths.
-///
-/// **Extracted so a test can call it rather than restate it.** Issue #492's
-/// first version of `the_gemv_tile_boundary_is_at_four_thousand_and_ninety_six`
-/// re-implemented this expression inside the test module, and a mutation moving
-/// the production boundary from 4096 to 2048 **survived it** — the test was
-/// checking its own copy. That is §15.1a's VACUOUS class in the check written to
-/// pin the fact, and §15.2 #11b's *"does the fixture vary the axis the code is
-/// parameterised on"* answered the wrong way. One definition, two callers.
-///
-/// Returns `(bm, bn, sm, sn)`. `tm` follows `out_vec_size` at the call site and
-/// `tn` is a constant, so neither is part of the tile decision this names.
-fn derive_gemv_tile(out_vec_size: usize, in_vec_size: usize) -> (usize, usize, usize, usize) {
-    if in_vec_size <= 64 {
-        (1, 1, 8, 4)
-    } else if in_vec_size >= 16 * out_vec_size {
-        (1, 8, 1, 32)
-    } else if out_vec_size >= 4096 {
-        (8, 1, 1, 32)
-    } else {
-        (4, 1, 1, 32)
-    }
-}
-
-/// The non-transposed GEMV's whole tile `(bm, bn, sm, sn, tm, tn)` as
-/// `gemv_dispatch` selects it: [`derive_gemv_tile`], #492's override and the
-/// `tm`/`tn` that follow. One definition for the dispatcher and for
-/// [`gemv_norm_serves`], so a caller's "does the fused kernel serve this
-/// shape" cannot drift from the tile the dispatcher then picks.
-fn gemv_tile(
-    out_vec_size: usize,
-    in_vec_size: usize,
-) -> (usize, usize, usize, usize, usize, usize) {
-    let (bm, bn, sm, sn) = derive_gemv_tile(out_vec_size, in_vec_size);
-    // #492's override, applied AFTER the shipping branch has chosen, so an
-    // unset variable leaves this expression byte-for-byte what it was. It
-    // reaches only the `(4|8, 1, 1, 32)` decode tiles: the `in_vec_size`
-    // branches above pick `bm == 1` shapes whose `bn`/`sm`/`sn` differ, and
-    // substituting `bm` alone there would name a tile that is not
-    // instantiated. Guarded rather than trusted, because the failure mode is
-    // a `LoadFunctionError` at a shape the caller cannot see.
-    let bm = match forced_gemv_bm() {
-        Some(forced) if bn == 1 && sm == 1 && sn == 32 => forced,
-        _ => bm,
-    };
-    let tm: usize = if out_vec_size < 4 { 1 } else { 4 };
-    (bm, bn, sm, sn, tm, 4usize)
-}
-
-/// Whether [`call_mlx_gemv_norm`] serves a non-transposed `[out, in]`
-/// matrix: the tile the dispatcher selects for it is one of the two decode
-/// tiles the inline norm is instantiated at (`bm4`/`bm8 bn1 sm1 sn32 tm4
-/// tn4`). A caller with an unfused path checks this first and takes that
-/// path where it is false, rather than meeting the refusal.
-pub fn gemv_norm_serves(out_vec_size: usize, in_vec_size: usize) -> bool {
-    let (bm, bn, sm, sn, tm, tn) = gemv_tile(out_vec_size, in_vec_size);
-    bn == 1 && sm == 1 && sn == 32 && tn == 4 && tm == 4 && (bm == 4 || bm == 8)
-}
 
 /// The largest `m` `select_tile_config` serves with the 16-row tile
 /// (`TILE_16_32_16_2_2`), inclusive. Measured cheapest of the three
@@ -1022,7 +929,7 @@ fn gemv_dispatch(
         (1usize, bn, sm, sn, 4usize, tn)
     } else {
         // gemv: mat[M_out,K] x vec[K] -> out[M_out]
-        gemv_tile(out_vec_size, in_vec_size)
+        gemv_tile_dims(out_vec_size, in_vec_size)
     };
 
     let dtype_str = match dtype {
@@ -1347,20 +1254,6 @@ pub struct GemvGroupNorm<'a> {
     pub scales: Option<(&'a Buffer, usize)>,
 }
 
-/// The most groups `PrologueGroupNorm`'s threadgroup scratch holds
-/// (`kGroupNormMaxGroups`).
-pub const GEMV_GROUP_NORM_MAX_GROUPS: usize = 8;
-
-/// Whether [`call_mlx_gemv_mixed_gnorm`] serves an `[n_out, k]` matrix with
-/// `groups` groups: the tile `derive_gemv_tile` picks is the one instantiated
-/// (`bm1 bn8 sm1 sn32 tm4`, 256 threads), `k` splits into the groups, and the
-/// groups fit the scratch. A caller checks this and composes otherwise.
-pub fn gemv_mixed_gnorm_serves(n_out: usize, k: usize, groups: usize) -> bool {
-    derive_gemv_tile(n_out, k) == (1, 8, 1, 32)
-        && n_out >= 4
-        && (1..=GEMV_GROUP_NORM_MAX_GROUPS).contains(&groups)
-        && k.is_multiple_of(groups)
-}
 
 /// [`call_mlx_gemv_mixed`] with a grouped RMSNorm of `vec` computed inside it
 /// ([`GemvGroupNorm`]): `out = epilogue(scale · mat · norm(vec))`, one launch
@@ -2074,7 +1967,7 @@ mod tile_config_gate {
             "this test asserts the DEFAULT; it cannot run with the override set"
         );
         assert_eq!(
-            forced_gemv_bm(),
+            crate::gemv_tile::forced_gemv_bm(),
             None,
             "unset must select the derived tile, so every recorded figure \
              belongs to the shipping path (§7.1a)"

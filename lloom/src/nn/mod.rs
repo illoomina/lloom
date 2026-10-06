@@ -26,6 +26,8 @@ pub mod decode;
 pub mod embedding;
 pub mod encoding;
 #[cfg(feature = "metal")]
+pub mod expert_fetch;
+#[cfg(feature = "metal")]
 pub mod expert_prefetch;
 pub mod expert_stream;
 pub mod func;

@@ -31,6 +31,8 @@ pub enum GgmlDType {
     IQ4NL,
     IQ4XS,
     Q2_0,
+    MXFP4,
+    FP8E4M3,
 }
 
 /// The plain matmul-vec kernel a weight kind has.
@@ -108,7 +110,7 @@ const fn kind(
 /// The table, in the enum's order ([`GgmlDType::kind`] indexes it by the
 /// discriminant; a test pins the order).
 #[rustfmt::skip]
-const KINDS: [QuantKind; 23] = [
+const KINDS: [QuantKind; 25] = [
     kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false),
     kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false),
     kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false),
@@ -132,11 +134,13 @@ const KINDS: [QuantKind; 23] = [
     kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true),
     kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true),
     kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false),
+    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some("kernel_get_rows_mxfp4"),   true),
+    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some("kernel_get_rows_fp8_e4m3"), false),
 ];
 
 impl GgmlDType {
     /// Every kind, in the enum's order.
-    pub const ALL: [GgmlDType; 23] = [
+    pub const ALL: [GgmlDType; 25] = [
         GgmlDType::Q4_0,
         GgmlDType::Q4_1,
         GgmlDType::Q5_0,
@@ -160,6 +164,8 @@ impl GgmlDType {
         GgmlDType::IQ4NL,
         GgmlDType::IQ4XS,
         GgmlDType::Q2_0,
+        GgmlDType::MXFP4,
+        GgmlDType::FP8E4M3,
     ];
 
     /// The kind's row of the table.
@@ -323,7 +329,8 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
         | GgmlDType::Q5_0
         | GgmlDType::Q5_1
         | GgmlDType::Q8_0
-        | GgmlDType::Q8_1 => {
+        | GgmlDType::Q8_1
+        | GgmlDType::FP8E4M3 => {
             let nth0 = 8;
             let nth1 = 8;
             let align = 8;
@@ -388,7 +395,7 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let nsg = iq_nsg(dtype);
             (4, 8 * nsg, 4 * nsg)
         }
-        GgmlDType::IQ4NL => {
+        GgmlDType::IQ4NL | GgmlDType::MXFP4 => {
             let nsg = iq_nsg(dtype);
             (4, 8 * nsg, 2 * nsg)
         }
@@ -431,7 +438,9 @@ pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
         // 97.6 → 90.3 µs and the down 75.0 → 66.3 against 2 (8 the same as
         // 4, 1 slower); every arm byte-identical (the row mapping alone).
         GgmlDType::IQ2XS => crate::tuning::tuning().qmv.iq2xs_nsg,
-        GgmlDType::IQ4NL => crate::tuning::tuning().qmv.iq4nl_nsg,
+        // MXFP4 runs the IQ4_NL core over its own block (`lut4_block` in
+        // the kernel), so it shares that core's simdgroup count.
+        GgmlDType::IQ4NL | GgmlDType::MXFP4 => crate::tuning::tuning().qmv.iq4nl_nsg,
         // The IQ2_S core stages its 8 KB grid per threadgroup (P31 (4)); 4
         // amortises the staging over 16 rows as the IQ2_XS core's does.
         GgmlDType::IQ2S => crate::tuning::tuning().qmv.iq2s_nsg,
@@ -475,7 +484,7 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
 fn mv_constant(dtype: GgmlDType) -> Option<(usize, Value)> {
     match dtype {
         GgmlDType::IQ2XS => Some((910, Value::USize(iq_nsg(dtype)))),
-        GgmlDType::IQ4NL => Some((911, Value::USize(iq_nsg(dtype)))),
+        GgmlDType::IQ4NL | GgmlDType::MXFP4 => Some((911, Value::USize(iq_nsg(dtype)))),
         GgmlDType::Q6K => Some((912, Value::USize(q6k_nr0()))),
         GgmlDType::IQ2S => Some((913, Value::USize(iq_nsg(dtype)))),
         // Always supplied (a function naming a constant must be specialised
@@ -581,7 +590,7 @@ fn rows_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
         // `first_row = r0 * N_DST`: one simdgroup of four rows.
         GgmlDType::Q4K => (4, 8, 4),
         // `first_row = (r0 * 2 + sgitg) * 2`: two simdgroups of two rows.
-        GgmlDType::IQ4XS | GgmlDType::IQ4NL => (4, 16, 4),
+        GgmlDType::IQ4XS | GgmlDType::IQ4NL | GgmlDType::MXFP4 => (4, 16, 4),
         // `first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST`: two of four.
         GgmlDType::IQ3S => (4, 16, 8),
         _ => mv_threadgroup(dtype),
@@ -681,7 +690,7 @@ pub fn call_quantized_matmul_mv_t(
     };
 
     // The small-batch arm: `m` activation rows (2..=8) share the weight
-    // read (`kernel_mul_mv_*_rows_impl`, the f32 triple, the five stem
+    // read (`kernel_mul_mv_*_rows_impl`, the f32 triple, the seven stem
     // types it is built for) — `NR1` rows per threadgroup, the grid's
     // second axis over the row groups, at the rows kernel's own geometry; a
     // row is a reordering of the one-row kernel's, not its bits. Elsewhere
@@ -689,12 +698,18 @@ pub fn call_quantized_matmul_mv_t(
     let (name, rows_per_group) = match (triple, dtype, m) {
         (
             GemvTriple::F32F32F32,
-            GgmlDType::Q6K | GgmlDType::Q4K | GgmlDType::IQ4XS | GgmlDType::IQ3S | GgmlDType::IQ4NL,
+            GgmlDType::Q6K
+            | GgmlDType::Q4K
+            | GgmlDType::IQ4XS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4NL
+            | GgmlDType::MXFP4
+            | GgmlDType::FP8E4M3,
             2..=8,
-        // The rows kernels keep the incumbent Q4_K geometry (one simdgroup of
-        // four rows); under the Q4_K rows-a-simdgroup arm (P31 (5)) they
-        // would be dispatched at the other shape, so the two arms do not
-        // compose — the per-row launches instead.
+            // The rows kernels keep the incumbent Q4_K geometry (one simdgroup of
+            // four rows); under the Q4_K rows-a-simdgroup arm (P31 (5)) they
+            // would be dispatched at the other shape, so the two arms do not
+            // compose — the per-row launches instead.
         ) if rows_arm_on() && !(matches!(dtype, GgmlDType::Q4K) && q4k_nr0().is_some()) => {
             let nr1 = if m <= 2 { 2 } else { 4 };
             (format!("{name}_r{nr1}"), nr1)

@@ -361,3 +361,31 @@ fn the_committed_lfm2_geometry_is_the_real_config() -> Result<()> {
     );
     Ok(())
 }
+
+/// The committed MTP sidecar shape is the sidecar's headers, when the
+/// sidecar is on this machine; `LLOOM_BLESS_LISTINGS=1` writes it.
+#[test]
+fn the_committed_mtp_sidecar_shape_is_the_real_headers() -> Result<()> {
+    use lloom::models::qwen4exp::testing::mtp_sidecar_manifest_path;
+    let Some(home) = std::env::var_os("HOME") else {
+        println!("SKIPPED: no HOME");
+        return Ok(());
+    };
+    let sidecar = Path::new(&home).join(".cache/lloom/qwen4exp-mtp-q8.gguf");
+    if !sidecar.exists() {
+        println!("SKIPPED: no MTP sidecar at {}", sidecar.display());
+        return Ok(());
+    }
+    let real = ShapeManifest::from_gguf(std::slice::from_ref(&sidecar), "qwen4exp-mtp-quantize Q8")?;
+    let path = mtp_sidecar_manifest_path();
+    if std::env::var_os("LLOOM_BLESS_LISTINGS").is_some() {
+        real.write(&path)?;
+    }
+    let committed = ShapeManifest::read(&path)?;
+    assert!(
+        real.to_json() == committed.to_json(),
+        "the committed sidecar shape is not {}'s",
+        sidecar.display()
+    );
+    Ok(())
+}

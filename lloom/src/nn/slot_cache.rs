@@ -807,6 +807,44 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, ListLru> {
 mod tests {
     use super::*;
 
+    /// A load beside a running pass takes a slot whose own last reader ran
+    /// before the pass's floor (or has completed), never one written or read
+    /// at or past it, never one routed to in this tick — and is blind to the
+    /// device plan's blanket stamp, which covers the pass the load is for.
+    #[test]
+    fn a_load_beside_a_pass_takes_only_a_slot_whose_readers_ran() {
+        let mut c = ExpertSlots::new(8, 3);
+        let t = c.begin();
+        for s in 0..3u32 {
+            c.install(SlotId(s), ExpertId(s));
+            c.touch(SlotId(s), t);
+        }
+        // Slot 0: read at epoch 9 (past the floor, not complete); slot 1 at
+        // 2 (before it); slot 2 at 5 (past the floor, complete).
+        c.stamp(SlotId(0), Epoch(9));
+        c.stamp(SlotId(1), Epoch(2));
+        c.stamp(SlotId(2), Epoch(5));
+        // The running pass's plan may read every slot.
+        c.plan_read_all(Epoch(9));
+        let t = c.begin();
+        let floor = Epoch(4);
+        // Nothing past the floor complete: slot 1 alone.
+        assert_eq!(
+            c.victim_beside(t, floor, Completed(4), false),
+            Some((SlotId(1), true))
+        );
+        // Slot 1 routed to now: none until epoch 5 completes, then slot 2.
+        c.touch(SlotId(1), t);
+        assert_eq!(c.victim_beside(t, floor, Completed(4), false), None);
+        assert_eq!(
+            c.victim_beside(t, floor, Completed(6), false),
+            Some((SlotId(2), true))
+        );
+        // The blanket stamp is what the other paths read: none of them
+        // would take a slot here.
+        assert_eq!(c.victim_in(t, true, Completed(6)), None);
+    }
+
     #[test]
     fn a_dense_cache_installs_evicts_lru_and_recycles_through_the_quarantine() {
         let mut c = ExpertSlots::new(8, 3);

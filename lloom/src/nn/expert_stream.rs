@@ -4458,6 +4458,66 @@ mod tests {
         let _ = topk;
     }
 
+    /// A device-planned replay (`QWEN4EXP_REPLAY=device`, the fetch arm's
+    /// redo) settles the same token's record again: its experts are counted
+    /// once — at the first settle — and a later token's are counted again.
+    #[test]
+    fn a_device_planned_replay_counts_its_experts_once() {
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::Q8_0);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::Q8_0);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::Q8_0);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let pre = Tensor::new(&[[1u32, 2]], &Device::Cpu).unwrap();
+        for g in streamed.plan(&pre).unwrap() {
+            streamed.ensure(&g).unwrap();
+        }
+        let ids_tok = [1u32, 2, 7];
+        let record = |streamed: &Streamed| -> Vec<u32> {
+            let inner = streamed.inner.lock();
+            let slots = ids_tok
+                .iter()
+                .map(|&i| inner.map.slot_of(i as usize).map_or(0, |s| s as u32));
+            let flags = ids_tok
+                .iter()
+                .map(|&i| inner.map.slot_of(i as usize).is_none() as u32);
+            slots.chain(ids_tok.iter().copied()).chain(flags).collect()
+        };
+        let before = streamed.usage();
+        // The step missed 7: its settle loads it and counts the three.
+        assert!(streamed.settle_host(&record(&streamed)).unwrap());
+        // The replay on the device plan: every expert resident now.
+        streamed.note_replay();
+        assert!(!streamed.settle_host(&record(&streamed)).unwrap());
+        let replayed = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                replayed[i as usize],
+                before[i as usize] + 1,
+                "expert {i} counted once over the settle and its replay"
+            );
+        }
+        // The next token's settle, no replay: counted.
+        assert!(!streamed.settle_host(&record(&streamed)).unwrap());
+        let next = streamed.usage();
+        for &i in &ids_tok {
+            assert_eq!(
+                next[i as usize],
+                before[i as usize] + 2,
+                "expert {i} counted by the next token"
+            );
+        }
+    }
+
     fn streamed_matches_resident(dtype: GgmlDType) {
         let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
         let gate = stacked(e, ff, d, 1.0, dtype);

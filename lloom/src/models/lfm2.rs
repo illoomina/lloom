@@ -4220,6 +4220,8 @@ impl Cache {
     /// first fused step under an `EscapeGuard` (it outlives every pass, so no
     /// plan serves it), and again only if the state's shape or dtype moved.
     fn conv_spare_for(&mut self, layer: usize, state: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        tests::SPARES_TAKEN.with(|n| n.set(n.get() + 1));
         if let Some(s) = self.conv_spare[layer].take() {
             if s.dims() == state.dims() && s.dtype() == state.dtype() && s.is_contiguous() {
                 return Ok(s);
@@ -7998,24 +8000,35 @@ impl ShortConv {
             };
             // A cache that keeps the state writes it into the layer's spare
             // and swaps the two; the batch arm's state is a pool row, copied
-            // into by `set_conv_state`, so it keeps a fresh one.
-            let next = if cache.use_kv_cache && cache.batch_slot().is_none() {
+            // into by `set_conv_state`, so it keeps a fresh one. Asked for
+            // only on the fused arm, and handed back when the step declines:
+            // the unfused step never takes one, so it allocates none a token.
+            let next = if self.conv_fused
+                && !conv_c_fusion_disabled()
+                && cache.use_kv_cache
+                && cache.batch_slot().is_none()
+            {
                 Some(cache.conv_spare_for(block_idx, &state)?)
             } else {
                 None
             };
-            if let Some((conv_out, new_state)) =
-                self.shortconv_fused(&b, &x_proj, &c, &state, next.as_ref())?
-            {
-                if cache.use_kv_cache {
-                    if next.is_some() {
-                        cache.conv_spare[block_idx] = Some(state);
+            match self.shortconv_fused(&b, &x_proj, &c, &state, next.as_ref())? {
+                Some((conv_out, new_state)) => {
+                    if cache.use_kv_cache {
+                        if next.is_some() {
+                            cache.conv_spare[block_idx] = Some(state);
+                        }
+                        cache.set_conv_state(block_idx, new_state)?;
                     }
-                    cache.set_conv_state(block_idx, new_state)?;
+                    // `c` is already applied in the kernel store; only the
+                    // transpose to `[b, seq, hidden]` for `out_proj` remains.
+                    return conv_out.transpose(1, 2)?.contiguous();
                 }
-                // `c` is already applied in the kernel store; only the transpose
-                // to `[b, seq, hidden]` for `out_proj` remains.
-                return conv_out.transpose(1, 2)?.contiguous();
+                None => {
+                    if let Some(spare) = next {
+                        cache.conv_spare[block_idx] = Some(spare);
+                    }
+                }
             }
         }
 
@@ -11300,6 +11313,52 @@ pub mod kv_slot_fuzz {
 mod tests {
     use super::kv_slot_fuzz::*;
     use super::*;
+
+    thread_local! {
+        /// `Cache::conv_spare_for`'s calls on this thread.
+        pub(super) static SPARES_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The unfused `Shuffle` decode step takes no spare state: the spare is
+    /// the fused step's (it writes the next state there and swaps), and a
+    /// step that does not take the fused arm asked for one, zeroed it and
+    /// dropped it — an allocation and a fill a conv layer a token
+    /// (`docs/optimizer-design.md` §10i). Three decode steps of a two-conv-
+    /// layer model on the CPU, where the fused arm never runs: none taken.
+    #[test]
+    fn the_unfused_shuffle_step_takes_no_spare() -> Result<()> {
+        use crate::models::lfm2_testing::Lfm2Tiny;
+        use crate::testing::tiny::{TinyCheckpoint, Weights};
+        let cfg = Config {
+            vocab_size: 64,
+            hidden_size: 64,
+            intermediate_size: 64,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            conv_l_cache: 3,
+            layer_types: vec![LayerType::Conv, LayerType::FullAttention, LayerType::Conv],
+            tie_embedding: true,
+            conv_state: ConvState::Shuffle,
+            conv_fused: false,
+            ..Default::default()
+        };
+        let dev = Device::Cpu;
+        let model = TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+            .with_dtype(DType::F32)
+            .model(&dev)?;
+        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let prompt = Tensor::new(&[1u32, 2, 3], &dev)?.reshape((1, 3))?;
+        model.forward(&prompt, 0, &mut cache)?;
+        let before = SPARES_TAKEN.with(|n| n.get());
+        for pos in 3..6 {
+            let tok = Tensor::new(&[pos as u32], &dev)?.reshape((1, 1))?;
+            model.forward(&tok, pos, &mut cache)?;
+        }
+        let taken = SPARES_TAKEN.with(|n| n.get()) - before;
+        assert_eq!(taken, 0, "spares taken by three unfused decode steps");
+        Ok(())
+    }
 
     /// The trait impls dispatch to the inherent entry points, checked at the
     /// bound rather than at a forward pass.

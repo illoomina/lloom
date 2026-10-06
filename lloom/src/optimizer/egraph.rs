@@ -442,7 +442,10 @@ fn core_of(tag: &str) -> Result<Core> {
 }
 
 /// Rebuilds a [`Graph`] from an extracted term DAG, hash-consing on the
-/// term id so a value shared in the source is shared in the result.
+/// term id so a value shared in the source is shared in the result. A leaf,
+/// a view and an opaque kernel name their source node, and keep its
+/// recurrence mark; the products and the elementwise ops do not, and come
+/// back straight-line (`plan::regions` reads the source for that reason).
 struct Rebuild<'a> {
     source: &'a Graph,
     fragments: &'a [Fragment],
@@ -563,7 +566,9 @@ impl<'a> Rebuild<'a> {
                     ))
                 })?;
                 let s: &Node = self.source.node(src);
-                self.graph.input(&s.name, s.shape.clone(), s.dtype)
+                let id = self.graph.input(&s.name, s.shape.clone(), s.dtype);
+                self.graph.mark_region(id, s.region);
+                id
             }
             "W" => {
                 let name = Self::string(dag, children[0])?;
@@ -577,9 +582,12 @@ impl<'a> Rebuild<'a> {
             }
             "View" => {
                 let name = Self::string(dag, children[0])?;
-                let shape = self.ordinal(dag, children[1], &name)?.shape.clone();
+                let s = self.ordinal(dag, children[1], &name)?;
+                let (shape, region) = (s.shape.clone(), s.region);
                 let x = self.term(dag, children[2])?;
-                self.graph.view(&name, x, shape)
+                let id = self.graph.view(&name, x, shape);
+                self.graph.mark_region(id, region);
+                id
             }
             head if head.starts_with("Gemv") => {
                 let core = core_of(&head["Gemv".len()..])?;
@@ -657,12 +665,14 @@ impl<'a> Rebuild<'a> {
             op if op.starts_with("Op") => {
                 let name = Self::string(dag, children[0])?;
                 let s = self.ordinal(dag, children[1], &name)?;
-                let (shape, dtype) = (s.shape.clone(), s.dtype);
+                let (shape, dtype, region) = (s.shape.clone(), s.dtype, s.region);
                 let mut inputs = Vec::with_capacity(children.len() - 2);
                 for &c in &children[2..] {
                     inputs.push(self.term(dag, c)?);
                 }
-                self.graph.opaque(&name, &inputs, shape, dtype)
+                let id = self.graph.opaque(&name, &inputs, shape, dtype);
+                self.graph.mark_region(id, region);
+                id
             }
             other => {
                 return Err(Error::Msg(format!(

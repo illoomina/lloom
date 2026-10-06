@@ -115,7 +115,7 @@ impl Marginal {
     }
 }
 
-fn elems(shape: &Shape) -> f64 {
+pub(crate) fn elems(shape: &Shape) -> f64 {
     shape
         .0
         .iter()
@@ -128,7 +128,7 @@ fn elems(shape: &Shape) -> f64 {
         .product()
 }
 
-fn bytes(shape: &Shape, dtype: DType) -> f64 {
+pub(crate) fn bytes(shape: &Shape, dtype: DType) -> f64 {
     elems(shape) * dtype.size_in_bytes() as f64
 }
 

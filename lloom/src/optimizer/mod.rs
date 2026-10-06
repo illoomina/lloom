@@ -24,8 +24,10 @@ pub mod egraph;
 pub mod exclusions;
 pub mod fragments;
 pub mod ir;
+pub mod kinds;
 pub mod numeric;
 pub mod plan;
+pub mod remarks;
 pub mod walk;
 
 use lloom_tensor::Result;
@@ -39,6 +41,7 @@ pub use ir::{
 };
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
+pub use remarks::{remarks, remarks_of, Remark, Remarks, Side, Why};
 pub use walk::{walk, walk_at, Visit, Walker};
 
 /// What the derivation may do.

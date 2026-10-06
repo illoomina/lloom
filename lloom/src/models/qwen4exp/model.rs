@@ -2476,7 +2476,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             cache.keep_standing();
             cache.host_plan_passes += 1;
             cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
-            if self.stream_misses() == before {
+            // The arm (`QWEN4EXP_REPLAY=device`): the plan arms after the
+            // first host-planned pass whatever it loaded — in a steady miss
+            // regime no pass is ever miss-free, so the default's switch
+            // never arms and every token is host-planned (48 drains); the
+            // arm puts those tokens on the device plan, their misses
+            // settled and replayed there.
+            if self.stream_misses() == before || replay_on_device() {
                 cache.device_plan_armed = true;
             }
             return Ok(logits);

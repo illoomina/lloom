@@ -2598,43 +2598,26 @@ impl Streamed {
                 back.push(st);
                 continue;
             }
+            // A FREE slot (the quarantined arm's list) or an EMPTY one, never
+            // an eviction: a prediction that displaces what the pool holds
+            // for what it may need is the `io` hint's finding again
+            // (`issue_hint`), and the first form of this — the LRU resident
+            // evicted for a staged expert the usage profile ranked above it
+            // — cost the warm decode +20–29 % (`memory.md` §9.9: ~35
+            // landings and ~95 wasted stagings a token on a pool that
+            // missed nothing). The copy is encoded in the pass's own stream,
+            // ordered after every reader encoded before it.
             let free = if inner.map.quarantined() {
                 inner.map.take_free()
             } else {
-                None
+                match inner.map.victim_in(tick, true, Completed::ALL) {
+                    Some((s, false)) => Some(s),
+                    _ => None,
+                }
             };
-            // A free slot, an empty one, else the LRU resident — evicted
-            // only for an expert the usage profile ranks above it (the
-            // hotlist's prediction is a swap of a colder resident for a
-            // hotter one, never a displacement of what the pool holds for
-            // what it may need: the `io` hint's finding, `issue_hint`).
-            // The copy is encoded in the pass's own stream, ordered after
-            // every reader encoded before it, so the victim's last reader
-            // need not have completed.
-            let s = match free {
-                Some(s) => s,
-                None => match inner.map.victim_in(tick, true, Completed::ALL) {
-                    Some((s, evicted)) => {
-                        if evicted {
-                            let old = inner.map.expert_in(s);
-                            if inner.map.usage[old as usize] >= inner.map.usage[e] {
-                                back.push(st);
-                                continue;
-                            }
-                            debug_assert_eq!(
-                                inner.plans_open, 0,
-                                "H2: an eviction under an open plan"
-                            );
-                            inner.table_set(old, NONE);
-                            self.counters.evictions.fetch_add(1, Ordering::Relaxed);
-                        }
-                        s
-                    }
-                    None => {
-                        back.push(st);
-                        continue;
-                    }
-                },
+            let Some(s) = free else {
+                back.push(st);
+                continue;
             };
             inner.map.install(s, e);
             inner.map.touch(s, tick);
@@ -3556,7 +3539,28 @@ impl ExpertResidency for Streamed {
 
     #[cfg(feature = "metal")]
     fn prefetch_hot(&self) -> Result<()> {
-        self.prefetch_ids(&[])
+        // Only what the pool can land without evicting (`land_predicted`):
+        // the usage profile's top missing experts, as many as there are
+        // free slots — none on a full pool, so the warm path stages nothing.
+        let (missing, planes) = {
+            let inner = self.inner.lock();
+            let free = inner.map.free_slots();
+            if free == 0 {
+                return Ok(());
+            }
+            let mut rest: Vec<u32> = (0..self.n_experts as u32)
+                .filter(|&e| inner.map.slot_of(e as usize).is_none())
+                .collect();
+            rest.sort_by_key(|&e| std::cmp::Reverse(inner.map.usage[e as usize]));
+            rest.truncate(free);
+            let planes = [
+                inner.sources[0].plane_source(),
+                inner.sources[1].plane_source(),
+                inner.sources[2].plane_source(),
+            ];
+            (rest, planes)
+        };
+        self.dispatch_hint(missing, planes)
     }
 
     #[cfg(feature = "metal")]
@@ -4753,39 +4757,48 @@ mod tests {
             &dev,
         )
         .unwrap();
-        // The pool warm with 0..6 on the host plan — two tokens run through
-        // (usage 1 each; 3, 4, 5 used in the latest tick, so never the LRU
-        // victim; each token's slots released by its `down`).
+        // The pool warm with 0..5 on the host plan — one slot of six left
+        // empty (two tokens run through; each token's slots released by its
+        // `down`).
         let xw = x(1, d, 0.25).to_device(&dev).unwrap();
         let _ = run(&pre, &xw, &Tensor::new(&[[0u32, 1, 2]], &dev).unwrap());
-        let _ = run(&pre, &xw, &Tensor::new(&[[3u32, 4, 5]], &dev).unwrap());
-        // The profile: expert 9 the hottest; every other missing one cold.
+        let _ = run(&pre, &xw, &Tensor::new(&[[3u32, 4, 4]], &dev).unwrap());
+        assert_eq!(pre.resident().len(), 5, "{:?}", pre.resident());
+        // The profile: expert 9 the hottest missing one. The hint stages as
+        // many as the pool can land without evicting — one; `staged` counts
+        // the warm's reads through the threads too, so from here.
         pre.inner.lock().map.usage[9] = 50;
-        // The hint stages the six missing (the pool's width); `staged`
-        // counts the warm's reads through the threads too, so from here.
         let staged0 = pre.prefetch_stats().staged;
         pre.prefetch_hot().unwrap();
         let t0 = std::time::Instant::now();
-        while pre.prefetch_stats().staged < staged0 + 6 {
+        while pre.prefetch_stats().staged < staged0 + 1 {
             assert!(
                 t0.elapsed() < std::time::Duration::from_secs(20),
-                "the prefetcher staged {} of 6",
+                "the prefetcher staged {} of 1",
                 pre.prefetch_stats().staged - staged0
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // A token wanting 9 (staged, hot) with 4 and 5 (resident): the plan
-        // lands 9 over one of 0, 1, 2 and maps every expert; the five cold
-        // staged go back.
-        let tok = Tensor::new(&[[9u32, 4, 5]], &dev).unwrap();
+        // A full pool stages nothing: a second hint now adds no request.
+        let issued = pre.prefetch_stats().issued;
+        // A token wanting 9 (staged, hot) with 3 and 4 (resident): the plan
+        // lands 9 in the empty slot and maps every expert.
+        let tok = Tensor::new(&[[9u32, 3, 4]], &dev).unwrap();
         let (slots, rec) = pre.plan_device(&tok).unwrap().expect("a device plan");
         let s = pre.stats();
-        assert_eq!((s.predict_landed, s.predict_wasted), (1, 5), "{s:?}");
+        assert_eq!((s.predict_landed, s.predict_wasted), (1, 0), "{s:?}");
+        assert_eq!(s.evictions, 0, "a prediction never evicts: {s:?}");
         let resident = pre.resident();
         assert_eq!(resident.len(), 6, "{resident:?}");
         assert!(resident.iter().any(|&r| r as usize == 9), "{resident:?}");
+        pre.prefetch_hot().unwrap();
+        assert_eq!(
+            pre.prefetch_stats().issued,
+            issued,
+            "a full pool stages nothing"
+        );
         let r: Vec<u32> = rec.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(&r[3..6], &[9, 4, 5], "the record's ids: {r:?}");
+        assert_eq!(&r[3..6], &[9, 3, 4], "the record's ids: {r:?}");
         assert_eq!(&r[6..9], &[0, 0, 0], "a landed expert is no miss: {r:?}");
         let xs = x(1, d, 0.5).to_device(&dev).unwrap();
         let arm = MoeArm::for_rows(1);

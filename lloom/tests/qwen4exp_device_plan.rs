@@ -130,10 +130,27 @@ fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str, prefetch: bool)
         );
     }
     if prefetch && std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist") {
-        assert!(
-            st.predict_landed + st.predict_wasted > 0,
-            "{tag}: QWEN4EXP_PREDICT=hotlist: nothing was staged for a device plan: {st:?}"
-        );
+        // The prediction lands only in free slots and stages only as many
+        // as there are (`memory.md` §9.9): with spare slots kept free
+        // (`QWEN4EXP_SPARE_SLOTS`, recycled a settle later) it must have
+        // landed; on the in-place arm this pool is full from the prefill
+        // on and the arm must have staged nothing.
+        let spare = std::env::var("QWEN4EXP_SPARE_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if spare > 0 {
+            assert!(
+                st.predict_landed > 0,
+                "{tag}: QWEN4EXP_PREDICT=hotlist with {spare} spare slots: nothing landed: {st:?}"
+            );
+        } else {
+            assert_eq!(
+                (st.predict_landed, st.predict_wasted),
+                (0, 0),
+                "{tag}: QWEN4EXP_PREDICT=hotlist on a full in-place pool staged something: {st:?}"
+            );
+        }
     }
     if std::env::var("QWEN4EXP_MASK").is_ok_and(|v| v == "1") {
         assert!(

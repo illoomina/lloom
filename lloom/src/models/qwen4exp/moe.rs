@@ -37,6 +37,19 @@ pub trait PlanHook {
     fn at_join(&mut self) -> Result<()> {
         Ok(())
     }
+    /// The fetch inside the token (`QWEN4EXP_FETCH=inside`): this pass
+    /// fetches its misses — each layer's slot map and routed experts wait
+    /// on the device for a worker that loads what the router chose.
+    fn fetching(&self) -> bool {
+        false
+    }
+    /// At a fetching layer, after the router and the shared expert: hand
+    /// the worker this layer's routing `ids` and encode the device's wait
+    /// for it (`ExpertResidency::fetch_register`). `false` when nothing was
+    /// encoded (the tier does not fetch).
+    fn fetch_join<R: ExpertResidency>(&mut self, _experts: &R, _ids: &Tensor) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 impl PlanHook for () {}
@@ -273,6 +286,9 @@ impl<R: ExpertResidency> MoeLayer<R> {
         hook: &mut H,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let r = self.prefill_route(x)?;
+        if hook.fetching() {
+            return self.decode_fetched(&r, hook);
+        }
         let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
             let groups = self.experts.plan(&r.ids)?;
             let y = self.routed_groups(&r.x3, &groups)?;
@@ -285,6 +301,34 @@ impl<R: ExpertResidency> MoeLayer<R> {
         let flags = self.mask_flags(&r, &rec)?;
         Ok((
             self.combine(&r, &y, &shared, &sh_logit, flags.as_ref())?,
+            Some(rec),
+        ))
+    }
+
+    /// A fetching step's MoE (`QWEN4EXP_FETCH=inside`,
+    /// `expert-streaming.md` §20.14c): the router, the shared expert, then
+    /// the device's wait for the worker that loads what the router chose
+    /// (`PlanHook::fetch_join`), and only after it the slot map and the
+    /// routed experts — so they read the pool the worker filled. The record
+    /// is settled after the pass as the device plan's is; a flag in it is
+    /// an expert the worker found no slot for, and the step is redone. A
+    /// tier that does not fetch takes the plain device plan.
+    fn decode_fetched<H: PlanHook>(
+        &self,
+        r: &PrefillRouted,
+        hook: &mut H,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let (shared, sh_logit) = self.shared_expert(r)?;
+        hook.fetch_join(&self.experts, &r.ids)?;
+        let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
+            let groups = self.experts.plan(&r.ids)?;
+            let y = self.routed_groups(&r.x3, &groups)?;
+            return Ok((self.combine(r, &y, &shared, &sh_logit, None)?, None));
+        };
+        let y = self.routed_one_group(&r.x3, &slot_ids)?;
+        let flags = self.mask_flags(r, &rec)?;
+        Ok((
+            self.combine(r, &y, &shared, &sh_logit, flags.as_ref())?,
             Some(rec),
         ))
     }

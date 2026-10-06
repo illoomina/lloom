@@ -1153,6 +1153,25 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
         lloom::models::qwen4exp::moe::ready_reorders(),
         lloom::models::qwen4exp::moe::masked_combines(),
     );
+    // The fetch inside the token (`QWEN4EXP_FETCH=inside`): the cache's
+    // steps (this run's) and the worker's counters (the process's).
+    let f = model.fetch_stats();
+    println!(
+        "FETCH run={run} passes={} entries={} exits={} redos={} pre_waits={} mode={} jobs={} missed_layers={} loads={} short={} timeouts={} watch_ms={:.0} serve_ms={:.0}",
+        cache.fetch_passes,
+        cache.fetch_entries,
+        cache.fetch_exits,
+        cache.fetch_redos,
+        cache.fetch_pre_waits,
+        cache.fetch_mode,
+        f.jobs,
+        f.missed_layers,
+        f.loads,
+        f.short,
+        f.timeouts,
+        f.watch_ns as f64 / 1e6,
+        f.serve_ns as f64 / 1e6,
+    );
 }
 
 /// `--driver`: the prompt through `Session::decode` on the blocking arm —

@@ -486,6 +486,23 @@ pub struct Cache {
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
+    /// The fetch inside the token (`QWEN4EXP_FETCH=inside`): whether the
+    /// next decode step fetches its misses (each layer waits on the device
+    /// for the worker that loads them) — on from a fresh cache and from a
+    /// step that missed, off after `fetch_exit` fetching steps in a row
+    /// loaded nothing.
+    pub fetch_mode: bool,
+    /// Fetching steps in a row that loaded nothing.
+    pub fetch_clean: usize,
+    /// Fetching steps run; entries into and exits from the fetching
+    /// regime; fetching steps redone (an expert the worker found no slot
+    /// for); the host waits a fetching step's start took for commands
+    /// still running (none while the previous step's settle waited).
+    pub fetch_passes: u64,
+    pub fetch_entries: u64,
+    pub fetch_exits: u64,
+    pub fetch_redos: u64,
+    pub fetch_pre_waits: u64,
     /// Host nanoseconds in the replays (`redos`) and in the disarmed
     /// host-plan passes (`host_plan_passes`): the miss regime's two pass
     /// kinds, timed only when they run.
@@ -685,6 +702,13 @@ impl Cache {
             device_replays: 0,
             replay_fallbacks: 0,
             host_plan_passes: 0,
+            fetch_mode: false,
+            fetch_clean: 0,
+            fetch_passes: 0,
+            fetch_entries: 0,
+            fetch_exits: 0,
+            fetch_redos: 0,
+            fetch_pre_waits: 0,
             replay_ns: 0,
             host_pass_ns: 0,
             settle_after_first: 0,
@@ -1149,6 +1173,10 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// Spike 0's event (`JoinHook::Wait`), made at first use.
     #[cfg(feature = "metal")]
     spike0: std::sync::OnceLock<Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>>,
+    /// The fetch worker (`JoinHook::Fetch`, `QWEN4EXP_FETCH=inside`), made
+    /// at the first fetching step.
+    #[cfg(feature = "metal")]
+    fetch_lane: std::sync::OnceLock<Option<std::sync::Arc<crate::nn::expert_fetch::FetchLane>>>,
     /// The device plan's settle reads every layer's record back into this
     /// Shared buffer rather than a pool buffer per step (`DESIGN.md` §9.2aa):
     /// grown to the largest record set, kept for the model's life.
@@ -1282,6 +1310,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
             spike0: std::sync::OnceLock::new(),
+            #[cfg(feature = "metal")]
+            fetch_lane: std::sync::OnceLock::new(),
             #[cfg(feature = "metal")]
             settle_dst: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
@@ -1469,13 +1499,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
-    fn decode_variant(&self, pos: usize, device_plan: bool) -> u32 {
+    /// Bit 4: the step fetches its misses (`QWEN4EXP_FETCH=inside`) — the
+    /// shared expert before the routed experts and a wait between, a
+    /// sequence of its own.
+    fn decode_variant(&self, pos: usize, device_plan: bool, fetch: bool) -> u32 {
         let ratio = self.layers.iter().find_map(|l| match &l.mixer {
             Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
             Mixer::Linear(_) => None,
         });
         let block = ratio.is_some_and(|r| (pos + 1).is_multiple_of(r));
-        block as u32 | (device_plan as u32) << 1 | self.prefill_variant(pos, 1) << 2
+        block as u32
+            | (device_plan as u32) << 1
+            | self.prefill_variant(pos, 1) << 2
+            | (fetch as u32) << 4
     }
 
     /// Which of this model's verify-window sequences a window of `t`
@@ -2655,6 +2691,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             return Ok(logits);
         }
+        // The arm (`QWEN4EXP_FETCH=inside`): a fresh cache, or a pool that
+        // is missing, fetches inside the step — each layer waits on the
+        // device for its misses — instead of taking the host plan.
+        #[cfg(feature = "metal")]
+        if self.fetches(cache) {
+            return self.decode_fetching(h, cache, obs, false);
+        }
         // The arm (`QWEN4EXP_PREDICT=hotlist`): before a device-planned
         // token, every layer's tier stages the hotlist's experts not
         // resident; its plan lands them before it maps the pool (#849's D
@@ -2716,6 +2759,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             return Ok(logits);
         }
         cache.settle_after_first += after_first;
+        // The arm (`QWEN4EXP_FETCH=inside`): the step is redone fetching
+        // (its later layers' misses loaded inside it, not one more replay
+        // each), and the steps after it fetch until the pool holds again.
+        #[cfg(feature = "metal")]
+        if self.fetch_ready() {
+            return self.decode_fetching(h, cache, obs, true);
+        }
         let t0 = std::time::Instant::now();
         // The arm (`QWEN4EXP_REPLAY=device`): the plan stays armed through
         // the miss. The settle loaded what the pass missed; the replay runs
@@ -2975,9 +3025,184 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// Whether the fetch arm (`QWEN4EXP_FETCH=inside`) can run on this
+    /// model: every layer's tier fetches (`ExpertResidency::fetch_ready`)
+    /// on a Metal device.
+    fn fetch_ready(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            crate::nn::expert_stream::fetch_on()
+                && self.device().is_metal()
+                && !self.layers.is_empty()
+                && self.layers.iter().all(|l| l.moe().experts().fetch_ready())
+        }
+        #[cfg(not(feature = "metal"))]
+        false
+    }
+
+    /// Whether the next decode step on `cache` fetches its misses: the arm
+    /// ready, and the cache in the fetching regime or not yet armed (a
+    /// fresh cache's first step fetches instead of taking the host plan).
+    fn fetches(&self, cache: &Cache) -> bool {
+        (cache.fetch_mode || !cache.device_plan_armed) && self.fetch_ready()
+    }
+
+    /// The model's fetch worker, made at first use.
+    #[cfg(feature = "metal")]
+    fn fetch_lane(&self) -> Result<Option<std::sync::Arc<crate::nn::expert_fetch::FetchLane>>> {
+        let dev = self.device();
+        let Ok(m) = dev.as_metal_device() else {
+            return Ok(None);
+        };
+        if let Some(l) = self.fetch_lane.get() {
+            return Ok(l.clone());
+        }
+        let t = &crate::tuning::tuning().stream;
+        let lane = crate::nn::expert_fetch::FetchLane::new(
+            m,
+            std::time::Duration::from_micros(t.fetch_poll_us as u64),
+            &t.fetch_qos,
+        )?;
+        Ok(self.fetch_lane.get_or_init(|| Some(lane)).clone())
+    }
+
+    /// The fetch worker's counters (zeros before the first fetching step,
+    /// or off Metal).
+    pub fn fetch_stats(&self) -> crate::nn::expert_stream::FetchStats {
+        #[cfg(feature = "metal")]
+        if let Some(Some(l)) = self.fetch_lane.get() {
+            return l.stats();
+        }
+        crate::nn::expert_stream::FetchStats::default()
+    }
+
+    /// Open a fetching step: every command already committed complete (a
+    /// host wait only when one is still running — the settle before it
+    /// waited for the last step), so the worker may write a slot whose last
+    /// reader ran before now; then each tier's routing slot filled with the
+    /// sentinel the worker tells a new routing from.
+    #[cfg(feature = "metal")]
+    fn fetch_begin(&self, cache: &mut Cache) -> Result<crate::nn::expert_fetch::FetchPass> {
+        let Some(lane) = self.fetch_lane()? else {
+            lloom_tensor::bail!("qwen4exp: a fetching step without a fetch worker")
+        };
+        let m = self.device();
+        let m = m.as_metal_device()?;
+        let clock = m.gpu_clock();
+        let cur = clock.current_epoch();
+        if cur.0 > 0 && !clock.is_complete(lloom_tensor::kernels::metal::Epoch(cur.0 - 1)) {
+            let marker = m.flush_marker()?;
+            m.wait_marker(&marker)?;
+            cache.fetch_pre_waits += 1;
+        }
+        let floor = clock.current_epoch();
+        let topk = self.cfg.n_experts_per_tok;
+        for layer in &self.layers {
+            layer.moe().experts().fetch_prepare(topk)?;
+        }
+        Ok(lane.begin_pass(floor))
+    }
+
+    /// A decode step that fetches its misses (`QWEN4EXP_FETCH=inside`,
+    /// `expert-streaming.md` §20.14c): the device plan with every layer's
+    /// slot map waiting for the worker that loads what the router chose —
+    /// no replay, no host plan. `replay`: the step is a redo of a device
+    /// plan that computed on a missing expert (its settle loaded what it
+    /// saw missing). A fetching step is redone only when the worker found
+    /// no slot for an expert, at most once per layer; past that, the host
+    /// plan once. The regime: on from here, off after `fetch_exit` steps in
+    /// a row that loaded nothing.
+    #[cfg(feature = "metal")]
+    fn decode_fetching<O: ForwardObserver>(
+        &self,
+        h: &Tensor,
+        cache: &mut Cache,
+        obs: &mut O,
+        replay: bool,
+    ) -> Result<Tensor> {
+        if !cache.fetch_mode {
+            cache.fetch_mode = true;
+            cache.fetch_entries += 1;
+            cache.fetch_clean = 0;
+        }
+        let t0 = std::time::Instant::now();
+        // A replay's `h` is already the model's own copy.
+        let owned;
+        let h = if replay {
+            h
+        } else {
+            owned = self.replay_input_owned(h)?;
+            &owned
+        };
+        let bound = self.layers.len().max(1);
+        for attempt in 0..bound {
+            if replay || attempt > 0 {
+                self.note_replay();
+                cache.rewind_window()?;
+                cache.redos += 1;
+                if attempt > 0 {
+                    cache.fetch_redos += 1;
+                }
+            }
+            let before = self.stream_misses();
+            let pass = self.fetch_begin(cache)?;
+            cache.open_window()?;
+            let (logits, records) =
+                self.decode_embed_pass_as(h, cache, obs, RowPlan::Device, true)?;
+            self.replay_read_encoded(h);
+            let records: Vec<(usize, Tensor)> = records
+                .into_iter()
+                .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
+                .collect();
+            let (redo, after_first) = self.settle_records(&records)?;
+            pass.finish();
+            cache.fetch_passes += 1;
+            cache.device_plan_armed = true;
+            cache.armed_through_misses = true;
+            if !redo {
+                cache.keep_standing();
+                if replay || attempt > 0 {
+                    cache.replay_ns += t0.elapsed().as_nanos() as u64;
+                }
+                if self.stream_misses() == before && !replay {
+                    cache.fetch_clean += 1;
+                    if cache.fetch_clean >= fetch_exit() {
+                        cache.fetch_mode = false;
+                        cache.fetch_exits += 1;
+                        cache.armed_through_misses = false;
+                    }
+                } else {
+                    cache.fetch_clean = 0;
+                }
+                return Ok(logits);
+            }
+            cache.settle_after_first += after_first;
+        }
+        cache.replay_fallbacks += 1;
+        self.note_replay();
+        cache.rewind_window()?;
+        cache.redos += 1;
+        cache.open_window()?;
+        let logits = self
+            .decode_embed_pass(h, cache, obs, RowPlan::Host)
+            .map(|(l, _)| l)?;
+        self.replay_read_encoded(h);
+        cache.keep_standing();
+        cache.replay_ns += t0.elapsed().as_nanos() as u64;
+        Ok(logits)
+    }
+
     /// The hook a device-planned decode pass runs at each layer's join
     /// points: nothing, or spike 0's wait (`QWEN4EXP_SPIKE0=wait`).
-    fn join_hook(&self) -> Result<JoinHook> {
+    fn join_hook(&self, fetch: bool) -> Result<JoinHook> {
+        #[cfg(feature = "metal")]
+        if fetch {
+            if let Some(lane) = self.fetch_lane()? {
+                return Ok(JoinHook::Fetch(lane));
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = fetch;
         #[cfg(feature = "metal")]
         if spike0_wait() {
             if let Ok(m) = self.device().as_metal_device() {
@@ -3004,13 +3229,27 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         obs: &mut O,
         plan: RowPlan,
     ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
+        self.decode_embed_pass_as(h, cache, obs, plan, false)
+    }
+
+    /// [`Self::decode_embed_pass`]; `fetch` (a device plan only): every
+    /// layer waits for the fetch worker before its slot map (`JoinHook::Fetch`).
+    fn decode_embed_pass_as<O: ForwardObserver>(
+        &self,
+        h: &Tensor,
+        cache: &mut Cache,
+        obs: &mut O,
+        plan: RowPlan,
+        fetch: bool,
+    ) -> Result<(Tensor, Vec<(usize, WindowPlan)>)> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let device_plan = plan == RowPlan::Device;
+        let fetch = fetch && device_plan;
         let mut records: Vec<(usize, WindowPlan)> = Vec::new();
         let bracket = self.open_pass_variant(
             crate::nn::decode::PassShape::Decode { b: 1 },
-            self.decode_variant(cache.pos, device_plan),
+            self.decode_variant(cache.pos, device_plan, fetch),
         )?;
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
@@ -3034,7 +3273,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                                                                      // and handed to layer l+2's prefetcher: its misses read during
                                                                      // layers l+1 and l+2's mixer, landed at l+2's resolve.
         let hint = decode_hint_on() && !device_plan;
-        let mut join = self.join_hook()?;
+        let mut join = self.join_hook(fetch)?;
         for (l, layer) in self.layers.iter().enumerate() {
             if probe {
                 for k in 0..4 {
@@ -3247,11 +3486,10 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
         if let Ok(m) = self.device().as_metal_device() {
             if m.pass_plans_enabled() {
                 let variant = if seq_len == 1 {
-                    let device_plan = self.device_plan
-                        && plan_on_device()
-                        && !cache.window_open()
-                        && cache.device_plan_armed;
-                    self.decode_variant(cache.pos, device_plan)
+                    let planned = self.device_plan && plan_on_device() && !cache.window_open();
+                    let fetch = planned && self.fetches(cache);
+                    let device_plan = planned && (cache.device_plan_armed || fetch);
+                    self.decode_variant(cache.pos, device_plan, fetch)
                 } else {
                     self.prefill_variant(cache.pos, seq_len)
                 };
@@ -4100,6 +4338,8 @@ impl crate::nn::model::CacheShare for Cache {
 /// a GPU wait on an event the host has already raised. What the hit path
 /// pays for the wait alone, before any host round trip. An instrument
 /// (`QWEN4EXP_SPIKE0=wait`); `Off` compiles to nothing.
+/// Or the fetch inside the token (`QWEN4EXP_FETCH=inside`): each layer
+/// waits for the worker that loads what its router chose.
 enum JoinHook {
     Off,
     #[cfg(feature = "metal")]
@@ -4107,6 +4347,8 @@ enum JoinHook {
         ring: std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>,
         next: u64,
     },
+    #[cfg(feature = "metal")]
+    Fetch(std::sync::Arc<crate::nn::expert_fetch::FetchLane>),
 }
 
 impl super::moe::PlanHook for JoinHook {
@@ -4119,6 +4361,27 @@ impl super::moe::PlanHook for JoinHook {
                 ring.signal(*next);
                 ring.encode_wait(*next)
             }
+            #[cfg(feature = "metal")]
+            JoinHook::Fetch(_) => Ok(()),
+        }
+    }
+
+    fn fetching(&self) -> bool {
+        #[cfg(feature = "metal")]
+        if let JoinHook::Fetch(_) = self {
+            return true;
+        }
+        false
+    }
+
+    fn fetch_join<E: ExpertResidency>(&mut self, experts: &E, ids: &Tensor) -> Result<bool> {
+        match self {
+            #[cfg(feature = "metal")]
+            JoinHook::Fetch(lane) => experts.fetch_register(lane, ids),
+            _ => {
+                let _ = (experts, ids);
+                Ok(false)
+            }
         }
     }
 }
@@ -4130,6 +4393,13 @@ impl super::moe::PlanHook for JoinHook {
 fn replay_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
+}
+
+/// Fetching steps in a row that load nothing before the waits stop
+/// (`QWEN4EXP_FETCH_EXIT`, read once).
+fn fetch_exit() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::tuning::tuning().stream.fetch_exit.max(1))
 }
 
 /// `QWEN4EXP_PREDICT=hotlist` (read once): before a device-planned token

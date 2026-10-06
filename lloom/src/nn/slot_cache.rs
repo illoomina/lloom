@@ -619,6 +619,45 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         best.map(|(s, _)| (SlotId(s as u32), true))
     }
 
+    /// The slot a load beside a running pass takes: the LRU unpinned slot
+    /// not used in `tick` and not in flight whose own last reader or writer
+    /// has run — in an epoch before `floor` (every one of which the caller
+    /// knows complete) or one `completed` covers. The device plan's blanket
+    /// stamp is not read: the caller's pass reads this tier only after the
+    /// load (`expert_stream`'s fetch). An empty slot wins outright unless
+    /// `skip_empty` (the quarantined arm, whose empty slots are held).
+    pub fn victim_beside(
+        &self,
+        tick: Tick,
+        floor: Epoch,
+        completed: Completed,
+        skip_empty: bool,
+    ) -> Option<(SlotId, bool)> {
+        let p = &self.policy;
+        let mut best: Option<(usize, Tick)> = None;
+        for s in 0..self.active {
+            let e = p.last_epoch[s];
+            if p.pinned[s]
+                || p.last_use[s] == tick
+                || p.inflight[s] != 0
+                || !(e < floor || completed.covers(e))
+            {
+                continue;
+            }
+            if self.key_in[s].is_none() {
+                if skip_empty {
+                    continue;
+                }
+                return Some((SlotId(s as u32), false));
+            }
+            match best {
+                Some((_, t)) if t <= p.last_use[s] => {}
+                _ => best = Some((s, p.last_use[s])),
+            }
+        }
+        best.map(|(s, _)| (SlotId(s as u32), true))
+    }
+
     /// The epoch of `slot`'s last GPU reader or writer.
     pub fn reader_epoch(&self, slot: SlotId) -> Epoch {
         self.policy.last_epoch[slot.index()].max(self.policy.plan_epoch)

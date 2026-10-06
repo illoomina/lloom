@@ -624,6 +624,8 @@ impl lloom_tensor::CustomOp2 for HcCollapse {
 /// [`HcCollapse`] over the carry `h` `[.., n·d]` itself, `xn` recomputed in
 /// the kernel from γ (held here: a fourth input) and the per-row stream
 /// `scales` `[.., n]` a grouped-norm GEMV wrote (`docs/tuning.md` §13.5u).
+// The fields are read by the Metal arm only.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) struct HcCollapseScaled {
     pub n: usize,
     pub d: usize,

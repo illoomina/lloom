@@ -1358,9 +1358,8 @@ pub const GEMV_GROUP_NORM_MAX_GROUPS: usize = 8;
 pub fn gemv_mixed_gnorm_serves(n_out: usize, k: usize, groups: usize) -> bool {
     derive_gemv_tile(n_out, k) == (1, 8, 1, 32)
         && n_out >= 4
-        && groups >= 1
-        && groups <= GEMV_GROUP_NORM_MAX_GROUPS
-        && k % groups == 0
+        && (1..=GEMV_GROUP_NORM_MAX_GROUPS).contains(&groups)
+        && k.is_multiple_of(groups)
 }
 
 /// [`call_mlx_gemv_mixed`] with a grouped RMSNorm of `vec` computed inside it

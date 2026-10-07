@@ -18,6 +18,9 @@ const fn tok(content: &'static str, special: bool) -> AddedToken {
 
 /// Qwen3.8-Flash-Next's added tokens, in id order (its `tokenizer.json`,
 /// snapshot `de4b8e4d`).
+/// How many of [`QWEN4EXP_ADDED`] the Qwen3.5 checkpoints carry.
+pub const QWEN3_5_ADDED_COUNT: usize = 26;
+
 pub const QWEN4EXP_ADDED: &[AddedToken] = &[
     tok("<|endoftext|>", true),
     tok("<|im_start|>", true),
@@ -202,6 +205,20 @@ impl TinyTokenizer {
         }
     }
 
+    /// Qwen3.5's added tokens: Qwen3.6-27B's `tokenizer.json` (snapshot
+    /// `6a9e13bd`) carries exactly the first 26 of Qwen4-exp's, in the same
+    /// order (`<|endoftext|>` … `</think>`), and no audio tokens.
+    pub fn qwen3_5() -> Self {
+        Self {
+            added: QWEN4EXP_ADDED
+                .iter()
+                .take(QWEN3_5_ADDED_COUNT)
+                .map(|t| (t.content.to_string(), t.special))
+                .collect(),
+            chat_template: include_str!("templates/qwen3_5.jinja"),
+        }
+    }
+
     /// Ids a model must be able to embed: the bytes and the added tokens.
     pub fn vocab_size(&self) -> usize {
         256 + self.added.len()
@@ -252,7 +269,11 @@ mod tests {
     /// and decodes back; an added token is one id at its place.
     #[test]
     fn the_tokenizer_round_trips_text_and_finds_the_turn_tokens() {
-        for tt in [TinyTokenizer::qwen4exp(), TinyTokenizer::lfm2()] {
+        for tt in [
+            TinyTokenizer::qwen4exp(),
+            TinyTokenizer::qwen3_5(),
+            TinyTokenizer::lfm2(),
+        ] {
             let tk = tokenizers::Tokenizer::from_bytes(tokenizer_json(&tt.added)).unwrap();
             assert_eq!(tk.get_vocab_size(true), tt.vocab_size());
             let ascii: String = (b' '..=b'~').map(char::from).collect();

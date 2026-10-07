@@ -12,6 +12,7 @@ pub mod common;
 pub mod family;
 pub mod lfm2;
 pub mod modes;
+pub mod qwen3_5;
 pub mod qwen4exp;
 pub mod report;
 pub mod serve;
@@ -150,8 +151,10 @@ pub struct Shape {
 pub enum Family {
     /// A safetensors checkpoint directory.
     Lfm2(PathBuf),
-    /// A GGUF's first shard.
+    /// A GGUF's first shard (`general.architecture = qwen4exp`).
     Qwen4Exp(PathBuf),
+    /// A GGUF's first shard (`qwen35` / `qwen35moe`).
+    Qwen3_5(PathBuf),
 }
 
 /// The family from the path: a `.gguf` file, or a directory holding GGUF
@@ -166,6 +169,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     let (f, checkpoint) = family::detect(&path)?;
     Ok(match f.name() {
         "lfm2" => Family::Lfm2(checkpoint),
+        "qwen3_5" => Family::Qwen3_5(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),
     })
 }

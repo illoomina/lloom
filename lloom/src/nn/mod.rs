@@ -24,6 +24,7 @@ mod batched_spec;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
+pub mod decoder;
 pub mod embedding;
 pub mod encoding;
 #[cfg(feature = "metal")]

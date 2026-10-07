@@ -8,7 +8,7 @@
 //! wrong — `served.rs`). `Served` stays the `dyn`-per-request seam; nothing
 //! here is on the token path.
 
-use super::{lfm2, qwen4exp, ModelArgs, Served, Shape};
+use super::{lfm2, qwen3_5, qwen4exp, ModelArgs, Served, Shape};
 #[allow(unused_imports)]
 use anyhow::Context as _;
 use anyhow::{Context, Result};
@@ -148,6 +148,7 @@ pub trait Family: Send + Sync {
 
 pub struct Lfm2Family;
 pub struct Qwen4ExpFamily;
+pub struct Qwen3_5Family;
 
 pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2",
@@ -193,8 +194,73 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
         served after gated runs came back wrong (expert-streaming.md §20.13c)",
 };
 
-/// Every family, in detection order.
-pub static FAMILIES: [&dyn Family; 2] = [&Lfm2Family, &Qwen4ExpFamily];
+pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
+    family: "qwen3_5",
+    profiles: lloom::profile::QWEN3_5,
+    lookahead_max: 1,
+    ring: "by-name: the decoder keeps no standing window, so a forward past an unlearned EOS is not undone",
+    batch: false,
+    prefix_share: false,
+    speculation: &[],
+    model_axes: false,
+    rewind: "none (the generic decoder's first rung keeps no window)",
+    executor_arms: false,
+    kv_quant: &[KvQuant::Off],
+    kv_dtype: "f32",
+    kv_dense: &["f32"],
+    kv_quant_missing: "the reduced stores are built on the attention block but their gates were not run on this family",
+    vision: false,
+    vision_missing: "no vision tower is built for Qwen3.5 (the text path only; its tower is #765's lineage)",
+    eos_gate: false,
+    eos_gate_missing: "its decode kernels (the GDN and attention kernels, the quantized cores) carry no gated variant",
+};
+
+/// Every family, in detection order: the GGUF families read the header's
+/// `general.architecture`, so their order does not matter; LFM2 is a
+/// directory with a `config.json`.
+pub static FAMILIES: [&dyn Family; 3] = [&Lfm2Family, &Qwen3_5Family, &Qwen4ExpFamily];
+
+/// The GGUF checkpoint `path` names — a shard, or a directory of shards —
+/// as the first shard, with its header's `general.architecture`.
+fn gguf_checkpoint(path: &Path) -> Option<(PathBuf, String)> {
+    let first = if path.is_file() {
+        (path.extension().and_then(|e| e.to_str()) == Some("gguf")).then(|| path.to_path_buf())?
+    } else {
+        if !path.is_dir() || path.join("config.json").is_file() {
+            return None;
+        }
+        let mut ggufs: Vec<PathBuf> = std::fs::read_dir(path)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+            .collect();
+        ggufs.sort();
+        // The first shard of a sharded checkpoint, else the only file.
+        ggufs
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.contains("-00001-of-"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| (ggufs.len() == 1).then(|| &ggufs[0]))
+            .cloned()?
+    };
+    // A file whose header does not read (an empty placeholder in a test)
+    // names no architecture; the load reports what is wrong with it.
+    let arch = std::fs::File::open(&first)
+        .ok()
+        .and_then(|mut f| lloom_tensor::quantized::gguf_file::Content::read(&mut f).ok())
+        .and_then(|c| {
+            c.metadata
+                .get("general.architecture")
+                .and_then(|v| v.to_string().ok())
+                .cloned()
+        })
+        .unwrap_or_default();
+    Some((first, arch))
+}
 
 /// The family for `path`, and the checkpoint path its loader takes.
 pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
@@ -207,7 +273,7 @@ pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
         anyhow::bail!("{}: no such model", path.display());
     }
     anyhow::bail!(
-        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp)",
+        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp, Qwen3.5)",
         path.display()
     )
 }
@@ -366,30 +432,10 @@ impl Family for Qwen4ExpFamily {
         "qwen4exp"
     }
     fn detect(&self, path: &Path) -> Option<PathBuf> {
-        if path.is_file() {
-            return (path.extension().and_then(|e| e.to_str()) == Some("gguf"))
-                .then(|| path.to_path_buf());
-        }
-        if !path.is_dir() || path.join("config.json").is_file() {
-            return None;
-        }
-        let mut ggufs: Vec<PathBuf> = std::fs::read_dir(path)
-            .ok()?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
-            .collect();
-        ggufs.sort();
-        // The first shard of a sharded checkpoint, else the only file.
-        ggufs
-            .iter()
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.contains("-00001-of-"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| (ggufs.len() == 1).then(|| &ggufs[0]))
-            .cloned()
+        let (first, arch) = gguf_checkpoint(path)?;
+        // A GGUF whose header names another family is theirs; one with no
+        // header (an empty placeholder in a test) is Qwen4-exp's, as before.
+        (arch.is_empty() || arch == "qwen4exp").then_some(first)
     }
     fn capabilities(&self) -> Capabilities {
         QWEN4EXP_CAPABILITIES
@@ -464,7 +510,9 @@ impl Family for Qwen4ExpFamily {
             ple_cache_rows: model.ple_cache_rows,
             ple: !model.no_ple,
             moe_act: model.moe_act.clone(),
-            mtp: (spec.method == "mtp").then(|| spec.drafter.clone()).flatten(),
+            mtp: (spec.method == "mtp")
+                .then(|| spec.drafter.clone())
+                .flatten(),
             dflash: (spec.method == "dflash").then(|| spec.drafter.clone().unwrap_or_default()),
             spec_k: spec.k,
             hotlist: model.hotlist.clone(),
@@ -478,6 +526,63 @@ impl Family for Qwen4ExpFamily {
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
             kv_precision: qwen_kv_precision(&shape.model.axes)?,
+        })
+    }
+}
+
+impl Family for Qwen3_5Family {
+    fn name(&self) -> &'static str {
+        "qwen3_5"
+    }
+    fn detect(&self, path: &Path) -> Option<PathBuf> {
+        let (first, arch) = gguf_checkpoint(path)?;
+        (arch == lloom::models::qwen3_5::ARCH_DENSE || arch == lloom::models::qwen3_5::ARCH_MOE)
+            .then_some(first)
+    }
+    fn capabilities(&self) -> Capabilities {
+        QWEN3_5_CAPABILITIES
+    }
+    fn resolve(&self, req: &Requested<'_>) -> Result<()> {
+        resolve_common(&QWEN3_5_CAPABILITIES, req)?;
+        let s = &req.shape;
+        if s.speculative.method != "none" && s.speculative.method != "auto" {
+            anyhow::bail!(
+                "speculative.method = {}: qwen3_5 has no speculative body yet (its MTP head is not built)",
+                s.speculative.method
+            );
+        }
+        if req.model.flash_k.is_some() {
+            anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen3_5 has no such arm");
+        }
+        match req.model.experts.as_str() {
+            "stream" | "resident" => {}
+            other => anyhow::bail!("--experts {other}: stream | resident"),
+        }
+        if req.model.cpu && lloom_tensor::tuning::contract().is_fast() {
+            // Nothing to refuse: the CPU runs either regime.
+        }
+        Ok(())
+    }
+    fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
+        let (model, shape) = (req.model, req.shape);
+        qwen3_5::load(qwen3_5::LoadOptions {
+            first_shard: first,
+            tokenizer: model.tokenizer.clone(),
+            cpu: model.cpu,
+            kv_capacity: shape.memory.kv_capacity,
+            readback: shape.decode.readback.arm(),
+            decode: shape.decode.clone(),
+            reuse_prefix: shape.reuse_prefix,
+            warmup: !model.no_warmup,
+            seed_text: shape.seed_text.clone(),
+            model_name: model.model_name.clone(),
+            prefill_tile: shape.decode.prefill.tile,
+            memory_fraction: shape.memory.memory_fraction,
+            mem_sample: shape.mem_sample,
+            executor: shape.executor.clone(),
+            memory: shape.memory.clone(),
+            kv_precision: None,
+            experts: model.experts.clone(),
         })
     }
 }
@@ -518,6 +623,7 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
         "lfm2" => (spec.drafter.is_some()
             || super::common::newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").is_some())
         .then_some("dspark"),
+        "qwen3_5" => None,
         "qwen4exp" => {
             if spec.drafter.is_none() {
                 spec.drafter = std::env::var("HOME")
@@ -717,7 +823,10 @@ mod tests {
         assert_eq!(s.speculative.method, "mtp", "{note}");
         let mut s = auto(2, Some(&drafter));
         resolve_auto_speculation("qwen4exp", &mut s);
-        assert_eq!(s.speculative.method, "none", "the MTP head speculates at one row");
+        assert_eq!(
+            s.speculative.method, "none",
+            "the MTP head speculates at one row"
+        );
         // A directory names a DFlash checkpoint on Qwen4-exp, at one row.
         let dir = std::env::temp_dir().join(format!("lloom-auto-dflash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

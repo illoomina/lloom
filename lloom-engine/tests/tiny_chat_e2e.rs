@@ -23,6 +23,7 @@
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, TinyTokenizer, Weights};
 use serde_json::{json, Value};
@@ -133,6 +134,37 @@ fn qwen4exp_tiny_chats_on_the_cpu_and_metal() {
     let tok = tok.to_str().unwrap();
     let want = bytes(PROMPT);
     let base = ["--tokenizer", tok, "--experts", "resident"];
+    let mut cpu = base.to_vec();
+    cpu.push("--cpu");
+    check(&model, &cpu, &want);
+    #[cfg(feature = "metal")]
+    check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Qwen3.5, both variants: no BOS; the GGUF is detected by its header's
+/// architecture (the family claims `qwen35` / `qwen35moe`, not every GGUF),
+/// the tokenizer sits beside it.
+#[test]
+fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
+    let dir = scratch("qwen3_5");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let want = bytes(PROMPT);
+    let base = ["--tokenizer", tok];
+    let mut cpu = base.to_vec();
+    cpu.push("--cpu");
+    check(&model, &cpu, &want);
+    #[cfg(feature = "metal")]
+    check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir = scratch("qwen3_5_moe");
+    let model = write::<Qwen3_5MoeTiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let base = ["--tokenizer", tok];
     let mut cpu = base.to_vec();
     cpu.push("--cpu");
     check(&model, &cpu, &want);
@@ -1275,7 +1307,10 @@ fn a_streamed_chat_is_the_unstreamed_reply_in_order() {
     let server = Server::start(&model, &["--cpu"]);
     let (status, plain) = server.chat(json!({ "max_tokens": 24 }));
     assert_eq!(status, 200, "{plain}");
-    let want = plain["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let want = plain["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let req = json!({
         "messages": [{ "role": "user", "content": PROMPT }],
         "max_tokens": 24,
@@ -1313,7 +1348,10 @@ fn a_streamed_chat_is_the_unstreamed_reply_in_order() {
         .iter()
         .map(|e| serde_json::from_str(e).unwrap_or_else(|err| panic!("{e:?}: {err}")))
         .collect();
-    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{text}");
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"]["role"], "assistant",
+        "{text}"
+    );
     let last = chunks.last().unwrap();
     assert!(last["choices"][0]["finish_reason"].is_string(), "{last}");
     let got: String = chunks

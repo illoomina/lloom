@@ -7,6 +7,7 @@
 
 use clap::Parser;
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::testing::tiny::{Geometry, TinyFamily, ValueLaw, Weights, Workload, MAX_PROMPT};
 use lloom_fuzz::geometry::{self, Outcome};
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 struct Args {
     #[command(flatten)]
     cli: lloom_fuzz::campaign::Cli,
-    /// `qwen4exp` or `lfm2`.
+    /// `qwen4exp`, `lfm2`, `qwen3_5` or `qwen3_5_moe`.
     #[arg(long, default_value = "qwen4exp")]
     family: String,
     /// The value law of the weights (`hash[:gain]`, `uniform[:half]`,
@@ -86,7 +87,9 @@ fn main() -> anyhow::Result<()> {
     match args.family.as_str() {
         "qwen4exp" => run::<Qwen4ExpTiny>(args),
         "lfm2" => run::<Lfm2Tiny>(args),
-        other => anyhow::bail!("--family {other}: qwen4exp | lfm2"),
+        "qwen3_5" => run::<Qwen3_5Tiny>(args),
+        "qwen3_5_moe" => run::<Qwen3_5MoeTiny>(args),
+        other => anyhow::bail!("--family {other}: qwen4exp | lfm2 | qwen3_5 | qwen3_5_moe"),
     }
 }
 

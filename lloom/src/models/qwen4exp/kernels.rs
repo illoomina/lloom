@@ -8,6 +8,7 @@
 //! `[1, 1, 2560]` elementwise kernels (`design/.dev/serving-catalogue.md`
 //! §0). Each op here takes one block's chain of launches down to one.
 
+use crate::nn::gdn::OutGate;
 use crate::nn::recurrent::PoolLayer;
 use crate::nn::short_conv::{Shift, ShortConv};
 use lloom_tensor::{shape_req, CpuStorage, Layout, Result, Shape, Tensor};
@@ -1356,7 +1357,16 @@ mod tests {
         });
         time("gated_norm", &|| {
             let _ = o
-                .apply_op3_no_bwd(&gamma, &z, &GdnGatedNorm { d, h_v, eps: 1e-6 })
+                .apply_op3_no_bwd(
+                    &gamma,
+                    &z,
+                    &GdnGatedNorm {
+                        d,
+                        h_v,
+                        eps: 1e-6,
+                        gate: OutGate::Sigmoid,
+                    },
+                )
                 .unwrap();
         });
     }
@@ -1576,7 +1586,16 @@ mod tests {
         let gamma = Tensor::full(3.0f32, d, &dev).unwrap();
         let z = Tensor::zeros(h_v * d, f32, &dev).unwrap();
         let out = o
-            .apply_op3_no_bwd(&gamma, &z, &GdnGatedNorm { d, h_v, eps: 0.0 })
+            .apply_op3_no_bwd(
+                &gamma,
+                &z,
+                &GdnGatedNorm {
+                    d,
+                    h_v,
+                    eps: 0.0,
+                    gate: OutGate::Sigmoid,
+                },
+            )
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -1694,6 +1713,7 @@ pub(crate) struct GdnGatedNorm {
     pub d: usize,
     pub h_v: usize,
     pub eps: f32,
+    pub gate: OutGate,
 }
 
 impl lloom_tensor::CustomOp3 for GdnGatedNorm {
@@ -1754,6 +1774,7 @@ impl lloom_tensor::CustomOp3 for GdnGatedNorm {
             metal_bo(s2, l2),
             metal_bo(s3, l3),
             &output,
+            self.gate.is_silu(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
@@ -2587,6 +2608,7 @@ pub(crate) struct GdnChunkEpilogue {
     pub h_v: usize,
     pub eps: f32,
     pub gamma: Tensor,
+    pub gate: OutGate,
 }
 
 impl lloom_tensor::CustomOp2 for GdnChunkEpilogue {
@@ -2656,6 +2678,7 @@ impl lloom_tensor::CustomOp2 for GdnChunkEpilogue {
             metal_bo(gs, gl),
             metal_bo(s2, l2),
             &output,
+            self.gate.is_silu(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
@@ -2969,6 +2992,7 @@ pub(crate) struct GdnGatedNormRows {
     pub d: usize,
     pub h_v: usize,
     pub eps: f32,
+    pub gate: OutGate,
 }
 
 impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
@@ -3028,6 +3052,7 @@ impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
             metal_bo(s2, l2),
             metal_bo(s3, l3),
             &output,
+            self.gate.is_silu(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((

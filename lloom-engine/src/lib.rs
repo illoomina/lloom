@@ -24,6 +24,7 @@ pub mod options;
 #[cfg(feature = "serve")]
 pub mod app;
 pub mod seam;
+pub mod sink;
 pub mod slots;
 pub mod stream;
 

@@ -1263,6 +1263,68 @@ fn eval_events(server: &Server, body: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// A streamed chat completion (`"stream": true`, SSE): the deltas, joined,
+/// are the non-streamed reply, the first chunk names the role, the last one
+/// carries the finish reason, and the stream ends with `[DONE]`. The deltas
+/// are batched by the writer thread (`StreamWriter::start_with_deltas`), so
+/// their count is not the token count; their text is the reply's.
+#[test]
+fn a_streamed_chat_is_the_unstreamed_reply_in_order() {
+    let dir = scratch("sse-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu"]);
+    let (status, plain) = server.chat(json!({ "max_tokens": 24 }));
+    assert_eq!(status, 200, "{plain}");
+    let want = plain["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let req = json!({
+        "messages": [{ "role": "user", "content": PROMPT }],
+        "max_tokens": 24,
+        "stream": true,
+    });
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let body = req.to_string();
+    write!(
+        s,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    s.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, mut rest) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{rest}");
+    let mut text = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).unwrap();
+        if n == 0 {
+            break;
+        }
+        text.push_str(&after[..n]);
+        rest = &after[n + 2..];
+    }
+    let events: Vec<&str> = text
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("data: "))
+        .collect();
+    assert_eq!(events.last(), Some(&"[DONE]"), "{text}");
+    let chunks: Vec<Value> = events[..events.len() - 1]
+        .iter()
+        .map(|e| serde_json::from_str(e).unwrap_or_else(|err| panic!("{e:?}: {err}")))
+        .collect();
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{text}");
+    let last = chunks.last().unwrap();
+    assert!(last["choices"][0]["finish_reason"].is_string(), "{last}");
+    let got: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(got, want, "the streamed deltas, joined, are the reply");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `/eval`'s `enable_thinking` on LFM2: `false` runs the rendering closed by
 /// the end marker, the prompt it reports says so, and a sample decodes; a
 /// value that is not a boolean is a 400.

@@ -478,9 +478,20 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
         let mut first_device_allocated: Option<u64> = None;
-        let mut stamps: Vec<f64> = Vec::new();
+        // One stamp a fragment at most, sized up front: the push never
+        // allocates on the decode thread.
+        let mut stamps: Vec<f64> = Vec::with_capacity(if args.verbose { params.max_tokens + 1 } else { 0 });
         let verbose = args.verbose;
         let device = engine.device().clone();
+        // The terminal write happens on the sink's thread: this callback runs
+        // on the decode thread, where a `write(2)` and the stdout lock per
+        // fragment would sit between the GPU's steps (`sink.rs`).
+        let mut out = crate::sink::FragmentSink::start((), |(), text: &str| {
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(text.as_bytes());
+            let _ = so.flush();
+            true
+        });
         let mut on_fragment = |frag: &str| {
             if first_at.is_none() {
                 first_at = Some(ms(started.elapsed()));
@@ -488,8 +499,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                     first_device_allocated = Some(MemSnapshot::read(&device).device_allocated);
                 }
             }
-            print!("{frag}");
-            let _ = std::io::stdout().flush();
+            out.push(frag);
             if verbose {
                 stamps.push(ms(started.elapsed()));
             }
@@ -499,9 +509,10 @@ pub fn run(args: ChatArgs) -> Result<()> {
             engine.complete_until(&ids, &params, &mut on_fragment)
         } else {
             engine.complete_images_until(&ids, &images, &params, &mut on_fragment)
-        }
-        .context("decoding the turn")?;
+        };
         let elapsed = started.elapsed();
+        out.finish();
+        let decoded = decoded.context("decoding the turn")?;
         println!();
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
@@ -579,7 +590,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         if args.verbose {
             eprintln!(
                 "[first-token: submit {:.2} ms (host encode, no GPU wait) | first fragment {} ms \
-                 (received and detokenized, to stdout); tail after the loop {:.2} ms]",
+                 (received and detokenized, handed to the printer thread); tail after the loop {:.2} ms]",
                 st.ttft_compute_ns as f64 / 1e6,
                 first_at
                     .map(|t| format!("{t:.2}"))

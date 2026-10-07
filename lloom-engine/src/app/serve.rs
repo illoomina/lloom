@@ -36,6 +36,7 @@ use super::template::{
 };
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
+use crate::sink::{DeltaBuffer, DRAIN_PERIOD};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -43,7 +44,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -129,6 +130,10 @@ struct Shared {
     engine: Box<dyn Served>,
     /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
     aborts: Mutex<HashSet<String>>,
+    /// Bumped after every insert into `aborts`: the decode thread's
+    /// per-fragment check reads this atomic and takes the lock only when it
+    /// moved, not every fragment.
+    abort_epoch: AtomicU64,
     server: Server,
     model_name: String,
     /// The sampling defaults a request that names none decodes with (the
@@ -199,6 +204,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let shared = Arc::new(Shared {
         engine,
         aborts: Mutex::new(HashSet::new()),
+        abort_epoch: AtomicU64::new(0),
         server,
         model_name,
         sampling,
@@ -922,8 +928,29 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         StreamKind::Completion => "/v1/completions",
         StreamKind::Chat => "/v1/chat/completions",
     };
-    let sw = StreamWriter::start(ChunkedWriter::start(request, "text/event-stream")?);
     let created = now();
+    // Each drained batch of text becomes one chunk, wrapped on the writer's
+    // thread (`StreamWriter::start_with_deltas`).
+    let wrap = {
+        let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
+        move |text: &str| -> String {
+            let chunk = match kind {
+                StreamKind::Completion => json!({
+                    "id": id, "object": "text_completion", "created": created, "model": model,
+                    "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": null }],
+                }),
+                StreamKind::Chat => json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
+                }),
+            };
+            format!("data: {chunk}\n\n")
+        }
+    };
+    let sw = StreamWriter::start_with_deltas(
+        ChunkedWriter::start(request, "text/event-stream")?,
+        wrap,
+    );
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -934,10 +961,9 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     let started = Instant::now();
     let decoded = {
         let engine = shared.engine.as_ref();
-        let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        // The callback runs on the decode thread: it serialises the chunk and
-        // queues it; the socket write happens on the writer thread. A client
-        // that went away stops the run at the next drained batch.
+        // The callback runs on the decode thread: it hands the text over;
+        // the chunk is built and written on the writer thread. A client that
+        // went away stops the run at the next drained batch.
         run_decode(
             engine,
             &run.prompt_ids,
@@ -947,17 +973,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
                 if sw.client_gone() {
                     return false;
                 }
-                let chunk = match kind {
-                    StreamKind::Completion => json!({
-                        "id": id, "object": "text_completion", "created": created, "model": model,
-                        "choices": [{ "index": 0, "text": frag, "logprobs": null, "finish_reason": null }],
-                    }),
-                    StreamKind::Chat => json!({
-                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{ "index": 0, "delta": { "content": frag }, "finish_reason": null }],
-                    }),
-                };
-                sw.event(&chunk);
+                sw.delta(frag);
                 true
             },
         )
@@ -1410,6 +1426,10 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         let mut pending = String::new();
                         let started = Instant::now();
                         let aborts = &shared.aborts;
+                        let epoch = &shared.abort_epoch;
+                        // The set is consulted on the first fragment and
+                        // again only after an abort was posted (`abort_epoch`).
+                        let mut seen = u64::MAX;
                         let decoded = {
                             let sid = sample_id.clone();
                             // An abort ends the run through the decode seam's own hook,
@@ -1423,7 +1443,15 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                                     }));
                                     pending.clear();
                                 }
-                                !sw.client_gone() && !lock(aborts).contains(&sid)
+                                if sw.client_gone() {
+                                    return false;
+                                }
+                                let now = epoch.load(Ordering::Acquire);
+                                if now != seen {
+                                    seen = now;
+                                    return !lock(aborts).contains(&sid);
+                                }
+                                true
                             })
                         };
                         let decoded = decoded?;
@@ -1498,6 +1526,7 @@ fn handle_abort(shared: &Shared, mut request: Request) -> Result<()> {
     match v.get("sample_id").and_then(Value::as_str) {
         Some(id) => {
             lock(&shared.aborts).insert(id.to_string());
+            shared.abort_epoch.fetch_add(1, Ordering::Release);
             eprintln!("[eval abort requested for {id}]");
             respond_json(request, 200, &json!({ "sample_id": id }))
         }
@@ -1580,26 +1609,85 @@ impl ChunkedWriter {
 /// error is latched and reported by [`Self::client_gone`], which the decode's
 /// callback reads to stop the run; [`Self::finish`] drains the queue, joins
 /// the thread and hands the writer back for the trailer.
+///
+/// **The per-token text does not go through the channel** when the writer
+/// is started with [`Self::start_with_deltas`]: a `send` to the parked writer
+/// is a wake — a syscall — per fragment, and the payload a `format!` and a
+/// `json!` built on the decode thread. The decode thread appends the bare
+/// text to a [`DeltaBuffer`] instead (`sink.rs`: no wait, no syscall, no
+/// allocation once grown), and this thread takes what accumulated every
+/// [`DRAIN_PERIOD`] and wraps it in one event — a delta of several tokens,
+/// which the OpenAI stream allows.
 struct StreamWriter {
     tx: Option<std::sync::mpsc::Sender<String>>,
     gone: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
+    deltas: Option<Arc<DeltaBuffer>>,
+    /// The deltas' wire wrapping, shared with the thread: [`Self::send`]
+    /// wraps what is pending itself so a control event keeps its place.
+    wrap: Option<Wrap>,
+    /// The producer's spill (`DeltaBuffer::push`); only the producer locks it.
+    spill: Mutex<String>,
 }
 
+type Wrap = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 impl StreamWriter {
-    fn start(mut w: ChunkedWriter) -> Self {
+    fn start(w: ChunkedWriter) -> Self {
+        Self::spawn(w, None)
+    }
+
+    /// [`Self::start`] with a delta buffer: [`Self::delta`] hands text over,
+    /// and `wrap` turns each drained batch into its wire event on this
+    /// writer's thread.
+    fn start_with_deltas(
+        w: ChunkedWriter,
+        wrap: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self::spawn(w, Some(Arc::new(wrap)))
+    }
+
+    fn spawn(mut w: ChunkedWriter, wrap: Option<Wrap>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let gone = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&gone);
+        let deltas = wrap.as_ref().map(|_| DeltaBuffer::new());
+        let buf = deltas.clone();
+        let thread_wrap = wrap.clone();
         let thread = std::thread::spawn(move || {
-            let mut err = None;
-            for payload in rx {
+            let mut err: Option<std::io::Error> = None;
+            let mut local = String::with_capacity(4096);
+            let write = |w: &mut ChunkedWriter, payload: &str, err: &mut Option<std::io::Error>| {
                 if err.is_some() {
-                    continue;
+                    return;
                 }
-                if let Err(e) = w.raw(&payload) {
+                if let Err(e) = w.raw(payload) {
                     flag.store(true, Ordering::Release);
-                    err = Some(e);
+                    *err = Some(e);
+                }
+            };
+            // The text that accumulated, as one event. (Text pushed before a
+            // control event reaches the channel ahead of it: `send` takes it.)
+            let mut drain = |w: &mut ChunkedWriter, err: &mut Option<std::io::Error>| {
+                if let (Some(b), Some(wrap)) = (&buf, &thread_wrap) {
+                    if b.take_into(&mut local) {
+                        write(w, &wrap(&local), err);
+                    }
+                }
+            };
+            loop {
+                let next = if buf.is_some() {
+                    rx.recv_timeout(DRAIN_PERIOD)
+                } else {
+                    rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                };
+                match next {
+                    Ok(payload) => write(&mut w, &payload, &mut err),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => drain(&mut w, &mut err),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        drain(&mut w, &mut err);
+                        break;
+                    }
                 }
             }
             (w, err)
@@ -1608,6 +1696,29 @@ impl StreamWriter {
             tx: Some(tx),
             gone,
             thread: Some(thread),
+            deltas,
+            wrap,
+            spill: Mutex::new(String::new()),
+        }
+    }
+
+    /// Hand text to the writer (the decode thread's per-fragment call on a
+    /// writer started with deltas): no wait, no syscall, no allocation.
+    fn delta(&self, text: &str) {
+        if let Some(b) = &self.deltas {
+            b.push(&mut lock(&self.spill), text);
+        }
+    }
+
+    /// Everything handed over so far, wrapped, queued ahead of what comes
+    /// next on the channel. Off the per-token path (a control event).
+    fn queue_pending(&self) {
+        if let (Some(b), Some(wrap), Some(tx)) = (&self.deltas, &self.wrap, &self.tx) {
+            b.flush(&mut lock(&self.spill));
+            let mut text = String::new();
+            if b.take_into(&mut text) {
+                let _ = tx.send(wrap(&text));
+            }
         }
     }
 
@@ -1622,6 +1733,7 @@ impl StreamWriter {
     }
 
     fn send(&self, payload: String) {
+        self.queue_pending();
         if let Some(tx) = &self.tx {
             // A closed receiver means the thread is gone, which `gone` reports.
             let _ = tx.send(payload);
@@ -1636,6 +1748,9 @@ impl StreamWriter {
     /// Drain what is queued, stop the thread, and return the writer with the
     /// first write error, if any.
     fn finish(mut self) -> Result<(ChunkedWriter, Option<std::io::Error>)> {
+        if let Some(b) = &self.deltas {
+            b.flush(&mut lock(&self.spill));
+        }
         drop(self.tx.take());
         let handle = self
             .thread
@@ -1649,6 +1764,9 @@ impl StreamWriter {
 
 impl Drop for StreamWriter {
     fn drop(&mut self) {
+        if let Some(b) = &self.deltas {
+            b.flush(&mut lock(&self.spill));
+        }
         drop(self.tx.take());
         if let Some(h) = self.thread.take() {
             let _ = h.join();
@@ -2189,6 +2307,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let shared = Shared {
         engine,
         aborts: Mutex::new(HashSet::new()),
+        abort_epoch: AtomicU64::new(0),
         server,
         model_name: model_name.clone(),
         sampling,
@@ -2685,5 +2804,54 @@ mod request_processors_tests {
         assert!(refusal(json!({"logit_bias": {"x": 1}})).contains("key `x` is not a token id"));
         assert!(refusal(json!({"logit_bias": {"3": 500}})).starts_with("logit_bias for token 3"));
         assert!(refusal(json!({"logit_bias": [1, 2]})).contains("must be an object"));
+    }
+}
+
+#[cfg(test)]
+mod stream_writer_tests {
+    use super::{ChunkedWriter, StreamWriter};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// A writer into shared memory, so the test reads what the thread wrote.
+    #[derive(Clone, Default)]
+    struct Mem(Arc<Mutex<Vec<u8>>>);
+    impl Write for Mem {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The wire keeps the producer's order: a control event queued before
+    /// text stays before it, text handed over before a control event goes
+    /// out ahead of it (`send` takes it), and text handed over just before
+    /// the run ends is written (`finish` flushes the spill; the writer drains
+    /// once more on its way out, whatever its tick was doing).
+    #[test]
+    fn text_pushed_at_the_end_is_written_after_what_preceded_it() {
+        let mem = Mem::default();
+        let w = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let sw = StreamWriter::start_with_deltas(w, |t: &str| format!("<{t}>"));
+        sw.send("ctl".to_string());
+        sw.delta("a");
+        sw.delta("b");
+        sw.send("mid".to_string());
+        sw.delta("c");
+        let (_w, err) = sw.finish().unwrap();
+        assert!(err.is_none());
+        let out = String::from_utf8(mem.0.lock().unwrap().clone()).unwrap();
+        let body: String = out
+            .split("\r\n")
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
     }
 }

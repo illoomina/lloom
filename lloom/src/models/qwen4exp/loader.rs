@@ -524,6 +524,10 @@ pub fn staging_ring_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
     }
 }
 
+/// Experts per warm group when the MTP head's experts are held resident:
+/// small against the staging ring (a group's planes pass through it whole).
+const MTP_WARM_GROUP: usize = 16;
+
 /// The ring with a prefetcher, and what the prefetcher may hold of it.
 pub const PREFETCH_RING_BYTES: usize = 2 << 30;
 pub const PREFETCH_STAGED_BYTES: usize = 1 << 30;
@@ -1235,8 +1239,13 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         );
         if held.is_some() {
             if let Some(head) = model.mtp_head() {
+                // In groups well under the staging ring: one group of every
+                // expert (2.67 GB for the Q8 head) is past the ring's bytes.
                 let all: Vec<u32> = (0..cfg0.n_experts as u32).collect();
-                let loaded = head.routed().warm(&all)?;
+                let mut loaded = 0usize;
+                for group in all.chunks(MTP_WARM_GROUP) {
+                    loaded += head.routed().warm(group)?;
+                }
                 if loaded != cfg0.n_experts {
                     lloom_tensor::bail!(
                         "the MTP head's experts: {loaded} of {} loaded resident",

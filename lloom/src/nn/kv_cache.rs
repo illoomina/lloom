@@ -33,11 +33,12 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 ///   write needs the per-batch index plan.
 /// - [`RawInterleavedKvCache`] is a CPU-side `Vec<f32>` written from flat slices
 ///   (`write_kv`), not `Tensor`s — a different storage layer entirely.
-/// - LFM2's `QuantKvSlot` pair (`lfm2.rs`): its `append` quantizes and returns
-///   **nothing to attend over** — the kernel (`sdpa_quant`) reads its code /
-///   scale / bias planes directly, so there is no live `(K, V)` view to hand
-///   back. Its `KvSlot` sibling (f16, returns the live prefix) DOES implement
-///   the trait; the quantized arm is the non-fitting shape.
+/// - the quantized slab (`nn::kv_quant::QuantKvSlab`, LFM2's and QSA's): its
+///   `append` quantizes and returns **nothing to attend over** — the kernel
+///   (`sdpa_quant`) reads its code / scale / bias planes directly, so there is
+///   no live `(K, V)` view to hand back. LFM2's `KvSlot` (f16, returns the
+///   live prefix) DOES implement the trait; the quantized arm is the
+///   non-fitting shape.
 ///
 /// Forcing these under `append(k, v) -> Tensor` was the trap the N2 finding
 /// names; they keep their own inherent methods.

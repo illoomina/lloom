@@ -653,11 +653,11 @@ impl DSparkRotary {
 /// # Against `CONTRIBUTING.md` §3.6 / `DESIGN.md` §15.2 #15
 ///
 /// That law names this type: *"`KvCache`, `Norm`, `Rope`, `Attention` should be
-/// traits with concrete impls (`KvSlot`, `QuantKvSlot`, a paged cache, **the
+/// traits with concrete impls (`KvSlot`, the quantized slab, a paged cache, **the
 /// DSpark draft-KV** — all one `KvCache`)"*. **The trait does not exist in the
 /// tree yet** — grepped, there is no `trait KvCache` — and minting the first one
 /// inside a drafter PR would decide a cross-cutting seam for `KvSlot`,
-/// `QuantKvSlot` and the paged cache from the narrowest of its four consumers.
+/// the quantized slab and the paged cache from the narrowest of its four consumers.
 /// That belongs to #602, the live tracker the law points at.
 ///
 /// **What is owed now is the seam, and it is held**: this type is *threaded as a

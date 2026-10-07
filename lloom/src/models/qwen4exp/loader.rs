@@ -793,7 +793,7 @@ impl LoadOptions {
 }
 
 /// §9.5k's fraction, `MemoryBudget::DEFAULT_FRACTION` (0.65) — asserted
-/// equal to it by `memory_fraction_matches_lfm2s`.
+/// equal to it by `memory_fraction_matches_the_budgets`.
 pub const DEFAULT_MEMORY_FRACTION: f64 = 0.65;
 
 /// What a load would hold on the device, from the headers: the resident
@@ -1706,13 +1706,13 @@ mod tests {
         assert_eq!(per(&cfg), 12 * (2 * 2 * (128 + 8) + indexer));
     }
 
-    /// The default fraction is §9.5k's, the one LFM2's budget and the Metal
+    /// The default fraction is §9.5k's, the one `MemoryBudget` and the Metal
     /// admission share.
     #[test]
-    fn memory_fraction_matches_lfm2s() {
+    fn memory_fraction_matches_the_budgets() {
         assert_eq!(
             DEFAULT_MEMORY_FRACTION,
-            crate::models::lfm2::MemoryBudget::DEFAULT_FRACTION
+            crate::nn::memory::MemoryBudget::DEFAULT_FRACTION
         );
     }
 }

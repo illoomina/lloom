@@ -7,6 +7,7 @@
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
+use crate::nn::kv_quant::QuantKvSlab;
 use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
@@ -828,126 +829,11 @@ pub const DEFAULT_KV_CAPACITY: usize = 4096;
 /// bucket allocates exactly what it did before growth existed.
 pub const DEFAULT_KV_BUCKET: usize = 4096;
 
-/// What admission needs that `Config` does not already carry (`DESIGN.md`
-/// §9.5d).
-///
-/// Present on `Config` as an `Option`, defaulting to `None`, so every existing
-/// caller keeps the path it had without naming it — the shape `AttnImpl`,
-/// `KvAppend` and `ConvState` all use (§7.1a).
-#[derive(Debug, Clone, Copy)]
-pub struct MemoryBudget {
-    /// Total weight bytes, from the checkpoint header (§5.5).
-    ///
-    /// Taken as a number rather than read here: the model's weights are loaded
-    /// through a `VarBuilder` whose backing store this type cannot see, and a
-    /// text-only request legitimately drops the 0.86 GB vision tower (#162).
-    /// The caller knows which; this does not.
-    ///
-    /// **This field is the one admission cannot check on its own, and §9.5m
-    /// (#244) is the check that it is right.** A caller passing the language
-    /// figure for a load that also brings the tower under-predicts by 0.825 GB,
-    /// and §3.5 reports no overrun — so the error is silent. `weight_tolerance`
-    /// is what governs when the divergence is reported.
-    pub weight_bytes: usize,
-    /// Concurrent sequences. Every measurement in this project is B=1 (§13.2).
-    pub batch: usize,
-    /// Fraction of `recommendedMaxWorkingSetSize` this process may claim.
-    ///
-    /// **0.65 is §9.5k's table value and not a measurement.** No evidence
-    /// chooses it; it is a default that is visible and settable for that
-    /// reason.
-    pub fraction: f64,
-    /// How far `weight_bytes` may diverge from what was allocated before
-    /// §9.5m's reconciliation reports it (#244).
-    ///
-    /// **256 MB by default, and it is a bound on the unaccounted rather than a
-    /// round number.** #162 measured the whole attributable non-weight residual
-    /// at 42 MB — the RoPE `cos`/`sin` tables at 16.4 MB plus KV, conv state and
-    /// activations — so the default clears that by ~6×, while the vision tower
-    /// it exists to catch is 3.2× larger than the tolerance. A caller that knows
-    /// its own load better may tighten it.
-    pub weight_tolerance: usize,
-    /// **The longest single forward pass this process will run** — #306.
-    ///
-    /// `1` is decode and is the default. A caller that prefills a `P`-token
-    /// prompt in one pass must set this to `P`; a caller that **chunks** its
-    /// prefill sets it to the chunk size, which is the whole mechanism by
-    /// which chunking makes a long prompt admissible (§13.2b).
-    ///
-    /// # Why this is not inferable, and why the default is 1
-    ///
-    /// **Admission runs once, at the head of `Cache::new_with`, before any
-    /// forward pass** (§9.5d) — so no `seq_len` exists to read, and the prompt
-    /// length is the caller's knowledge arriving later. Defaulting to
-    /// `max_position_embeddings` would refuse essentially every configuration,
-    /// which is §8.1g's failure and the one the admitted arm exists to catch;
-    /// defaulting to 1 leaves every existing verdict **exactly** where it was
-    /// and lets a prefilling caller opt in.
-    ///
-    /// # The limit, stated rather than hidden
-    ///
-    /// A caller that prefills and does not set this gets the pre-#306
-    /// behaviour — which is the behaviour that admitted a configuration
-    /// peaking at **30.5 GB with 77 MB of host memory free** (§13.4c). **What
-    /// #306 buys is that the figure is expressible and checked, not that an
-    /// unwitting caller is safe.** §9.5m's weight term has the same shape and
-    /// the same honest limit: the contract is checkable and the caller still
-    /// has to state it.
-    pub max_seq_len: usize,
-    /// The rows the activation class is computed for — `None` = `batch`
-    /// (every row its own forward); `Some(1)` for the batched serving loop,
-    /// whose step is one ragged forward over every row's tokens
-    /// (`admission::Budget::activation_rows`, issue #148). KV and conv state
-    /// are per row either way.
-    pub activation_rows: Option<usize>,
-}
+/// The admission budget a caller declares (`nn::memory::MemoryBudget`);
+/// re-exported here because every LFM2 caller names it through this module.
+pub use crate::nn::memory::MemoryBudget;
 
-impl MemoryBudget {
-    /// The fraction §9.5k's residual table is computed at.
-    ///
-    /// Duplicated from `admission::DEFAULT_BUDGET_FRACTION` rather than
-    /// referenced, because this type exists on every backend and that constant
-    /// is Metal-only. The two are asserted equal by
-    /// `default_fraction_matches_admissions` under the `metal` feature, so the
-    /// copy cannot drift — which is §8.1b's checked-registry argument at the
-    /// smallest possible scale.
-    pub const DEFAULT_FRACTION: f64 = 0.65;
-
-    /// §9.5m's default tolerance for the weight reconciliation (#244).
-    ///
-    /// Duplicated from `admission::WEIGHT_RECONCILE_TOLERANCE` for the same
-    /// reason `DEFAULT_FRACTION` is — this type exists on every backend and
-    /// that constant is Metal-only — and asserted equal by
-    /// `default_weight_tolerance_matches_admissions` under the `metal` feature,
-    /// so the copy cannot drift.
-    pub const DEFAULT_WEIGHT_TOLERANCE: usize = 256 * 1_000_000;
-
-    /// A B=1 budget at §9.5k's fraction, for a model whose weights are
-    /// `weight_bytes`.
-    pub fn new(weight_bytes: usize) -> Self {
-        Self {
-            weight_bytes,
-            batch: 1,
-            fraction: Self::DEFAULT_FRACTION,
-            weight_tolerance: Self::DEFAULT_WEIGHT_TOLERANCE,
-            // Decode. #306: see the field's own doc comment for why this is 1
-            // and not `max_position_embeddings`.
-            max_seq_len: 1,
-            activation_rows: None,
-        }
-    }
-
-    /// The same budget, told the longest forward pass it will be asked for.
-    ///
-    /// A single-shot prefill of `P` tokens passes `P`; a chunked one passes
-    /// its **chunk size** (§13.2b, §4.1).
-    pub fn with_prefill(mut self, seq_len: usize) -> Self {
-        self.max_seq_len = seq_len;
-        self
-    }
-}
-
-/// Report a weight-term divergence §9.5m has detected (#244).
+/// Report a weight-term divergence §9.5m has detected.
 ///
 /// **Reported on `stderr` rather than returned as an error**, and the choice is
 /// argued rather than defaulted. By the time this fires every caller has already
@@ -1737,220 +1623,6 @@ type KvSlot = crate::nn::slab::Slab;
 
 fn kv_slot(capacity: usize) -> KvSlot {
     crate::nn::slab::Slab::new(2, capacity, crate::nn::slab::Grow::Fixed, zs::LFM2_KV_SLAB)
-}
-
-/// One attention layer's K or V, stored as integer codes plus a (scale, bias)
-/// pair per head vector (`DESIGN.md` §10.7, issue #218).
-///
-/// **The quantized sibling of [`KvSlot`], and it preserves that type's three
-/// properties** (§6.2b): there is no `cat`, the write is constant-size, and the
-/// buffer identity does not change — the planes are allocated once at capacity
-/// and written at a moving offset, exactly as `all_data` is.
-///
-/// # The layout, and why the scales are a separate plane
-///
-/// ```text
-/// codes   [B, H, capacity, D]   u8   (int8: 1 code/elem; int4: 2 codes/byte)
-/// scales  [B, H, capacity]      f16  one per (head, token) — the group IS the
-/// biases  [B, H, capacity]      f16  head vector, since gs == head_dim == 64
-/// ```
-///
-/// §17 item 18(c) and §10.7a: interleaving the scale beside each head vector
-/// breaks `sdpa_vector`'s contiguous walk, which §9.1d records as a
-/// *requirement* rather than a preference — `head_dim × dtype` is one 128 B
-/// cache line at f16, and a dim-outer order scatters a token's vector across 64
-/// lines. A parallel plane preserves it.
-///
-/// # Determinism
-///
-/// A scale is computed once at write time and only read thereafter, so it sits
-/// **outside** the per-token reduction §2.3.3 #1 governs — §16 #6 and §10.7a
-/// both record that **int8 KV needs no determinism variant tier**, and that is
-/// why this type adds no arm to `.bench/configurations.md`'s determinism
-/// column. The digests move because the *values* differ (a tier-2 arm in
-/// §2.3.3c's terms), not because the order does.
-#[derive(Debug, Clone)]
-struct QuantKvSlot {
-    /// `[B, H, capacity, D]` codes, packed. `None` until the first append,
-    /// because the batch size is not known at `Cache::new` — `KvSlot`'s reason.
-    codes: Option<Tensor>,
-    scales: Option<Tensor>,
-    biases: Option<Tensor>,
-    /// The `SdpaQuantParams` block, rebuilt per step because `n` moves.
-    ///
-    /// A caller-owned buffer rather than `setBytes` scalars, so this family is
-    /// ICB-encodable from the first commit (`DESIGN.md` §3.7c, §11.3l finding
-    /// 3): a params buffer allocated per call makes ICB coverage zero, because
-    /// a command binds a buffer by identity at encode time.
-    params: Option<Tensor>,
-    len: usize,
-    capacity: usize,
-    quant: KvQuant,
-    /// The plane geometry, recorded by `ensure` so a grow can re-lay the
-    /// planes at a wider stride without a source tensor in hand.
-    b_sz: usize,
-    n_heads: usize,
-    head_dim: usize,
-}
-
-impl QuantKvSlot {
-    fn new(capacity: usize, quant: KvQuant) -> Self {
-        Self {
-            codes: None,
-            scales: None,
-            biases: None,
-            params: None,
-            len: 0,
-            capacity,
-            quant,
-            b_sz: 0,
-            n_heads: 0,
-            head_dim: 0,
-        }
-    }
-
-    /// Bytes the three planes hold. Zero before the first append.
-    fn bytes(&self) -> usize {
-        [&self.codes, &self.scales, &self.biases]
-            .into_iter()
-            .flatten()
-            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .sum()
-    }
-
-    /// Widen the planes to `capacity` tokens, keeping every position where it
-    /// is — `KvSlot::grow_to`'s contract on three planes.
-    ///
-    /// The planes are flat and `capacity` is their row stride (`[B, H,
-    /// capacity, D]` codes, `[B, H, capacity]` scales and biases), so the copy
-    /// is per `(batch, head)` row: each old row lands at the head of the
-    /// wider row it now has, which is one `copy2d` per plane through a
-    /// two-dimensional view of the same bytes. Positions above `len` are
-    /// carried too; they are unreachable either way.
-    fn grow_to(&mut self, capacity: usize) -> Result<()> {
-        if capacity <= self.capacity {
-            return Ok(());
-        }
-        if let Some(codes) = self.codes.as_ref() {
-            let rows = self.b_sz * self.n_heads;
-            let row = |cap: usize| -> Result<usize> {
-                self.quant
-                    .code_bytes(cap * self.head_dim)
-                    .ok_or_else(|| lloom_tensor::Error::msg("QuantKvSlot::grow_to on the Off arm"))
-            };
-            let (old_row, new_row) = (row(self.capacity)?, row(capacity)?);
-            let old = codes.reshape((rows, old_row))?;
-            let grown = zs::zeros(
-                zs::LFM2_KV_QUANT,
-                (rows, new_row),
-                DType::U8,
-                codes.device(),
-            )?;
-            grown.slice_set(&old, 1, 0)?;
-            self.codes = Some(grown.reshape(rows * new_row)?);
-            for plane in [&mut self.scales, &mut self.biases] {
-                if let Some(p) = plane.as_ref() {
-                    let old = p.reshape((rows, self.capacity))?;
-                    let grown =
-                        zs::zeros(zs::LFM2_KV_QUANT, (rows, capacity), p.dtype(), p.device())?;
-                    grown.slice_set(&old, 1, 0)?;
-                    *plane = Some(grown.reshape(rows * capacity)?);
-                }
-            }
-        }
-        self.capacity = capacity;
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.len = 0;
-        self.codes = None;
-        self.scales = None;
-        self.biases = None;
-        self.params = None;
-    }
-
-    /// Discard the last `count` appended positions.
-    ///
-    /// `KvSlot::rewind`'s contract exactly (§10.2a): a length decrement and
-    /// nothing else. The discarded codes sit above `len` and no kernel can
-    /// address them, and the allocation is deliberately not touched.
-    fn rewind(&mut self, count: usize) -> Result<()> {
-        if count > self.len {
-            lloom_tensor::bail!(
-                "lfm2 quantized KV rewind past the start: {count} > len {}",
-                self.len
-            )
-        }
-        self.len -= count;
-        Ok(())
-    }
-
-    /// Allocate the three planes on first use.
-    fn ensure(
-        &mut self,
-        b_sz: usize,
-        n_heads: usize,
-        head_dim: usize,
-        device: &Device,
-    ) -> Result<()> {
-        if self.codes.is_some() {
-            return Ok(());
-        }
-        let code_bytes = self
-            .quant
-            .code_bytes(b_sz * n_heads * self.capacity * head_dim)
-            .ok_or_else(|| lloom_tensor::Error::msg("QuantKvSlot::ensure on the Off arm"))?;
-        // A u8 plane rather than a typed one: the packing is the kernel's, and
-        // a `Tensor` of the code width does not exist at int4 anyway.
-        self.codes = Some(zs::zeros(zs::LFM2_KV_QUANT, code_bytes, DType::U8, device)?);
-        let scale_els = b_sz * n_heads * self.capacity;
-        self.scales = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
-        self.biases = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
-        self.b_sz = b_sz;
-        self.n_heads = n_heads;
-        self.head_dim = head_dim;
-        Ok(())
-    }
-
-    /// Quantize `src` and append it, advancing `len`.
-    fn append(&mut self, src: &Tensor) -> Result<()> {
-        let (b_sz, n_heads, seq_len, head_dim) = src.dims4()?;
-        if self.len + seq_len > self.capacity {
-            lloom_tensor::bail!(
-                "lfm2 quantized KV cache exhausted: {} + {} > capacity {}",
-                self.len,
-                seq_len,
-                self.capacity
-            )
-        }
-        self.ensure(b_sz, n_heads, head_dim, src.device())?;
-
-        let bits = match self.quant {
-            KvQuant::Off => lloom_tensor::bail!("QuantKvSlot::append on the Off arm"),
-            KvQuant::Int8 => 8usize,
-            KvQuant::Int4 => 4usize,
-        };
-        let _ = bits;
-        // **The params block is built by the metal side, not hand-packed
-        // here.** An earlier draft wrote the struct as a `&[u32]` with manual
-        // padding, which is precisely the class §11.3k's layout check exists to
-        // catch: a field at the wrong offset does not crash, it reads a
-        // well-formed number from the wrong place. `write_params` fills a
-        // caller-owned buffer through the same `SdpaQuantWriteParams` the
-        // kernel reads and the layout test pins.
-        crate::nn::ops::quantize_kv_into(
-            src,
-            self.codes.as_ref().unwrap(),
-            self.scales.as_ref().unwrap(),
-            self.biases.as_ref().unwrap(),
-            self.capacity,
-            self.len,
-            self.quant,
-        )?;
-        self.len += seq_len;
-        Ok(())
-    }
 }
 
 // The `seam::KvCache` impl for LFM2's in-place slot pair
@@ -3157,12 +2829,13 @@ pub struct State<P: Profile> {
     // Held beside `kvs` rather than replacing it so that both arms stay
     // compiled and the unselected one allocates nothing.
     kv_slots: Vec<(KvSlot, KvSlot)>,
-    /// The `KvQuant` arm's storage, one (K, V) pair per layer.
+    /// The `KvQuant` arm's storage, one K + V slab per layer
+    /// (`nn::kv_quant`, the block Qwen4-exp's QSA stores through too).
     ///
     /// Held beside `kv_slots` rather than replacing it, so both arms stay
     /// compiled and the unselected one allocates nothing -- `kv_slots`' own
     /// argument, one axis further out.
-    quant_slots: Vec<(QuantKvSlot, QuantKvSlot)>,
+    quant_slots: Vec<QuantKvSlab>,
     /// The `KvAppend::Paged` arm's storage: the page tables, the epoch
     /// quarantine and one (K, V) pool per attention layer.
     #[cfg(feature = "metal")]
@@ -3889,10 +3562,9 @@ impl<P: Profile> State<P> {
                 .collect(),
             quant_slots: (0..num_layers)
                 .map(|_| {
-                    (
-                        QuantKvSlot::new(slab, config.kv_quant),
-                        QuantKvSlot::new(slab, config.kv_quant),
-                    )
+                    QuantKvSlab::fixed(config.kv_quant, slab)
+                        .scales_at(DType::F16)
+                        .at_site(zs::LFM2_KV_QUANT)
                 })
                 .collect(),
             #[cfg(feature = "metal")]
@@ -4349,7 +4021,7 @@ impl<P: Profile> State<P> {
             lloom_tensor::bail!("lfm2 kv_bucket must be at least one token")
         }
         let allocated = self.kv_slots.iter().any(|(k, _)| k.is_allocated())
-            || self.quant_slots.iter().any(|(k, _)| k.codes.is_some());
+            || self.quant_slots.iter().any(|s| s.is_allocated());
         if allocated {
             lloom_tensor::bail!(
                 "lfm2 with_kv_bucket: the slab is already allocated; set the bucket before \
@@ -4390,8 +4062,8 @@ impl<P: Profile> State<P> {
             return self
                 .quant_slots
                 .iter()
-                .find(|(k, _)| k.codes.is_some())
-                .map(|(k, _)| k.len)
+                .find(|s| s.is_allocated())
+                .map(|s| s.len())
                 .unwrap_or(0);
         }
         match self.kv_append {
@@ -4427,10 +4099,7 @@ impl<P: Profile> State<P> {
     /// The KV slab's state, for a run's memory report.
     pub fn kv_report(&self) -> KvReport {
         let bytes = if self.kv_quant.is_on() {
-            self.quant_slots
-                .iter()
-                .map(|(k, v)| k.bytes() + v.bytes())
-                .sum()
+            self.quant_slots.iter().map(|s| s.bytes()).sum()
         } else {
             match self.kv_append {
                 KvAppend::Cat => self
@@ -4612,9 +4281,8 @@ impl<P: Profile> State<P> {
     pub(crate) fn apply_grow(&mut self, plan: &GrowPlan) -> Result<()> {
         let slab = plan.slab;
         if self.kv_quant.is_on() {
-            for (k, v) in self.quant_slots.iter_mut() {
-                k.grow_to(slab)?;
-                v.grow_to(slab)?;
+            for s in self.quant_slots.iter_mut() {
+                s.grow_to(slab)?;
             }
         } else {
             match self.kv_append {
@@ -4651,9 +4319,8 @@ impl<P: Profile> State<P> {
             k.set_capacity(slab);
             v.set_capacity(slab);
         }
-        for (k, v) in self.quant_slots.iter_mut() {
-            k.capacity = slab;
-            v.capacity = slab;
+        for s in self.quant_slots.iter_mut() {
+            s.set_capacity(slab);
         }
         let mut slab = slab;
         #[cfg(feature = "metal")]
@@ -4706,16 +4373,7 @@ impl<P: Profile> State<P> {
         let extra = slab.saturating_sub(self.kv_slab);
         let elem = |t: &Tensor| t.dtype().size_in_bytes();
         let per_token: usize = if self.kv_quant.is_on() {
-            self.quant_slots
-                .iter()
-                .flat_map(|(k, v)| [k, v])
-                .filter(|s| s.codes.is_some())
-                .map(|s| {
-                    let rows = s.b_sz * s.n_heads;
-                    rows * s.quant.code_bytes(s.head_dim).unwrap_or(0)
-                        + 2 * rows * DType::F16.size_in_bytes()
-                })
-                .sum()
+            self.quant_slots.iter().map(|s| s.bytes_per_token()).sum()
         } else {
             match self.kv_append {
                 KvAppend::InPlace => self
@@ -5101,10 +4759,7 @@ impl<P: Profile> State<P> {
             k.reset();
             v.reset();
         });
-        self.quant_slots.iter_mut().for_each(|(k, v)| {
-            k.reset();
-            v.reset();
-        });
+        self.quant_slots.iter_mut().for_each(|s| s.reset());
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
             p.release_all();
@@ -5224,12 +4879,11 @@ impl<P: Profile> State<P> {
             k_slot.rewind(n)?;
             v_slot.rewind(n)?;
         }
-        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
-            if k_slot.codes.is_none() {
+        for s in self.quant_slots.iter_mut() {
+            if !s.is_allocated() {
                 continue;
             }
-            k_slot.rewind(n)?;
-            v_slot.rewind(n)?;
+            s.rewind(n)?;
         }
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
@@ -5487,12 +5141,11 @@ impl<P: Profile> State<P> {
             k_slot.rewind(n)?;
             v_slot.rewind(n)?;
         }
-        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
-            if k_slot.codes.is_none() {
+        for s in self.quant_slots.iter_mut() {
+            if !s.is_allocated() {
                 continue;
             }
-            k_slot.rewind(n)?;
-            v_slot.rewind(n)?;
+            s.rewind(n)?;
         }
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
@@ -5676,12 +5329,11 @@ impl<P: Profile> State<P> {
         // a length decrement, discarded codes left unreachable above `len`
         // (§10.2a). The `codes.is_none()` skip is `all_data`'s, for the 22 conv
         // layers whose slots never allocate.
-        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
-            if k_slot.codes.is_none() {
+        for s in self.quant_slots.iter_mut() {
+            if !s.is_allocated() {
                 continue;
             }
-            k_slot.rewind(discard)?;
-            v_slot.rewind(discard)?;
+            s.rewind(discard)?;
         }
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
@@ -7000,29 +6652,11 @@ impl<P: Profile> Attention<P> {
         if cache.use_kv_cache && cache.kv_quant.is_on() {
             let k = k.contiguous()?;
             let v = v.contiguous()?;
-            let (k_slot, v_slot) = &mut cache.quant_slots[block_idx];
-            k_slot.append(&k)?;
-            v_slot.append(&v)?;
-            let n = k_slot.len;
-            let capacity = k_slot.capacity;
+            let slab = &mut cache.quant_slots[block_idx];
+            slab.append(&k, &v)?;
 
             if seq_len == 1 {
-                let y = crate::nn::ops::sdpa_quant(
-                    &q,
-                    k_slot.codes.as_ref().unwrap(),
-                    k_slot.scales.as_ref().unwrap(),
-                    k_slot.biases.as_ref().unwrap(),
-                    v_slot.codes.as_ref().unwrap(),
-                    v_slot.scales.as_ref().unwrap(),
-                    v_slot.biases.as_ref().unwrap(),
-                    self.num_attention_heads / self.num_key_value_heads,
-                    n,
-                    capacity,
-                    1f32 / (self.head_dim as f32).sqrt(),
-                    1.0,
-                    cache.kv_quant,
-                )?;
-                return Ok(y);
+                return slab.attend(&q, None, 1f32 / (self.head_dim as f32).sqrt());
             }
         }
 
@@ -7049,35 +6683,7 @@ impl<P: Profile> Attention<P> {
             // hold**, not the originals, so prefill sees exactly the cache
             // decode will see -- which is what makes the two paths consistent
             // rather than merely both present.
-            let (k_slot, v_slot) = &cache.quant_slots[block_idx];
-            let n = k_slot.len;
-            let capacity = k_slot.capacity;
-            let dtype = q.dtype();
-            let k = crate::nn::ops::dequantize_kv(
-                k_slot.codes.as_ref().unwrap(),
-                k_slot.scales.as_ref().unwrap(),
-                k_slot.biases.as_ref().unwrap(),
-                b_sz,
-                self.num_key_value_heads,
-                n,
-                self.head_dim,
-                capacity,
-                dtype,
-                cache.kv_quant,
-            )?;
-            let v = crate::nn::ops::dequantize_kv(
-                v_slot.codes.as_ref().unwrap(),
-                v_slot.scales.as_ref().unwrap(),
-                v_slot.biases.as_ref().unwrap(),
-                b_sz,
-                self.num_key_value_heads,
-                n,
-                self.head_dim,
-                capacity,
-                dtype,
-                cache.kv_quant,
-            )?;
-            (k, v)
+            cache.quant_slots[block_idx].dequantize_to(q.dtype())?
         } else {
             match cache.kv_append {
                 KvAppend::Cat => {

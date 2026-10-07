@@ -216,6 +216,23 @@ pub trait ReadbackStrategy {
         None
     }
 
+    /// Whether [`Self::retract_draw`] can take the last draw back (a
+    /// provisional step's redraw, `CausalLM::settle_step`). The default
+    /// cannot.
+    fn retracts_draw(&self) -> bool {
+        false
+    }
+
+    /// Take back the last [`Self::sample_and_feed`], before
+    /// [`Self::eos_of_last`] or a drain has seen it: its id leaves the ids,
+    /// and the strategy is as it was before the call. Refused by default.
+    fn retract_draw(&mut self) -> Result<()> {
+        lloom_tensor::bail!(
+            "{}: this readback arm cannot take a draw back",
+            self.eos_read_arm()
+        )
+    }
+
     /// Was the token fed by the last [`Self::sample_and_feed`] an EOS? Waits
     /// by this arm's own mechanism until it knows; a `true` retracts that
     /// token from the ids [`Self::take_ids`] will return.
@@ -353,6 +370,8 @@ pub struct Blocking {
     ids: Vec<u32>,
     last: Option<u32>,
     forcing: Option<HostForcing>,
+    /// The budget's state before the last draw ([`ReadbackStrategy::retract_draw`]).
+    forcing_before: Option<crate::generation::budget::ForcingMark>,
 }
 
 impl Blocking {
@@ -366,6 +385,7 @@ impl Blocking {
             ids: Vec::new(),
             last: None,
             forcing: None,
+            forcing_before: None,
         })
     }
 }
@@ -406,6 +426,7 @@ impl ReadbackStrategy for Blocking {
         // (#814 part 5 item A — the ring's shape, on the blocking arm). The
         // other arms are host draws by construction (a sort, a multinomial),
         // so they read the id and upload it as they always did.
+        self.forcing_before = self.forcing.as_ref().map(HostForcing::mark);
         if self.forcing.is_none() && *sampler.sampling() == Sampling::ArgMax {
             if let Some((draw, id)) = sampler.draw_and_read(logits)? {
                 self.ids.push(id);
@@ -429,6 +450,21 @@ impl ReadbackStrategy for Blocking {
 
     fn fed_host_ids(&self) -> Option<&[u32]> {
         self.last.as_ref().map(std::slice::from_ref)
+    }
+
+    fn retracts_draw(&self) -> bool {
+        true
+    }
+
+    fn retract_draw(&mut self) -> Result<()> {
+        if self.last.take().is_none() {
+            lloom_tensor::bail!("Blocking::retract_draw: no draw to take back");
+        }
+        self.ids.pop();
+        if let (Some(f), Some(m)) = (self.forcing.as_mut(), self.forcing_before.take()) {
+            f.rewind(m);
+        }
+        Ok(())
     }
 
     fn eos_of_last(&mut self) -> Result<bool> {
@@ -2553,6 +2589,46 @@ impl std::str::FromStr for CommitBudget {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// A draw taken back leaves the blocking arm as it was before it: the
+    /// ids, and a thinking budget's position — a draw retracted inside the
+    /// forced tail and made again feeds the tail's same token, so the run's
+    /// fed ids are a run's without the retraction.
+    #[test]
+    fn a_retracted_draw_leaves_the_ids_and_the_budget_as_before() {
+        let dev = Device::Cpu;
+        // Logits (as the loop hands them, one row squeezed) whose argmax is
+        // 1, every step.
+        let logits =
+            Tensor::new(&[0f32, 5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &dev).unwrap();
+        let budget = ThinkingBudget::new(2, vec![9], vec![3, 4, 9]).unwrap();
+        let fed = |rb: &mut Blocking, s: &mut LogitsProcessor| -> u32 {
+            rb.sample_and_feed(s, &logits)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()[0]
+        };
+        let run = |retract_at: &[usize]| -> (Vec<u32>, Vec<u32>) {
+            let mut rb = Blocking::new(&[100], &dev).unwrap();
+            rb.set_thinking_budget(Some(&budget)).unwrap();
+            let mut s = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let mut out = Vec::new();
+            for step in 0..6 {
+                if retract_at.contains(&step) {
+                    fed(&mut rb, &mut s);
+                    rb.retract_draw().unwrap();
+                }
+                out.push(fed(&mut rb, &mut s));
+                assert!(!rb.eos_of_last().unwrap());
+            }
+            (out, rb.take_ids().unwrap())
+        };
+        let want = run(&[]);
+        assert_eq!(want.0, vec![1, 1, 3, 4, 9, 1], "the budget's tail is fed");
+        assert_eq!(run(&[0, 2, 3, 5]), want);
+    }
 
     #[test]
     fn budget_parses_and_renders_its_period() {

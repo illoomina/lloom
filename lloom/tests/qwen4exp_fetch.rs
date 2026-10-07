@@ -235,8 +235,60 @@ fn a_fetching_steps_settle_trails_and_the_run_end_settles_it_metal() -> Result<(
     )?;
     assert!(!out.ids.is_empty());
     assert!(
+        out.stats.provisional,
+        "the blocking arm's run did not settle its fetching steps itself"
+    );
+    assert!(
         !streamed.fetch_settle_trailing(),
         "the session's run ended with a fetching step's settle still trailing"
+    );
+    Ok(())
+}
+
+/// A settle behind the next step's encode reads its own step's records:
+/// each tier alternates its record slot per plan and the settle waits for
+/// its own pass only. Through the per-token loop here every fetching step
+/// settles behind the next one's encode; through the session (the blocking
+/// arm) every step is settled by the driver before the next is encoded.
+/// The two count the same experts used — the tiers' usage profile, which
+/// the settles write from the records — and decode the same ids. With one
+/// record slot a tier, the settle behind read the next step's record: the
+/// first decode step's experts went uncounted and the last step's counted
+/// twice.
+#[test]
+fn a_settle_behind_the_next_encode_reads_its_own_steps_records_metal() -> Result<()> {
+    use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+    arm();
+    let Some((fx, dev)) = fixture("qwen4exp_fetch_own_records_metal")? else {
+        return Ok(());
+    };
+    let cfg = fx.config(|_| {});
+    let opts = LoadOptions::default();
+    let behind = fx.streamed::<CrownExact>(&cfg, &dev, &opts, &stream(6))?;
+    let (ids, _, mut cache) = decode(&behind, &cfg, &dev, &PROMPT, STEPS)?;
+    behind.settle_pending(&mut cache)?;
+    let driven = fx.streamed::<CrownExact>(&cfg, &dev, &opts, &stream(6))?;
+    let mut session = Session::new(&driven, driven.new_cache(&cfg, &dev)?);
+    let mut rb = Blocking::new(&[u32::MAX - 1], &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        &PROMPT,
+        &DecodeOptions::new(STEPS),
+        &mut |_| Ok(()),
+    )?;
+    assert!(out.stats.provisional);
+    // Both loops draw STEPS ids, each from the pass before it, and run a
+    // decode forward after each draw: the same passes.
+    assert_eq!(out.ids, ids, "the two loops decode different ids");
+    assert!(cache.fetch_passes > 0, "no step fetched");
+    assert_eq!(
+        behind.stream_usage(),
+        driven.stream_usage(),
+        "the settle behind the next encode counted other experts than the step's own"
     );
     Ok(())
 }

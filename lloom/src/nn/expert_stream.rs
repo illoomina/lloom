@@ -1305,19 +1305,48 @@ struct Inner {
 #[derive(Default)]
 struct DecodeIo {
     ids_dst: Option<lloom_tensor::kernels::metal::BufferHandle>,
-    /// The routing ids' host-read slot (#814 part 5): `moe_topk` writes a
-    /// one-row step's ids straight into it and [`Streamed::plan`] reads it in
-    /// place — no copy dispatch into `ids_dst`, no staging buffer. One per
-    /// tier, so one per MoE layer: a layer's write never lands on another
+    /// The routing ids' host-read slots (#814 part 5): `moe_topk` writes a
+    /// one-row step's ids straight into one and [`Streamed::plan`] reads it
+    /// in place — no copy dispatch into `ids_dst`, no staging buffer. Per
+    /// tier, so per MoE layer: a layer's write never lands on another
     /// layer's value inside a step.
-    ids_slot: Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
-    /// The device plan's record host-read slot: `SlotMap` writes a one-row
-    /// step's record into it and the settle reads it in place (#814 part 5).
-    record_slot: Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
+    ///
+    /// **Two, and why two (§15.2 #10c, derived):** a fetching pass takes the
+    /// other one (`fetch_prepare`) and fills it with the sentinel on the
+    /// host while the pass before it may still be running and its worker
+    /// still reading the routing it wrote. The slot it takes was last
+    /// written by the pass two back, which is complete and whose jobs are
+    /// served: that pass's settle waits for both, and it runs before the
+    /// pass after it is encoded (`Qwen4Exp::decode_fetching`). One slot let
+    /// the sentinel clobber, or be taken for, the running pass's routing.
+    ids_slots: [Option<Arc<lloom_tensor::metal_backend::HostSlot>>; 2],
+    /// Which of [`Self::ids_slots`] the next one-row routing writes.
+    ids_at: usize,
+    /// The device plan's record host-read slots: `SlotMap` writes a one-row
+    /// step's record into one and the settle reads it in place (#814 part 5).
+    /// **Two, alternating per device plan (derived):** a pass's settle may
+    /// read its record after the next pass is encoded — the fetching settle
+    /// behind the next encode, a provisional step settled by the driver —
+    /// and the next pass writes the other slot; the pass after that is
+    /// encoded only once the settle has read it.
+    record_slots: [Option<Arc<lloom_tensor::metal_backend::HostSlot>>; 2],
+    /// Which of [`Self::record_slots`] the last device plan took.
+    record_at: usize,
     slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
     /// The epoch of the command buffer the slot ids' last readers were
     /// encoded into (`down` stamps it), or `BUSY` from the write until then.
     slots_read_at: Option<Epoch>,
+}
+
+#[cfg(feature = "metal")]
+impl DecodeIo {
+    /// The one of `slots` whose buffer `t` is a view of.
+    fn holding(
+        slots: &[Option<Arc<lloom_tensor::metal_backend::HostSlot>>; 2],
+        t: &Tensor,
+    ) -> Option<Arc<lloom_tensor::metal_backend::HostSlot>> {
+        slots.iter().flatten().find(|s| s.holds(t)).map(Arc::clone)
+    }
 }
 
 /// [`DecodeIo::slots_read_at`] between a write and its group's `down`.
@@ -1326,50 +1355,53 @@ const BUSY: Epoch = Epoch(u64::MAX);
 
 #[cfg(feature = "metal")]
 impl Inner {
-    /// The routing ids' host-read slot for a one-row step of `topk` ids,
-    /// made on first use and kept for the tier's life.
+    /// The routing ids' host-read slot for a one-row step of `topk` ids —
+    /// the current one of the two — made on first use and kept for the
+    /// tier's life.
     fn decode_ids_slot(
         &mut self,
         topk: usize,
     ) -> Result<Option<Arc<lloom_tensor::metal_backend::HostSlot>>> {
-        let Ok(m) = self.device.as_metal_device() else {
-            return Ok(None);
-        };
-        if let Some(s) = &self.decode_io.ids_slot {
-            if s.cap() >= topk {
-                return Ok(Some(Arc::clone(s)));
-            }
-        }
-        let slot = Arc::new(lloom_tensor::metal_backend::HostSlot::new(
-            m,
-            topk,
-            lloom_tensor::DType::U32,
-        )?);
-        self.decode_io.ids_slot = Some(Arc::clone(&slot));
-        Ok(Some(slot))
+        let at = self.decode_io.ids_at;
+        Self::slot_at(&self.device, &mut self.decode_io.ids_slots[at], topk)
     }
 
-    /// The device plan's record slot for a one-row step's `len` words, made
-    /// on first use and kept for the tier's life.
+    /// A fetching pass begins: the routing from here on goes to the other
+    /// slot (see [`DecodeIo::ids_slots`]).
+    fn next_ids_slot(&mut self) {
+        self.decode_io.ids_at ^= 1;
+    }
+
+    /// The device plan's record slot for a one-row step's `len` words: the
+    /// other one of the two from the last plan's, made on first use and kept
+    /// for the tier's life.
     fn decode_record_slot(
         &mut self,
         len: usize,
     ) -> Result<Option<Arc<lloom_tensor::metal_backend::HostSlot>>> {
-        let Ok(m) = self.device.as_metal_device() else {
+        self.decode_io.record_at ^= 1;
+        let at = self.decode_io.record_at;
+        Self::slot_at(&self.device, &mut self.decode_io.record_slots[at], len)
+    }
+
+    fn slot_at(
+        device: &lloom_tensor::Device,
+        slot: &mut Option<Arc<lloom_tensor::metal_backend::HostSlot>>,
+        len: usize,
+    ) -> Result<Option<Arc<lloom_tensor::metal_backend::HostSlot>>> {
+        let Ok(m) = device.as_metal_device() else {
             return Ok(None);
         };
-        if let Some(s) = &self.decode_io.record_slot {
-            if s.cap() >= len {
-                return Ok(Some(Arc::clone(s)));
-            }
+        if let Some(s) = slot.as_ref().filter(|s| s.cap() >= len) {
+            return Ok(Some(Arc::clone(s)));
         }
-        let slot = Arc::new(lloom_tensor::metal_backend::HostSlot::new(
+        let made = Arc::new(lloom_tensor::metal_backend::HostSlot::new(
             m,
             len,
             lloom_tensor::DType::U32,
         )?);
-        self.decode_io.record_slot = Some(Arc::clone(&slot));
-        Ok(Some(slot))
+        *slot = Some(Arc::clone(&made));
+        Ok(Some(made))
     }
 
     /// The destination a one-row plan's routing ids are read back into:
@@ -2890,13 +2922,7 @@ impl Streamed {
         // reads.
         #[cfg(feature = "metal")]
         let slot = if rows == 1 {
-            self.inner
-                .lock()
-                .decode_io
-                .ids_slot
-                .as_ref()
-                .filter(|s| s.holds(ids))
-                .map(Arc::clone)
+            DecodeIo::holding(&self.inner.lock().decode_io.ids_slots, ids)
         } else {
             None
         };
@@ -3901,7 +3927,13 @@ impl ExpertResidency for Streamed {
             if !self.fetch_ready() {
                 return Ok(false);
             }
-            let slot = self.inner.lock().decode_ids_slot(topk)?;
+            // The other slot: the running pass's routing may still be in
+            // this one (`DecodeIo::ids_slots`).
+            let slot = {
+                let mut inner = self.inner.lock();
+                inner.next_ids_slot();
+                inner.decode_ids_slot(topk)?
+            };
             match slot {
                 Some(s) => {
                     s.fill_u32(NONE, topk)?;
@@ -3926,14 +3958,7 @@ impl ExpertResidency for Streamed {
         if !self.fetch_ready() {
             return Ok(false);
         }
-        let slot = self
-            .inner
-            .lock()
-            .decode_io
-            .ids_slot
-            .as_ref()
-            .filter(|s| s.holds(ids))
-            .map(Arc::clone);
+        let slot = DecodeIo::holding(&self.inner.lock().decode_io.ids_slots, ids);
         let Some(slot) = slot else {
             return Ok(false);
         };
@@ -3966,14 +3991,7 @@ impl ExpertResidency for Streamed {
     fn read_record_in_place(&self, record: &Tensor) -> Result<Option<Vec<u32>>> {
         #[cfg(feature = "metal")]
         {
-            let slot = self
-                .inner
-                .lock()
-                .decode_io
-                .record_slot
-                .as_ref()
-                .filter(|s| s.holds(record))
-                .map(Arc::clone);
+            let slot = DecodeIo::holding(&self.inner.lock().decode_io.record_slots, record);
             slot.map(|s| s.read_unchecked::<u32>(record.elem_count()))
                 .transpose()
         }
@@ -5359,6 +5377,62 @@ mod tests {
         let (_, rec2) = io.plan_device(&tok2).unwrap().expect("a device plan");
         assert_eq!(io.stats().plan_waits, 1, "{:?}", io.stats());
         assert!(!io.settle(&rec2).unwrap());
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: a device plan's record is read in place from the tier's
+    /// host-read slot, and the next plan writes the other slot — so a settle
+    /// that runs after the next pass is encoded (the fetching settle behind
+    /// the next encode, a provisional step's) reads its own pass's record,
+    /// not the next one's (`DecodeIo::record_slots`). One slot handed both
+    /// plans the same buffer: the first record read back as the second.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_plans_record_survives_the_next_plan() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let tier = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        tier.warm(&[1, 2, 3]).unwrap();
+        let read = |rec: &Tensor| -> Vec<u32> {
+            let marker = m.flush_marker().unwrap();
+            m.wait_marker(&marker).unwrap();
+            tier.read_record_in_place(rec)
+                .unwrap()
+                .expect("a one-row record is read in place")
+        };
+        // Plan A: every expert resident. Plan B: three misses.
+        let a = Tensor::new(&[[1u32, 2, 3]], &dev).unwrap();
+        let (_, rec_a) = tier.plan_device(&a).unwrap().expect("a device plan");
+        let want_a = read(&rec_a);
+        assert_eq!(&want_a[6..9], &[0, 0, 0], "plan A misses nothing: {want_a:?}");
+        let b = Tensor::new(&[[7u32, 8, 9]], &dev).unwrap();
+        let (_, rec_b) = tier.plan_device(&b).unwrap().expect("a device plan");
+        let got_b = read(&rec_b);
+        assert_ne!(want_a, got_b, "the two plans' records are the same: no test");
+        assert_eq!(
+            read(&rec_a),
+            want_a,
+            "plan A's record read after plan B ran is not plan A's"
+        );
+        assert!(!tier.settle_host(&want_a).unwrap());
+        assert!(tier.settle_host(&got_b).unwrap(), "plan B computed on missing experts");
         std::fs::remove_file(path).ok();
     }
 

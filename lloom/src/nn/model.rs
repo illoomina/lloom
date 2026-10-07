@@ -125,6 +125,28 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Provisional steps: when `on`, the model may return a decode step's
+    /// logits before it has settled the step — before it knows the step
+    /// computed on everything it needed (a streamed tier's device plan that
+    /// may have mapped a missing expert) — and the driver promises to call
+    /// [`Self::settle_step`] once it has read each step's logits back and
+    /// before it hands the token drawn from them out. Returns whether the
+    /// model takes it up; a driver whose draw it cannot take back must not
+    /// ask. `false` ends it (after the driver's last `settle_step`). The
+    /// default declines.
+    fn provisional(&self, _cache: &mut Self::Cache, _on: bool) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Settle the last decode step when it is provisional: `None` when it
+    /// stands; `Some(logits)` — shaped as [`Self::forward`]'s — when it did
+    /// not, and was redone: the cache is as if the step had run once,
+    /// correctly, and the driver draws again from these logits in place of
+    /// the draw it made. The default has nothing to settle.
+    fn settle_step(&self, _cache: &mut Self::Cache) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     fn vocab_size(&self) -> usize;
 }
 

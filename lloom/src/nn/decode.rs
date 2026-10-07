@@ -583,6 +583,13 @@ pub struct DecodeStats {
     /// The model's host fill (`CausalLM::host_feed`), when the run took it:
     /// its engagement counters.
     pub host_feed: Option<HostFeedReport>,
+    /// Whether the run's steps were provisional (`CausalLM::provisional`):
+    /// the loop settled each after its readback, before its token was
+    /// handed out.
+    pub provisional: bool,
+    /// Draws taken back and made again from a redone step's logits (a
+    /// provisional step that computed on something it lacked).
+    pub redraws: u64,
 }
 
 /// What a run's host fill did (`CausalLM::host_feed`).
@@ -1695,6 +1702,30 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
+        let out = self.decode_until_run(spec, readback, sampler, prompt, opts, on_tokens);
+        if out.is_err() {
+            // A run that failed mid-way may leave a provisional step: settled
+            // (whatever it finds, the run's error is the answer) and the
+            // cache's steps the model's own again.
+            let _ = self.model.settle_step(&mut self.seq.cache);
+            let _ = self.model.provisional(&mut self.seq.cache, false);
+        }
+        out
+    }
+
+    fn decode_until_run<S, R>(
+        &mut self,
+        spec: &mut S,
+        readback: &mut R,
+        sampler: &mut LogitsProcessor,
+        prompt: &[u32],
+        opts: &DecodeOptions,
+        on_tokens: &mut dyn FnMut(&[u32]) -> Result<bool>,
+    ) -> Result<DecodeOut>
+    where
+        S: Speculator,
+        R: ReadbackStrategy,
+    {
         if spec.max_draft() > 0 {
             lloom_tensor::bail!(
                 "Session::decode: a proposer with max_draft {} needs the speculative body \
@@ -1854,6 +1885,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
             pacer.set_depth(opts.pacer_depth());
         }
 
+        // Provisional steps (`CausalLM::provisional`): on an arm that reads
+        // each token back before the next forward and can take its draw back
+        // (the blocking arm), with a sampler that can draw again as if it had
+        // not (no processor history), the model's step returns without
+        // settling and the loop settles it after the readback — the pass is
+        // complete by then, so the settle waits for nothing — redrawing from
+        // the redone step when it computed on something it lacked. Armed
+        // after the prefill, whose passes settle as they always did.
+        let provisional = opts.lookahead == 0
+            && readback.retracts_draw()
+            && sampler.mark().is_some()
+            && self.model.provisional(&mut self.seq.cache, true)?;
+        stats.provisional = provisional;
+
         // The model's host fill (`CausalLM::host_feed`): on an arm whose
         // reader sees every token as it is stamped, a producer thread fills
         // each decode forward's host-side input from the token before it and
@@ -1994,7 +2039,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // sample-split split; skip the clock read on the steady path.
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
-            let feed = readback.sample_and_feed(sampler, &logits)?;
+            let mark = if provisional { sampler.mark() } else { None };
+            let mut feed = readback.sample_and_feed(sampler, &logits)?;
+            // The step behind these logits settled, now that its pass is done
+            // and before its token goes anywhere: a redone step's logits are
+            // drawn from again, the first draw taken back.
+            if provisional {
+                if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
+                    readback.retract_draw()?;
+                    if let Some(m) = mark {
+                        sampler.rewind(m);
+                    }
+                    logits = redone.squeeze(0)?;
+                    feed = readback.sample_and_feed(sampler, &logits)?;
+                    stats.redraws += 1;
+                }
+            }
             if let Some(f) = &host_feed {
                 f.link().note_fed();
             }
@@ -2389,6 +2449,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let (published, report) = f.finish()?;
             self.model.host_feed_end(&mut self.seq.cache, &published)?;
             stats.host_feed = Some(report);
+        }
+        // The last step, when provisional, settled before its logits are
+        // held: a redone step's are the ones a continuation resumes from.
+        if provisional {
+            if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
+                logits = redone.squeeze(0)?;
+            }
+            self.model.provisional(&mut self.seq.cache, false)?;
         }
         // Work the model let trail the last step (a fetching settle behind
         // the next encode) is the run's: settled here, after the host fill

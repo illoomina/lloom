@@ -1419,7 +1419,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // A verify window plans its own rows: a trailing fetching settle
         // closes the plan before it.
         #[cfg(feature = "metal")]
-        self.settle_fetch_pending(Some(cache))?;
+        self.settle_trailing(Some(cache))?;
         if anchor.pos != cache.pos {
             lloom_tensor::bail!(
                 "qwen4exp verify: anchor pos {} != cache pos {}",

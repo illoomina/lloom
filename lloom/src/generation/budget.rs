@@ -125,7 +125,26 @@ pub(crate) struct HostForcing {
     closed: bool,
 }
 
+/// A [`HostForcing`]'s position before a draw, to take the draw back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForcingMark {
+    step: usize,
+    closed: bool,
+}
+
 impl HostForcing {
+    pub(crate) fn mark(&self) -> ForcingMark {
+        ForcingMark {
+            step: self.step,
+            closed: self.closed,
+        }
+    }
+
+    pub(crate) fn rewind(&mut self, m: ForcingMark) {
+        self.step = m.step;
+        self.closed = m.closed;
+    }
+
     pub(crate) fn new(cfg: ThinkingBudget) -> Self {
         Self {
             cfg,

@@ -594,6 +594,17 @@ pub struct State<P: Profile> {
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+    /// A driver owns the settles of this cache's device-planned decode steps
+    /// (`CausalLM::provisional`): a step returns its logits unsettled, and
+    /// the driver settles it once it has read them back
+    /// (`CausalLM::settle_step`), redrawing from the redone step's logits
+    /// when it computed on a missing expert. Off outside such a run.
+    #[cfg(feature = "metal")]
+    pub(crate) provisional: bool,
+    /// Provisional steps the driver's settle found had computed on a
+    /// missing expert, redone before their token was handed out (`redos`
+    /// counts them too).
+    pub provisional_redos: u64,
 }
 
 /// A sequence's PLE host fill: the run in progress, if a decode loop armed
@@ -892,6 +903,9 @@ impl<P: Profile> State<P> {
             fetch_entries: 0,
             fetch_exits: 0,
             fetch_redos: 0,
+            #[cfg(feature = "metal")]
+            provisional: false,
+            provisional_redos: 0,
             replay_ns: 0,
             host_pass_ns: 0,
             settle_after_first: 0,
@@ -1457,15 +1471,21 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// at the first fetching step.
     #[cfg(feature = "metal")]
     fetch_lane: std::sync::OnceLock<Option<std::sync::Arc<crate::nn::expert_fetch::FetchLane>>>,
-    /// A fetching step whose settle trails the next step's encode
-    /// (`QWEN4EXP_FETCH_SETTLE=behind`): its records, its pass, the misses
-    /// before it. Held by the model, not the cache — the settle is the
-    /// tiers' bookkeeping, and a cache rewound or reset meanwhile does not
-    /// change it — and settled at the model's next entry
-    /// ([`Self::settle_fetch_pending`]), or by the driver at a run's end
-    /// (`CausalLM::settle_pending`).
+    /// A fetching step whose settle trails its return — the next step's
+    /// encode (`QWEN4EXP_FETCH_SETTLE=behind`) or the driver's settle (a
+    /// provisional step): its records, its pass, the misses before it. Held
+    /// by the model, not the cache — the settle is the tiers' bookkeeping,
+    /// and a cache rewound or reset meanwhile does not change it — and
+    /// settled by the driver (`CausalLM::settle_step`, `settle_pending` at a
+    /// run's end) or at the model's next entry ([`Self::settle_trailing`]).
     #[cfg(feature = "metal")]
     fetch_pending: parking_lot::Mutex<Option<PendingFetch>>,
+    /// A provisional device-planned decode step (`State::provisional`): its
+    /// records, waiting for the driver's settle (`CausalLM::settle_step`).
+    /// On the model beside `fetch_pending`, for the same reason, and settled
+    /// at the same entries if the driver did not.
+    #[cfg(feature = "metal")]
+    step_pending: parking_lot::Mutex<Option<PendingStep>>,
     /// The device plan's settle reads every layer's record back into this
     /// Shared buffer rather than a pool buffer per step (`DESIGN.md` §9.2aa):
     /// grown to the largest record set, kept for the model's life.
@@ -1635,6 +1655,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             fetch_lane: std::sync::OnceLock::new(),
             #[cfg(feature = "metal")]
             fetch_pending: parking_lot::Mutex::new(None),
+            #[cfg(feature = "metal")]
+            step_pending: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
             settle_dst: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
@@ -2112,7 +2134,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         };
         // A plan open on the tiers refuses the shrink: a trailing fetching
         // settle closes it first.
-        self.settle_fetch_pending(None)?;
+        self.settle_trailing(None)?;
         let wanted = t.wanted_units();
         let mut parked = 0usize;
         #[cfg(feature = "metal")]
@@ -2830,7 +2852,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // A trailing fetching settle runs before a multi-row pass.
         #[cfg(feature = "metal")]
         if seq > 1 {
-            self.settle_fetch_pending(Some(cache))?;
+            self.settle_trailing(Some(cache))?;
         }
         // The last decode step is final once another forward begins.
         cache.settle_standing()?;
@@ -3151,10 +3173,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             && !(0..self.layers.len())
                 .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
         // A trailing fetching settle runs before any other kind of step; a
-        // fetching step settles it after its own encode.
+        // fetching step settles it after its own encode. A provisional step
+        // the driver left unsettled is settled here, whatever comes next.
         #[cfg(feature = "metal")]
         if !(planned && self.fetches(cache)) {
-            self.settle_fetch_pending(Some(cache))?;
+            self.settle_trailing(Some(cache))?;
+        } else {
+            self.settle_trailing_step()?;
         }
         if !planned {
             // Inside a verify's window the step is the verify's to undo;
@@ -3232,12 +3257,41 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             .into_iter()
             .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
             .collect();
+        // A provisional step (`State::provisional`): the settle is the
+        // driver's, once it has read the logits back — no wait here, so the
+        // host is not standing between this pass and the draw after it.
+        #[cfg(feature = "metal")]
+        if cache.provisional && !records.is_empty() {
+            let marker = self.device().as_metal_device()?.flush_marker()?;
+            *self.step_pending.lock() = Some(PendingStep {
+                records,
+                marker,
+                h: h.clone(),
+            });
+            cache.keep_standing();
+            return Ok(logits);
+        }
         let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             // The step's window stays open as the standing one.
             cache.keep_standing();
             return Ok(logits);
         }
+        self.redo_device_step(h, cache, obs, after_first)
+    }
+
+    /// A device-planned decode step whose settle found a layer computed on
+    /// a missing expert, redone. `h` is the step's input (the model's own
+    /// copy), the cache's open window the step's own (standing or not);
+    /// `after_first` the experts the settle loaded past the first layer that
+    /// missed.
+    fn redo_device_step<O: ForwardObserver>(
+        &self,
+        h: &Tensor,
+        cache: &mut State<P>,
+        obs: &mut O,
+        after_first: u64,
+    ) -> Result<Tensor> {
         cache.settle_after_first += after_first;
         // The arm (`QWEN4EXP_FETCH=inside`): the step is redone fetching
         // (its later layers' misses loaded inside it, not one more replay
@@ -3321,7 +3375,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     /// Every layer's device-plan record on the host, in ONE wait: read in
     /// place from the tiers' host-read slots when they hold them (a one-row
-    /// step, #814 part 5), else a `cat` and one readback.
+    /// step, #814 part 5), else a `cat` and one readback. The wait is for
+    /// everything encoded so far — the settle of the pass just encoded.
     fn read_records_host(&self, records: &[(usize, Tensor)]) -> Result<Vec<Vec<u32>>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -3329,18 +3384,43 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if let Ok(m) = records[0].1.device().as_metal_device() {
             let marker = m.flush_marker()?;
-            m.wait_marker(&marker)?;
-            let mut owned: Vec<Vec<u32>> = Vec::with_capacity(records.len());
-            for (l, r) in records {
-                match self.layers[*l].moe().experts().read_record_in_place(r)? {
-                    Some(v) => owned.push(v),
-                    None => break,
-                }
-            }
-            if owned.len() == records.len() {
-                return Ok(owned);
+            return self.read_records_at(records, &marker);
+        }
+        self.read_records_cat(records)
+    }
+
+    /// [`Self::read_records_host`] for a pass whose last commit is `marker`:
+    /// the wait is for that pass only, so a pass encoded after it keeps
+    /// running (the settle trailing the next encode), and its records are
+    /// its own (each tier alternates its record slot per plan,
+    /// `DecodeIo::record_slots`).
+    #[cfg(feature = "metal")]
+    fn read_records_at(
+        &self,
+        records: &[(usize, Tensor)],
+        marker: &lloom_tensor::metal_backend::CommandMarker,
+    ) -> Result<Vec<Vec<u32>>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let m = records[0].1.device().as_metal_device()?;
+        m.wait_marker(marker)?;
+        let mut owned: Vec<Vec<u32>> = Vec::with_capacity(records.len());
+        for (l, r) in records {
+            match self.layers[*l].moe().experts().read_record_in_place(r)? {
+                Some(v) => owned.push(v),
+                None => break,
             }
         }
+        if owned.len() == records.len() {
+            return Ok(owned);
+        }
+        self.read_records_cat(records)
+    }
+
+    /// The records through a `cat` and one readback (a record not in its
+    /// tier's slot: a multi-row plan, or off Metal).
+    fn read_records_cat(&self, records: &[(usize, Tensor)]) -> Result<Vec<Vec<u32>>> {
         let flat: Vec<Tensor> = records
             .iter()
             .map(|(_, r)| r.flatten_all())
@@ -3366,6 +3446,25 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             at += n;
         }
         Ok(owned)
+    }
+
+    /// [`Self::settle_records`] for a pass whose last commit is `marker`.
+    #[cfg(feature = "metal")]
+    fn settle_records_at(
+        &self,
+        records: &[(usize, Tensor)],
+        marker: &lloom_tensor::metal_backend::CommandMarker,
+    ) -> Result<(bool, u64)> {
+        if records.is_empty() {
+            return Ok((false, 0));
+        }
+        let owned = self.read_records_at(records, marker)?;
+        let parts: Vec<(&R, &[u32])> = records
+            .iter()
+            .zip(&owned)
+            .map(|((l, _), v)| (self.layers[*l].moe().experts(), v.as_slice()))
+            .collect();
+        Self::redo_of(R::settle_batch(&parts)?)
     }
 
     /// A settle's verdicts as `(redo, misses after the first)`.
@@ -3556,31 +3655,35 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         crate::nn::expert_stream::FetchStats::default()
     }
 
-    /// Settle the fetching step whose settle trails (`fetch_pending`), if
-    /// any: its records read back (one wait — on a step the GPU ran while
-    /// the host encoded the next), its pass's jobs, the regime's counters on
-    /// `cache` when there is one. Its token was handed out already, so a
-    /// pass that computed on a missing expert — the worker's fail-safe
-    /// fired — is an error, never a silent redo.
+    /// Settle a fetching step whose settle trailed: its records read back
+    /// once its own pass completed (one wait — none when the pass is done,
+    /// and never on the steps encoded after it), its pass's jobs, and the
+    /// regime's counters on `cache` when there is one. `Some(h)` — the
+    /// step's input, for its redo — when it computed on a missing expert
+    /// (the fetch worker's fail-safe fired: no slot or no routing within its
+    /// bound).
     #[cfg(feature = "metal")]
-    pub(crate) fn settle_fetch_pending(&self, cache: Option<&mut State<P>>) -> Result<()> {
-        let Some(p) = self.fetch_pending.lock().take() else {
-            return Ok(());
-        };
-        let (redo, _) = self.settle_records(&p.records)?;
-        p.pass.finish();
+    fn settle_fetch(&self, p: PendingFetch, cache: Option<&mut State<P>>) -> Result<Option<Tensor>> {
+        let PendingFetch {
+            records,
+            pass,
+            before,
+            marker,
+            h,
+        } = p;
+        let (redo, after_first) = self.settle_records_at(&records, &marker)?;
+        pass.finish();
         if redo {
-            lloom_tensor::bail!(
-                "qwen4exp: a fetching step computed on a missing expert after its token was handed \
-                 out (the fetch worker's fail-safe fired: no slot or no routing within its bound); \
-                 QWEN4EXP_FETCH_SETTLE=now settles each step before its token"
-            )
+            if let Some(cache) = cache {
+                cache.settle_after_first += after_first;
+            }
+            return Ok(Some(h));
         }
         if let Some(cache) = cache {
             // The decision lags a step: the step after the one that ends the
             // regime was already encoded fetching, so its settle finds the
             // regime off and is not a second exit.
-            if self.stream_misses() == p.before {
+            if self.stream_misses() == before {
                 cache.fetch_clean += 1;
                 if cache.fetch_mode && cache.fetch_clean >= fetch_exit() {
                     cache.fetch_mode = false;
@@ -3591,7 +3694,70 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 cache.fetch_clean = 0;
             }
         }
+        Ok(None)
+    }
+
+    /// Settle whatever step's settle still trails — a fetching step held
+    /// for the next step's encode, a provisional step the driver did not
+    /// settle — before work that must not run beside it (a multi-row pass,
+    /// a verify window, a grant, the run's end). Its token was handed out
+    /// already, so a step that computed on a missing expert is an error
+    /// here, never a silent redo: only the driver's settle
+    /// (`CausalLM::settle_step`) can still take its token back.
+    #[cfg(feature = "metal")]
+    pub(crate) fn settle_trailing(&self, mut cache: Option<&mut State<P>>) -> Result<()> {
+        let fetch = self.fetch_pending.lock().take();
+        if let Some(p) = fetch {
+            if self.settle_fetch(p, cache.as_deref_mut())?.is_some() {
+                lloom_tensor::bail!(
+                    "qwen4exp: a fetching step computed on a missing expert after its token was \
+                     handed out (the fetch worker's fail-safe fired: no slot or no routing within \
+                     its bound); QWEN4EXP_FETCH_SETTLE=now settles each step before its token"
+                )
+            }
+        }
+        self.settle_trailing_step()
+    }
+
+    /// [`Self::settle_trailing`] for a provisional step only (a fetching
+    /// step's entry settles the fetching one after its own encode).
+    #[cfg(feature = "metal")]
+    fn settle_trailing_step(&self) -> Result<()> {
+        let step = self.step_pending.lock().take();
+        if let Some(p) = step {
+            let (redo, _) = self.settle_records_at(&p.records, &p.marker)?;
+            if redo {
+                lloom_tensor::bail!(
+                    "qwen4exp: a provisional decode step computed on a missing expert and reached \
+                     the model's next entry unsettled — its driver hands a step's token out only \
+                     after `CausalLM::settle_step`"
+                )
+            }
+        }
         Ok(())
+    }
+
+    /// The driver's settle of the last decode step, when it trails
+    /// (`CausalLM::settle_step`): `Some(logits)` of the step redone when it
+    /// computed on a missing expert.
+    #[cfg(feature = "metal")]
+    fn settle_step_inner(&self, cache: &mut State<P>) -> Result<Option<Tensor>> {
+        let fetch = self.fetch_pending.lock().take();
+        if let Some(p) = fetch {
+            if let Some(h) = self.settle_fetch(p, Some(cache))? {
+                cache.provisional_redos += 1;
+                return self.decode_fetching(&h, cache, &mut (), true).map(Some);
+            }
+        }
+        let step = self.step_pending.lock().take();
+        if let Some(p) = step {
+            let (redo, after_first) = self.settle_records_at(&p.records, &p.marker)?;
+            if redo {
+                cache.provisional_redos += 1;
+                return self.redo_device_step(&p.h, cache, &mut (), after_first).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     /// Whether a fetching step's settle is trailing — held for the next
@@ -3600,6 +3766,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     #[doc(hidden)]
     pub fn fetch_settle_trailing(&self) -> bool {
         self.fetch_pending.lock().is_some()
+    }
+
+    /// Whether a provisional device-planned step waits for its settle.
+    /// Test surface.
+    #[cfg(feature = "metal")]
+    #[doc(hidden)]
+    pub fn step_settle_trailing(&self) -> bool {
+        self.step_pending.lock().is_some()
     }
 
     /// Open a fetching step at the current epoch, the pass's floor: the
@@ -3654,11 +3828,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             owned = self.replay_input_owned(h)?;
             &owned
         };
-        // The settle trails the next step's encode (`QWEN4EXP_FETCH_SETTLE`
-        // = behind): this step is encoded, then the step before it settled
-        // — the GPU runs that one while the host encodes this one — and this
-        // step's records wait for the next. A replay settles at once.
-        if !replay && fetch_settle_behind() {
+        // The settle trails (`QWEN4EXP_FETCH_SETTLE` = behind): this step
+        // is encoded, then the step before it settled — waiting for that
+        // pass alone, which the GPU runs while the host encodes this one —
+        // and this step's records wait for the next step. A provisional
+        // step's settle is the driver's instead, after its draw and before
+        // its token is handed out (the one before it was settled there). A
+        // replay settles at once.
+        if !replay && (cache.provisional || fetch_settle_behind()) {
             let before = self.stream_misses();
             let mut pass = self.fetch_begin(cache)?;
             cache.open_window()?;
@@ -3666,15 +3843,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 self.decode_embed_pass_as(h, cache, obs, RowPlan::Device, true)?;
             self.replay_read_encoded(h);
             pass.seal();
+            let marker = self.device().as_metal_device()?.flush_marker()?;
             let records: Vec<(usize, Tensor)> = records
                 .into_iter()
                 .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
                 .collect();
-            self.settle_fetch_pending(Some(cache))?;
+            self.settle_trailing(Some(cache))?;
             *self.fetch_pending.lock() = Some(PendingFetch {
                 records,
                 pass,
                 before,
+                marker,
+                h: h.clone(),
             });
             cache.fetch_passes += 1;
             cache.device_plan_armed = true;
@@ -4266,10 +4446,46 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     /// step.
     fn settle_pending(&self, cache: &mut Self::Cache) -> Result<()> {
         #[cfg(feature = "metal")]
-        self.settle_fetch_pending(Some(cache))?;
+        self.settle_trailing(Some(cache))?;
         #[cfg(not(feature = "metal"))]
         let _ = cache;
         Ok(())
+    }
+
+    /// Provisional steps on the device plan's warm path and the fetching
+    /// steps (Metal; `QWEN4EXP_PROVISIONAL=off` declines): their settle — the
+    /// records' one wait, and a redo when a layer computed on a missing
+    /// expert — moves from the end of the step to the driver's settle after
+    /// its readback, where the pass has completed and the wait costs
+    /// nothing.
+    fn provisional(&self, cache: &mut Self::Cache, on: bool) -> Result<bool> {
+        #[cfg(feature = "metal")]
+        {
+            // Only a tier that plans on the device has a settle to defer.
+            cache.provisional = on
+                && self.device().is_metal()
+                && provisional_on()
+                && self.device_plan
+                && self.layers.iter().any(|l| l.moe().experts().plans_on_device());
+            Ok(cache.provisional)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (cache, on);
+            Ok(false)
+        }
+    }
+
+    fn settle_step(&self, cache: &mut Self::Cache) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        {
+            self.settle_step_inner(cache)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = cache;
+            Ok(None)
+        }
     }
 
     fn host_feed_end(&self, cache: &mut Self::Cache, published: &[u32]) -> Result<()> {
@@ -4330,7 +4546,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         rows: &mut [crate::nn::model::Row<'_, State<P>>],
     ) -> Result<Tensor> {
         #[cfg(feature = "metal")]
-        self.settle_fetch_pending(None)?;
+        self.settle_trailing(None)?;
         let (b, seq) = tokens.dims2()?;
         if seq != 1 {
             lloom_tensor::bail!(
@@ -4901,7 +5117,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         all_loaded: bool,
     ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
         #[cfg(feature = "metal")]
-        self.settle_fetch_pending(Some(cache))?;
+        self.settle_trailing(Some(cache))?;
         let dev = self.device();
         let t = tokens.len();
         let mut argmax = Vec::with_capacity(t);
@@ -5099,6 +5315,13 @@ fn replay_on_device() -> bool {
     *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
 }
 
+/// Whether a decode driver may take the device plan's settles
+/// (`QWEN4EXP_PROVISIONAL`, `on` | `off`, default `on`; the A/B arm).
+#[cfg(feature = "metal")]
+fn provisional_on() -> bool {
+    crate::tuning::tuning().stream.provisional == "on"
+}
+
 /// The fetch worker holds pointers into the tiers (`expert_fetch::TierRef`):
 /// a trailing settle's pass and any job still queued end before the layers
 /// do. Fields drop after this runs.
@@ -5106,18 +5329,42 @@ fn replay_on_device() -> bool {
 impl<P: Profile, R: ExpertResidency> Drop for Qwen4Exp<P, R> {
     fn drop(&mut self) {
         drop(self.fetch_pending.get_mut().take());
+        drop(self.step_pending.get_mut().take());
         if let Some(Some(lane)) = self.fetch_lane.get() {
             lane.quiesce();
         }
     }
 }
 
-/// A fetching step whose settle trails the next step's encode.
+/// A fetching step whose settle trails its return: the next step's encode
+/// (`QWEN4EXP_FETCH_SETTLE=behind`) or the driver's settle (a provisional
+/// step).
 #[cfg(feature = "metal")]
 struct PendingFetch {
     records: Vec<(usize, Tensor)>,
     pass: crate::nn::expert_fetch::FetchPass,
     before: u64,
+    /// The pass's own last commit: the settle waits for it, not for the
+    /// steps encoded after it.
+    marker: lloom_tensor::metal_backend::CommandMarker,
+    /// The step's input, the model's own copy: a provisional step's redo
+    /// runs it again.
+    h: Tensor,
+}
+
+/// A provisional device-planned decode step (`State::provisional`).
+#[cfg(feature = "metal")]
+struct PendingStep {
+    records: Vec<(usize, Tensor)>,
+    marker: lloom_tensor::metal_backend::CommandMarker,
+    h: Tensor,
+}
+
+#[cfg(feature = "metal")]
+impl std::fmt::Debug for PendingStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PendingStep {{ layers: {} }}", self.records.len())
+    }
 }
 
 #[cfg(feature = "metal")]

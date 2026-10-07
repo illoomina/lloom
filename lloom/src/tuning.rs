@@ -122,6 +122,9 @@ fn parse_plan(v: &str) -> Result<String, String> {
 fn parse_fetch_settle(v: &str) -> Result<String, String> {
     one_of(v, "fetch settle", &["behind", "now"])
 }
+fn parse_provisional(v: &str) -> Result<String, String> {
+    one_of(v, "provisional steps", &["on", "off"])
+}
 fn parse_fetch(v: &str) -> Result<String, String> {
     one_of(v, "expert fetch", &["off", "inside"])
 }
@@ -283,9 +286,12 @@ pub struct StreamTuning {
         parser = "parse_at_least_one"
     )]
     pub fetch_exit: usize,
-    /// When a fetching step settles (`QWEN4EXP_FETCH=inside`): `behind` = after the next step is encoded, so the host encodes step t+1 while the GPU runs step t (the step's misses were loaded inside it, so its settle is bookkeeping; a pass that still computed on a missing expert — past the worker's fail-safe — is an error, not a redo); `now` = at the step's own end, the host waiting for the GPU every step (the previous behaviour).
+    /// When a fetching step settles (`QWEN4EXP_FETCH=inside`) on a driver that does not settle its steps itself (`provisional`): `behind` = after the next step is encoded, waiting for that step's own pass only, so the host encodes step t+1 while the GPU runs step t (the step's misses were loaded inside it, so its settle is bookkeeping; a pass that still computed on a missing expert — past the worker's fail-safe — is an error, not a redo, its token handed out); `now` = at the step's own end, the host waiting for the GPU every step (the previous behaviour).
     #[opt(flag = "fetch-settle", env = "QWEN4EXP_FETCH_SETTLE", parser = "parse_fetch_settle", variants = ["behind", "now"])]
     pub fetch_settle: String,
+    /// Provisional steps (`CausalLM::provisional`): a decode driver that can take its draw back (the blocking arm) settles each device-planned step itself, after its readback — the pass complete, so the settle waits for nothing — and redraws from the redone step when it computed on a missing expert; the model's step then returns without waiting for its pass. `off` = the step settles at its own end (the host waiting for the GPU every step, then again for the draw).
+    #[opt(flag = "provisional", env = "QWEN4EXP_PROVISIONAL", parser = "parse_provisional", variants = ["on", "off"])]
+    pub provisional: String,
     /// The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`.
     #[opt(
         flag = "fetch-qos",
@@ -315,6 +321,7 @@ impl Default for StreamTuning {
             fetch_poll_us: 50,
             fetch_exit: 8,
             fetch_settle: "behind".into(),
+            provisional: "on".into(),
             fetch_qos: "user-interactive".into(),
         }
     }

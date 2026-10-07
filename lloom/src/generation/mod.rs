@@ -68,6 +68,12 @@ pub struct LogitsProcessor {
     draw_slot: Option<lloom_tensor::metal_backend::HostSlot>,
 }
 
+/// A [`LogitsProcessor`]'s state before a draw ([`LogitsProcessor::mark`]).
+#[derive(Clone)]
+pub struct DrawMark {
+    rng: rand::rngs::StdRng,
+}
+
 impl LogitsProcessor {
     pub fn from_sampling(seed: u64, sampling: Sampling) -> Self {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -89,6 +95,23 @@ impl LogitsProcessor {
             .is_active()
             .then(|| processors::Stage::new(processors));
         self
+    }
+
+    /// The sampler's state before a draw, so a draw taken back can be made
+    /// again as if the first had not been (a provisional step's redraw,
+    /// `Session::decode`): the rng, which is all a draw without processors
+    /// advances. `None` with processors — their history advances from the
+    /// drawn token, on the device for a device draw — so such a sampler's
+    /// draws are not taken back.
+    pub fn mark(&self) -> Option<DrawMark> {
+        self.stage.is_none().then(|| DrawMark {
+            rng: self.rng.clone(),
+        })
+    }
+
+    /// Put the sampler back to `mark` ([`Self::mark`]).
+    pub fn rewind(&mut self, mark: DrawMark) {
+        self.rng = mark.rng;
     }
 
     /// The processors this sampler runs, when any is active. A caller whose

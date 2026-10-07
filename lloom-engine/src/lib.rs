@@ -19,7 +19,10 @@
 //! caller (`RESTRUCTURING_DESIGN.md` §1.9, §10.1 wave F).
 
 pub mod batch;
+pub mod couplings;
 pub mod decode;
+pub mod option_schema;
+pub mod option_tree;
 pub mod options;
 #[cfg(feature = "serve")]
 pub mod app;
@@ -37,8 +40,10 @@ pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingArm, RingPool, Stop,
 };
 pub use options::{
-    DecodeConfig, EngineOptions, EosKind, ExecutorConfig, MemoryConfig, ModelConfig, PrefillConfig,
-    ReadbackConfig, ReadbackKind, SamplingConfig, SpeculativeConfig, TuningOptions,
+    BenchConfig, DecodeConfig, EngineOptions, EosKind, ExecutorConfig, LoadConfig, MemoryConfig,
+    ModelConfig, PrefillConfig, PrefixConfig, PromptConfig, ReadbackConfig, ReadbackKind,
+    ReasoningConfig, ReportConfig, SamplingConfig, SchedulerConfig, ServerConfig,
+    SpeculativeConfig, TuningOptions,
 };
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

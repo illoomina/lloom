@@ -5579,13 +5579,13 @@ impl super::moe::PlanHook for JoinHook {
     }
 }
 
-/// `QWEN4EXP_REPLAY=device` (read once): a decode step that missed replays
+/// `weights.experts.replay_arming = device` (read once): a decode step that missed replays
 /// on the device plan, the plan staying armed (#849 D's base, #892's
 /// follow-up); the default replays on the host plan and disarms, as
 /// before — the maintainer decides the default on the numbers.
 fn replay_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.replay == "device")
 }
 
 /// Whether a decode driver may take the device plan's settles
@@ -5700,12 +5700,12 @@ fn fetch_exit() -> usize {
     *N.get_or_init(|| crate::tuning::tuning().stream.fetch_exit.max(1))
 }
 
-/// `QWEN4EXP_PREDICT=hotlist` (read once): before a device-planned token
+/// `weights.experts.predict = hotlist` (read once): before a device-planned token
 /// the tiers stage the hotlist's experts not resident and the plan lands
 /// them (#849's D with the hotlist's prediction); off by default.
 fn predict_hot() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.predict == "hotlist")
 }
 
 /// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.

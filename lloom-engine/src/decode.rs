@@ -1822,8 +1822,10 @@ mod tests {
                             let cli = Cli::parse_from(
                                 std::iter::once("t".to_string()).chain(argv.iter().cloned()),
                             );
-                            let config = match crate::app::resolve_options_uninstalled(&cli.common)
-                            {
+                            let config = match crate::app::resolve_options_uninstalled(
+                                &cli.common,
+                                &crate::app::no_front,
+                            ) {
                                 Err(e) => return Ok(Err(e.to_string())),
                                 Ok(o) => o.decode,
                             };

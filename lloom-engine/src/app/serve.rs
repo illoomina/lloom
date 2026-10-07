@@ -43,7 +43,6 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -57,72 +56,47 @@ the same pattern every time, only the position moving. A benchmark that wants a 
 exact length repeats a passage like this one until the count is met, because the count is the \
 work and the words are not. ";
 
-/// The serving flags. The model flags (`--model`, the family's own knobs)
-/// are [`super::ModelArgs`], shared with `lloom chat`.
+/// The serving flags: the option layers and the tree's flags, the socket,
+/// the batch and the prefix reuse.
 #[derive(Parser)]
 #[command(
     name = "lloom serve",
-    about = "Serve a checkpoint (LFM2 or Qwen4-exp) over an OpenAI-compatible endpoint and the pipette benchmark sidecar contract"
+    about = "Serve a checkpoint (LFM2 or Qwen4-exp) over an OpenAI-compatible endpoint and the pipette benchmark sidecar contract",
+    after_help = super::OPTIONS_HELP
 )]
 pub struct ServeArgs {
     #[command(flatten)]
-    pub model: super::ModelArgs,
-
-    /// Bind address. Loopback: this is a sidecar, not a public server.
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-
-    /// Port; 0 picks a free one. The bound port is in the ready marker.
-    #[arg(long, default_value_t = 0)]
-    port: u16,
-
-    /// The option layers: `--config`, `--decode-config`, `--set`, and the
-    /// generated flags (`--readback`, `--lookahead`, `--commit-budget`,
-    /// `--prefill-tile`, `--prefill-chunk`, …).
-    #[command(flatten)]
     pub common: super::CommonArgs,
+    #[command(flatten)]
+    pub server: crate::options::ServerConfigArgs,
+    #[command(flatten)]
+    pub scheduler: crate::options::SchedulerConfigArgs,
+    #[command(flatten)]
+    pub prefix: crate::options::PrefixConfigArgs,
+    #[command(flatten)]
+    pub report: crate::options::ReportConfigArgs,
+}
 
-    /// Reuse the cached prefix across requests (`Session::prepare`). Off by
-    /// default: a benchmark measures a cold prefill per request.
-    #[arg(long)]
-    reuse_prefix: bool,
+impl ServeArgs {
+    /// `serve`'s own flags, as the top layer.
+    pub fn front(&self, o: &mut crate::EngineOptions) -> std::result::Result<(), String> {
+        self.server.apply(&mut o.server)?;
+        self.scheduler.apply(&mut o.scheduler)?;
+        self.prefix.apply(&mut o.prefix)?;
+        self.report.apply(&mut o.report)
+    }
+}
 
-    /// A file whose text is tiled into the throughput cells' prompts. Falls
-    /// back to `PIPETTE_PROMPT_SEED_TEXT` / `PIPETTE_MLX_PROMPT_SEED_TEXT`, then
-    /// a built-in passage.
-    #[arg(long)]
-    prompt_seed_file: Option<PathBuf>,
-
-    /// The batch width: how many requests decode together, one weight sweep
-    /// per step for all of them (issue #148). `1` is the single-sequence
-    /// crown loop; `N > 1` starts the continuous-batching scheduler with `N`
-    /// sequences and lets the benchmark cells take `batch` up to `N`.
-    #[arg(long, default_value_t = 1)]
-    batch: usize,
-
-    /// Sample the memory gauges at 10 ms around every benchmark cell and
-    /// report the peaks (`mem` on the response). A gauge run — it perturbs
-    /// the timing it sits beside — so off by default; `/health` reads the
-    /// gauges once at any time.
-    #[arg(long)]
-    mem_sample: bool,
-
-    /// How the rows of `--batch N` hold their state: `pool` (one shared
-    /// paged pool, the attention and conv of the batch in one dispatch per
-    /// kernel — the default at `N > 1`, under `--dspark` too, where it is
-    /// the continuous speculative loop), `pool-per-row` (the same pool, the
-    /// per-row loop: the A/B arm), `private` (a crown cache per row; under
-    /// `--dspark` the static pipelined driver).
-    #[arg(long, default_value = "auto")]
-    rows: String,
-
-    /// Share a request's prompt prefix from another row's cache, by page —
-    /// an idle slot's or a live row's; a request whose prefix a live row is
-    /// still feeding waits for it (`batched-decode-design.md` §12.3). The
-    /// `pool` arms only. Off by default: the benchmark cells feed one prompt
-    /// to every row and would otherwise measure the share.
-    #[arg(long)]
-    share_prefix: bool,
+/// The prompt seed for the throughput cells: the file, the pipette's env
+/// seed, then the built-in passage.
+fn seed_text(file: Option<&std::path::Path>) -> Result<String> {
+    Ok(match file {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("reading the prompt seed {}", p.display()))?,
+        None => std::env::var("PIPETTE_PROMPT_SEED_TEXT")
+            .or_else(|_| std::env::var("PIPETTE_MLX_PROMPT_SEED_TEXT"))
+            .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
+    })
 }
 
 /// State shared by every request thread.
@@ -142,38 +116,18 @@ struct Shared {
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
-    let mut options = super::resolve_options(&args.common)?;
-    let seed_text = match &args.prompt_seed_file {
-        Some(p) => std::fs::read_to_string(p)
-            .with_context(|| format!("reading the prompt seed {}", p.display()))?,
-        None => std::env::var("PIPETTE_PROMPT_SEED_TEXT")
-            .or_else(|_| std::env::var("PIPETTE_MLX_PROMPT_SEED_TEXT"))
-            .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
-    };
-
-    let batched = args.batch > 1;
+    let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
+    let batched = options.scheduler.max_sequences > 1;
     // The CHUNK defaults to 512 at `N > 1` (the interleaved prefill), whole
     // prompts at `N = 1`.
     if batched && options.decode.prefill.chunk == 0 {
         options.decode.prefill.chunk = 512;
     }
     let load_start = Instant::now();
-    let (engine, model_path) = super::load_engine(
-        &args.model,
-        super::Shape {
-            decode: options.decode.clone(),
-            model: options.model.clone(),
-            speculative: options.speculative.clone(),
-            executor: options.executor.clone(),
-            memory: options.memory.clone(),
-            reuse_prefix: args.reuse_prefix,
-            seed_text,
-            batch: args.batch,
-            mem_sample: args.mem_sample,
-            rows: args.rows.clone(),
-            share_prefix: args.share_prefix,
-        },
-    )?;
+    let shape = super::Shape::of(&options, false, seed_text);
+    let reuse_prefix = shape.reuse_prefix;
+    let (engine, model_path) = super::load_engine(&options.load, shape)?;
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config().as_ref());
@@ -188,18 +142,19 @@ pub fn run(args: ServeArgs) -> Result<()> {
         engine.device(),
         engine.kv_capacity(),
         engine.readback().name(),
-        args.reuse_prefix,
+        reuse_prefix,
         engine.describe(),
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
+    let (host, port) = (options.server.host.clone(), options.server.port);
 
-    let server = Server::http((args.host.as_str(), args.port))
-        .map_err(|e| anyhow::anyhow!("binding {}:{}: {e}", args.host, args.port))?;
+    let server = Server::http((host.as_str(), port))
+        .map_err(|e| anyhow::anyhow!("binding {host}:{port}: {e}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
         #[allow(unreachable_patterns)]
-        _ => args.port,
+        _ => port,
     };
     let shared = Arc::new(Shared {
         engine,
@@ -212,12 +167,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
     // else on stdout before it. Everything the operator reads goes to stderr.
-    println!(
-        "{}",
-        json!({"kind": "ready", "host": args.host, "port": port})
-    );
+    println!("{}", json!({"kind": "ready", "host": host, "port": port}));
     std::io::stdout().flush().ok();
-    eprintln!("[serving on http://{}:{port}]", args.host);
+    eprintln!("[serving on http://{host}:{port}]");
 
     loop {
         let request = match shared.server.recv() {
@@ -2080,109 +2032,33 @@ fn load_warnings_json(engine: &dyn Served) -> Value {
 #[derive(Parser)]
 #[command(
     name = "lloom bench",
-    about = "Run the benchmark cells, or a multi-sequence mode, in-process"
+    about = "The benchmark cells (the pipette sidecar's) in-process, both families; or a multi-sequence mode",
+    after_help = super::OPTIONS_HELP
 )]
 pub struct BenchArgs {
     #[command(flatten)]
-    pub model: super::ModelArgs,
-
-    #[command(flatten)]
     pub common: super::CommonArgs,
-
-    /// The cells, comma-separated: `prefill:P`, `decode:P:D`, `e2e:P:D`, `memory:P:D`
-    /// (P prompt tokens, D decode tokens).
-    #[arg(
-        long,
-        default_value = "prefill:512,decode:512:100,e2e:8:64,memory:512:100"
-    )]
-    pub cells: String,
-
-    /// Runs per cell (the first is the cold one).
-    #[arg(long, default_value_t = 2)]
-    pub runs: usize,
-
-    /// The batch width the engine is loaded for; the cells take `batch` up to it.
-    #[arg(long, default_value_t = 1)]
-    pub batch: usize,
-
-    /// How the rows of `--batch N` hold their state (`auto | pool | pool-per-row | private`).
-    #[arg(long, default_value = "auto")]
-    pub rows: String,
-
-    /// Reuse the cached prefix across cells.
-    #[arg(long)]
-    pub reuse_prefix: bool,
-
-    /// Sample the memory gauges around every cell (a gauge run).
-    #[arg(long)]
-    pub mem_sample: bool,
-
-    /// Share a prompt prefix between rows (the pool arms).
-    #[arg(long)]
-    pub share_prefix: bool,
-
-    /// A file whose text is tiled into the cells' prompts.
-    #[arg(long)]
-    pub prompt_seed_file: Option<PathBuf>,
-
-    /// `cells` (the cells above), or a multi-sequence mode on LFM2: `reuse` (a
-    /// two-turn conversation through prefix reuse against a fresh prefill;
-    /// are the turn-2 streams identical, and turn 2's TTFT on each) or
-    /// `concurrent` (`--sequences` conversations on one model — the
-    /// time-sliced interleave, `--batched`, or the pipelined speculative
-    /// driver under `--dspark` — each stream checked against its solo run).
-    #[arg(long, default_value = "cells", value_name = "cells|reuse|concurrent")]
-    pub mode: String,
-
-    /// `--mode concurrent`: how many sequences. The prompts are a varied set
-    /// of eight from the workloads corpus, cycled past eight.
-    #[arg(long, default_value_t = 2)]
-    pub sequences: usize,
-
-    /// `--mode concurrent`: drive the sequences through the batched-forward
-    /// driver — one `m = B` forward per step for every live sequence —
-    /// against each prompt run solo on the selected readback arm.
-    #[arg(long)]
-    pub batched: bool,
-
-    /// `--mode concurrent --batched`: skip the neighbour-independence arm
-    /// (the rows re-run as two separately batched halves).
-    #[arg(long)]
-    pub no_independence_check: bool,
-
-    /// `--mode concurrent --batched`: skip the solo arm; the identity
-    /// columns then read `false`.
-    #[arg(long)]
-    pub skip_solo: bool,
-
     #[command(flatten)]
-    pub gate: super::modes::GateConfigArgs,
+    pub bench: crate::options::BenchConfigArgs,
+    #[command(flatten)]
+    pub scheduler: crate::options::SchedulerConfigArgs,
+    #[command(flatten)]
+    pub prefix: crate::options::PrefixConfigArgs,
+    #[command(flatten)]
+    pub report: crate::options::ReportConfigArgs,
+    #[command(flatten)]
+    pub pipette: crate::options::PipetteConfigArgs,
+}
 
-    /// `--mode concurrent`: tokens per visit on the time-sliced interleave.
-    #[arg(long, default_value_t = 16)]
-    pub chunk: usize,
-
-    /// `--mode concurrent`: sequence `i` arrives at round (interleave) or
-    /// step (`--batched`) `i × N`; 0 admits every sequence at once.
-    #[arg(long, default_value_t = 0)]
-    pub stagger: usize,
-
-    /// `--mode concurrent`: give the last sequence a synthetic prompt of
-    /// exactly this many body tokens, so a long prompt arrives beside the
-    /// short ones; 0 keeps the corpus prompt.
-    #[arg(long, default_value_t = 0)]
-    pub long_prompt_tokens: usize,
-
-    /// `--mode concurrent`: which arm runs first — `solo`, or `pipelined`
-    /// (`--dspark`) / `batched` (`--batched`) — so a rotation can alternate
-    /// the order.
-    #[arg(long, default_value = "solo")]
-    pub first: String,
-
-    /// `--mode concurrent --dspark`: write every round of both arms as CSV
-    /// (`arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted`).
-    #[arg(long, value_name = "PATH")]
-    pub timeline: Option<PathBuf>,
+impl BenchArgs {
+    /// `bench`'s own flags, as the top layer.
+    pub fn front(&self, o: &mut crate::EngineOptions) -> std::result::Result<(), String> {
+        self.bench.apply(&mut o.bench)?;
+        self.scheduler.apply(&mut o.scheduler)?;
+        self.prefix.apply(&mut o.prefix)?;
+        self.report.apply(&mut o.report)?;
+        self.pipette.apply(&mut o.server.pipette)
+    }
 }
 
 /// One cell of `--cells`.
@@ -2241,49 +2117,28 @@ impl Cell {
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {
-    let mode = match args.mode.as_str() {
-        "cells" => None,
+    let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    super::report::arm_trace();
+    let mode = match options.bench.mode.as_str() {
         "reuse" => Some(super::modes::Mode::Reuse),
         "concurrent" => Some(super::modes::Mode::Concurrent),
-        other => anyhow::bail!("--mode {other}: cells | reuse | concurrent"),
+        _ => None,
     };
     if let Some(mode) = mode {
-        return bench_mode(args, mode);
+        return bench_mode(&args, mode, options);
     }
-    let cells = Cell::parse_list(&args.cells)?;
+    let cells = Cell::parse_list(&options.bench.cells)?;
     if cells.is_empty() {
         anyhow::bail!("--cells names no cell");
     }
-    let mut options = super::resolve_options(&args.common)?;
-    super::report::arm_trace();
-    let seed_text = match &args.prompt_seed_file {
-        Some(p) => std::fs::read_to_string(p)
-            .with_context(|| format!("reading the prompt seed {}", p.display()))?,
-        None => std::env::var("PIPETTE_PROMPT_SEED_TEXT")
-            .or_else(|_| std::env::var("PIPETTE_MLX_PROMPT_SEED_TEXT"))
-            .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
-    };
-    let batched = args.batch > 1;
+    let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
+    let batched = options.scheduler.max_sequences > 1;
     if batched && options.decode.prefill.chunk == 0 {
         options.decode.prefill.chunk = 512;
     }
     let load_start = Instant::now();
-    let (engine, model_path) = super::load_engine(
-        &args.model,
-        super::Shape {
-            decode: options.decode.clone(),
-            model: options.model.clone(),
-            speculative: options.speculative.clone(),
-            executor: options.executor.clone(),
-            memory: options.memory.clone(),
-            reuse_prefix: args.reuse_prefix,
-            seed_text: seed_text.clone(),
-            batch: args.batch,
-            mem_sample: args.mem_sample,
-            rows: args.rows.clone(),
-            share_prefix: args.share_prefix,
-        },
-    )?;
+    let shape = super::Shape::of(&options, false, seed_text);
+    let (engine, model_path) = super::load_engine(&options.load, shape)?;
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config().as_ref());
@@ -2312,8 +2167,8 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         model_name: model_name.clone(),
         sampling,
     };
-    let batch = args.batch.max(1);
-    for run in 0..args.runs.max(1) {
+    let batch = options.scheduler.max_sequences.max(1);
+    for run in 0..options.bench.runs.max(1) {
         for cell in &cells {
             let started = Instant::now();
             let out = match cell {
@@ -2378,29 +2233,22 @@ pub fn bench(args: BenchArgs) -> Result<()> {
 }
 
 /// `lloom bench --mode reuse | concurrent`: resolve the mode's knobs, load
-/// the engine at `--batch 1` on the arms the mode needs, and run it.
-fn bench_mode(args: BenchArgs, mode: super::modes::Mode) -> Result<()> {
-    let mut options = super::resolve_options(&args.common)?;
-    super::report::arm_trace();
-    let gate = super::modes::GateConfig::resolve(&args.gate)?;
-    let spec = resolve_mode(&args, mode, &mut options, &gate)?;
+/// the engine at one sequence on the arms the mode needs, and run it.
+fn bench_mode(
+    args: &BenchArgs,
+    mode: super::modes::Mode,
+    mut options: crate::EngineOptions,
+) -> Result<()> {
+    let spec = resolve_mode(args, mode, &mut options)?;
     let load_start = Instant::now();
-    let (engine, model_path) = super::load_engine(
-        &args.model,
-        super::Shape {
-            decode: options.decode.clone(),
-            model: options.model.clone(),
-            speculative: options.speculative.clone(),
-            executor: options.executor.clone(),
-            memory: options.memory.clone(),
-            reuse_prefix: false,
-            seed_text: DEFAULT_SEED_TEXT.to_string(),
-            batch: 1,
-            mem_sample: false,
-            rows: "auto".into(),
-            share_prefix: false,
-        },
-    )?;
+    let mut shape = super::Shape::of(&options, false, DEFAULT_SEED_TEXT.to_string());
+    shape.reuse_prefix = false;
+    shape.batch = 1;
+    shape.mem_sample = false;
+    shape.rows = "auto".into();
+    shape.share_prefix = false;
+    let mem_sample = options.report.memory_sample;
+    let (engine, model_path) = super::load_engine(&options.load, shape)?;
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; {}]",
         engine.model_name(),
@@ -2409,10 +2257,10 @@ fn bench_mode(args: BenchArgs, mode: super::modes::Mode) -> Result<()> {
         engine.device(),
         engine.describe(),
     );
-    let gauge = super::common::MemGauge::start(engine.device(), args.mem_sample);
+    let gauge = super::common::MemGauge::start(engine.device(), mem_sample);
     let out = engine.run_mode(&spec);
     let mem = gauge.finish(engine.device());
-    if args.mem_sample {
+    if mem_sample {
         super::report::print_mempeak(&mem);
     }
     #[cfg(feature = "metal")]
@@ -2435,8 +2283,8 @@ fn resolve_mode(
     args: &BenchArgs,
     mode: super::modes::Mode,
     options: &mut crate::EngineOptions,
-    gate: &super::modes::GateConfig,
 ) -> Result<super::modes::ModeSpec> {
+    let b = options.bench.clone();
     if options.speculative.method == "auto" {
         anyhow::bail!(
             "speculative.method = auto is resolved when the model loads; lloom bench's modes \
@@ -2447,8 +2295,8 @@ fn resolve_mode(
     let decode = &options.decode;
     // The flag only: the env alias is process-wide, set once for a gate
     // script's every arm, most of which have no rows gate to read it.
-    let rows_gate = mode == super::modes::Mode::Concurrent && args.batched;
-    if args.gate.fail_on_gate.is_some() && !rows_gate {
+    let rows_gate = mode == super::modes::Mode::Concurrent && b.batched;
+    if args.bench.fail_on_gate.is_some() && !rows_gate {
         anyhow::bail!(
             "--fail-on-gate is read by the rows gate, `--mode concurrent --batched`; \
              --mode {}{} prints no gate verdict",
@@ -2460,7 +2308,7 @@ fn resolve_mode(
             }
         );
     }
-    if args.batch > 1 {
+    if options.scheduler.max_sequences > 1 {
         anyhow::bail!(
             "--mode {} drives its own sequences (`--sequences`); --batch starts the serving \
              scheduler, which is `lloom serve --batch N` / the cells",
@@ -2474,7 +2322,7 @@ fn resolve_mode(
             mode.name()
         );
     }
-    if args.batched && dspark {
+    if b.batched && dspark {
         anyhow::bail!(
             "--batched drives the K=1 batched-forward body; a batched verify is not built \
              (speculative-pipeline-scheduler-design.md §4b). Pick one of --batched / --dspark"
@@ -2494,10 +2342,10 @@ fn resolve_mode(
         );
     }
     let rows = super::lfm2::RowsArm::parse(
-        if args.rows == "auto" {
+        if options.scheduler.rows == "auto" {
             "private"
         } else {
-            &args.rows
+            &options.scheduler.rows
         },
         true,
     )?;
@@ -2530,23 +2378,23 @@ fn resolve_mode(
         readback,
         lookahead: decode.readback.lookahead,
         commit_budget: decode.readback.commit_budget,
-        sequences: args.sequences,
-        chunk: args.chunk,
+        sequences: b.sequences,
+        chunk: b.chunk,
         prefill_ubatch: decode.prefill.ubatch,
         // The speculative drivers' seed does not read the tile.
         prefill_tile: if dspark { 0 } else { decode.prefill.tile },
         prefill_chunk: decode.prefill.chunk,
         pass_widths: decode.prefill.pass_widths,
-        stagger: args.stagger,
-        long_prompt_tokens: args.long_prompt_tokens,
+        stagger: b.stagger,
+        long_prompt_tokens: b.long_prompt_tokens,
         dspark,
-        batched: args.batched,
+        batched: b.batched,
         rows,
-        check_independence: !args.no_independence_check,
-        skip_solo: args.skip_solo,
-        fail_on_gate: gate.fail_on_gate,
-        first: args.first.clone(),
-        timeline: args.timeline.clone(),
+        check_independence: b.independence_check,
+        skip_solo: b.skip_solo,
+        fail_on_gate: b.fail_on_gate,
+        first: b.first.clone(),
+        timeline: b.timeline.clone(),
     })
 }
 
@@ -2562,18 +2410,15 @@ mod bench_mode_tests {
         let mut full = vec!["lloom bench"];
         full.extend_from_slice(argv);
         let args = BenchArgs::try_parse_from(full)?;
-        let mut o = super::super::resolve_options_uninstalled(&args.common)?;
-        let mode = match args.mode.as_str() {
+        // Without the env layer: `modes.rs`'s env tests set variables, and a
+        // process-wide read here would race them.
+        let front = |o: &mut crate::EngineOptions| args.front(o);
+        let (mut o, _) = super::super::resolve_layers(&args.common, &front, &|_| None, false)?;
+        let mode = match o.bench.mode.as_str() {
             "reuse" => Mode::Reuse,
             _ => Mode::Concurrent,
         };
-        // The gate group without its env layer: `modes.rs`'s env-alias test
-        // sets the variable, and a process-wide read here would race it.
-        let mut gate = crate::app::modes::GateConfig::default();
-        args.gate
-            .apply(&mut gate)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let spec = resolve_mode(&args, mode, &mut o, &gate)?;
+        let spec = resolve_mode(&args, mode, &mut o)?;
         Ok((spec, o))
     }
 

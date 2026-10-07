@@ -1298,7 +1298,12 @@ pub struct Config {
         flag = "attn",
         variants = ["Generic", "Sdpa", "FlashDecoding"],
         default = "Generic",
-        parser = "AttnImpl::parse"
+        parser = "AttnImpl::parse",
+        path = "kernels.attention.impl",
+        status = "advanced",
+        cli = "attn",
+        arms = ["generic", "sdpa", "flash"],
+        doc = "The attention kernel a decode step takes: `generic` (the composed attention), `sdpa` (the vector kernel) or `flash` (FlashDecoding over the contiguous cache or the page pool); unset = the preset's."
     )]
     pub attn_impl: AttnImpl,
     /// KV tokens per **page** — the allocation granularity — for
@@ -1347,7 +1352,11 @@ pub struct Config {
         flag = "flash-scratch-sizing",
         variants = ["Grow", "Reserve", "Bucket"],
         default = "Grow",
-        parser = "FlashScratchSizing::parse"
+        parser = "FlashScratchSizing::parse",
+        path = "kernels.attention.flash.scratch",
+        status = "arm",
+        arms = ["grow", "reserve", "bucket"],
+        doc = "How FlashDecoding's partial scratch is sized: `grow`, `reserve` or `bucket`; unset = the preset's."
     )]
     pub flash_scratch_sizing: FlashScratchSizing,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
@@ -1356,7 +1365,11 @@ pub struct Config {
         flag = "kv-append",
         variants = ["Cat", "InPlace", "Paged"],
         default = "Cat",
-        parser = "KvAppend::parse"
+        parser = "KvAppend::parse",
+        path = "context.kv.layout",
+        status = "advanced",
+        arms = ["cat", "in-place", "paged"],
+        doc = "How a step's keys and values join the KV cache: `cat` (a grown tensor), `in-place` (a preallocated slab) or `paged` (the page pool); unset = the preset's."
     )]
     pub kv_append: KvAppend,
     /// Whether the KV cache stores integer codes, and at which width
@@ -1376,7 +1389,13 @@ pub struct Config {
         flag = "kv-quant",
         variants = ["Off", "Int8", "Int4"],
         default = "Off",
-        parser = "KvQuant::parse"
+        parser = "KvQuant::parse",
+        path = "context.kv.dtype",
+        status = "stable",
+        cli = "kv-dtype",
+        aliases = ["kv-cache-dtype"],
+        arms = ["off", "f16", "int8", "int4"],
+        doc = "The KV store: `off` (the family's own dtype), `f16`, `int8` or `int4` (codes, Metal only); unset = the family's."
     )]
     pub kv_quant: KvQuant,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
@@ -1385,7 +1404,11 @@ pub struct Config {
         flag = "conv-state",
         variants = ["Shuffle", "SlidingRing", "RotatingRing"],
         default = "Shuffle",
-        parser = "ConvState::parse"
+        parser = "ConvState::parse",
+        path = "models.lfm2.conv_state",
+        status = "arm",
+        arms = ["shuffle", "ring[:<K>[:<slack>]]", "rotating[:<K>]"],
+        doc = "How the short convolution keeps its state: `shuffle`, `ring[:<K>[:<slack>]]` or `rotating[:<K>]`; unset = the preset's."
     )]
     pub conv_state: ConvState,
     /// `DESIGN.md` §9.5's memory budget. `None` — admission off — by default,
@@ -1414,7 +1437,7 @@ pub struct Config {
     /// discriminator: SiLU is applied to the f32 accumulator where the
     /// `silu_f16` dispatch it replaces applies it at `T` to the rounded store
     /// (§12.2d). It is not gated on an unchanged digest.
-    #[axis(name = "GemvSilu", flag = "gemv-silu", variants = ["off", "on"], default = "off", bool)]
+    #[axis(name = "GemvSilu", flag = "gemv-silu", variants = ["off", "on"], default = "off", bool, path = "kernels.fusion.gemv_silu", status = "arm", doc = "The SiLU on the gate projection's GEMV store; unset = the preset's.")]
     pub gemv_silu: bool,
     /// Fuse the two residual adds onto their producing GEMV's store (#509's
     /// kernel, wired by #509).
@@ -1432,7 +1455,7 @@ pub struct Config {
     ///
     /// **This arm moves the digests by construction** (§12.2h): the add is at
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
-    #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool)]
+    #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool, path = "kernels.fusion.gemv_residual", status = "arm", doc = "The two residual adds on their producing GEMV's store; unset = the preset's.")]
     pub gemv_residual: bool,
     /// How the SwiGLU product `silu(w1(x)) * w3(x)` is dispatched (issue
     /// #732, `DESIGN.md` §12.2e row 3b, §12.2 row 5): `off` — `w3`'s GEMV
@@ -1450,7 +1473,11 @@ pub struct Config {
         flag = "gemv-gate",
         variants = ["off", "mul", "swiglu"],
         default = "off",
-        parser = "GateFusion::parse"
+        parser = "GateFusion::parse",
+        path = "kernels.fusion.gemv_gate",
+        status = "arm",
+        arms = ["off", "mul", "swiglu"],
+        doc = "How the SwiGLU product is dispatched: `off` (a GEMV and a multiply), `mul` (the multiply on the up projection's store) or `swiglu` (the whole product in one GEMV); unset = the preset's."
     )]
     pub gemv_gate: GateFusion,
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
@@ -1461,7 +1488,7 @@ pub struct Config {
     /// is on the dispatch axis: ~2–3 dispatches per conv layer become 1, and
     /// LFM2 has 22 conv layers, so it is the largest single dispatch reduction
     /// the catalogue leaves open (llama.cpp's decode conv is one kernel).
-    #[axis(name = "ConvFused", flag = "conv-fused", variants = ["off", "on"], default = "off", bool)]
+    #[axis(name = "ConvFused", flag = "conv-fused", variants = ["off", "on"], default = "off", bool, path = "kernels.fusion.conv", status = "arm", doc = "The fused short-convolution kernels; unset = the preset's.")]
     pub conv_fused: bool,
     /// Carry the conv state across a multi-token pass onto a warm cache, as the
     /// convolution's left context (`DESIGN.md` §13.2f defect 1, issue #677).
@@ -1474,7 +1501,7 @@ pub struct Config {
     /// exactly what one pass over the concatenation computes. **Off by default**
     /// (§7.1a): every recorded `--turns 3` digest belongs to the zero-padded
     /// arm, and flipping it is its own argued decision.
-    #[axis(name = "ConvPrefillCtx", flag = "conv-prefill-ctx", variants = ["off", "on"], default = "off", bool)]
+    #[axis(name = "ConvPrefillCtx", flag = "conv-prefill-ctx", variants = ["off", "on"], default = "off", bool, path = "models.lfm2.conv_prefill_context", status = "arm", doc = "Carry the conv state across a multi-token pass onto a warm cache (forced on wherever a carry is needed); unset = the preset's.")]
     pub conv_prefill_ctx: bool,
     /// Whether the epilogue fusions are selected by their flags or derived by
     /// the optimizer at construction (issue #732, P1).
@@ -1491,7 +1518,11 @@ pub struct Config {
         flag = "fusion",
         variants = ["Manual", "Derived"],
         default = "Manual",
-        parser = "FusionPolicy::parse"
+        parser = "FusionPolicy::parse",
+        path = "kernels.fusion.policy",
+        status = "arm",
+        arms = ["manual", "derived"],
+        doc = "Who decides the epilogue fusions a decode step takes: `manual` (the flags) or `derived` (the optimizer's plan over the model's walk); unset = each family's own."
     )]
     pub fusion: FusionPolicy,
     /// How the Q/K/V `transpose` views reach the norms and the KV append
@@ -1501,7 +1532,11 @@ pub struct Config {
         flag = "qkv-layout",
         variants = ["Contiguous", "Strided", "Fused"],
         default = "Contiguous",
-        parser = "QkvLayout::parse"
+        parser = "QkvLayout::parse",
+        path = "kernels.attention.qkv_layout",
+        status = "arm",
+        arms = ["contiguous", "strided", "fused"],
+        doc = "How the attention projections reach their norms and the KV append: `contiguous`, `strided` or `fused`; unset = the preset's."
     )]
     pub qkv_layout: QkvLayout,
     /// Which layers' **input residual** to capture into [`Cache::taps`], for a
@@ -1570,7 +1605,11 @@ pub struct Config {
         flag = "silu-impl",
         variants = ["Exact", "Recip", "Literal", "Coarse4", "Coarse1", "HardSwish", "Relu"],
         default = "Exact",
-        parser = "parse_silu_impl"
+        parser = "parse_silu_impl",
+        path = "kernels.activation.silu",
+        status = "reference",
+        arms = ["exact", "recip", "literal", "coarse4", "coarse1", "hardswish", "relu"],
+        doc = "The SiLU's arithmetic: `exact` (the shipping arm) or one of the reference approximations `recip`, `literal`, `coarse4`, `coarse1`, `hardswish`, `relu`; unset = the preset's."
     )]
     pub silu_impl: SiluImpl,
 }
@@ -2067,21 +2106,13 @@ impl PagedKv {
         num_layers: usize,
         clock: Arc<GpuClock>,
     ) -> Result<Self> {
-        let env_usize = |name: &str| -> Result<Option<usize>> {
-            match std::env::var(name) {
-                Ok(v) => v.parse::<usize>().map(Some).map_err(|e| {
-                    lloom_tensor::Error::msg(format!("{name}={v:?} is not a page count: {e}"))
-                }),
-                Err(_) => Ok(None),
-            }
-        };
         Ok(Self {
             page_size: config.flash_page_size.max(1),
             pages_per_chunk: config.flash_pages_per_chunk.max(1),
             kv_capacity,
             slab,
-            pool_pages_override: env_usize("LLOOM_148_POOL_PAGES")?,
-            churn_pages: env_usize("LLOOM_148_POOL_CHURN")?.unwrap_or(0),
+            pool_pages_override: crate::tuning::tuning().lfm2.pool_pages,
+            churn_pages: crate::tuning::tuning().lfm2.pool_churn,
             pool: None,
             clock,
             pools: vec![None; num_layers],
@@ -3633,7 +3664,7 @@ fn dump_logits(logits: &Tensor, pos: usize) -> Result<()> {
     use std::sync::OnceLock;
     static SINK: OnceLock<Option<parking_lot::Mutex<std::fs::File>>> = OnceLock::new();
     let sink = SINK.get_or_init(|| {
-        let path = std::env::var_os("LLOOM_LFM2_LOGITS_DUMP")?;
+        let path = crate::tuning::tuning().lfm2.logits_dump.clone()?;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

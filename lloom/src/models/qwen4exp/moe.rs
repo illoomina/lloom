@@ -56,7 +56,7 @@ pub trait PlanHook {
 
 impl PlanHook for () {}
 
-/// `QWEN4EXP_MASK=1` (read once): on a device-planned pass a plane whose
+/// `weights.experts.per_plane_mask` (read once): on a device-planned pass a plane whose
 /// expert the plan found missing contributes nothing to the combine (the
 /// record's flag — #842's C, the mask for an unpredicted miss): the pass
 /// without that expert, defined and finite, instead of slot 0's expert
@@ -64,10 +64,10 @@ impl PlanHook for () {}
 /// Off by default: the combine kernel is the plain one.
 pub fn mask_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_MASK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.per_plane_mask)
 }
 
-/// `QWEN4EXP_READY_FIRST=1` (read once): a host-planned tile's groups run
+/// `weights.experts.readiness_order` (read once): a host-planned tile's groups run
 /// in readiness order — the group with the fewest experts to load first —
 /// so the later groups' loads overlap the earlier groups' compute the
 /// longest (`profiles-and-memory-design.md` §4.8 "the schedule covers the
@@ -77,7 +77,7 @@ pub fn mask_on() -> bool {
 /// order: the rows'.
 pub fn ready_first_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_READY_FIRST").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.ready_first)
 }
 
 /// Tiles whose groups ran in an order other than the rows' (the arm's

@@ -8,7 +8,7 @@
 //! wrong — `served.rs`). `Served` stays the `dyn`-per-request seam; nothing
 //! here is on the token path.
 
-use super::{lfm2, qwen4exp, ModelArgs, Served, Shape};
+use super::{lfm2, qwen4exp, LoadConfig, Served, Shape};
 #[allow(unused_imports)]
 use anyhow::Context as _;
 use anyhow::{Context, Result};
@@ -129,7 +129,7 @@ const KV_QUANT_AXIS: &str = "kv-quant";
 
 /// What a run asked for: the family's own load flags and the option groups.
 pub struct Requested<'a> {
-    pub model: &'a ModelArgs,
+    pub model: &'a LoadConfig,
     pub shape: Shape,
 }
 
@@ -263,6 +263,13 @@ fn qwen_kv_precision(
         .transpose()
 }
 
+/// The `fusion` axis written by the merged key `kernels.fusion.policy`
+/// (which sets every family's policy at once): its value is also the
+/// process's Qwen4-exp policy. The LFM2-only spellings set the axis alone.
+fn merged_fusion(axis: &str, value: &str) -> bool {
+    axis == "fusion" && lloom::tuning::tuning().qwen4exp.fusion == value
+}
+
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
@@ -280,9 +287,9 @@ fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let config_axes: Vec<&str> = s
         .model
         .axes
-        .keys()
-        .map(String::as_str)
-        .filter(|k| *k != KV_QUANT_AXIS)
+        .iter()
+        .filter(|(k, v)| *k != KV_QUANT_AXIS && !merged_fusion(k, v))
+        .map(|(k, _)| k.as_str())
         .collect();
     if !cap.model_axes && (!config_axes.is_empty() || s.model.cache != "auto") {
         anyhow::bail!(
@@ -336,13 +343,13 @@ impl Family for Lfm2Family {
         let spec = &shape.speculative;
         lfm2::load(lfm2::LoadOptions {
             model_dir: dir,
-            cpu: model.cpu,
+            cpu: model.cpu(),
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
             model: shape.model.clone(),
             reuse_prefix: shape.reuse_prefix,
-            warmup: !model.no_warmup,
+            warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
             batch: shape.batch,
@@ -433,7 +440,7 @@ impl Family for Qwen4ExpFamily {
                     s.batch
                 );
             }
-            if p.quant().is_on() && req.model.cpu {
+            if p.quant().is_on() && req.model.cpu() {
                 anyhow::bail!(
                     "kv-quant = {p:?} is Metal-only (the quantized append and reads are Metal kernels)"
                 );
@@ -447,12 +454,12 @@ impl Family for Qwen4ExpFamily {
         qwen4exp::load(qwen4exp::LoadOptions {
             first_shard: first,
             tokenizer: model.tokenizer.clone(),
-            cpu: model.cpu,
+            cpu: model.cpu(),
             kv_capacity: shape.memory.kv_capacity,
             readback: shape.decode.readback.arm(),
             decode: shape.decode.clone(),
             reuse_prefix: shape.reuse_prefix,
-            warmup: !model.no_warmup,
+            warmup: model.warmup,
             seed_text: shape.seed_text.clone(),
             model_name: model.model_name.clone(),
             prefill_tile: shape.decode.prefill.tile,
@@ -462,7 +469,7 @@ impl Family for Qwen4ExpFamily {
             slots: shape.memory.slots.clone(),
             loader: model.loader.clone(),
             ple_cache_rows: model.ple_cache_rows,
-            ple: !model.no_ple,
+            ple: model.ple,
             moe_act: model.moe_act.clone(),
             mtp: (spec.method == "mtp").then(|| spec.drafter.clone()).flatten(),
             dflash: (spec.method == "dflash").then(|| spec.drafter.clone().unwrap_or_default()),
@@ -547,7 +554,7 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
 }
 
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
-pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     let path = match &model.model {
         Some(p) => p.clone(),
         None => lfm2::default_model_dir()
@@ -557,6 +564,8 @@ pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf
     let mut shape = shape;
     if let Some(note) = resolve_auto_speculation(family.name(), &mut shape) {
         eprintln!("[speculate: {note}]");
+        crate::couplings::refuse_speculative(&shape.speculative.method, &shape.sampling)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
     if let Some(note) = &clamp {
@@ -586,15 +595,17 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn model_args(argv: &[&str]) -> ModelArgs {
+    fn model_args(argv: &[&str]) -> LoadConfig {
         #[derive(Parser)]
         struct T {
             #[command(flatten)]
-            m: ModelArgs,
+            m: crate::options::LoadConfigArgs,
         }
         let mut full = vec!["t"];
         full.extend_from_slice(argv);
-        T::parse_from(full).m
+        let mut m = LoadConfig::default();
+        T::parse_from(full).m.apply(&mut m).unwrap();
+        m
     }
 
     fn shape() -> Shape {
@@ -604,6 +615,7 @@ mod tests {
             speculative: Default::default(),
             executor: Default::default(),
             memory: Default::default(),
+            sampling: Default::default(),
             reuse_prefix: false,
             seed_text: String::new(),
             batch: 1,

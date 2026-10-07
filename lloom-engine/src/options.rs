@@ -1208,6 +1208,18 @@ pub struct SpeculativeConfig {
     /// The drafter's weights: a DSpark checkpoint directory (none = the newest LFM2.5-2.6B-DSpark snapshot in the HF cache), a DFlash checkpoint directory (none = the newest PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash snapshot), or the MTP sidecar GGUF (required).
     #[opt(flag = "drafter", path = "speculative.model", status = "stable", cli = "spec-model", aliases = ["draft-dir"])]
     pub drafter: Option<std::path::PathBuf>,
+    /// Reserved: the drafter's own options where it is a checkpoint of the target's family (its own `models.<family>` keys, which today it shares with the target). Not built; any value is refused.
+    #[opt(flag = "spec-draft-overrides", parser = "parse_reserved_overrides", path = "speculative.draft.overrides", status = "advanced")]
+    pub draft_overrides: Option<String>,
+}
+
+/// `speculative.draft.overrides` is a reserved key: the name is the
+/// tree's, the mechanism is not built.
+fn parse_reserved_overrides(v: &str) -> Result<Option<String>, String> {
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    Err("speculative.draft.overrides is reserved: a same-family drafter's own options are not built (it shares the target's)".into())
 }
 
 impl Default for SpeculativeConfig {
@@ -1216,6 +1228,7 @@ impl Default for SpeculativeConfig {
             method: "none".into(),
             k: None,
             drafter: None,
+            draft_overrides: None,
         }
     }
 }

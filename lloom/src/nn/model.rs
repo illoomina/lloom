@@ -117,6 +117,14 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Settle any work a model let trail a step past its return (Qwen4-exp's
+    /// fetching settle behind the next step's encode): the driver calls it
+    /// when a run ends, so the run's bookkeeping and counters are its own.
+    /// The default is a no-op.
+    fn settle_pending(&self, _cache: &mut Self::Cache) -> Result<()> {
+        Ok(())
+    }
+
     fn vocab_size(&self) -> usize;
 }
 

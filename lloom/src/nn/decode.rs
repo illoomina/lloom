@@ -2390,6 +2390,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.model.host_feed_end(&mut self.seq.cache, &published)?;
             stats.host_feed = Some(report);
         }
+        // Work the model let trail the last step (a fetching settle behind
+        // the next encode) is the run's: settled here, after the host fill
+        // could satisfy every wait the forwards encoded.
+        self.model.settle_pending(&mut self.seq.cache)?;
         readback.arm_publish_event(false, false, true)?;
         if all_ids.len() != produced {
             lloom_tensor::bail!(
@@ -3015,6 +3019,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.overrun = overrun;
         stats.overrun = overrun;
         stats.drafter_ctx = spec.context_len(seq).map(|n| (n, self.seq.pos));
+        self.model.settle_pending(&mut self.seq.cache)?;
 
         stats.produced = produced;
         stats.readback = readback.counters();

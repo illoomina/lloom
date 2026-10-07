@@ -153,14 +153,34 @@ impl FetchLane {
         }))
     }
 
-    /// Open a pass: every command buffer before `floor` is known complete,
-    /// so a slot whose last reader ran before it may be written at once.
-    /// The guard ends the pass (see [`FetchPass`]).
+    /// Open a pass at `floor`: the worker writes a slot only once every
+    /// command buffer before it has completed (`floor_settled`). The guard
+    /// ends the pass (see [`FetchPass`]).
     pub fn begin_pass(self: &Arc<Self>, floor: Epoch) -> FetchPass {
         self.lane.state.lock().floor = floor;
         FetchPass {
             lane: Arc::clone(self),
+            upto: None,
+            done: false,
         }
+    }
+
+    /// Wait for every job and stop taking new ones' effects: the model's
+    /// drop, before the tiers the jobs point at go.
+    pub(crate) fn quiesce(&self) {
+        self.drain(true);
+    }
+
+    /// Wait until the first `upto` registered jobs are done.
+    fn wait_done(&self, upto: u64) {
+        let mut g = self.lane.state.lock();
+        while g.done < upto {
+            self.lane.cv.wait(&mut g);
+        }
+    }
+
+    fn registered(&self) -> u64 {
+        self.lane.state.lock().registered
     }
 
     /// Register `tier`'s layer of the open pass and encode the device's
@@ -235,21 +255,37 @@ impl Drop for FetchLane {
     }
 }
 
-/// A fetching pass in progress. Dropped, it waits for the worker to finish
-/// every job the pass registered — at once on success (the device waited
-/// for each), cancelling the rest otherwise — so no job outlives the pass
-/// whose tiers it points at.
+/// A fetching pass in progress. Its jobs are the ones registered up to
+/// [`Self::seal`]: a later pass's jobs may be registered behind them while
+/// this one is still open (the settle trailing the next step's encode).
+/// Finished, it waits for its own jobs only; dropped unfinished (an error
+/// path), it cancels what is pending and waits — so no job outlives the
+/// model whose tiers it points at (the model's drop quiesces the lane too).
 pub struct FetchPass {
     lane: Arc<FetchLane>,
+    upto: Option<u64>,
+    done: bool,
 }
 
 impl FetchPass {
-    /// End the pass after its device work completed: every job is served.
-    pub fn finish(self) {}
+    /// Mark the end of this pass's jobs: everything registered so far.
+    pub fn seal(&mut self) {
+        self.upto = Some(self.lane.registered());
+    }
+
+    /// End the pass after its device work completed: its jobs are served.
+    pub fn finish(mut self) {
+        let upto = self.upto.unwrap_or_else(|| self.lane.registered());
+        self.lane.wait_done(upto);
+        self.done = true;
+    }
 }
 
 impl Drop for FetchPass {
     fn drop(&mut self) {
+        if self.done {
+            return;
+        }
         let pending = {
             let g = self.lane.lane.state.lock();
             g.done < g.registered

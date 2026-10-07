@@ -175,5 +175,68 @@ fn the_waits_stop_once_the_pool_holds_the_stream_metal() -> Result<()> {
         cache.fetch_passes * cfg.n_layers as u64,
         "a step that does not fetch encodes no wait"
     );
+    // The steps after the regime ended are plain device plans, and the
+    // first of them settles the last fetching step's trailing settle.
+    assert!(
+        !streamed.fetch_settle_trailing(),
+        "a non-fetching step ran with a fetching step's settle still trailing"
+    );
+    Ok(())
+}
+
+/// The settle trails (`QWEN4EXP_FETCH_SETTLE=behind`, the default inside
+/// the arm): after every fetching step its records wait for the next step,
+/// so the host encodes step t+1 while the GPU runs step t; the model's next
+/// entry or the driver's run end (`CausalLM::settle_pending`) settles it.
+/// Through `Session::decode` the run ends with nothing trailing.
+#[test]
+fn a_fetching_steps_settle_trails_and_the_run_end_settles_it_metal() -> Result<()> {
+    use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+    arm();
+    let Some((fx, dev)) = fixture("qwen4exp_fetch_trailing_metal")? else {
+        return Ok(());
+    };
+    let cfg = fx.config(|_| {});
+    let opts = LoadOptions::default();
+    let streamed = fx.streamed::<CrownExact>(&cfg, &dev, &opts, &stream(6))?;
+    let mut cache = streamed.new_cache(&cfg, &dev)?;
+    let input = Tensor::from_vec(PROMPT.to_vec(), (1, PROMPT.len()), &dev)?;
+    let mut logits = streamed.forward(&input, 0, &mut cache)?;
+    for step in 0..8 {
+        let row: Vec<f32> = logits.flatten_all()?.to_vec1()?;
+        let next = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m })
+            .0 as u32;
+        let input = Tensor::from_vec(vec![next], (1, 1), &dev)?;
+        logits = streamed.forward(&input, cache.pos, &mut cache)?;
+        assert!(
+            streamed.fetch_settle_trailing(),
+            "step {step}: a fetching step settled before returning"
+        );
+    }
+    streamed.settle_pending(&mut cache)?;
+    assert!(!streamed.fetch_settle_trailing(), "settle_pending left a step trailing");
+    // Through the session: the run's end settles the last step.
+    let cache = streamed.new_cache(&cfg, &dev)?;
+    let mut session = Session::new(&streamed, cache);
+    let eos = [cfg.eos_token_id];
+    let mut rb = Blocking::new(&eos, &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        &PROMPT,
+        &DecodeOptions::new(12),
+        &mut |_| Ok(()),
+    )?;
+    assert!(!out.ids.is_empty());
+    assert!(
+        !streamed.fetch_settle_trailing(),
+        "the session's run ended with a fetching step's settle still trailing"
+    );
     Ok(())
 }

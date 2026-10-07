@@ -119,6 +119,9 @@ fn parse_qsa_window(v: &str) -> Result<String, String> {
 fn parse_plan(v: &str) -> Result<String, String> {
     one_of(v, "expert plan", &["device", "host"])
 }
+fn parse_fetch_settle(v: &str) -> Result<String, String> {
+    one_of(v, "fetch settle", &["behind", "now"])
+}
 fn parse_fetch(v: &str) -> Result<String, String> {
     one_of(v, "expert fetch", &["off", "inside"])
 }
@@ -280,6 +283,9 @@ pub struct StreamTuning {
         parser = "parse_at_least_one"
     )]
     pub fetch_exit: usize,
+    /// When a fetching step settles (`QWEN4EXP_FETCH=inside`): `behind` = after the next step is encoded, so the host encodes step t+1 while the GPU runs step t (the step's misses were loaded inside it, so its settle is bookkeeping; a pass that still computed on a missing expert — past the worker's fail-safe — is an error, not a redo); `now` = at the step's own end, the host waiting for the GPU every step (the previous behaviour).
+    #[opt(flag = "fetch-settle", env = "QWEN4EXP_FETCH_SETTLE", parser = "parse_fetch_settle", variants = ["behind", "now"])]
+    pub fetch_settle: String,
     /// The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`.
     #[opt(
         flag = "fetch-qos",
@@ -308,6 +314,7 @@ impl Default for StreamTuning {
             fetch: "off".into(),
             fetch_poll_us: 50,
             fetch_exit: 8,
+            fetch_settle: "behind".into(),
             fetch_qos: "user-interactive".into(),
         }
     }

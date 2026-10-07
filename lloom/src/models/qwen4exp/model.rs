@@ -555,13 +555,12 @@ pub struct State<P: Profile> {
     pub fetch_clean: usize,
     /// Fetching steps run; entries into and exits from the fetching
     /// regime; fetching steps redone (an expert the worker found no slot
-    /// for); the host waits a fetching step's start took for commands
-    /// still running (none while the previous step's settle waited).
+    /// for). (The wait for the commands before a fetching step is the
+    /// worker's now — `FetchStats::floor_waits`.)
     pub fetch_passes: u64,
     pub fetch_entries: u64,
     pub fetch_exits: u64,
     pub fetch_redos: u64,
-    pub fetch_pre_waits: u64,
     /// Host nanoseconds in the replays (`redos`) and in the disarmed
     /// host-plan passes (`host_plan_passes`): the miss regime's two pass
     /// kinds, timed only when they run.
@@ -893,7 +892,6 @@ impl<P: Profile> State<P> {
             fetch_entries: 0,
             fetch_exits: 0,
             fetch_redos: 0,
-            fetch_pre_waits: 0,
             replay_ns: 0,
             host_pass_ns: 0,
             settle_after_first: 0,
@@ -3533,26 +3531,20 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         crate::nn::expert_stream::FetchStats::default()
     }
 
-    /// Open a fetching step: every command already committed complete (a
-    /// host wait only when one is still running — the settle before it
-    /// waited for the last step), so the worker may write a slot whose last
-    /// reader ran before now; then each tier's routing slot filled with the
-    /// sentinel the worker tells a new routing from.
+    /// Open a fetching step at the current epoch, the pass's floor: the
+    /// worker waits for every epoch before it to complete before it writes a
+    /// slot (`expert_fetch::floor_settled`, its `floor_waits`), so this
+    /// thread does not — the step before may still be running while this one
+    /// is encoded. Then each tier's routing slot is filled with the sentinel
+    /// the worker tells a new routing from.
     #[cfg(feature = "metal")]
-    fn fetch_begin(&self, cache: &mut State<P>) -> Result<crate::nn::expert_fetch::FetchPass> {
+    fn fetch_begin(&self, _cache: &mut State<P>) -> Result<crate::nn::expert_fetch::FetchPass> {
         let Some(lane) = self.fetch_lane()? else {
             lloom_tensor::bail!("qwen4exp: a fetching step without a fetch worker")
         };
         let m = self.device();
         let m = m.as_metal_device()?;
-        let clock = m.gpu_clock();
-        let cur = clock.current_epoch();
-        if cur.0 > 0 && !clock.is_complete(lloom_tensor::kernels::metal::Epoch(cur.0 - 1)) {
-            let marker = m.flush_marker()?;
-            m.wait_marker(&marker)?;
-            cache.fetch_pre_waits += 1;
-        }
-        let floor = clock.current_epoch();
+        let floor = m.gpu_clock().current_epoch();
         let topk = self.cfg.n_experts_per_tok;
         for layer in &self.layers {
             layer.moe().experts().fetch_prepare(topk)?;

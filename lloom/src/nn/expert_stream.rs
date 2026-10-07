@@ -1017,6 +1017,10 @@ pub struct FetchStats {
     pub timeouts: u64,
     pub watch_ns: u64,
     pub serve_ns: u64,
+    /// Passes the worker waited on their earlier epochs for.
+    pub floor_waits: u64,
+    /// No-slot looks repeated.
+    pub retries: u64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).

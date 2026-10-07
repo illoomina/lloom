@@ -20,6 +20,7 @@
 //! routing ~1 ms late (§20.14b).
 
 use crate::nn::expert_stream::{FetchStats, Streamed};
+use lloom_tensor::kernels::metal::GpuClock;
 use lloom_tensor::metal_backend::{HostEvent, HostSlot};
 use lloom_tensor::retire::Epoch;
 use lloom_tensor::{MetalDevice, Result};
@@ -83,6 +84,13 @@ pub struct FetchCounters {
     /// seen to the event raised (the loads, when there were any).
     pub watch_ns: AtomicU64,
     pub serve_ns: AtomicU64,
+    /// Passes whose earlier epochs had not all completed when the worker
+    /// reached their first job: the wait for them, here rather than on the
+    /// decode thread (`Self::floor_settled`).
+    pub floor_waits: AtomicU64,
+    /// Looks again at a layer that found no slot for an expert: the slots
+    /// free up as their readers complete and their loads land.
+    pub retries: AtomicU64,
 }
 
 struct Lane {
@@ -93,6 +101,9 @@ struct Lane {
     stop: AtomicBool,
     poll: Duration,
     counters: FetchCounters,
+    /// The device's clock: the worker waits here for the epochs before a
+    /// pass's floor, so the decode thread does not.
+    clock: Arc<GpuClock>,
 }
 
 /// The worker and its queue: one per model, made on the first fetching
@@ -125,6 +136,7 @@ impl FetchLane {
             stop: AtomicBool::new(false),
             poll,
             counters: FetchCounters::default(),
+            clock: device.gpu_clock(),
         });
         let w = Arc::clone(&lane);
         let qos = qos.to_string();
@@ -191,6 +203,8 @@ impl FetchLane {
             timeouts: c.timeouts.load(Ordering::Relaxed),
             watch_ns: c.watch_ns.load(Ordering::Relaxed),
             serve_ns: c.serve_ns.load(Ordering::Relaxed),
+            floor_waits: c.floor_waits.load(Ordering::Relaxed),
+            retries: c.retries.load(Ordering::Relaxed),
         }
     }
 
@@ -244,8 +258,28 @@ impl Drop for FetchPass {
     }
 }
 
+/// Wait until every epoch before `floor` has completed: the commands a
+/// pass's floor stands after, whose slots the worker may then write. The
+/// epoch AT the floor is never waited for — it holds this pass's own joins.
+/// `false` when the wait outlived the fail-safe or the lane was cancelled.
+fn floor_settled(lane: &Lane, floor: Epoch) -> bool {
+    if floor.0 == 0 || lane.clock.is_complete(Epoch(floor.0 - 1)) {
+        return true;
+    }
+    lane.counters.floor_waits.fetch_add(1, Ordering::Relaxed);
+    let t0 = Instant::now();
+    while !lane.clock.is_complete(Epoch(floor.0 - 1)) {
+        if lane.cancel.load(Ordering::Acquire) || t0.elapsed() > ROUTING_TIMEOUT {
+            return false;
+        }
+        std::thread::sleep(lane.poll);
+    }
+    true
+}
+
 fn work(lane: &Lane) {
     let mut ids: Vec<u32> = Vec::new();
+    let mut settled_floor: Option<Epoch> = None;
     loop {
         let (tier, slot, topk, n_experts, value, floor) = {
             let mut g = lane.state.lock();
@@ -288,10 +322,31 @@ fn work(lane: &Lane) {
         lane.counters
             .watch_ns
             .fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        if seen && settled_floor != Some(floor) {
+            if floor_settled(lane, floor) {
+                settled_floor = Some(floor);
+            } else {
+                lane.counters.timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if seen {
             // SAFETY: the job's pass has not returned (`TierRef`).
             let tier = unsafe { &*tier };
-            let (loaded, short) = tier.fetch_beside(&ids, floor);
+            // A layer that found no slot looks again: slots free up as their
+            // readers complete and in-flight loads land, so a pass computes
+            // on a missing expert only past the fail-safe.
+            let (mut loaded, mut short) = tier.fetch_beside(&ids, floor);
+            let t_retry = Instant::now();
+            while short > 0
+                && !lane.cancel.load(Ordering::Acquire)
+                && t_retry.elapsed() <= ROUTING_TIMEOUT
+            {
+                lane.counters.retries.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(lane.poll);
+                let (l, s) = tier.fetch_beside(&ids, floor);
+                loaded += l;
+                short = s;
+            }
             if loaded + short > 0 {
                 lane.counters.missed_layers.fetch_add(1, Ordering::Relaxed);
             }

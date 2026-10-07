@@ -1219,7 +1219,7 @@ fn stream_line<P: QwenShape, R: ExpertResidency + HasStreamStats>(
         cache.fetch_entries,
         cache.fetch_exits,
         cache.fetch_redos,
-        cache.fetch_pre_waits,
+        f.floor_waits,
         cache.fetch_mode,
         f.jobs,
         f.missed_layers,

@@ -108,7 +108,7 @@ fn a_fetching_decode_is_the_resident_stream_with_no_replay_metal() -> Result<()>
         cache.redos,
         cache.fetch_redos,
         cache.host_plan_passes,
-        cache.fetch_pre_waits,
+        f.floor_waits,
         f.jobs,
         f.missed_layers,
         f.loads,

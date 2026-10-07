@@ -2283,7 +2283,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // encoded again. Before `eos_of_last` and every drain, so no
                 // taken-back token is ever streamed or read as EOS.
                 if provisional == crate::nn::model::Provisional::Behind {
-                    if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
+                    // Settled again after a forward encoded again: the redone
+                    // step's window, held behind it, is released there.
+                    while let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
                         readback.retract_draw()?;
                         if let Some(f) = &host_feed {
                             f.link().retract(FEED_RETRACT_TIMEOUT)?;

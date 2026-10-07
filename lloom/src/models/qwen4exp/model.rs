@@ -2926,8 +2926,15 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // held behind this step's window until the driver settles it.
         #[cfg(feature = "metal")]
         if seq == 1 && cache.provisional == crate::nn::model::Provisional::Behind {
+            // The driver settles behind every forward it encodes, which
+            // releases the window held before it: one still held here is a
+            // settle the driver skipped, and settling it now would settle
+            // the newest step too, ahead of its time.
             if cache.window_held() {
-                self.settle_trailing(Some(cache))?;
+                lloom_tensor::bail!(
+                    "qwen4exp: a decode step's window still held at the next step's entry — its \
+                     driver did not settle behind the forward it encoded (`CausalLM::settle_step`)"
+                )
             }
             cache.hold_standing()?;
         } else {

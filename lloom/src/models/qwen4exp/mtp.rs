@@ -147,6 +147,14 @@ pub(crate) struct Folded<P: Profile> {
     valid: bool,
 }
 
+impl<P: Profile, R: ExpertResidency> MtpHead<P, R> {
+    /// The head layer's routed-expert tier (the loader warms it when the
+    /// head's experts are held resident, `qwen4exp.mtp_experts`).
+    pub(crate) fn routed(&self) -> &R {
+        self.layer.moe().experts()
+    }
+}
+
 impl<P: Profile<Rewind = NoRewind, Rows = One>, R: ExpertResidency> MtpHead<P, R> {
     pub fn new(
         norm_e: RmsNorm,

@@ -104,6 +104,9 @@ fn parse_draft_loads(v: &str) -> Result<String, String> {
 fn parse_fusion_budget(v: &str) -> Result<String, String> {
     one_of(v, "fusion budget", &["rounding", "reorder"])
 }
+fn parse_mtp_experts(v: &str) -> Result<String, String> {
+    one_of(v, "MTP experts", &["resident", "streamed"])
+}
 fn parse_fusion(v: &str) -> Result<String, String> {
     one_of(v, "fusion", &["manual", "derived"])
 }
@@ -329,6 +332,9 @@ pub struct Qwen4ExpTuning {
     /// The shared expert's SwiGLU on its quantized projections' stores: the SiLU on the gate's, the product multiplied into the gate's buffer on the up's — one launch less a layer (`silu_mul`); off = the two products and `silu_mul` (the A/B arm). An arm, off by default: measured 1.1 % slower a token (`optimizer-design.md` §10k).
     #[opt(flag = "qwen-shared-store", env = "QWEN4EXP_SHARED_STORE", bool)]
     pub shared_store: bool,
+    /// Where the MTP head's routed experts live when the target's are streamed: `resident` (all of the head layer's experts loaded at load, about 1/48 of the expert set, claimed beside the slot pool; a draft pass never misses) or `streamed` (the head layer takes the target's per-layer slot count and misses as the pool does — the previous behaviour).
+    #[opt(flag = "qwen-mtp-experts", env = "QWEN4EXP_MTP_EXPERTS", parser = "parse_mtp_experts", variants = ["resident", "streamed"])]
+    pub mtp_experts: String,
     /// The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way.
     #[opt(flag = "qwen-f16-fold", env = "QWEN4EXP_F16_FOLD", bool)]
     pub f16_fold: bool,
@@ -415,6 +421,7 @@ impl Default for Qwen4ExpTuning {
             fused_off: false,
             f16_fuse: true,
             shared_store: false,
+            mtp_experts: "resident".into(),
             f16_fold: false,
             chunk_scan: true,
             delta_reduce: false,

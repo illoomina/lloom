@@ -589,6 +589,21 @@ fn plan_load<Rd: Read + Seek>(
     fraction: f64,
     slots: Option<usize>,
 ) -> LoadPlan {
+    plan_load_holding(gg, device, fraction, slots, None)
+}
+
+/// [`plan_load`] with layer `held`'s routed experts counted as resident
+/// bytes rather than as planes of every slot: the MTP head layer when its
+/// experts are held whole (`qwen4exp.mtp_experts = resident`), so the pool's
+/// per-slot unit, the slot plan and the admission all see the same split.
+fn plan_load_holding<Rd: Read + Seek>(
+    gg: &Gguf<'_, Rd>,
+    device: &Device,
+    fraction: f64,
+    slots: Option<usize>,
+    held: Option<usize>,
+) -> LoadPlan {
+    let held_prefix = held.map(|l| format!("blk.{l}."));
     let mut resident = 0usize;
     let mut per_slot = 0usize;
     let mut total = 0usize;
@@ -599,7 +614,8 @@ fn plan_load<Rd: Read + Seek>(
             if name == "per_layer_token_embd.weight" {
                 continue; // memory-mapped, not resident
             }
-            if name.ends_with("_exps.weight") {
+            let held_layer = held_prefix.as_deref().is_some_and(|p| name.starts_with(p));
+            if name.ends_with("_exps.weight") && !held_layer {
                 // [n_experts, n, k]: one plane per slot
                 let n_experts = info.shape.dims().first().copied().unwrap_or(1).max(1);
                 per_slot += bytes / n_experts;
@@ -642,8 +658,9 @@ fn plan_slots<Rd: Read + Seek>(
     device: &Device,
     fraction: f64,
     claims: &[SessionClaim],
+    held: Option<usize>,
 ) -> Result<SlotPlan> {
-    let plan = plan_load(gg, device, fraction, None);
+    let plan = plan_load_holding(gg, device, fraction, None, held);
     let per_slot = plan.expert_bytes_per_slot.max(1);
     let reserve_bytes = session_floor_bytes(claims);
     #[cfg(not(feature = "metal"))]
@@ -1090,6 +1107,11 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         if let Some(p) = opts.kv_precision {
             cfg0.kv_precision = p;
         }
+        // The MTP head layer (`blk.{n_layers}`), held whole when asked: its
+        // tier takes every expert as a slot and is warmed at load, and its
+        // bytes are resident in the plan, not planes of every pool slot.
+        let held = (opts.mtp && crate::tuning::tuning().qwen4exp.mtp_experts == "resident")
+            .then_some(cfg0.n_layers);
         let slots = match stream.slots {
             SlotBudget::Fixed(n) => n,
             SlotBudget::Auto {
@@ -1114,7 +1136,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                         capability: true,
                     });
                 }
-                let plan = plan_slots(&gg, &cfg0, device, fraction, &claims)?;
+                let plan = plan_slots(&gg, &cfg0, device, fraction, &claims, held)?;
                 if plan.working_set == 0 {
                     lloom_tensor::bail!(
                         "SlotBudget::Auto needs a Metal device (recommendedMaxWorkingSetSize)"
@@ -1130,7 +1152,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // A fixed count is admitted like any load; `Auto` sized itself to
         // the budget and passes by construction (or sits at the pool's
         // `topk + 1` floor, which is then refused with the arithmetic).
-        let plan = plan_load(&gg, device, opts.fraction(), Some(slots));
+        let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held);
         admit_load(&plan)?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
@@ -1187,7 +1209,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                 src(gg, format!("{p}.ffn_gate_exps.weight"))?,
                 src(gg, format!("{p}.ffn_up_exps.weight"))?,
                 src(gg, format!("{p}.ffn_down_exps.weight"))?,
-                slots,
+                if held == Some(l) { cfg0.n_experts } else { slots },
                 arm.clone(),
                 device,
                 staging.clone(),
@@ -1211,6 +1233,18 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
             cfg0.n_experts,
             cfg0.n_experts_per_tok,
         );
+        if held.is_some() {
+            if let Some(head) = model.mtp_head() {
+                let all: Vec<u32> = (0..cfg0.n_experts as u32).collect();
+                let loaded = head.routed().warm(&all)?;
+                if loaded != cfg0.n_experts {
+                    lloom_tensor::bail!(
+                        "the MTP head's experts: {loaded} of {} loaded resident",
+                        cfg0.n_experts
+                    )
+                }
+            }
+        }
         Ok(model)
     }
 }
@@ -1490,6 +1524,59 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holding a layer's experts whole (the MTP head, `qwen4exp.mtp_experts
+    /// = resident`) moves exactly that layer's expert bytes out of the
+    /// per-slot unit and the expert total into the resident bytes: the slot
+    /// plan, the admission and the ledger's unit see one split.
+    #[test]
+    fn a_held_layer_is_resident_bytes_not_a_plane_of_every_slot() -> Result<()> {
+        let mut cfg = Config::tiny();
+        cfg.n_experts = 12;
+        let dev = Device::Cpu;
+        let held = cfg.n_layers; // the MTP head's index
+        let mut owned: Vec<(String, QTensor)> = Vec::new();
+        for l in 0..=held {
+            let [g, u, d] = super::super::testing::expert_stacks(&cfg, l % cfg.n_layers, &dev, GgmlDType::F32);
+            owned.push((format!("blk.{l}.ffn_gate_exps.weight"), g));
+            owned.push((format!("blk.{l}.ffn_up_exps.weight"), u));
+            owned.push((format!("blk.{l}.ffn_down_exps.weight"), d));
+        }
+        let held_bytes: usize = owned
+            .iter()
+            .filter(|(n, _)| n.starts_with(&format!("blk.{held}.")))
+            .map(|(_, t)| t.storage_size_in_bytes())
+            .sum();
+        let path = std::env::temp_dir().join(format!("lloom-held-{}.gguf", std::process::id()));
+        let refs: Vec<(&str, &QTensor)> = owned.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        lloom_tensor::quantized::gguf_file::write(&mut File::create(&path)?, &[], &refs)?;
+        let mut f = File::open(&path)?;
+        let content = Content::read(&mut f)?;
+        let gg = Gguf::new(
+            vec![Shard {
+                content,
+                reader: &mut f,
+                path: Some(path.clone()),
+            }],
+            &dev,
+        )?;
+        let all = plan_load(&gg, &dev, 0.65, Some(4));
+        let mtp = plan_load_holding(&gg, &dev, 0.65, Some(4), Some(held));
+        std::fs::remove_file(&path).ok();
+        assert!(held_bytes > 0);
+        assert_eq!(mtp.resident_bytes, all.resident_bytes + held_bytes);
+        assert_eq!(mtp.expert_bytes_total, all.expert_bytes_total - held_bytes);
+        assert_eq!(
+            mtp.expert_bytes_per_slot,
+            all.expert_bytes_per_slot - held_bytes / cfg.n_experts
+        );
+        // 4 slots of the other layers plus every expert of the held one.
+        assert_eq!(
+            mtp.predicted(),
+            all.resident_bytes + held_bytes + 4 * mtp.expert_bytes_per_slot
+        );
+        Ok(())
+    }
 
     /// The numbers this machine's SLOTPLAN lines carry (issue #749 P18): a
     /// 55.66 GB working set, a 4.12 GB resident tier, 83.8 MB a slot over

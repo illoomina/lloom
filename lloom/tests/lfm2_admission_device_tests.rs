@@ -40,7 +40,19 @@ fn config(max_position_embeddings: usize) -> Config {
         max_position_embeddings,
         conv_l_cache: 3,
         conv_bias: false,
-        layer_types: vec![LayerType::Conv; 30],
+        // LFM2.5-2.6B's layer order (`config.json`): full attention at 2, 5,
+        // 9, 13, 17, 21, 24, 27. Admission sizes the KV class from these
+        // since the bytes per token are read from the config (§15.2 #10c);
+        // an all-conv stand-in holds no KV and is admitted at any length.
+        layer_types: (0..30)
+            .map(|i| {
+                if [2, 5, 9, 13, 17, 21, 24, 27].contains(&i) {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::Conv
+                }
+            })
+            .collect(),
         tie_embedding: true,
         bos_token_id: None,
         eos_token_id: None,

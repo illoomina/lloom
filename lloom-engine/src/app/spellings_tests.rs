@@ -132,6 +132,8 @@ const POOL: &[&str] = &[
     "m",
     "progressive:1,64",
     "inherit:1",
+    "recip",
+    "hardswish",
 ];
 
 thread_local! {
@@ -157,9 +159,7 @@ fn known(sub: &str, flag: &str) -> bool {
 
 type Front<'a> = Box<dyn Fn(&mut EngineOptions) -> Result<(), String> + 'a>;
 
-fn front_of(
-    cli: &Cli,
-) -> (&CommonArgs, Front<'_>) {
+fn front_of(cli: &Cli) -> (&CommonArgs, Front<'_>) {
     match &cli.command {
         Command::Chat(a) => (&a.common, Box::new(move |o| a.front(o))),
         Command::Serve(a) => (&a.common, Box::new(move |o| a.front(o))),
@@ -235,7 +235,9 @@ fn reaches_by_flag(key: &str, flag: &str) -> Result<String, String> {
             return Ok(format!("{sub} {flag} {v}"));
         }
     }
-    Err(format!("{flag}: on no subcommand"))
+    Err(format!(
+        "{flag}: no subcommand where a value of the pool moves the key alone"
+    ))
 }
 
 #[test]

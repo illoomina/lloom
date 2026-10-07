@@ -308,7 +308,10 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
             "executor.packed, executor.arena.enabled -> on <- executor.replay.enabled (C8)".into(),
         );
     }
-    let adaptive = r.kind != crate::ReadbackKind::Blocking && r.ring_arm().adaptive;
+    // The arm that runs: the blocking one where C1 resolves `auto` to it.
+    let blocking = r.kind == crate::ReadbackKind::Blocking
+        || (r.kind == crate::ReadbackKind::Auto && host_side(&sampling));
+    let adaptive = !blocking && r.ring_arm().adaptive;
     if adaptive && !r.stream_reader {
         out.push(
             "decode.readback.stream_reader -> on <- decode.readback.adaptive_commit (C9)".into(),

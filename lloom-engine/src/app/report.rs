@@ -1128,7 +1128,7 @@ fn print_encoder_counters(s: &lloom_tensor::kernels::metal::profile::Snapshot) {
         );
     }
     eprintln!("]");
-    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+    if let Some(path) = lloom_tensor::tuning::tuning().instrument.profile_dump.clone() {
         use std::io::Write;
         let path = format!("{path}.encoders.csv");
         let write = || -> std::io::Result<()> {
@@ -1287,7 +1287,7 @@ fn print_idle_gaps(
             1e3 * step_starved[0],
         );
     }
-    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+    if let Some(path) = lloom_tensor::tuning::tuning().instrument.profile_dump.clone() {
         use std::io::Write;
         let write = || -> std::io::Result<()> {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);

@@ -157,7 +157,19 @@ pub fn qmat_operand(q: &QMatMul) -> (Core, Shape, DType) {
     match q {
         QMatMul::TensorF16(t) => (Core::Mixed, Shape::of(t.dims()), t.dtype()),
         QMatMul::Tensor(t) => (Core::Gemv, Shape::of(t.dims()), t.dtype()),
-        QMatMul::QTensor(t) => (Core::Quant, Shape::of(t.shape().dims()), DType::U8),
+        // A dense kind (an f16 / f32 / bf16 `QTensor`) carries its element
+        // type: the quantized matvec's store blocks ride the packed kinds'
+        // cores only, and the rules read the weight's dtype to know which.
+        QMatMul::QTensor(t) => {
+            use lloom_tensor::quantized::GgmlDType;
+            let dtype = match t.dtype() {
+                GgmlDType::F32 => DType::F32,
+                GgmlDType::F16 => DType::F16,
+                GgmlDType::BF16 => DType::BF16,
+                _ => DType::U8,
+            };
+            (Core::Quant, Shape::of(t.shape().dims()), dtype)
+        }
     }
 }
 

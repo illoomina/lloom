@@ -242,8 +242,8 @@ pub struct CommonArgs {
     pub generation_config: Option<String>,
 
     /// The speculative body by name (`speculative.method`): `none`, `dspark`,
-    /// `mtp`, or `auto` — the family's own drafter when one is at hand.
-    /// `--dspark` and `--mtp` override it.
+    /// `mtp`, `dflash` (Qwen4-exp's block drafter), or `auto` — the family's
+    /// own drafter when one is at hand. `--dspark` and `--mtp` override it.
     #[arg(long, value_name = "METHOD")]
     pub speculate: Option<String>,
 
@@ -254,12 +254,14 @@ pub struct CommonArgs {
     #[arg(long)]
     pub dspark: bool,
 
-    /// LFM2, under `--dspark`: the drafter checkpoint directory (`speculative.drafter`).
+    /// The block drafter's checkpoint directory (`speculative.drafter`): LFM2's
+    /// DSpark under `--dspark`, Qwen4-exp's DFlash under `--speculate dflash`.
     #[arg(long, value_name = "DIR")]
     pub draft_dir: Option<PathBuf>,
 
-    /// LFM2, under `--dspark`: propose this many positions per round instead
-    /// of the drafter's block width (9), clamped to it (`speculative.k`).
+    /// Under `--dspark` (LFM2) or `--speculate dflash` (Qwen4-exp): propose
+    /// this many positions per round (default: LFM2 the block, 9; Qwen4-exp
+    /// 3 of its 7), clamped to the block (`speculative.k`).
     #[arg(long)]
     pub dspark_k: Option<usize>,
 

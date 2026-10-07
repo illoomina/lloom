@@ -10,9 +10,10 @@
 //! misses (`resolve_readback`, `design/docs/expert-streaming.md` §20.13c).
 //! `--mtp` puts the MTP head on the speculative body
 //! (`decode_speculative_until`): one drafted token per round, verified by the
-//! target, byte-identical to greedy (issue #749).
-//!
-//! Not built for this family yet: `--dspark` (LFM2's drafter). `--batch N`
+//! target, byte-identical to greedy (issue #749). `speculative.method =
+//! dflash` puts the DFlash block drafter there instead (the DSpark family's
+//! backbone over the target's tapped HC residuals, `models::qwen4exp::dflash`):
+//! a block a round, the same verify window. `--batch N`
 //! runs the rows through the scheduler (the weights once over the rows, the
 //! state per row).
 
@@ -29,12 +30,14 @@ use crate::{
 use anyhow::{Context, Result};
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::load_warning::{LoadWarning, LoadWarningKind};
+use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
 };
 use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::{
-    ExpertResidency, MtpDrafter, MtpLanes, Qwen4Exp, Resident, Shape as QwenShape, State, Streamed,
+    ExpertResidency, MtpDrafter, MtpLanes, Qwen4Exp, QwenHead, Resident, Shape as QwenShape, State,
+    Streamed,
 };
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
@@ -72,6 +75,12 @@ pub struct LoadOptions {
     pub ple: bool,
     pub moe_act: String,
     pub mtp: Option<PathBuf>,
+    /// The DFlash drafter's checkpoint directory (`speculative.method =
+    /// dflash`); empty is the newest [`DFLASH_SNAPSHOT`] in the HF cache.
+    pub dflash: Option<PathBuf>,
+    /// `speculative.k`: the drafter's tokens a round (DFlash: clamped to its
+    /// block; none is the block).
+    pub spec_k: Option<usize>,
     /// The expert hotlist file (streamed experts): warm at load, write at
     /// shutdown.
     pub hotlist: Option<PathBuf>,
@@ -115,6 +124,53 @@ pub fn routed_act(
     })
 }
 
+/// The HF cache directory of the DFlash drafter trained for this target.
+pub const DFLASH_SNAPSHOT: &str = "models--PixelML--Qwen3.8-Flash-Next-NVFP4-DFlash";
+
+/// DFlash's tokens a round when `speculative.k` names none: three of the
+/// block's seven. Measured through `lloom chat` (`speculation.md`
+/// §10.2z-vi): the verify window's rows cost more than the deeper drafts
+/// return on this target, and K = 3 is at or above K = 7 on every prompt
+/// and turn taken.
+const DFLASH_DEFAULT_K: usize = 3;
+
+/// The DFlash drafter's directory: `dir`, or the newest [`DFLASH_SNAPSHOT`]
+/// when `dir` is empty.
+fn dflash_dir(dir: &Path) -> Result<PathBuf> {
+    if !dir.as_os_str().is_empty() {
+        return Ok(dir.to_path_buf());
+    }
+    newest_snapshot(DFLASH_SNAPSHOT).context(
+        "no PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash snapshot in the HF cache and no drafter \
+         directory; the drafter is trained against THIS target (speculation.md §10.2z-vi)",
+    )
+}
+
+/// The largest absolute position a DFlash draft attends: the KV ceiling
+/// plus the block and slack.
+fn dflash_max_pos(kv_capacity: usize, dcfg: &DSparkConfig) -> usize {
+    kv_capacity + dcfg.block_size + 64
+}
+
+/// What the DFlash drafter holds on the device, for the slot plan's claim:
+/// its weights at f16 (the checkpoint is bf16, loaded as f16: Apple7
+/// emulates bfloat), `fc` kept transposed at the taps' f32
+/// (`DSparkProjection::fc_t`), the RoPE table at f16, and its context KV —
+/// one page pool per layer, a bucket of tokens past the block's reserve.
+fn dflash_device_bytes(dcfg: &DSparkConfig, max_pos: usize) -> usize {
+    let h = dcfg.hidden_size;
+    let weights = lloom::models::lfm2_dspark::drafter_params(dcfg) * 2;
+    let fc_f32 = h * dcfg.target_layer_ids.len() * h * 4;
+    let rope = 2 * max_pos * (dcfg.head_dim / 2) * 2;
+    let ctx = dcfg.num_hidden_layers
+        * 2
+        * (4096usize + dcfg.block_size).next_multiple_of(256)
+        * dcfg.num_key_value_heads
+        * dcfg.head_dim
+        * 2;
+    weights + fc_f32 + rope + ctx
+}
+
 /// The model, shared with the batch thread.
 pub struct QwenCore<P: Profile, R: ExpertResidency + HasStreamStats> {
     pub model: Qwen4Exp<P, R>,
@@ -150,6 +206,10 @@ pub struct Engine<P: QwenShape, R: ExpertResidency + HasStreamStats> {
     mtp: bool,
     /// Tokens the MTP drafter proposes per round.
     mtp_k: usize,
+    /// The DFlash drafter, when it is the speculative body: one sequence's,
+    /// kept across requests so its context follows the target's prefix
+    /// reuse (`Speculator::begin_at`).
+    dflash: Option<Mutex<DSparkSpeculator<QwenHead>>>,
     /// The hotlist to write at shutdown (the usage since load merged in).
     hotlist: Option<PathBuf>,
     /// The tier's load-time description (`[loaded …]`, `/health`).
@@ -266,14 +326,77 @@ fn discover_shards(first: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// The DFlash speculator over `model` from the checkpoint in `dir`, and the
+/// layers the target's cache taps for it: the drafter's own weights (f16 on
+/// Metal, f32 on the CPU), the target's `token_embd` and `lm_head` shared,
+/// `speculative.k` (else [`DFLASH_DEFAULT_K`]) clamping the block, its
+/// pipelines warmed off the clock.
+fn load_dflash<P: Profile, R: ExpertResidency>(
+    model: &Qwen4Exp<P, R>,
+    dir: &Path,
+    device: &Device,
+    kv_capacity: usize,
+    spec_k: Option<usize>,
+    warmup: bool,
+) -> Result<(DSparkSpeculator<QwenHead>, Vec<usize>)> {
+    let dcfg = DSparkConfig::read_from_dir(dir)
+        .with_context(|| format!("reading the DFlash drafter config in {}", dir.display()))?;
+    let cfg = model.config();
+    if dcfg.hidden_size != cfg.hidden_size || dcfg.num_target_layers != cfg.n_layers {
+        anyhow::bail!(
+            "the drafter in {} reads {} layers of width {}, the target has {} of {}: not this \
+             target's drafter",
+            dir.display(),
+            dcfg.num_target_layers,
+            dcfg.hidden_size,
+            cfg.n_layers,
+            cfg.hidden_size
+        );
+    }
+    let file = dir.join("model.safetensors");
+    if !file.exists() {
+        anyhow::bail!("{} does not exist", file.display());
+    }
+    let dtype = if device.is_metal() {
+        DType::F16
+    } else {
+        DType::F32
+    };
+    let t = Instant::now();
+    let vb = unsafe { lloom::nn::VarBuilder::from_mmaped_safetensors(&[file], dtype, device)? };
+    let taps = dcfg.tap_layers();
+    let block = dcfg.max_draft();
+    let drafter = DSparkDrafter::new(dcfg.clone(), dflash_max_pos(kv_capacity, &dcfg), vb)
+        .context("constructing the DFlash drafter")?;
+    let mut spec = DSparkSpeculator::with_head(drafter, QwenHead::of(model), 1)
+        .context("constructing the DFlash speculator")?;
+    spec.set_max_draft(spec_k.unwrap_or(DFLASH_DEFAULT_K));
+    let k = lloom::nn::Speculator::max_draft(&spec);
+    eprintln!(
+        "[dflash: drafter loaded from {} in {:.1} ms, {} layers at {dtype:?}, K={k} of the block \
+         {block} (verify window {} positions), taps {taps:?}, context kv {}]",
+        dir.display(),
+        ms(t.elapsed()),
+        dcfg.num_hidden_layers,
+        k + 1,
+        spec.ctx_kv().name()
+    );
+    if warmup {
+        spec.warmup(device)
+            .context("warming the DFlash drafter's pipelines")?;
+    }
+    Ok((spec, taps))
+}
+
 /// The boundary (`profiles-and-memory-design.md` §7.4): the engine at the
-/// profile the mode names — `Ring` under `--mtp`, `Paged` at `--batch N`,
+/// profile the mode names — `Ring` under `--mtp` or `--speculate dflash`,
+/// `Paged` at `--batch N`,
 /// the regime from the contract — one `match` over the eight
 /// (`lloom::profile::dispatch!`), bounded by what the family ships.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = ProfileKey::at_contract(
-        if opts.mtp.is_some() {
+        if opts.mtp.is_some() || opts.dflash.is_some() {
             Ring::NAME
         } else {
             NoRewind::NAME
@@ -292,15 +415,31 @@ pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
 fn rewindable<P: Profile>() -> Result<lloom::profile::RewindProof<P>> {
     lloom::profile::RewindProof::<P>::ask().with_context(|| {
         format!(
-            "the MTP drafter on the {} shape: `--mtp` is the `Ring` shape",
+            "a speculative drafter on the {} shape: `--mtp` and `--speculate dflash` run on the `Ring` shape",
             P::KEY
         )
     })
 }
 
 /// Load the family `opts` names, on the tier `opts.experts` names, at `P`.
-fn load_as<P: QwenShape>(opts: LoadOptions) -> Result<Box<dyn Served>> {
+fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
     {
+        // The DFlash drafter's directory and config first: the slot plan
+        // claims what it will hold beside the experts.
+        let mut drafter_bytes = 0usize;
+        if let Some(d) = &opts.dflash {
+            if opts.mtp.is_some() {
+                anyhow::bail!(
+                    "--mtp and speculative.method = dflash: one speculative body per run"
+                );
+            }
+            let dir = dflash_dir(d)?;
+            let dcfg = DSparkConfig::read_from_dir(&dir).with_context(|| {
+                format!("reading the DFlash drafter config in {}", dir.display())
+            })?;
+            drafter_bytes = dflash_device_bytes(&dcfg, dflash_max_pos(opts.kv_capacity, &dcfg));
+            opts.dflash = Some(dir);
+        }
         let device = if opts.cpu {
             Device::Cpu
         } else {
@@ -376,6 +515,7 @@ fn load_as<P: QwenShape>(opts: LoadOptions) -> Result<Box<dyn Served>> {
                     loader,
                     prefetch: opts.prefetch,
                     io_hints: opts.io_hints,
+                    drafter_bytes,
                 };
                 let mut model: Qwen4Exp<P, Streamed> =
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
@@ -489,12 +629,32 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         if mtp && model.mtp_head().is_none() {
             anyhow::bail!("--mtp was given but the loader found no MTP head in the shards");
         }
+        let dflash = match &opts.dflash {
+            Some(dir) => Some(load_dflash(
+                &model,
+                dir,
+                &device,
+                opts.kv_capacity,
+                opts.spec_k,
+                opts.warmup,
+            )?),
+            None => None,
+        };
         // The sequence's state at the shape `P` names (`Shape::single`): its
-        // own on `No × One`; under `--mtp` the verify window's states in
-        // phase rings, an accept by phase.
-        let mut cache = P::single(&model, &device, opts.mtp_k.max(1))?;
+        // own on `No × One`; under `--mtp` or DFlash the verify window's
+        // states in phase rings (`K` phases for the drafter's `K`), an accept
+        // by phase; DFlash's cache names the layers it taps.
+        let k = match &dflash {
+            Some((spec, _)) => lloom::nn::Speculator::max_draft(spec),
+            None => opts.mtp_k.max(1),
+        };
+        let mut cache = P::single(&model, &device, k)?;
+        if let Some((_, taps)) = &dflash {
+            cache.set_tap_layers(taps)?;
+        }
         cache.want_nextn = mtp;
         tier["mtp"] = json!(mtp);
+        tier["dflash"] = json!(opts.dflash.as_ref().map(|d| d.display().to_string()));
         tier["ple"] = json!(opts.ple);
         tier["ple_cache_rows"] = json!(opts.ple_cache_rows);
         tier["moe_act"] = json!(
@@ -527,6 +687,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             mem_sample: opts.mem_sample,
             mtp,
             mtp_k: opts.mtp_k.max(1),
+            dflash: dflash.map(|(spec, _)| Mutex::new(spec)),
             hotlist: opts.hotlist.clone(),
             tier,
             load_warnings,
@@ -965,12 +1126,13 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} config=[{}] prefill_tile={} mem_sample={} {}",
+            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} dflash={} ple={} ple_cache_rows={} moe_act={} config=[{}] prefill_tile={} mem_sample={} {}",
             self.batch,
             self.tier["experts"].as_str().unwrap_or("?"),
             self.tier["slots_per_layer"].as_u64().unwrap_or(0),
             self.tier["loader"].as_str().unwrap_or("-"),
             self.mtp,
+            self.dflash.is_some(),
             self.tier["ple"].as_bool().unwrap_or(true),
             self.tier["ple_cache_rows"].as_u64().unwrap_or(0),
             self.tier["moe_act"].as_str().unwrap_or("f32"),
@@ -1028,7 +1190,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {
             Some(super::budgets::BATCHED)
-        } else if self.mtp {
+        } else if self.mtp || self.dflash.is_some() {
             Some(super::budgets::SPECULATIVE)
         } else {
             None
@@ -1054,7 +1216,18 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             if !reuse {
                 s.reset();
             }
-            if self.mtp {
+            if let Some(d) = &self.dflash {
+                let mut spec = lock(d);
+                s.decode_speculative_until(
+                    rewindable::<P>()?,
+                    &mut *spec,
+                    prompt_ids,
+                    detok,
+                    params,
+                    |f| on_fragment(f),
+                )
+                .map_err(anyhow::Error::from)
+            } else if self.mtp {
                 let lanes = lock(&self.mtp_lanes).take();
                 let mut drafter = self.drafter(lanes)?;
                 let out = s.decode_speculative_until(
@@ -1125,7 +1298,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         let gauge = MemGauge::start(&device, self.mem_sample);
         let mut timing = self.with_single(|s| {
             s.reset();
-            if self.mtp {
+            if self.mtp || self.dflash.is_some() {
                 // One run of `D` tokens through the speculative body; the
                 // prompt's submit time subtracted (the prefill's GPU tail is
                 // inside the bracket), as the LFM2 engine brackets DSpark.
@@ -1135,17 +1308,32 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                     readback,
                     ..DecodeParams::default()
                 };
-                let mut drafter = self.drafter(None)?;
                 super::common::profile_reset();
                 let t = Instant::now();
-                let run = s.decode_speculative_until(
-                    rewindable::<P>()?,
-                    &mut drafter,
-                    &prompt,
-                    detok,
-                    &params,
-                    |_| true,
-                )?;
+                let run = match &self.dflash {
+                    Some(d) => {
+                        let mut spec = lock(d);
+                        s.decode_speculative_until(
+                            rewindable::<P>()?,
+                            &mut *spec,
+                            &prompt,
+                            detok,
+                            &params,
+                            |_| true,
+                        )?
+                    }
+                    None => {
+                        let mut drafter = self.drafter(None)?;
+                        s.decode_speculative_until(
+                            rewindable::<P>()?,
+                            &mut drafter,
+                            &prompt,
+                            detok,
+                            &params,
+                            |_| true,
+                        )?
+                    }
+                };
                 device.synchronize()?;
                 let wall = ms(t.elapsed());
                 let prof = super::common::profile_take();

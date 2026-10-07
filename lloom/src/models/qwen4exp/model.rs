@@ -76,6 +76,13 @@ impl<P: Profile, R: ExpertResidency> Layer<P, R> {
         self.hc_ffn.collapse(res_hc)
     }
 
+    /// The `[.., d]` input this layer's mixer reads from the carry entering
+    /// it — its attention bracket's mix — which is what a cache tapping
+    /// this layer retains (`Cache::set_tap_layers`).
+    pub fn attn_input(&self, res_hc: &Tensor) -> Result<Tensor> {
+        self.hc_attn.collapse(res_hc)
+    }
+
     /// One position through the layer: `res_hc [1, 1, n·d]` → the new carry,
     /// plus the token-mixer's and the MoE's outputs (the non-finite watch reads
     /// them). State channel / KV slot `l` of `cache`.
@@ -153,6 +160,15 @@ impl<P: Profile, R: ExpertResidency> Layer<P, R> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
         trace("attn.mix", l, &cur);
         trace("attn.inject", l, &inject);
+        if let [cache] = caches {
+            cache.keep_tap(l, &cur)?;
+        } else {
+            for (r, c) in caches.iter_mut().enumerate() {
+                if c.taps_layer(l) {
+                    c.keep_tap(l, &cur.narrow(0, r, 1)?)?;
+                }
+            }
+        }
         let mixed = match &self.mixer {
             Mixer::Linear(dn) => {
                 let mut states: Vec<(&mut RecurrentState, &mut RecurrentState)> = caches
@@ -231,6 +247,7 @@ impl<P: Profile, R: ExpertResidency> Layer<P, R> {
         plan: super::moe::WindowPlanKind,
     ) -> Result<SeqParts> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [T, 1, d]
+        cache.keep_tap(l, &cur)?;
         let (mixed, lens) = match &self.mixer {
             Mixer::Linear(dn) => (
                 dn.decode_seq(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
@@ -287,6 +304,7 @@ impl<P: Profile, R: ExpertResidency> Layer<P, R> {
         cache: &mut State<P>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [1, seq, d]
+        cache.keep_tap(l, &cur)?;
         let mixed = match &self.mixer {
             Mixer::Linear(dn) => dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
             Mixer::Full(qsa) => qsa.prefill(&cur, &mut cache.kv[l])?,
@@ -475,9 +493,18 @@ pub struct State<P: Profile> {
     /// `NextnHidden` probe an MTP drafter reads) until [`Self::take_nextn`].
     /// Off, a forward keeps nothing.
     pub want_nextn: bool,
-    nextn: Vec<Tensor>,
+    nextn: RowLog,
     /// Retained carries a verify pass found untaken and discarded.
     nextn_drops: u64,
+    /// The `LayerTaps` probe a hidden-state drafter reads (DFlash/DSpark):
+    /// per tapped layer, the d-wide input its attention bracket's mix hands
+    /// the mixer, every position, until [`Self::take_taps`]. `tap_slot[l]`
+    /// is layer `l`'s index into `taps` (the drafter's consumer order);
+    /// empty, a forward taps nothing.
+    tap_slot: Vec<Option<usize>>,
+    taps: Vec<RowLog>,
+    /// Retained taps a verify pass found untaken and discarded.
+    tap_drops: u64,
     /// The open speculative window's pre-window bookkeeping, if any.
     window: Option<CacheWindow>,
     /// The open window is the STANDING one: the last decode step's, kept
@@ -603,6 +630,61 @@ struct CacheWindow {
     /// for an accept by position (`State::<P>::accept_window`).
     tokens: Vec<u32>,
     kv_after: Vec<Vec<(usize, usize)>>,
+    /// The rows the retained carries and taps held when the window opened
+    /// (every tap holds the same rows): a rewind cuts what the window's
+    /// passes retained, so a replayed pass retains its positions once.
+    retained: (usize, usize),
+}
+
+/// Per-position values a forward retains for a drafter until it takes them:
+/// one `[1, rows, w]` part per pass, in position order.
+#[derive(Debug, Clone, Default)]
+struct RowLog {
+    parts: Vec<Tensor>,
+}
+
+impl RowLog {
+    fn push(&mut self, part: Tensor) {
+        self.parts.push(part);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.parts.clear();
+    }
+
+    fn rows(&self) -> usize {
+        self.parts.iter().map(|t| t.dim(1).unwrap_or(0)).sum()
+    }
+
+    /// The retained rows concatenated along the sequence, `None` if none.
+    fn take(&mut self) -> Result<Option<Tensor>> {
+        let parts = std::mem::take(&mut self.parts);
+        match parts.len() {
+            0 => Ok(None),
+            1 => Ok(parts.into_iter().next()),
+            _ => Ok(Some(Tensor::cat(&parts, 1)?)),
+        }
+    }
+
+    /// Keep the first `rows` rows: whole parts, the last one narrowed.
+    fn keep_first(&mut self, rows: usize) -> Result<()> {
+        let mut left = rows;
+        let mut kept = Vec::with_capacity(self.parts.len());
+        for t in std::mem::take(&mut self.parts) {
+            if left == 0 {
+                break;
+            }
+            let n = t.dim(1)?;
+            kept.push(if n <= left { t } else { t.narrow(1, 0, left)? });
+            left -= n.min(left);
+        }
+        self.parts = kept;
+        Ok(())
+    }
 }
 
 /// The one-sequence, no-rewind shape (`No × One`): every channel and the
@@ -759,23 +841,13 @@ impl<P: Profile> State<P> {
         Ok(())
     }
 
-    /// Cut the retained carries to their first `a` positions.
+    /// Cut the retained probes (the carries and every tap) to their first
+    /// `a` positions.
     fn keep_first_rows(&mut self, a: usize) -> Result<()> {
-        let mut left = a;
-        let mut kept = Vec::with_capacity(self.nextn.len());
-        for t in std::mem::take(&mut self.nextn) {
-            if left == 0 {
-                break;
-            }
-            let rows = t.dim(1)?;
-            kept.push(if rows <= left {
-                t
-            } else {
-                t.narrow(1, 0, left)?
-            });
-            left -= rows.min(left);
+        self.nextn.keep_first(a)?;
+        for t in &mut self.taps {
+            t.keep_first(a)?;
         }
-        self.nextn = kept;
         Ok(())
     }
 
@@ -801,8 +873,11 @@ impl<P: Profile> State<P> {
             host: HostFill::default(),
             pos: 0,
             want_nextn: false,
-            nextn: Vec::new(),
+            nextn: RowLog::default(),
             nextn_drops: 0,
+            tap_slot: Vec::new(),
+            taps: Vec::new(),
+            tap_drops: 0,
             window: None,
             standing: false,
             redos: 0,
@@ -847,6 +922,9 @@ impl<P: Profile> State<P> {
         self.host.run = None;
         self.pos = 0;
         self.nextn.clear();
+        for t in &mut self.taps {
+            t.clear();
+        }
         self.window = None;
         self.standing = false;
     }
@@ -854,12 +932,97 @@ impl<P: Profile> State<P> {
     /// The carries retained since the last take, concatenated along the
     /// sequence: `[1, positions, n·d]`, or `None` if nothing was retained.
     pub fn take_nextn(&mut self) -> Result<Option<Tensor>> {
-        let rows = std::mem::take(&mut self.nextn);
-        match rows.len() {
-            0 => Ok(None),
-            1 => Ok(rows.into_iter().next()),
-            _ => Ok(Some(Tensor::cat(&rows, 1)?)),
+        self.nextn.take()
+    }
+
+    /// Tap the attention bracket's mix output of `layers` (in this order,
+    /// the drafter's consumer order) on every forward from now on. Each is
+    /// the input layer `l`'s mixer reads — the HC-contracted residual the
+    /// layers before `l` left, d wide. Empty taps nothing; a layer this
+    /// cache does not have, or one named twice, is refused.
+    pub fn set_tap_layers(&mut self, layers: &[usize]) -> Result<()> {
+        let n = self.kv.len();
+        let mut slot = vec![None; if layers.is_empty() { 0 } else { n }];
+        for (i, &l) in layers.iter().enumerate() {
+            if l >= n {
+                lloom_tensor::bail!(
+                    "qwen4exp cache: tap layer {l} past the {n} layers (a tap on the last layer's \
+                     output is the head mixer's, not a layer's)"
+                )
+            }
+            if slot[l].replace(i).is_some() {
+                lloom_tensor::bail!("qwen4exp cache: tap layer {l} named twice")
+            }
         }
+        self.tap_slot = slot;
+        self.taps = vec![RowLog::default(); layers.len()];
+        Ok(())
+    }
+
+    /// The tapped layers, in consumer order.
+    pub fn tap_layers(&self) -> Vec<usize> {
+        let mut out = vec![0; self.taps.len()];
+        for (l, s) in self.tap_slot.iter().enumerate() {
+            if let Some(i) = s {
+                out[*i] = l;
+            }
+        }
+        out
+    }
+
+    /// The taps retained since the last take, one `[1, positions, d]` F32
+    /// per tapped layer in consumer order; `None` when nothing was retained
+    /// or no layer is tapped.
+    pub fn take_taps(&mut self) -> Result<Option<Vec<Tensor>>> {
+        if self.taps.iter().all(RowLog::is_empty) {
+            return Ok(None);
+        }
+        let rows = self.taps[0].rows();
+        let mut out = Vec::with_capacity(self.taps.len());
+        for (i, t) in self.taps.iter_mut().enumerate() {
+            let r = t.rows();
+            if r != rows {
+                lloom_tensor::bail!(
+                    "qwen4exp cache: tap {i} holds {r} positions, tap 0 holds {rows}"
+                )
+            }
+            out.push(t.take()?.expect("non-empty: every tap holds the same rows"));
+        }
+        Ok(Some(out))
+    }
+
+    /// Whether layer `l` is tapped.
+    pub(crate) fn taps_layer(&self, l: usize) -> bool {
+        matches!(self.tap_slot.get(l), Some(Some(_)))
+    }
+
+    /// Retain layer `l`'s attention-bracket input `cur` (`[rows, 1, d]` or
+    /// `[1, rows, d]`, positions in order) when `l` is tapped: an F32 copy
+    /// outside every pass plan, since the drafter reads it after the pass.
+    pub(crate) fn keep_tap(&mut self, l: usize, cur: &Tensor) -> Result<()> {
+        let Some(&Some(i)) = self.tap_slot.get(l) else {
+            return Ok(());
+        };
+        let d = cur.dim(D::Minus1)?;
+        let rows = cur.elem_count() / d.max(1);
+        let f = cur.to_dtype(lloom_tensor::DType::F32)?;
+        self.taps[i].push(declared_copy(&f)?.reshape((1, rows, d))?);
+        Ok(())
+    }
+
+    /// Discard whatever taps are retained, counting it as a dropped probe.
+    pub(crate) fn drop_taps(&mut self) {
+        if self.taps.iter().any(|t| !t.is_empty()) {
+            self.tap_drops += 1;
+            for t in &mut self.taps {
+                t.clear();
+            }
+        }
+    }
+
+    /// Retained taps discarded untaken so far (`Probes::probe_drops`).
+    pub fn tap_drops(&self) -> u64 {
+        self.tap_drops
     }
 
     /// Retain a forward's carries `res_hc` when they are wanted. The drafter
@@ -916,6 +1079,7 @@ impl<P: Profile> State<P> {
             pos: self.pos,
             tokens: Vec::new(),
             kv_after: Vec::new(),
+            retained: (self.nextn.rows(), self.taps.first().map_or(0, RowLog::rows)),
         });
         Ok(())
     }
@@ -941,6 +1105,11 @@ impl<P: Profile> State<P> {
         self.pending_tokens = w.pending_tokens;
         self.pending_noted = false;
         self.pos = w.pos;
+        // What the window's passes retained goes with them.
+        self.nextn.keep_first(w.retained.0)?;
+        for t in &mut self.taps {
+            t.keep_first(w.retained.1)?;
+        }
         Ok(())
     }
 
@@ -973,6 +1142,9 @@ impl<P: Profile> State<P> {
         }
         self.pos = tokens;
         self.nextn.clear();
+        for t in &mut self.taps {
+            t.clear();
+        }
         self.prepared = None;
         Ok(())
     }
@@ -1394,8 +1566,9 @@ impl PassPlan {
 
 /// What Qwen4-exp's switches can express, added to `policy`: the bracket
 /// epilogues ride the brackets' own products only (`mixed_silu` the `down`
-/// projection, `mixed_sigmoid` the `up`), and no switch puts a norm in a
-/// product's load. A derivation over the walk under this policy proposes
+/// projection, `mixed_sigmoid` the `up`), the quantized store blocks the
+/// shared expert's (`quant_silu` its gate, `quant_mul` its up), and no
+/// switch puts a norm in a product's load. A derivation over the walk under this policy proposes
 /// only what [`Qwen4Exp::derive_fusion_with`] can set.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fusion_policy(policy: &crate::optimizer::Policy) -> crate::optimizer::Policy {
@@ -1410,6 +1583,8 @@ pub fn fusion_policy(policy: &crate::optimizer::Policy) -> crate::optimizer::Pol
     for (f, site) in [
         ("mixed_silu", "_down.weight"),
         ("mixed_sigmoid", "_up.weight"),
+        ("quant_silu", "ffn_gate_shexp.weight"),
+        ("quant_mul", "ffn_up_shexp.weight"),
     ] {
         if !policy.sites.iter().any(|(n, _)| n == f) {
             policy.sites.push((f.to_string(), vec![site.to_string()]));
@@ -1531,11 +1706,24 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             swiglus(lloom_tensor::DType::F32),
             swiglus(lloom_tensor::DType::F16),
         );
-        if placed("silu_mul_f32") != f32_sites {
+        // The shared experts' SwiGLUs on their projections' stores: every
+        // layer's, or none (one switch).
+        let shared_sites = self.layers.len();
+        let store_pairs = d.plan.sites_of("quant_mul").len();
+        let shared_store = match (d.plan.sites_of("quant_silu").len(), store_pairs) {
+            (0, 0) => false,
+            (g, u) if g == shared_sites && u == shared_sites => true,
+            (g, u) => lloom_tensor::bail!(
+                "qwen4exp fusion=derived: the plan puts the shared SwiGLU on {g} gate and {u} up \
+                 stores of {shared_sites} layers, which the one switch cannot express; plan: {}",
+                d.plan
+            ),
+        };
+        if placed("silu_mul_f32") + store_pairs != f32_sites {
             lloom_tensor::bail!(
                 "qwen4exp fusion=derived: the plan leaves {} of {f32_sites} f32 SwiGLUs composed, \
                  which no switch selects; plan: {}",
-                f32_sites - placed("silu_mul_f32"),
+                f32_sites - placed("silu_mul_f32") - store_pairs,
                 d.plan
             )
         }
@@ -1551,7 +1739,9 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         };
         for (site, fragment) in sites {
             let known = (fragment == "mixed_silu" && site.ends_with("_down.weight"))
-                || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"));
+                || (fragment == "mixed_sigmoid" && site.ends_with("_up.weight"))
+                || (fragment == "quant_silu" && site.ends_with("ffn_gate_shexp.weight"))
+                || (fragment == "quant_mul" && site.ends_with("ffn_up_shexp.weight"));
             if !known {
                 lloom_tensor::bail!(
                     "qwen4exp fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site \
@@ -1576,6 +1766,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if let Some(on) = f16_fuse {
             self.set_f16_fuse(on);
         }
+        self.set_shared_store(shared_store);
         let refused: Vec<String> = d
             .refused
             .iter()
@@ -1598,6 +1789,39 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         );
         self.fusion_report = Some(line.clone());
         Ok(line)
+    }
+
+    /// The composition the model as configured runs, as a policy: the
+    /// model's own ([`fusion_policy`]) with every block whose switch is off
+    /// refused by that switch — the bracket epilogues where every bracket's
+    /// is off, the shared expert's store blocks under
+    /// `qwen4exp.shared_store` off (admitted, their measured loss
+    /// notwithstanding, with it on), the f16 routed step's compositions under
+    /// `qwen4exp.f16_fuse` off. A derivation over the walk under it is the
+    /// step the forward dispatches (the census tests hold the two equal).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn switches_policy(&self) -> crate::optimizer::Policy {
+        let mut p = fusion_policy(&crate::optimizer::Policy::default());
+        let mut off = |f: &str, why: &str| p.unavailable.push((f.to_string(), why.to_string()));
+        let epi = self.bracket_epilogues();
+        if epi.iter().all(|e| !e.0) {
+            off("mixed_silu", "every bracket's down epilogue is off");
+        }
+        if epi.iter().all(|e| !e.1) {
+            off("mixed_sigmoid", "every bracket's up epilogue is off");
+        }
+        if self.layers.iter().all(|l| !l.moe().shared_store()) {
+            off("quant_silu", "the switch qwen4exp.shared_store is off");
+            off("quant_mul", "the switch qwen4exp.shared_store is off");
+        } else {
+            // The switch runs the blocks whatever their measurement.
+            p.admit.extend(["quant_silu".to_string(), "quant_mul".to_string()]);
+        }
+        if self.layers.iter().all(|l| !l.moe().f16_fuse()) {
+            off("silu_mul_f16", "the switch qwen4exp.f16_fuse is off");
+            off("combine_cast", "the switch qwen4exp.f16_fuse is off");
+        }
+        p
     }
 
     /// Every HyperConnection bracket of the decode step: each layer's attn
@@ -2142,6 +2366,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
         if let Some(m) = &mut self.mtp {
             m.layer_mut().moe_mut().set_f16_fuse(on);
+        }
+    }
+
+    /// Select whether every layer's shared expert runs its SwiGLU on its
+    /// quantized projections' stores (`MoeLayer::set_shared_store`;
+    /// `qwen4exp.shared_store` by default).
+    pub fn set_shared_store(&mut self, on: bool) {
+        for l in &mut self.layers {
+            l.moe.set_shared_store(on);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_shared_store(on);
         }
     }
 

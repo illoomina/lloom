@@ -165,6 +165,11 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     /// rounded to half on load (`qwen4exp.f16_fold`); off, a cast launch
     /// first. The same bits either way.
     f16_fold: bool,
+    /// Whether the shared expert's SwiGLU rides its quantized projections'
+    /// stores at a one-row step (`qwen4exp.shared_store`, or a derived
+    /// plan's verdict): the SiLU on the gate's store, the up projection
+    /// multiplied into the gate's buffer — `silu_mul`'s launch removed.
+    shared_store: bool,
 }
 
 impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
@@ -192,6 +197,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
             f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
+            shared_store: crate::tuning::tuning().qwen4exp.shared_store,
             probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -216,6 +222,20 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// read (see the field); the tuning's `qwen4exp.f16_fuse` by default.
     pub fn set_f16_fuse(&mut self, on: bool) {
         self.f16_fuse = on;
+    }
+
+    /// Select whether the shared expert's SwiGLU rides its projections'
+    /// stores (see the field).
+    pub fn set_shared_store(&mut self, on: bool) {
+        self.shared_store = on;
+    }
+
+    pub fn shared_store(&self) -> bool {
+        self.shared_store
+    }
+
+    pub fn f16_fuse(&self) -> bool {
+        self.f16_fuse
     }
 
     /// Select whether the f16 routed step folds its activation cast into
@@ -680,7 +700,7 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// on — and its gate's logit `[seq, 1]`.
     fn shared_expert(&self, r: &PrefillRouted) -> Result<(Tensor, Tensor)> {
         let x1 = &r.x1;
-        let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
+        let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down, self.shared_store)?;
         let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
         Ok((shared, sh_logit))
     }
@@ -866,7 +886,19 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     }
 }
 
-fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul) -> Result<Tensor> {
+fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul, store: bool) -> Result<Tensor> {
+    // On the projections' stores, where both serve the row: the SiLU on the
+    // gate's, the up projection multiplied into the gate's buffer (which
+    // nothing else reads).
+    if store && gate.mv_store_serves(x) && up.mv_store_serves(x) {
+        if let Some(g) = gate.forward_silu(x) {
+            let g = g?;
+            if let Some(done) = up.forward_mul_into(x, &g) {
+                done?;
+                return down.forward(&g);
+            }
+        }
+    }
     let g = gate.forward(x)?;
     let u = up.forward(x)?;
     let h = match super::kernels::silu_mul(&g, &u) {

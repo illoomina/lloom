@@ -2925,7 +2925,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // drafter's own bound) is a different sequence and a different
             // key. The draft and the observe are outside the bracket: they
             // run on the drafter's model and its own caches.
-            let k = (spec.max_draft() + 1).min(u16::MAX as usize) as u16;
+            // The round keeps nothing past the budget (`fit_to_room`): a
+            // cache fed past the stream is an overrun the next request's
+            // reuse may not be able to take back.
+            let room = opts.remaining(produced);
+            let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
+            let k = (spec.max_draft().min(room.saturating_sub(1).max(floor)) + 1)
+                .min(u16::MAX as usize) as u16;
             let (accepted, timing) = self.speculative_round_keyed(
                 spec,
                 &[seq],
@@ -2934,6 +2940,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 eos_ids,
                 probe,
                 Some((&device, PassShape::Verify { k: k as usize })),
+                room,
             )?;
             let accepted = accepted.into_iter().next().ok_or_else(|| {
                 lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")
@@ -3175,6 +3182,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // Prime: one verify in flight per live sequence.
         for i in 0..n {
             if !lanes[i].done {
+                let room = opts.remaining(lanes[i].produced);
                 Self::pipeline_enqueue(
                     &mut sessions[i],
                     &mut lanes[i],
@@ -3182,6 +3190,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     i,
                     run_start,
                     device,
+                    room,
                 )?;
             }
         }
@@ -3253,7 +3262,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 );
                 lane.done = lane.eos || opts.reached(lane.produced);
                 if !lane.done {
-                    Self::pipeline_enqueue(s, lane, spec, i, run_start, device)?;
+                    let room = opts.remaining(lane.produced);
+                    Self::pipeline_enqueue(s, lane, spec, i, run_start, device, room)?;
                 }
             }
             if !progressed {
@@ -3284,7 +3294,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
     }
 
     /// Draft sequence `i` and enqueue its verify, leaving the receipt in the
-    /// lane. The draft is one drafter forward; nothing here waits for the GPU.
+    /// lane; the draft fitted to `room`, the tokens the lane may still
+    /// publish (`fit_to_room`). The draft is one drafter forward; nothing
+    /// here waits for the GPU.
+    #[allow(clippy::too_many_arguments)]
     fn pipeline_enqueue<S>(
         s: &mut Self,
         lane: &mut Lane<<M as Probes<S::Probe>>::Pending>,
@@ -3292,6 +3305,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         i: usize,
         run_start: std::time::Instant,
         device: &Device,
+        room: usize,
     ) -> Result<()>
     where
         S: Speculator,
@@ -3306,9 +3320,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let t = std::time::Instant::now();
         let rb = readbacks();
         let drafts = spec.draft(&[SeqId(i)])?;
-        let draft = drafts.into_iter().next().ok_or_else(|| {
+        let mut draft = drafts.into_iter().next().ok_or_else(|| {
             lloom_tensor::Error::msg("decode_speculative_pipelined: the drafter returned no block")
         })?;
+        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(s.model));
+        crate::nn::speculator::fit_to_room(&mut draft, room, floor)?;
         timing.draft_ns = t.elapsed().as_nanos() as u64;
         timing.draft_readbacks = readbacks() - rb;
 
@@ -3321,7 +3337,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the two halves — so a bracket spanning them would put another
         // sequence's passes inside this one's, which is exactly the drift
         // the key exists to refuse.
-        let k = (spec.max_draft() + 1).min(u16::MAX as usize);
+        let k = (draft.tokens.len() + 1).min(u16::MAX as usize);
         s.model.prepare_verify(&mut s.seq.cache, k)?;
         begin_pass(device, PassShape::Verify { k })?;
         let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache);

@@ -604,6 +604,13 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         let _ = cache;
         0
     }
+
+    /// Whether a verify window of the anchor alone — a draft of nothing —
+    /// is one this target runs (a decode step), so a driver may fit the last
+    /// round of a bounded run to it. The default refuses.
+    fn verifies_anchor_alone(&self) -> bool {
+        false
+    }
 }
 
 /// The greedy accept: the longest prefix of the window on which the target's
@@ -626,6 +633,27 @@ pub fn accept_prefix(argmax: &[u32], proposed: &[u32], eos_ids: &[u32]) -> Vec<u
         }
     }
     accepted
+}
+
+/// Cut `draft` so its round keeps no token past the run's budget. A window
+/// `[anchor, k drafts]` keeps at most `k + 1` tokens, so with `room` tokens
+/// left to publish it proposes at most `room − 1`, and no fewer than
+/// `floor` (1 for a target whose verify needs a draft,
+/// [`Probes::verifies_anchor_alone`]). A round that kept more fed the cache
+/// past the stream: an overrun only a target able to rewind that far can
+/// take back, and the next request's prefix reuse falls to a fresh prefill
+/// on one that cannot (Qwen4-exp's settled window).
+pub(crate) fn fit_to_room(draft: &mut Draft, room: usize, floor: usize) -> Result<()> {
+    let cap = room.saturating_sub(1).max(floor);
+    if draft.tokens.len() > cap {
+        if cap == 0 {
+            draft.tokens = DraftTokens::Host(Vec::new());
+        } else {
+            draft.tokens.truncate(cap)?;
+        }
+        draft.confidence.truncate(cap);
+    }
+    Ok(())
 }
 
 /// How [`Session::speculative_round`] brackets its phases.
@@ -1210,11 +1238,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        self.speculative_round_keyed(spec, active, anchors, p_min, eos_ids, probe, None)
+        self.speculative_round_keyed(spec, active, anchors, p_min, eos_ids, probe, None, usize::MAX)
     }
 
     /// [`Self::speculative_round`] with the VERIFY phase bracketed as a
-    /// planned pass of `verify_key`'s shape (`DESIGN.md` §9.2aa).
+    /// planned pass of `verify_key`'s shape (`DESIGN.md` §9.2aa), and every
+    /// draft fitted to `room`, the tokens the run may still publish
+    /// ([`fit_to_room`]; `usize::MAX` for no bound).
     ///
     /// Only the verify is bracketed. The draft and the observe run on the
     /// DRAFTER's model and its own caches — a different allocation sequence
@@ -1231,6 +1261,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         eos_ids: &[u32],
         probe: RoundProbe<'_>,
         verify_key: Option<(&Device, crate::nn::decode::PassShape)>,
+        room: usize,
     ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
     where
         S: Speculator,
@@ -1262,6 +1293,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     d.confidence.truncate(cut);
                 }
             }
+        }
+        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
+        for d in drafts.iter_mut() {
+            fit_to_room(d, room, floor)?;
         }
 
         // ONE target forward over `[last, draft…]`, extracting the probe in the

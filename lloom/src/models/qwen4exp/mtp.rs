@@ -26,8 +26,8 @@ use super::hc::HyperConnection;
 use super::model::{Layer, Qwen4Exp, State, VerifyPass};
 use super::moe::{ExpertResidency, WindowPlan, WindowPlanKind, WindowRecord};
 use crate::nn::speculator::{
-    accept_prefix, Anchor, Draft, DraftTokens, KvSource, NextnHidden, Probes, SeqId, Speculator,
-    VerifyRowRef,
+    accept_prefix, Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, Probes, SeqId,
+    Speculator, TargetProbe, VerifyRowRef,
 };
 use crate::nn::{CausalLM, RmsNorm};
 use crate::profile::{NoRewind, One, Own, Profile};
@@ -1172,13 +1172,80 @@ fn mtp_trace() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.mtp_trace)
 }
 
+/// What a verify window retains for its drafter — the family's probe,
+/// armed before the window runs and taken once the accept is known. The
+/// window's mechanics (the pass, the accept by phase or the replay, the
+/// streamed tier's settle) are the family's alike; only this differs.
+pub(crate) trait WindowProbe: TargetProbe {
+    /// Discard anything retained untaken and arm the cache to retain this
+    /// probe over the window; returns the arming to restore after it.
+    fn arm<P: Profile>(cache: &mut State<P>) -> bool;
+    fn disarm<P: Profile>(cache: &mut State<P>, was: bool);
+    /// Discard what is retained, counting a dropped probe.
+    fn drop_retained<P: Profile>(cache: &mut State<P>);
+    fn take<P: Profile>(cache: &mut State<P>) -> Result<Option<Self::Output>>;
+    /// The positions a taken probe covers.
+    fn rows(out: &Self::Output) -> Result<usize>;
+}
+
+impl WindowProbe for NextnHidden {
+    fn arm<P: Profile>(cache: &mut State<P>) -> bool {
+        cache.drop_nextn();
+        std::mem::replace(&mut cache.want_nextn, true)
+    }
+    fn disarm<P: Profile>(cache: &mut State<P>, was: bool) {
+        cache.want_nextn = was;
+    }
+    fn drop_retained<P: Profile>(cache: &mut State<P>) {
+        cache.drop_nextn();
+    }
+    fn take<P: Profile>(cache: &mut State<P>) -> Result<Option<Tensor>> {
+        cache.take_nextn()
+    }
+    fn rows(out: &Tensor) -> Result<usize> {
+        out.dim(1)
+    }
+}
+
+/// The taps are retained on every forward once a cache names its tapped
+/// layers (`Cache::set_tap_layers`), so arming is a check, not a switch.
+impl<const N: usize> WindowProbe for LayerTaps<N> {
+    fn arm<P: Profile>(cache: &mut State<P>) -> bool {
+        cache.drop_taps();
+        true
+    }
+    fn disarm<P: Profile>(_: &mut State<P>, _: bool) {}
+    fn drop_retained<P: Profile>(cache: &mut State<P>) {
+        cache.drop_taps();
+    }
+    fn take<P: Profile>(cache: &mut State<P>) -> Result<Option<Vec<Tensor>>> {
+        let taps = cache.take_taps()?;
+        if let Some(t) = &taps {
+            if t.len() != N {
+                lloom_tensor::bail!(
+                    "qwen4exp: the cache taps {} layers and the drafter reads {N}",
+                    t.len()
+                )
+            }
+        }
+        Ok(taps)
+    }
+    fn rows(out: &Vec<Tensor>) -> Result<usize> {
+        match out.first() {
+            Some(t) => t.dim(1),
+            None => Ok(0),
+        }
+    }
+}
+
 /// A verify pass encoded and read back, awaiting the accept decision.
 #[derive(Debug)]
-pub struct MtpPending<P: Profile> {
+pub struct WindowPending<P: Profile> {
     /// The target's argmax at each of the `k + 1` window positions.
     argmax: Vec<u32>,
     /// The window's input tokens `[anchor, proposed…]`.
     tokens: Vec<u32>,
+    /// The probe's arming before the window ([`WindowProbe::arm`]).
     want_was: bool,
     /// The window ran as one pass over the phase rings
     /// (`verify_window_run`): the accept is by phase, and the streamed
@@ -1220,8 +1287,8 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
                 anchors.len()
             )
         }
-        let pending = self.verify_enqueue(&drafts[0], &anchors[0], cache)?;
-        let (accepted, probe) = self.verify_complete(pending, cache, eos_ids)?;
+        let pending = self.window_enqueue::<NextnHidden>(&drafts[0], &anchors[0], cache)?;
+        let (accepted, probe) = self.window_complete::<NextnHidden>(pending, cache, eos_ids)?;
         Ok((vec![accepted], probe))
     }
 
@@ -1240,9 +1307,9 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         Ok(())
     }
 
-    type Pending = MtpPending<P>;
-    /// One [`MtpPending`] per row, in row order.
-    type PendingRows = Vec<MtpPending<P>>;
+    type Pending = WindowPending<P>;
+    /// One [`WindowPending`] per row, in row order.
+    type PendingRows = Vec<WindowPending<P>>;
 
     /// Every row's window through [`Self::verify_enqueue`] against its own
     /// cache, one after another: a row verifies exactly as it would alone, so
@@ -1252,18 +1319,18 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
     fn verify_rows_enqueue(
         &self,
         rows: &mut [VerifyRowRef<'_, Self::Cache>],
-    ) -> Result<Vec<MtpPending<P>>> {
+    ) -> Result<Vec<WindowPending<P>>> {
         if rows.is_empty() {
             lloom_tensor::bail!("qwen4exp verify_rows_enqueue: no rows")
         }
         rows.iter_mut()
-            .map(|r| self.verify_enqueue(r.draft, &r.anchor, r.cache))
+            .map(|r| self.window_enqueue::<NextnHidden>(r.draft, &r.anchor, r.cache))
             .collect()
     }
 
     fn verify_rows_complete(
         &self,
-        pending: Vec<MtpPending<P>>,
+        pending: Vec<WindowPending<P>>,
         caches: &mut [&mut Self::Cache],
         eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, Tensor)>> {
@@ -1279,7 +1346,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
             .into_iter()
             .zip(caches.iter_mut())
             .zip(eos_sets)
-            .map(|((p, c), eos)| self.verify_complete(p, c, eos))
+            .map(|((p, c), eos)| self.window_complete::<NextnHidden>(p, c, eos))
             .collect()
     }
 
@@ -1290,7 +1357,57 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         draft: &Draft,
         anchor: &Anchor,
         cache: &mut Self::Cache,
-    ) -> Result<MtpPending<P>> {
+    ) -> Result<WindowPending<P>> {
+        self.window_enqueue::<NextnHidden>(draft, anchor, cache)
+    }
+
+    /// Accept the longest agreeing prefix; on a partial accept rewind the
+    /// window and replay the accepted prefix. The probe is the carry at each
+    /// accepted position. Over the phase rings the streamed tier's plans are
+    /// settled AFTER the accept: a rejected draft's experts are neither
+    /// loaded nor touched, a draft that computed on a missing expert cuts
+    /// the prefix at itself, only a miss at the real next token redoes the
+    /// window (`expert-streaming.md` §20.16).
+    fn verify_complete(
+        &self,
+        pending: WindowPending<P>,
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+    ) -> Result<(Vec<u32>, Tensor)> {
+        self.window_complete::<NextnHidden>(pending, cache, eos_ids)
+    }
+
+    fn take_probe(&self, cache: &mut Self::Cache) -> Result<Tensor> {
+        let (n, d) = (self.config().hc_count, self.config().hidden_size);
+        match cache.take_nextn()? {
+            Some(t) => Ok(t),
+            None => Tensor::zeros((1, 0, n * d), lloom_tensor::DType::F32, &self.device()),
+        }
+    }
+
+    fn probe_drops(&self, cache: &Self::Cache) -> u64 {
+        cache.nextn_drops()
+    }
+
+    /// The window `[anchor]` is a decode step over the phase rings.
+    fn verifies_anchor_alone(&self) -> bool {
+        true
+    }
+}
+
+impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
+    /// [`Probes::verify_enqueue`] for any family whose probe a window
+    /// retains ([`WindowProbe`]): the window `[anchor, proposed…]` as one
+    /// pass over the phase rings when the cache holds them, else `k + 1`
+    /// sequential decode steps inside an open window; the argmax read back
+    /// once. A device-resident draft is read back here: the PLE hashes the
+    /// window's ids on the host.
+    pub(crate) fn window_enqueue<W: WindowProbe>(
+        &self,
+        draft: &Draft,
+        anchor: &Anchor,
+        cache: &mut State<P>,
+    ) -> Result<WindowPending<P>> {
         if anchor.pos != cache.pos {
             lloom_tensor::bail!(
                 "qwen4exp verify: anchor pos {} != cache pos {}",
@@ -1302,15 +1419,10 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
             DraftTokens::Host(v) => v.clone(),
             DraftTokens::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
         };
-        if proposed.is_empty() {
-            lloom_tensor::bail!("qwen4exp verify: no proposed tokens")
-        }
         let mut tokens = Vec::with_capacity(proposed.len() + 1);
         tokens.push(anchor.last);
         tokens.extend_from_slice(&proposed);
-        cache.drop_nextn();
-        let want_was = cache.want_nextn;
-        cache.want_nextn = true;
+        let want_was = W::arm(cache);
         // The window as ONE pass with every position's state kept (the
         // phase rings, `verify_window_run`) when the cache holds them; else
         // the sequential steps with the replay on a partial accept.
@@ -1326,7 +1438,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
             }
             (Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?, None)
         };
-        Ok(MtpPending {
+        Ok(WindowPending {
             argmax,
             tokens,
             want_was,
@@ -1334,20 +1446,14 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         })
     }
 
-    /// Accept the longest agreeing prefix; on a partial accept rewind the
-    /// window and replay the accepted prefix. The probe is the carry at each
-    /// accepted position. Over the phase rings the streamed tier's plans are
-    /// settled AFTER the accept: a rejected draft's experts are neither
-    /// loaded nor touched, a draft that computed on a missing expert cuts
-    /// the prefix at itself, only a miss at the real next token redoes the
-    /// window (`expert-streaming.md` §20.16).
-    fn verify_complete(
+    /// [`Probes::verify_complete`] for any [`WindowProbe`] family.
+    pub(crate) fn window_complete<W: WindowProbe>(
         &self,
-        pending: MtpPending<P>,
-        cache: &mut Self::Cache,
+        pending: WindowPending<P>,
+        cache: &mut State<P>,
         eos_ids: &[u32],
-    ) -> Result<(Vec<u32>, Tensor)> {
-        let MtpPending {
+    ) -> Result<(Vec<u32>, W::Output)> {
+        let WindowPending {
             argmax,
             tokens,
             want_was,
@@ -1396,39 +1502,27 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         let probe = if verdict.is_some() {
             // The accepted prefix by phase: no replay.
             cache.accept_window(a)?;
-            cache.take_nextn()?
+            W::take(cache)?
         } else if a == tokens.len() {
             cache.resolve_window()?;
-            cache.take_nextn()?
+            W::take(cache)?
         } else {
             cache.rewind_window()?;
-            cache.drop_nextn();
+            W::drop_retained(cache);
             self.replay(&tokens[..a], cache)?;
-            cache.take_nextn()?
+            W::take(cache)?
         };
-        cache.want_nextn = want_was;
+        W::disarm(cache, want_was);
         let probe = match probe {
             Some(p) => p,
-            None => lloom_tensor::bail!("qwen4exp verify: the pass retained no carry"),
+            None => lloom_tensor::bail!("qwen4exp verify: the pass retained no probe"),
         };
-        if probe.dim(1)? != a {
+        let rows = W::rows(&probe)?;
+        if rows != a {
             lloom_tensor::bail!(
-                "qwen4exp verify: {} carries for {a} accepted positions",
-                probe.dim(1)?
+                "qwen4exp verify: the probe covers {rows} positions for {a} accepted"
             )
         }
         Ok((accepted, probe))
-    }
-
-    fn take_probe(&self, cache: &mut Self::Cache) -> Result<Tensor> {
-        let (n, d) = (self.config().hc_count, self.config().hidden_size);
-        match cache.take_nextn()? {
-            Some(t) => Ok(t),
-            None => Tensor::zeros((1, 0, n * d), lloom_tensor::DType::F32, &self.device()),
-        }
-    }
-
-    fn probe_drops(&self, cache: &Self::Cache) -> u64 {
-        cache.nextn_drops()
     }
 }

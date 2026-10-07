@@ -68,6 +68,9 @@ pub struct Policy {
     /// rides a product whose weight name ends with one of the suffixes, and
     /// no other.
     pub sites: Vec<(String, Vec<String>)>,
+    /// Blocks admitted despite their measured loss: a switch the model runs
+    /// them under is on.
+    pub admit: Vec<String>,
 }
 
 impl Default for Policy {
@@ -101,6 +104,7 @@ impl Default for Policy {
             barrier_model: Some(CostModel::default()),
             unavailable: Vec::new(),
             sites: Vec::new(),
+            admit: Vec::new(),
         }
     }
 }
@@ -138,7 +142,11 @@ impl Policy {
         // validation state worth reporting.
         fragments
             .iter()
-            .filter(|f| f.refusal.is_none() && f.class().within(self.budget))
+            .filter(|f| {
+                f.refusal.is_none()
+                    && f.class().within(self.budget)
+                    && (f.loss.is_none() || self.admit.iter().any(|a| a == f.name))
+            })
             .cloned()
             .filter_map(|f| {
                 let t = ExclusionSet::fragment_transform(f.name);
@@ -259,7 +267,7 @@ pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Re
     if let Some(model) = &policy.barrier_model {
         let names: Vec<&str> = admitted.iter().map(|f| f.name).collect();
         loop {
-            let m = cost::marginals(model, &derived, &names);
+            let m = cost::marginals_in(model, &derived, &names, catalogue);
             let worst = m
                 .iter()
                 .filter(|x| x.sites > 0 && x.delta_us > 0.0)
@@ -280,7 +288,7 @@ pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Re
                             w.sites
                         ),
                     ));
-                    derived = cost::unfuse(&derived, &w.fragment);
+                    derived = cost::unfuse_in(&derived, &w.fragment, catalogue);
                     marginals.push(w);
                 }
                 None => {
@@ -893,7 +901,24 @@ mod tests {
         let route = g.input("route", Shape::of(&[1, 4]), DType::F32);
         let out = g.opaque("moe_combine", &[y32, route], Shape::of(&[1, 64]), DType::F32);
         g.mark_root(out);
+        // Admitted, the store blocks take the SwiGLU on packed products —
+        // the SiLU on the gate's store, the product into the gate's buffer —
+        // one launch fewer than the kernel fragment's; by default they are
+        // refused by their measured loss and the kernel fragment is the
+        // answer.
+        let admit = Policy {
+            admit: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &admit).unwrap();
+        assert_eq!(d.plan.sites.get("wg").map(String::as_str), Some("quant_silu"));
+        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        assert!(!d.plan.kernels.contains_key("silu_mul_f32"));
         let d = derive(&g, &Policy::default()).unwrap();
+        assert!(d
+            .refused
+            .iter()
+            .any(|(n, w)| n == "quant_mul" && w == fragments::QUANT_STORE_LOSS));
         assert_eq!(d.plan.kernels.get("silu_mul_f32"), Some(&1));
         assert_eq!(d.plan.kernels.get("combine_cast"), Some(&1));
         assert_eq!(d.plan.after.get("silu_mul"), Some(&1));
@@ -906,12 +931,54 @@ mod tests {
         assert!(d.plan.to_string().contains(" combine_cast=1 silu_mul_f32=1"), "{}", d.plan);
         // Excluded by name, both pairs stay.
         let policy = Policy {
-            excluded: vec!["silu_mul_f32".to_string(), "combine_cast".to_string()],
+            excluded: vec![
+                "silu_mul_f32".to_string(),
+                "combine_cast".to_string(),
+                "quant_silu".to_string(),
+                "quant_mul".to_string(),
+            ],
             ..Default::default()
         };
         let d = derive(&g, &policy).unwrap();
         assert!(d.plan.kernels.is_empty());
         assert_eq!(d.plan.after.get("cast"), Some(&1));
+    }
+
+    /// The product multiplied into its operand overwrites the operand, so
+    /// it rides only where the operand has no other reader; and the store
+    /// blocks ride packed weights only, never a dense quantized tensor.
+    #[test]
+    fn the_store_product_into_its_operand_needs_the_operand_alone_and_a_packed_weight() {
+        let swiglu = |extra_reader: bool, wdtype: DType| {
+            let mut g = Graph::new();
+            let x = g.input("x", Shape::of(&[1, 1, 64]), DType::F32);
+            let wg = g.weight("wg", Shape::of(&[32, 64]), wdtype);
+            let wu = g.weight("wu", Shape::of(&[32, 64]), wdtype);
+            let a = g.gemv_on(Core::Quant, wg, x);
+            let s = g.silu(a);
+            let b = g.gemv_on(Core::Quant, wu, x);
+            let h = g.mul(s, b);
+            g.mark_root(h);
+            if extra_reader {
+                let e = g.sigmoid(s);
+                g.mark_root(e);
+            }
+            let admit = Policy {
+                admit: vec!["quant_silu".to_string(), "quant_mul".to_string()],
+                ..Default::default()
+            };
+            derive(&g, &admit).unwrap()
+        };
+        let d = swiglu(false, DType::U8);
+        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        let d = swiglu(true, DType::U8);
+        assert_eq!(d.plan.sites.get("wu"), None, "{:?}", d.plan.sites);
+        let d = swiglu(false, DType::F32);
+        assert!(
+            d.plan.sites.values().all(|f| !f.starts_with("quant_")),
+            "{:?}",
+            d.plan.sites
+        );
     }
 
     #[test]

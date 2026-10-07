@@ -32,7 +32,9 @@ use lloom::models::lfm2::{
     Config, ConvState, KvAppend, LayerType, Model, Shape as Lfm2Shape, State,
 };
 use lloom::nn::{RaggedRow, Row, VarBuilder};
-use lloom::profile::{CrownExact, PoolSpecExact};
+use lloom::profile::CrownExact;
+#[cfg(feature = "metal")]
+use lloom::profile::PoolSpecExact;
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// The process-wide switches this binary runs under, set before any test

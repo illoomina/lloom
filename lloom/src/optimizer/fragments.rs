@@ -73,6 +73,9 @@ pub struct Fragment {
     /// prologue alone always): `gemv.metal`'s `_norm`, `_norm_silu`,
     /// `_norm_swiglu`. Empty for an epilogue.
     pub composes_with: &'static [&'static str],
+    /// A measured loss: the block is refused with it unless a policy admits
+    /// it by name (`Policy::admit`, a switch that runs it anyway).
+    pub loss: Option<&'static str>,
 }
 
 impl Fragment {
@@ -107,6 +110,7 @@ fn describe<E: Epilogue>() -> Fragment {
         needs: TileNeed::Any,
         refusal: None,
         composes_with: &[],
+        loss: None,
     }
 }
 
@@ -138,6 +142,7 @@ fn describe_prologue<P: Prologue>(
         needs: P::NEEDS,
         refusal,
         composes_with,
+        loss: None,
     }
 }
 
@@ -166,8 +171,42 @@ fn describe_mixed(e: MixedEpilogue) -> Option<Fragment> {
         needs: TileNeed::Any,
         refusal: None,
         composes_with: &[],
+        loss: None,
     })
 }
+
+/// A quantized-matvec store block (`lloom_tensor::quantized::MvStore`,
+/// instantiated per kind from the kinds table): the SiLU, or the product
+/// multiplied into the operand's own buffer. `Rounding`, the GEMV epilogues'
+/// class: the block computes on the core's f32 sum, as the pair's next
+/// launch does on its f32 store.
+fn describe_quant(s: lloom_tensor::quantized::MvStore) -> Fragment {
+    use lloom_tensor::quantized::MvStore;
+    let (name, semantics, operand) = match s {
+        MvStore::Silu => ("quant_silu", Semantics::Silu, OperandKind::None),
+        MvStore::MulInto => ("quant_mul", Semantics::MulOperand, OperandKind::Into),
+    };
+    Fragment {
+        name,
+        core: Core::Quant,
+        semantics,
+        precision: Precision::Accumulator,
+        operand,
+        scales: false,
+        model: TargetFpModel::of_family("gemv").expect("the GEMV's model is declared"),
+        side: Side::Store,
+        needs: TileNeed::Any,
+        refusal: None,
+        composes_with: &[],
+        loss: Some(QUANT_STORE_LOSS),
+    }
+}
+
+/// The quantized store blocks' measurement, as a pair on Qwen4-exp's shared
+/// experts: not a win.
+pub const QUANT_STORE_LOSS: &str = "a measured loss as a pair (optimizer-design.md §10k): \
+     +1.13 % [-0.92, +1.32] decode end to end on Qwen4-exp, 4 rotations, null -0.12 %; the up \
+     projection waits on the gate's sweep where silu_mul waited on both";
 
 /// Why the imported-scale norm prologue is never placed.
 pub const RMSNORM_REFUSAL: &str = "a measured loss (fusion.md §12.2a): the reduction stays a \
@@ -203,6 +242,8 @@ pub fn catalogue() -> Vec<Fragment> {
         .into_iter()
         .filter_map(describe_mixed),
     );
+    cat.push(describe_quant(lloom_tensor::quantized::MvStore::Silu));
+    cat.push(describe_quant(lloom_tensor::quantized::MvStore::MulInto));
     cat.push(describe_prologue::<PrologueNormInline>(
         Core::Gemv,
         None,
@@ -306,7 +347,7 @@ mod tests {
     #[test]
     fn the_catalogue_is_the_shipped_epilogues_of_both_cores() {
         let cat = catalogue();
-        assert_eq!(cat.len(), 9);
+        assert_eq!(cat.len(), 11);
         assert_eq!(cat[0].name, "silu");
         assert_eq!(cat[0].semantics, Semantics::Silu);
         assert_eq!(cat[0].operand, OperandKind::None);
@@ -354,7 +395,17 @@ mod tests {
                 f.name
             );
         }
-        for f in &cat[..6] {
+        // The quantized matvec's two store blocks: the SiLU, and the product
+        // multiplied into its operand's own buffer.
+        assert_eq!(
+            (cat[6].name, cat[6].core, cat[6].semantics, cat[6].operand, cat[6].class()),
+            ("quant_silu", Core::Quant, Semantics::Silu, OperandKind::None, NumericClass::Rounding)
+        );
+        assert_eq!(
+            (cat[7].name, cat[7].semantics, cat[7].operand),
+            ("quant_mul", Semantics::MulOperand, OperandKind::Into)
+        );
+        for f in &cat[..8] {
             assert_eq!(
                 (f.side, f.needs, f.refusal, f.composes_with.len()),
                 (Side::Store, TileNeed::Any, None, 0)
@@ -364,7 +415,7 @@ mod tests {
         // in the reorder class; the imported-scale norm and the grouped norm
         // catalogued with the reason they are refused.
         assert_eq!(
-            (cat[6].name, cat[6].core, cat[6].side, cat[6].needs, cat[6].class()),
+            (cat[8].name, cat[8].core, cat[8].side, cat[8].needs, cat[8].class()),
             (
                 "norm",
                 Core::Gemv,
@@ -373,15 +424,15 @@ mod tests {
                 NumericClass::ReorderEquiv
             )
         );
-        assert_eq!(cat[6].refusal, None);
-        assert_eq!(cat[6].composes_with, ["silu", "swiglu"]);
-        assert_eq!((cat[7].name, cat[7].side), ("rmsnorm", Side::Load));
-        assert_eq!(cat[7].refusal, Some(RMSNORM_REFUSAL));
+        assert_eq!(cat[8].refusal, None);
+        assert_eq!(cat[8].composes_with, ["silu", "swiglu"]);
+        assert_eq!((cat[9].name, cat[9].side), ("rmsnorm", Side::Load));
+        assert_eq!(cat[9].refusal, Some(RMSNORM_REFUSAL));
         assert_eq!(
-            (cat[8].name, cat[8].core, cat[8].semantics, cat[8].class()),
+            (cat[10].name, cat[10].core, cat[10].semantics, cat[10].class()),
             ("mixed_gnorm", Core::Mixed, Semantics::GroupRmsNorm, NumericClass::BitExact)
         );
-        assert_eq!(cat[8].refusal, Some(MIXED_GNORM_REFUSAL));
+        assert_eq!(cat[10].refusal, Some(MIXED_GNORM_REFUSAL));
         let k = kernels();
         assert_eq!(
             k.iter().map(|k| (k.name, k.class)).collect::<Vec<_>>(),

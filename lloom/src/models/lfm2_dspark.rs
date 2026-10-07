@@ -5,6 +5,11 @@
 //! the drafter offers, and it is reachable *before* the backbone exists.
 //! This module is that projection, and nothing more.
 //!
+//! The module grew into the whole block-drafter family — projection,
+//! backbone, context KV, [`DSparkSpeculator`] — and serves two targets: LFM2's
+//! DSpark checkpoint and Qwen4-exp's DFlash one, whose embedding and head
+//! reach it through [`SharedHead`] (`design/docs/speculation.md` §10.2z-vi).
+//!
 //! # What it computes
 //!
 //! `H_ctx = RMSNorm_enc( W_c · [H(l₁); …; H(l₅)] )` — the drafter's `fc.weight`
@@ -397,12 +402,10 @@ impl DSparkConfig {
                 .unwrap_or(1e-5),
             rope_theta: v
                 .get("rope_theta")
+                .or_else(|| v.get("rope_parameters").and_then(|r| r.get("rope_theta")))
                 .and_then(|x| x.as_f64())
                 .ok_or_else(|| missing("rope_theta"))?,
-            rope_is_neox_style: v
-                .get("rope_is_neox_style")
-                .and_then(|x| x.as_bool())
-                .ok_or_else(|| missing("rope_is_neox_style"))?,
+            rope_is_neox_style: Self::rope_style(&v)?,
             block_size: usize_at("block_size")?,
             mask_token_id: dfc
                 .get("mask_token_id")
@@ -427,6 +430,33 @@ impl DSparkConfig {
             // Not a key in config.json — a property of the packaging (§10.2p).
             logits_start: 0,
         })
+    }
+
+    /// Whether the drafter's RoPE is neox (rotate-half) style: the config's
+    /// `rope_is_neox_style` (LFM2's DSpark) or `is_neox_style` (a vLLM
+    /// drafter override), else the checkpoint class's own convention when
+    /// its class fixes one — DeepSpec's `Qwen3DSparkModel` rotates by
+    /// transformers' Qwen3 `rotate_half`, neox, and carries no key for it.
+    /// Any other config without the key is refused: the style alters no
+    /// shape and only the acceptance rate would show it.
+    fn rope_style(v: &serde_json::Value) -> Result<bool> {
+        if let Some(b) = ["rope_is_neox_style", "is_neox_style"]
+            .iter()
+            .find_map(|k| v.get(*k).and_then(|x| x.as_bool()))
+        {
+            return Ok(b);
+        }
+        let class = v
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|x| x.as_str());
+        match class {
+            Some("Qwen3DSparkModel") => Ok(true),
+            other => lloom_tensor::bail!(
+                "drafter config has no rope_is_neox_style and its class {other:?} fixes none"
+            ),
+        }
     }
 
     /// The `Config::tap_layers` that deliver `target_layer_ids`' output residuals.
@@ -3037,6 +3067,53 @@ impl PerSeq {
     }
 }
 
+/// The target's token embedding and output head, which a hidden-state
+/// drafter borrows: DSpark and DFlash checkpoints ship neither (the trainer
+/// copies both from the target and freezes them), so the block is embedded
+/// and its predictions are read through the TARGET's raw pair. One impl per
+/// target's storage — LFM2's dense tensors ([`DenseHead`]), Qwen4-exp's
+/// quantized ones (`qwen4exp::QwenHead`) — resolved at compile time.
+pub trait SharedHead {
+    /// The raw embedding of `ids` (`U32`, any shape) → `[.., hidden]`.
+    fn embed(&self, ids: &Tensor) -> Result<Tensor>;
+    /// The raw head over `hidden` (`[.., hidden]`, any float dtype) →
+    /// `[.., vocab]` F32.
+    fn logits(&self, hidden: &Tensor) -> Result<Tensor>;
+    fn device(&self) -> &Device;
+}
+
+/// LFM2's pair: the target's own `Embedding` and `lm_head` tensors, cloned
+/// (both are `Arc`-backed), so the drafter pins no target alive.
+#[derive(Debug, Clone)]
+pub struct DenseHead {
+    embed: TracedEmbedding,
+    lm_head: TracedLinear,
+}
+
+impl DenseHead {
+    pub fn new(embed: TracedEmbedding, lm_head: TracedLinear) -> Self {
+        Self { embed, lm_head }
+    }
+}
+
+impl SharedHead for DenseHead {
+    fn embed(&self, ids: &Tensor) -> Result<Tensor> {
+        self.embed.forward(ids)
+    }
+
+    /// The head reads at the embedding table's dtype — the target's — and
+    /// returns F32 for the argmax chain.
+    fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head
+            .forward(&hidden.to_dtype(self.embed.embeddings().dtype())?)?
+            .to_dtype(DType::F32)
+    }
+
+    fn device(&self) -> &Device {
+        self.lm_head.weight().device()
+    }
+}
+
 /// A DSpark proposer driving a fixed set of sequences — the [`Speculator`]
 /// implementation of the DSpark family (`RESTRUCTURING_DESIGN.md` §3.4).
 ///
@@ -3064,13 +3141,12 @@ impl PerSeq {
 /// Thereafter each `observe` re-keys from the verified round's taps and advances
 /// the anchor. This mirrors the `lfm2-dspark-verify` example's
 /// seed-then-loop shape, factored behind the seam.
-pub struct DSparkSpeculator {
+pub struct DSparkSpeculator<H: SharedHead = DenseHead> {
     drafter: DSparkDrafter,
-    /// The target's token embedding, shared (the drafter ships none).
-    embed: TracedEmbedding,
-    /// The target's raw `lm_head`, shared. The proposal head must stay the raw
-    /// projection (`Model::draft_lm_head`'s contract).
-    lm_head: TracedLinear,
+    /// The target's token embedding and raw `lm_head`, shared (the drafter
+    /// ships neither). The proposal head must stay the raw projection
+    /// (`Model::draft_lm_head`'s contract).
+    head: H,
     seqs: Vec<PerSeq>,
     /// The draft-block width `γ` and the prediction cap, read once from the
     /// drafter config.
@@ -3102,7 +3178,7 @@ pub struct DSparkSpeculator {
     ctx_resets: u64,
 }
 
-impl DSparkSpeculator {
+impl DSparkSpeculator<DenseHead> {
     /// Build a proposer for `n_seq` server slots, the context KV arm read
     /// from the tuning ([`CtxKv::resolve`]: `auto` unset, paged per sequence
     /// on Metal).
@@ -3117,8 +3193,7 @@ impl DSparkSpeculator {
         lm_head: TracedLinear,
         n_seq: usize,
     ) -> Result<Self> {
-        let ctx_kv = CtxKv::resolve(lm_head.weight().device())?;
-        Self::new_with_ctx(drafter, embed, lm_head, n_seq, ctx_kv)
+        Self::with_head(drafter, DenseHead::new(embed, lm_head), n_seq)
     }
 
     /// [`Self::new`] with the context KV arm chosen by the caller.
@@ -3129,9 +3204,28 @@ impl DSparkSpeculator {
         n_seq: usize,
         ctx_kv: CtxKv,
     ) -> Result<Self> {
+        Self::with_head_ctx(drafter, DenseHead::new(embed, lm_head), n_seq, ctx_kv)
+    }
+}
+
+impl<H: SharedHead> DSparkSpeculator<H> {
+    /// A proposer over any target's shared pair ([`SharedHead`]), the
+    /// context KV arm read from the tuning.
+    pub fn with_head(drafter: DSparkDrafter, head: H, n_seq: usize) -> Result<Self> {
+        let ctx_kv = CtxKv::resolve(head.device())?;
+        Self::with_head_ctx(drafter, head, n_seq, ctx_kv)
+    }
+
+    /// [`Self::with_head`] with the context KV arm chosen by the caller.
+    pub fn with_head_ctx(
+        drafter: DSparkDrafter,
+        head: H,
+        n_seq: usize,
+        ctx_kv: CtxKv,
+    ) -> Result<Self> {
         let block_size = drafter.config().block_size;
         let max_draft = drafter.config().max_draft();
-        let device = lm_head.weight().device().clone();
+        let device = head.device().clone();
         let mask_block = drafter.block_input_ids(0, block_size);
         let seqs = drafter
             .make_ctx_caches_for(ctx_kv, n_seq, &device)?
@@ -3163,8 +3257,7 @@ impl DSparkSpeculator {
         let active_slot = Tensor::new(vec![0u32; rows].as_slice(), &device)?;
         Ok(Self {
             drafter,
-            embed,
-            lm_head,
+            head,
             seqs,
             block_size,
             max_draft,
@@ -3345,20 +3438,15 @@ impl DSparkSpeculator {
             .iter()
             .map(|s| self.seqs[s.0].ctx.as_slice())
             .collect();
-        let block_embeds = self.drafter.embed_block(&self.embed.forward(&ids)?)?;
+        let block_embeds = self.drafter.embed_block(&self.head.embed(&ids)?)?;
         let hidden =
             self.drafter
                 .block_hidden_rows(&block_embeds, &offsets, &caches, active_t.as_ref())?;
         let pred = self.drafter.head_slice(&hidden, self.max_draft)?; // [B, cap, hidden]
         let (_, cap, h) = pred.dims3()?;
         let base_logits = self
-            .lm_head
-            .forward(
-                &pred
-                    .reshape((b * cap, h))?
-                    .to_dtype(self.embed.embeddings().dtype())?,
-            )?
-            .to_dtype(DType::F32)?
+            .head
+            .logits(&pred.reshape((b * cap, h))?)?
             .reshape((b, cap, ()))?;
         let tokens = self.drafter.sample_block_rows(&base_logits, &anchors)?; // [B, cap]
         let confidence: Vec<Vec<f32>> = match self.drafter.confidence_head() {
@@ -3388,9 +3476,7 @@ impl DSparkSpeculator {
     /// per-round draft body, factored behind the seam.
     fn draft_one(&self, seq: &PerSeq) -> Result<Draft> {
         let block_tensor = seq.block_ids(&self.drafter, seq.last, self.block_size)?;
-        let block_embeds = self
-            .drafter
-            .embed_block(&self.embed.forward(&block_tensor)?)?;
+        let block_embeds = self.drafter.embed_block(&self.head.embed(&block_tensor)?)?;
         let hidden = self
             .drafter
             .block_hidden(&block_embeds, seq.ctx_offset, &seq.ctx)?;
@@ -3398,10 +3484,7 @@ impl DSparkSpeculator {
             .drafter
             .head_slice(&hidden, self.max_draft)?
             .squeeze(0)?;
-        let base_logits = self
-            .lm_head
-            .forward(&pred.to_dtype(self.embed.embeddings().dtype())?)?
-            .to_dtype(DType::F32)?;
+        let base_logits = self.head.logits(&pred)?;
         // The block stays on the device: the verify takes it as a tensor, and
         // the host sees the ids in the verify's own readback.
         let anchor = seq.anchor_tensor(seq.last)?;
@@ -3433,7 +3516,7 @@ impl DSparkSpeculator {
     }
 }
 
-impl Speculator for DSparkSpeculator {
+impl<H: SharedHead> Speculator for DSparkSpeculator<H> {
     type Probe = LayerTaps<5>;
     type Family = crate::nn::speculator::DSpark;
 
@@ -3625,7 +3708,7 @@ impl PerSeq {
     }
 }
 
-impl DSparkSpeculator {
+impl<H: SharedHead> DSparkSpeculator<H> {
     /// Draft `k` positions per round instead of the drafter's block width:
     /// the block is still predicted whole and its first `k` proposed, so the
     /// verify window is `k + 1` positions. Clamped to `1..=block`. A lever

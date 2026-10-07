@@ -619,6 +619,7 @@ fn a_planned_verify_under_f16_routing_reads_its_routing() -> Result<()> {
         loader: StreamLoader::Pread,
         prefetch: false,
         io_hints: false,
+        drafter_bytes: 0,
     };
     // Every window host-planned: its ids read back at each layer.
     let build = |dev: &Device| -> Result<Qwen4Exp<RewindableExact, Streamed>> {

@@ -562,6 +562,10 @@ pub struct StreamOptions {
     /// arm's DMA is already asynchronous, and a pool smaller than the
     /// tile's working set has no room to read ahead into.
     pub io_hints: bool,
+    /// Bytes a drafter loaded beside the model holds (its weights and the
+    /// tables it keeps), claimed out of the slot plan under `Auto`; 0 for
+    /// none (the MTP head is a shard of the model and counted with it).
+    pub drafter_bytes: usize,
 }
 
 /// The slots `Auto` resolves to, and the terms it resolved them from.
@@ -1094,7 +1098,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                 kv_tokens,
                 prefill_tile,
             } => {
-                let claims = session_claims(
+                let mut claims = session_claims(
                     &cfg0,
                     rows,
                     kv_tokens,
@@ -1102,6 +1106,14 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     &stream.loader,
                     stream.prefetch,
                 );
+                if stream.drafter_bytes > 0 {
+                    claims.push(SessionClaim {
+                        name: "qwen4exp-drafter",
+                        bytes: stream.drafter_bytes,
+                        unit: stream.drafter_bytes,
+                        capability: true,
+                    });
+                }
                 let plan = plan_slots(&gg, &cfg0, device, fraction, &claims)?;
                 if plan.working_set == 0 {
                     lloom_tensor::bail!(

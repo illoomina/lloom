@@ -229,18 +229,26 @@ pub fn step_cost(model: &CostModel, graph: &Graph) -> StepCost {
 /// derivation for one fragment, without egglog; what the marginal is priced
 /// against.
 pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
+    unfuse_in(graph, fragment, &super::fragments::catalogue())
+}
+
+/// [`unfuse`] with the blocks read from `catalogue`: the pair a block stands
+/// for is read off its semantics, so a block on any core unfuses.
+pub fn unfuse_in(graph: &Graph, fragment: &str, catalogue: &[super::fragments::Fragment]) -> Graph {
+    use crate::nn::fusion::Semantics;
     let mut out = Graph::new();
     let mut map: Vec<Option<NodeId>> = vec![None; graph.nodes().len()];
     // A prologue's norm, once per (weight, input): its readers shared it.
     let mut norms: std::collections::HashMap<(NodeId, NodeId), NodeId> =
         std::collections::HashMap::new();
     let class_of = |name: &str| {
-        super::fragments::catalogue()
-            .into_iter()
+        catalogue
+            .iter()
             .find(|f| f.name == name)
             .map(|f| f.class())
             .unwrap_or(super::numeric::NumericClass::BitExact)
     };
+    let semantics_of = |name: &str| catalogue.iter().find(|f| f.name == name).map(|f| f.semantics);
     for id in order(graph) {
         let n = graph.node(id);
         let inputs: Vec<NodeId> = n
@@ -287,30 +295,29 @@ pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
                         Some(c) if c != 1.0 => out.scale(g, c),
                         _ => g,
                     };
-                    match (n.name.as_str(), operand) {
-                        ("mixed_silu", None) => {
+                    match (semantics_of(&n.name), operand) {
+                        (Some(Semantics::Silu), None) => {
                             let s = scaled(&mut out, g);
                             out.silu(s)
                         }
-                        ("mixed_sigmoid", None) => {
+                        (Some(Semantics::Sigmoid), None) => {
                             let s = scaled(&mut out, g);
                             out.sigmoid(s)
                         }
-                        ("silu", None) => out.silu(g),
-                        ("residual", Some(r)) => out.add(g, r),
+                        (Some(Semantics::AddOperand), Some(r)) => out.add(g, r),
                         // The emitter's operand order: `mul(gate, up)`, the
                         // gate first — so the pair is priced in the order the
                         // layer runs.
-                        ("mul", Some(r)) => out.mul(r, g),
+                        (Some(Semantics::MulOperand), Some(r)) => out.mul(r, g),
                         // The two-weight kernel stands for four dispatches:
                         // `gemv(w1)`, `silu`, `gemv(w3)`, `mul(gate, up)` —
                         // the emitter's order. The operand is the gate WEIGHT.
-                        ("swiglu", Some(w1)) => {
+                        (Some(Semantics::SwigluGate), Some(w1)) => {
                             let gate = product(&mut out, w1);
                             let gate = out.silu(gate);
                             out.mul(gate, g)
                         }
-                        (other, _) => panic!("optimizer: no unfused pair for fragment `{other}`"),
+                        _ => panic!("optimizer: no unfused pair for fragment `{}`", n.name),
                     }
                 }
             }
@@ -332,6 +339,16 @@ pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
 /// the step with that fragment's sites unfused. The pair a costing
 /// fragment's barrier lands between is named from the first such site.
 pub fn marginals(model: &CostModel, derived: &Graph, fragments: &[&str]) -> Vec<Marginal> {
+    marginals_in(model, derived, fragments, &super::fragments::catalogue())
+}
+
+/// [`marginals`] with the blocks read from `catalogue`.
+pub fn marginals_in(
+    model: &CostModel,
+    derived: &Graph,
+    fragments: &[&str],
+    catalogue: &[super::fragments::Fragment],
+) -> Vec<Marginal> {
     let full = step_cost(model, derived);
     fragments
         .iter()
@@ -349,7 +366,7 @@ pub fn marginals(model: &CostModel, derived: &Graph, fragments: &[&str]) -> Vec<
                     between: None,
                 };
             }
-            let without = step_cost(model, &unfuse(derived, f));
+            let without = step_cost(model, &unfuse_in(derived, f, catalogue));
             let delta_us = full.total_us() - without.total_us();
             let between = full
                 .barriers

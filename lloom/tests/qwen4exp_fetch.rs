@@ -29,6 +29,7 @@ fn stream(slots: usize) -> StreamOptions {
         loader: StreamLoader::Pread,
         prefetch: true,
         io_hints: false,
+        drafter_bytes: 0,
     }
 }
 

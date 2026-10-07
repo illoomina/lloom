@@ -217,6 +217,7 @@ fn a_prompt_past_the_dense_range_prefills_in_chunks_metal() -> Result<()> {
         loader: StreamLoader::Pread,
         prefetch: false,
         io_hints: false,
+        drafter_bytes: 0,
     };
     let mut model = fx.streamed(&cfg, &dev, &opts, &stream)?;
     let base = [3u32, 5, 2, 8, 8, 1, 9, 3, 5];

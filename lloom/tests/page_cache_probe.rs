@@ -10,6 +10,7 @@
 //!
 //!   LLOOM_PROBE_FILE=~/.cache/huggingface/hub/…/model.safetensors \
 //!     cargo test -p lloom --features metal --test page_cache_probe -- --ignored --nocapture
+#![cfg(target_os = "macos")]
 #![allow(clippy::needless_range_loop)]
 use std::os::unix::fs::FileExt;
 

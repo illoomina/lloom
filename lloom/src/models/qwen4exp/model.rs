@@ -3467,6 +3467,27 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         Self::redo_of(R::settle_batch(&parts)?)
     }
 
+    /// [`Self::settle_records_at`] for a fetching pass: the bookkeeping
+    /// alone (`ExpertResidency::settle_fetched_batch`) — it may run while
+    /// the fetch worker serves the next pass, so it loads nothing.
+    #[cfg(feature = "metal")]
+    fn settle_records_fetched_at(
+        &self,
+        records: &[(usize, Tensor)],
+        marker: &lloom_tensor::metal_backend::CommandMarker,
+    ) -> Result<(bool, u64)> {
+        if records.is_empty() {
+            return Ok((false, 0));
+        }
+        let owned = self.read_records_at(records, marker)?;
+        let parts: Vec<(&R, &[u32])> = records
+            .iter()
+            .zip(&owned)
+            .map(|((l, _), v)| (self.layers[*l].moe().experts(), v.as_slice()))
+            .collect();
+        Self::redo_of(R::settle_fetched_batch(&parts)?)
+    }
+
     /// A settle's verdicts as `(redo, misses after the first)`.
     fn redo_of(settled: Vec<(bool, u64)>) -> Result<(bool, u64)> {
         let mut redo = false;
@@ -3671,7 +3692,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             marker,
             h,
         } = p;
-        let (redo, after_first) = self.settle_records_at(&records, &marker)?;
+        let (redo, after_first) = self.settle_records_fetched_at(&records, &marker)?;
         pass.finish();
         if redo {
             if let Some(cache) = cache {

@@ -325,6 +325,24 @@ pub trait ExpertResidency {
             .collect()
     }
 
+    /// [`Self::settle_batch`] for a FETCHING pass's records
+    /// (`QWEN4EXP_FETCH=inside`), settled after the pass returned — behind
+    /// the next step's encode, while the fetch worker serves that step's
+    /// layers, or by a provisional step's driver: the bookkeeping alone. The
+    /// pass's misses were loaded inside it, so the settle touches and counts
+    /// what it used and loads nothing: an expert missing now was evicted
+    /// since, by a later pass's fetch, and is that worker's to load when it
+    /// is routed again — a load here would run beside the worker's and take
+    /// its reads (`expert-streaming.md` §20.16y). Per part, whether the pass
+    /// computed on a missing expert (its redo is the caller's) and the
+    /// experts loaded (none). The default is the settle.
+    fn settle_fetched_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>>
+    where
+        Self: Sized,
+    {
+        Self::settle_batch(parts)
+    }
+
     /// The host plan of a speculative window `ids [rows, topk]` (u32, on
     /// the device; row 0 the real next token, the rows after it drafts):
     /// the first `real_rows` rows' experts made resident (loaded, counted
@@ -3343,6 +3361,54 @@ impl Streamed {
     /// A settle's first half: what the pass used touched, its misses given
     /// slots and their reads submitted; `None` when the pass found every
     /// expert resident (nothing to finish, no replay).
+    /// A fetching pass's settle (`ExpertResidency::settle_fetched_batch`):
+    /// the plan closed, what the pass used touched where it is still
+    /// resident and counted, nothing loaded. `true` when the pass flagged a
+    /// miss.
+    fn settle_fetched(&self, v: &[u32]) -> Result<bool> {
+        if !v.len().is_multiple_of(3) {
+            lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
+        }
+        let n = v.len() / 3;
+        let ids = &v[n..2 * n];
+        let flags = &v[2 * n..];
+        let mut inner = self.inner.lock();
+        inner.plans_open = inner.plans_open.saturating_sub(1);
+        if inner.plans_open == 0 {
+            let n = inner.plans_settled();
+            self.counters
+                .h3_deferred_writes
+                .fetch_add(n, Ordering::Relaxed);
+        }
+        let mut distinct = std::mem::take(&mut inner.scratch_ids);
+        distinct.clear();
+        distinct.extend_from_slice(ids);
+        distinct.sort_unstable();
+        distinct.dedup();
+        let tick = inner.map.begin();
+        // As `settle_begin`: a replay's settle does not count the token's
+        // experts a second time.
+        let replaying = std::mem::take(&mut inner.replay_pending);
+        let prior = if replaying {
+            std::mem::take(&mut inner.counted)
+        } else {
+            Vec::new()
+        };
+        for &e in &distinct {
+            if let Some(s) = inner.map.slot_of(e as usize) {
+                inner.map.touch(s, tick);
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            }
+            if !prior.contains(&e) {
+                inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
+            }
+        }
+        inner.counted.clear();
+        inner.counted.extend_from_slice(&distinct);
+        inner.scratch_ids = distinct;
+        Ok(flags.iter().any(|&f| f != 0))
+    }
+
     fn settle_begin(&self, v: &[u32]) -> Result<Option<SettlePending>> {
         if !v.len().is_multiple_of(3) {
             lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
@@ -4083,6 +4149,13 @@ impl ExpertResidency for Streamed {
             }
             None => false,
         })
+    }
+
+    fn settle_fetched_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>> {
+        parts
+            .iter()
+            .map(|(r, v)| Ok((r.settle_fetched(v)?, 0)))
+            .collect()
     }
 
     fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>> {
@@ -5433,6 +5506,64 @@ mod tests {
         );
         assert!(!tier.settle_host(&want_a).unwrap());
         assert!(tier.settle_host(&got_b).unwrap(), "plan B computed on missing experts");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A fetching pass's settle is its bookkeeping alone: the experts its
+    /// record names are counted and the resident ones touched, and nothing
+    /// is loaded — one missing now was evicted since by a later pass's
+    /// fetch, and a load here would run beside that pass's worker. The
+    /// settle of the same record loads what is missing.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_fetched_settle_counts_and_loads_nothing() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let dtype = GgmlDType::F32;
+        let (e, ff, d) = (12usize, 32usize, 64usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let tier = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            6,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        tier.warm(&[1, 2, 3]).unwrap();
+        let tok = Tensor::new(&[[1u32, 2, 3]], &dev).unwrap();
+        // A plan open, as a fetching pass's is until its settle.
+        let _ = tier.plan_device(&tok).unwrap().expect("a device plan");
+        // Its record, as the settle reads it: 1 resident, 8 and 9 not —
+        // evicted since the pass mapped them. No flag: the pass was right.
+        let record = [0u32, 0, 0, 1, 8, 9, 0, 0, 0];
+        let before = tier.stats();
+        let usage_before = tier.usage();
+        assert!(!tier.settle_fetched(&record).unwrap());
+        let after = tier.stats();
+        assert_eq!(
+            (after.misses, after.bytes_loaded),
+            (before.misses, before.bytes_loaded),
+            "a fetched settle loaded: {after:?}"
+        );
+        let usage = tier.usage();
+        for x in [1usize, 8, 9] {
+            assert_eq!(usage[x], usage_before[x] + 1, "expert {x} not counted once");
+        }
+        // A flag is reported, still without a load.
+        let _ = tier.plan_device(&tok).unwrap().expect("a device plan");
+        assert!(tier.settle_fetched(&[0, 0, 0, 1, 8, 9, 0, 1, 0]).unwrap());
+        assert_eq!(tier.stats().bytes_loaded, before.bytes_loaded);
+        // The settle proper loads the two missing experts.
+        let _ = tier.plan_device(&tok).unwrap().expect("a device plan");
+        tier.settle_host(&record).unwrap();
+        assert!(tier.stats().bytes_loaded > before.bytes_loaded, "the control loaded nothing");
         std::fs::remove_file(path).ok();
     }
 

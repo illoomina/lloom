@@ -292,3 +292,87 @@ fn a_settle_behind_the_next_encode_reads_its_own_steps_records_metal() -> Result
     );
     Ok(())
 }
+
+/// On a lookahead ring (`lookahead = 1`), a fetching step's settle held for
+/// the next step's encode runs while the GPU runs that next step and the
+/// worker serves its layers: the two must not collide. The held settle is
+/// the tiers' bookkeeping (the step's misses were loaded inside it), so it
+/// loads nothing beside the worker; the decode is the resident model's,
+/// every step fetched, nothing timed out. Run on a thread of its own and
+/// bounded: a collision parks the queue rather than failing.
+#[test]
+fn a_fetching_settle_held_on_a_lookahead_ring_is_the_resident_stream_metal() {
+    arm();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(ring_run());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(r) => r.unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the ring run did not return in 120 s: a held settle and the worker parked")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the ring run panicked"),
+    }
+}
+
+fn ring_run() -> Result<()> {
+    use lloom::generation::poll::PollMechanism;
+    use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
+    use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+    let Some((fx, dev)) = fixture("qwen4exp_fetch_ring_metal")? else {
+        return Ok(());
+    };
+    let cfg = fx.config(|_| {});
+    let opts = LoadOptions::default();
+    let no_eos = [u32::MAX - 1];
+    let want = {
+        let resident = fx.resident::<CrownExact>(&cfg, &dev, &opts)?;
+        let mut session = Session::new(&resident, resident.new_cache(&cfg, &dev)?);
+        let mut rb = Blocking::new(&no_eos, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        session
+            .decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut sampler,
+                &PROMPT,
+                &DecodeOptions::new(STEPS),
+                &mut |_| Ok(()),
+            )?
+            .ids
+    };
+    let streamed = fx.streamed::<CrownExact>(&cfg, &dev, &opts, &stream(6))?;
+    let mut session = Session::new(&streamed, streamed.new_cache(&cfg, &dev)?);
+    let mut rb = Ring::new(&no_eos, &dev, 64, EosRead::Poll(PollMechanism::default()))?
+        .with_poll_budget(20_000);
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let mut o = DecodeOptions::new(STEPS);
+    o.lookahead = 1;
+    o.budget = CommitBudget::steps(4)?;
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        &PROMPT,
+        &o,
+        &mut |_| Ok(()),
+    )?;
+    let f = streamed.fetch_stats();
+    let cache = session.cache_mut();
+    println!(
+        "FETCHTEST ring steps={STEPS} provisional={} passes={} redos={} jobs={} loads={} short={} timeouts={} floor_waits={}",
+        out.stats.provisional, cache.fetch_passes, cache.redos, f.jobs, f.loads, f.short, f.timeouts, f.floor_waits
+    );
+    assert!(!out.stats.provisional, "a ring arm cannot take its draw back");
+    assert_eq!(out.ids, want, "the fetching ring's ids differ from the resident model's");
+    assert!(cache.fetch_passes > 0 && f.loads > 0, "no step fetched: {f:?}");
+    assert_eq!((f.short, f.timeouts), (0, 0), "a layer went short or timed out");
+    assert_eq!(
+        streamed.stream_stats().settle_loads,
+        0,
+        "a held settle loaded beside the worker"
+    );
+    assert!(!streamed.fetch_settle_trailing());
+    Ok(())
+}

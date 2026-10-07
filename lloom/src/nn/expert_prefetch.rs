@@ -842,7 +842,11 @@ fn cancel_key(g: &mut State, key: usize) -> (u64, Vec<Assembly>) {
     let mut whole = 0u64;
     let mut pieces: HashMap<u64, usize> = HashMap::new();
     g.reqs.retain(|r| {
-        if r.key != key {
+        // A direct read is never a stale hint: a waiter counts it down
+        // (`direct_pending`, `wait_direct`), and one dropped here would park
+        // that waiter for good — the fetch worker's, when a settle on the
+        // decode thread took the same tier (`expert-streaming.md` §20.16y).
+        if r.key != key || r.direct.is_some() {
             return true;
         }
         match r.part {
@@ -1237,4 +1241,62 @@ fn stage(w: &Shared, req: &Req) -> Result<Staged> {
             it.next().expect("three"),
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(key: usize, direct: bool, file: &Arc<File>) -> Req {
+        let plane = || PlaneSource {
+            file: Arc::clone(file),
+            data_start: 0,
+            plane_bytes: 16,
+        };
+        Req {
+            key,
+            generation: 0,
+            expert: 1,
+            planes: [plane(), plane(), plane()],
+            part: Part::Whole,
+            direct: direct.then(|| {
+                (
+                    7,
+                    [
+                        DirectDst(std::ptr::null_mut()),
+                        DirectDst(std::ptr::null_mut()),
+                        DirectDst(std::ptr::null_mut()),
+                    ],
+                    Epoch(0),
+                )
+            }),
+            now: false,
+        }
+    }
+
+    /// A tier's hints are cancelled when its pass reaches it; its direct
+    /// reads are not — someone waits on each (`wait_direct`), and a direct
+    /// read dropped here never counts its batch down.
+    #[test]
+    fn cancelling_a_tier_keeps_its_direct_reads() {
+        let file = Arc::new(File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut g = State {
+            direct_batches: 7,
+            direct_pending: HashMap::from([(7, 1)]),
+            assembling: HashMap::new(),
+            next_asm: 0,
+            reqs: VecDeque::from([req(3, false, &file), req(3, true, &file), req(4, false, &file)]),
+            done: HashMap::new(),
+            done_now: HashMap::new(),
+            generation: HashMap::new(),
+            staged_bytes: 0,
+            takes: 0,
+            last_take: HashMap::new(),
+        };
+        let (dropped, finished) = cancel_key(&mut g, 3);
+        assert_eq!(dropped, 1, "the tier's one hint is cancelled");
+        assert!(finished.is_empty());
+        let left: Vec<(usize, bool)> = g.reqs.iter().map(|r| (r.key, r.direct.is_some())).collect();
+        assert_eq!(left, vec![(3, true), (4, false)]);
+    }
 }

@@ -3118,13 +3118,17 @@ impl Inner {
     }
 }
 
-/// Greedy row grouping: consecutive rows whose distinct experts fit `n_slots`.
+/// Greedy row grouping: consecutive rows whose distinct experts fit `n_slots`
+/// — [`plan_rows_pinned`] with nothing pinned. The tests' entry point; the
+/// tier groups through `plan_rows_pinned` itself.
+#[cfg(test)]
 fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range<usize>> {
     plan_rows_pinned(ids, rows, topk, n_slots, &[])
 }
 
-/// [`plan_rows`] with `capacity` unpinned slots: a pinned expert (`pinned[e]`)
-/// is resident in every group and takes none of them.
+/// Greedy row grouping — consecutive rows whose distinct experts fit
+/// `capacity` unpinned slots: a pinned expert (`pinned[e]`) is resident in
+/// every group and takes none of them.
 fn plan_rows_pinned(
     ids: &[u32],
     rows: usize,

@@ -972,7 +972,6 @@ impl QMetalStorage {
                 self_shape
             )
         }
-        use super::PairOrder;
         use crate::kernels::PairGrid;
         let device = self.device.clone();
         let launch =

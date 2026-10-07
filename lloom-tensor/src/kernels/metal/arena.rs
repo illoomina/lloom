@@ -2568,7 +2568,7 @@ mod tests {
         const CONV_BYTES: usize = 12288;
 
         let mut rec = ArenaRecorder::new();
-        let mut step = |rec: &mut ArenaRecorder| {
+        let step = |rec: &mut ArenaRecorder| {
             // The shuffle reads *last* step's conv state first. On the opening
             // step there is none, which is why the read comes before the alloc.
             rec.record_bind(CONV);
@@ -2635,7 +2635,7 @@ mod tests {
         const STRIDE: usize = 128;
 
         let mut rec = ArenaRecorder::new();
-        let mut step = |rec: &mut ArenaRecorder, kv_bytes: usize| {
+        let step = |rec: &mut ArenaRecorder, kv_bytes: usize| {
             rec.record_alloc(KV, kv_bytes);
             rec.record_bind(KV);
             rec.record_dispatch();
@@ -2673,7 +2673,7 @@ mod tests {
     fn a_fixed_size_session_tenant_gets_no_reservation() {
         const CONV: usize = 0xc0;
         let mut rec = ArenaRecorder::new();
-        let mut step = |rec: &mut ArenaRecorder| {
+        let step = |rec: &mut ArenaRecorder| {
             rec.record_bind(CONV);
             rec.record_dispatch();
             rec.record_alloc(CONV, 12288);
@@ -2703,7 +2703,7 @@ mod tests {
     fn a_stable_activation_is_never_reserved() {
         const ACT: usize = 0xa0;
         let mut rec = ArenaRecorder::new();
-        let mut step = |rec: &mut ArenaRecorder| {
+        let step = |rec: &mut ArenaRecorder| {
             rec.record_alloc(ACT, 21504);
             rec.record_bind(ACT);
             rec.record_dispatch();
@@ -2743,7 +2743,7 @@ mod tests {
         const ADDR: usize = 0xa0;
         const KEPT: usize = 0xb0;
         let mut rec = ArenaRecorder::new();
-        let mut step = |rec: &mut ArenaRecorder| {
+        let step = |rec: &mut ArenaRecorder| {
             // A genuine survivor, read before anything this step allocates --
             // the conv-state shape, kept here so the test also shows the two
             // cases being told apart rather than everything being admitted.
@@ -2848,7 +2848,7 @@ mod tests {
     /// stability check.
     #[test]
     fn a_value_that_grows_between_steps_is_kept_out_of_the_arena() {
-        let mut step = |kv: usize, rec: &mut ArenaRecorder| {
+        let step = |kv: usize, rec: &mut ArenaRecorder| {
             rec.record_alloc(0xa0, 4096);
             rec.record_bind(0xa0);
             rec.record_dispatch();

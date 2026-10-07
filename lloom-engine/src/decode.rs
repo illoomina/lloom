@@ -1698,7 +1698,9 @@ mod tests {
 
         /// One request on a fresh session at `temperature` (and `top_p`), on
         /// the arm the options select: the reply, whatever the sampler drew,
-        /// and the text its fragments streamed.
+        /// and the text its fragments streamed. (Its one caller is the
+        /// `serve`-gated arm sweep.)
+        #[cfg(feature = "serve")]
         fn sampled(
             model: &Chain,
             device: &Device,

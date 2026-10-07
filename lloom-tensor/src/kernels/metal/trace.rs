@@ -580,13 +580,11 @@ pub fn use_resource_count() -> u64 {
 static EXECUTE_RANGES: AtomicU64 = AtomicU64::new(0);
 static USE_RESOURCE: AtomicU64 = AtomicU64::new(0);
 
-/// Record that a new encoder session began, resetting hazard state.
+/// One encoder session opened ([`ENCODER_SESSIONS`]).
 ///
 /// Barriers order dispatches only *within* an encoder, so a barrier count is
 /// uninterpretable without knowing where the sessions divide. Candle opens one
 /// every `CANDLE_METAL_COMPUTE_PER_BUFFER` dispatches.
-#[inline]
-/// One encoder session opened ([`ENCODER_SESSIONS`]).
 #[inline]
 pub fn note_encoder_session() {
     ENCODER_SESSIONS.fetch_add(1, Ordering::Relaxed);

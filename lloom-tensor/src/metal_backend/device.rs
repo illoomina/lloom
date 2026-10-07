@@ -2977,19 +2977,8 @@ impl MetalDevice {
     }
 }
 
-/// Alignment applied to every buffer allocation.
-///
-/// This is the Apple Silicon cache line. Aligning to it means every buffer
-/// starts on a line boundary, so no two buffers share a line and the memory
-/// controller can coalesce accesses cleanly. It also covers the alignment any
-/// dtype could need: the kernels use `float4`/`half4` (16 bytes) widely and
-/// quantized block structures are wider still, all well under 128.
-///
-/// **This is the DEFAULT and no longer the only reachable value** — see
-/// [`buffer_alignment`], which reads `LLOOM_586_BUFFER_ALIGNMENT` once. The
-/// constant is kept as the name every comment and test refers to, and as what
-/// the axis reports when nothing selects an arm.
-const BUFFER_ALIGNMENT: usize = 128;
+// `BUFFER_ALIGNMENT` (128), the axis's default, lives in `crate::tuning`
+// beside the knob that overrides it: one definition.
 
 /// The lowest alignment the axis will accept.
 ///

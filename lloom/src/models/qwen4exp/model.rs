@@ -1893,12 +1893,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// holds a pass already. Returns whether this call opened it. The pass
     /// is keyed as the model's own: it opens after the embedding a driver's
     /// pass of the same shape holds, so the two are different sequences.
-    fn open_pass(&self, shape: crate::nn::decode::PassShape) -> Result<bool> {
-        self.open_pass_variant(shape, 0)
-    }
-
-    /// [`Self::open_pass`] for the allocation sequence `variant` of `shape`
-    /// ([`Self::decode_variant`]).
+    /// It opens the allocation sequence `variant` of `shape`
+    /// ([`Self::decode_variant`]); variant 0 is the shape's plain sequence.
     fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {

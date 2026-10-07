@@ -624,12 +624,45 @@ pub struct MetalTuning {
     pub allow_emulated: Option<String>,
 }
 
+/// The cut period: dispatches per command buffer. 50 is the shipping path and
+/// every recorded digest belongs to it; it is also the overlap granularity of a
+/// loop that WAITS on every step -- the GPU runs the first fifty dispatches
+/// while the host encodes the rest -- which is why a prefill and a blocking
+/// loop want it small (lloom #715: `lfm2-decode-profile` at 512 read −8.5 %,
+/// 20.0 vs 18.5 ms/token; a prompt in one buffer +1.6–2.6 ms of TTFT).
+pub const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+/// The cut period for a PIPELINED decode loop -- one that encodes step `s+1`
+/// while the GPU runs step `s` (`lookahead ≥ 1`), so a cut buys no overlap and
+/// costs a seam. 512 is "at most one interior cut per decode step" for LFM2's
+/// ~345 dispatches, with margin; measured on the crown loop (#715,
+/// `measurements/issue-715-cut-period.md`): **+2.2 % [+1.9, +2.6] tok/s at
+/// 350, 512 and 1024 against 50**, streams byte-identical, the visible cadence
+/// the commit budget's, prefill memory unchanged. The decode loop raises the
+/// period to this for its steps (`Commands::set_compute_per_buffer`) and
+/// restores the default after; the prefill runs at the default.
+/// `CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER` overrides it.
+pub const DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER: usize = 512;
+
+/// Alignment applied to every buffer allocation.
+///
+/// This is the Apple Silicon cache line. Aligning to it means every buffer
+/// starts on a line boundary, so no two buffers share a line and the memory
+/// controller can coalesce accesses cleanly. It also covers the alignment any
+/// dtype could need: the kernels use `float4`/`half4` (16 bytes) widely and
+/// quantized block structures are wider still, all well under 128.
+///
+/// **This is the DEFAULT and no longer the only reachable value** — see
+/// `metal_backend::device::buffer_alignment`, which reads `LLOOM_586_BUFFER_ALIGNMENT` once. The
+/// constant is kept as the name every comment and test refers to, and as what
+/// the axis reports when nothing selects an arm.
+pub const BUFFER_ALIGNMENT: usize = 128;
+
 impl Default for MetalTuning {
     fn default() -> Self {
         MetalTuning {
             completion_wait: "synchronize".into(),
-            compute_per_buffer: 50,
-            pipelined_compute_per_buffer: 512,
+            compute_per_buffer: DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
+            pipelined_compute_per_buffer: DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER,
             cut_policy: "counter".into(),
             nodes_per_cb: 0,
             hazard_key: None,
@@ -716,7 +749,7 @@ impl Default for PoolTuning {
             retain_evicted: false,
             unpooled_uploads: false,
             stream_pooled_staging: false,
-            buffer_alignment: 128,
+            buffer_alignment: BUFFER_ALIGNMENT,
         }
     }
 }

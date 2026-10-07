@@ -3073,6 +3073,9 @@ pub fn chunk_scan_on() -> bool {
 /// heads alone leave most of a 32-core GPU idle; 4 slices of 32 columns.
 pub const CHUNK_SCAN_SPLITS: usize = 4;
 
+/// The scan arm, set in-process: the GDN chunk-scan parity test's A/B
+/// (`deltanet_block` tests); the engine reads `qwen4exp.chunk_scan`.
+#[cfg(all(test, feature = "metal"))]
 pub fn set_chunk_scan(on: bool) {
     CHUNK_SCAN.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
 }

@@ -24,8 +24,11 @@ pub struct Ring {
     backing: Tensor,
     frames: usize,
     frame: Shape,
+    /// Held, never read: the ledger keeps its tenants as `Weak`
+    /// (`Ledger::register`), so this strong reference is what keeps the
+    /// ring's row on the ledger for as long as the ring lives.
     #[cfg(feature = "metal")]
-    ledger: Option<Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
+    _ledger: Option<Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
 }
 
 impl Ring {
@@ -75,7 +78,7 @@ impl Ring {
             frames: frames.max(1),
             frame,
             #[cfg(feature = "metal")]
-            ledger,
+            _ledger: ledger,
         })
     }
 

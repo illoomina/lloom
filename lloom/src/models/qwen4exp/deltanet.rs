@@ -525,7 +525,7 @@ mod tests {
         let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
         // Deterministic pseudo-inputs.
         let mk = |n: usize, seed: f32| -> Vec<f32> {
-            (0..n).map(|i| ((i as f32 * 0.37 + seed).sin())).collect()
+            (0..n).map(|i| (i as f32 * 0.37 + seed).sin()).collect()
         };
         let q = mk(h_v * d_k, 0.1);
         let k = mk(h_v * d_k, 0.2);

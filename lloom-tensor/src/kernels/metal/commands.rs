@@ -19,24 +19,9 @@ use std::sync::Arc;
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-/// The cut period: dispatches per command buffer. 50 is the shipping path and
-/// every recorded digest belongs to it; it is also the overlap granularity of a
-/// loop that WAITS on every step -- the GPU runs the first fifty dispatches
-/// while the host encodes the rest -- which is why a prefill and a blocking
-/// loop want it small (lloom #715: `lfm2-decode-profile` at 512 read −8.5 %,
-/// 20.0 vs 18.5 ms/token; a prompt in one buffer +1.6–2.6 ms of TTFT).
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
-/// The cut period for a PIPELINED decode loop -- one that encodes step `s+1`
-/// while the GPU runs step `s` (`lookahead ≥ 1`), so a cut buys no overlap and
-/// costs a seam. 512 is "at most one interior cut per decode step" for LFM2's
-/// ~345 dispatches, with margin; measured on the crown loop (#715,
-/// `measurements/issue-715-cut-period.md`): **+2.2 % [+1.9, +2.6] tok/s at
-/// 350, 512 and 1024 against 50**, streams byte-identical, the visible cadence
-/// the commit budget's, prefill memory unchanged. The decode loop raises the
-/// period to this for its steps (`Commands::set_compute_per_buffer`) and
-/// restores the default after; the prefill runs at the default.
-/// `CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER` overrides it.
-const DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER: usize = 512;
+// The cut periods' defaults (50 blocking/prefill, 512 pipelined) live in
+// `crate::tuning` beside the knobs that override them, one definition each.
+use crate::tuning::DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER;
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
 ///

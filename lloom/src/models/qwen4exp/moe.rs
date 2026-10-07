@@ -796,6 +796,16 @@ pub struct PrefillRouted {
 /// SwiGLU, the routed down, the shared expert (its two stems, its SwiGLU,
 /// its down, its gate's logit), the combine. `In` is the bracket's output.
 #[cfg(not(target_arch = "wasm32"))]
+/// The routed MoE as a level-0 block (`nn::blocks::Ffn`): every position
+/// routed on its own, the host plan; the device-planned pass and the
+/// streamed tier's settle are the family's own path.
+impl<P: Profile, R: ExpertResidency> crate::nn::blocks::Ffn for MoeLayer<P, R> {
+    type State = ();
+    fn execute(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
 impl<P: Profile, R: ExpertResidency> crate::optimizer::Visit for MoeLayer<P, R> {
     type In = crate::optimizer::NodeId;
     type Out = crate::optimizer::NodeId;

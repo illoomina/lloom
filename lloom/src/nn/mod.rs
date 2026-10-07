@@ -19,6 +19,7 @@ pub mod activation;
 pub mod attention;
 pub mod batch_norm;
 pub mod batched;
+pub mod blocks;
 mod batched_spec;
 pub mod conv;
 pub mod cpu_flash_attention;

@@ -6007,6 +6007,16 @@ impl crate::optimizer::Visit for Mlp {
     }
 }
 
+/// The dense SwiGLU MLP as a level-0 block (`nn::blocks::Ffn`): the
+/// resident projections, no per-sequence state. A streamed layer's views
+/// are the family's own path (`DecoderLayer::weights`).
+impl crate::nn::blocks::Ffn for Mlp {
+    type State = ();
+    fn execute(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        self.forward(x, &self.resident())
+    }
+}
+
 /// Attention layer with per-head QK normalization and RoPE.
 #[derive(Debug, Clone)]
 struct Attention<P: Profile> {

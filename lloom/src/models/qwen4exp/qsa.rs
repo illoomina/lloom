@@ -2995,6 +2995,20 @@ impl<P: Profile> QsaAttention<P> {
 /// ([`Indexer::visit_select`]); and the attention over keys that reach the
 /// 2-pass length is two launches.
 #[cfg(not(target_arch = "wasm32"))]
+/// The sparse attention as a level-0 block (`nn::blocks::Mixer`): one
+/// position is a decode step, more are a chunk (what `decode` computes
+/// position by position, up to fp32 reorder).
+impl<P: Profile> crate::nn::blocks::Mixer for QsaAttention<P> {
+    type State = KvCache;
+    fn execute(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
+        if x.dim(1)? == 1 {
+            self.decode(x, kv)
+        } else {
+            self.prefill(x, kv)
+        }
+    }
+}
+
 impl<P: Profile> crate::optimizer::Visit for QsaAttention<P> {
     type In = (crate::optimizer::NodeId, usize, KvPrecision);
     type Out = crate::optimizer::NodeId;

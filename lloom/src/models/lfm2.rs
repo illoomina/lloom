@@ -1917,13 +1917,8 @@ impl PagedKv {
                      with the KV slab, B x ceil(slab / page_size), toward the ceiling)"
                 ))
             })?;
-            let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
-            for t in start..start + seq_len {
-                slots.push(
-                    (pages[t / self.page_size].0 * self.page_size as u32)
-                        + (t % self.page_size) as u32,
-                );
-            }
+            let seq = pool.seq(s).expect("sequence index within max_seqs");
+            slots.extend(seq.cells(self.page_size, start..start + seq_len));
         }
         self.len = start + seq_len;
         self.pass_len = seq_len;
@@ -2047,13 +2042,8 @@ impl PagedKv {
         let mut ks = Vec::with_capacity(n_seqs);
         let mut vs = Vec::with_capacity(n_seqs);
         for s in 0..n_seqs {
-            let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
-            let ids: Vec<u32> = (0..n_prev)
-                .map(|t| {
-                    pages[t / self.page_size].0 * self.page_size as u32
-                        + (t % self.page_size) as u32
-                })
-                .collect();
+            let seq = pool.seq(s).expect("sequence index within max_seqs");
+            let ids: Vec<u32> = seq.cells(self.page_size, 0..n_prev).collect();
             let ids = Tensor::new(ids.as_slice(), device)?;
             ks.push(pk.index_select(&ids, 2)?);
             vs.push(pv.index_select(&ids, 2)?);
@@ -2193,10 +2183,8 @@ impl PagedKv {
                      with the KV slab, slots x ceil(slab / page_size), toward the ceiling)"
                 ))
             })?;
-            let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
-            for t in start..start + n {
-                slots.push((pages[t / page_size].0 * page_size as u32) + (t % page_size) as u32);
-            }
+            let seq = pool.seq(slot).expect("slot index within max_seqs");
+            slots.extend(seq.cells(page_size, start..start + n));
         }
         let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
 
@@ -2328,12 +2316,8 @@ impl PagedKv {
         let (pk, pv) = self.pools[block_idx]
             .as_ref()
             .expect("the layer has a pool once a token was written");
-        let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
-        let ids: Vec<u32> = (0..n_prev)
-            .map(|t| {
-                pages[t / self.page_size].0 * self.page_size as u32 + (t % self.page_size) as u32
-            })
-            .collect();
+        let seq = pool.seq(slot).expect("slot index within max_seqs");
+        let ids: Vec<u32> = seq.cells(self.page_size, 0..n_prev).collect();
         let ids = Tensor::new(ids.as_slice(), device)?;
         Ok((pk.index_select(&ids, 2)?, pv.index_select(&ids, 2)?))
     }

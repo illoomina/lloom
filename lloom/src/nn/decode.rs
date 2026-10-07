@@ -1118,6 +1118,11 @@ fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
 /// [`compute_in_flight_depth`] for why a static value caps other models/machines.
 pub const IN_FLIGHT_FLOOR: usize = 2;
 
+/// How long the loop waits for the host fill's producer to take a draw back
+/// (`FeedLink::retract`): a fail-safe, the producer's take-back is a few
+/// microseconds once it wakes. The same bound as the fetch worker's.
+const FEED_RETRACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Back-compat alias for [`IN_FLIGHT_FLOOR`]: callers that sized a buffer to the
 /// old constant get the floor, which is a safe lower bound (the real depth is
 /// `>=` it). Prefer `Session::measured_in_flight_depth` / `DecodeOptions::
@@ -1511,6 +1516,14 @@ fn produce(
                 t.gap_over_1ms_ns += gap;
             }
         }
+        // The loop took draws back (`FeedLink::retract`): the tokens they
+        // were filled from leave the window, and the reader reads their
+        // slots again under the stamps the draws made again carry.
+        while link.retracts_pending() > 0 {
+            fill.rewind_one()?;
+            reader.retract_one();
+            link.ack_retract();
+        }
         tokens.clear();
         reader
             .read_all_new(&mut tokens)
@@ -1707,8 +1720,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // A run that failed mid-way may leave a provisional step: settled
             // (whatever it finds, the run's error is the answer) and the
             // cache's steps the model's own again.
+            let _ = self
+                .model
+                .provisional(&mut self.seq.cache, crate::nn::model::Provisional::Settled);
             let _ = self.model.settle_step(&mut self.seq.cache);
-            let _ = self.model.provisional(&mut self.seq.cache, false);
+            let _ = self
+                .model
+                .provisional(&mut self.seq.cache, crate::nn::model::Provisional::Off);
         }
         out
     }
@@ -1885,19 +1903,45 @@ impl<'m, M: CausalLM> Session<'m, M> {
             pacer.set_depth(opts.pacer_depth());
         }
 
-        // Provisional steps (`CausalLM::provisional`): on an arm that reads
-        // each token back before the next forward and can take its draw back
-        // (the blocking arm), with a sampler that can draw again as if it had
-        // not (no processor history), the model's step returns without
-        // settling and the loop settles it after the readback — the pass is
-        // complete by then, so the settle waits for nothing — redrawing from
-        // the redone step when it computed on something it lacked. Armed
-        // after the prefill, whose passes settle as they always did.
-        let provisional = opts.lookahead == 0
-            && readback.retracts_draw()
-            && sampler.mark().is_some()
-            && self.model.provisional(&mut self.seq.cache, true)?;
-        stats.provisional = provisional;
+        // Provisional steps (`CausalLM::provisional`), where the loop can take
+        // a draw back (`ReadbackStrategy::retract_draw`) and the sampler can
+        // draw again as if it had not (no processor history):
+        // - the blocking arm (`Settled`): the model's step returns without
+        //   settling and the loop settles it after the readback — the pass
+        //   is complete, the settle waits for nothing — redrawing from the
+        //   redone step when it computed on something it lacked;
+        // - the ring on the fixed cadence at `lookahead = 1` (`Behind`): the
+        //   loop settles each step after it has encoded the next, while the
+        //   GPU runs it; a redone step undoes the forward after it, whose
+        //   draw is taken back and drawn again and whose forward is encoded
+        //   again. Not under the adaptive commit or a streaming reader: a
+        //   token the ring stamped there may be streamed before its step is
+        //   settled.
+        // Armed after the prefill, whose passes settle as they always did.
+        let provisional = {
+            use crate::nn::model::Provisional;
+            let takes_back = readback.retracts_draw() && sampler.mark().is_some();
+            let want = if !takes_back {
+                Provisional::Off
+            } else if !readback.arms().token_ring && opts.lookahead == 0 {
+                Provisional::Settled
+            } else if readback.arms().token_ring
+                && opts.lookahead == 1
+                && !opts.adaptive_commit
+                && !opts.stream_via_reader
+                && !opts.eos_gate
+            {
+                Provisional::Behind
+            } else {
+                Provisional::Off
+            };
+            if want == Provisional::Off {
+                Provisional::Off
+            } else {
+                self.model.provisional(&mut self.seq.cache, want)?
+            }
+        };
+        stats.provisional = provisional != crate::nn::model::Provisional::Off;
 
         // The model's host fill (`CausalLM::host_feed`): on an arm whose
         // reader sees every token as it is stamped, a producer thread fills
@@ -2039,15 +2083,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // sample-split split; skip the clock read on the steady path.
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
-            let mark = if provisional { sampler.mark() } else { None };
+            let mark = if provisional != crate::nn::model::Provisional::Off {
+                sampler.mark()
+            } else {
+                None
+            };
             let mut feed = readback.sample_and_feed(sampler, &logits)?;
             // The step behind these logits settled, now that its pass is done
             // and before its token goes anywhere: a redone step's logits are
             // drawn from again, the first draw taken back.
-            if provisional {
+            if provisional == crate::nn::model::Provisional::Settled {
                 if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
                     readback.retract_draw()?;
-                    if let Some(m) = mark {
+                    if let Some(m) = mark.clone() {
                         sampler.rewind(m);
                     }
                     logits = redone.squeeze(0)?;
@@ -2225,6 +2273,45 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     }
                 } else if pace {
                     pacer.after_forward(&device)?;
+                }
+                // Behind (`Provisional::Behind`): the step before this one
+                // settles now, while the GPU runs this one. If it is redone,
+                // the draw this forward consumed came from wrong logits: the
+                // model has undone this forward and redone the step; the
+                // draw is taken back (the ring's slot, the host fill's
+                // token), drawn again from the redone logits, and the forward
+                // encoded again. Before `eos_of_last` and every drain, so no
+                // taken-back token is ever streamed or read as EOS.
+                if provisional == crate::nn::model::Provisional::Behind {
+                    if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
+                        readback.retract_draw()?;
+                        if let Some(f) = &host_feed {
+                            f.link().retract(FEED_RETRACT_TIMEOUT)?;
+                        }
+                        if let Some(m) = mark.clone() {
+                            sampler.rewind(m);
+                        }
+                        self.seq.pos -= 1;
+                        let again = readback.sample_and_feed(sampler, &redone.squeeze(0)?)?;
+                        if let Some(f) = &host_feed {
+                            f.link().note_fed();
+                        }
+                        if pace {
+                            pacer.before_forward(&device)?;
+                        }
+                        self.model.prepare_pass(&mut self.seq.cache, 1)?;
+                        begin_decode_step(&device);
+                        logits = self
+                            .model
+                            .forward(&again, self.seq.pos, &mut self.seq.cache)?
+                            .squeeze(0)?;
+                        end_decode_step(&device)?;
+                        self.seq.pos += 1;
+                        if pace {
+                            pacer.after_forward(&device)?;
+                        }
+                        stats.redraws += 1;
+                    }
                 }
                 let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 let t = timed.then(std::time::Instant::now);
@@ -2452,11 +2539,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         // The last step, when provisional, settled before its logits are
         // held: a redone step's are the ones a continuation resumes from.
-        if provisional {
+        if provisional != crate::nn::model::Provisional::Off {
+            // Behind, the newest step's settle waited for a next forward that
+            // never came: every step settles now.
+            self.model
+                .provisional(&mut self.seq.cache, crate::nn::model::Provisional::Settled)?;
             if let Some(redone) = self.model.settle_step(&mut self.seq.cache)? {
                 logits = redone.squeeze(0)?;
             }
-            self.model.provisional(&mut self.seq.cache, false)?;
+            self.model
+                .provisional(&mut self.seq.cache, crate::nn::model::Provisional::Off)?;
         }
         // Work the model let trail the last step (a fetching settle behind
         // the next encode) is the run's: settled here, after the host fill

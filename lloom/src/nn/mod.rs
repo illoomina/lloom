@@ -94,8 +94,8 @@ pub use layer_norm::{
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
 pub use model::{
-    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row,
-    Speculative, VisionEncoder,
+    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, Provisional, RaggedRow,
+    Row, Speculative, VisionEncoder,
 };
 pub use observer::{
     ForwardObserver, HcStatePoint, HookKind, HookPlan, HookPoint, LayerInputPoint,

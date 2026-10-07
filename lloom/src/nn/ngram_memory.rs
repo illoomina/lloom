@@ -940,7 +940,11 @@ pub const HOST_FILL_SLOTS: usize = 2;
 /// Values are `base + k` for the `k`-th decode forward of the run (1-based),
 /// which consumes the `k`-th token the loop fed: position `pos0 + k - 1`. A
 /// forward replayed at the same position (a device-plan miss) waits for the
-/// same value and reads the same slot.
+/// same value and reads the same slot. A draw the loop takes back
+/// ([`FeedLink::retract`], a provisional step redone behind the next
+/// forward) shifts every later value by one: the forward encoded again at
+/// its position waits for the fill of the token drawn again, never for the
+/// value the taken-back token already signalled.
 #[derive(Debug)]
 pub struct FeedLink {
     #[cfg(feature = "metal")]
@@ -952,6 +956,12 @@ pub struct FeedLink {
     signalled: AtomicU64,
     demanded: AtomicU64,
     released: AtomicBool,
+    /// Draws taken back this run: added to a position's index to give the
+    /// value its forward waits for.
+    shift: AtomicU64,
+    /// Take-backs the loop asked of the producer, and those it has done.
+    retract_req: AtomicU64,
+    retract_ack: AtomicU64,
     /// Why the producer stopped, if it failed.
     failure: parking_lot::Mutex<Option<String>>,
     /// Wakes the producer when a forward demands a value or the run ends.
@@ -1023,6 +1033,9 @@ impl FeedLink {
             signalled: AtomicU64::new(0),
             demanded: AtomicU64::new(0),
             released: AtomicBool::new(false),
+            shift: AtomicU64::new(0),
+            retract_req: AtomicU64::new(0),
+            retract_ack: AtomicU64::new(0),
             failure: parking_lot::Mutex::new(None),
             wake: Arc::new(FeedWake::default()),
             demand_wakes: AtomicU64::new(0),
@@ -1107,6 +1120,12 @@ impl FeedLink {
         Ok((pos - self.pos0) as u64 + 1)
     }
 
+    /// The run-relative value the forward at `pos` waits for: its position's
+    /// index, shifted by one per draw the loop took back ([`Self::retract`]).
+    pub fn value_at(&self, pos: usize) -> Result<u64> {
+        Ok(self.index_at(pos)? + self.shift.load(Ordering::Acquire))
+    }
+
     /// The rows the forward at `pos` reads: a wait for its value, encoded
     /// here, and the `[len]` f32 slot the producer fills. Refused when the
     /// loop has not yet fed the token that value is filled from — a wait
@@ -1123,7 +1142,7 @@ impl FeedLink {
                 self.pos0
             )
         }
-        let k = self.index_at(pos)?;
+        let k = self.value_at(pos)?;
         let fed = self.fed();
         if k > fed {
             lloom_tensor::bail!(
@@ -1156,6 +1175,52 @@ impl FeedLink {
         #[cfg(feature = "metal")]
         self.ring.release(self.base);
         self.wake.wake();
+    }
+
+    /// Take back the last token the producer filled (the loop took back its
+    /// draw: a provisional step redone behind the forward that consumed it,
+    /// `Session::decode`): the producer rewinds its n-gram window and its
+    /// reader by one, and every later forward's value shifts by one, so the
+    /// forward encoded again waits for the fill of the token drawn again.
+    /// Waits, at most `timeout`, for the producer to have done it.
+    ///
+    /// Precondition: the producer has filled the taken-back token — the
+    /// forward that consumed it has completed — and no token after it is
+    /// published.
+    pub fn retract(&self, timeout: std::time::Duration) -> Result<()> {
+        let want = self.retract_req.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shift.fetch_add(1, Ordering::AcqRel);
+        self.wake.wake();
+        let t0 = std::time::Instant::now();
+        while self.retract_ack.load(Ordering::Acquire) < want {
+            if self.released() {
+                lloom_tensor::bail!(
+                    "host feed: a draw taken back from a run whose fill ended{}",
+                    match &*self.failure.lock() {
+                        Some(why) => format!(": {why}"),
+                        None => String::new(),
+                    }
+                )
+            }
+            if t0.elapsed() > timeout {
+                lloom_tensor::bail!("host feed: the producer did not take a draw back in {timeout:?}")
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            self.wake.wake();
+        }
+        Ok(())
+    }
+
+    /// Take-backs asked of the producer and not yet done.
+    pub fn retracts_pending(&self) -> u64 {
+        self.retract_req
+            .load(Ordering::Acquire)
+            .saturating_sub(self.retract_ack.load(Ordering::Acquire))
+    }
+
+    /// The producer did one take-back.
+    pub fn ack_retract(&self) {
+        self.retract_ack.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The producer failed with `why`: record it and release every wait.
@@ -1211,6 +1276,7 @@ impl HostFeed {
                 link: Arc::clone(&link),
                 rows,
                 hash,
+                window0: window.clone(),
                 window,
                 filled: 0,
                 ids: vec![0; n],
@@ -1239,6 +1305,8 @@ pub struct NgramFill {
     rows: Arc<RowTable>,
     hash: NgramHash,
     window: NgramWindow,
+    /// The window the run began with: a take-back rebuilds from it.
+    window0: NgramWindow,
     filled: u64,
     ids: Vec<i64>,
     scratch: Vec<Option<u32>>,
@@ -1273,6 +1341,21 @@ impl NgramFill {
     #[cfg(not(feature = "metal"))]
     fn gather_into_slot(&self, _k: u64) -> Result<()> {
         lloom_tensor::bail!("host feed: no host-fed ring off Metal")
+    }
+
+    /// Take back the last token filled ([`FeedLink::retract`]): out of the
+    /// tokens consumed and the n-gram window. The fill count stays — it is
+    /// the last value signalled, and the next fill signals the one after
+    /// it. A rebuild from the run's first window, on the rare path.
+    pub fn rewind_one(&mut self) -> Result<()> {
+        if self.consumed.pop().is_none() {
+            lloom_tensor::bail!("host feed: a take-back with nothing filled")
+        }
+        self.window = self.window0.clone();
+        for &t in &self.consumed {
+            self.window.push(Some(t));
+        }
+        Ok(())
     }
 
     /// Slots filled so far this run.
@@ -1338,6 +1421,95 @@ mod tests {
     /// on a scattered id set with a row repeated, at f32 and at IQ4_NL.
     /// Pins the pool path's addressing: a row read at the wrong offset or
     /// landed in the wrong slot differs from the map's.
+    /// A token the loop takes back ([`FeedLink::retract`]) is filled again as
+    /// if the run had never seen it: the producer's handshake rewinds the
+    /// window, the token drawn again fills the NEXT value, whose rows are
+    /// those a run that drew it the first time fills, the consumed tokens
+    /// leave the taken-back one out, and the forward at the taken-back
+    /// position waits for the new value, never the one the wrong token
+    /// signalled.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_taken_back_token_is_filled_again_as_if_never_filled() {
+        use lloom_tensor::metal_backend::HostFedRing;
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let head_dim = 8;
+        let path = table_file("takeback", 80, head_dim, GgmlDType::F32);
+        let rows = Arc::new(RowTable::Mmap(MmapRows::open(&path).unwrap()));
+        let hash = NgramHash::new(
+            vec![1_000_003, 999_983, 7],
+            vec![13, 17, 19, 23],
+            vec![0, 13, 30, 49],
+            2,
+            0,
+        )
+        .unwrap();
+        let len = hash.n_heads() * head_dim;
+        let slot = |ring: &HostFedRing, v: u64| -> Vec<f32> {
+            ring.tensor(v).to_vec1::<f32>().unwrap()
+        };
+        let feed = |ring: &Arc<HostFedRing>| {
+            let link = Arc::new(FeedLink::new(Arc::clone(ring), 10));
+            HostFeed::new(
+                link,
+                Arc::clone(&rows),
+                hash.clone(),
+                NgramWindow::new(hash.context_len()),
+            )
+            .into_parts()
+        };
+        // A fourth token's rows hash the three before it: the reference
+        // fills 5, 6, 9, 11; the control 5, 6, 7, 11.
+        let fill_all = |tokens: &[u32]| -> (Vec<f32>, Vec<u32>) {
+            let ring = Arc::new(HostFedRing::new(&m, HOST_FILL_SLOTS, len).unwrap());
+            let base = ring.base();
+            let (_, mut fill) = feed(&ring);
+            for &t in tokens {
+                fill.fill(t).unwrap();
+            }
+            (slot(&ring, base + tokens.len() as u64), fill.into_consumed())
+        };
+        let (want, _) = fill_all(&[5, 6, 9, 11]);
+        let (control, _) = fill_all(&[5, 6, 7, 11]);
+        assert_ne!(want, control, "11's rows do not see the token before it: no test");
+        // 5, 6, 7 — then 7 taken back, and 9, 11 drawn after it.
+        let ring = Arc::new(HostFedRing::new(&m, HOST_FILL_SLOTS, len).unwrap());
+        let base = ring.base();
+        let (link, mut fill) = feed(&ring);
+        for t in [5, 6, 7] {
+            fill.fill(t).unwrap();
+        }
+        assert_eq!(link.value_at(12).unwrap(), 3);
+        // The loop's side of the handshake on a thread, the producer's here.
+        let l = Arc::clone(&link);
+        let asked = std::thread::spawn(move || l.retract(std::time::Duration::from_secs(5)));
+        while link.retracts_pending() == 0 {
+            std::thread::yield_now();
+        }
+        fill.rewind_one().unwrap();
+        link.ack_retract();
+        asked.join().unwrap().unwrap();
+        assert_eq!(
+            link.value_at(12).unwrap(),
+            4,
+            "the forward at the taken-back position waits for the next value"
+        );
+        assert_eq!(link.value_at(13).unwrap(), 5);
+        fill.fill(9).unwrap();
+        fill.fill(11).unwrap();
+        assert_eq!(fill.filled(), 5);
+        assert_eq!(
+            slot(&ring, base + 5),
+            want,
+            "the token after the one drawn again hashed the taken-back token"
+        );
+        assert_eq!(fill.into_consumed(), vec![5, 6, 9, 11]);
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn every_read_policy_gathers_the_same_rows() {
         for (dtype, head_dim) in [(GgmlDType::F32, 8usize), (GgmlDType::IQ4NL, 160)] {

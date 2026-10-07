@@ -2865,3 +2865,56 @@ fn the_fused_publishs_stamp_never_runs_ahead_of_its_slot() -> Result<()> {
     }
     Ok(())
 }
+
+/// A draw the loop takes back on the ring (`Ring::retract_draw`, a
+/// provisional step redone behind the next forward): its history slot is
+/// written again by the next draw, which carries the NEXT stamp, so a reader
+/// that read the taken-back token reads the new one as new once it shifts
+/// its mapping (`RingReader::retract_one`); the drain returns the history
+/// without the taken-back token; `eos_of_last` answers for the draw made
+/// again; the publishes reconcile with the retraction counted.
+#[cfg(feature = "metal")]
+#[test]
+fn a_draw_taken_back_on_the_ring_is_read_as_the_one_drawn_again() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let mut rb = Ring::new(&[EOS], &device, 64, EosRead::Poll(PollMechanism::default()))?
+        .with_poll_budget(20_000);
+    let mut reader = rb.reader().expect("mapped ring");
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let logits = |hot: usize| -> Result<Tensor> {
+        let mut v = vec![0f32; 16];
+        v[hot] = 5.0;
+        Tensor::from_vec(v, 16, &device)
+    };
+    assert!(rb.retracts_draw());
+    rb.sample_and_feed(&mut sampler, &logits(3)?)?;
+    assert!(!rb.eos_of_last()?);
+    rb.sample_and_feed(&mut sampler, &logits(7)?)?;
+    device.synchronize()?;
+    let mut seen = Vec::new();
+    reader.read_all_new(&mut seen).expect("no lap");
+    assert_eq!(seen, vec![3, 7]);
+    // 7 taken back before its EOS read; 9 drawn in its place.
+    rb.retract_draw()?;
+    reader.retract_one();
+    rb.sample_and_feed(&mut sampler, &logits(9)?)?;
+    assert!(!rb.eos_of_last()?);
+    device.synchronize()?;
+    seen.clear();
+    reader.read_all_new(&mut seen).expect("no lap");
+    assert_eq!(seen, vec![9], "the reader read the slot under the new stamp");
+    rb.sample_and_feed(&mut sampler, &logits(11)?)?;
+    assert!(!rb.eos_of_last()?);
+    device.synchronize()?;
+    seen.clear();
+    reader.read_all_new(&mut seen).expect("no lap");
+    assert_eq!(seen, vec![11]);
+    assert_eq!(rb.drain_all()?, vec![3, 9, 11], "the history kept the taken-back token");
+    let c = rb.counters();
+    assert_eq!(c.ring_retracted, 1);
+    assert_eq!(c.ring_publishes, 4);
+    // A later reader of this ring maps the same stamps to the same slots.
+    Ok(())
+}

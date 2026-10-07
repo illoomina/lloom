@@ -76,6 +76,14 @@ pub struct RecurrentState {
     /// Whether a speculative window is currently open (guards double-open and
     /// resolve/rewind-without-open). A plain bool — the channel is single-owner.
     window_open: bool,
+    /// A window HELD behind the open one ([`Self::hold_window`]): its base per
+    /// layer, still restorable while the newer window runs — a decode step
+    /// whose settle trails the next step's encode (a provisional step on a
+    /// lookahead ring) is undone two steps deep. A write never lands in it,
+    /// and no buffer it names is handed out as the spare. Empty when no
+    /// window is held.
+    held: Vec<Option<Tensor>>,
+    held_open: bool,
     /// The pool lease when the state lives in a [`StatePool`].
     pooled: Option<Pooled>,
 }
@@ -303,6 +311,8 @@ impl RecurrentState {
             base: vec![None; n_layers],
             spare: vec![None; n_layers],
             window_open: false,
+            held: vec![None; n_layers],
+            held_open: false,
             pooled: Some(Pooled {
                 pool: pool.clone(),
                 slot,
@@ -407,6 +417,8 @@ impl RecurrentState {
             base: vec![None; n_layers],
             spare: vec![None; n_layers],
             window_open: false,
+            held: vec![None; n_layers],
+            held_open: false,
             pooled: None,
         }
     }
@@ -418,6 +430,19 @@ impl RecurrentState {
             (Some(s), Some(b)) => s.id() == b.id(),
             _ => false,
         }
+    }
+
+    /// Whether `buf` is the held window's base at layer `l`.
+    fn held_has(&self, l: usize, buf: &Tensor) -> bool {
+        self.held[l].as_ref().is_some_and(|b| b.id() == buf.id())
+    }
+
+    /// Whether `t` is a buffer a window still restores — the open window's
+    /// base or the held one's — at layer `l`: never written, never retired as
+    /// the spare.
+    fn is_kept(&self, l: usize, t: &Tensor) -> bool {
+        self.base[l].as_ref().is_some_and(|b| b.id() == t.id())
+            || self.held[l].as_ref().is_some_and(|b| b.id() == t.id())
     }
 
     /// A buffer of the slab's shape for layer `l` that is neither the slab
@@ -478,10 +503,9 @@ impl RecurrentState {
                 );
             }
         }
-        let was_base = self.slab_is_base(l);
         let old = self.slab[l].replace(next);
         if let Some(old) = old {
-            if !was_base && old.id() != self.slab[l].as_ref().expect("set").id() {
+            if !self.is_kept(l, &old) && old.id() != self.slab[l].as_ref().expect("set").id() {
                 self.spare[l] = Some(old);
             }
         }
@@ -526,7 +550,10 @@ impl RecurrentState {
         match &self.slab[l] {
             // Under an open window the slab may be the base: copy on write
             // into the spare and swap, the base untouched.
-            Some(buf) if self.window_open && self.slab_is_base(l) && buf.id() != next.id() => {
+            Some(buf)
+                if ((self.window_open && self.slab_is_base(l)) || self.held_has(l, buf))
+                    && buf.id() != next.id() =>
+            {
                 if buf.dims() != next.dims() {
                     lloom_tensor::bail!(
                         "RecurrentState::write: layer {l} shape {:?} != slab {:?}",
@@ -592,6 +619,10 @@ impl RecurrentState {
         for s in &mut self.base {
             *s = None;
         }
+        for s in &mut self.held {
+            *s = None;
+        }
+        self.held_open = false;
         if let Some(p) = &mut self.pooled {
             for w in &mut p.written {
                 *w = false;
@@ -634,14 +665,15 @@ impl RecurrentState {
             self.window_open = false;
             return Ok(());
         }
-        // A base the window moved away from is a free buffer: the spare.
+        // A base the window moved away from is a free buffer: the spare —
+        // unless the held window still restores it.
         for l in 0..self.slab.len() {
             if let Some(b) = self.base[l].take() {
                 let moved = self.slab[l]
                     .as_ref()
                     .map(|s| s.id() != b.id())
                     .unwrap_or(true);
-                if moved && self.spare[l].is_none() {
+                if moved && !self.held_has(l, &b) && self.spare[l].is_none() {
                     self.spare[l] = Some(b);
                 }
             }
@@ -665,10 +697,11 @@ impl RecurrentState {
         for l in 0..self.slab.len() {
             let base = self.base[l].take();
             let cur = self.slab[l].take();
-            // The buffer the window wrote is free (unless it IS the base).
+            // The buffer the window wrote is free (unless it IS the base, or
+            // the held window's).
             if let Some(c) = &cur {
                 let is_base = base.as_ref().map(|b| b.id() == c.id()).unwrap_or(false);
-                if !is_base && self.spare[l].is_none() {
+                if !is_base && !self.held_has(l, c) && self.spare[l].is_none() {
                     self.spare[l] = cur.clone();
                 }
             }
@@ -684,6 +717,73 @@ impl RecurrentState {
     pub fn window_open(&self) -> bool {
         self.window_open
     }
+
+    /// Hold the open window behind the next one: its base stays restorable
+    /// ([`Self::unhold_window`] after the newer window is rewound) or is
+    /// released ([`Self::resolve_held`]) once the step it covers is settled,
+    /// while a new window opens over the current state. One held window at a
+    /// time; refused on a pooled channel (its rollback is by phase, and a
+    /// held window would need a third).
+    pub fn hold_window(&mut self) -> Result<()> {
+        if !self.window_open {
+            lloom_tensor::bail!("RecurrentState: no window open to hold");
+        }
+        if self.held_open {
+            lloom_tensor::bail!("RecurrentState: a window is already held");
+        }
+        if self.pooled.is_some() {
+            lloom_tensor::bail!("RecurrentState: a pooled channel does not hold a window");
+        }
+        for l in 0..self.slab.len() {
+            self.held[l] = self.base[l].take();
+        }
+        self.window_open = false;
+        self.held_open = true;
+        Ok(())
+    }
+
+    /// The held window's step stands: its base is a free buffer (the spare,
+    /// when the spare is empty and the buffer is neither the slab nor the
+    /// open window's base).
+    pub fn resolve_held(&mut self) -> Result<()> {
+        if !self.held_open {
+            lloom_tensor::bail!("RecurrentState: no window is held");
+        }
+        for l in 0..self.slab.len() {
+            if let Some(b) = self.held[l].take() {
+                let in_use = self.slab[l].as_ref().is_some_and(|s| s.id() == b.id())
+                    || self.base[l].as_ref().is_some_and(|x| x.id() == b.id());
+                if !in_use && self.spare[l].is_none() {
+                    self.spare[l] = Some(b);
+                }
+            }
+        }
+        self.held_open = false;
+        Ok(())
+    }
+
+    /// The held window becomes the open one again: the newer window was
+    /// rewound (the state is the held step's), and the held step is now the
+    /// one a rewind undoes. Refused while a window is open.
+    pub fn unhold_window(&mut self) -> Result<()> {
+        if !self.held_open {
+            lloom_tensor::bail!("RecurrentState: no window is held");
+        }
+        if self.window_open {
+            lloom_tensor::bail!("RecurrentState: unhold under an open window");
+        }
+        for l in 0..self.slab.len() {
+            self.base[l] = self.held[l].take();
+        }
+        self.held_open = false;
+        self.window_open = true;
+        Ok(())
+    }
+
+    /// Whether a window is held behind the open one.
+    pub fn window_held(&self) -> bool {
+        self.held_open
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +793,98 @@ mod tests {
 
     fn t(v: f32, dev: &Device) -> Tensor {
         Tensor::full(v, (2, 2), dev).unwrap()
+    }
+
+    fn val(rs: &RecurrentState) -> f32 {
+        rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0]
+    }
+
+    /// A window held behind the open one is undone two steps deep: the newer
+    /// window rewound, the held one made the open one again and rewound.
+    #[test]
+    fn a_held_window_restores_two_steps_back() {
+        let dev = Device::Cpu;
+        let mut rs = RecurrentState::new(1);
+        rs.write(0, t(0.0, &dev)).unwrap();
+        rs.open_window().unwrap();
+        rs.write(0, t(1.0, &dev)).unwrap();
+        rs.hold_window().unwrap();
+        rs.open_window().unwrap();
+        rs.write(0, t(2.0, &dev)).unwrap();
+        assert_eq!(val(&rs), 2.0);
+        rs.rewind_to_window().unwrap();
+        assert_eq!(val(&rs), 1.0, "the newer window rewound");
+        rs.unhold_window().unwrap();
+        assert!(!rs.window_held() && rs.window_open());
+        rs.rewind_to_window().unwrap();
+        assert_eq!(val(&rs), 0.0, "the held window rewound");
+    }
+
+    /// Steady state under a held window, out of place as the fused kernels
+    /// write (`take_spare` + `swap_in`): each step holds the last window,
+    /// opens its own, writes, and the held step is settled. The held base
+    /// keeps its value while the newer step writes, and the layer rotates
+    /// three buffers with no allocation after the first lap.
+    #[test]
+    fn a_held_window_rotates_three_buffers_and_keeps_its_base() {
+        let dev = Device::Cpu;
+        let mut rs = RecurrentState::new(1);
+        rs.write(0, t(0.0, &dev)).unwrap();
+        rs.open_window().unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for step in 1..=12 {
+            let before = val(&rs);
+            rs.hold_window().unwrap();
+            rs.open_window().unwrap();
+            let sp = rs.take_spare(0).unwrap();
+            sp.slice_set(&t(step as f32, &dev), 0, 0).unwrap();
+            rs.swap_in(0, sp).unwrap();
+            ids.insert(rs.get(0).unwrap().id());
+            // The held base is the state two steps back, untouched.
+            assert_eq!(
+                rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0],
+                before - 1.0_f32.min(before),
+                "step {step}: the held base moved"
+            );
+            rs.resolve_held().unwrap();
+            assert_eq!(val(&rs), step as f32);
+        }
+        assert!(ids.len() <= 3, "{} buffers for one layer", ids.len());
+    }
+
+    /// A held step that did not write the layer leaves the slab the held
+    /// base; with no window open over it, a write there copies out of it —
+    /// never in place.
+    #[test]
+    fn a_write_with_no_window_open_copies_out_of_a_held_base() {
+        let dev = Device::Cpu;
+        let mut rs = RecurrentState::new(1);
+        rs.write(0, t(0.0, &dev)).unwrap();
+        rs.open_window().unwrap();
+        rs.hold_window().unwrap();
+        rs.write(0, t(2.0, &dev)).unwrap();
+        assert_eq!(val(&rs), 2.0);
+        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+    }
+
+    /// A write lands in neither base, in place or not.
+    #[test]
+    fn a_write_never_lands_in_a_held_base() {
+        let dev = Device::Cpu;
+        let mut rs = RecurrentState::new(1);
+        rs.write(0, t(0.0, &dev)).unwrap();
+        rs.open_window().unwrap();
+        // The step does not write the layer: the open base IS the slab.
+        rs.hold_window().unwrap();
+        rs.open_window().unwrap();
+        rs.write(0, t(5.0, &dev)).unwrap();
+        rs.write(0, t(6.0, &dev)).unwrap();
+        assert_eq!(val(&rs), 6.0);
+        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+        rs.rewind_to_window().unwrap();
+        rs.unhold_window().unwrap();
+        rs.rewind_to_window().unwrap();
+        assert_eq!(val(&rs), 0.0);
     }
 
     #[test]

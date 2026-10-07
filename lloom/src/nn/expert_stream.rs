@@ -325,6 +325,12 @@ pub trait ExpertResidency {
             .collect()
     }
 
+    /// A device plan that will never be settled — its pass ran on an input
+    /// that is being taken back (a provisional step encoded after a step
+    /// being redone, `Qwen4Exp::settle_step`): the plan closes, nothing is
+    /// touched, counted or loaded. The default keeps no plans.
+    fn discard_plan(&self) {}
+
     /// [`Self::settle_batch`] for a FETCHING pass's records
     /// (`QWEN4EXP_FETCH=inside`), settled after the pass returned — behind
     /// the next step's encode, while the fetch worker serves that step's
@@ -4149,6 +4155,17 @@ impl ExpertResidency for Streamed {
             }
             None => false,
         })
+    }
+
+    fn discard_plan(&self) {
+        let mut inner = self.inner.lock();
+        inner.plans_open = inner.plans_open.saturating_sub(1);
+        if inner.plans_open == 0 {
+            let n = inner.plans_settled();
+            self.counters
+                .h3_deferred_writes
+                .fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     fn settle_fetched_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>> {

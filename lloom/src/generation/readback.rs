@@ -77,6 +77,10 @@ pub struct ReadbackCounters {
     pub fused_publishes: u64,
     /// Publishes that turned out to be EOS and were retracted from the history.
     pub ring_eos_publishes: u64,
+    /// Publishes taken back because the step their draw came from was redone
+    /// (a provisional step settled behind the next forward,
+    /// [`ReadbackStrategy::retract_draw`]) and drawn again.
+    pub ring_retracted: u64,
     /// Iterations of the EOS wait, across every step.
     pub poll_iters: u64,
     /// Steps on which the non-blocking poll gave up and took the blocking read.
@@ -87,7 +91,7 @@ pub struct ReadbackCounters {
     /// Publishes discarded past an EOS the host learned late
     /// ([`EosRead::HostOnDrain`]): the forwards the loop enqueued after the EOS
     /// before the drain showed it. `ring_publishes == ids + ring_eos_publishes
-    /// + ring_discarded` is the reconciliation.
+    /// + ring_discarded + ring_retracted` is the reconciliation.
     pub ring_discarded: u64,
     /// [`EosRead::GpuBatchedNonblocking`]: drains answered by a staged
     /// `eos_index` whose command buffer had already completed (no wait).
@@ -731,6 +735,16 @@ impl RingReader {
     /// Whether a stop id ended the stream for this reader.
     pub fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// The loop took back the last token this reader read
+    /// ([`ReadbackStrategy::retract_draw`]): its history slot is written
+    /// again under the NEXT stamp, as an EOS retraction leaves it, so the
+    /// stamps run one further ahead of the slots from here on. The cursor
+    /// stays — the stamp it consumed is spent; the next one is the token
+    /// drawn again.
+    pub fn retract_one(&mut self) {
+        self.slot_shift = (self.slot_shift + self.total_tiles - 1) % self.total_tiles;
     }
 
     /// Skip everything the ring had published when this reader was taken: a
@@ -2118,6 +2132,37 @@ impl ReadbackStrategy for Ring {
         } else {
             self.commits_since_live.set(since);
         }
+        Ok(())
+    }
+
+    /// The per-step EOS reads, unfused, with no thinking budget live: the
+    /// draw is one history slot and one stamp, which a take-back leaves as
+    /// an EOS retraction does. The deferred reads stamp per commit window, a
+    /// fused publish draws inside its kernel, a live budget keeps device
+    /// state a draw advances: none is taken back.
+    fn retracts_draw(&self) -> bool {
+        matches!(self.eos, EosRead::Poll(_) | EosRead::Blocking)
+            && !self.fused_step
+            && !self.fused_publish
+            && self.forcing.as_ref().is_none_or(|f| !f.live())
+    }
+
+    /// Take back the last draw before `eos_of_last` has seen it: its history
+    /// slot is retracted (the next publish writes it again), its stamp is
+    /// spent — the token drawn again carries the next one, so a reader that
+    /// read this one sees the new one as new ([`RingReader::retract_one`]),
+    /// and `eos_of_last` waits for the new stamp, never reading the old
+    /// flag. The input slot it wrote is not read again: the forward
+    /// encoded again reads the next publish's.
+    fn retract_draw(&mut self) -> Result<()> {
+        if !self.retracts_draw() {
+            lloom_tensor::bail!("Ring::retract_draw: this arm does not take a draw back");
+        }
+        if !(self.history.tile_open && self.history.in_tile > 0) {
+            lloom_tensor::bail!("Ring::retract_draw: no draw in the open tile to take back");
+        }
+        self.history.retract_one();
+        self.counters.ring_retracted += 1;
         Ok(())
     }
 

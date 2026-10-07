@@ -34,6 +34,23 @@ pub trait Model: Sized {
     fn from_weights(vb: VarBuilder, cfg: &Self::Config) -> Result<Self>;
 }
 
+/// When a driver settles a model's decode steps ([`CausalLM::provisional`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Provisional {
+    /// Every step settles before it returns.
+    #[default]
+    Off,
+    /// The driver settles each step after reading its token back and before
+    /// it encodes the next forward (the blocking arm): a redone step's draw
+    /// is taken back and made again.
+    Settled,
+    /// The driver settles each step after it has encoded the NEXT forward (a
+    /// ring at `lookahead = 1`): a redone step undoes the forward after it
+    /// too, and the driver takes back that forward's draw and encodes it
+    /// again.
+    Behind,
+}
+
 /// The LLM domain: an autoregressive model that projects the residual stream to
 /// vocabulary logits and threads a cache across positions.
 ///
@@ -125,24 +142,27 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
-    /// Provisional steps: when `on`, the model may return a decode step's
-    /// logits before it has settled the step — before it knows the step
-    /// computed on everything it needed (a streamed tier's device plan that
-    /// may have mapped a missing expert) — and the driver promises to call
-    /// [`Self::settle_step`] once it has read each step's logits back and
-    /// before it hands the token drawn from them out. Returns whether the
-    /// model takes it up; a driver whose draw it cannot take back must not
-    /// ask. `false` ends it (after the driver's last `settle_step`). The
-    /// default declines.
-    fn provisional(&self, _cache: &mut Self::Cache, _on: bool) -> Result<bool> {
-        Ok(false)
+    /// Provisional steps: the model may return a decode step's logits before
+    /// it has settled the step — before it knows the step computed on
+    /// everything it needed (a streamed tier's device plan that may have
+    /// mapped a missing expert) — and the driver promises to call
+    /// [`Self::settle_step`] at the point `mode` names, before it hands out
+    /// a token drawn from an unsettled step. Returns the mode the model took
+    /// up ([`Provisional::Off`] when it declines); a driver whose draws it
+    /// cannot take back must not ask. [`Provisional::Off`] ends it (after the
+    /// driver's last `settle_step`). The default declines.
+    fn provisional(&self, _cache: &mut Self::Cache, _mode: Provisional) -> Result<Provisional> {
+        Ok(Provisional::Off)
     }
 
-    /// Settle the last decode step when it is provisional: `None` when it
-    /// stands; `Some(logits)` — shaped as [`Self::forward`]'s — when it did
-    /// not, and was redone: the cache is as if the step had run once,
-    /// correctly, and the driver draws again from these logits in place of
-    /// the draw it made. The default has nothing to settle.
+    /// Settle the provisional steps the mode allows: every one under
+    /// [`Provisional::Settled`], every one but the newest under
+    /// [`Provisional::Behind`]. `None` when they stand; `Some(logits)` —
+    /// shaped as [`Self::forward`]'s — when one did not and was redone: the
+    /// cache is as if that step had run once, correctly, and every step
+    /// encoded after it is undone; the driver takes back the draw it made
+    /// from the redone step's logits (and, behind, the forward it fed) and
+    /// draws again from these. The default has nothing to settle.
     fn settle_step(&self, _cache: &mut Self::Cache) -> Result<Option<Tensor>> {
         Ok(None)
     }

@@ -294,8 +294,9 @@ fn a_settle_behind_the_next_encode_reads_its_own_steps_records_metal() -> Result
 }
 
 /// On a lookahead ring (`lookahead = 1`), a fetching step's settle held for
-/// the next step's encode runs while the GPU runs that next step and the
-/// worker serves its layers: the two must not collide. The held settle is
+/// the next step's encode — by the loop, `Provisional::Behind` (#927) —
+/// runs while the GPU runs that next step and the worker serves its layers:
+/// the two must not collide. The held settle is
 /// the tiers' bookkeeping (the step's misses were loaded inside it), so it
 /// loads nothing beside the worker; the decode is the resident model's,
 /// every step fetched, nothing timed out. Run on a thread of its own and
@@ -364,7 +365,13 @@ fn ring_run() -> Result<()> {
         "FETCHTEST ring steps={STEPS} provisional={} passes={} redos={} jobs={} loads={} short={} timeouts={} floor_waits={}",
         out.stats.provisional, cache.fetch_passes, cache.redos, f.jobs, f.loads, f.short, f.timeouts, f.floor_waits
     );
-    assert!(!out.stats.provisional, "a ring arm cannot take its draw back");
+    // Since #927 the ring's fixed cadence takes its steps provisionally
+    // (`Provisional::Behind`): the held settle is the driver's, after the
+    // next step's encode — the same overlap with the worker this test pins.
+    assert!(
+        out.stats.provisional,
+        "the ring's fixed cadence did not settle its steps behind the next forward"
+    );
     assert_eq!(out.ids, want, "the fetching ring's ids differ from the resident model's");
     assert!(cache.fetch_passes > 0 && f.loads > 0, "no step fetched: {f:?}");
     assert_eq!((f.short, f.timeouts), (0, 0), "a layer went short or timed out");

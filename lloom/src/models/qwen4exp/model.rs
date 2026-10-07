@@ -507,6 +507,12 @@ pub struct State<P: Profile> {
     tap_drops: u64,
     /// The open speculative window's pre-window bookkeeping, if any.
     window: Option<CacheWindow>,
+    /// A decode step's window HELD behind the standing one (`hold_standing`):
+    /// a provisional step settled one step behind (`Provisional::Behind`,
+    /// a lookahead ring) is still undone after the next step was encoded —
+    /// the newer step dropped (`drop_newer`), then this one rewound. Every
+    /// recurrent channel holds its base (`RecurrentState::hold_window`).
+    held: Option<CacheWindow>,
     /// The open window is the STANDING one: the last decode step's, kept
     /// open after the step so the step can be undone (`CacheRewind`, horizon
     /// = the tokens fed since it opened — one). Settled (resolved) by the
@@ -600,7 +606,7 @@ pub struct State<P: Profile> {
     /// (`CausalLM::settle_step`), redrawing from the redone step's logits
     /// when it computed on a missing expert. Off outside such a run.
     #[cfg(feature = "metal")]
-    pub(crate) provisional: bool,
+    pub(crate) provisional: crate::nn::model::Provisional,
     /// Provisional steps the driver's settle found had computed on a
     /// missing expert, redone before their token was handed out (`redos`
     /// counts them too).
@@ -889,6 +895,7 @@ impl<P: Profile> State<P> {
             taps: Vec::new(),
             tap_drops: 0,
             window: None,
+            held: None,
             standing: false,
             redos: 0,
             device_plan_armed: false,
@@ -904,7 +911,7 @@ impl<P: Profile> State<P> {
             fetch_exits: 0,
             fetch_redos: 0,
             #[cfg(feature = "metal")]
-            provisional: false,
+            provisional: crate::nn::model::Provisional::Off,
             provisional_redos: 0,
             replay_ns: 0,
             host_pass_ns: 0,
@@ -938,6 +945,7 @@ impl<P: Profile> State<P> {
             t.clear();
         }
         self.window = None;
+        self.held = None;
         self.standing = false;
     }
 
@@ -1194,6 +1202,72 @@ impl<P: Profile> State<P> {
             self.resolve_window()?;
         }
         Ok(())
+    }
+
+    /// Hold the standing window behind the next step's (a provisional step
+    /// settled one step behind): the step stays undoable while the next one
+    /// runs. Nothing to hold without a standing window; refused under a
+    /// verify's window or with a window already held.
+    #[cfg(feature = "metal")]
+    pub(crate) fn hold_standing(&mut self) -> Result<()> {
+        if self.window.is_none() {
+            return Ok(());
+        }
+        if !self.standing {
+            lloom_tensor::bail!("qwen4exp cache: holding a verify's window")
+        }
+        if self.held.is_some() {
+            lloom_tensor::bail!("qwen4exp cache: a window is already held")
+        }
+        self.s_state.hold_window()?;
+        self.conv_state.hold_window()?;
+        self.ple_conv.hold_window()?;
+        self.held = self.window.take();
+        self.standing = false;
+        Ok(())
+    }
+
+    /// The held step stands: release its window.
+    #[cfg(feature = "metal")]
+    pub(crate) fn resolve_held(&mut self) -> Result<()> {
+        if self.held.take().is_some() {
+            self.s_state.resolve_held()?;
+            self.conv_state.resolve_held()?;
+            self.ple_conv.resolve_held()?;
+        }
+        Ok(())
+    }
+
+    /// Undo the standing step and make the held one standing again: the cache
+    /// is as it was right after the held step, which a rewind now undoes.
+    #[cfg(feature = "metal")]
+    pub(crate) fn drop_newer(&mut self) -> Result<()> {
+        if self.held.is_none() {
+            lloom_tensor::bail!("qwen4exp cache: no held window to fall back to")
+        }
+        if self.window.is_some() {
+            if !self.standing {
+                lloom_tensor::bail!("qwen4exp cache: dropping a verify's window")
+            }
+            self.rewind_window()?;
+        }
+        self.s_state.unhold_window()?;
+        self.conv_state.unhold_window()?;
+        self.ple_conv.unhold_window()?;
+        self.window = self.held.take();
+        self.standing = true;
+        Ok(())
+    }
+
+    /// Whether a window is held behind the standing one.
+    pub fn window_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Whether every recurrent channel can hold a window (none is pooled).
+    #[cfg(feature = "metal")]
+    pub(crate) fn holds_windows(&self) -> bool {
+        !self.s_state.is_pooled() && !self.conv_state.is_pooled() && !self.ple_conv.is_pooled()
     }
 
     /// The tokens the standing window would undo: 0 without one.
@@ -1479,13 +1553,7 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// settled by the driver (`CausalLM::settle_step`, `settle_pending` at a
     /// run's end) or at the model's next entry ([`Self::settle_trailing`]).
     #[cfg(feature = "metal")]
-    fetch_pending: parking_lot::Mutex<Option<PendingFetch>>,
-    /// A provisional device-planned decode step (`State::provisional`): its
-    /// records, waiting for the driver's settle (`CausalLM::settle_step`).
-    /// On the model beside `fetch_pending`, for the same reason, and settled
-    /// at the same entries if the driver did not.
-    #[cfg(feature = "metal")]
-    step_pending: parking_lot::Mutex<Option<PendingStep>>,
+    pending: parking_lot::Mutex<std::collections::VecDeque<Pending>>,
     /// The device plan's settle reads every layer's record back into this
     /// Shared buffer rather than a pool buffer per step (`DESIGN.md` §9.2aa):
     /// grown to the largest record set, kept for the model's life.
@@ -1493,9 +1561,10 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     settle_dst: parking_lot::Mutex<Option<lloom_tensor::kernels::metal::BufferHandle>>,
     /// A one-row decode step's replay input, in memory the model owns rather
     /// than a pool buffer per step (`replay_input_owned`), and the epoch of
-    /// the command buffer its last reader was encoded into.
+    /// the command buffer its last reader was encoded into — two, alternating
+    /// (`ReplayInputs`).
     #[cfg(feature = "metal")]
-    replay_h: parking_lot::Mutex<Option<(Tensor, Option<lloom_tensor::kernels::metal::Epoch>)>>,
+    replay_h: parking_lot::Mutex<ReplayInputs>,
     /// A one-position step's PLE rows, gathered on the host into a Shared
     /// buffer the model keeps rather than uploaded per step
     /// (`ple_rows_owned`), and the epoch of its last reader.
@@ -1654,13 +1723,11 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             #[cfg(feature = "metal")]
             fetch_lane: std::sync::OnceLock::new(),
             #[cfg(feature = "metal")]
-            fetch_pending: parking_lot::Mutex::new(None),
-            #[cfg(feature = "metal")]
-            step_pending: parking_lot::Mutex::new(None),
+            pending: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             #[cfg(feature = "metal")]
             settle_dst: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
-            replay_h: parking_lot::Mutex::new(None),
+            replay_h: parking_lot::Mutex::new(ReplayInputs::default()),
             #[cfg(feature = "metal")]
             ple_rows: parking_lot::Mutex::new(None),
             fusion_report: None,
@@ -2854,7 +2921,19 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         if seq > 1 {
             self.settle_trailing(Some(cache))?;
         }
-        // The last decode step is final once another forward begins.
+        // The last decode step is final once another forward begins — or,
+        // when its settle trails this step's encode (`Provisional::Behind`),
+        // held behind this step's window until the driver settles it.
+        #[cfg(feature = "metal")]
+        if seq == 1 && cache.provisional == crate::nn::model::Provisional::Behind {
+            if cache.window_held() {
+                self.settle_trailing(Some(cache))?;
+            }
+            cache.hold_standing()?;
+        } else {
+            cache.settle_standing()?;
+        }
+        #[cfg(not(feature = "metal"))]
         cache.settle_standing()?;
         let mut logits = None;
         match self.prefill_mode {
@@ -3176,10 +3255,20 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // fetching step settles it after its own encode. A provisional step
         // the driver left unsettled is settled here, whatever comes next.
         #[cfg(feature = "metal")]
-        if !(planned && self.fetches(cache)) {
-            self.settle_trailing(Some(cache))?;
-        } else {
-            self.settle_trailing_step()?;
+        {
+            let behind = cache.provisional == crate::nn::model::Provisional::Behind;
+            if behind && planned {
+                // The step before this one settles after this one's encode,
+                // by the driver; anything older is a contract the driver did
+                // not keep.
+                if self.pending.lock().len() > 1 {
+                    self.settle_trailing(Some(cache))?;
+                }
+            } else if !(planned && self.fetches(cache)) {
+                self.settle_trailing(Some(cache))?;
+            } else {
+                self.settle_trailing_devices()?;
+            }
         }
         if !planned {
             // Inside a verify's window the step is the verify's to undo;
@@ -3261,13 +3350,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // driver's, once it has read the logits back — no wait here, so the
         // host is not standing between this pass and the draw after it.
         #[cfg(feature = "metal")]
-        if cache.provisional && !records.is_empty() {
+        if cache.provisional != crate::nn::model::Provisional::Off && !records.is_empty() {
             let marker = self.device().as_metal_device()?.flush_marker()?;
-            *self.step_pending.lock() = Some(PendingStep {
+            self.pending.lock().push_back(Pending::Device(PendingStep {
                 records,
                 marker,
                 h: h.clone(),
-            });
+            }));
             cache.keep_standing();
             return Ok(logits);
         }
@@ -3573,19 +3662,38 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             if m.activations_may_be_reused() {
                 let clock = m.gpu_clock();
                 let mut g = self.replay_h.lock();
-                let fits = matches!(g.as_ref(), Some((t, _)) if t.dims() == h.dims() && t.dtype() == h.dtype());
+                // A replay of a step whose input is already the model's own:
+                // the same buffer, read again.
+                if g.bufs.iter().flatten().any(|(t, _)| t.id() == h.id()) {
+                    return Ok(h.clone());
+                }
+                // The other buffer than the last step's: that one may still
+                // be a pending step's input (`ReplayInputs`).
+                let at = g.at ^ 1;
+                let fits = matches!(&g.bufs[at], Some((t, _)) if t.dims() == h.dims() && t.dtype() == h.dtype());
                 if !fits {
                     // Outlives every pass: no plan serves it.
                     let _declared = lloom_tensor::EscapeGuard::new();
-                    *g = Some((Tensor::zeros(h.dims(), h.dtype(), h.device())?, None));
+                    g.bufs[at] = Some((Tensor::zeros(h.dims(), h.dtype(), h.device())?, None));
                 }
-                let (t, read) = g.as_mut().expect("made above");
-                if read.is_none_or(|e| clock.is_complete(e)) {
+                // Never the input a pending step's redo would replay — the
+                // alternation keeps it the other buffer; this keeps it so.
+                let named = {
+                    let t = &g.bufs[at].as_ref().expect("made above").0;
+                    self.pending.lock().iter().any(|p| match p {
+                        Pending::Device(d) => d.h.id() == t.id(),
+                        Pending::Fetch(f) => f.h.id() == t.id(),
+                    })
+                };
+                let (t, read) = g.bufs[at].as_mut().expect("made above");
+                if !named && read.is_none_or(|e| clock.is_complete(e)) {
                     // The copy as `replay_input` makes it, minus the fill.
                     let _declared = lloom_tensor::EscapeGuard::new();
                     t.slice_set(&h.contiguous()?, 0, 0)?;
                     *read = None;
-                    return Ok(t.clone());
+                    let t = t.clone();
+                    g.at = at;
+                    return Ok(t);
                 }
             }
         }
@@ -3600,7 +3708,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if let Ok(m) = h.device().as_metal_device() {
             let mut g = self.replay_h.lock();
-            if let Some((t, read)) = g.as_mut() {
+            for (t, read) in g.bufs.iter_mut().flatten() {
                 if t.id() == h.id() {
                     *read = Some(m.gpu_clock().current_epoch());
                 }
@@ -3720,34 +3828,52 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     /// Settle whatever step's settle still trails — a fetching step held
     /// for the next step's encode, a provisional step the driver did not
-    /// settle — before work that must not run beside it (a multi-row pass,
-    /// a verify window, a grant, the run's end). Its token was handed out
-    /// already, so a step that computed on a missing expert is an error
-    /// here, never a silent redo: only the driver's settle
-    /// (`CausalLM::settle_step`) can still take its token back.
+    /// settle — oldest first, before work that must not run beside it (a
+    /// multi-row pass, a verify window, a grant, a step the driver did not
+    /// settle behind); then the window held behind the standing one, if
+    /// `cache` has one. Their tokens were handed out already, so a step that
+    /// computed on a missing expert is an error here, never a silent redo:
+    /// only the driver's settle (`CausalLM::settle_step`) can still take a
+    /// token back.
     #[cfg(feature = "metal")]
     pub(crate) fn settle_trailing(&self, mut cache: Option<&mut State<P>>) -> Result<()> {
-        let fetch = self.fetch_pending.lock().take();
-        if let Some(p) = fetch {
-            if self.settle_fetch(p, cache.as_deref_mut())?.is_some() {
+        loop {
+            let p = self.pending.lock().pop_front();
+            let Some(p) = p else { break };
+            let redo = match p {
+                Pending::Fetch(f) => self.settle_fetch(f, cache.as_deref_mut())?.is_some(),
+                Pending::Device(d) => self.settle_records_at(&d.records, &d.marker)?.0,
+            };
+            if redo {
                 lloom_tensor::bail!(
-                    "qwen4exp: a fetching step computed on a missing expert after its token was \
-                     handed out (the fetch worker's fail-safe fired: no slot or no routing within \
-                     its bound); QWEN4EXP_FETCH_SETTLE=now settles each step before its token"
+                    "qwen4exp: a decode step computed on a missing expert after its token was \
+                     handed out — a fetching step past the fetch worker's fail-safe \
+                     (QWEN4EXP_FETCH_SETTLE=now settles each step before its token), or a \
+                     provisional step its driver did not settle (`CausalLM::settle_step`)"
                 )
             }
         }
-        self.settle_trailing_step()
+        if let Some(cache) = cache {
+            cache.resolve_held()?;
+        }
+        Ok(())
     }
 
-    /// [`Self::settle_trailing`] for a provisional step only (a fetching
-    /// step's entry settles the fetching one after its own encode).
+    /// [`Self::settle_trailing`] for the provisional device-planned steps at
+    /// the queue's head only: a fetching step's entry, whose own held settle
+    /// runs after its encode.
     #[cfg(feature = "metal")]
-    fn settle_trailing_step(&self) -> Result<()> {
-        let step = self.step_pending.lock().take();
-        if let Some(p) = step {
-            let (redo, _) = self.settle_records_at(&p.records, &p.marker)?;
-            if redo {
+    fn settle_trailing_devices(&self) -> Result<()> {
+        loop {
+            let p = {
+                let mut q = self.pending.lock();
+                match q.front() {
+                    Some(Pending::Device(_)) => q.pop_front(),
+                    _ => None,
+                }
+            };
+            let Some(Pending::Device(d)) = p else { break };
+            if self.settle_records_at(&d.records, &d.marker)?.0 {
                 lloom_tensor::bail!(
                     "qwen4exp: a provisional decode step computed on a missing expert and reached \
                      the model's next entry unsettled — its driver hands a step's token out only \
@@ -3758,25 +3884,121 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         Ok(())
     }
 
-    /// The driver's settle of the last decode step, when it trails
-    /// (`CausalLM::settle_step`): `Some(logits)` of the step redone when it
-    /// computed on a missing expert.
+    /// Whether any layer's record flags a pass that computed on a missing
+    /// expert — read in place once the pass completed, nothing settled.
+    #[cfg(feature = "metal")]
+    fn records_flagged(
+        &self,
+        records: &[(usize, Tensor)],
+        marker: &lloom_tensor::metal_backend::CommandMarker,
+    ) -> Result<bool> {
+        Ok(self.read_records_at(records, marker)?.iter().any(|v| {
+            let n = v.len() / 3;
+            v[2 * n..].iter().any(|&f| f != 0)
+        }))
+    }
+
+    /// Everything encoded so far complete: a redo behind the next step
+    /// undoes that step, which must have run (and the PLE host fill read
+    /// its token) before it is taken back.
+    #[cfg(feature = "metal")]
+    fn sync_encoded(&self) -> Result<()> {
+        let m = self.device();
+        let m = m.as_metal_device()?;
+        let marker = m.flush_marker()?;
+        m.wait_marker(&marker)
+    }
+
+    /// A pending step that will never be settled — encoded after a step that
+    /// is being redone: its plans close (`ExpertResidency::discard_plan`),
+    /// its fetching pass's jobs end. Its pass has completed.
+    #[cfg(feature = "metal")]
+    fn discard_pending(&self, p: Pending) {
+        for (l, _) in p.records() {
+            self.layers[*l].moe().experts().discard_plan();
+        }
+        if let Pending::Fetch(f) = p {
+            f.pass.finish();
+        }
+    }
+
+    /// The driver's settle (`CausalLM::settle_step`): every pending step,
+    /// oldest first — under `Provisional::Behind` every one but the newest,
+    /// whose settle trails the next step's encode. A step that settles clean
+    /// releases the window held behind the next one. A step that computed on
+    /// a missing expert is redone: the steps encoded after it are dropped
+    /// (their passes complete, their plans closed, the cache back to the
+    /// redone step's window) and `Some(logits)` of the redo returned — the
+    /// driver takes back the draws made after it.
     #[cfg(feature = "metal")]
     fn settle_step_inner(&self, cache: &mut State<P>) -> Result<Option<Tensor>> {
-        let fetch = self.fetch_pending.lock().take();
-        if let Some(p) = fetch {
-            if let Some(h) = self.settle_fetch(p, Some(cache))? {
-                cache.provisional_redos += 1;
-                return self.decode_fetching(&h, cache, &mut (), true).map(Some);
+        use crate::nn::model::Provisional;
+        let keep = usize::from(cache.provisional == Provisional::Behind);
+        loop {
+            let p = {
+                let mut q = self.pending.lock();
+                if q.len() <= keep {
+                    None
+                } else {
+                    q.pop_front()
+                }
+            };
+            let Some(p) = p else { break };
+            // A step encoded after this one: its window is the standing one
+            // and this one's is held.
+            let mut newer = !self.pending.lock().is_empty();
+            // A flagged step is redone, and every step after it ran on its
+            // wrong output: they are dropped FIRST — their passes complete,
+            // their plans closed, the cache back to this step's window — so
+            // the settle's loads run with no pass beside them and no other
+            // plan open (in place, a load may not evict under an open plan).
+            if newer {
+                let (records, marker) = match &p {
+                    Pending::Device(d) => (&d.records, &d.marker),
+                    Pending::Fetch(f) => (&f.records, &f.marker),
+                };
+                if self.records_flagged(records, marker)? {
+                    self.sync_encoded()?;
+                    let dropped: Vec<Pending> = self.pending.lock().drain(..).collect();
+                    for d in dropped {
+                        self.discard_pending(d);
+                    }
+                    cache.drop_newer()?;
+                    newer = false;
+                }
             }
+            let redo = match p {
+                Pending::Fetch(f) => self.settle_fetch(f, Some(cache))?.map(|h| (h, None)),
+                Pending::Device(d) => {
+                    let (redo, after_first) = self.settle_records_at(&d.records, &d.marker)?;
+                    redo.then_some((d.h, Some(after_first)))
+                }
+            };
+            let Some((h, after_first)) = redo else {
+                if newer {
+                    cache.resolve_held()?;
+                }
+                continue;
+            };
+            if newer {
+                // Flagged nowhere and still redone: not a shape the settle
+                // produces (a redo is a flag); refuse rather than redo under
+                // a step encoded on its output.
+                lloom_tensor::bail!(
+                    "qwen4exp: a provisional step was redone without a flag while a later step \
+                     ran on its output"
+                )
+            }
+            cache.provisional_redos += 1;
+            return match after_first {
+                Some(n) => self.redo_device_step(&h, cache, &mut (), n).map(Some),
+                None => self.decode_fetching(&h, cache, &mut (), true).map(Some),
+            };
         }
-        let step = self.step_pending.lock().take();
-        if let Some(p) = step {
-            let (redo, after_first) = self.settle_records_at(&p.records, &p.marker)?;
-            if redo {
-                cache.provisional_redos += 1;
-                return self.redo_device_step(&p.h, cache, &mut (), after_first).map(Some);
-            }
+        // The held step had nothing to settle (a host-planned or replayed
+        // step, settled inline): it stands.
+        if cache.window_held() && self.pending.lock().len() <= keep {
+            cache.resolve_held()?;
         }
         Ok(None)
     }
@@ -3786,7 +4008,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     #[cfg(feature = "metal")]
     #[doc(hidden)]
     pub fn fetch_settle_trailing(&self) -> bool {
-        self.fetch_pending.lock().is_some()
+        self.pending
+            .lock()
+            .iter()
+            .any(|p| matches!(p, Pending::Fetch(_)))
     }
 
     /// Whether a provisional device-planned step waits for its settle.
@@ -3794,7 +4019,10 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     #[cfg(feature = "metal")]
     #[doc(hidden)]
     pub fn step_settle_trailing(&self) -> bool {
-        self.step_pending.lock().is_some()
+        self.pending
+            .lock()
+            .iter()
+            .any(|p| matches!(p, Pending::Device(_)))
     }
 
     /// Open a fetching step at the current epoch, the pass's floor: the
@@ -3856,7 +4084,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // step's settle is the driver's instead, after its draw and before
         // its token is handed out (the one before it was settled there). A
         // replay settles at once.
-        if !replay && (cache.provisional || fetch_settle_behind()) {
+        let provisional = cache.provisional != crate::nn::model::Provisional::Off;
+        if !replay && (provisional || fetch_settle_behind()) {
             let before = self.stream_misses();
             let mut pass = self.fetch_begin(cache)?;
             cache.open_window()?;
@@ -3869,14 +4098,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 .into_iter()
                 .filter_map(|(l, r)| r.into_device().map(|t| (l, t)))
                 .collect();
-            self.settle_trailing(Some(cache))?;
-            *self.fetch_pending.lock() = Some(PendingFetch {
+            // A provisional step's settle is the driver's (before this one's
+            // encode on the blocking arm, after it on a lookahead ring).
+            if !provisional {
+                self.settle_trailing(Some(cache))?;
+            }
+            self.pending.lock().push_back(Pending::Fetch(PendingFetch {
                 records,
                 pass,
                 before,
                 marker,
                 h: h.clone(),
-            });
+            }));
             cache.fetch_passes += 1;
             cache.device_plan_armed = true;
             cache.armed_through_misses = true;
@@ -4476,24 +4709,36 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     /// Provisional steps on the device plan's warm path and the fetching
     /// steps (Metal; `QWEN4EXP_PROVISIONAL=off` declines): their settle — the
     /// records' one wait, and a redo when a layer computed on a missing
-    /// expert — moves from the end of the step to the driver's settle after
-    /// its readback, where the pass has completed and the wait costs
-    /// nothing.
-    fn provisional(&self, cache: &mut Self::Cache, on: bool) -> Result<bool> {
+    /// expert — moves from the end of the step to the driver's settle: after
+    /// its readback (`Settled`), where the pass has completed and the wait
+    /// costs nothing, or after the next step's encode (`Behind`), the host
+    /// encoding one step while the GPU runs the one before. `Behind` holds a
+    /// window behind the standing one, which a pooled recurrent channel does
+    /// not; it declines there.
+    fn provisional(
+        &self,
+        cache: &mut Self::Cache,
+        mode: crate::nn::model::Provisional,
+    ) -> Result<crate::nn::model::Provisional> {
+        use crate::nn::model::Provisional;
         #[cfg(feature = "metal")]
         {
-            // Only a tier that plans on the device has a settle to defer.
-            cache.provisional = on
-                && self.device().is_metal()
+            let able = self.device().is_metal()
                 && provisional_on()
                 && self.device_plan
                 && self.layers.iter().any(|l| l.moe().experts().plans_on_device());
+            cache.provisional = match mode {
+                Provisional::Off => Provisional::Off,
+                Provisional::Settled if able => Provisional::Settled,
+                Provisional::Behind if able && cache.holds_windows() => Provisional::Behind,
+                _ => Provisional::Off,
+            };
             Ok(cache.provisional)
         }
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (cache, on);
-            Ok(false)
+            let _ = (cache, mode);
+            Ok(Provisional::Off)
         }
     }
 
@@ -5349,8 +5594,7 @@ fn provisional_on() -> bool {
 #[cfg(feature = "metal")]
 impl<P: Profile, R: ExpertResidency> Drop for Qwen4Exp<P, R> {
     fn drop(&mut self) {
-        drop(self.fetch_pending.get_mut().take());
-        drop(self.step_pending.get_mut().take());
+        self.pending.get_mut().clear();
         if let Some(Some(lane)) = self.fetch_lane.get() {
             lane.quiesce();
         }
@@ -5371,6 +5615,39 @@ struct PendingFetch {
     /// The step's input, the model's own copy: a provisional step's redo
     /// runs it again.
     h: Tensor,
+}
+
+/// A decode step whose settle trails its return, oldest first in
+/// `Qwen4Exp::pending`: a device-planned provisional step, or a fetching
+/// step held for the next encode or the driver.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+enum Pending {
+    Device(PendingStep),
+    Fetch(PendingFetch),
+}
+
+#[cfg(feature = "metal")]
+impl Pending {
+    fn records(&self) -> &[(usize, Tensor)] {
+        match self {
+            Pending::Device(d) => &d.records,
+            Pending::Fetch(f) => &f.records,
+        }
+    }
+}
+
+/// A one-row decode step's replay inputs (`Qwen4Exp::replay_input_owned`):
+/// two buffers, each step copying into the one the step before did not.
+/// **Two, derived (§15.2 #10c):** a step's input is read by its own passes
+/// (the epoch stamped here) and by its redo while its settle is pending; a
+/// settle trails its step by one at most (`Provisional::Behind`), so the
+/// pending step is always the last copy's, and the copy goes to the other.
+#[cfg(feature = "metal")]
+#[derive(Debug, Default)]
+struct ReplayInputs {
+    bufs: [Option<(Tensor, Option<lloom_tensor::kernels::metal::Epoch>)>; 2],
+    at: usize,
 }
 
 /// A provisional device-planned decode step (`State::provisional`).

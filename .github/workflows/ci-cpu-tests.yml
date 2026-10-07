@@ -1,0 +1,83 @@
+# CPU tests, no `metal` feature: the tests a GitHub-hosted runner can run.
+#
+#   runs here     lloom-tensor: the CPU tensor library's unit + integration
+#                 tests (matmul, conv, quantized k-quants, grad, indexing, ...)
+#                 and its doctests. lloom: the model / generation / driver
+#                 tests that carry a CPU arm, the `token_ring_fuzz` proptest and
+#                 the LFM2 conv-slot model proptest, and its doctests.
+#                 lloom-engine: its unit tests. Every crate's examples are
+#                 built (`cargo test` builds them).
+#
+#   cannot run    everything `#![cfg(feature = "metal")]`: the kernel parity,
+#   here          determinism and mutation suites, the Metal buffer-pool, arena,
+#                 blit-ordering, RNG and concurrency tests, and the in-crate
+#                 Metal fuzzers. They need a Metal device and run on Apple
+#                 silicon (`cargo test --features metal`). This job is the CPU
+#                 half only.
+#
+# Non-vacuity, in two halves:
+#   * cpu-tests.sh refuses a run whose passed-test total is under a floor, and
+#     requires the named CPU fuzzer binary to have run >= 1 test -- a Metal-gated
+#     binary legitimately reports `running 0 tests` here, so the total alone
+#     cannot see the CPU fuzzer silently gated off.
+#   * cpu-test-positive-control.sh breaks TokenRing's EOS decision in place and
+#     requires the token-ring tests to go red, then restores (SHA-256-verified)
+#     and requires green.
+
+name: CI / CPU tests (no metal)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    name: cargo test, no metal feature, non-vacuous
+    runs-on: ubuntu-latest
+    # A run still going at this point is a hung test or a runaway proptest.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # .cargo/config.toml pins `target-cpu=native` for the development
+      # machine; the runner builds with its own defaults.
+      - name: Remove cargo config
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # One step per crate so a failure names the crate. cpu-tests.sh runs
+      # `--no-fail-fast`, so every test binary runs even when one is red, and
+      # the failing set must equal the step's --known-red list exactly: a
+      # listed test that passes fails the gate too, so a fixed test cannot stay
+      # silently listed. Each floor is about 2/3 of the passed count measured
+      # when it was set, so a whole test binary vanishing trips it while
+      # ordinary churn does not.
+      - name: lloom-tensor tests (no metal)
+        run: >-
+          bash .github/ci/cpu-tests.sh
+          --known-red src/lib.rs::tuning::tests::the_parsers_refuse_what_the_sites_refused
+          lloom-tensor 176
+
+      - name: lloom-engine tests (no metal)
+        run: bash .github/ci/cpu-tests.sh lloom-engine 11
+
+      # PROPTEST_CASES raises the proptests' case counts; token_ring_fuzz is
+      # the named binary that must have run >= 1 test.
+      - name: lloom tests (no metal, PROPTEST_CASES raised)
+        env:
+          PROPTEST_CASES: "4096"
+        run: bash .github/ci/cpu-tests.sh lloom 290 token_ring_fuzz
+
+      # Shows the gate can FAIL: a broken TokenRing must go red here.
+      - name: positive control (mutated TokenRing must fail)
+        run: bash .github/ci/cpu-test-positive-control.sh

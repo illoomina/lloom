@@ -1,0 +1,459 @@
+[arb:gpu] waiting behind 4 entries
+[arb:gpu] acquired after 3177s
+[arb:gpu] load 3.85, proceeding
+[arb:gpu] holding gpu exclusively
+CONTRACT profile=deterministic arms=none
+SLOTPLAN working_set=55662788608 fraction=0.65 resident_bytes=4115863040 expert_bytes_per_slot=83814400 reserve_bytes=3916267520 rows=1 kv_tokens=4096 prefill_tile=512 slots=335
+LOADED gguf=/Users/ocean/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF/snapshots/2c4721899b4382bd07dfb61ae4fbad90c09caf7d/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf shards=2 layers=48 hidden=2560 vocab=248320 experts=512x10 device=Metal(MetalDevice(DeviceId(1))) ple=on ple_cache_rows=0 prefill=Chunk moe_act=f32 experts_mode=stream slots=auto loader=pread config=[KvQuant=Off:f32] load_ms=4285
+MEM run=0 phase=loaded device_gb=32.91 pool_live_gb=2.16 pool_free_gb=0.07 pool_pending_gb=0.01 phys_gb=34.05 working_set_gb=55.66 residency_allocations=1295 residency_commits=2512 residency_added=2448 residency_removed=1153 heap_chunks=0 heap_size_gb=0.00 heap_used_gb=0.00
+DRIVER arm=blocking prefill_tile=1024 lookahead=0 adaptive=false host_fill=false
+TRACE run=0 step=9 dispatches=1671 barriers=1146 encoders=52
+TRACE run=0 step=9 break n=29 after=moe_topk_f32 before=copy2d_u32
+TRACE run=0 step=9 break n=5 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xs_f32
+TRACE run=0 step=9 break n=4 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_s_f32
+TRACE run=0 step=9 break n=4 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_xxs_f32
+TRACE run=0 step=9 break n=3 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xxs_f32
+TRACE run=0 step=9 break n=3 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=0 step=9 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=0 step=9 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=0 step=9 break n=1 after=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid before=hc_collapse_f32
+TRACE run=0 step=9 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=36 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=0 step=9 kernel=copy2d_u32 n=139 barrier=18 36×[grid=1x176000x1 tg=1024 threads=176000] 27×[grid=1x115200x1 tg=1024 threads=115200] 19×[grid=1x230400x1 tg=1024 threads=230400] 18×[grid=1x131200x1 tg=1024 threads=131200] 16×[grid=1x118400x1 tg=1024 threads=118400] 14×[grid=1x105600x1 tg=1024 threads=105600] 8×[grid=1x156800x1 tg=1024 threads=156800] 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=0 step=9 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=97 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=0 step=9 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=97 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=9 kernel=hc_collapse_f32 n=97 barrier=96 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=9 kernel=hc_norm_f32 n=97 barrier=97 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=0 step=9 kernel=hc_combine_f32 n=96 barrier=96 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=0 step=9 kernel=silu_mul_f32 n=96 barrier=96 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=0 step=9 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=33 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=9 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=10 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=9 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=0 step=9 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=48 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=0 step=9 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=9 kernel=moe_combine_f32 n=48 barrier=48 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=9 kernel=moe_topk_f32 n=48 barrier=48 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=9 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=8 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=0 step=9 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=0 step=9 kernel=copy2d_f32 n=39 barrier=25 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x128x1 tg=128 threads=128] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=0 step=9 kernel=gdn_gated_norm_f32 n=36 barrier=36 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=0 step=9 kernel=gdn_prologue_f32 n=36 barrier=36 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=0 step=9 kernel=gdn_step_r16_f32 n=36 barrier=36 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=18 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=0 step=9 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=6 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=10 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=9 kernel=qsa_prep_f32 n=12 barrier=12 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=0 step=9 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=0 step=9 kernel=sigmoid_mul_f32 n=12 barrier=12 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=6 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=5 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=6 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=9 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=8 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=0 step=9 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=2 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=9 kernel=badd_f32 n=5 barrier=5 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=9 kernel=bmul_f32 n=5 barrier=5 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=9 kernel=rmsnorm_f32 n=3 barrier=2 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=9 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=0 step=9 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=affine_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=bsub_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=0 step=9 kernel=fast_argmax_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=0 step=9 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=9 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=9 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=0 step=9 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=9 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=9 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 dispatches=1989 barriers=1298 encoders=62
+TRACE run=0 step=10 break n=40 after=moe_topk_f32 before=copy2d_u32
+TRACE run=0 step=10 break n=4 after=hc_collapse_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=0 step=10 break n=2 after=copy2d_f32 before=copy2d_f32
+TRACE run=0 step=10 break n=2 after=hc_norm_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu
+TRACE run=0 step=10 break n=2 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xs_f32
+TRACE run=0 step=10 break n=2 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xxs_f32
+TRACE run=0 step=10 break n=2 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=0 step=10 break n=1 after=badd_f32 before=hc_norm_f32
+TRACE run=0 step=10 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=0 step=10 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=0 step=10 break n=1 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_s_f32
+TRACE run=0 step=10 break n=1 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_xxs_f32
+TRACE run=0 step=10 break n=1 after=sigmoid_mul_f32 before=kernel_mul_mv_q5_K_f32
+TRACE run=0 step=10 break n=1 after=sigmoid_mul_f32 before=kernel_mul_mv_q6_K_f32
+TRACE run=0 step=10 kernel=copy2d_u32 n=301 barrier=61 70×[grid=1x115200x1 tg=1024 threads=115200] 56×[grid=1x176000x1 tg=1024 threads=176000] 50×[grid=1x131200x1 tg=1024 threads=131200] 36×[grid=1x118400x1 tg=1024 threads=118400] 34×[grid=1x105600x1 tg=1024 threads=105600] 30×[grid=1x230400x1 tg=1024 threads=230400] 24×[grid=1x156800x1 tg=1024 threads=156800] 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=0 step=10 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=36 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=0 step=10 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=95 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=0 step=10 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=97 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=10 kernel=hc_collapse_f32 n=97 barrier=97 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=10 kernel=hc_norm_f32 n=97 barrier=96 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=0 step=10 kernel=hc_combine_f32 n=96 barrier=96 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=0 step=10 kernel=silu_mul_f32 n=96 barrier=96 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=0 step=10 kernel=copy2d_f32 n=87 barrier=59 24×[grid=1x128x1 tg=128 threads=128] 24×[grid=1x32x1 tg=32 threads=32] 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x64x1 tg=64 threads=64] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=0 step=10 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=32 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=10 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=10 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=10 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=0 step=10 kernel=bmul_f32 n=53 barrier=17 48×[grid=1x1x1tg tg=16 threads=16] 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=44 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=0 step=10 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=10 kernel=moe_combine_f32 n=48 barrier=48 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=10 kernel=moe_topk_f32 n=48 barrier=48 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=10 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=8 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=0 step=10 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=0 step=10 kernel=gdn_gated_norm_f32 n=36 barrier=36 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=0 step=10 kernel=gdn_prologue_f32 n=36 barrier=36 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=0 step=10 kernel=gdn_step_r16_f32 n=36 barrier=36 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=18 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=0 step=10 kernel=badd_f32 n=17 barrier=17 12×[grid=1x1x1tg tg=16 threads=16] 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=10 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=5 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=0 step=10 kernel=rmsnorm_f32 n=15 barrier=14 12×[grid=1x1x1tg tg=64 threads=64] 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=10 kernel=affine_f32 n=13 barrier=13 12×[grid=1x1x1tg tg=64 threads=64] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=bsub_f32 n=13 barrier=13 12×[grid=1x1x1tg tg=16 threads=16] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=11 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=10 kernel=fast_sum_f32_strided n=12 barrier=12 12×[grid=128x1x1tg tg=2 threads=256]
+TRACE run=0 step=10 kernel=qsa_prep_f32 n=12 barrier=12 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=0 step=10 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=0 step=10 kernel=sigmoid_mul_f32 n=12 barrier=12 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=9 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=8 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=7 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=10 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=8 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=0 step=10 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=5 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=10 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=10 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=0 step=10 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=0 step=10 kernel=fast_argmax_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=0 step=10 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=10 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=10 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=0 step=10 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=10 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=10 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 dispatches=1665 barriers=1145 encoders=51
+TRACE run=0 step=11 break n=27 after=moe_topk_f32 before=copy2d_u32
+TRACE run=0 step=11 break n=6 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_s_f32
+TRACE run=0 step=11 break n=6 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=0 step=11 break n=4 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xs_f32
+TRACE run=0 step=11 break n=3 after=moe_topk_f32 before=kernel_mul_mv_id2_iq3_xxs_f32
+TRACE run=0 step=11 break n=2 after=moe_topk_f32 before=kernel_mul_mv_id2_iq2_xxs_f32
+TRACE run=0 step=11 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=0 step=11 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=0 step=11 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=36 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=0 step=11 kernel=copy2d_u32 n=133 barrier=18 30×[grid=1x115200x1 tg=1024 threads=115200] 26×[grid=1x105600x1 tg=1024 threads=105600] 20×[grid=1x131200x1 tg=1024 threads=131200] 18×[grid=1x118400x1 tg=1024 threads=118400] 18×[grid=1x176000x1 tg=1024 threads=176000] 14×[grid=1x230400x1 tg=1024 threads=230400] 6×[grid=1x156800x1 tg=1024 threads=156800] 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=0 step=11 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=97 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=0 step=11 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=97 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=11 kernel=hc_collapse_f32 n=97 barrier=97 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=11 kernel=hc_norm_f32 n=97 barrier=97 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=0 step=11 kernel=hc_combine_f32 n=96 barrier=96 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=0 step=11 kernel=silu_mul_f32 n=96 barrier=96 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=0 step=11 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=33 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=11 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=10 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=0 step=11 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=0 step=11 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=48 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=0 step=11 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=11 kernel=moe_combine_f32 n=48 barrier=48 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=0 step=11 kernel=moe_topk_f32 n=48 barrier=48 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=0 step=11 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=8 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=0 step=11 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=0 step=11 kernel=copy2d_f32 n=39 barrier=25 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x128x1 tg=128 threads=128] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=0 step=11 kernel=gdn_gated_norm_f32 n=36 barrier=36 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=0 step=11 kernel=gdn_prologue_f32 n=36 barrier=36 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=0 step=11 kernel=gdn_step_r16_f32 n=36 barrier=36 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=18 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=0 step=11 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=6 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=7 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=11 kernel=qsa_prep_f32 n=12 barrier=12 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=0 step=11 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=0 step=11 kernel=sigmoid_mul_f32 n=12 barrier=12 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=4 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=6 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=7 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=11 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=8 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=0 step=11 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=3 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=0 step=11 kernel=badd_f32 n=5 barrier=5 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=11 kernel=bmul_f32 n=5 barrier=5 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=11 kernel=rmsnorm_f32 n=3 barrier=2 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=11 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=0 step=11 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=affine_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=bsub_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=0 step=11 kernel=fast_argmax_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=0 step=11 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=0 step=11 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=0 step=11 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=0 step=11 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=0 step=11 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=0 step=11 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+MEM run=0 phase=driver device_gb=34.84 pool_live_gb=2.61 pool_free_gb=0.11 pool_pending_gb=0.00 phys_gb=36.01 working_set_gb=55.66 residency_allocations=4242 residency_commits=5266 residency_added=5396 residency_removed=1154 heap_chunks=0 heap_size_gb=0.00 heap_used_gb=0.00
+TOKENS 760,13071,995,427,3173,364,2250,2756,11,12680,279,9117,1083,264,509,51554
+RESULT run=0 tokens_sha256=097d4b416f45cc589c5f5d71887b8ebd511646cb73d8bc263c7f49f91b4a58f0 logits_sha256=- logits_max=- prompt_tokens=38 generated=16 hit_eos=false prefill_ms=31829 decode_ms=1854 max_tokens=16 driver=session-blocking steps=16 commits=0 host_fill_forwards=0 host_fill_fills=0 host_fill_parked=0 publish_parks=0 poll_fallbacks=0 overrun=0 config=[KvQuant=Off:f32]
+PREFETCH run=0 on=true spec_ahead=0 issued=22211 staged=9651 used=6985 wasted=2666 stale=12535 bytes=18964723200 parked=78 stage_read_gb_s=0.76 direct_read_gb_s=0.00
+STREAMPRE run=0 misses=5882 readback_ms=1757 load_now_ms=1531 land_ms=33 sync_load_ms=0 settle_loads=0 settle_ms=0 direct_loads=0 direct_wait_ms=0
+STREAM run=0 loader=pread slots=335 plans=816 groups=816 hits=6469 misses=6985 evictions=0 bytes_loaded=12284032000 hit_rate=0.4808 device_plans=0 settled_misses=0 prefetch_now=6131 redos=0 host_plan_passes=16 readback_ms=2657 load_now_ms=2160 land_ms=50 sync_load_ms=0 io_hints=0 io_inflight_hits=0 io_inflight_wasted=0 io_inflight_landed=0 direct_loads=0 direct_wait_ms=0 settle_loads=0 settle_ms=0 settle_clock_lag=0 settle_after_first=0 replay_ms=0 host_pass_ms=1791 free_takes=0 inplace_takes=0 quarantined=0 recycled=0 h1_restamps=0 h2_refusals=0 h3_deferred_writes=0 slot_reallocations=0 slot_bytes_released=0
+TRACE run=1 step=9 dispatches=1581 barriers=1172 encoders=34
+TRACE run=1 step=9 break n=3 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu before=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid
+TRACE run=1 step=9 break n=2 after=gdn_prologue_f32 before=gdn_step_r16_f32
+TRACE run=1 step=9 break n=2 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=1 step=9 break n=2 after=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid before=hc_collapse_f32
+TRACE run=1 step=9 break n=2 after=hc_combine_f32 before=hc_norm_f32
+TRACE run=1 step=9 break n=2 after=kernel_mul_mv_q4_K_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=9 break n=2 after=kernel_mul_mv_q6_K_f32 before=hc_combine_f32
+TRACE run=1 step=9 break n=2 after=moe_combine_f32 before=hc_combine_f32
+TRACE run=1 step=9 break n=1 after=cast_u8_f32 before=bsub_f32
+TRACE run=1 step=9 break n=1 after=copy2d_f32 before=copy2d_f32
+TRACE run=1 step=9 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=1 step=9 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=1 step=9 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=copy2d_f32
+TRACE run=1 step=9 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=1 step=9 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=9 break n=1 after=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 before=moe_topk_f32
+TRACE run=1 step=9 break n=1 after=hc_norm_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu
+TRACE run=1 step=9 break n=1 after=kernel_mul_mv_id2_iq3_xxs_f32 before=silu_mul_f32
+TRACE run=1 step=9 break n=1 after=kernel_mul_mv_id_q2_0_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=9 break n=1 after=kernel_mul_mv_id_q2_0_f32 before=kernel_mul_mv_q4_K_f32
+TRACE run=1 step=9 break n=1 after=kernel_mul_mv_iq4_nl_f32 before=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0
+TRACE run=1 step=9 break n=1 after=moe_slot_map_u32 before=kernel_mul_mv_id2_iq2_xxs_f32
+TRACE run=1 step=9 break n=1 after=moe_slot_map_u32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=1 step=9 break n=1 after=silu_mul_f32 before=kernel_mul_mv_q2_0_f32
+TRACE run=1 step=9 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=35 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=1 step=9 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=96 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=1 step=9 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=94 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=9 kernel=hc_collapse_f32 n=97 barrier=95 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=9 kernel=hc_norm_f32 n=97 barrier=95 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=1 step=9 kernel=hc_combine_f32 n=96 barrier=92 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=1 step=9 kernel=silu_mul_f32 n=96 barrier=95 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=1 step=9 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=33 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=9 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=10 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=9 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=1 step=9 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=46 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=1 step=9 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=9 kernel=moe_combine_f32 n=48 barrier=48 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=9 kernel=moe_slot_map_u32 n=48 barrier=48 48×[grid=1x1x1tg tg=64 threads=64]
+TRACE run=1 step=9 kernel=moe_topk_f32 n=48 barrier=47 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=9 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=8 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=1 step=9 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=1 step=9 kernel=copy2d_f32 n=39 barrier=24 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x128x1 tg=128 threads=128] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=1 step=9 kernel=gdn_gated_norm_f32 n=36 barrier=36 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=1 step=9 kernel=gdn_prologue_f32 n=36 barrier=36 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=1 step=9 kernel=gdn_step_r16_f32 n=36 barrier=34 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=18 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=1 step=9 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=6 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=12 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=9 kernel=qsa_prep_f32 n=12 barrier=12 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=1 step=9 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=1 step=9 kernel=sigmoid_mul_f32 n=12 barrier=12 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=8 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=9 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=7 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=1 step=9 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=6 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=9 kernel=badd_f32 n=5 barrier=5 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=9 kernel=bmul_f32 n=5 barrier=5 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=9 kernel=rmsnorm_f32 n=3 barrier=2 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=9 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=1 step=9 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=affine_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=bsub_f32 n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=copy2d_u32 n=1 barrier=1 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=1 step=9 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=1 step=9 kernel=fast_argmax_f32 n=1 barrier=0 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=1 step=9 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=9 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=9 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=1 step=9 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=9 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=9 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 dispatches=1737 barriers=1276 encoders=37
+TRACE run=1 step=10 break n=2 after=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 before=moe_combine_f32
+TRACE run=1 step=10 break n=2 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu before=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid
+TRACE run=1 step=10 break n=2 after=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid before=hc_collapse_f32
+TRACE run=1 step=10 break n=2 after=hc_collapse_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=1 step=10 break n=2 after=hc_norm_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu
+TRACE run=1 step=10 break n=2 after=moe_combine_f32 before=hc_combine_f32
+TRACE run=1 step=10 break n=2 after=moe_topk_f32 before=moe_slot_map_u32
+TRACE run=1 step=10 break n=1 after=badd_f32 before=copy2d_f32
+TRACE run=1 step=10 break n=1 after=bmul_f32 before=bmul_f32
+TRACE run=1 step=10 break n=1 after=bmul_f32 before=bsub_f32
+TRACE run=1 step=10 break n=1 after=cast_u8_f32 before=bsub_f32
+TRACE run=1 step=10 break n=1 after=copy2d_f32 before=fast_sum_f32_strided
+TRACE run=1 step=10 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=1 step=10 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=1 step=10 break n=1 after=gdn_gated_norm_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=10 break n=1 after=gdn_step_r16_f32 before=gdn_gated_norm_f32
+TRACE run=1 step=10 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=10 break n=1 after=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 before=moe_topk_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_id_iq4_nl_f32 before=kernel_mul_mv_iq3_s_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_iq4_nl_f32 before=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_iq4_xs_f32 before=gdn_prologue_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_iq4_xs_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_q4_K_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_q4_K_f32 before=silu_mul_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_q6_K_f32 before=hc_combine_f32
+TRACE run=1 step=10 break n=1 after=kernel_mul_mv_q6_K_f32 before=qsa_prep_f32
+TRACE run=1 step=10 break n=1 after=moe_slot_map_u32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=1 step=10 break n=1 after=sdpa_vector_float_256 before=sigmoid_mul_f32
+TRACE run=1 step=10 break n=1 after=silu_mul_f32 before=kernel_mul_mv_id_iq4_nl_f32
+TRACE run=1 step=10 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=36 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=1 step=10 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=95 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=1 step=10 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=95 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=10 kernel=hc_collapse_f32 n=97 barrier=95 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=10 kernel=hc_norm_f32 n=97 barrier=97 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=1 step=10 kernel=hc_combine_f32 n=96 barrier=93 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=1 step=10 kernel=silu_mul_f32 n=96 barrier=95 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=1 step=10 kernel=copy2d_f32 n=87 barrier=61 24×[grid=1x128x1 tg=128 threads=128] 24×[grid=1x32x1 tg=32 threads=32] 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x64x1 tg=64 threads=64] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=1 step=10 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=33 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=10 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=9 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=10 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=1 step=10 kernel=bmul_f32 n=53 barrier=17 48×[grid=1x1x1tg tg=16 threads=16] 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=47 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=1 step=10 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=10 kernel=moe_combine_f32 n=48 barrier=46 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=10 kernel=moe_slot_map_u32 n=48 barrier=46 48×[grid=1x1x1tg tg=64 threads=64]
+TRACE run=1 step=10 kernel=moe_topk_f32 n=48 barrier=47 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=10 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=7 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=1 step=10 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=1 step=10 kernel=gdn_gated_norm_f32 n=36 barrier=35 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=1 step=10 kernel=gdn_prologue_f32 n=36 barrier=34 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=1 step=10 kernel=gdn_step_r16_f32 n=36 barrier=36 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=17 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=1 step=10 kernel=badd_f32 n=17 barrier=17 12×[grid=1x1x1tg tg=16 threads=16] 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=10 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=6 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=1 step=10 kernel=rmsnorm_f32 n=15 barrier=14 12×[grid=1x1x1tg tg=64 threads=64] 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=10 kernel=affine_f32 n=13 barrier=13 12×[grid=1x1x1tg tg=64 threads=64] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=bsub_f32 n=13 barrier=11 12×[grid=1x1x1tg tg=16 threads=16] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=12 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=10 kernel=fast_sum_f32_strided n=12 barrier=11 12×[grid=128x1x1tg tg=2 threads=256]
+TRACE run=1 step=10 kernel=qsa_prep_f32 n=12 barrier=11 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=1 step=10 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=1 step=10 kernel=sigmoid_mul_f32 n=12 barrier=11 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=9 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=10 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=8 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=1 step=10 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=6 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=10 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=10 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=1 step=10 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=copy2d_u32 n=1 barrier=1 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=1 step=10 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=1 step=10 kernel=fast_argmax_f32 n=1 barrier=0 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=1 step=10 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=10 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=10 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=1 step=10 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=10 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=10 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 dispatches=1581 barriers=1172 encoders=34
+TRACE run=1 step=11 break n=3 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu before=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid
+TRACE run=1 step=11 break n=2 after=gdn_prologue_f32 before=gdn_step_r16_f32
+TRACE run=1 step=11 break n=2 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=1 step=11 break n=2 after=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid before=hc_collapse_f32
+TRACE run=1 step=11 break n=2 after=hc_combine_f32 before=hc_norm_f32
+TRACE run=1 step=11 break n=2 after=kernel_mul_mv_q4_K_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=11 break n=2 after=kernel_mul_mv_q6_K_f32 before=hc_combine_f32
+TRACE run=1 step=11 break n=2 after=moe_combine_f32 before=hc_combine_f32
+TRACE run=1 step=11 break n=1 after=cast_u8_f32 before=bsub_f32
+TRACE run=1 step=11 break n=1 after=copy2d_f32 before=copy2d_f32
+TRACE run=1 step=11 break n=1 after=copy2d_f32 before=silu_f32
+TRACE run=1 step=11 break n=1 after=copy2d_u32 before=kernel_get_rows_iq3_s
+TRACE run=1 step=11 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=copy2d_f32
+TRACE run=1 step=11 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0
+TRACE run=1 step=11 break n=1 after=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=11 break n=1 after=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 before=moe_topk_f32
+TRACE run=1 step=11 break n=1 after=hc_norm_f32 before=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu
+TRACE run=1 step=11 break n=1 after=kernel_mul_mv_id2_iq3_xxs_f32 before=silu_mul_f32
+TRACE run=1 step=11 break n=1 after=kernel_mul_mv_id_q2_0_f32 before=kernel_mul_mv_iq4_xs_f32
+TRACE run=1 step=11 break n=1 after=kernel_mul_mv_id_q2_0_f32 before=kernel_mul_mv_q4_K_f32
+TRACE run=1 step=11 break n=1 after=kernel_mul_mv_iq4_nl_f32 before=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0
+TRACE run=1 step=11 break n=1 after=moe_slot_map_u32 before=kernel_mul_mv_id2_iq2_xxs_f32
+TRACE run=1 step=11 break n=1 after=moe_slot_map_u32 before=kernel_mul_mv_id2_iq3_s_f32
+TRACE run=1 step=11 break n=1 after=silu_mul_f32 before=kernel_mul_mv_q2_0_f32
+TRACE run=1 step=11 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0 n=144 barrier=35 96×[grid=1x1x1tg tg=256 threads=256] 36×[grid=24x1x1tg tg=256 threads=6144] 12×[grid=32x1x1tg tg=256 threads=8192]
+TRACE run=1 step=11 kernel=gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu n=97 barrier=96 97×[grid=80x1x1tg tg=256 threads=20480]
+TRACE run=1 step=11 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid n=97 barrier=94 97×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=11 kernel=hc_collapse_f32 n=97 barrier=95 97×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=11 kernel=hc_norm_f32 n=97 barrier=95 97×[grid=4x1x1tg tg=256 threads=1024]
+TRACE run=1 step=11 kernel=hc_combine_f32 n=96 barrier=92 96×[grid=40x1x1tg tg=256 threads=10240]
+TRACE run=1 step=11 kernel=silu_mul_f32 n=96 barrier=95 48×[grid=25x1x1tg tg=256 threads=6400] 48×[grid=3x1x1tg tg=256 threads=768]
+TRACE run=1 step=11 kernel=kernel_mul_mv_q6_K_f32 n=71 barrier=33 29×[grid=640x1x1tg tg=64 threads=40960] 15×[grid=128x1x1tg tg=64 threads=8192] 14×[grid=2560x1x1tg tg=64 threads=163840] 5×[grid=1536x1x1tg tg=64 threads=98304] 4×[grid=160x1x1tg tg=64 threads=10240] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=11 kernel=kernel_mul_mv_iq4_xs_f32 n=67 barrier=10 31×[grid=160x1x1tg tg=64 threads=10240] 11×[grid=1536x1x1tg tg=64 threads=98304] 11×[grid=2560x1x1tg tg=64 threads=163840] 6×[grid=640x1x1tg tg=64 threads=40960] 4×[grid=128x1x1tg tg=64 threads=8192] 4×[grid=3072x1x1tg tg=64 threads=196608]
+TRACE run=1 step=11 kernel=kernel_mul_mv_iq3_s_f32 n=55 barrier=4 40×[grid=80x1x1tg tg=64 threads=5120] 10×[grid=768x1x1tg tg=64 threads=49152] 3×[grid=320x1x1tg tg=64 threads=20480] 1×[grid=1536x1x1tg tg=64 threads=98304] 1×[grid=64x1x1tg tg=64 threads=4096]
+TRACE run=1 step=11 kernel=gemv_mixed_f16w_f32_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=49 barrier=46 48×[grid=32x1x1tg tg=128 threads=4096] 1×[grid=160x1x1tg tg=128 threads=20480]
+TRACE run=1 step=11 kernel=gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0 n=48 barrier=0 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=11 kernel=moe_combine_f32 n=48 barrier=48 48×[grid=10x1x1tg tg=256 threads=2560]
+TRACE run=1 step=11 kernel=moe_slot_map_u32 n=48 barrier=48 48×[grid=1x1x1tg tg=64 threads=64]
+TRACE run=1 step=11 kernel=moe_topk_f32 n=48 barrier=47 48×[grid=1x1x1tg tg=256 threads=256]
+TRACE run=1 step=11 kernel=kernel_mul_mv_q4_K_f32 n=45 barrier=8 19×[grid=160x1x1tg tg=32 threads=5120] 8×[grid=2560x1x1tg tg=32 threads=81920] 7×[grid=1536x1x1tg tg=32 threads=49152] 5×[grid=640x1x1tg tg=32 threads=20480] 3×[grid=128x1x1tg tg=32 threads=4096] 3×[grid=3072x1x1tg tg=32 threads=98304]
+TRACE run=1 step=11 kernel=kernel_mul_mv_iq4_nl_f32 n=40 barrier=40 40×[grid=320x1x1tg tg=128 threads=40960]
+TRACE run=1 step=11 kernel=copy2d_f32 n=39 barrier=24 24×[grid=2x256x1 tg=512 threads=512] 12×[grid=1x128x1 tg=128 threads=128] 2×[grid=10240x9x1 tg=1024 threads=92160] 1×[grid=10240x1x1 tg=1024 threads=10240]
+TRACE run=1 step=11 kernel=gdn_gated_norm_f32 n=36 barrier=36 36×[grid=48x1x1tg tg=128 threads=6144]
+TRACE run=1 step=11 kernel=gdn_prologue_f32 n=36 barrier=36 36×[grid=80x1x1tg tg=128 threads=10240]
+TRACE run=1 step=11 kernel=gdn_step_r16_f32 n=36 barrier=34 36×[grid=128x1x1tg tg=384 threads=49152]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id_q2_0_f32 n=30 barrier=30 30×[grid=160x1x10tg tg=64 threads=102400]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id_iq4_nl_f32 n=18 barrier=18 18×[grid=320x1x10tg tg=128 threads=409600]
+TRACE run=1 step=11 kernel=kernel_mul_mv_q5_K_f32 n=15 barrier=6 5×[grid=640x1x1tg tg=64 threads=40960] 3×[grid=1536x1x1tg tg=64 threads=98304] 3×[grid=2560x1x1tg tg=64 threads=163840] 2×[grid=160x1x1tg tg=64 threads=10240] 1×[grid=128x1x1tg tg=64 threads=8192] 1×[grid=62080x1x1tg tg=64 threads=3973120]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id2_iq3_s_f32 n=13 barrier=12 13×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=11 kernel=qsa_prep_f32 n=12 barrier=12 12×[grid=26x1x1tg tg=256 threads=6656]
+TRACE run=1 step=11 kernel=sdpa_vector_float_256 n=12 barrier=0 12×[grid=1x24x1tg tg=1024 threads=24576]
+TRACE run=1 step=11 kernel=sigmoid_mul_f32 n=12 barrier=12 12×[grid=24x1x1tg tg=256 threads=6144]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id2_iq2_s_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id2_iq2_xs_f32 n=10 barrier=10 10×[grid=40x2x10tg tg=128 threads=102400]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id2_iq2_xxs_f32 n=9 barrier=8 9×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=11 kernel=kernel_mul_mv_q2_0_f32 n=8 barrier=7 8×[grid=160x1x1tg tg=64 threads=10240]
+TRACE run=1 step=11 kernel=kernel_mul_mv_id2_iq3_xxs_f32 n=6 barrier=6 6×[grid=80x2x10tg tg=64 threads=102400]
+TRACE run=1 step=11 kernel=badd_f32 n=5 barrier=5 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=11 kernel=bmul_f32 n=5 barrier=5 4×[grid=5x1x1tg tg=1024 threads=5120] 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=bmul_f32_strided n=5 barrier=2 5×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=11 kernel=rmsnorm_f32 n=3 barrier=2 3×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=11 kernel=cast_u8_f32 n=2 barrier=2 2×[grid=1x1x1tg tg=1 threads=1]
+TRACE run=1 step=11 kernel=abs_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=affine_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=bmaximum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=bminimum_f32_cs n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=bsub_f32 n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=copy2d_u32 n=1 barrier=1 1×[grid=1x1x1 tg=1 threads=1]
+TRACE run=1 step=11 kernel=copy_f32_strided n=1 barrier=1 1×[grid=10x1x1tg tg=1024 threads=10240]
+TRACE run=1 step=11 kernel=fast_argmax_f32 n=1 barrier=0 1×[grid=1x1x1tg tg=1024 threads=1024]
+TRACE run=1 step=11 kernel=fast_sum_f32 n=1 barrier=1 1×[grid=4x1x1tg tg=1024 threads=4096]
+TRACE run=1 step=11 kernel=gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0 n=1 barrier=0 1×[grid=320x1x1tg tg=256 threads=81920]
+TRACE run=1 step=11 kernel=gt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=kernel_get_rows_iq3_s n=1 barrier=0 1×[grid=1x1x1tg tg=128 threads=128]
+TRACE run=1 step=11 kernel=lt_f32_cs n=1 barrier=0 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=sigmoid_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+TRACE run=1 step=11 kernel=silu_f32 n=1 barrier=0 1×[grid=5x1x1tg tg=1024 threads=5120]
+TRACE run=1 step=11 kernel=sqrt_f32 n=1 barrier=1 1×[grid=1x1x1tg tg=2 threads=2]
+MEM run=1 phase=driver device_gb=34.78 pool_live_gb=2.50 pool_free_gb=0.14 pool_pending_gb=0.00 phys_gb=35.97 working_set_gb=55.66 residency_allocations=5540 residency_commits=5391 residency_added=6746 residency_removed=1206 heap_chunks=0 heap_size_gb=0.00 heap_used_gb=0.00
+TOKENS 760,13071,995,427,3173,364,2250,2756,11,12680,279,9117,1083,264,509,51554
+RESULT run=1 tokens_sha256=097d4b416f45cc589c5f5d71887b8ebd511646cb73d8bc263c7f49f91b4a58f0 logits_sha256=- logits_max=- prompt_tokens=38 generated=16 hit_eos=false prefill_ms=604 decode_ms=603 max_tokens=16 driver=session-blocking steps=16 commits=0 host_fill_forwards=0 host_fill_fills=0 host_fill_parked=0 publish_parks=0 poll_fallbacks=0 overrun=0 config=[KvQuant=Off:f32]
+PREFETCH run=1 on=true spec_ahead=0 issued=38192 staged=12517 used=6985 wasted=5532 stale=25624 bytes=24205888000 parked=78 stage_read_gb_s=0.81 direct_read_gb_s=0.00
+STREAMPRE run=1 misses=6985 readback_ms=3277 load_now_ms=2160 land_ms=50 sync_load_ms=0 settle_loads=0 settle_ms=0 direct_loads=0 direct_wait_ms=0
+STREAM run=1 loader=pread slots=335 plans=912 groups=912 hits=19923 misses=6985 evictions=0 bytes_loaded=12284032000 hit_rate=0.7404 device_plans=720 settled_misses=0 prefetch_now=6131 redos=0 host_plan_passes=1 readback_ms=3277 load_now_ms=2160 land_ms=50 sync_load_ms=0 io_hints=0 io_inflight_hits=0 io_inflight_wasted=0 io_inflight_landed=0 direct_loads=0 direct_wait_ms=0 settle_loads=0 settle_ms=0 settle_clock_lag=0 settle_after_first=0 replay_ms=0 host_pass_ms=55 free_takes=0 inplace_takes=0 quarantined=0 recycled=0 h1_restamps=49 h2_refusals=0 h3_deferred_writes=0 slot_reallocations=0 slot_bytes_released=0
+exit=0

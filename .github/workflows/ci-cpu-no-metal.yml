@@ -1,0 +1,54 @@
+# CPU build, no `metal` feature.
+#
+# The CPU backend is the reference the Metal kernels are tested against, and a
+# backend nobody builds decays silently. This job builds it with NO `metal`
+# feature, so a CPU regression surfaces here rather than inside a tolerance
+# comparison. `lloom-engine` is also built with `serve`, the feature behind the
+# `lloom` and `lloom-serve` binaries, which no other job compiles.
+
+name: CI / CPU (no metal)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-no-metal:
+    name: cargo build, no metal feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # .cargo/config.toml pins `target-cpu=native` for the development
+      # machine; the runner builds with its own defaults.
+      - name: Remove cargo config
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Each crate with its default features (no crate defaults to `metal`),
+      # built separately so a failure names the crate.
+      - name: lloom-tensor (no metal)
+        run: cargo build -p lloom-tensor
+
+      - name: lloom-engine (no metal)
+        run: cargo build -p lloom-engine
+
+      - name: lloom (no metal)
+        run: cargo build -p lloom
+
+      - name: lloom-engine binaries (serve, no metal)
+        run: cargo build -p lloom-engine --features serve --bins
+
+      # Resolves the graph, builds nothing.
+      - name: shape-probe stays out of lloom-engine
+        run: bash .github/ci/shape-probe-release.sh

@@ -1,0 +1,55 @@
+# CUDA compile-check: the backend that cannot be executed on a hosted runner.
+#
+# The CUDA backend is COMPILED here, never executed: the job runs inside a CUDA
+# `-devel` container so nvcc is present (candle-kernels' build script compiles
+# the .cu kernels to PTX); no GPU is required and no kernel is launched. It
+# checks lloom-tensor's library AND its test targets (`--lib --tests`): the
+# `cfg(feature = "cuda")` test code is compiled by no other job.
+#
+# The gate is not "it compiled": cuda-positive-control.sh also shows the
+# compile-check FAILING on a deliberately broken CUDA kernel and passing once
+# restored. Its baseline arm is the compile-check itself.
+
+name: CI / CUDA (compile-check)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-compile-check:
+    name: cargo check --features cuda --lib --tests + positive control
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # A CUDA toolkit (nvcc + headers); no GPU and no CUDA driver are used.
+    container:
+      image: nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+    env:
+      # candle-kernels needs a target compute capability to build PTX. Any
+      # valid cap compiles; the kernels are never launched.
+      CUDA_COMPUTE_CAP: "86"
+    steps:
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates build-essential pkg-config libssl-dev git
+
+      - uses: actions/checkout@v4
+
+      - name: Remove cargo config (not needed in the container)
+        run: rm -f .cargo/config.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: CUDA compile-check with positive control
+        run: bash .github/ci/cuda-positive-control.sh

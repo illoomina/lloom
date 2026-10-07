@@ -155,9 +155,9 @@ fn gate_exit(failures: &[String], fail_on_gate: bool) -> Result<()> {
     Ok(())
 }
 
-/// `design/workloads/prompts/`, the workloads corpus: a multi-turn pair and
-/// four single prompts of DIFFERENT shapes — varied so the concurrent run
-/// exercises prefill rather than sharing one prefix.
+/// The workloads corpus: a multi-turn pair and four single prompts of
+/// DIFFERENT shapes — varied so the concurrent run exercises prefill rather
+/// than sharing one prefix. The four not inlined below live in `prompts/`.
 const TURN_1: &str = "I am designing a cache for a single-threaded interpreter. Entries are immutable once written and the working set is about eight times the cache. What eviction policy should I start with, and why not LRU?";
 const TURN_2: &str = "Suppose I measure and find the hit rate is 40% lower than you predicted. What are the two most likely causes, and which measurement separates them?";
 const PROMPTS: [&str; 8] = [
@@ -169,10 +169,10 @@ const PROMPTS: [&str; 8] = [
     // above four still has distinct prompts of distinct shapes (the four
     // above ARE its `short-factual`, `low-entropy-list`, `code-completion`
     // and `structured-extract`). Beyond eight the set cycles.
-    include_str!("../../../../design/workloads/prompts/long-summarize.txt"),
-    include_str!("../../../../design/workloads/prompts/multiturn-t1.txt"),
-    include_str!("../../../../design/workloads/prompts/multiturn-t2.txt"),
-    include_str!("../../../../design/workloads/prompts/multiturn-t3.txt"),
+    include_str!("prompts/long-summarize.txt"),
+    include_str!("prompts/multiturn-t1.txt"),
+    include_str!("prompts/multiturn-t2.txt"),
+    include_str!("prompts/multiturn-t3.txt"),
 ];
 
 /// Render a knob's value only when the run read it. `--dspark` drives the

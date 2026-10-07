@@ -72,6 +72,7 @@ const ALL_SOURCES: &[Source] = &[
     Source::Indexing,
     Source::MlxSort,
     Source::Quantized,
+    Source::QuantizedStore,
     Source::Qwen4Exp,
     Source::Random,
     Source::Reduce,
@@ -101,6 +102,7 @@ fn label(s: Source) -> &'static str {
         Source::Indexing => "indexing",
         Source::MlxSort => "mlx_sort",
         Source::Quantized => "quantized",
+        Source::QuantizedStore => "quantized_store",
         Source::Qwen4Exp => "qwen4exp",
         Source::Random => "random",
         Source::Reduce => "reduce",
@@ -120,8 +122,8 @@ fn main() {
     let mut total = 0usize;
     let mut rows: Vec<(&str, Vec<String>)> = Vec::new();
 
-    // 24 arms in `label`; a list shorter than that under-reports.
-    assert_eq!(ALL_SOURCES.len(), 24, "ALL_SOURCES does not name every Source");
+    // 25 arms in `label`; a list shorter than that under-reports.
+    assert_eq!(ALL_SOURCES.len(), 25, "ALL_SOURCES does not name every Source");
     for source in ALL_SOURCES {
         let label = label(*source);
         let library = match kernels.load_library(&device, *source) {

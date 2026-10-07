@@ -808,16 +808,22 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
         .collect();
     let c = m.pass_plan_counters().unwrap();
     eprintln!("[dspark] {c:?} verify keys={verify:?}");
-    assert_eq!(
-        verify.len(),
-        1,
-        "one verify window, one key: {:?}",
-        keys.iter().map(|(k, ..)| k.kind).collect::<Vec<_>>()
-    );
+    // The full rounds share one key, the K+1 window. A bounded run's last
+    // rounds ask the drafter for no more than the budget leaves room for
+    // (#921, `speculation.md` §10.2z-vi: the cache ends one position behind
+    // the stream), so the tail adds narrower windows, each its own key —
+    // never a wider one, never a second key at K+1.
+    let kinds = keys.iter().map(|(k, ..)| k.kind).collect::<Vec<_>>();
+    let full = verify
+        .iter()
+        .filter(|(key, ..)| matches!(key.kind, PassKind::Verify { k: w } if w as usize == k + 1))
+        .count();
+    assert_eq!(full, 1, "the full rounds share one K+1 window key: {kinds:?}");
     assert!(
-        matches!(verify[0].0.kind, PassKind::Verify { k: w } if w as usize == k + 1),
-        "the key is the K+1 window: {:?}",
-        verify[0].0.kind
+        verify
+            .iter()
+            .all(|(key, ..)| matches!(key.kind, PassKind::Verify { k: w } if (w as usize) <= k + 1)),
+        "only the budget's tail rounds take a narrower window, none a wider one: {kinds:?}"
     );
     assert_eq!(c.evicted, 0, "a verify drifted under its own plan: {c:?}");
     assert_eq!(c.escapes, 0, "the taps were not declared: {c:?}");

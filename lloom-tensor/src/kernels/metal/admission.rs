@@ -352,6 +352,11 @@ pub struct Budget {
     /// Per-sequence conv state. [`CONV_STATE_BYTES`] for `Shuffle` and
     /// `RotatingRing`; larger for `SlidingRing` at slack (§10.2g).
     pub conv_state_bytes: usize,
+    /// One position's KV over every attention layer, per sequence.
+    /// [`KV_BYTES_PER_TOKEN`] (LFM2-2.6B's geometry) by default; a caller
+    /// that knows its model's geometry sets it (`lfm2::State::admission_budget`
+    /// does), so a model of another size is not sized as the 2.6B.
+    pub kv_bytes_per_token: usize,
     /// §9.1a's sizing policy for the scratch class.
     pub scratch_sizing: Sizing,
     /// The partials geometry scratch is sized from. `n_heads` is the **query**
@@ -393,6 +398,7 @@ impl Budget {
             max_context,
             weights,
             conv_state_bytes: CONV_STATE_BYTES,
+            kv_bytes_per_token: KV_BYTES_PER_TOKEN,
             scratch_sizing: Sizing::Reserve,
             partials: PartialsGeometry::default(),
             fraction: DEFAULT_BUDGET_FRACTION,
@@ -437,7 +443,7 @@ impl Budget {
         let scratch = N_ATTENTION_LAYERS * partials.partials_bytes(chunks);
         Footprint {
             weights: self.weights,
-            kv: self.batch * self.kv_capacity * KV_BYTES_PER_TOKEN,
+            kv: self.batch * self.kv_capacity * self.kv_bytes_per_token,
             conv: self.batch * self.conv_state_bytes,
             // #306: a function of `seq_len`, not a constant. At `max_seq_len
             // == 1` this is exactly #68's measured 68 KB × B, so no decode

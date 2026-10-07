@@ -4937,9 +4937,24 @@ impl<P: Profile> State<P> {
         // rather than recomputed, so the budget cannot disagree with the
         // allocation about how wide the state is -- the hand-sync §8.1b exists
         // to remove.
-        b.conv_state_bytes = admission::CONV_STATE_BYTES
+        //
+        // Both per-sequence classes from THIS config's geometry: the
+        // admission constants are LFM2-2.6B's (22 conv layers × 2048, 8
+        // attention layers × 8 KV heads × 64), which a model of another size
+        // would otherwise inherit. At the 2.6B's geometry these are the
+        // constants exactly (`admission_budget_reads_the_configs_geometry`).
+        // 2 bytes an element: the f16 store the constants assume (an int8 or
+        // int4 KV arm is over-predicted, never under).
+        let (conv_layers, attention_layers) = (
+            b.prefill_geometry.conv_layers,
+            b.prefill_geometry.attention_layers,
+        );
+        b.conv_state_bytes = conv_layers
+            * config.hidden_size
             * config.conv_state.width(config.conv_l_cache)
-            / config.conv_l_cache;
+            * 2;
+        b.kv_bytes_per_token =
+            2 * config.num_key_value_heads * config.head_dim() * 2 * attention_layers;
         b
     }
 
@@ -12394,5 +12409,42 @@ mod tests {
         );
         assert_eq!(cfg.extra["torch_dtype"], serde_json::json!("bfloat16"));
         assert_eq!(cfg.extra["unforeseen_future_field"], serde_json::json!(42));
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod admission_geometry_tests {
+    use super::*;
+    use lloom_tensor::metal_backend::admission;
+
+    fn geometry(conv: usize, attn: usize, hidden: usize, heads: usize, kv_heads: usize) -> Config {
+        let mut layer_types = vec![LayerType::Conv; conv];
+        layer_types.extend(vec![LayerType::FullAttention; attn]);
+        Config {
+            hidden_size: hidden,
+            num_hidden_layers: conv + attn,
+            num_attention_heads: heads,
+            num_key_value_heads: kv_heads,
+            layer_types,
+            ..Default::default()
+        }
+    }
+
+    /// The per-sequence classes are the config's: at LFM2-2.6B's geometry the
+    /// admission constants exactly (the numbers every recorded budget used),
+    /// and another geometry its own bytes — not the 2.6B's.
+    #[test]
+    fn admission_budget_reads_the_configs_geometry() {
+        let mb = MemoryBudget::new(1);
+        let big = geometry(22, 8, 2048, 32, 8);
+        let b = State::<crate::profile::CrownExact>::admission_budget(&big, &mb, 1024);
+        assert_eq!(b.conv_state_bytes, admission::CONV_STATE_BYTES);
+        assert_eq!(b.kv_bytes_per_token, admission::KV_BYTES_PER_TOKEN);
+        let small = geometry(2, 1, 64, 4, 2);
+        let s = State::<crate::profile::CrownExact>::admission_budget(&small, &mb, 1024);
+        let width = small.conv_state.width(small.conv_l_cache);
+        assert_eq!(s.conv_state_bytes, 2 * 64 * width * 2);
+        assert_eq!(s.kv_bytes_per_token, 2 * 2 * 16 * 2);
+        assert!(s.kv_bytes_per_token < b.kv_bytes_per_token);
     }
 }

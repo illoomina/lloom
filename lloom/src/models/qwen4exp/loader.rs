@@ -524,10 +524,6 @@ pub fn staging_ring_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
     }
 }
 
-/// Experts per warm group when the MTP head's experts are held resident:
-/// small against the staging ring (a group's planes pass through it whole).
-const MTP_WARM_GROUP: usize = 16;
-
 /// The ring with a prefetcher, and what the prefetcher may hold of it.
 pub const PREFETCH_RING_BYTES: usize = 2 << 30;
 pub const PREFETCH_STAGED_BYTES: usize = 1 << 30;
@@ -1239,11 +1235,23 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         );
         if held.is_some() {
             if let Some(head) = model.mtp_head() {
-                // In groups well under the staging ring: one group of every
-                // expert (2.67 GB for the Q8 head) is past the ring's bytes.
+                // In groups of at most half the bytes the loads pass through
+                // (the staging ring, or the `io` arm's in-flight reserve):
+                // one group of every expert (2.67 GB for the Q8 head) is past
+                // a 2 GiB ring, and the ring's overflow is an unpooled
+                // allocation per load, off the ledger (`staging.rs`).
+                let through = match staging_ring_bytes(&stream.loader, stream.prefetch) {
+                    0 => IO_INFLIGHT_RESERVE_BYTES,
+                    b => b,
+                };
+                let per_expert = (plan_load_holding(&gg, device, opts.fraction(), None, None)
+                    .expert_bytes_total
+                    - plan.expert_bytes_total)
+                    / cfg0.n_experts.max(1);
+                let group = (through / 2 / per_expert.max(1)).clamp(1, cfg0.n_experts.max(1));
                 let all: Vec<u32> = (0..cfg0.n_experts as u32).collect();
                 let mut loaded = 0usize;
-                for group in all.chunks(MTP_WARM_GROUP) {
+                for group in all.chunks(group) {
                     loaded += head.routed().warm(group)?;
                 }
                 if loaded != cfg0.n_experts {

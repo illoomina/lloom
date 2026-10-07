@@ -17,7 +17,7 @@ use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
-use crate::profile::{Profile, Regime as _, Rewind as _, Rows as _};
+use crate::profile::{Arm, ArmMut, Picked as _, Profile, Regime as _, Rewind as _, Rows as _};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::metal::{GpuClock, PageError, PageIdx};
 #[cfg(feature = "metal")]
@@ -1681,7 +1681,7 @@ impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
 /// obligation, §6.7 L4).
 #[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
-struct PagedKv {
+pub struct PagedKv {
     page_size: usize,
     pages_per_chunk: usize,
     /// The ceiling, in tokens per sequence.
@@ -2715,7 +2715,7 @@ impl BatchPool {
 /// pass it is part of.
 #[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
-struct BatchSlot {
+pub struct BatchSlot {
     pool: BatchPool,
     lease: Arc<SlotLease>,
     /// This row's own pass (the per-row path), opened at the first attention
@@ -2817,34 +2817,443 @@ pub fn kv_grow_fits(allocated: usize, working_set: usize, fraction: f64, grow: u
 /// each keyed on their `kv_len`, so a long run names one new shape per step or
 /// tile and nothing ever asks for an old one again.
 const MASK_CACHE_ENTRIES: usize = 16;
+/// The `One` shapes' KV: a sequence's own store. Which of the three it is
+/// follows `KvAppend` × `KvQuant`, preset values the profile does not carry
+/// (`profiles-and-memory-design.md` §3: a value, not a shape), so the three
+/// are one enum rather than three types; a `Paged` config is not a `One`
+/// state and is refused at construction.
+#[derive(Debug, Clone)]
+pub enum OwnKv {
+    /// `KvAppend::Cat`: the live (K, V) per layer, grown by `Tensor::cat`.
+    Cat(Vec<Option<(Tensor, Tensor)>>),
+    /// `KvAppend::InPlace`: one (K, V) slot pair per layer.
+    InPlace(Vec<(KvSlot, KvSlot)>),
+    /// `KvQuant` on: one K + V quantized slab per layer (`nn::kv_quant`,
+    /// the block Qwen4-exp's QSA stores through too).
+    Quant(Vec<QuantKvSlab>),
+}
+
+impl OwnKv {
+    fn new(config: &Config, slab: usize, num_layers: usize) -> Result<Self> {
+        if config.kv_append == KvAppend::Paged {
+            lloom_tensor::bail!(
+                "lfm2: a `One` state on a `KvAppend::Paged` config: the paged KV is the `Paged` \
+                 shapes' (profiles-and-memory-design.md §3)"
+            )
+        }
+        if config.kv_quant.is_on() {
+            return Ok(OwnKv::Quant(
+                (0..num_layers)
+                    .map(|_| {
+                        QuantKvSlab::fixed(config.kv_quant, slab)
+                            .scales_at(DType::F16)
+                            .at_site(zs::LFM2_KV_QUANT)
+                    })
+                    .collect(),
+            ));
+        }
+        Ok(match config.kv_append {
+            KvAppend::Cat => OwnKv::Cat(vec![None; num_layers]),
+            KvAppend::InPlace => OwnKv::InPlace(
+                (0..num_layers)
+                    .map(|_| (kv_slot(slab), kv_slot(slab)))
+                    .collect(),
+            ),
+            KvAppend::Paged => unreachable!("refused above"),
+        })
+    }
+
+    /// Whether any layer's planes exist (`Cat` holds no planes).
+    fn is_allocated(&self) -> bool {
+        match self {
+            OwnKv::Cat(_) => false,
+            OwnKv::InPlace(slots) => slots.iter().any(|(k, _)| k.is_allocated()),
+            OwnKv::Quant(slabs) => slabs.iter().any(|s| s.is_allocated()),
+        }
+    }
+
+    /// Positions held, read from the first layer that holds any — 22 of
+    /// LFM2's 30 layers are conv and hold nothing here (§5.3).
+    fn len(&self) -> usize {
+        match self {
+            OwnKv::Cat(kvs) => kvs
+                .iter()
+                .flatten()
+                .next()
+                .and_then(|(k, _)| k.dim(2).ok())
+                .unwrap_or(0),
+            OwnKv::InPlace(slots) => slots
+                .iter()
+                .find(|(k, _)| k.is_allocated())
+                .map(|(k, _)| k.len())
+                .unwrap_or(0),
+            OwnKv::Quant(slabs) => slabs
+                .iter()
+                .find(|s| s.is_allocated())
+                .map(|s| s.len())
+                .unwrap_or(0),
+        }
+    }
+
+    /// The in-place slots' live length, for the speculative window's check.
+    fn slot_len(&self) -> Option<usize> {
+        match self {
+            OwnKv::InPlace(slots) => slots
+                .iter()
+                .find(|(k, _)| k.is_allocated())
+                .map(|(k, _)| k.len()),
+            _ => None,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            OwnKv::Cat(kvs) => kvs
+                .iter()
+                .flatten()
+                .map(|(k, v)| {
+                    k.elem_count() * k.dtype().size_in_bytes()
+                        + v.elem_count() * v.dtype().size_in_bytes()
+                })
+                .sum(),
+            OwnKv::InPlace(slots) => slots.iter().map(|(k, v)| k.bytes() + v.bytes()).sum(),
+            OwnKv::Quant(slabs) => slabs.iter().map(|s| s.bytes()).sum(),
+        }
+    }
+
+    /// Bytes one token costs across the allocated planes, read from their
+    /// shapes (0 before the first append, and on `Cat`).
+    fn bytes_per_token(&self) -> usize {
+        match self {
+            OwnKv::Cat(_) => 0,
+            OwnKv::InPlace(slots) => slots
+                .iter()
+                .flat_map(|(k, v)| [k, v])
+                .filter_map(|s| s.data().as_ref())
+                .map(|t| {
+                    let d = t.dims();
+                    d[0] * d[1] * d[3] * t.dtype().size_in_bytes()
+                })
+                .sum(),
+            OwnKv::Quant(slabs) => slabs.iter().map(|s| s.bytes_per_token()).sum(),
+        }
+    }
+
+    /// Widen every plane to `slab` tokens (`Cat` has no slab).
+    fn grow_to(&mut self, slab: usize) -> Result<()> {
+        match self {
+            OwnKv::Cat(_) => {}
+            OwnKv::InPlace(slots) => {
+                for (k, v) in slots.iter_mut() {
+                    k.grow_to(slab)?;
+                    v.grow_to(slab)?;
+                }
+            }
+            OwnKv::Quant(slabs) => {
+                for s in slabs.iter_mut() {
+                    s.grow_to(slab)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set every unallocated plane's width.
+    fn set_capacity(&mut self, slab: usize) {
+        match self {
+            OwnKv::Cat(_) => {}
+            OwnKv::InPlace(slots) => {
+                for (k, v) in slots.iter_mut() {
+                    k.set_capacity(slab);
+                    v.set_capacity(slab);
+                }
+            }
+            OwnKv::Quant(slabs) => {
+                for s in slabs.iter_mut() {
+                    s.set_capacity(slab);
+                }
+            }
+        }
+    }
+
+    /// Drop every plane: a new sequence may have a different batch size, so
+    /// keeping the allocation would pin the previous one's.
+    fn clear(&mut self) {
+        match self {
+            OwnKv::Cat(kvs) => kvs.iter_mut().for_each(|v| *v = None),
+            OwnKv::InPlace(slots) => slots.iter_mut().for_each(|(k, v)| {
+                k.reset();
+                v.reset();
+            }),
+            OwnKv::Quant(slabs) => slabs.iter_mut().for_each(|s| s.reset()),
+        }
+    }
+
+    /// Every allocated plane's length moved back by `n` (§10.2a: the rows
+    /// above the length are unreachable and never cleared). Only the
+    /// attention layers' planes are allocated — a conv layer's never is,
+    /// and rewinding one would be an error, not a no-op.
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        match self {
+            OwnKv::Cat(_) => {}
+            OwnKv::InPlace(slots) => {
+                for (k_slot, v_slot) in slots.iter_mut() {
+                    if !k_slot.is_allocated() {
+                        continue;
+                    }
+                    k_slot.rewind(n)?;
+                    v_slot.rewind(n)?;
+                }
+            }
+            OwnKv::Quant(slabs) => {
+                for s in slabs.iter_mut() {
+                    if !s.is_allocated() {
+                        continue;
+                    }
+                    s.rewind(n)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `Paged` shapes' KV: the sequence's own page pool, or a row of a
+/// shared [`BatchPool`] (`State::for_batch`) whose pages and conv ring live
+/// in the pool, addressed by slot. `Off` is a `Paged` state built without a
+/// cache. There is no quantized variant: a quantized `Paged` config is
+/// refused at construction, since `KvQuant` is a value the type cannot see.
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+// One per sequence, and the own pool's bookkeeping is what the state held
+// before the arms were typed: no indirection on the per-layer read.
+#[allow(clippy::large_enum_variant)]
+pub enum PooledKv {
+    Own(PagedKv),
+    Shared(BatchSlot),
+    Off,
+}
+
+/// Off Metal the `Paged` shapes have no store — the pool is read by a Metal
+/// kernel — so the arm is a refusal at construction and holds nothing.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Clone)]
+pub struct PooledKv;
+
+impl PooledKv {
+    /// What a `Paged` config must be, whichever pool it is served from.
+    fn check(config: &Config, device: &Device) -> Result<()> {
+        if config.kv_append != KvAppend::Paged {
+            lloom_tensor::bail!(
+                "lfm2: a `Paged` state on a `{:?}` config: the `One` shapes hold a sequence's \
+                 own KV (profiles-and-memory-design.md §3)",
+                config.kv_append
+            )
+        }
+        if config.attn_impl != AttnImpl::FlashDecoding {
+            lloom_tensor::bail!(
+                "lfm2 `KvAppend::Paged` reads the pool through the chunk table, which only \
+                 the FlashDecoding kernels take: use `--attn flash` (DESIGN.md 10.3b)"
+            )
+        }
+        if config.kv_quant.is_on() {
+            lloom_tensor::bail!("lfm2 `KvAppend::Paged` has no quantized arm")
+        }
+        if !device.is_metal() {
+            lloom_tensor::bail!(
+                "lfm2 `KvAppend::Paged` is Metal-only: the pool is read by a Metal kernel"
+            )
+        }
+        Ok(())
+    }
+
+    #[allow(unused_variables)]
+    fn new(
+        config: &Config,
+        device: &Device,
+        kv_capacity: usize,
+        slab: usize,
+        num_layers: usize,
+        use_kv_cache: bool,
+    ) -> Result<Self> {
+        Self::check(config, device)?;
+        #[cfg(not(feature = "metal"))]
+        {
+            lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only")
+        }
+        #[cfg(feature = "metal")]
+        {
+            if !use_kv_cache {
+                return Ok(PooledKv::Off);
+            }
+            let clock = match device {
+                Device::Metal(d) => d.gpu_clock(),
+                _ => lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only"),
+            };
+            Ok(PooledKv::Own(PagedKv::new(
+                config,
+                kv_capacity,
+                slab,
+                num_layers,
+                clock,
+            )?))
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+impl PooledKv {
+    fn len(&self) -> usize {
+        match self {
+            PooledKv::Own(p) => p.len,
+            PooledKv::Shared(b) => b.pool.inner.lock().kv.row_len(b.slot()),
+            PooledKv::Off => 0,
+        }
+    }
+
+    /// The pool's bytes: a shared pool's are every row's, which a gauge
+    /// reads once through `BatchPool::report`.
+    fn bytes(&self) -> usize {
+        match self {
+            PooledKv::Own(p) => p.bytes(),
+            PooledKv::Shared(b) => b.pool.inner.lock().kv.bytes(),
+            PooledKv::Off => 0,
+        }
+    }
+
+    fn grow_to(&mut self, slab: usize) -> Result<()> {
+        match self {
+            PooledKv::Own(p) => p.grow_to(slab),
+            PooledKv::Shared(b) => b.pool.inner.lock().kv.grow_to(slab),
+            PooledKv::Off => Ok(()),
+        }
+    }
+
+    /// Set the width a pool that does not exist yet will take, and return
+    /// the width the state records: an existing pool keeps its own.
+    fn set_slab(&mut self, slab: usize) -> usize {
+        match self {
+            PooledKv::Own(p) => {
+                if p.pool.is_none() {
+                    p.slab = slab;
+                    slab
+                } else {
+                    p.slab
+                }
+            }
+            PooledKv::Shared(b) => b.pool.inner.lock().kv.slab,
+            PooledKv::Off => slab,
+        }
+    }
+
+    /// Bytes widening the pool from `from` to `slab` tokens per sequence
+    /// allocates: a pool grows by whole pages for every sequence, so the
+    /// token count is the pool's; the per-token cost is read from an
+    /// allocated layer's pool when one exists, else it is `per_token`.
+    fn grow_bytes(&self, from: usize, slab: usize, per_token: usize) -> usize {
+        match self {
+            PooledKv::Own(p) => {
+                let tokens = p
+                    .pool_tokens_at(slab)
+                    .saturating_sub(p.pool_tokens_at(from));
+                let measured: usize = p
+                    .pools
+                    .iter()
+                    .flatten()
+                    .map(|(k, v)| {
+                        let (dk, dv) = (k.dims(), v.dims());
+                        dk[0] * dk[1] * dk[3] * k.dtype().size_in_bytes()
+                            + dv[0] * dv[1] * dv[3] * v.dtype().size_in_bytes()
+                    })
+                    .sum();
+                if measured > 0 {
+                    measured * tokens
+                } else {
+                    per_token * tokens
+                }
+            }
+            PooledKv::Shared(_) | PooledKv::Off => per_token * slab.saturating_sub(from),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            PooledKv::Own(p) => p.release_all(),
+            PooledKv::Shared(b) => {
+                b.pool.inner.lock().release(b.slot());
+                b.pass = None;
+            }
+            PooledKv::Off => {}
+        }
+    }
+
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        match self {
+            PooledKv::Own(p) => p.rewind(n),
+            PooledKv::Shared(b) => b.pool.inner.lock().kv.rewind_slot(b.slot(), n),
+            PooledKv::Off => Ok(()),
+        }
+    }
+
+    /// The unwritten rewind's KV half: the sequence's own pool moves its
+    /// length back; a shared pool's row length advances only in the pass
+    /// that writes it, which an unwritten position never opened.
+    fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        match self {
+            PooledKv::Own(p) => p.rewind(n),
+            PooledKv::Shared(_) | PooledKv::Off => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+impl PooledKv {
+    fn len(&self) -> usize {
+        0
+    }
+    fn bytes(&self) -> usize {
+        0
+    }
+    fn grow_to(&mut self, _slab: usize) -> Result<()> {
+        Ok(())
+    }
+    fn set_slab(&mut self, slab: usize) -> usize {
+        slab
+    }
+    fn grow_bytes(&self, from: usize, slab: usize, per_token: usize) -> usize {
+        per_token * slab.saturating_sub(from)
+    }
+    fn clear(&mut self) {}
+    fn rewind(&mut self, _n: usize) -> Result<()> {
+        Ok(())
+    }
+    fn rewind_unwritten(&mut self, _n: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The family's two KV arms, picked by the rows axis (`profile::Fork`).
+#[derive(Debug, Clone, Copy)]
+pub struct KvFork;
+
+impl crate::profile::Fork for KvFork {
+    type One = OwnKv;
+    type Paged = PooledKv;
+}
+
+/// The KV store the rows axis names: an [`OwnKv`] on the `One` shapes, a
+/// [`PooledKv`] on `Paged`.
+pub type KvOf<P> = <<P as Profile>::Rows as crate::profile::Rows>::Pick<KvFork>;
+
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct State<P: Profile> {
     profile: PhantomData<P>,
     masks: HashMap<(usize, usize), Tensor>,
     pub use_kv_cache: bool,
-    // KV cache for attention layers: (key, value) per layer
-    kvs: Vec<Option<(Tensor, Tensor)>>,
-    // The `KvAppend::InPlace` arm's storage, one (K, V) pair per layer.
-    // Held beside `kvs` rather than replacing it so that both arms stay
-    // compiled and the unselected one allocates nothing.
-    kv_slots: Vec<(KvSlot, KvSlot)>,
-    /// The `KvQuant` arm's storage, one K + V slab per layer
-    /// (`nn::kv_quant`, the block Qwen4-exp's QSA stores through too).
-    ///
-    /// Held beside `kv_slots` rather than replacing it, so both arms stay
-    /// compiled and the unselected one allocates nothing -- `kv_slots`' own
-    /// argument, one axis further out.
-    quant_slots: Vec<QuantKvSlab>,
-    /// The `KvAppend::Paged` arm's storage: the page tables, the epoch
-    /// quarantine and one (K, V) pool per attention layer.
-    #[cfg(feature = "metal")]
-    paged: Option<PagedKv>,
-    /// The row's slot in a shared [`BatchPool`] (`Cache::for_batch`): the
-    /// KV pages and the conv ring live in the pool, addressed by slot, and
-    /// `paged` above is `None`.
-    #[cfg(feature = "metal")]
-    batch: Option<BatchSlot>,
+    /// The KV, one representation per shape (`profiles-and-memory-design.md`
+    /// §7.1): the other arm is not a field.
+    kv: KvOf<P>,
     /// Set once per forward pass so the first attention layer of the pass
     /// allocates this pass's pages and slots for every layer.
     paged_pass_pending: bool,
@@ -3359,6 +3768,52 @@ impl<P: Profile> State<P> {
 }
 
 impl<P: Profile> State<P> {
+    /// The sequence's own store, on the `One` shapes.
+    #[inline]
+    fn own(&self) -> Option<&OwnKv> {
+        match self.kv.arm() {
+            Arm::One(own) => Some(own),
+            Arm::Paged(_) => None,
+        }
+    }
+
+    #[inline]
+    fn own_mut(&mut self) -> Option<&mut OwnKv> {
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => Some(own),
+            ArmMut::Paged(_) => None,
+        }
+    }
+
+    /// The sequence's own page pool, on the `Paged` shapes.
+    #[cfg(feature = "metal")]
+    #[inline]
+    fn paged(&self) -> Option<&PagedKv> {
+        match self.kv.arm() {
+            Arm::Paged(PooledKv::Own(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The row's slot in a shared pool, on the `Paged` shapes.
+    #[cfg(feature = "metal")]
+    #[inline]
+    fn shared(&self) -> Option<&BatchSlot> {
+        match self.kv.arm() {
+            Arm::Paged(PooledKv::Shared(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[inline]
+    fn shared_mut(&mut self) -> Option<&mut BatchSlot> {
+        match self.kv.arm_mut() {
+            ArmMut::Paged(PooledKv::Shared(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     /// A cache whose KV grows in buckets toward the model's positional
     /// ceiling: `kv_capacity` is `max_position_embeddings`. See
     /// [`Cache::new_with`] for the ceiling and [`DEFAULT_KV_BUCKET`] for the
@@ -3443,6 +3898,31 @@ impl<P: Profile> State<P> {
         device: &Device,
         kv_capacity: usize,
     ) -> Result<Self> {
+        Self::with_kv(
+            use_kv_cache,
+            dtype,
+            config,
+            device,
+            kv_capacity,
+            |slab, num_layers| {
+                <P::Rows as crate::profile::Rows>::pick::<KvFork, lloom_tensor::Error>(
+                    || OwnKv::new(config, slab, num_layers),
+                    || PooledKv::new(config, device, kv_capacity, slab, num_layers, use_kv_cache),
+                )
+            },
+        )
+    }
+
+    /// [`Self::new_with`] with the KV arm built by `kv(slab, num_layers)`:
+    /// the shape's own store, or a row of a shared pool ([`Self::for_batch`]).
+    fn with_kv(
+        use_kv_cache: bool,
+        dtype: DType,
+        config: &Config,
+        device: &Device,
+        kv_capacity: usize,
+        kv: impl FnOnce(usize, usize) -> Result<KvOf<P>>,
+    ) -> Result<Self> {
         // `DESIGN.md` §9.5d: admission at configuration time, BEFORE the first
         // allocation. It is `Ok(())` unless a caller has asked for it -- see
         // `admit_memory_budget` for why it is opt-in and what it costs.
@@ -3506,32 +3986,7 @@ impl<P: Profile> State<P> {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
 
         let num_layers = config.num_hidden_layers;
-        if config.kv_append == KvAppend::Paged {
-            if config.attn_impl != AttnImpl::FlashDecoding {
-                lloom_tensor::bail!(
-                    "lfm2 `KvAppend::Paged` reads the pool through the chunk table, which only \
-                     the FlashDecoding kernels take: use `--attn flash` (DESIGN.md 10.3b)"
-                )
-            }
-            if config.kv_quant.is_on() {
-                lloom_tensor::bail!("lfm2 `KvAppend::Paged` has no quantized arm")
-            }
-            if !device.is_metal() {
-                lloom_tensor::bail!(
-                    "lfm2 `KvAppend::Paged` is Metal-only: the pool is read by a Metal kernel"
-                )
-            }
-        }
-        #[cfg(feature = "metal")]
-        let paged = if config.kv_append == KvAppend::Paged && use_kv_cache {
-            let clock = match device {
-                Device::Metal(d) => d.gpu_clock(),
-                _ => lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only"),
-            };
-            Some(PagedKv::new(config, kv_capacity, slab, num_layers, clock)?)
-        } else {
-            None
-        };
+        let kv = kv(slab, num_layers)?;
         #[cfg(feature = "metal")]
         let ledger = match device {
             Device::Metal(m) if use_kv_cache => {
@@ -3556,21 +4011,7 @@ impl<P: Profile> State<P> {
             profile: PhantomData,
             masks: HashMap::new(),
             use_kv_cache,
-            kvs: vec![None; num_layers],
-            kv_slots: (0..num_layers)
-                .map(|_| (kv_slot(slab), kv_slot(slab)))
-                .collect(),
-            quant_slots: (0..num_layers)
-                .map(|_| {
-                    QuantKvSlab::fixed(config.kv_quant, slab)
-                        .scales_at(DType::F16)
-                        .at_site(zs::LFM2_KV_QUANT)
-                })
-                .collect(),
-            #[cfg(feature = "metal")]
-            paged,
-            #[cfg(feature = "metal")]
-            batch: None,
+            kv,
             paged_pass_pending: false,
             kv_append: config.kv_append,
             kv_quant: config.kv_quant,
@@ -3617,7 +4058,7 @@ impl<P: Profile> State<P> {
     pub fn batch_slot(&self) -> Option<usize> {
         #[cfg(feature = "metal")]
         {
-            self.batch.as_ref().map(|b| b.slot())
+            self.shared().map(|b| b.slot())
         }
         #[cfg(not(feature = "metal"))]
         {
@@ -3629,7 +4070,7 @@ impl<P: Profile> State<P> {
     pub fn batch_pool(&self) -> Option<&BatchPool> {
         #[cfg(feature = "metal")]
         {
-            self.batch.as_ref().map(|b| &b.pool)
+            self.shared().map(|b| &b.pool)
         }
         #[cfg(not(feature = "metal"))]
         {
@@ -3640,7 +4081,7 @@ impl<P: Profile> State<P> {
     /// Whether `other` is a row of the same pool.
     #[cfg(feature = "metal")]
     fn shares_pool_with(&self, other: &Self) -> bool {
-        match (&self.batch, &other.batch) {
+        match (self.shared(), other.shared()) {
             (Some(a), Some(b)) => a.pool.same(&b.pool),
             _ => false,
         }
@@ -3662,7 +4103,7 @@ impl<P: Profile> State<P> {
             return Ok(Some(t.clone()));
         }
         #[cfg(feature = "metal")]
-        if let Some(b) = &self.batch {
+        if let Some(b) = self.shared() {
             let slot = b.slot();
             let view = {
                 let mut g = b.pool.inner.lock();
@@ -3700,7 +4141,7 @@ impl<P: Profile> State<P> {
     /// (§12.3). A no-op otherwise.
     #[cfg(feature = "metal")]
     fn snapshot_page_boundary(&mut self) -> Result<()> {
-        let Some(b) = &self.batch else {
+        let Some(b) = self.shared() else {
             return Ok(());
         };
         let slot = b.slot();
@@ -3708,7 +4149,7 @@ impl<P: Profile> State<P> {
         let mut g = pool.inner.lock();
         let p = g.kv.page_size;
         let len = g.kv.row_len(slot);
-        if let Some(b) = &mut self.batch {
+        if let Some(b) = self.shared_mut() {
             b.pass_start = len;
         }
         if len == 0 || len % p != 0 {
@@ -3765,7 +4206,7 @@ impl<P: Profile> State<P> {
         width: usize,
         n_layers: usize,
     ) -> Result<()> {
-        let Some(b) = &self.batch else {
+        let Some(b) = self.shared() else {
             return Ok(());
         };
         let (start, p) = (b.pass_start, b.page_size);
@@ -3783,7 +4224,7 @@ impl<P: Profile> State<P> {
             let cols = conv_in.narrow(2, ci + 1 - take, take)?;
             let ring = Tensor::zeros((1, hidden, width), conv_in.dtype(), conv_in.device())?;
             ring.slice_set(&cols.contiguous()?, 2, l_cache - take)?;
-            let b = self.batch.as_mut().expect("checked above");
+            let b = self.shared_mut().expect("checked above");
             let entry = match b.staged_snaps.iter_mut().find(|(pos, _)| *pos == t) {
                 Some(e) => e,
                 None => {
@@ -3804,7 +4245,7 @@ impl<P: Profile> State<P> {
     /// in the row's table). A no-op when nothing is staged.
     #[cfg(feature = "metal")]
     fn flush_ring_snapshots(&mut self) {
-        let Some(b) = &mut self.batch else {
+        let Some(b) = self.shared_mut() else {
             return;
         };
         if b.staged_snaps.is_empty() {
@@ -3845,7 +4286,7 @@ impl<P: Profile> State<P> {
         }
         #[cfg(feature = "metal")]
         {
-            let (Some(d), Some(s)) = (&self.batch, &src.batch) else {
+            let (Some(d), Some(s)) = (self.shared(), src.shared()) else {
                 lloom_tensor::bail!(
                     "lfm2 share_prefix_from: both rows must be slots of a BatchPool"
                 )
@@ -3934,7 +4375,7 @@ impl<P: Profile> State<P> {
     /// state produced elsewhere is copied in), else as the cache's tensor.
     fn set_conv_state(&mut self, layer: usize, state: Tensor) -> Result<()> {
         #[cfg(feature = "metal")]
-        if self.batch.is_some() {
+        if self.shared().is_some() {
             let (_, hidden, width) = state.dims3()?;
             let view = self
                 .conv_state_view(layer, hidden, width, state.dtype())?
@@ -4020,8 +4461,7 @@ impl<P: Profile> State<P> {
         if bucket == 0 {
             lloom_tensor::bail!("lfm2 kv_bucket must be at least one token")
         }
-        let allocated = self.kv_slots.iter().any(|(k, _)| k.is_allocated())
-            || self.quant_slots.iter().any(|s| s.is_allocated());
+        let allocated = self.own().is_some_and(OwnKv::is_allocated);
         if allocated {
             lloom_tensor::bail!(
                 "lfm2 with_kv_bucket: the slab is already allocated; set the bucket before \
@@ -4058,81 +4498,17 @@ impl<P: Profile> State<P> {
         if !self.use_kv_cache {
             return 0;
         }
-        if self.kv_quant.is_on() {
-            return self
-                .quant_slots
-                .iter()
-                .find(|s| s.is_allocated())
-                .map(|s| s.len())
-                .unwrap_or(0);
-        }
-        match self.kv_append {
-            KvAppend::Cat => self
-                .kvs
-                .iter()
-                .flatten()
-                .next()
-                .and_then(|(k, _)| k.dim(2).ok())
-                .unwrap_or(0),
-            KvAppend::InPlace => self
-                .kv_slots
-                .iter()
-                .find(|(k, _)| k.is_allocated())
-                .map(|(k, _)| k.len())
-                .unwrap_or(0),
-            KvAppend::Paged => {
-                #[cfg(feature = "metal")]
-                {
-                    if let Some(b) = &self.batch {
-                        return b.pool.inner.lock().kv.row_len(b.slot());
-                    }
-                    self.paged.as_ref().map(|p| p.len).unwrap_or(0)
-                }
-                #[cfg(not(feature = "metal"))]
-                {
-                    0
-                }
-            }
+        match self.kv.arm() {
+            Arm::One(own) => own.len(),
+            Arm::Paged(p) => p.len(),
         }
     }
 
     /// The KV slab's state, for a run's memory report.
     pub fn kv_report(&self) -> KvReport {
-        let bytes = if self.kv_quant.is_on() {
-            self.quant_slots.iter().map(|s| s.bytes()).sum()
-        } else {
-            match self.kv_append {
-                KvAppend::Cat => self
-                    .kvs
-                    .iter()
-                    .flatten()
-                    .map(|(k, v)| {
-                        k.elem_count() * k.dtype().size_in_bytes()
-                            + v.elem_count() * v.dtype().size_in_bytes()
-                    })
-                    .sum(),
-                KvAppend::InPlace => self
-                    .kv_slots
-                    .iter()
-                    .map(|(k, v)| k.bytes() + v.bytes())
-                    .sum(),
-                KvAppend::Paged => {
-                    #[cfg(feature = "metal")]
-                    {
-                        if let Some(b) = &self.batch {
-                            // The pool's, shared by every row: a gauge reads
-                            // it once through `BatchPool::report`.
-                            b.pool.inner.lock().kv.bytes()
-                        } else {
-                            self.paged.as_ref().map(|p| p.bytes()).unwrap_or(0)
-                        }
-                    }
-                    #[cfg(not(feature = "metal"))]
-                    {
-                        0
-                    }
-                }
-            }
+        let bytes = match self.kv.arm() {
+            Arm::One(own) => own.bytes(),
+            Arm::Paged(p) => p.bytes(),
         };
         KvReport {
             kv_len: self.kv_len(),
@@ -4230,7 +4606,7 @@ impl<P: Profile> State<P> {
             return Ok(None);
         }
         #[cfg(feature = "metal")]
-        if let Some(b) = &self.batch {
+        if let Some(b) = self.shared() {
             let g = b.pool.inner.lock();
             if need <= g.kv.slab {
                 return Ok(None);
@@ -4255,7 +4631,7 @@ impl<P: Profile> State<P> {
         // sequence's nor free (`PagedKv::pages_short`). The headroom may take
         // the pool past the ceiling; the ceiling check above bounds positions.
         #[cfg(feature = "metal")]
-        if let Some(p) = self.paged.as_ref() {
+        if let Some(p) = self.paged() {
             let short = p.pages_short(seq_len);
             if short > 0 {
                 let wide = self.kv_slab + short * p.page_size;
@@ -4280,30 +4656,9 @@ impl<P: Profile> State<P> {
     /// rows' — so this allocates and copies and nothing else.
     pub(crate) fn apply_grow(&mut self, plan: &GrowPlan) -> Result<()> {
         let slab = plan.slab;
-        if self.kv_quant.is_on() {
-            for s in self.quant_slots.iter_mut() {
-                s.grow_to(slab)?;
-            }
-        } else {
-            match self.kv_append {
-                KvAppend::InPlace => {
-                    for (k, v) in self.kv_slots.iter_mut() {
-                        k.grow_to(slab)?;
-                        v.grow_to(slab)?;
-                    }
-                }
-                KvAppend::Paged => {
-                    #[cfg(feature = "metal")]
-                    if let Some(p) = self.paged.as_mut() {
-                        p.grow_to(slab)?;
-                    }
-                    #[cfg(feature = "metal")]
-                    if let Some(b) = &self.batch {
-                        b.pool.inner.lock().kv.grow_to(slab)?;
-                    }
-                }
-                KvAppend::Cat => {}
-            }
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => own.grow_to(slab)?,
+            ArmMut::Paged(p) => p.grow_to(slab)?,
         }
         self.kv_slab = slab;
         self.kv_grows += 1;
@@ -4315,26 +4670,13 @@ impl<P: Profile> State<P> {
     /// paged pool that already exists keeps its width, and the figure follows
     /// it.
     fn set_slab(&mut self, slab: usize) {
-        for (k, v) in self.kv_slots.iter_mut() {
-            k.set_capacity(slab);
-            v.set_capacity(slab);
-        }
-        for s in self.quant_slots.iter_mut() {
-            s.set_capacity(slab);
-        }
-        let mut slab = slab;
-        #[cfg(feature = "metal")]
-        if let Some(p) = self.paged.as_mut() {
-            if p.pool.is_none() {
-                p.slab = slab;
-            } else {
-                slab = p.slab;
+        let slab = match self.kv.arm_mut() {
+            ArmMut::One(own) => {
+                own.set_capacity(slab);
+                slab
             }
-        }
-        #[cfg(feature = "metal")]
-        if let Some(b) = &self.batch {
-            slab = b.pool.inner.lock().kv.slab;
-        }
+            ArmMut::Paged(p) => p.set_slab(slab),
+        };
         self.kv_slab = slab;
         self.ledger_note();
     }
@@ -4371,59 +4713,16 @@ impl<P: Profile> State<P> {
     /// predicted from the geometry at B=1 before the first append.
     fn grow_bytes(&self, slab: usize) -> usize {
         let extra = slab.saturating_sub(self.kv_slab);
-        let elem = |t: &Tensor| t.dtype().size_in_bytes();
-        let per_token: usize = if self.kv_quant.is_on() {
-            self.quant_slots.iter().map(|s| s.bytes_per_token()).sum()
-        } else {
-            match self.kv_append {
-                KvAppend::InPlace => self
-                    .kv_slots
-                    .iter()
-                    .flat_map(|(k, v)| [k, v])
-                    .filter_map(|s| s.data().as_ref())
-                    .map(|t| {
-                        let d = t.dims();
-                        d[0] * d[1] * d[3] * elem(t)
-                    })
-                    .sum(),
-                KvAppend::Paged => {
-                    #[cfg(feature = "metal")]
-                    {
-                        // A pool grows by whole pages for every sequence, so the
-                        // token count is the pool's, not the slab's.
-                        if let Some(p) = self.paged.as_ref() {
-                            let tokens = p
-                                .pool_tokens_at(slab)
-                                .saturating_sub(p.pool_tokens_at(self.kv_slab));
-                            let per_token: usize = p
-                                .pools
-                                .iter()
-                                .flatten()
-                                .map(|(k, v)| {
-                                    let (dk, dv) = (k.dims(), v.dims());
-                                    dk[0] * dk[1] * dk[3] * elem(k)
-                                        + dv[0] * dv[1] * dv[3] * elem(v)
-                                })
-                                .sum();
-                            if per_token > 0 {
-                                return per_token * tokens;
-                            }
-                            return self.kv_bytes_per_token * tokens;
-                        }
-                        0
-                    }
-                    #[cfg(not(feature = "metal"))]
-                    {
-                        0
-                    }
+        match self.kv.arm() {
+            Arm::One(own) => {
+                let per_token = own.bytes_per_token();
+                if per_token == 0 {
+                    self.kv_bytes_per_token * extra
+                } else {
+                    per_token * extra
                 }
-                KvAppend::Cat => 0,
             }
-        };
-        if per_token == 0 {
-            self.kv_bytes_per_token * extra
-        } else {
-            per_token * extra
+            Arm::Paged(p) => p.grow_bytes(self.kv_slab, slab, self.kv_bytes_per_token),
         }
     }
 
@@ -4754,20 +5053,9 @@ impl<P: Profile> State<P> {
     /// would pin `b_sz` from the previous one.
     pub fn clear(&mut self) {
         self.masks.clear();
-        self.kvs.iter_mut().for_each(|v| *v = None);
-        self.kv_slots.iter_mut().for_each(|(k, v)| {
-            k.reset();
-            v.reset();
-        });
-        self.quant_slots.iter_mut().for_each(|s| s.reset());
-        #[cfg(feature = "metal")]
-        if let Some(p) = &mut self.paged {
-            p.release_all();
-        }
-        #[cfg(feature = "metal")]
-        if let Some(b) = &mut self.batch {
-            b.pool.inner.lock().release(b.slot());
-            b.pass = None;
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => own.clear(),
+            ArmMut::Paged(p) => p.clear(),
         }
         // A new sequence starts at one bucket again: the slab was dropped with
         // the buffers, and the next one is sized by what the next sequence
@@ -4793,7 +5081,7 @@ impl<P: Profile> State<P> {
     /// on the `Paged` arm. `None` on the other arms.
     #[cfg(feature = "metal")]
     pub fn paged_stats(&self) -> Option<(usize, usize, usize)> {
-        self.paged.as_ref().map(|p| {
+        self.paged().map(|p| {
             (
                 p.len,
                 p.pool
@@ -4872,28 +5160,10 @@ impl<P: Profile> State<P> {
     /// (`DESIGN.md` §10.2a: discarded rows are unreachable above the length
     /// and are never cleared). The caller has decided the conv half.
     fn rewind_kv(&mut self, n: usize) -> Result<()> {
-        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if !k_slot.is_allocated() {
-                continue;
-            }
-            k_slot.rewind(n)?;
-            v_slot.rewind(n)?;
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => own.rewind(n),
+            ArmMut::Paged(p) => p.rewind(n),
         }
-        for s in self.quant_slots.iter_mut() {
-            if !s.is_allocated() {
-                continue;
-            }
-            s.rewind(n)?;
-        }
-        #[cfg(feature = "metal")]
-        if let Some(p) = &mut self.paged {
-            p.rewind(n)?;
-        }
-        #[cfg(feature = "metal")]
-        if let Some(b) = &self.batch {
-            b.pool.inner.lock().kv.rewind_slot(b.slot(), n)?;
-        }
-        Ok(())
     }
 
     /// A multi-token pass of `seq_len` positions is beginning: take a
@@ -5086,7 +5356,7 @@ impl<P: Profile> State<P> {
         self.conv_compact = false;
         self.paged_pass_pending = false;
         #[cfg(feature = "metal")]
-        if let Some(b) = &mut self.batch {
+        if let Some(b) = self.shared_mut() {
             b.pass = None;
         }
         self.forget_checkpoints_past(pos);
@@ -5134,22 +5404,9 @@ impl<P: Profile> State<P> {
                  from the per-step counter; the EOS gate needs `shuffle` or `rotating`"
             );
         }
-        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if !k_slot.is_allocated() {
-                continue;
-            }
-            k_slot.rewind(n)?;
-            v_slot.rewind(n)?;
-        }
-        for s in self.quant_slots.iter_mut() {
-            if !s.is_allocated() {
-                continue;
-            }
-            s.rewind(n)?;
-        }
-        #[cfg(feature = "metal")]
-        if let Some(p) = &mut self.paged {
-            p.rewind(n)?;
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => own.rewind(n)?,
+            ArmMut::Paged(p) => p.rewind_unwritten(n)?,
         }
         if let ConvState::RotatingRing { .. } = self.conv_state {
             if n > self.conv_history {
@@ -5237,11 +5494,7 @@ impl<P: Profile> State<P> {
             // The first *allocated* slot, not the first slot: 22 of 30 layers
             // are conv and never append, so `kv_slots[0]` is empty on a model
             // whose layer 0 is a conv layer -- which LFM2's is (§5.3).
-            kv_len: self
-                .kv_slots
-                .iter()
-                .find(|(k_slot, _)| k_slot.is_allocated())
-                .map(|(k_slot, _)| k_slot.len()),
+            kv_len: self.own().and_then(OwnKv::slot_len),
             conv_phase: self.conv_phase,
         })
     }
@@ -5318,30 +5571,9 @@ impl<P: Profile> State<P> {
         // no-op but an error, because `count > len`. Skipping unallocated slots
         // rather than tolerating a short rewind is what keeps `rewind`'s bound
         // check meaningful for the slots that *are* live.
-        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
-            if !k_slot.is_allocated() {
-                continue;
-            }
-            k_slot.rewind(discard)?;
-            v_slot.rewind(discard)?;
-        }
-        // The quantized arm rewinds by the same rule and for the same reason:
-        // a length decrement, discarded codes left unreachable above `len`
-        // (§10.2a). The `codes.is_none()` skip is `all_data`'s, for the 22 conv
-        // layers whose slots never allocate.
-        for s in self.quant_slots.iter_mut() {
-            if !s.is_allocated() {
-                continue;
-            }
-            s.rewind(discard)?;
-        }
-        #[cfg(feature = "metal")]
-        if let Some(p) = &mut self.paged {
-            p.rewind(discard)?;
-        }
-        #[cfg(feature = "metal")]
-        if let Some(b) = &self.batch {
-            b.pool.inner.lock().kv.rewind_slot(b.slot(), discard)?;
+        match self.kv.arm_mut() {
+            ArmMut::One(own) => own.rewind(discard)?,
+            ArmMut::Paged(p) => p.rewind(discard)?,
         }
 
         // Conv: a pointer move, and this is the line §10.2a's cost column means
@@ -5353,14 +5585,9 @@ impl<P: Profile> State<P> {
 
         // The KV length is checked the same way and for the same reason. It is
         // recorded per `advance` from layer 0, and every layer moves together.
-        if let (Some(before), Some((k_slot, _))) = (
-            tok.kv_len,
-            self.kv_slots
-                .iter()
-                .find(|(k_slot, _)| k_slot.is_allocated()),
-        ) {
+        if let (Some(before), Some(len)) = (tok.kv_len, self.own().and_then(OwnKv::slot_len)) {
             debug_assert_eq!(
-                k_slot.len(),
+                len,
                 before + n,
                 "resolve must leave exactly the accepted positions live"
             );
@@ -5445,21 +5672,20 @@ impl<P: Profile<Rows = crate::profile::Paged>> State<P> {
             if !use_kv_cache {
                 lloom_tensor::bail!("lfm2 State::<P>::for_batch: a batch row keeps its KV")
             }
-            let mut cache = Self::new_with(true, dtype, config, device, pool.kv_capacity())?;
-            // The per-cache pool `new_with` built for the `Paged` arm is not
-            // this row's: its pages are the shared pool's.
-            cache.paged = None;
+            PooledKv::check(config, device)?;
             let lease = pool.lease()?;
             let page_size = pool.page_size();
-            cache.batch = Some(BatchSlot {
+            let slot = BatchSlot {
                 pool: pool.clone(),
                 lease: Arc::new(lease),
                 pass: None,
                 pass_start: 0,
                 page_size,
                 staged_snaps: Vec::new(),
-            });
-            Ok(cache)
+            };
+            Self::with_kv(true, dtype, config, device, pool.kv_capacity(), |_, _| {
+                Ok(crate::profile::PagedOf(PooledKv::Shared(slot)))
+            })
         }
     }
 }
@@ -6184,7 +6410,7 @@ impl<P: Profile> Attention<P> {
         }
         let mut first: Option<&State<P>> = None;
         for c in caches {
-            if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() {
+            if c.shared().is_none() || !c.use_kv_cache || c.kv_quant.is_on() {
                 return false;
             }
             match first {
@@ -6199,8 +6425,7 @@ impl<P: Profile> Attention<P> {
         match first {
             Some(f) => {
                 matches!(dtype, DType::F16 | DType::F32)
-                    && f.batch
-                        .as_ref()
+                    && f.shared()
                         .expect("checked")
                         .pool
                         .inner
@@ -6228,15 +6453,14 @@ impl<P: Profile> Attention<P> {
             }
             let pass = Arc::new(pool.inner.lock().kv.begin_rows(rows, device)?);
             for c in caches.iter_mut() {
-                if let Some(b) = c.batch.as_mut() {
+                if let Some(b) = c.shared_mut() {
                     b.pass = Some(pass.clone());
                 }
             }
             return Ok(pass);
         }
         let pass = caches[0]
-            .batch
-            .as_ref()
+            .shared()
             .and_then(|b| b.pass.clone())
             .ok_or_else(|| lloom_tensor::Error::msg("lfm2 batched arm: no pass is open"))?;
         if pass.rows != rows {
@@ -6285,10 +6509,10 @@ impl<P: Profile> Attention<P> {
         let q = crate::nn::rotary_emb::rope(&q, &cos, &sin)?;
         let k = crate::nn::rotary_emb::rope(&k, &cos, &sin)?;
 
-        let pool = rows[0].cache.batch.as_ref().expect("checked").pool.clone();
+        let pool = rows[0].cache.shared().expect("checked").pool.clone();
         let slots: Vec<(usize, usize)> = rows
             .iter()
-            .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), 1))
+            .map(|r| (r.cache.shared().expect("checked").slot(), 1))
             .collect();
         let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
@@ -6364,10 +6588,10 @@ impl<P: Profile> Attention<P> {
         let q_t = crate::nn::rotary_emb::rope(&q_t, &cos, &sin)?;
         let k_t = crate::nn::rotary_emb::rope(&k_t, &cos, &sin)?;
 
-        let pool = rows[0].cache.batch.as_ref().expect("checked").pool.clone();
+        let pool = rows[0].cache.shared().expect("checked").pool.clone();
         let slots: Vec<(usize, usize)> = rows
             .iter()
-            .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), r.len))
+            .map(|r| (r.cache.shared().expect("checked").slot(), r.len))
             .collect();
         let mut caches: Vec<&mut State<P>> = rows.iter_mut().map(|r| &mut *r.cache).collect();
         let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
@@ -6652,7 +6876,10 @@ impl<P: Profile> Attention<P> {
         if cache.use_kv_cache && cache.kv_quant.is_on() {
             let k = k.contiguous()?;
             let v = v.contiguous()?;
-            let slab = &mut cache.quant_slots[block_idx];
+            let Some(OwnKv::Quant(slabs)) = cache.own_mut() else {
+                lloom_tensor::bail!("lfm2: the quantized KV is a `One` shape's store")
+            };
+            let slab = &mut slabs[block_idx];
             slab.append(&k, &v)?;
 
             if seq_len == 1 {
@@ -6683,11 +6910,19 @@ impl<P: Profile> Attention<P> {
             // hold**, not the originals, so prefill sees exactly the cache
             // decode will see -- which is what makes the two paths consistent
             // rather than merely both present.
-            cache.quant_slots[block_idx].dequantize_to(q.dtype())?
+            match cache.own() {
+                Some(OwnKv::Quant(slabs)) => slabs[block_idx].dequantize_to(q.dtype())?,
+                _ => lloom_tensor::bail!("lfm2: the quantized KV is a `One` shape's store"),
+            }
         } else {
-            match cache.kv_append {
-                KvAppend::Cat => {
-                    let (k, v) = match &cache.kvs[block_idx] {
+            let device = cache.device.clone();
+            let pending = std::mem::take(&mut cache.paged_pass_pending);
+            match cache.kv.arm_mut() {
+                ArmMut::One(OwnKv::Quant(_)) => {
+                    lloom_tensor::bail!("lfm2: the quantized arm is read above")
+                }
+                ArmMut::One(OwnKv::Cat(kvs)) => {
+                    let (k, v) = match &kvs[block_idx] {
                         Some((k_cache, v_cache)) if index_pos > 0 => {
                             let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
                             let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
@@ -6695,10 +6930,10 @@ impl<P: Profile> Attention<P> {
                         }
                         _ => (k, v),
                     };
-                    cache.kvs[block_idx] = Some((k.clone(), v.clone()));
+                    kvs[block_idx] = Some((k.clone(), v.clone()));
                     (k, v)
                 }
-                KvAppend::InPlace => {
+                ArmMut::One(OwnKv::InPlace(slots)) => {
                     // `k` comes from the norm or the rotation, a fresh
                     // contiguous tensor, so `append`'s `slice_set` takes its
                     // `copy2d`. `v` is the bare `transpose` view on the
@@ -6709,7 +6944,7 @@ impl<P: Profile> Attention<P> {
                         k.is_contiguous(),
                         "KvAppend::InPlace: k should be contiguous here"
                     );
-                    let (k_slot, v_slot) = &mut cache.kv_slots[block_idx];
+                    let (k_slot, v_slot) = &mut slots[block_idx];
                     // A turn boundary re-prefills without clearing, so this is
                     // a `seq_len > 1` append onto a non-empty slot. It is the
                     // same call — the offset simply advances by more than one.
@@ -6717,109 +6952,104 @@ impl<P: Profile> Attention<P> {
                     let v = v_slot.append(&v)?;
                     (k, v)
                 }
-                KvAppend::Paged => {
+                ArmMut::Paged(pooled) => {
                     #[cfg(not(feature = "metal"))]
                     {
-                        let _ = block_idx;
+                        let _ = (block_idx, pooled, device, pending);
                         lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only")
                     }
                     #[cfg(feature = "metal")]
                     {
                         let k = k.contiguous()?;
                         let v = v.contiguous()?;
-                        let device = cache.device.clone();
-                        let pending = std::mem::take(&mut cache.paged_pass_pending);
                         // The FlashDecoding read walks the pool in place; any
                         // other read attends over a gathered copy (below).
                         let reads_pool =
                             seq_len == 1 && self.route.decode == DecodeAttn::FlashDecoding;
-                        if cache.batch.is_some() {
-                            // A row of a shared pool, attending alone: its own
-                            // pass over its slot — the per-row path the
-                            // batched arm (`attend_rows_shared`) is checked
-                            // against, bit for bit.
-                            if b_sz != 1 {
-                                lloom_tensor::bail!(
-                                    "lfm2 batch row: a row's cache holds one sequence, got a \
-                                     batch of {b_sz}"
-                                )
-                            }
-                            let pass = if pending {
-                                let slot = cache.batch.as_ref().expect("checked").slot();
-                                let pool = cache.batch.as_ref().expect("checked").pool.clone();
-                                let pass = Arc::new(
-                                    pool.inner
-                                        .lock()
-                                        .kv
-                                        .begin_rows(&[(slot, seq_len)], &device)?,
-                                );
-                                cache.batch.as_mut().expect("checked").pass = Some(pass.clone());
-                                pass
-                            } else {
-                                cache
-                                    .batch
-                                    .as_ref()
-                                    .expect("checked")
-                                    .pass
-                                    .clone()
-                                    .ok_or_else(|| {
+                        match pooled {
+                            PooledKv::Shared(b) => {
+                                // A row of a shared pool, attending alone: its own
+                                // pass over its slot — the per-row path the
+                                // batched arm (`attend_rows_shared`) is checked
+                                // against, bit for bit.
+                                if b_sz != 1 {
+                                    lloom_tensor::bail!(
+                                        "lfm2 batch row: a row's cache holds one sequence, got a \
+                                         batch of {b_sz}"
+                                    )
+                                }
+                                let pass = if pending {
+                                    let slot = b.slot();
+                                    let pass = Arc::new(
+                                        b.pool
+                                            .inner
+                                            .lock()
+                                            .kv
+                                            .begin_rows(&[(slot, seq_len)], &device)?,
+                                    );
+                                    b.pass = Some(pass.clone());
+                                    pass
+                                } else {
+                                    b.pass.clone().ok_or_else(|| {
                                         lloom_tensor::Error::msg(
                                             "lfm2 batch row: a layer ran before the pass opened",
                                         )
                                     })?
-                            };
-                            let pool = cache.batch.as_ref().expect("checked").pool.clone();
-                            let mut g = pool.inner.lock();
-                            g.kv.write_rows(block_idx, &k, &v, &pass)?;
-                            let n_prev = pass.prev[0];
-                            if reads_pool {
-                                let (pk, pv) = g.kv.pools[block_idx]
-                                    .as_ref()
-                                    .expect("write_rows allocates the layer's pool");
-                                (pk.clone(), pv.clone())
-                            } else if n_prev == 0 {
-                                (k, v)
-                            } else {
-                                let slot = pass.rows[0].0;
-                                let (prev_k, prev_v) =
-                                    g.kv.gather_row(block_idx, slot, n_prev, &device)?;
-                                let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
-                                let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
-                                (k, v)
+                                };
+                                let pool = b.pool.clone();
+                                let mut g = pool.inner.lock();
+                                g.kv.write_rows(block_idx, &k, &v, &pass)?;
+                                let n_prev = pass.prev[0];
+                                if reads_pool {
+                                    let (pk, pv) = g.kv.pools[block_idx]
+                                        .as_ref()
+                                        .expect("write_rows allocates the layer's pool");
+                                    (pk.clone(), pv.clone())
+                                } else if n_prev == 0 {
+                                    (k, v)
+                                } else {
+                                    let slot = pass.rows[0].0;
+                                    let (prev_k, prev_v) =
+                                        g.kv.gather_row(block_idx, slot, n_prev, &device)?;
+                                    let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
+                                    let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
+                                    (k, v)
+                                }
                             }
-                        } else {
-                            let Some(paged) = cache.paged.as_mut() else {
+                            PooledKv::Own(paged) => {
+                                if pending {
+                                    paged.begin_pass(b_sz, seq_len, &device)?;
+                                }
+                                let n_prev = paged.len - paged.pass_len;
+                                // The write: this pass's tokens to the slots the table
+                                // names, one dispatch for K and one for V.
+                                paged.write_layer(block_idx, &k, &v)?;
+                                if reads_pool {
+                                    // Decode reads the pool through the table below;
+                                    // the tensors handed on are the pool itself.
+                                    let (pk, pv) = paged.pools[block_idx]
+                                        .as_ref()
+                                        .expect("write_layer allocates the layer's pool");
+                                    (pk.clone(), pv.clone())
+                                } else if n_prev == 0 {
+                                    // A first pass attends over its own tokens.
+                                    (k, v)
+                                } else {
+                                    // A turn-boundary prefill (§10.9), or a decode step
+                                    // whose shape FlashDecoding does not instantiate,
+                                    // attends over the accumulated cache: gathered from
+                                    // the pool by physical slot, then this pass's
+                                    // tokens. O(kv_len) per pass, and on the decode path
+                                    // only on that fallback (`AttnRoute`).
+                                    let (prev_k, prev_v) =
+                                        paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
+                                    let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
+                                    let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
+                                    (k, v)
+                                }
+                            }
+                            PooledKv::Off => {
                                 lloom_tensor::bail!("lfm2 `KvAppend::Paged` with no page pool")
-                            };
-                            if pending {
-                                paged.begin_pass(b_sz, seq_len, &device)?;
-                            }
-                            let n_prev = paged.len - paged.pass_len;
-                            // The write: this pass's tokens to the slots the table
-                            // names, one dispatch for K and one for V.
-                            paged.write_layer(block_idx, &k, &v)?;
-                            if reads_pool {
-                                // Decode reads the pool through the table below;
-                                // the tensors handed on are the pool itself.
-                                let (pk, pv) = paged.pools[block_idx]
-                                    .as_ref()
-                                    .expect("write_layer allocates the layer's pool");
-                                (pk.clone(), pv.clone())
-                            } else if n_prev == 0 {
-                                // A first pass attends over its own tokens.
-                                (k, v)
-                            } else {
-                                // A turn-boundary prefill (§10.9), or a decode step
-                                // whose shape FlashDecoding does not instantiate,
-                                // attends over the accumulated cache: gathered from
-                                // the pool by physical slot, then this pass's
-                                // tokens. O(kv_len) per pass, and on the decode path
-                                // only on that fallback (`AttnRoute`).
-                                let (prev_k, prev_v) =
-                                    paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
-                                let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
-                                let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
-                                (k, v)
                             }
                         }
                     }
@@ -6863,7 +7093,7 @@ impl<P: Profile> Attention<P> {
                 let reserve_chunks = cache
                     .kv_capacity
                     .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
-                if let Some(b) = &cache.batch {
+                if let Some(b) = cache.shared() {
                     let pass = b.pass.as_ref().ok_or_else(|| {
                         lloom_tensor::Error::msg("lfm2 batch row: reading before the pass opened")
                     })?;
@@ -6882,7 +7112,7 @@ impl<P: Profile> Attention<P> {
                         pass.n_keys.clone(),
                     )?
                 } else {
-                    let paged = cache.paged.as_ref().expect("checked above");
+                    let paged = cache.paged().expect("checked above");
                     crate::nn::ops::flash_decoding_paged_resident(
                         &q,
                         &k,
@@ -7695,7 +7925,7 @@ impl<P: Profile> ShortConv<P> {
         }
         let mut first: Option<&State<P>> = None;
         for c in caches {
-            if c.batch.is_none() || !c.use_kv_cache {
+            if c.shared().is_none() || !c.use_kv_cache {
                 return false;
             }
             match first {
@@ -7709,8 +7939,7 @@ impl<P: Profile> ShortConv<P> {
         }
         match first {
             Some(f) => {
-                f.batch
-                    .as_ref()
+                f.shared()
                     .expect("checked")
                     .pool
                     .inner
@@ -7740,10 +7969,10 @@ impl<P: Profile> ShortConv<P> {
             // Bind (and on a fresh lease zero) the row's ring, so the pool's
             // row is the state this row's every kernel reads.
             c.conv_state_view(block_idx, self.hidden_size, width, dtype)?;
-            slots.push(c.batch.as_ref().expect("checked").slot() as u32);
+            slots.push(c.shared().expect("checked").slot() as u32);
             phases.push(c.conv_phase as u32);
         }
-        let pool = caches[0].batch.as_ref().expect("checked").pool.clone();
+        let pool = caches[0].shared().expect("checked").pool.clone();
         let (pool_t, slots_t, phases_t) = {
             let mut g = pool.inner.lock();
             g.shared_calls += 1;
@@ -7858,7 +8087,7 @@ impl<P: Profile> ShortConv<P> {
         // A batch row's ring is a row of the pool: bound before any arm below
         // reads `conv_states`, so what they read and write is the pool's row.
         #[cfg(feature = "metal")]
-        if cache.batch.is_some() && cache.use_kv_cache {
+        if cache.shared().is_some() && cache.use_kv_cache {
             let width = self.conv_state.width(self.l_cache);
             cache.conv_state_view(block_idx, self.hidden_size, width, bcx.dtype())?;
         }
@@ -8246,7 +8475,7 @@ impl<P: Profile> ShortConv<P> {
             // A batch row's piece crossing a page boundary leaves the ring
             // after that page's last token for a sharer (§12.3).
             #[cfg(feature = "metal")]
-            if cache.batch.is_some() && cache.use_kv_cache && b_sz == 1 {
+            if cache.shared().is_some() && cache.use_kv_cache && b_sz == 1 {
                 let ctx_len = ctx.as_ref().map(|c| c.dim(2)).transpose()?.unwrap_or(0);
                 let width = self.conv_state.width(self.l_cache);
                 cache.stage_piece_snapshots(
@@ -10167,8 +10396,8 @@ impl<P: Profile> Model<P> {
         cache.paged_pass_pending = true;
         cache.turn_checkpoint_begin(seq_len);
         #[cfg(feature = "metal")]
-        if cache.batch.is_some() {
-            if let Some(b) = &mut cache.batch {
+        if cache.shared().is_some() {
+            if let Some(b) = cache.shared_mut() {
                 b.pass = None;
             }
             // A pass beginning at a page boundary: the ring holds the state

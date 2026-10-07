@@ -718,7 +718,10 @@ impl QMetalStorage {
                     .map(|x| x * DType::F32.size_in_bytes())
                     .collect::<Vec<_>>(),
                 storage.buffer(),
-                src1_l.start_offset() * storage.dtype().size_in_bytes(),
+                // The activation view's own offset: `src1_l` is a fresh contiguous
+                // layout (offset 0) for the strides, and a row view (`narrow`) starts
+                // inside its buffer.
+                layout.start_offset() * storage.dtype().size_in_bytes(),
                 dst_shape.dims(),
                 0,
                 &dst,
@@ -763,7 +766,10 @@ impl QMetalStorage {
                 .map(|x| x * DType::F32.size_in_bytes())
                 .collect::<Vec<_>>(),
             storage.buffer(),
-            src1_l.start_offset() * storage.dtype().size_in_bytes(),
+            // The activation view's own offset: `src1_l` is a fresh contiguous
+            // layout (offset 0) for the strides, and a row view (`narrow`) starts
+            // inside its buffer.
+            layout.start_offset() * storage.dtype().size_in_bytes(),
             dst_shape.dims(),
             0,
             &dst,

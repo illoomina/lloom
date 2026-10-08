@@ -270,6 +270,119 @@ pub fn parse_number(value: &str) -> Result<f64, String> {
     }
 }
 
+// ---- the meanings that moved ------------------------------------------------------
+
+/// What a legacy env variable's value selected before the variable joined the
+/// option tree, where that differs from the grammar: the field's stored value
+/// it meant (as JSON text), or `None` where the old reader refused it.
+pub type Before = fn(&str) -> Option<String>;
+
+/// A legacy env name, the field it writes (a storage path in its group) and
+/// what its values selected before.
+pub type BeforeRow = (&'static str, &'static str, Before);
+
+/// The old readers, by shape.
+pub mod before {
+    /// Read for presence: any value, `0` included, was on.
+    pub fn presence(_: &str) -> Option<String> {
+        Some("true".into())
+    }
+    /// Exactly `1` was on, anything else off.
+    pub fn exactly_one(v: &str) -> Option<String> {
+        Some((v == "1").to_string())
+    }
+    /// Exactly `true|t|yes|y|1` were on, anything else off.
+    pub fn truthy(v: &str) -> Option<String> {
+        Some(["true", "t", "yes", "y", "1"].contains(&v).to_string())
+    }
+    /// A bool field's spellings before the grammar (`1|true|yes|on`,
+    /// `0|false|no|off`, any case), anything else refused.
+    pub fn derive_bool(v: &str) -> Option<String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some("true".into()),
+            "0" | "false" | "no" | "off" => Some("false".into()),
+            _ => None,
+        }
+    }
+    /// A count parsed as written (no whitespace), anything else refused.
+    pub fn strict_count(v: &str) -> Option<String> {
+        v.parse::<usize>().ok().map(|n| n.to_string())
+    }
+    /// A count parsed as written, anything else silently unset.
+    pub fn count_or_unset(v: &str) -> Option<String> {
+        Some(
+            v.parse::<u64>()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "null".into()),
+        )
+    }
+    /// A path taken as written, the empty one included.
+    pub fn path_verbatim(v: &str) -> Option<String> {
+        Some(serde_json::Value::String(v.into()).to_string())
+    }
+    /// An optional typed field: the empty value unset it.
+    pub fn empty_unset(v: &str) -> Option<String> {
+        v.is_empty().then(|| "null".into())
+    }
+    /// An optional arm: the empty value and `off` unset it.
+    pub fn empty_or_off_unset(v: &str) -> Option<String> {
+        (v.is_empty() || v.eq_ignore_ascii_case("off")).then(|| "null".into())
+    }
+}
+
+/// The declaration at `storage` (a dotted path in the group `metas` describes).
+pub fn meta_at(metas: &'static [KnobMeta], storage: &str) -> Option<&'static KnobMeta> {
+    let (head, rest) = match storage.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (storage, None),
+    };
+    let m = metas.iter().find(|m| m.key == head)?;
+    match (m.nested, rest) {
+        (Some(sub), Some(rest)) => meta_at(sub, rest),
+        (None, None) => Some(m),
+        _ => None,
+    }
+}
+
+/// An env lookup by name.
+pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// One line per row of `table` whose variable `env` sets to a value whose
+/// meaning moved: the variable, what it selected before, what it selects now.
+/// `resolve` builds the group from one variable alone (the env it is given)
+/// and returns it as JSON, or the refusal. A cold path: read once, at startup.
+pub fn legacy_notes(
+    table: &[BeforeRow],
+    metas: &'static [KnobMeta],
+    env: Env<'_>,
+    resolve: &dyn Fn(Env<'_>) -> Result<Value, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (var, storage, before) in table {
+        let Some(value) = env(var) else { continue };
+        let Some(old) = before(&value) else { continue };
+        let alone = |name: &str| (name == *var).then(|| value.clone());
+        let new = match resolve(&alone) {
+            Ok(v) => storage
+                .split('.')
+                .try_fold(&v, |v, seg| v.get(seg))
+                .cloned()
+                .unwrap_or(Value::Null)
+                .to_string(),
+            Err(e) => format!("nothing: it is refused ({e})"),
+        };
+        if new != old {
+            let key = meta_at(metas, storage)
+                .map(|m| if m.path.is_empty() { *storage } else { m.path })
+                .unwrap_or(storage);
+            out.push(format!(
+                "[options] {var}={value:?} selected {key} = {old} before the option tree; it now selects {new}"
+            ));
+        }
+    }
+    out
+}
+
 /// One row of an option table: the full dotted storage path and the leaf's description,
 /// with the value the given instance holds (rendered from its JSON).
 #[derive(Debug, Clone)]

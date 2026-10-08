@@ -10,15 +10,100 @@
 //! changes.
 
 use lloom_macros::Options;
-use lloom_tensor::options::{non_empty, parse_arm, parse_count};
+use lloom_tensor::options::{before, non_empty, parse_arm, parse_count, BeforeRow};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
+/// The legacy env names of this group whose values meant something else
+/// before they joined the option tree (`lloom_tensor::options::legacy_notes`).
+pub const LEGACY_BEFORE: &[BeforeRow] = &[
+    ("LLOOM_WG_SYNC", "wg.sync", before::presence),
+    (
+        "LLOOM_WG_CUT_AFTER_ENSURE",
+        "wg.cut_after_ensure",
+        before::presence,
+    ),
+    ("LLOOM_WG_NO_LOADER", "wg.no_loader", before::presence),
+    ("LLOOM_WG_TRACE", "wg.trace", before::presence),
+    // The field took the bool spellings and the batch scheduler checked for
+    // presence beside it, so a false spelling left the scheduler's trace on.
+    ("LLOOM_148_SHARE_TRACE", "lfm2.share_trace", |v| {
+        before::derive_bool(v).map(|_| "true".into())
+    }),
+    (
+        "QWEN4EXP_MASK",
+        "stream.per_plane_mask",
+        before::exactly_one,
+    ),
+    (
+        "QWEN4EXP_READY_FIRST",
+        "stream.ready_first",
+        before::exactly_one,
+    ),
+    ("QWEN4EXP_REPLAY", "stream.replay", |v| {
+        Some(
+            if v == "device" {
+                "\"device\""
+            } else {
+                "\"host\""
+            }
+            .into(),
+        )
+    }),
+    ("QWEN4EXP_PREDICT", "stream.predict", |v| {
+        Some(
+            if v == "hotlist" {
+                "\"hotlist\""
+            } else {
+                "\"off\""
+            }
+            .into(),
+        )
+    }),
+    (
+        "LLOOM_148_POOL_PAGES",
+        "lfm2.pool_pages",
+        before::strict_count,
+    ),
+    (
+        "LLOOM_148_POOL_CHURN",
+        "lfm2.pool_churn",
+        before::strict_count,
+    ),
+    (
+        "LLOOM_WG_SLOW_LOADER_MS",
+        "wg.slow_loader_ms",
+        before::count_or_unset,
+    ),
+    // An empty path opened nothing.
+    ("LLOOM_LFM2_LOGITS_DUMP", "lfm2.logits_dump", |v| {
+        if v.is_empty() {
+            Some("null".into())
+        } else {
+            before::path_verbatim(v)
+        }
+    }),
+];
+
+/// [`LEGACY_BEFORE`]'s lines for the values `env` sets.
+pub fn legacy_notes(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    lloom_tensor::options::legacy_notes(LEGACY_BEFORE, Tuning::META, env, &|alone| {
+        let mut t = Tuning::default();
+        t.from_env_with(alone)?;
+        serde_json::to_value(&t).map_err(|e| e.to_string())
+    })
+}
+
 /// The group in force for this process (see the module docs).
 pub fn tuning() -> &'static Tuning {
     TUNING.get_or_init(|| {
+        for note in legacy_notes(&|name: &str| {
+            std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+        }) {
+            eprintln!("{note}");
+        }
         let mut t = Tuning::default();
         if let Err(e) = t.from_env() {
             panic!("tuning: {e}");

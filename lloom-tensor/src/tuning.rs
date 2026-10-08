@@ -21,7 +21,7 @@
 //! believes otherwise is the failure the whole knob exists to avoid); where a
 //! site used to fall back silently, this is a deliberate tightening.
 
-use crate::options::{is_none, non_empty, parse_arm, parse_count, parse_number};
+use crate::options::{before, is_none, non_empty, parse_arm, parse_count, parse_number, BeforeRow};
 use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -136,8 +136,7 @@ static CONTRACT_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// named it). `Err` if the group was already fixed. What a gate harness or a
 /// bit-identity test calls first, so its contract is stated, not inherited.
 pub fn pin_contract(c: Contract) -> Result<Contract, String> {
-    let mut t = Tuning::default();
-    t.from_env().map_err(|e| format!("tuning: {e}"))?;
+    let mut t = from_process_env().map_err(|e| format!("tuning: {e}"))?;
     if std::env::var_os("LLOOM_PROFILE").is_none() {
         t.contract.profile = c.name().to_string();
     }
@@ -163,17 +162,81 @@ pub fn gate_contract(who: &str) -> Result<Contract, String> {
     Ok(contract())
 }
 
+/// The legacy env names of this group whose values meant something else
+/// before they joined the option tree (`options::legacy_notes`).
+pub const LEGACY_BEFORE: &[BeforeRow] = &[
+    (
+        "CANDLE_METAL_ENABLE_FAST_MATH",
+        "metal.fast_math",
+        before::truthy,
+    ),
+    (
+        "CANDLE_METAL_EAGER_RESIDENCY_RELEASE",
+        "metal.eager_residency_release",
+        |v| Some((v == "1" || v.eq_ignore_ascii_case("true")).to_string()),
+    ),
+    (
+        "CANDLE_METAL_PROFILE_DUMP",
+        "instrument.profile_dump",
+        before::path_verbatim,
+    ),
+    ("LLOOM_383_TILE", "gemm.tile", before::empty_or_off_unset),
+    (
+        "LLOOM_386_FORCE_GEMM",
+        "gemm.force",
+        before::empty_or_off_unset,
+    ),
+    (
+        "CANDLE_METAL_HAZARD_KEY",
+        "metal.hazard_key",
+        before::empty_or_off_unset,
+    ),
+    (
+        "LLOOM_47_REUSE_OVERSIZE_BOUND",
+        "pool.reuse_oversize_bound",
+        before::empty_or_off_unset,
+    ),
+    (
+        "LLOOM_METAL_ALLOW_EMULATED",
+        "metal.allow_emulated",
+        before::empty_or_off_unset,
+    ),
+    ("LLOOM_492_GEMV_BM", "gemm.gemv_bm", before::empty_unset),
+    ("LLOOM_QMV_Q4K_NR0", "qmv.q4k_nr0", before::empty_unset),
+    ("LLOOM_QMV_Q5K_NR0", "qmv.q5k_nr0", before::empty_unset),
+    ("LLOOM_QMV_MM_FROM", "qmv.mm_from", before::empty_unset),
+    // The empty value was the arm that advises nothing, as `none` is.
+    ("CANDLE_MMAP_ADVICE", "cpu.mmap_advice", |v| {
+        v.is_empty().then(|| "\"none\"".into())
+    }),
+];
+
+/// [`LEGACY_BEFORE`]'s lines for the values `env` sets.
+pub fn legacy_notes(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    crate::options::legacy_notes(LEGACY_BEFORE, Tuning::META, env, &|alone| {
+        let mut t = Tuning::default();
+        t.from_env_with(alone)?;
+        serde_json::to_value(&t).map_err(|e| e.to_string())
+    })
+}
+
+/// The defaults with the process env applied, the moved meanings noted.
+fn from_process_env() -> Result<Tuning, String> {
+    for note in
+        legacy_notes(&|name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned()))
+    {
+        eprintln!("{note}");
+    }
+    let mut t = Tuning::default();
+    t.from_env()?;
+    Ok(t)
+}
+
 /// The group in force for this process. First use resolves it: the
 /// installed group if [`install`] ran, else the defaults with the env
 /// aliases applied (a malformed alias panics, naming the variable).
 pub fn tuning() -> &'static Tuning {
-    TUNING.get_or_init(|| {
-        let mut t = Tuning::default();
-        if let Err(e) = t.from_env() {
-            panic!("tuning: {e}");
-        }
-        t
-    })
+    TUNING.get_or_init(|| from_process_env().unwrap_or_else(|e| panic!("tuning: {e}")))
 }
 
 /// Install the group for the process, before anything reads it. `Err` hands

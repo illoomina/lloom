@@ -180,6 +180,7 @@ pub fn tuning() -> &'static Tuning {
 /// the group back if a read already happened (the knobs a `OnceLock` site
 /// took are fixed; installing after would make the report line lie).
 pub fn install(t: Tuning) -> Result<(), Tuning> {
+    crate::isolation::claim("lloom_tensor::tuning");
     TUNING.set(t)
 }
 

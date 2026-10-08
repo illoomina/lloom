@@ -7,6 +7,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 license.workspace = true
+# One integration-test binary (`tests/main.rs`, lloom #939): the `tests/*.rs`
+# files are its modules, declared there. A file that owns its binary (a
+# `#[global_allocator]`) is listed below.
+autotests = false
 
 [dependencies]
 # The inference core (RESTRUCTURING §7.1): the serving engine links lloom's
@@ -51,6 +55,10 @@ base64 = { version = "0.22", optional = true }
 libc = { workspace = true, optional = true }
 # The sampling group draws a fresh seed when none is given (the library too).
 rand = { workspace = true }
+
+[[test]]
+name = "main"
+path = "tests/main.rs"
 
 [dev-dependencies]
 anyhow = { workspace = true }

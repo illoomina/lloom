@@ -8,6 +8,10 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
+# One integration-test binary (`tests/main.rs`, lloom #939): the `tests/*.rs`
+# files are its modules, declared there. A file that owns its binary (a
+# `#[global_allocator]`) is listed below.
+autotests = false
 
 [dependencies]
 # The tensor layer (candle-core + candle-metal-kernels merged, RESTRUCTURING
@@ -60,6 +64,14 @@ egglog = { workspace = true }
 # (`lfm2_dspark.rs`, five short critical sections per speculative round, on
 # the draft path); the pass-plan tests' serialiser is the other.
 parking_lot = { workspace = true }
+
+[[test]]
+name = "main"
+path = "tests/main.rs"
+
+[[test]]
+name = "token_ring_nonblocking"
+path = "tests/token_ring_nonblocking.rs"
 
 [dev-dependencies]
 # The integration tests drive the fuzz models that live behind `fuzzing`, and

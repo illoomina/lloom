@@ -29,6 +29,7 @@ pub fn tuning() -> &'static Tuning {
 /// Install the group before anything reads it; `Err` hands it back if a read
 /// already fixed the defaults.
 pub fn install(t: Tuning) -> Result<(), Tuning> {
+    lloom_tensor::isolation::claim("lloom::tuning");
     TUNING.set(t)
 }
 
@@ -134,6 +135,12 @@ fn parse_state_write(v: &str) -> Result<String, String> {
 fn parse_rows_arm(v: &str) -> Result<String, String> {
     one_of(v, "rows arm", &["batched", "per-row"])
 }
+fn parse_predict(v: &str) -> Result<String, String> {
+    one_of(v, "expert prediction", &["off", "hotlist"])
+}
+fn parse_replay(v: &str) -> Result<String, String> {
+    one_of(v, "replay plan", &["host", "device"])
+}
 fn parse_poison_value(v: &str) -> Result<String, String> {
     one_of(v, "poison value", &["nan", "finite"])
 }
@@ -142,39 +149,97 @@ fn parse_poison_value(v: &str) -> Result<String, String> {
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Lfm2Tuning {
-    /// Run the decode conv's composed path instead of the fused kernel (the A/B for the digest gate).
-    #[opt(flag = "skip-conv-c-fusion", env = "LLOOM_SKIP_CONV_C_FUSION", bool)]
+    /// The decode conv's fused kernel (off: the composed path, the A/B for the digest gate). Stored as its negation.
+    #[opt(
+        flag = "skip-conv-c-fusion",
+        env = "LLOOM_SKIP_CONV_C_FUSION",
+        bool,
+        path = "kernels.fusion.conv_c",
+        status = "arm",
+        invert
+    )]
     pub skip_conv_c_fusion: bool,
     /// The pool rows' kernels: `batched` (the batch in one dispatch per kernel) or `per-row` (the per-row loop, the A/B arm).
-    #[opt(flag = "rows-arm", env = "LLOOM_148_ROWS_ARM", parser = "parse_rows_arm", variants = ["batched", "per-row"])]
+    #[opt(flag = "rows-arm", env = "LLOOM_148_ROWS_ARM", parser = "parse_rows_arm", variants = ["batched", "per-row"], path = "models.lfm2.rows_kernels", status = "arm")]
     pub rows_arm: String,
     /// The FlashDecoding partial kernel's block width: 8 or 32 (the kernels differ only in this geometry).
-    #[opt(flag = "flash-partial-bn", env = "LLOOM_FLASH_PARTIAL_BN", parser = "parse_flash_bn", variants = ["8", "32"])]
+    #[opt(flag = "flash-partial-bn", env = "LLOOM_FLASH_PARTIAL_BN", parser = "parse_flash_bn", variants = ["8", "32"], path = "kernels.attention.flash.partial_block", status = "arm")]
     pub flash_partial_bn: usize,
     /// Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves.
-    #[opt(flag = "sdpa-two-pass-k", env = "LLOOM_SDPA_TWO_PASS_K")]
+    #[opt(
+        flag = "sdpa-two-pass-k",
+        env = "LLOOM_SDPA_TWO_PASS_K",
+        path = "kernels.attention.sdpa.two_pass_from_keys",
+        status = "advanced"
+    )]
     pub sdpa_two_pass_k: usize,
     /// The decode step's RMSNorms computed inside the projections that consume them (`nn::ops::gemv_norm`: one dispatch where the pair is two; moves digests). An arm, off by default.
-    #[opt(flag = "lfm2-norm-gemv", env = "LLOOM_LFM2_NORM_GEMV", bool)]
+    #[opt(
+        flag = "lfm2-norm-gemv",
+        env = "LLOOM_LFM2_NORM_GEMV",
+        bool,
+        path = "kernels.fusion.norm_in_gemv",
+        status = "arm"
+    )]
     pub norm_gemv: bool,
-    /// The weakest numerical class `--fusion derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
-    #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"])]
+    /// The weakest numerical class `kernels.fusion.policy = derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm.
+    #[opt(flag = "lfm2-fusion-budget", env = "LLOOM_LFM2_FUSION_BUDGET", parser = "parse_fusion_budget", variants = ["rounding", "reorder"], path = "kernels.fusion.budget", status = "arm")]
     pub fusion_budget: String,
     /// Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument.
-    #[opt(flag = "lfm2-ablate", env = "LLOOM_LFM2_ABLATE")]
+    #[opt(
+        flag = "lfm2-ablate",
+        env = "LLOOM_LFM2_ABLATE",
+        path = "diagnostics.ablate",
+        status = "instrument"
+    )]
     pub ablate: String,
     /// Print every prefix share (pages, snapshots) — an instrument.
-    #[opt(flag = "share-trace", env = "LLOOM_148_SHARE_TRACE", bool)]
+    #[opt(
+        flag = "share-trace",
+        env = "LLOOM_148_SHARE_TRACE",
+        bool,
+        path = "diagnostics.trace.prefix_share",
+        status = "instrument"
+    )]
     pub share_trace: bool,
     /// Print every verify poll's spins and fallback — an instrument.
-    #[opt(flag = "verify-poll-trace", env = "LLOOM_VERIFY_POLL_TRACE", bool)]
+    #[opt(flag = "verify-poll-trace", env = "LLOOM_VERIFY_POLL_TRACE", bool, path = "diagnostics.trace.verify_poll", status = "instrument", flows = ["token-out"])]
     pub verify_poll_trace: bool,
     /// Fill these zero sites with a sentinel instead of zeros (`nn/zeros.rs`): `all`, or site names separated by commas — an instrument.
-    #[opt(flag = "poison-zeros", env = "LLOOM_POISON_ZEROS")]
+    #[opt(
+        flag = "poison-zeros",
+        env = "LLOOM_POISON_ZEROS",
+        path = "diagnostics.poison.sites",
+        status = "instrument"
+    )]
     pub poison_zeros: String,
     /// The poison's sentinel: `nan` (any read that reaches arithmetic shows) or `finite` (a read whose value matters shows).
-    #[opt(flag = "poison-value", env = "LLOOM_POISON_VALUE", parser = "parse_poison_value", variants = ["nan", "finite"])]
+    #[opt(flag = "poison-value", env = "LLOOM_POISON_VALUE", parser = "parse_poison_value", variants = ["nan", "finite"], path = "diagnostics.poison.value", status = "instrument")]
     pub poison_value: String,
+    /// Append every decode step's logits, `vocab` little-endian f32, to this file — an instrument (a readback per forward).
+    #[opt(
+        flag = "lfm2-logits-dump",
+        env = "LLOOM_LFM2_LOGITS_DUMP",
+        path = "diagnostics.dump.logits",
+        status = "instrument"
+    )]
+    pub logits_dump: Option<String>,
+    /// Pin the rows' paged KV pool at this many pages instead of sizing it from the KV ceiling — a fault-injection instrument.
+    #[opt(
+        flag = "pool-pages",
+        env = "LLOOM_148_POOL_PAGES",
+        path = "diagnostics.faults.pool_pages",
+        status = "instrument"
+    )]
+    pub pool_pages: Option<usize>,
+    /// Pages the rows' paged pool allocates and recycles before any sequence exists, so the sequences' page tables are not the identity — a fault-injection instrument (0 = none).
+    #[opt(
+        flag = "pool-churn",
+        env = "LLOOM_148_POOL_CHURN",
+        path = "diagnostics.faults.pool_churn_pages",
+        status = "instrument"
+    )]
+    pub pool_churn: usize,
 }
 
 impl Default for Lfm2Tuning {
@@ -191,6 +256,9 @@ impl Default for Lfm2Tuning {
             verify_poll_trace: false,
             poison_zeros: String::new(),
             poison_value: "nan".into(),
+            logits_dump: None,
+            pool_pages: None,
+            pool_churn: 0,
         }
     }
 }
@@ -200,10 +268,16 @@ impl Default for Lfm2Tuning {
 #[serde(default)]
 pub struct DsparkTuning {
     /// Where the drafter keeps its context KV: `auto` (paged per sequence on Metal, contiguous on the CPU), `contiguous` (cat-grown) or `paged[:<page_size>][:shared]`.
-    #[opt(flag = "dspark-ctx", env = "LLOOM_DSPARK_CTX_KV", parser = "parse_ctx_kv", variants = ["auto", "contiguous", "paged[:page][:shared]"])]
+    #[opt(flag = "dspark-ctx", env = "LLOOM_DSPARK_CTX_KV", parser = "parse_ctx_kv", variants = ["auto", "contiguous", "paged[:page][:shared]"], path = "speculative.dspark.context_kv", status = "advanced")]
     pub ctx_kv: String,
     /// The drafter's eager attention arm (the parity gate's A/B).
-    #[opt(flag = "dspark-eager-attn", env = "LLOOM_DSPARK_EAGER_ATTN", bool)]
+    #[opt(
+        flag = "dspark-eager-attn",
+        env = "LLOOM_DSPARK_EAGER_ATTN",
+        bool,
+        path = "speculative.dspark.eager_attention",
+        status = "reference"
+    )]
     pub eager_attn: bool,
 }
 
@@ -222,83 +296,89 @@ impl Default for DsparkTuning {
 #[serde(default)]
 pub struct StreamTuning {
     /// `pread` straight into the slot's Shared buffer (no staging copy) — measured slower under pressure, opt-in.
-    #[opt(flag = "pread-direct", env = "LLOOM_PREAD_DIRECT", bool)]
+    #[opt(flag = "pread-direct", env = "LLOOM_PREAD_DIRECT", bool, path = "weights.experts.pread_direct", status = "arm", facets = ["transport"], flows = ["weights-in"])]
     pub pread_direct: bool,
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
-    #[opt(
-        flag = "prefetch-threads",
+    #[opt(flag = "prefetch-threads",
         env = "LLOOM_PREFETCH_THREADS",
-        parser = "parse_at_least_one"
-    )]
+        parser = "parse_at_least_one", path = "weights.experts.prefetch.threads", status = "advanced", facets = ["transport"], flows = ["weights-in"])]
     pub prefetch_threads: usize,
     /// The prefetcher's reader threads' QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
-    #[opt(
-        flag = "prefetch-qos",
+    #[opt(flag = "prefetch-qos",
         env = "LLOOM_PREFETCH_QOS",
-        parser = "parse_spawned_qos"
-    )]
+        parser = "parse_spawned_qos", path = "weights.experts.prefetch.qos", status = "advanced", facets = ["qos"], flows = ["weights-in"], forms = ["user-interactive", "user-initiated", "default", "utility", "background", "inherit"], schema = "ThreadQos")]
     pub prefetch_qos: String,
     /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
-    #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
+    #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT", path = "weights.experts.prefetch.split", status = "arm", facets = ["transport", "cadence"], flows = ["weights-in"])]
     pub prefetch_split: usize,
     /// Layers of lead the prefill's prefetcher runs ahead of the layer being computed (≥ 1).
-    #[opt(
-        flag = "prefetch-lead",
+    #[opt(flag = "prefetch-lead",
         env = "QWEN4EXP_PREFETCH_LEAD",
-        parser = "parse_at_least_one"
-    )]
+        parser = "parse_at_least_one", path = "weights.experts.prefetch.lead_layers", status = "advanced", facets = ["lead"], flows = ["weights-in"])]
     pub prefetch_lead: usize,
     /// Where the routed experts are planned: `device` (the settle once a token) or `host` (a readback per layer, the A/B arm).
-    #[opt(flag = "expert-plan", env = "QWEN4EXP_PLAN", parser = "parse_plan", variants = ["device", "host"])]
+    #[opt(flag = "expert-plan", env = "QWEN4EXP_PLAN", parser = "parse_plan", variants = ["device", "host"], path = "weights.experts.plan", status = "arm", facets = ["locality"], flows = ["weights-in"], schema = "Locality")]
     pub plan: String,
     /// At decode under the host plan, layer l+2's router names the experts to prefetch (recall 0.56, P27).
-    #[opt(flag = "decode-hint", env = "QWEN4EXP_DECODE_HINT", bool)]
+    #[opt(flag = "decode-hint", env = "QWEN4EXP_DECODE_HINT", bool, path = "weights.experts.decode_hint", status = "arm", facets = ["lead"], flows = ["weights-in"])]
     pub decode_hint: bool,
     /// Score the residual-speculation hint against the real routing — an instrument (extra router runs and readbacks).
-    #[opt(flag = "hint-recall", env = "QWEN4EXP_HINT_RECALL", bool)]
+    #[opt(
+        flag = "hint-recall",
+        env = "QWEN4EXP_HINT_RECALL",
+        bool,
+        path = "diagnostics.experts.hint_recall",
+        status = "instrument"
+    )]
     pub hint_recall: bool,
     /// Slots each streamed layer keeps free: a miss lands in one, an eviction is quarantined until its readers complete (0 = land in the victim's slot in place; the protocol a load beside the pass needs, off while none runs: each spare slot is one expert less cached).
-    #[opt(flag = "spare-slots", env = "QWEN4EXP_SPARE_SLOTS")]
+    #[opt(flag = "spare-slots", env = "QWEN4EXP_SPARE_SLOTS", path = "weights.experts.spare_slots", status = "advanced", facets = ["buffer", "liveness"], flows = ["weights-in", "memory-return"])]
     pub spare_slots: usize,
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
-    #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool)]
+    #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool, path = "weights.experts.settle_batch", status = "arm", facets = ["cadence"], flows = ["weights-in"])]
     pub settle_batch: bool,
     /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
-    #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"])]
+    #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"], path = "diagnostics.experts.spike0", status = "instrument")]
     pub spike0: String,
     /// Print every settle's ids, flags and misses — an instrument.
-    #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool)]
+    #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool, path = "diagnostics.trace.expert_settle", status = "instrument", flows = ["weights-in"])]
     pub trace_settle: bool,
     /// The fetch inside the token: `inside` = while the pool misses, a device-planned decode step waits on the device at each layer for the misses its router chose, read beside the pass, instead of replaying the token or taking the host plan (`off` = the settle and replay).
-    #[opt(flag = "expert-fetch", env = "QWEN4EXP_FETCH", parser = "parse_fetch", variants = ["off", "inside"])]
+    #[opt(flag = "expert-fetch", env = "QWEN4EXP_FETCH", parser = "parse_fetch", variants = ["off", "inside"], path = "weights.experts.fetch.mode", status = "arm", facets = ["wait"], flows = ["weights-in"])]
     pub fetch: String,
-    /// Microseconds the fetch worker sleeps between looks at a layer's routing (it never spins).
-    #[opt(
-        flag = "fetch-poll-us",
+    /// How the fetch worker waits between looks at a layer's routing: `sleep:<dur>` (it never spins; the older spelling is the bare count of microseconds).
+    #[opt(flag = "fetch-poll-us",
         env = "QWEN4EXP_FETCH_POLL_US",
-        parser = "parse_at_least_one"
-    )]
+        parser = "parse_at_least_one", path = "weights.experts.fetch.wait", status = "advanced", facets = ["wait"], flows = ["weights-in"], forms = ["sleep"], from_v1 = "lloom_tensor::options::v1::fetch_wait_from", to_v1 = "lloom_tensor::options::v1::fetch_wait_to", schema = "Wait")]
     pub fetch_poll_us: usize,
     /// Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again).
-    #[opt(
-        flag = "fetch-exit",
+    #[opt(flag = "fetch-exit",
         env = "QWEN4EXP_FETCH_EXIT",
-        parser = "parse_at_least_one"
-    )]
+        parser = "parse_at_least_one", path = "weights.experts.fetch.exit_after_steps", status = "advanced", facets = ["cadence"], flows = ["weights-in"])]
     pub fetch_exit: usize,
     /// When a fetching step settles (`QWEN4EXP_FETCH=inside`) on a driver that does not settle its steps itself (`provisional`): `behind` = after the next step is encoded, waiting for that step's own pass only, so the host encodes step t+1 while the GPU runs step t (the step's misses were loaded inside it, so its settle is bookkeeping; a pass that still computed on a missing expert — past the worker's fail-safe — is an error, not a redo, its token handed out); `now` = at the step's own end, the host waiting for the GPU every step (the previous behaviour).
-    #[opt(flag = "fetch-settle", env = "QWEN4EXP_FETCH_SETTLE", parser = "parse_fetch_settle", variants = ["behind", "now"])]
+    #[opt(flag = "fetch-settle", env = "QWEN4EXP_FETCH_SETTLE", parser = "parse_fetch_settle", variants = ["behind", "now"], path = "weights.experts.fetch.settle", status = "arm", facets = ["wait", "cadence"], flows = ["weights-in", "commands-out"])]
     pub fetch_settle: String,
     /// Provisional steps (`CausalLM::provisional`): a decode driver that can take its draw back (the blocking arm) settles each device-planned step itself, after its readback — the pass complete, so the settle waits for nothing — and redraws from the redone step when it computed on a missing expert; the model's step then returns without waiting for its pass. `off` = the step settles at its own end (the host waiting for the GPU every step, then again for the draw).
-    #[opt(flag = "provisional", env = "QWEN4EXP_PROVISIONAL", parser = "parse_provisional", variants = ["on", "off"])]
+    #[opt(flag = "provisional", env = "QWEN4EXP_PROVISIONAL", parser = "parse_provisional", variants = ["on", "off"], path = "weights.experts.provisional_steps", status = "arm", facets = ["wait"], flows = ["weights-in", "token-out"])]
     pub provisional: String,
     /// The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`.
-    #[opt(
-        flag = "fetch-qos",
+    #[opt(flag = "fetch-qos",
         env = "QWEN4EXP_FETCH_QOS",
-        parser = "parse_spawned_qos"
-    )]
+        parser = "parse_spawned_qos", path = "weights.experts.fetch.qos", status = "advanced", facets = ["qos"], flows = ["weights-in"], forms = ["user-interactive", "user-initiated", "default", "utility", "background", "inherit"], schema = "ThreadQos")]
     pub fetch_qos: String,
+    /// On a device-planned pass, a plane whose expert the plan found missing contributes nothing to the combine (the pass without that expert, defined and finite) instead of slot 0's expert under its weight; the token is settled and replayed as without it.
+    #[opt(flag = "expert-mask", env = "QWEN4EXP_MASK", bool, path = "weights.experts.per_plane_mask", status = "arm", facets = ["locality"], flows = ["weights-in"])]
+    pub per_plane_mask: bool,
+    /// Before a device-planned token, stage the experts the hotlist predicts that are not resident, and let the plan land them: `hotlist`, or `off`.
+    #[opt(flag = "expert-predict", env = "QWEN4EXP_PREDICT", parser = "parse_predict", variants = ["off", "hotlist"], path = "weights.experts.predict", status = "arm", facets = ["lead"], flows = ["weights-in"])]
+    pub predict: String,
+    /// A host-planned tile's groups run in readiness order — the group with the fewest experts to load first — so the later groups' loads overlap the earlier groups' compute; off = the rows' order. Each row's arithmetic is unchanged.
+    #[opt(flag = "expert-ready-first", env = "QWEN4EXP_READY_FIRST", bool, path = "weights.experts.readiness_order", status = "arm", facets = ["lead"], flows = ["weights-in", "commands-out"])]
+    pub ready_first: bool,
+    /// Where a decode step that missed replays: `host` (the host plan, the plan disarmed) or `device` (the device plan, kept armed).
+    #[opt(flag = "expert-replay", env = "QWEN4EXP_REPLAY", parser = "parse_replay", variants = ["host", "device"], path = "weights.experts.replay_arming", status = "arm", facets = ["locality"], flows = ["weights-in", "commands-out"])]
+    pub replay: String,
 }
 
 impl Default for StreamTuning {
@@ -323,6 +403,10 @@ impl Default for StreamTuning {
             fetch_settle: "behind".into(),
             provisional: "on".into(),
             fetch_qos: "user-interactive".into(),
+            per_plane_mask: false,
+            predict: "off".into(),
+            ready_first: false,
+            replay: "host".into(),
         }
     }
 }
@@ -332,98 +416,203 @@ impl Default for StreamTuning {
 #[serde(default)]
 pub struct Qwen4ExpTuning {
     /// Who decides the bracket epilogues a decode step takes: `manual` (every one the forward can fuse, the incumbent) or `derived` (the optimizer's plan over the model's walk, once at load; issue #732).
-    #[opt(flag = "qwen-fusion", env = "QWEN4EXP_FUSION", parser = "parse_fusion", variants = ["manual", "derived"])]
+    #[opt(flag = "qwen-fusion", env = "QWEN4EXP_FUSION", parser = "parse_fusion", variants = ["manual", "derived"], path = "kernels.fusion.policy", status = "arm")]
     pub fusion: String,
     /// The fused HyperConnection prologue pair instead of the composed chain (measured +3.6 % slower in situ, P29 (4); the arm the next bracket kernel is measured against).
-    #[opt(flag = "hc-mix", env = "QWEN4EXP_HC_MIX", bool)]
+    #[opt(
+        flag = "hc-mix",
+        env = "QWEN4EXP_HC_MIX",
+        bool,
+        path = "models.qwen4exp.hc.fused_mix",
+        status = "arm"
+    )]
     pub hc_mix: bool,
     /// Every fused op declines and the composed path runs (the A/B for the fused kernels).
-    #[opt(flag = "fused-off", env = "QWEN4EXP_FUSED_OFF", bool)]
+    #[opt(
+        flag = "fused-off",
+        env = "QWEN4EXP_FUSED_OFF",
+        bool,
+        path = "kernels.fusion.disabled",
+        status = "reference"
+    )]
     pub fused_off: bool,
     /// The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm).
-    #[opt(flag = "qwen-f16-fuse", env = "QWEN4EXP_F16_FUSE", bool)]
+    #[opt(
+        flag = "qwen-f16-fuse",
+        env = "QWEN4EXP_F16_FUSE",
+        bool,
+        path = "models.qwen4exp.moe.f16_swiglu_fused",
+        status = "advanced"
+    )]
     pub f16_fuse: bool,
     /// The shared expert's SwiGLU on its quantized projections' stores: the SiLU on the gate's, the product multiplied into the gate's buffer on the up's — one launch less a layer (`silu_mul`); off = the two products and `silu_mul` (the A/B arm). An arm, off by default: measured 1.1 % slower a token (`optimizer-design.md` §10k).
-    #[opt(flag = "qwen-shared-store", env = "QWEN4EXP_SHARED_STORE", bool)]
+    #[opt(
+        flag = "qwen-shared-store",
+        env = "QWEN4EXP_SHARED_STORE",
+        bool,
+        path = "models.qwen4exp.moe.shared_expert_store",
+        status = "arm"
+    )]
     pub shared_store: bool,
     /// Where the MTP head's routed experts live when the target's are streamed: `streamed` (the head layer takes the target's per-layer slot count and misses as the pool does; the default) or `resident` (every expert of the head layer loaded at load and claimed beside the slot pool — 2.67 GB for the Q8 sidecar, 12 of 314 slots at 0.65 — so no observe pass is flagged and every draft comes from the fold). An arm: on the prose prompt it reads 129 rounds / 30 accepted against streamed's 123 / 36, tokens identical.
-    #[opt(flag = "qwen-mtp-experts", env = "QWEN4EXP_MTP_EXPERTS", parser = "parse_mtp_experts", variants = ["resident", "streamed"])]
+    #[opt(flag = "qwen-mtp-experts", env = "QWEN4EXP_MTP_EXPERTS", parser = "parse_mtp_experts", variants = ["resident", "streamed"], path = "speculative.mtp.experts", status = "advanced")]
     pub mtp_experts: String,
     /// The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way.
-    #[opt(flag = "qwen-f16-fold", env = "QWEN4EXP_F16_FOLD", bool)]
+    #[opt(
+        flag = "qwen-f16-fold",
+        env = "QWEN4EXP_F16_FOLD",
+        bool,
+        path = "models.qwen4exp.moe.f16_cast_fold",
+        status = "arm"
+    )]
     pub f16_fold: bool,
     /// The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches).
-    #[opt(flag = "chunk-scan", env = "QWEN4EXP_CHUNK_SCAN", bool)]
+    #[opt(
+        flag = "chunk-scan",
+        env = "QWEN4EXP_CHUNK_SCAN",
+        bool,
+        path = "kernels.deltanet.chunk_scan",
+        status = "advanced"
+    )]
     pub chunk_scan: bool,
     /// The delta rule as a broadcast product + reduce instead of batched matmuls (a recorded non-deterministic arm; never shipping).
-    #[opt(flag = "delta-reduce", env = "QWEN4EXP_DELTA_REDUCE", bool)]
+    #[opt(
+        flag = "delta-reduce",
+        env = "QWEN4EXP_DELTA_REDUCE",
+        bool,
+        path = "kernels.deltanet.delta_reduce",
+        status = "reference"
+    )]
     pub delta_reduce: bool,
     /// How a recurrent state is written: `in-place` or `copy` (an allocation per layer per token; a debugging arm).
-    #[opt(flag = "state-write", env = "QWEN4EXP_STATE_WRITE", parser = "parse_state_write", variants = ["in-place", "copy"])]
+    #[opt(flag = "state-write", env = "QWEN4EXP_STATE_WRITE", parser = "parse_state_write", variants = ["in-place", "copy"], path = "kernels.recurrent.state_write", status = "reference")]
     pub state_write: String,
     /// The prefill CHUNK the paired tiles are cut into (0 = the model's default).
-    #[opt(flag = "qwen-prefill-chunk", env = "QWEN4EXP_PREFILL_CHUNK")]
+    #[opt(flag = "qwen-prefill-chunk", env = "QWEN4EXP_PREFILL_CHUNK", path = "prefill.recurrent_chunk", status = "advanced", facets = ["cadence"], flows = ["prompt-in"])]
     pub prefill_chunk: usize,
     /// The paired prefill: two chunks in one forward, the second's loads under the first's compute.
-    #[opt(flag = "prefill-pair", env = "QWEN4EXP_PREFILL_PAIR", bool)]
+    #[opt(flag = "prefill-pair", env = "QWEN4EXP_PREFILL_PAIR", bool, path = "prefill.pair", status = "advanced", facets = ["lead"], flows = ["prompt-in", "weights-in"])]
     pub prefill_pair: bool,
     /// Pipelined prefill tiles in flight (≥ 2; the reserve and admission follow).
-    #[opt(
-        flag = "prefill-tiles",
+    #[opt(flag = "prefill-tiles",
         env = "QWEN4EXP_PREFILL_TILES",
-        parser = "parse_at_least_two"
-    )]
+        parser = "parse_at_least_two", path = "prefill.tiles_in_flight", status = "advanced", facets = ["lead"], flows = ["prompt-in", "commands-out"])]
     pub prefill_tiles: usize,
     /// Speculate the next layer's routing ahead: 0 (off) or 1.
-    #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"])]
+    #[opt(flag = "spec-ahead", env = "QWEN4EXP_SPEC_AHEAD", parser = "parse_spec_ahead", variants = ["0", "1"], path = "weights.experts.route_ahead_layers", status = "arm", facets = ["lead"], flows = ["weights-in"])]
     pub spec_ahead: usize,
     /// What a pass the memory budget cannot take does: `off`, `report` or `refuse`.
-    #[opt(flag = "mem-check", env = "QWEN4EXP_MEM", parser = "parse_mem_check", variants = ["off", "report", "refuse"])]
+    #[opt(flag = "mem-check", env = "QWEN4EXP_MEM", parser = "parse_mem_check", variants = ["off", "report", "refuse"], path = "memory.on_overflow", status = "advanced")]
     pub mem_check: String,
     /// The QSA block score as a broadcast product + reduce instead of the matmul (an A/B instrument).
-    #[opt(flag = "score-no-matmul", env = "QWEN4EXP_SCORE_NO_MATMUL", bool)]
+    #[opt(
+        flag = "score-no-matmul",
+        env = "QWEN4EXP_SCORE_NO_MATMUL",
+        bool,
+        path = "kernels.attention.qsa.score_no_matmul",
+        status = "reference"
+    )]
     pub score_no_matmul: bool,
     /// A prefill chunk's queries past the QSA dense range attend through one masked dense attention over every cell instead of the paged kernel over each query's cells (an A/B arm).
-    #[opt(flag = "sparse-masked", env = "QWEN4EXP_SPARSE_MASKED", bool)]
+    #[opt(
+        flag = "sparse-masked",
+        env = "QWEN4EXP_SPARSE_MASKED",
+        bool,
+        path = "kernels.attention.qsa.masked_dense",
+        status = "arm"
+    )]
     pub sparse_masked: bool,
     /// Read the QSA selection back and check it every position — an instrument (a host sync per full layer per token).
-    #[opt(flag = "check-sel", env = "QWEN4EXP_CHECK_SEL", bool)]
+    #[opt(
+        flag = "check-sel",
+        env = "QWEN4EXP_CHECK_SEL",
+        bool,
+        path = "diagnostics.checks.qsa_selection",
+        status = "instrument"
+    )]
     pub check_sel: bool,
     /// Check every layer's outputs for non-finite values and stop at the first — an instrument.
-    #[opt(flag = "watch-nan", env = "QWEN4EXP_WATCH_NAN", bool)]
+    #[opt(
+        flag = "watch-nan",
+        env = "QWEN4EXP_WATCH_NAN",
+        bool,
+        path = "diagnostics.checks.non_finite",
+        status = "instrument"
+    )]
     pub watch_nan: bool,
     /// The sub-block activation trace — an instrument (a readback per sub-block).
-    #[opt(flag = "qwen-trace", env = "QWEN4EXP_TRACE", bool)]
+    #[opt(
+        flag = "qwen-trace",
+        env = "QWEN4EXP_TRACE",
+        bool,
+        path = "diagnostics.trace.activations",
+        status = "instrument"
+    )]
     pub trace: bool,
     /// Print each stacked stem's kinds at load — an instrument.
-    #[opt(flag = "trace-load", env = "QWEN4EXP_TRACE_LOAD", bool)]
+    #[opt(
+        flag = "trace-load",
+        env = "QWEN4EXP_TRACE_LOAD",
+        bool,
+        path = "diagnostics.trace.load",
+        status = "instrument"
+    )]
     pub trace_load: bool,
     /// The MTP prompt-row ablation probe — an instrument.
-    #[opt(flag = "mtp-probe", env = "QWEN4EXP_MTP_PROBE", bool)]
+    #[opt(
+        flag = "mtp-probe",
+        env = "QWEN4EXP_MTP_PROBE",
+        bool,
+        path = "diagnostics.mtp_probe",
+        status = "instrument"
+    )]
     pub mtp_probe: bool,
     /// Print every MTP verify round's window, argmax and accepted prefix — an instrument.
-    #[opt(flag = "mtp-trace", env = "QWEN4EXP_MTP_TRACE", bool)]
+    #[opt(
+        flag = "mtp-trace",
+        env = "QWEN4EXP_MTP_TRACE",
+        bool,
+        path = "diagnostics.trace.mtp_rounds",
+        status = "instrument"
+    )]
     pub mtp_trace: bool,
     /// Whether a host-planned MTP verify window loads the DRAFT rows' missing experts beside row 0's: `auto` (while the real row's loads per host-planned window average 2 or more — the pool is missing the stream — off again under 1), `on` (always), `off` (never: a draft row's miss flags the row and loads nothing).
-    #[opt(flag = "mtp-draft-loads", env = "QWEN4EXP_MTP_DRAFT_LOADS", parser = "parse_draft_loads", variants = ["auto", "on", "off"])]
+    #[opt(flag = "mtp-draft-loads", env = "QWEN4EXP_MTP_DRAFT_LOADS", parser = "parse_draft_loads", variants = ["auto", "on", "off"], path = "speculative.mtp.draft_loads", status = "advanced", facets = ["lead"], flows = ["weights-in"])]
     pub mtp_draft_loads: String,
     /// Where the MTP head's own streamed experts are planned in the drafter's observe: `device` (no readback at its layer; its record settled after the draft's argmax) or `host` (a readback per round, the A/B arm).
-    #[opt(flag = "mtp-observe-plan", env = "QWEN4EXP_MTP_OBSERVE_PLAN", parser = "parse_plan", variants = ["device", "host"])]
+    #[opt(flag = "mtp-observe-plan", env = "QWEN4EXP_MTP_OBSERVE_PLAN", parser = "parse_plan", variants = ["device", "host"], path = "speculative.mtp.observe_plan", status = "arm", facets = ["locality"], flows = ["weights-in", "token-out"], schema = "Locality")]
     pub mtp_observe_plan: String,
     /// Each HyperConnection bracket's grouped RMSNorm computed inside its consumers at a one-row step — the `down` and `inject` mixed GEMVs (the norm in their prologue, `down` also writing the stream scales) and the collapse (reading them) — so `hc_norm_f32` is not launched (`docs/tuning.md` §13.5u). An arm, off by default.
-    #[opt(flag = "qwen-hc-norm-gemv", env = "QWEN4EXP_HC_NORM_GEMV", bool)]
+    #[opt(
+        flag = "qwen-hc-norm-gemv",
+        env = "QWEN4EXP_HC_NORM_GEMV",
+        bool,
+        path = "kernels.fusion.norm_in_gemv",
+        status = "arm"
+    )]
     pub hc_norm_gemv: bool,
     /// Skip a decode step's work by name, comma-separated (`hcnorm`: each HC bracket's grouped RMSNorm, its input passed through) — an instrument pricing a fusion's bound; the output is wrong.
-    #[opt(flag = "qwen-ablate", env = "QWEN4EXP_ABLATE")]
+    #[opt(
+        flag = "qwen-ablate",
+        env = "QWEN4EXP_ABLATE",
+        path = "diagnostics.ablate",
+        status = "instrument"
+    )]
     pub ablate: String,
     /// How a verify window's planned pass is keyed: `kind` (one key per window length, the incumbent) or `variant` (also by the sequence the window runs: the rows that complete an indexer block, the device or host plan, the drafts' loads, the dense range — so each is served its own plan instead of evicting another's).
-    #[opt(flag = "mtp-verify-key", env = "QWEN4EXP_MTP_VERIFY_KEY", parser = "parse_verify_key", variants = ["kind", "variant"])]
+    #[opt(flag = "mtp-verify-key", env = "QWEN4EXP_MTP_VERIFY_KEY", parser = "parse_verify_key", variants = ["kind", "variant"], path = "speculative.mtp.verify_plan_key", status = "arm")]
     pub mtp_verify_key: String,
     /// The QSA layers of a verify window: `rows` (each position's prep, append, indexer and attention launched one after another, the incumbent) or `batched` (the window's positions in one launch per kernel, each row's arithmetic unchanged).
-    #[opt(flag = "qsa-window", env = "QWEN4EXP_QSA_WINDOW", parser = "parse_qsa_window", variants = ["rows", "batched"])]
+    #[opt(flag = "qsa-window", env = "QWEN4EXP_QSA_WINDOW", parser = "parse_qsa_window", variants = ["rows", "batched"], path = "kernels.attention.qsa.verify_window", status = "arm")]
     pub qsa_window: String,
     /// Run the MTP head on every verify window row inside the verify's pass (draft-for-every-prefix) and take the accepted row's draft after the accept, in place of the observe's own submission and readback.
-    #[opt(flag = "mtp-fold", env = "QWEN4EXP_MTP_FOLD", bool)]
+    #[opt(
+        flag = "mtp-fold",
+        env = "QWEN4EXP_MTP_FOLD",
+        bool,
+        path = "speculative.mtp.fold",
+        status = "arm"
+    )]
     pub mtp_fold: bool,
 }
 
@@ -469,33 +658,29 @@ impl Default for Qwen4ExpTuning {
 #[serde(default)]
 pub struct RingTuning {
     /// Consumer-slack bytes of the token ring's history (0 = the tight geometry, the A/B baseline).
-    #[opt(flag = "ring-slack-bytes", env = "LLOOM_RING_SLACK_BYTES")]
+    #[opt(flag = "ring-slack-bytes", env = "LLOOM_RING_SLACK_BYTES", path = "decode.ring.slack_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
     pub slack_bytes: usize,
-    /// The decode thread's QoS: `interactive` (claim `USER_INTERACTIVE`), `default`, or `off`.
-    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"])]
+    /// The decode thread's QoS: `user-interactive` (claim it for the run), `default` (hold the class a spawned thread has, a measurement arm) or `off` (leave the thread as found). The older spellings `interactive`, `demote`, `0` and `none` are the same arms.
+    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"], path = "decode.thread_qos", status = "advanced", facets = ["qos"], flows = ["token-out", "commands-out"], forms = ["user-interactive", "default", "off"], from_v1 = "lloom_tensor::options::v1::hot_thread_from", to_v1 = "lloom_tensor::options::v1::hot_thread_to", schema = "ThreadQos")]
     pub hot_thread: String,
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
-    #[opt(
-        flag = "host-feed-qos",
+    #[opt(flag = "host-feed-qos",
         env = "LLOOM_HOST_FEED_QOS",
-        parser = "parse_spawned_qos"
-    )]
+        parser = "parse_spawned_qos", path = "decode.host_feed.qos", status = "advanced", facets = ["qos"], flows = ["host-feed-in"], forms = ["user-interactive", "user-initiated", "default", "utility", "background", "inherit"], schema = "ThreadQos")]
     pub feed_qos: String,
-    /// How the host fill producer waits between tokens: `on-demand[:<µs>]` (`WFE` while a forward waits on an unfilled value, else a µs sleep: measured fastest), `event[:<µs>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`.
-    #[opt(
-        flag = "host-feed-poll",
+    /// How the host fill producer waits between tokens: `adaptive[:<dur>]` (`WFE` while a forward waits on an unfilled value, else a sleep of that long: measured fastest), `event[:<dur>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<dur>]`, `wfe`, `spin-hint`, `spin`. The older spellings (`on-demand`, durations as bare µs) are the same arms.
+    #[opt(flag = "host-feed-poll",
         env = "LLOOM_HOST_FEED_POLL",
-        parser = "parse_poll"
-    )]
+        parser = "parse_poll", path = "decode.host_feed.wait", status = "advanced", facets = ["wait"], flows = ["host-feed-in"], forms = ["adaptive", "event", "sleep", "wfe", "spin-hint", "spin"], from_v1 = "lloom_tensor::options::v1::feed_wait_from", to_v1 = "lloom_tensor::options::v1::feed_wait_to", schema = "Wait")]
     pub feed_poll: String,
     /// Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument.
-    #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool)]
+    #[opt(flag = "host-feed-trace", env = "LLOOM_HOST_FEED_TRACE", bool, path = "diagnostics.trace.host_feed", status = "instrument", flows = ["host-feed-in"])]
     pub feed_trace: bool,
-    /// The fixed cadence's EOS wait parks on the ring's publish event instead of polling the stamp (off: the poll; parking measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
-    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool)]
+    /// How the fixed cadence's EOS wait learns the stamp: `inherit` (poll it, as the readback's own wait does) or `event` (park on the ring's publish event; measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp).
+    #[opt(flag = "ring-eos-park", env = "LLOOM_RING_EOS_PARK", bool, path = "decode.ring.eos_wait", status = "arm", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
     pub eos_park: bool,
-    /// DSpark's verify completion parks on an event behind the round's stamp instead of polling it (off = the poll, the A/B arm).
-    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool)]
+    /// How DSpark's verify completion is waited for: `event` (park on an event behind the round's stamp) or `inherit` (poll the stamp, the A/B arm).
+    #[opt(flag = "verify-park", env = "LLOOM_VERIFY_PARK", bool, path = "speculative.verify_wait", status = "advanced", facets = ["wait"], flows = ["token-out"], values = ["inherit=false", "event=true"], forms = ["inherit", "event"], schema = "Wait")]
     pub verify_park: bool,
 }
 
@@ -522,6 +707,39 @@ impl Default for RingTuning {
     }
 }
 
+/// The dense weight-group tier (`nn/weight_groups.rs`): its diagnosis knobs.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct WgTuning {
+    /// Wait the queue out after every host write and every load request (a diagnosis arm, never on by default).
+    #[opt(flag = "wg-sync", env = "LLOOM_WG_SYNC", bool, path = "weights.groups.sync", status = "arm", facets = ["wait"], flows = ["weights-in"])]
+    pub sync: bool,
+    /// Take the blocking path instead of the loader thread (a diagnosis arm).
+    #[opt(
+        flag = "wg-no-loader",
+        env = "LLOOM_WG_NO_LOADER",
+        bool,
+        path = "weights.groups.no_loader",
+        status = "instrument"
+    )]
+    pub no_loader: bool,
+    /// Delay every loader write by this many milliseconds — a fault-injection instrument.
+    #[opt(flag = "wg-slow-loader-ms", env = "LLOOM_WG_SLOW_LOADER_MS", path = "diagnostics.faults.slow_loader_ms", status = "instrument", flows = ["weights-in"])]
+    pub slow_loader_ms: Option<u64>,
+    /// Cut the command buffer after every `ensure` without the restamp at the next one — a fault-injection instrument.
+    #[opt(
+        flag = "wg-cut-after-ensure",
+        env = "LLOOM_WG_CUT_AFTER_ENSURE",
+        bool,
+        path = "diagnostics.faults.cut_after_ensure",
+        status = "instrument"
+    )]
+    pub cut_after_ensure: bool,
+    /// Narrate every request, wait and write of the tier and its loader on stderr — an instrument.
+    #[opt(flag = "wg-trace", env = "LLOOM_WG_TRACE", bool, path = "diagnostics.trace.weight_groups", status = "instrument", flows = ["weights-in"])]
+    pub trace: bool,
+}
+
 /// Every tuning knob of the model crate.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
@@ -541,6 +759,9 @@ pub struct Tuning {
     /// The token ring and the decode thread.
     #[opt(nested)]
     pub ring: RingTuning,
+    /// The dense weight-group tier.
+    #[opt(nested)]
+    pub wg: WgTuning,
 }
 
 #[cfg(test)]

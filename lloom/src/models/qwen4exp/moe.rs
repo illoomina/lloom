@@ -56,7 +56,7 @@ pub trait PlanHook {
 
 impl PlanHook for () {}
 
-/// `QWEN4EXP_MASK=1` (read once): on a device-planned pass a plane whose
+/// `weights.experts.per_plane_mask` (read once): on a device-planned pass a plane whose
 /// expert the plan found missing contributes nothing to the combine (the
 /// record's flag — #842's C, the mask for an unpredicted miss): the pass
 /// without that expert, defined and finite, instead of slot 0's expert
@@ -64,10 +64,10 @@ impl PlanHook for () {}
 /// Off by default: the combine kernel is the plain one.
 pub fn mask_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_MASK").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.per_plane_mask)
 }
 
-/// `QWEN4EXP_READY_FIRST=1` (read once): a host-planned tile's groups run
+/// `weights.experts.readiness_order` (read once): a host-planned tile's groups run
 /// in readiness order — the group with the fewest experts to load first —
 /// so the later groups' loads overlap the earlier groups' compute the
 /// longest (`profiles-and-memory-design.md` §4.8 "the schedule covers the
@@ -77,7 +77,7 @@ pub fn mask_on() -> bool {
 /// order: the rows'.
 pub fn ready_first_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_READY_FIRST").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.ready_first)
 }
 
 /// Tiles whose groups ran in an order other than the rows' (the arm's
@@ -172,6 +172,26 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     shared_store: bool,
 }
 
+/// What a routed MoE layer needs of a family's config: the expert count,
+/// the top-k and the experts' width. A family builds one from its own
+/// config ([`From<&Config>`] is Qwen4-exp's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeGeometry {
+    pub n_experts: usize,
+    pub n_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+}
+
+impl From<&Config> for MoeGeometry {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            n_experts: cfg.n_experts,
+            n_experts_per_tok: cfg.n_experts_per_tok,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+        }
+    }
+}
+
 impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -183,6 +203,29 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         sh_router: QMatMul,
         cfg: &Config,
     ) -> Self {
+        Self::with_geometry(
+            router,
+            experts,
+            sh_gate,
+            sh_up,
+            sh_down,
+            sh_router,
+            &MoeGeometry::from(cfg),
+        )
+    }
+
+    /// [`Self::new`] from the geometry alone, for a family whose config is
+    /// not Qwen4-exp's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_geometry(
+        router: QMatMul,
+        experts: R,
+        sh_gate: QMatMul,
+        sh_up: QMatMul,
+        sh_down: QMatMul,
+        sh_router: QMatMul,
+        geo: &MoeGeometry,
+    ) -> Self {
         Self {
             profile: PhantomData,
             router,
@@ -191,9 +234,9 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             sh_up,
             sh_down,
             sh_router,
-            n_experts_per_tok: cfg.n_experts_per_tok,
-            n_experts: cfg.n_experts,
-            moe_intermediate_size: cfg.moe_intermediate_size,
+            n_experts_per_tok: geo.n_experts_per_tok,
+            n_experts: geo.n_experts,
+            moe_intermediate_size: geo.moe_intermediate_size,
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
             f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
@@ -700,7 +743,13 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// on — and its gate's logit `[seq, 1]`.
     fn shared_expert(&self, r: &PrefillRouted) -> Result<(Tensor, Tensor)> {
         let x1 = &r.x1;
-        let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down, self.shared_store)?;
+        let shared = swiglu(
+            x1,
+            &self.sh_gate,
+            &self.sh_up,
+            &self.sh_down,
+            self.shared_store,
+        )?;
         let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
         Ok((shared, sh_logit))
     }
@@ -796,6 +845,16 @@ pub struct PrefillRouted {
 /// SwiGLU, the routed down, the shared expert (its two stems, its SwiGLU,
 /// its down, its gate's logit), the combine. `In` is the bracket's output.
 #[cfg(not(target_arch = "wasm32"))]
+/// The routed MoE as a level-0 block (`nn::blocks::Ffn`): every position
+/// routed on its own, the host plan; the device-planned pass and the
+/// streamed tier's settle are the family's own path.
+impl<P: Profile, R: ExpertResidency> crate::nn::blocks::Ffn for MoeLayer<P, R> {
+    type State = ();
+    fn execute(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
 impl<P: Profile, R: ExpertResidency> crate::optimizer::Visit for MoeLayer<P, R> {
     type In = crate::optimizer::NodeId;
     type Out = crate::optimizer::NodeId;
@@ -886,7 +945,13 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     }
 }
 
-fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul, store: bool) -> Result<Tensor> {
+pub(crate) fn swiglu(
+    x: &Tensor,
+    gate: &QMatMul,
+    up: &QMatMul,
+    down: &QMatMul,
+    store: bool,
+) -> Result<Tensor> {
     // On the projections' stores, where both serve the row: the SiLU on the
     // gate's, the up projection multiplied into the gate's buffer (which
     // nothing else reads).

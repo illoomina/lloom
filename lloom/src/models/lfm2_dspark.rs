@@ -653,11 +653,11 @@ impl DSparkRotary {
 /// # Against `CONTRIBUTING.md` §3.6 / `DESIGN.md` §15.2 #15
 ///
 /// That law names this type: *"`KvCache`, `Norm`, `Rope`, `Attention` should be
-/// traits with concrete impls (`KvSlot`, `QuantKvSlot`, a paged cache, **the
+/// traits with concrete impls (`KvSlot`, the quantized slab, a paged cache, **the
 /// DSpark draft-KV** — all one `KvCache`)"*. **The trait does not exist in the
 /// tree yet** — grepped, there is no `trait KvCache` — and minting the first one
 /// inside a drafter PR would decide a cross-cutting seam for `KvSlot`,
-/// `QuantKvSlot` and the paged cache from the narrowest of its four consumers.
+/// the quantized slab and the paged cache from the narrowest of its four consumers.
 /// That belongs to #602, the live tracker the law points at.
 ///
 /// **What is owed now is the seam, and it is held**: this type is *threaded as a
@@ -1201,11 +1201,6 @@ mod paged_ctx {
             Ok(())
         }
 
-        /// The token slot of position `t` in `pages`.
-        fn slot(pages: &[PageIdx], t: usize, page_size: usize) -> u32 {
-            pages[t / page_size].0 * page_size as u32 + (t % page_size) as u32
-        }
-
         /// Append `[1, H_kv, n, D]` `k`/`v` to `(layer, seq)`: the context
         /// grows by `n` positions and `reserve` slots stay held past it for
         /// the block. Pages the GPU has finished reading come back first.
@@ -1237,13 +1232,11 @@ mod paged_ctx {
             let mut block = std::mem::take(&mut self.scratch_block);
             {
                 // The page list read in place; the slots into the scratch.
-                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                let sp = lp.pool.seq(seq).expect("seq within n_seqs");
                 slots.clear();
-                slots.extend((start..start + n).map(|t| Self::slot(pages, t, page_size)));
+                slots.extend(sp.cells(page_size, start..start + n));
                 block.clear();
-                block.extend(
-                    (start + n..start + n + reserve).map(|t| Self::slot(pages, t, page_size)),
-                );
+                block.extend(sp.cells(page_size, start + n..start + n + reserve));
             }
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
@@ -1308,11 +1301,9 @@ mod paged_ctx {
                 let lp = &mut self.layers[layer];
                 let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
                 lp.pool.append(seq, n).map_err(lloom_tensor::Error::wrap)?;
-                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
-                slots.extend((start..start + n).map(|t| Self::slot(pages, t, page_size)));
-                blocks.extend(
-                    (start + n..start + n + reserve).map(|t| Self::slot(pages, t, page_size)),
-                );
+                let sp = lp.pool.seq(seq).expect("seq within n_seqs");
+                slots.extend(sp.cells(page_size, start..start + n));
+                blocks.extend(sp.cells(page_size, start + n..start + n + reserve));
             }
             let lp = &mut self.layers[layer];
             let tokens = lp.pool.pool_pages() * page_size;
@@ -1430,9 +1421,9 @@ mod paged_ctx {
             let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
             let mut block = std::mem::take(&mut self.scratch_block);
             {
-                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                let sp = lp.pool.seq(seq).expect("seq within n_seqs");
                 block.clear();
-                block.extend((start..start + reserve).map(|t| Self::slot(pages, t, page_size)));
+                block.extend(sp.cells(page_size, start..start + reserve));
             }
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
@@ -1635,9 +1626,9 @@ mod paged_ctx {
                 let device = block.device().clone();
                 let mut slots = std::mem::take(&mut self.scratch_block);
                 {
-                    let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                    let sp = lp.pool.seq(seq).expect("seq within n_seqs");
                     slots.clear();
-                    slots.extend((to..to + reserve).map(|t| Self::slot(pages, t, page_size)));
+                    slots.extend(sp.cells(page_size, to..to + reserve));
                 }
                 let r = self.set_block(layer, seq, &slots, &device);
                 self.scratch_block = slots;

@@ -3,7 +3,6 @@ use crate::kernels::source::{
     INDEXING, MERGED_MEMBERS, MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, QWEN4EXP, RANDOM,
     REDUCE, ROPE, SCRATCH, SDPA, SORT, TERNARY, UNARY,
 };
-use crate::kernels::utils::get_env_bool;
 use crate::kernels::{
     ComputePipeline, ConstantValues, Device, Function, Library, MTLCompileOptions,
     MTLMathFloatingPointFunctions, MTLMathMode, MetalKernelError, Source,
@@ -467,13 +466,11 @@ pub fn merged_translation_unit() -> bool {
 }
 
 /// Whether this process compiles its kernels under `MTLMathMode::Fast`
-/// (`CANDLE_METAL_ENABLE_FAST_MATH`, default on — Metal's own default,
-/// `DESIGN.md` §2.3.9). Read once: the value is fixed for the process, and it
-/// is part of the fp model every recorded digest and exclusion belongs to
-/// (`optimizer-design.md` §5a).
+/// (`backend.metal.compiler.fast_math`, default on — Metal's own default,
+/// `DESIGN.md` §2.3.9). Fixed for the process, and part of the fp model
+/// every recorded digest and exclusion belongs to (`optimizer-design.md` §5a).
 pub fn fast_math_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true))
+    crate::tuning::tuning().metal.fast_math
 }
 
 fn get_compile_options() -> Retained<MTLCompileOptions> {

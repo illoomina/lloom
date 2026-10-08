@@ -175,7 +175,10 @@ pub fn for_device(device: &Device) -> Features {
             return *features;
         }
     }
-    let features = Features::detect(device).minus(Features::from_env("LLOOM_METAL_DISABLE"));
+    let features = Features::detect(device).minus(Features::from_list(
+        crate::tuning::tuning().metal.disable_features.as_deref(),
+        "backend.metal.disable_features",
+    ));
     let _ = CACHE.set((id, features));
     features
 }

@@ -36,7 +36,6 @@ use lloom::models::lfm2::{BatchPool, Config, GateFusion, Model, Shape as Lfm2Sha
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
 use lloom::profile::Profile;
-use lloom_macros::Options;
 use lloom_tensor::{DType, Device};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -107,34 +106,15 @@ pub struct ModeSpec {
     /// only the batched arm's step; the identity columns then read `false`).
     pub skip_solo: bool,
     /// Under `batched`: exit non-zero when the rows gate reads `fail`
-    /// ([`GateConfig`]). Off, the verdicts are reported and the run exits 0.
+    /// (`bench.fail_on_gate`). Off, the verdicts are reported and the run
+    /// exits 0: a gate run executes every arm and reads each verdict off its
+    /// `gate=` field (CONTRIBUTING §3.1a).
     pub fail_on_gate: bool,
     /// Which arm runs first (`solo`, or `pipelined` / `batched`), so a
     /// rotation can alternate the order.
     pub first: String,
     /// Under `dspark`: every round of both arms as CSV.
     pub timeline: Option<PathBuf>,
-}
-
-/// What a failing rows gate does to the process. A gate run executes every
-/// arm and reads each verdict off its `gate=` field, so by default a `fail`
-/// is reported and the run exits 0; the opt-in makes it exit non-zero for a
-/// caller that wants the status (CONTRIBUTING §3.1a).
-#[derive(Options, Debug, Clone, PartialEq, Default)]
-pub struct GateConfig {
-    /// `--mode concurrent --batched`: exit non-zero when the rows gate reads `gate=fail` (off: report it and exit 0).
-    #[opt(flag = "fail-on-gate", bool, env = "LLOOM_FAIL_ON_GATE")]
-    pub fail_on_gate: bool,
-}
-
-impl GateConfig {
-    /// The defaults, then the env alias, then the flags that were given.
-    pub fn resolve(args: &GateConfigArgs) -> Result<Self> {
-        let mut g = Self::default();
-        g.from_env().map_err(|e| anyhow::anyhow!("env: {e}"))?;
-        args.apply(&mut g).map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(g)
-    }
 }
 
 /// The rows gate's exit: the failures are reported either way, and they fail
@@ -2213,7 +2193,7 @@ fn user_turn_text(p: &str) -> String {
 mod tests {
     use super::{
         argmax, batched_passes, gate_exit, others_above, read_or_na, row_verdict, seam_crossed,
-        ulp_at, ulps_apart, GateConfig, GateConfigArgs, Parting, Pass, RowVerdict, SoloKernels,
+        ulp_at, ulps_apart, Parting, Pass, RowVerdict, SoloKernels,
     };
     use anyhow::Result;
 
@@ -2450,43 +2430,44 @@ mod tests {
         assert!(gate_exit(&[], false).is_ok());
     }
 
-    /// The opt-in reaches the group from its flag and from its env alias,
-    /// the flag over the env. The only test that sets the variable, so no
-    /// other test's resolution can see it.
+    /// The opt-in reaches the key from its flag, its legacy env name and its
+    /// canonical one, the flag over the env.
     #[test]
     fn the_opt_in_is_a_flag_and_an_env_alias() {
         use clap::Parser;
         #[derive(Parser)]
         struct Cli {
             #[command(flatten)]
-            gate: GateConfigArgs,
+            bench: crate::options::BenchConfigArgs,
         }
-        let resolve = |argv: &[&str]| {
-            let mut full = vec!["lloom bench"];
-            full.extend_from_slice(argv);
-            GateConfig::resolve(&Cli::try_parse_from(full).unwrap().gate).map(|g| g.fail_on_gate)
-        };
         const ENV: &str = "LLOOM_FAIL_ON_GATE";
-        std::env::remove_var(ENV);
-        assert!(!resolve(&[]).unwrap(), "off by default");
-        assert!(resolve(&["--fail-on-gate"]).unwrap());
-        assert!(!resolve(&["--fail-on-gate=false"]).unwrap());
-        std::env::set_var(ENV, "1");
-        assert!(resolve(&[]).unwrap(), "the env alias turns it on");
+        let resolve =
+            |argv: &[&str], var: &str, value: Option<&str>| -> std::result::Result<bool, String> {
+                let mut full = vec!["lloom bench"];
+                full.extend_from_slice(argv);
+                let mut b = crate::options::BenchConfig::default();
+                b.from_env_with(&|n| (n == var).then(|| value.map(str::to_string)).flatten())?;
+                Cli::try_parse_from(full).unwrap().bench.apply(&mut b)?;
+                Ok(b.fail_on_gate)
+            };
+        assert!(!resolve(&[], ENV, None).unwrap(), "off by default");
+        assert!(resolve(&["--fail-on-gate"], ENV, None).unwrap());
+        assert!(!resolve(&["--fail-on-gate=false"], ENV, None).unwrap());
         assert!(
-            !resolve(&["--fail-on-gate=false"]).unwrap(),
+            resolve(&[], ENV, Some("1")).unwrap(),
+            "the env alias turns it on"
+        );
+        assert!(
+            resolve(&[], "LLOOM_BENCH__FAIL_ON_GATE", Some("1")).unwrap(),
+            "and the key's"
+        );
+        assert!(
+            !resolve(&["--fail-on-gate=false"], ENV, Some("1")).unwrap(),
             "the flag wins over the env"
         );
-        std::env::set_var(ENV, "0");
-        assert!(!resolve(&[]).unwrap());
-        std::env::set_var(ENV, "maybe");
-        let e = resolve(&[])
-            .expect_err("a malformed alias is refused")
-            .to_string();
-        std::env::remove_var(ENV);
+        assert!(!resolve(&[], ENV, Some("0")).unwrap());
+        let e = resolve(&[], ENV, Some("maybe")).expect_err("a malformed alias is refused");
         assert!(e.contains(ENV), "{e}");
-        assert_eq!(GateConfig::META[0].env, Some(ENV));
-        assert_eq!(GateConfig::META[0].flag, "fail-on-gate");
     }
 
     /// A `--dspark` line must not report a readback knob the speculative body

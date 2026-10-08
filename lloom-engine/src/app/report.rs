@@ -379,19 +379,13 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
     const WARMUP_ROUNDS: usize = 4;
     let phase_sync = wanted.phase_sync;
     let rounds = &stats.rounds;
-    if rounds.len() <= WARMUP_ROUNDS {
-        if wanted.verbose {
-            eprintln!(
-                "[dspark rounds: only {} rounds, fewer than the {WARMUP_ROUNDS} dropped as warm-up; \
-                 no breakdown]",
-                rounds.len()
-            );
-        }
+    if rounds.is_empty() {
         return;
     }
     // Acceptance over every round (the warm-up's included: it is the
     // drafter's, not the timing's), `hist[a]` the rounds that kept `a`
-    // tokens, the bonus counted.
+    // tokens, the bonus counted. Reported however short the run: a short
+    // answer's acceptance is a gate's reading too.
     let widest = rounds.iter().map(|r| r.accepted).max().unwrap_or(0);
     let hist: Vec<usize> = (0..=widest)
         .map(|a| rounds.iter().filter(|r| r.accepted == a).count())
@@ -402,6 +396,16 @@ pub fn print_rounds(stats: &DecodeStats, wanted: Wanted) {
         rounds.len(),
         all as f64 / rounds.len() as f64
     );
+    if rounds.len() <= WARMUP_ROUNDS {
+        if wanted.verbose {
+            eprintln!(
+                "[dspark rounds: only {} rounds, fewer than the {WARMUP_ROUNDS} dropped as warm-up; \
+                 no breakdown]",
+                rounds.len()
+            );
+        }
+        return;
+    }
     let timed = &rounds[WARMUP_ROUNDS..];
     let n = timed.len() as f64;
     let ms = |ns: u64| ns as f64 / 1e6;
@@ -1128,7 +1132,11 @@ fn print_encoder_counters(s: &lloom_tensor::kernels::metal::profile::Snapshot) {
         );
     }
     eprintln!("]");
-    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+    if let Some(path) = lloom_tensor::tuning::tuning()
+        .instrument
+        .profile_dump
+        .clone()
+    {
         use std::io::Write;
         let path = format!("{path}.encoders.csv");
         let write = || -> std::io::Result<()> {
@@ -1287,7 +1295,11 @@ fn print_idle_gaps(
             1e3 * step_starved[0],
         );
     }
-    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+    if let Some(path) = lloom_tensor::tuning::tuning()
+        .instrument
+        .profile_dump
+        .clone()
+    {
         use std::io::Write;
         let write = || -> std::io::Result<()> {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);

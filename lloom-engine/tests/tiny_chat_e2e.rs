@@ -23,6 +23,7 @@
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, TinyTokenizer, Weights};
 use serde_json::{json, Value};
@@ -62,6 +63,14 @@ fn sha(ids: &[u32]) -> String {
 
 /// One `lloom chat --raw` turn; the `[turn 1: …]` line's fields.
 fn chat(model: &Path, extra: &[&str]) -> std::collections::BTreeMap<String, String> {
+    chat_with_stderr(model, extra).0
+}
+
+/// [`chat`], with the process's stderr beside the turn's fields.
+fn chat_with_stderr(
+    model: &Path,
+    extra: &[&str],
+) -> (std::collections::BTreeMap<String, String>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
         .arg(model)
@@ -80,12 +89,14 @@ fn chat(model: &Path, extra: &[&str]) -> std::collections::BTreeMap<String, Stri
         .find(|l| l.starts_with("[turn 1:"))
         .unwrap_or_else(|| panic!("no turn line:\n{stderr}"));
     eprintln!("{line}");
-    line.trim_start_matches("[turn 1:")
+    let fields = line
+        .trim_start_matches("[turn 1:")
         .trim_end_matches(']')
         .split_whitespace()
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+        .collect();
+    (fields, stderr.to_string())
 }
 
 fn check(model: &Path, extra: &[&str], want_prompt: &[u32]) {
@@ -138,6 +149,177 @@ fn qwen4exp_tiny_chats_on_the_cpu_and_metal() {
     check(&model, &cpu, &want);
     #[cfg(feature = "metal")]
     check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Qwen3.5, both variants: no BOS; the GGUF is detected by its header's
+/// architecture (the family claims `qwen35` / `qwen35moe`, not every GGUF),
+/// the tokenizer sits beside it.
+#[test]
+fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
+    let dir = scratch("qwen3_5");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let want = bytes(PROMPT);
+    let base = ["--tokenizer", tok];
+    let mut cpu = base.to_vec();
+    cpu.push("--cpu");
+    check(&model, &cpu, &want);
+    #[cfg(feature = "metal")]
+    check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir = scratch("qwen3_5_moe");
+    let model = write::<Qwen3_5MoeTiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let base = ["--tokenizer", tok];
+    let mut cpu = base.to_vec();
+    cpu.push("--cpu");
+    check(&model, &cpu, &want);
+    #[cfg(feature = "metal")]
+    check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Qwen3.5 through the speculative body: a tiny checkpoint that keeps its
+/// MTP block (`block_count` = `n_layers` + 1, `nextn_predict_layers` 1,
+/// unsloth's Qwen3.8-27B shape) served with `--speculate mtp` emits the
+/// greedy run's tokens, at `--spec-tokens` 1 and 2, on the CPU and on
+/// Metal; the turn reports its rounds. A checkpoint without the block
+/// refuses the method by name.
+#[test]
+fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
+    let dir = scratch("qwen3_5_mtp");
+    let mut cfg = Qwen3_5Tiny::template();
+    TinyConfig::set_axis(
+        &mut cfg,
+        "vocab_size",
+        Qwen3_5Tiny::tokenizer().vocab_size(),
+    );
+    TinyConfig::derive(&mut cfg);
+    cfg.n_nextn_layers = 1;
+    let model = TinyCheckpoint::<Qwen3_5Tiny>::new(cfg, Weights::default())
+        .write(&dir)
+        .expect("the tiny checkpoint writes");
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let want = bytes(PROMPT);
+    let mut devices: Vec<&[&str]> = vec![&["--cpu"]];
+    if cfg!(feature = "metal") {
+        devices.push(&[]);
+    }
+    for dev in devices {
+        let mut base = vec![
+            "--tokenizer",
+            tok,
+            "--sampling-defaults",
+            "greedy",
+            "-n",
+            "12",
+        ];
+        base.extend_from_slice(dev);
+        let greedy = chat(&model, &base);
+        assert_eq!(greedy["prompt_ids_sha256"], sha(&want));
+        assert_eq!(greedy["completion_tokens"], "12");
+        for k in ["1", "2"] {
+            let mut args = base.clone();
+            args.extend_from_slice(&["--speculate", "mtp", "--spec-tokens", k]);
+            let (spec, stderr) = chat_with_stderr(&model, &args);
+            assert_eq!(
+                spec["tokens_sha256"], greedy["tokens_sha256"],
+                "{dev:?} k={k}: the speculative body's tokens are not greedy's"
+            );
+            assert_eq!(spec["completion_tokens"], "12");
+            // The acceptance line (`report::print_rounds`): rounds and the
+            // tokens they kept, the bonus counted.
+            let accept = stderr
+                .lines()
+                .find(|l| l.starts_with("DSPARK_ACCEPT "))
+                .unwrap_or_else(|| panic!("{dev:?} k={k}: no acceptance line:\n{stderr}"));
+            eprintln!("{accept}");
+            let field = |name: &str| -> usize {
+                accept
+                    .split_whitespace()
+                    .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("no {name} on {accept}"))
+            };
+            let (rounds, tokens) = (field("rounds"), field("tokens"));
+            assert!((1..=12).contains(&rounds), "{dev:?} k={k}: {rounds} rounds");
+            // The first token is the prefill's, before round 0.
+            assert!(
+                tokens + 1 >= 12,
+                "{dev:?} k={k}: the rounds kept {tokens} tokens for 12 emitted"
+            );
+        }
+    }
+    // The logits digest (`--logits-digest`): the same tokens as the run
+    // without it, a digest the same on a second run, and refused by the
+    // speculative body.
+    let mut args = vec![
+        "--tokenizer",
+        tok,
+        "--sampling-defaults",
+        "greedy",
+        "-n",
+        "12",
+        "--cpu",
+    ];
+    let greedy = chat(&model, &args);
+    assert_eq!(greedy["logits_sha256"], "-");
+    args.push("--logits-digest");
+    let a = chat(&model, &args);
+    let b = chat(&model, &args);
+    assert_eq!(a["tokens_sha256"], greedy["tokens_sha256"]);
+    assert_eq!(a["logits_sha256"].len(), 64, "{a:?}");
+    assert_eq!(a["logits_sha256"], b["logits_sha256"]);
+    assert_eq!(
+        a["readback"], "blocking",
+        "the digest reads the logits on the host"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args([
+            "--raw",
+            "-p",
+            PROMPT,
+            "-n",
+            "4",
+            "--cpu",
+            "--tokenizer",
+            tok,
+        ])
+        .args(["--speculate", "mtp", "--logits-digest"])
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("logits_digest"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Without the block, the method is refused by name.
+    let dir = scratch("qwen3_5_no_mtp");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--raw", "-p", PROMPT, "-n", "4", "--cpu", "--tokenizer"])
+        .arg(&tok)
+        .args(["--speculate", "mtp"])
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a checkpoint without the block served MTP:\n{stderr}"
+    );
+    assert!(stderr.contains("no MTP block"), "{stderr}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -505,6 +687,84 @@ fn serve_refuses_an_effort_the_template_does_not_act_on() {
 fn added_id(tok: &TinyTokenizer, content: &str) -> u32 {
     tok.id(content)
         .unwrap_or_else(|| panic!("{content} is not an added token"))
+}
+
+/// The decision scoring on `lloom serve`: `logprobs` with `options` scores
+/// every option's first token under one forward on the tiny Qwen3.5 (the
+/// decision models' family) — the chosen option carries the highest
+/// log-probability, every option's logprob is that token's in the full
+/// distribution (the top-k block agrees where it lists it), an option
+/// encoding to several tokens reports the count, two options sharing a
+/// first token are flagged, and the shapes a decision cannot take are 400s.
+#[test]
+fn serve_scores_decision_options_from_one_forward() {
+    let dir = scratch("decide-qwen3_5");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let server = Server::start(&model, &["--cpu", "--tokenizer", tok.to_str().unwrap()]);
+    let req = |options: Value, top: u64| {
+        json!({
+            "max_tokens": 1,
+            "logprobs": true,
+            "top_logprobs": top,
+            "options": options,
+        })
+    };
+    let (status, body) = server.chat(req(json!(["A", "B", "yes!", "no"]), 64));
+    assert_eq!(status, 200, "{body}");
+    let d = &body["choices"][0]["decision"];
+    let opts = d["options"].as_array().unwrap();
+    assert_eq!(opts.len(), 4, "{d}");
+    let lps: Vec<f64> = opts
+        .iter()
+        .map(|o| o["logprob"].as_f64().unwrap())
+        .collect();
+    let choice = d["choice"].as_u64().unwrap() as usize;
+    let best = lps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert_eq!(lps[choice], best, "{d}");
+    assert_eq!(d["text"], opts[choice]["text"]);
+    assert!(lps.iter().all(|lp| lp.is_finite() && *lp <= 0.0), "{d}");
+    assert_eq!(
+        opts[2]["tokens"], 4,
+        "`yes!` is four byte tokens on the tiny tokenizer: {d}"
+    );
+    assert_eq!(opts[0]["tokens"], 1);
+    assert_eq!(d["ambiguous"], json!([]));
+    // The top-k block and the decision agree on a token both list.
+    let top = body["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        .as_array()
+        .unwrap();
+    for o in opts {
+        if let Some(t) = top.iter().find(|t| t["token"] == o["token"]) {
+            assert_eq!(t["logprob"], o["logprob"], "{o} vs {t}");
+        }
+    }
+    // Two options with one first token are flagged.
+    let (status, body) = server.chat(req(json!(["yes", "yes!"]), 1));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["decision"]["ambiguous"], json!([0, 1]));
+    // The shapes a decision cannot take.
+    for (options, why) in [
+        (json!(["A"]), "at least two"),
+        (json!(["A", ""]), "non-empty"),
+        (json!("A"), "array"),
+    ] {
+        let (status, body) = server.chat(req(options, 1));
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(why),
+            "{body}"
+        );
+    }
+    // Without options the block is absent and the reply is as before.
+    let (status, body) = server.chat(json!({ "max_tokens": 1, "logprobs": true }));
+    assert_eq!(status, 200, "{body}");
+    assert!(body["choices"][0]["decision"].is_null());
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A `lloom serve` chat request's generated ids and `timings`.
@@ -1275,7 +1535,10 @@ fn a_streamed_chat_is_the_unstreamed_reply_in_order() {
     let server = Server::start(&model, &["--cpu"]);
     let (status, plain) = server.chat(json!({ "max_tokens": 24 }));
     assert_eq!(status, 200, "{plain}");
-    let want = plain["choices"][0]["message"]["content"].as_str().unwrap().to_string();
+    let want = plain["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let req = json!({
         "messages": [{ "role": "user", "content": PROMPT }],
         "max_tokens": 24,
@@ -1313,7 +1576,10 @@ fn a_streamed_chat_is_the_unstreamed_reply_in_order() {
         .iter()
         .map(|e| serde_json::from_str(e).unwrap_or_else(|err| panic!("{e:?}: {err}")))
         .collect();
-    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{text}");
+    assert_eq!(
+        chunks[0]["choices"][0]["delta"]["role"], "assistant",
+        "{text}"
+    );
     let last = chunks.last().unwrap();
     assert!(last["choices"][0]["finish_reason"].is_string(), "{last}");
     let got: String = chunks

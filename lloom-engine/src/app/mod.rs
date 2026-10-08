@@ -1,7 +1,7 @@
 //! `lloom` — the one binary over every served family: `serve` (the OpenAI
 //! endpoint + the pipette sidecar contract, the former `lloom-serve`) and
 //! `chat` (a streaming REPL on the same engine). The model is named once
-//! ([`ModelArgs`]) and its family is read from the path: a safetensors
+//! (`model.path`, [`LoadConfig`]) and its family is read from the path: a safetensors
 //! checkpoint directory is LFM2 (`lfm2.rs`, every arm the serving binary
 //! had), a GGUF is Qwen4-exp (`qwen4exp.rs`). `lloom-serve` stays as a
 //! binary name for the pipette runner and is `lloom serve` verbatim.
@@ -12,6 +12,7 @@ pub mod common;
 pub mod family;
 pub mod lfm2;
 pub mod modes;
+pub mod qwen3_5;
 pub mod qwen4exp;
 pub mod report;
 pub mod serve;
@@ -25,104 +26,9 @@ use clap::{Args, Parser, Subcommand};
 use served::Served;
 use std::path::{Path, PathBuf};
 
-/// Which model, and the family's own knobs. Shared by `serve` and `chat`.
-#[derive(Args, Clone, Debug)]
-pub struct ModelArgs {
-    /// The model: an LFM2 checkpoint directory (config.json, tokenizer.json,
-    /// *.safetensors, chat_template.jinja) or a Qwen4-exp GGUF (the first
-    /// shard, `-00001-of-0000N`; its siblings are found beside it, or a
-    /// directory holding them). Defaults to LFM2_MODEL_DIR, then the
-    /// LFM2.5-2.6B snapshot in the HF cache.
-    #[arg(long, alias = "model-dir")]
-    pub model: Option<PathBuf>,
-
-    /// The `model` id reported by `/v1/models` and accepted by requests.
-    /// Defaults to the checkpoint's Hub id when it is a HF-cache snapshot.
-    #[arg(long)]
-    pub model_name: Option<String>,
-
-
-    /// Skip the pipeline warmup at load (the first prompt then compiles the
-    /// prefill pipelines inside its own TTFT).
-    #[arg(long)]
-    pub no_warmup: bool,
-
-    /// Force the CPU device.
-    #[arg(long)]
-    pub cpu: bool,
-
-
-    /// Qwen4-exp: tokenizer.json (with chat_template.jinja beside it).
-    /// Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
-    #[arg(long)]
-    pub tokenizer: Option<PathBuf>,
-
-    /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool
-    /// per layer filled from the checkpoint on demand, the tier that fits
-    /// this machine; `expert-streaming.md` §20) or `resident` (every expert
-    /// in memory).
-    #[arg(long, default_value = "stream")]
-    pub experts: String,
-
-
-    /// Qwen4-exp, `--experts stream`: the loader primitive, `pread` (read +
-    /// compute-encoder copy) or `io` (`MTLIOCommandQueue`).
-    #[arg(long, default_value = "pread")]
-    pub loader: String,
-
-    /// Qwen4-exp: rows of the N-gram PLE hot-row cache (0 = read the memory
-    /// map every gather).
-    #[arg(long, default_value_t = 0)]
-    pub ple_cache_rows: usize,
-
-    /// Qwen4-exp: load without the N-gram PLE (a measurement arm; the
-    /// digests belong to the PLE-on model).
-    #[arg(long)]
-    pub no_ple: bool,
-
-    /// Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under
-    /// the `fast` contract, `f32` under `deterministic`), `f32` (the
-    /// byte-identical routed arm) or `f16`.
-    #[arg(long, default_value = "auto")]
-    pub moe_act: String,
-
-    /// Qwen4-exp `--experts stream`: the expert hotlist file — read at load
-    /// to warm every layer's pool before the first request (§20.3 R2; a
-    /// missing file warms nothing), written at shutdown with the usage
-    /// since load merged in.
-    #[arg(long)]
-    pub hotlist: Option<PathBuf>,
-
-    /// Qwen4-exp `--experts stream`: the expert prefetcher (the streamed
-    /// tier's reads off the encoding thread, ahead of the layer; §20.4).
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub prefetch: bool,
-
-    /// Qwen4-exp `--experts stream --loader io`: the in-flight residency
-    /// hints into free slots (measured not to pay on a pool smaller than the
-    /// tile; off).
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub io_hints: bool,
-
-    /// Qwen4-exp: how a prompt is prefilled — `chunk` (the chunked DeltaNet /
-    /// QSA passes) or `replay` (the decode recurrence replayed per token; a
-    /// reference arm).
-    #[arg(long, default_value = "chunk", value_name = "chunk|replay")]
-    pub prefill_mode: String,
-
-    /// Qwen4-exp `--experts stream --hotlist`: pin this many experts per
-    /// layer from the hotlist (never evicted); 0 = none.
-    #[arg(long, default_value_t = 0)]
-    pub pin: usize,
-
-    /// LFM2, under `--attn flash`: pages per FlashDecoding chunk (`k` of
-    /// `chunk_size = k × page_size`; 1, the shipped value, is a 256-key chunk
-    /// per partial threadgroup). A probe of the partial kernel's geometry at
-    /// long context; `k > 1` needs the pool's pages chunk-contiguous, which a
-    /// fresh single-sequence pool is and a recycled one is not (§10.3d).
-    #[arg(long, value_name = "K")]
-    pub flash_k: Option<usize>,
-}
+/// What `--model` and the load-time options name: the option tree's
+/// `model`, `backend.device`, `weights.experts` and `models.qwen4exp` keys.
+pub use crate::options::LoadConfig;
 
 /// The serving shape the family builds for: `serve`'s width and cells, or
 /// `chat`'s one sequence with prefix reuse.
@@ -137,6 +43,9 @@ pub struct Shape {
     pub executor: crate::ExecutorConfig,
     /// The memory budgets.
     pub memory: crate::MemoryConfig,
+    /// The sampling defaults, which a resolved drafter is checked against
+    /// (C11).
+    pub sampling: crate::SamplingConfig,
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
@@ -145,13 +54,36 @@ pub struct Shape {
     pub share_prefix: bool,
 }
 
+impl Shape {
+    /// The shape `o` names; `reuse_default` is the front-end's own prefix
+    /// reuse where `context.prefix.reuse` is unset.
+    pub fn of(o: &crate::EngineOptions, reuse_default: bool, seed_text: String) -> Shape {
+        Shape {
+            decode: o.decode.clone(),
+            model: o.model.clone(),
+            speculative: o.speculative.clone(),
+            executor: o.executor.clone(),
+            memory: o.memory.clone(),
+            sampling: o.sampling.clone(),
+            reuse_prefix: o.prefix.reuse.unwrap_or(reuse_default),
+            seed_text,
+            batch: o.scheduler.max_sequences,
+            mem_sample: o.report.memory_sample,
+            rows: o.scheduler.rows.clone(),
+            share_prefix: o.prefix.share,
+        }
+    }
+}
+
 /// What `--model` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Family {
     /// A safetensors checkpoint directory.
     Lfm2(PathBuf),
-    /// A GGUF's first shard.
+    /// A GGUF's first shard (`general.architecture = qwen4exp`).
     Qwen4Exp(PathBuf),
+    /// A GGUF's first shard (`qwen35` / `qwen35moe`).
+    Qwen3_5(PathBuf),
 }
 
 /// The family from the path: a `.gguf` file, or a directory holding GGUF
@@ -166,15 +98,16 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     let (f, checkpoint) = family::detect(&path)?;
     Ok(match f.name() {
         "lfm2" => Family::Lfm2(checkpoint),
+        "qwen3_5" => Family::Qwen3_5(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),
     })
 }
 
-/// Load the engine `args` names for `shape`. Returns it with the path it
+/// Load the engine `load` names for `shape`. Returns it with the path it
 /// was loaded from. An adaptive commit the readback arm cannot carry, and
 /// an EOS gate the executor arms cannot run, are named here with their
 /// reasons, beside the arm the loaded line renders.
-pub fn load_engine(model: &ModelArgs, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     use lloom::load_warning::{LoadWarning, LoadWarningKind};
     let mut notes = Vec::new();
     if let Some(note) = shape.decode.readback.adaptive_clamp() {
@@ -185,7 +118,7 @@ pub fn load_engine(model: &ModelArgs, mut shape: Shape) -> Result<(Box<dyn Serve
         eprintln!("[readback: {note}]");
         notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
-    let (mut engine, path) = family::load(model, shape)?;
+    let (mut engine, path) = family::load(load, shape)?;
     engine.note_load_warnings(notes);
     Ok((engine, path))
 }
@@ -202,250 +135,456 @@ fn clamp_eos_gate(shape: &mut Shape) -> Option<String> {
     Some(format!("eos_gate is off: {why}"))
 }
 
-/// The option layers every subcommand takes (`lloom_engine::options`):
-/// a config file, the JSON groups, the dotted overrides, and the shorthand
-/// flags generated from the groups — applied in that order onto the
-/// defaults and the env aliases.
+/// The help every subcommand ends with: where the options without a flag
+/// are.
+pub const OPTIONS_HELP: &str =
+    "Every option is a key in one tree, and the flags above are the stable \
+surface. `lloom options [GROUP]` lists every key (with --flow, --facet, --status, --internal, \
+--schema); set any of them with --set KEY=VALUE, --<group>-config JSON, --config FILE, or the env \
+(LLOOM_<KEY>, `__` between levels). Every older flag and env name still works.";
+
+const LAYERS: &str = "Config layers";
+
+/// The option layers every subcommand takes: a config file, the JSON
+/// groups, the dotted overrides, and the flags generated from the groups —
+/// applied in that order onto the defaults and the env.
 #[derive(Args, Clone, Debug, Default)]
 pub struct CommonArgs {
-    /// A JSON file of option groups (`{"decode": {...}}`) — what `lloom config`
-    /// prints, read back. Applied over the defaults and the env aliases.
-    #[arg(long, value_name = "PATH")]
+    /// A JSON file of options in the tree's shape (what `lloom config` prints), `$schema` allowed; any older dotted spelling is read too. Applied over the defaults and the env.
+    #[arg(long, value_name = "PATH", help_heading = LAYERS)]
     pub config: Option<PathBuf>,
 
-    /// The decode group as JSON (`'{"readback": "ring-hostdrain", "in_flight": 2}'`).
-    #[arg(long, value_name = "JSON")]
+    /// One option by key, repeatable (`--set decode.readback.eos=gpu-batched`); any older dotted spelling is read too.
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append, help_heading = LAYERS)]
+    pub set: Vec<String>,
+
+    /// The decode group as JSON (`'{"readback": "ring-hostdrain", "in_flight_forwards": 2}'`).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub decode_config: Option<String>,
-
-    /// The tuning group as JSON (`'{"qmv": {"q6k_nr0": 4}, "metal": {"cut_policy": "node-aligned"}}'`).
-    #[arg(long, value_name = "JSON")]
+    /// The storage tree's tuning group as JSON (`'{"qmv": {"q6k_nr0": 4}}'`).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub tuning_config: Option<String>,
-
-    /// The model group as JSON (`'{"cache": "crown", "axes": {"attn": "flash", "kv-append": "paged"}}'`).
-    #[arg(long, value_name = "JSON")]
+    /// The model group as JSON (`'{"path": "…", "served_name": "x"}'`; the legacy `cache` and `axes` too).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub model_config: Option<String>,
-
-    /// The speculative group as JSON (`'{"method": "mtp", "k": 2, "drafter": "…gguf"}'`).
-    #[arg(long, value_name = "JSON")]
+    /// The speculative group as JSON (`'{"method": "mtp", "num_speculative_tokens": 2, "model": "…gguf"}'`).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub speculative_config: Option<String>,
-
-    /// The executor group as JSON (`'{"replay": true, "replay_barriers": "always"}'`).
-    #[arg(long, value_name = "JSON")]
+    /// The executor group as JSON (`'{"replay": {"enabled": true}}'`).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub executor_config: Option<String>,
-
-    /// The memory group as JSON (`'{"memory_fraction": 0.75, "kv_capacity": 4096, "slots": "200"}'`).
-    #[arg(long, value_name = "JSON")]
+    /// The memory group as JSON (`'{"fraction": 0.75}'`).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub memory_config: Option<String>,
-
-    /// The sampling group as JSON (`'{"temperature": 0.7, "top_p": 0.9, "max_tokens": 256}'`; vLLM's name).
-    #[arg(long, value_name = "JSON")]
+    /// The generation group as JSON (`'{"temperature": 0.7, "top_p": 0.9, "max_tokens": 256}'`; vLLM's name).
+    #[arg(long, value_name = "JSON", hide = true)]
     pub generation_config: Option<String>,
+    /// The weights group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub weights_config: Option<String>,
+    /// The context group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub context_config: Option<String>,
+    /// The scheduler group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub scheduler_config: Option<String>,
+    /// The prefill group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub prefill_config: Option<String>,
+    /// The reasoning group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub reasoning_config: Option<String>,
+    /// The prompt group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub prompt_config: Option<String>,
+    /// The kernels group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub kernels_config: Option<String>,
+    /// The backend group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub backend_config: Option<String>,
+    /// The models group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub models_config: Option<String>,
+    /// The diagnostics group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub diagnostics_config: Option<String>,
+    /// The server group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub server_config: Option<String>,
+    /// The bench group as JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    pub bench_config: Option<String>,
 
-    /// The speculative body by name (`speculative.method`): `none`, `dspark`,
-    /// `mtp`, `dflash` (Qwen4-exp's block drafter), or `auto` — the family's
-    /// own drafter when one is at hand. `--dspark` and `--mtp` override it.
-    #[arg(long, value_name = "METHOD")]
-    pub speculate: Option<String>,
-
-    /// LFM2: the speculative body (`speculative.method = dspark`): a DSpark
-    /// drafter proposes a block per round, the target verifies it in one
-    /// pass. Loads the newest LFM2.5-2.6B-DSpark snapshot in the HF cache,
-    /// or `--draft-dir`.
-    #[arg(long)]
+    /// LFM2: the DSpark speculative body (`speculative.method = dspark`).
+    #[arg(long, hide = true)]
     pub dspark: bool,
 
-    /// The block drafter's checkpoint directory (`speculative.drafter`): LFM2's
-    /// DSpark under `--dspark`, Qwen4-exp's DFlash under `--speculate dflash`.
-    #[arg(long, value_name = "DIR")]
-    pub draft_dir: Option<PathBuf>,
-
-    /// Under `--dspark` (LFM2) or `--speculate dflash` (Qwen4-exp): propose
-    /// this many positions per round (default: LFM2 the block, 9; Qwen4-exp
-    /// 3 of its 7), clamped to the block (`speculative.k`).
-    #[arg(long)]
-    pub dspark_k: Option<usize>,
-
-    /// Qwen4-exp: the GGUF carrying the MTP head (`blk.{n_layers}.*` +
-    /// `nextn.*`, the sidecar `qwen4exp-mtp-quantize write` produces);
-    /// `speculative.method = mtp`, `speculative.drafter`.
-    #[arg(long, value_name = "GGUF")]
+    /// Qwen4-exp: the MTP head's sidecar GGUF (`speculative.method = mtp`, `speculative.model`).
+    #[arg(long, value_name = "GGUF", hide = true)]
     pub mtp: Option<PathBuf>,
-
-    /// Qwen4-exp `--mtp`: tokens the drafter proposes per round (`speculative.k`).
-    #[arg(long)]
-    pub mtp_k: Option<usize>,
-
-    /// One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`).
-    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
-    pub set: Vec<String>,
 
     #[command(flatten)]
     pub options: crate::options::EngineOptionsArgs,
 }
 
-/// Resolve the option tree from `common`: defaults < env aliases <
-/// `--config` < `--<group>-config` < `--set` < flags; every group's refusals
-/// checked once at the end. The tuning knobs are installed into both library
-/// crates here — before the device or the model exists, so every `OnceLock`
-/// read site takes them.
-pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
-    let o = resolve_options_uninstalled(common)?;
+impl CommonArgs {
+    /// The `--<group>-config` flags given, in the order they apply: the
+    /// group, its JSON, and the storage group its older keys fall back to.
+    fn group_configs(&self) -> Vec<(&'static str, &String, Option<&'static str>)> {
+        [
+            ("decode", &self.decode_config, None),
+            ("tuning", &self.tuning_config, None),
+            ("model", &self.model_config, None),
+            ("speculative", &self.speculative_config, None),
+            ("executor", &self.executor_config, None),
+            ("memory", &self.memory_config, None),
+            ("generation", &self.generation_config, Some("sampling")),
+            ("weights", &self.weights_config, None),
+            ("context", &self.context_config, None),
+            ("scheduler", &self.scheduler_config, None),
+            ("prefill", &self.prefill_config, None),
+            ("reasoning", &self.reasoning_config, None),
+            ("prompt", &self.prompt_config, None),
+            ("kernels", &self.kernels_config, None),
+            ("backend", &self.backend_config, None),
+            ("models", &self.models_config, None),
+            ("diagnostics", &self.diagnostics_config, None),
+            ("server", &self.server_config, None),
+            ("bench", &self.bench_config, None),
+        ]
+        .into_iter()
+        .filter_map(|(g, j, f)| j.as_ref().map(|j| (g, j, f)))
+        .collect()
+    }
+
+    /// Whether `--set` names `key` by any of its spellings.
+    pub fn sets(&self, key: &str) -> bool {
+        let idx = crate::option_tree::index();
+        self.set.iter().any(|kv| {
+            lloom_tensor::options::split_assignment(kv)
+                .ok()
+                .and_then(|(k, _)| idx.key_of(k))
+                .is_some_and(|k| k.path == key)
+        })
+    }
+}
+
+/// A subcommand's own flags (the groups only it flattens), applied as the
+/// top layer beside the common flags.
+pub type FrontFlags<'a> = &'a dyn Fn(&mut crate::EngineOptions) -> std::result::Result<(), String>;
+
+/// No subcommand flags.
+pub fn no_front(_: &mut crate::EngineOptions) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+/// The process environment, for the env layer.
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Resolve the option tree from `common`: defaults < env (the legacy names,
+/// then `LLOOM_<KEY>`) < `--config` < `--<group>-config` < `--set` < flags;
+/// every refusal checked once at the end. The tuning is installed into
+/// both library crates here — before the device or the model exists, so
+/// every `OnceLock` read site takes it.
+pub fn resolve_options(common: &CommonArgs, front: FrontFlags<'_>) -> Result<crate::EngineOptions> {
+    let o = resolve_options_uninstalled(common, front)?;
     o.tuning.install().map_err(|e| anyhow::anyhow!("{e}"))?;
     eprintln!("[contract: {}]", lloom_tensor::tuning::contract().report());
     Ok(o)
 }
 
-/// [`resolve_options`] without installing the tuning knobs (`lloom config`,
-/// `lloom knobs`, the tests — nothing that goes on to load a model).
-pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineOptions> {
+/// [`resolve_options`] without installing the tuning (`lloom config`,
+/// `lloom options`, the tests — nothing that goes on to load a model).
+pub fn resolve_options_uninstalled(
+    common: &CommonArgs,
+    front: FrontFlags<'_>,
+) -> Result<crate::EngineOptions> {
+    Ok(resolve_layers(common, front, &process_env, false)?.0)
+}
+
+/// One layer's effect: its label and the keys it moved, with their values.
+pub type Layer = (
+    String,
+    std::collections::BTreeMap<String, serde_json::Value>,
+);
+
+/// The layers, applied in order; with `trace` each one's moves are kept
+/// (`lloom config --explain`).
+pub fn resolve_layers(
+    common: &CommonArgs,
+    front: FrontFlags<'_>,
+    env: &dyn Fn(&str) -> Option<String>,
+    trace: bool,
+) -> Result<(crate::EngineOptions, Vec<Layer>)> {
+    let idx = crate::option_tree::index();
     let mut o = crate::EngineOptions::default();
-    o.from_env().map_err(|e| anyhow::anyhow!("env: {e}"))?;
+    let mut layers: Vec<Layer> = Vec::new();
+    let mut last = if trace {
+        idx.flat(&o)
+    } else {
+        Default::default()
+    };
+    let mut mark = |label: &str, o: &crate::EngineOptions| {
+        if !trace {
+            return;
+        }
+        let now = idx.flat(o);
+        let moved = now
+            .iter()
+            .filter(|(k, v)| last.get(*k) != Some(*v))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if !moved.is_empty() {
+            layers.push((label.to_string(), moved));
+        }
+        last = now;
+    };
+    o.from_env_with(env)
+        .map_err(|e| anyhow::anyhow!("env: {e}"))?;
+    mark("env", &o);
     if let Some(path) = &common.config {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading --config {}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("--config {}: not JSON", path.display()))?;
-        o.merge_json(&v)
+        idx.merge(&mut o, &v)
             .map_err(|e| anyhow::anyhow!("--config {}: {e}", path.display()))?;
+        mark(&format!("--config {}", path.display()), &o);
     }
-    if let Some(json) = &common.decode_config {
+    for (group, json, fallback) in common.group_configs() {
         let v: serde_json::Value =
-            serde_json::from_str(json).context("--decode-config: not JSON")?;
-        o.decode
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--decode-config: {e}"))?;
-    }
-    if let Some(json) = &common.tuning_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--tuning-config: not JSON")?;
-        o.tuning
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--tuning-config: {e}"))?;
-    }
-    if let Some(json) = &common.model_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--model-config: not JSON")?;
-        o.model
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--model-config: {e}"))?;
-    }
-    if let Some(json) = &common.speculative_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--speculative-config: not JSON")?;
-        o.speculative
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--speculative-config: {e}"))?;
-    }
-    if let Some(json) = &common.executor_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--executor-config: not JSON")?;
-        o.executor
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--executor-config: {e}"))?;
-    }
-    if let Some(json) = &common.memory_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--memory-config: not JSON")?;
-        o.memory
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--memory-config: {e}"))?;
-    }
-    if let Some(json) = &common.generation_config {
-        let v: serde_json::Value =
-            serde_json::from_str(json).context("--generation-config: not JSON")?;
-        o.sampling
-            .merge_json(&v)
-            .map_err(|e| anyhow::anyhow!("--generation-config: {e}"))?;
+            serde_json::from_str(json).with_context(|| format!("--{group}-config: not JSON"))?;
+        idx.merge_group(&mut o, group, &v, fallback)
+            .map_err(|e| anyhow::anyhow!("--{group}-config: {e}"))?;
+        mark(&format!("--{group}-config"), &o);
     }
     for kv in &common.set {
-        let (k, v) = lloom_tensor::options::split_assignment(kv).map_err(|e| anyhow::anyhow!("--set {e}"))?;
-        o.set(k, v).map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
+        let (k, v) = lloom_tensor::options::split_assignment(kv)
+            .map_err(|e| anyhow::anyhow!("--set {e}"))?;
+        idx.set(&mut o, k, v)
+            .map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
+        mark(&format!("--set {k}"), &o);
     }
     common
         .options
         .apply(&mut o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    front(&mut o).map_err(|e| anyhow::anyhow!("{e}"))?;
     // The speculation shorthands (the harnesses' spellings), over the group.
     if common.dspark && common.mtp.is_some() {
-        anyhow::bail!("--dspark is LFM2's drafter and --mtp Qwen4-exp's; one speculative body per run");
-    }
-    if let Some(m) = &common.speculate {
-        o.speculative.method =
-            crate::options::parse_method(m).map_err(|e| anyhow::anyhow!("--speculate: {e}"))?;
+        anyhow::bail!(
+            "--dspark is LFM2's drafter and --mtp Qwen4-exp's; one speculative body per run"
+        );
     }
     if common.dspark {
         o.speculative.method = "dspark".into();
-    }
-    if let Some(dir) = &common.draft_dir {
-        o.speculative.drafter = Some(dir.clone());
-    }
-    if let Some(k) = common.dspark_k {
-        o.speculative.k = Some(k);
     }
     if let Some(path) = &common.mtp {
         o.speculative.method = "mtp".into();
         o.speculative.drafter = Some(path.clone());
     }
-    if let Some(k) = common.mtp_k {
-        o.speculative.k = Some(k);
-    }
+    mark("flags", &o);
     o.check().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(o)
+    Ok((o, layers))
 }
 
-/// `lloom config`: the resolved option tree as JSON — every knob with the
-/// value this invocation would run, in the shape `--config` reads back. Not
-/// `ConfigArgs`: clap names an argument group after its struct, and the
-/// model group flattens `lfm2::ConfigArgs` into this one.
+/// `lloom config`: the resolved option tree as JSON — every key with the
+/// value this invocation would run, in the shape `--config` reads back.
 #[derive(Parser)]
-#[command(name = "lloom config", about = "Print the resolved option tree as JSON")]
+#[command(name = "lloom config", about = "Print the resolved option tree as JSON", after_help = OPTIONS_HELP)]
 pub struct ConfigCmdArgs {
+    /// Print, beside the tree, where each value that is not its default
+    /// came from, and what the couplings resolve.
+    #[arg(long)]
+    pub explain: bool,
+    /// Print the storage tree (the groups' own shape) instead of the keys.
+    #[arg(long, hide = true)]
+    pub storage: bool,
     #[command(flatten)]
     pub common: CommonArgs,
+    #[command(flatten)]
+    pub front: FrontArgs,
 }
 
-/// `lloom knobs`: every knob of every group — key, flag, env alias, type,
-/// arms, the default, the doc — one line each.
-pub fn print_knobs() -> Result<()> {
-    let defaults = crate::EngineOptions::default();
-    let value = serde_json::to_value(&defaults)?;
-    let mut rows = lloom_tensor::options::rows("", crate::EngineOptions::META, &value);
-    // The model axes come from `lfm2::Config`'s own derive: one row each,
-    // the default rendered from a default config.
-    let probe = lloom::models::lfm2::Config::default();
-    let line = probe.axes_line();
-    for m in lloom::models::lfm2::Config::AXES_META {
-        let value = line
-            .split(' ')
-            .find_map(|kv| kv.strip_prefix(&format!("{}=", m.ty)))
-            .unwrap_or("")
-            .to_string();
-        rows.push(lloom_tensor::options::KnobRow {
-            key: format!("model.axes.{}", m.key),
-            flag: format!("--{}", m.flag),
-            env: None,
-            ty: m.ty,
-            variants: m.variants,
-            doc: m.doc,
-            value,
-        });
+/// The groups the front-ends flatten, all at once (`lloom config`).
+#[derive(Args, Clone, Debug, Default)]
+pub struct FrontArgs {
+    #[command(flatten)]
+    pub scheduler: crate::options::SchedulerConfigArgs,
+    #[command(flatten)]
+    pub prefix: crate::options::PrefixConfigArgs,
+    #[command(flatten)]
+    pub reasoning: crate::options::ReasoningConfigArgs,
+    #[command(flatten)]
+    pub prompt: crate::options::PromptConfigArgs,
+    #[command(flatten)]
+    pub report: crate::options::ReportConfigArgs,
+    #[command(flatten)]
+    pub server: crate::options::ServerConfigArgs,
+    #[command(flatten)]
+    pub bench: crate::options::BenchConfigArgs,
+}
+
+impl FrontArgs {
+    pub fn apply(&self, o: &mut crate::EngineOptions) -> std::result::Result<(), String> {
+        self.scheduler.apply(&mut o.scheduler)?;
+        self.prefix.apply(&mut o.prefix)?;
+        self.reasoning.apply(&mut o.reasoning)?;
+        self.prompt.apply(&mut o.prompt)?;
+        self.report.apply(&mut o.report)?;
+        self.server.apply(&mut o.server)?;
+        self.bench.apply(&mut o.bench)
     }
-    for r in rows {
-        let env = r.env.map(|e| format!(" env={e}")).unwrap_or_default();
-        let arms = if r.variants.is_empty() {
-            String::new()
+}
+
+/// `lloom config`.
+pub fn print_config(args: &ConfigCmdArgs) -> Result<()> {
+    let front = |o: &mut crate::EngineOptions| args.front.apply(o);
+    let (o, layers) = resolve_layers(&args.common, &front, &process_env, args.explain)?;
+    let idx = crate::option_tree::index();
+    if args.storage {
+        println!("{}", serde_json::to_string_pretty(&o)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&idx.render(&o))?);
+    }
+    if args.explain {
+        let defaults = idx.flat(&crate::EngineOptions::default());
+        let mut from: std::collections::BTreeMap<String, (String, serde_json::Value)> =
+            Default::default();
+        for (label, moved) in &layers {
+            for (k, v) in moved {
+                from.insert(k.clone(), (label.clone(), v.clone()));
+            }
+        }
+        eprintln!("[explain: the values that are not their default, and the layer that set them]");
+        for (k, (label, v)) in &from {
+            if defaults.get(k) != Some(v) {
+                eprintln!("{k} = {}  <- {label}", lloom_tensor::options::render(v));
+            }
+        }
+        eprintln!("[explain: what the couplings resolve]");
+        for line in crate::couplings::explain(&o) {
+            eprintln!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `lloom options` (alias `knobs`): every key of the tree, or one group's.
+#[derive(Parser)]
+#[command(name = "lloom options", about = "List the option tree's keys", after_help = OPTIONS_HELP)]
+pub struct OptionsCmdArgs {
+    /// One group (`kernels`, `decode.readback`, …); every key when omitted.
+    pub group: Option<String>,
+    /// The keys acting on one data flow: token-out, host-feed-in, weights-in, commands-out, prompt-in, memory-return.
+    #[arg(long)]
+    pub flow: Option<String>,
+    /// The keys of one facet: source, produce, buffer, transport, signal, wait, lead, cadence, locality, consume, qos, liveness.
+    #[arg(long)]
+    pub facet: Option<String>,
+    /// The keys of one status: stable, advanced, arm, reference, instrument.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Each key's internal notes (its references), its legacy spellings and its couplings.
+    #[arg(long)]
+    pub internal: bool,
+    /// Print the JSON Schema of the tree instead, generated from the same declarations.
+    #[arg(long)]
+    pub schema: bool,
+}
+
+/// `lloom options`.
+pub fn print_options(args: &OptionsCmdArgs) -> Result<()> {
+    if args.schema {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::option_schema::schema())?
+        );
+        return Ok(());
+    }
+    if let Some(s) = &args.status {
+        if lloom_tensor::options::Status::parse(s).is_none() {
+            anyhow::bail!("--status {s}: stable | advanced | arm | reference | instrument");
+        }
+    }
+    let idx = crate::option_tree::index();
+    let defaults = idx.flat(&crate::EngineOptions::default());
+    let group = args.group.as_deref().unwrap_or("");
+    if !group.is_empty() && idx.keys_under(group).next().is_none() {
+        anyhow::bail!("no key under `{group}`");
+    }
+    let mut shown = 0usize;
+    for k in idx.keys_under(group) {
+        let m = k.meta();
+        if let Some(f) = &args.flow {
+            if !m.flows.contains(&f.as_str()) {
+                continue;
+            }
+        }
+        if let Some(f) = &args.facet {
+            if !m.facets.contains(&f.as_str()) {
+                continue;
+            }
+        }
+        if let Some(s) = &args.status {
+            if m.status.name() != s {
+                continue;
+            }
+        }
+        shown += 1;
+        let flag = match k.cli() {
+            Some(c) => format!("--{c}"),
+            None => "-".to_string(),
+        };
+        let value = if k.compound.is_some() {
+            "(shorthand)".to_string()
         } else {
-            format!(" arms=[{}]", r.variants.join(", "))
+            lloom_tensor::options::render(defaults.get(&k.path).unwrap_or(&serde_json::Value::Null))
+        };
+        let arms = if m.forms.is_empty() {
+            m.variants.join("|")
+        } else {
+            format!("{} of {}", m.forms.join("|"), m.schema)
         };
         println!(
-            "{key}  {flag} ({ty}) default={value}{env}{arms}\n    {doc}",
-            key = r.key,
-            flag = r.flag,
-            ty = r.ty,
-            value = r.value,
-            doc = r.doc,
+            "{key}  [{status}]  {flag}  default={value}{arms}",
+            key = k.path,
+            status = m.status.name(),
+            arms = if arms.is_empty() {
+                String::new()
+            } else {
+                format!("  ({arms})")
+            },
         );
+        println!("    {}", m.doc);
+        if args.internal {
+            if m.internal != m.doc && !m.internal.is_empty() {
+                println!("    internal: {}", m.internal);
+            }
+            let legacy: Vec<String> = k
+                .flags()
+                .into_iter()
+                .chain(k.legacy_env().into_iter().map(|e| format!("${e}")))
+                .chain(k.legacy_keys())
+                .collect();
+            println!("    env: {}  spellings: {}", k.env(), legacy.join(" "));
+            if !m.facets.is_empty() || !m.flows.is_empty() {
+                println!(
+                    "    facets: {}  flows: {}",
+                    m.facets.join(","),
+                    m.flows.join(",")
+                );
+            }
+            let c = crate::couplings::of(&k.path);
+            if !c.is_empty() {
+                println!("    couplings: {}", c.join(", "));
+            }
+        }
     }
+    eprintln!("[{shown} keys]");
     Ok(())
 }
 
@@ -470,8 +609,9 @@ pub enum Command {
     Bench(serve::BenchArgs),
     /// Print the resolved option tree (the layers applied) as JSON.
     Config(ConfigCmdArgs),
-    /// List every knob: key, flag, env alias, default, arms, doc.
-    Knobs,
+    /// List the option tree: key, status, flag, default, description.
+    #[command(alias = "knobs")]
+    Options(OptionsCmdArgs),
 }
 
 /// The `lloom` binary's entry.
@@ -481,12 +621,8 @@ pub fn main(argv: Vec<String>) -> Result<()> {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Bench(args) => serve::bench(args),
-        Command::Config(args) => {
-            let o = resolve_options_uninstalled(&args.common)?;
-            println!("{}", serde_json::to_string_pretty(&o)?);
-            Ok(())
-        }
-        Command::Knobs => print_knobs(),
+        Command::Config(args) => print_config(&args),
+        Command::Options(args) => print_options(&args),
     }
 }
 
@@ -497,6 +633,8 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
     argv.insert(1.min(argv.len()), "serve".to_string());
     main(argv)
 }
+#[cfg(test)]
+mod spellings_tests;
 
 #[cfg(test)]
 mod option_layer_tests {
@@ -546,17 +684,22 @@ mod option_layer_tests {
             "decode.readback.kind=ring",
             "--in-flight",
             "7",
-        ]))
+        ]), &no_front)
         .unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain, "from the file");
         assert_eq!(o.decode.readback.lookahead, 0, "from the file");
         assert_eq!(o.decode.readback.wake_cadence, 2, "from --decode-config");
         assert_eq!(o.decode.readback.kind, ReadbackKind::Ring, "from --set");
         assert_eq!(o.decode.in_flight, 7, "the flag wins over --set over the json over the file");
-        // The dump is a valid --config that reproduces the tree.
+        // The dump (`lloom config`'s tree) is a valid --config that
+        // reproduces the options.
         let dumped = dir.join("dump.json");
-        std::fs::write(&dumped, serde_json::to_string_pretty(&o).unwrap()).unwrap();
-        let back = resolve_options_uninstalled(&common(&["--config", dumped.to_str().unwrap()])).unwrap();
+        std::fs::write(
+            &dumped,
+            serde_json::to_string_pretty(&crate::option_tree::index().render(&o)).unwrap(),
+        )
+        .unwrap();
+        let back = resolve_options_uninstalled(&common(&["--config", dumped.to_str().unwrap()]), &no_front).unwrap();
         assert_eq!(back, o);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -570,16 +713,16 @@ mod option_layer_tests {
             eprintln!("LLOOM_PROFILE is set; the default is not observable here");
             return;
         }
-        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.tuning.contract.profile, "fast");
         assert_eq!(o.tuning.tensor().contract.profile, "fast");
-        let o = resolve_options_uninstalled(&common(&["--profile", "deterministic"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--profile", "deterministic"]), &no_front).unwrap();
         assert_eq!(o.tuning.tensor().contract.profile, "deterministic");
         assert!(
-            resolve_options_uninstalled(&common(&["--set", "tuning.contract.profile=relaxed"]))
+            resolve_options_uninstalled(&common(&["--set", "tuning.contract.profile=relaxed"]), &no_front)
                 .is_err()
         );
-        let o = resolve_options_uninstalled(&common(&["--gpu-profile"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--gpu-profile"]), &no_front).unwrap();
         assert!(o.tuning.instrument.profile);
         assert_eq!(o.tuning.contract.profile, "fast");
     }
@@ -587,7 +730,7 @@ mod option_layer_tests {
     #[test]
     fn a_refused_combination_names_itself() {
         // The blocking arm ignores the cadence knobs rather than refusing them.
-        let o = resolve_options_uninstalled(&common(&["--readback", "blocking", "--adaptive-commit"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "blocking", "--adaptive-commit"]), &no_front).unwrap();
         assert_eq!(o.decode.readback.arm(), crate::ReadbackArm::Blocking);
         // The EOS gate defaults on and rides the adaptive commit: every
         // fixed-cadence route serves without it rather than being refused.
@@ -598,14 +741,14 @@ mod option_layer_tests {
             &["--readback", "ring-fixed"],
             &["--lookahead", "0"],
         ] {
-            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            let o = resolve_options_uninstalled(&common(argv), &no_front).unwrap();
             assert!(o.decode.readback.eos_gate, "{argv:?}");
             assert!(!o.decode.readback.ring_arm().adaptive, "{argv:?}");
         }
         // `ring` (the flag EOS read) resolves to the fixed cadence, and the
         // clamp note names the EOS gate that goes off with the commit.
         for argv in [&["--readback", "ring"][..], &["--readback", "ring", "--eos-gate"]] {
-            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            let o = resolve_options_uninstalled(&common(argv), &no_front).unwrap();
             assert!(
                 o.decode.readback.adaptive_clamp().is_some_and(|n| n.contains("EOS gate")),
                 "{argv:?}"
@@ -613,13 +756,13 @@ mod option_layer_tests {
             assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
         }
         // The stream reader streams every ring arm, the flag read included.
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"]), &no_front).unwrap();
         assert!(o.decode.readback.stream_reader);
-        let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]))
+        let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]), &no_front)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown key `nope`"), "{err}");
-        let err = resolve_options_uninstalled(&common(&["--set", "decode.readback"]))
+        assert!(err.contains("unknown key `decode.nope`"), "{err}");
+        let err = resolve_options_uninstalled(&common(&["--set", "decode.readback"]), &no_front)
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected key=value"), "{err}");
@@ -631,13 +774,14 @@ mod option_layer_tests {
     #[test]
     fn the_replay_executor_takes_the_eos_gate_off_at_load() {
         let shape = |argv: &[&str]| {
-            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            let o = resolve_options_uninstalled(&common(argv), &no_front).unwrap();
             Shape {
                 decode: o.decode,
                 model: o.model,
                 speculative: o.speculative,
                 executor: o.executor,
                 memory: o.memory,
+                sampling: o.sampling,
                 reuse_prefix: false,
                 seed_text: String::new(),
                 batch: 1,
@@ -666,15 +810,15 @@ mod option_layer_tests {
 
     #[test]
     fn the_shorthands_are_lfm2_chats() {
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-gpubatch-nonblocking"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-gpubatch-nonblocking"]), &no_front).unwrap();
         assert_eq!(o.decode.readback.kind, ReadbackKind::Ring);
         assert_eq!(o.decode.readback.eos, EosKind::GpuBatchedNonblocking);
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-la0"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-la0"]), &no_front).unwrap();
         assert_eq!(o.decode.readback.lookahead, 0);
         assert!(!o.decode.readback.adaptive_commit);
         // The compound and its keys compose in either order: the spelling
         // sets kind + eos, the key flags override field by field.
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"]), &no_front).unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain);
         assert_eq!(o.decode.readback.lookahead, 0);
     }
@@ -708,7 +852,7 @@ mod model_group_tests {
             "model.kv-append=paged",
             "--model-config",
             r#"{"axes": {"qkv-layout": "fused"}}"#,
-        ]))
+        ]), &no_front)
         .unwrap();
         assert_eq!(o.model.cache, "crown");
         assert_eq!(o.model.axes.get("attn").map(String::as_str), Some("flash"));
@@ -744,7 +888,7 @@ mod model_group_tests {
             ),
             (vec!["--kv-quant", "off"], KvQuant::Off),
         ] {
-            let o = resolve_options_uninstalled(&common(&argv)).unwrap();
+            let o = resolve_options_uninstalled(&common(&argv), &no_front).unwrap();
             let mut cfg = Config::default();
             o.model.apply_axes(&mut cfg).unwrap();
             assert_eq!(cfg.kv_quant, want, "{argv:?}");
@@ -755,7 +899,7 @@ mod model_group_tests {
                 cfg.axes_line()
             );
         }
-        let err = resolve_options_uninstalled(&common(&["--kv-quant", "int9"]))
+        let err = resolve_options_uninstalled(&common(&["--kv-quant", "int9"]), &no_front)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--kv-quant"), "{err}");
@@ -763,18 +907,18 @@ mod model_group_tests {
 
     #[test]
     fn a_bad_axis_or_preset_is_refused_at_parse() {
-        let err = resolve_options_uninstalled(&common(&["--attn", "bogus"]))
+        let err = resolve_options_uninstalled(&common(&["--attn", "bogus"]), &no_front)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--attn"), "{err}");
-        let err = resolve_options_uninstalled(&common(&["--cache", "shiny"]))
+        let err = resolve_options_uninstalled(&common(&["--cache", "shiny"]), &no_front)
             .unwrap_err()
             .to_string();
         assert!(err.contains("cache:"), "{err}");
-        let err = resolve_options_uninstalled(&common(&["--set", "model.nope=1"]))
+        let err = resolve_options_uninstalled(&common(&["--set", "model.nope=1"]), &no_front)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown axis `nope`"), "{err}");
+        assert!(err.contains("unknown key `model.nope`"), "{err}");
     }
 }
 
@@ -812,7 +956,7 @@ mod sampling_and_speculation_tests {
             "0.05",
             "--logit-bias",
             "42:-100, 7:2.5",
-        ]))
+        ]), &no_front)
         .unwrap();
         let p = o
             .sampling
@@ -833,14 +977,14 @@ mod sampling_and_speculation_tests {
             r#"{"presence_penalty": 1.0, "logit_bias": {"3": -5}}"#,
             "--set",
             "sampling.min_p=0.2",
-        ]))
+        ]), &no_front)
         .unwrap();
         let p = o.sampling.processors();
         assert_eq!(
             (p.presence_penalty, p.min_p, p.logit_bias.clone()),
             (1.0, 0.2, vec![(3, -5.0)])
         );
-        assert!(!resolve_options_uninstalled(&common(&[]))
+        assert!(!resolve_options_uninstalled(&common(&[]), &no_front)
             .unwrap()
             .sampling
             .processors()
@@ -858,7 +1002,7 @@ mod sampling_and_speculation_tests {
             ),
             (vec!["--logit-bias", "x:1"], "not a token id"),
         ] {
-            let e = resolve_options_uninstalled(&common(&argv))
+            let e = resolve_options_uninstalled(&common(&argv), &no_front)
                 .unwrap_err()
                 .to_string();
             assert!(e.contains(name), "{argv:?}: {e}");
@@ -868,7 +1012,7 @@ mod sampling_and_speculation_tests {
             min_p: Some(0.1),
             ..Default::default()
         };
-        let mut s = resolve_options_uninstalled(&common(&["--min-p", "0.3"]))
+        let mut s = resolve_options_uninstalled(&common(&["--min-p", "0.3"]), &no_front)
             .unwrap()
             .sampling;
         s.apply_checkpoint(Some(&gc));
@@ -887,17 +1031,17 @@ mod sampling_and_speculation_tests {
 
     #[test]
     fn the_sampler_arms_follow_the_fields() {
-        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::TopP { p: 0.9, temperature: 0.7 });
         assert_eq!(o.sampling.max_tokens, 64);
         assert_eq!(o.sampling.seed, Some(7));
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-k", "40", "--top-p", "0.9"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-k", "40", "--top-p", "0.9"]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::TopKThenTopP { k: 40, p: 0.9, temperature: 0.7 });
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::GumbelSoftmax { temperature: 0.7 });
-        let o = resolve_options_uninstalled(&common(&["--generation-config", r#"{"temperature": 0.3, "stop": ["<|im_end|>", "\n\n"], "ignore_eos": true}"#])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--generation-config", r#"{"temperature": 0.3, "stop": ["<|im_end|>", "\n\n"], "ignore_eos": true}"#]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::All { temperature: 0.3 });
         assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
         let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
@@ -920,19 +1064,19 @@ mod sampling_and_speculation_tests {
 
     #[test]
     fn the_speculation_shorthands_fill_the_group() {
-        let o = resolve_options_uninstalled(&common(&["--dspark", "--dspark-k", "3"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--dspark", "--dspark-k", "3"]), &no_front).unwrap();
         assert_eq!(o.speculative.method, "dspark");
         assert_eq!(o.speculative.k, Some(3));
         assert_eq!(o.speculative.drafter, None);
-        let o = resolve_options_uninstalled(&common(&["--mtp", "/tmp/mtp.gguf", "--mtp-k", "2"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--mtp", "/tmp/mtp.gguf", "--mtp-k", "2"]), &no_front).unwrap();
         assert_eq!(o.speculative.method, "mtp");
         assert_eq!(o.speculative.k, Some(2));
         assert_eq!(o.speculative.drafter.as_deref(), Some(std::path::Path::new("/tmp/mtp.gguf")));
-        let o = resolve_options_uninstalled(&common(&["--speculative-config", r#"{"method": "dspark", "k": 4, "drafter": "/d"}"#])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--speculative-config", r#"{"method": "dspark", "k": 4, "drafter": "/d"}"#]), &no_front).unwrap();
         assert_eq!((o.speculative.method.as_str(), o.speculative.k), ("dspark", Some(4)));
-        let err = resolve_options_uninstalled(&common(&["--dspark", "--mtp", "/x"])).unwrap_err().to_string();
+        let err = resolve_options_uninstalled(&common(&["--dspark", "--mtp", "/x"]), &no_front).unwrap_err().to_string();
         assert!(err.contains("one speculative body"), "{err}");
-        let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"])).unwrap_err().to_string();
+        let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"]), &no_front).unwrap_err().to_string();
         assert!(err.contains("not a speculation method"), "{err}");
     }
 }
@@ -975,7 +1119,7 @@ mod executor_and_memory_tests {
             "200",
             "--kv-reserve-tokens",
             "1024",
-        ]))
+        ]), &no_front)
         .unwrap();
         assert!(o.executor.replay && o.executor.pass_plans && !o.executor.arena);
         assert_eq!(o.executor.arena_layout, "non-aliasing");
@@ -990,18 +1134,18 @@ mod executor_and_memory_tests {
         assert_eq!(o.memory.free_budget_mb, Some(512));
         assert_eq!(o.memory.slots, "200");
         assert_eq!(o.memory.kv_reserve_tokens, Some(1024));
-        let err = resolve_options_uninstalled(&common(&["--arena-layout", "loose"]))
+        let err = resolve_options_uninstalled(&common(&["--arena-layout", "loose"]), &no_front)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not an arena layout"), "{err}");
-        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=true");
-        let o = resolve_options_uninstalled(&common(&["--pass-plans", "false"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--pass-plans", "false"]), &no_front).unwrap();
         assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=false");
-        let o = resolve_options_uninstalled(&common(&["--arena"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--arena"]), &no_front).unwrap();
         assert_eq!(o.executor.line(), "arena=packed packed=false replay=off pass_plans=false");
         // The layout selects the plans' layout too, and the line says so.
-        let o = resolve_options_uninstalled(&common(&["--arena-layout", "non-aliasing"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--arena-layout", "non-aliasing"]), &no_front).unwrap();
         assert_eq!(
             o.executor.line(),
             "arena=off packed=false replay=off pass_plans=true/non-aliasing"

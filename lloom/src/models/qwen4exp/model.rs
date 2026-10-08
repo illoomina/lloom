@@ -652,56 +652,7 @@ struct CacheWindow {
     retained: (usize, usize),
 }
 
-/// Per-position values a forward retains for a drafter until it takes them:
-/// one `[1, rows, w]` part per pass, in position order.
-#[derive(Debug, Clone, Default)]
-struct RowLog {
-    parts: Vec<Tensor>,
-}
-
-impl RowLog {
-    fn push(&mut self, part: Tensor) {
-        self.parts.push(part);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.parts.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.parts.clear();
-    }
-
-    fn rows(&self) -> usize {
-        self.parts.iter().map(|t| t.dim(1).unwrap_or(0)).sum()
-    }
-
-    /// The retained rows concatenated along the sequence, `None` if none.
-    fn take(&mut self) -> Result<Option<Tensor>> {
-        let parts = std::mem::take(&mut self.parts);
-        match parts.len() {
-            0 => Ok(None),
-            1 => Ok(parts.into_iter().next()),
-            _ => Ok(Some(Tensor::cat(&parts, 1)?)),
-        }
-    }
-
-    /// Keep the first `rows` rows: whole parts, the last one narrowed.
-    fn keep_first(&mut self, rows: usize) -> Result<()> {
-        let mut left = rows;
-        let mut kept = Vec::with_capacity(self.parts.len());
-        for t in std::mem::take(&mut self.parts) {
-            if left == 0 {
-                break;
-            }
-            let n = t.dim(1)?;
-            kept.push(if n <= left { t } else { t.narrow(1, 0, left)? });
-            left -= n.min(left);
-        }
-        self.parts = kept;
-        Ok(())
-    }
-}
+use crate::nn::row_log::RowLog;
 
 /// The one-sequence, no-rewind shape (`No × One`): every channel and the
 /// KV the state's own, the standing window a snapshot.
@@ -1913,7 +1864,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             off("quant_mul", "the switch qwen4exp.shared_store is off");
         } else {
             // The switch runs the blocks whatever their measurement.
-            p.admit.extend(["quant_silu".to_string(), "quant_mul".to_string()]);
+            p.admit
+                .extend(["quant_silu".to_string(), "quant_mul".to_string()]);
         }
         if self.layers.iter().all(|l| !l.moe().f16_fuse()) {
             off("silu_mul_f16", "the switch qwen4exp.f16_fuse is off");
@@ -3799,7 +3751,11 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// (the fetch worker's fail-safe fired: no slot or no routing within its
     /// bound).
     #[cfg(feature = "metal")]
-    fn settle_fetch(&self, p: PendingFetch, cache: Option<&mut State<P>>) -> Result<Option<Tensor>> {
+    fn settle_fetch(
+        &self,
+        p: PendingFetch,
+        cache: Option<&mut State<P>>,
+    ) -> Result<Option<Tensor>> {
         let PendingFetch {
             records,
             pass,
@@ -4733,7 +4689,10 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
             let able = self.device().is_metal()
                 && provisional_on()
                 && self.device_plan
-                && self.layers.iter().any(|l| l.moe().experts().plans_on_device());
+                && self
+                    .layers
+                    .iter()
+                    .any(|l| l.moe().experts().plans_on_device());
             cache.provisional = match mode {
                 Provisional::Off => Provisional::Off,
                 Provisional::Settled if able => Provisional::Settled,
@@ -5579,13 +5538,13 @@ impl super::moe::PlanHook for JoinHook {
     }
 }
 
-/// `QWEN4EXP_REPLAY=device` (read once): a decode step that missed replays
+/// `weights.experts.replay_arming = device` (read once): a decode step that missed replays
 /// on the device plan, the plan staying armed (#849 D's base, #892's
 /// follow-up); the default replays on the host plan and disarms, as
 /// before — the maintainer decides the default on the numbers.
 fn replay_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_REPLAY").is_ok_and(|v| v == "device"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.replay == "device")
 }
 
 /// Whether a decode driver may take the device plan's settles
@@ -5700,12 +5659,12 @@ fn fetch_exit() -> usize {
     *N.get_or_init(|| crate::tuning::tuning().stream.fetch_exit.max(1))
 }
 
-/// `QWEN4EXP_PREDICT=hotlist` (read once): before a device-planned token
+/// `weights.experts.predict = hotlist` (read once): before a device-planned token
 /// the tiers stage the hotlist's experts not resident and the plan lands
 /// them (#849's D with the hotlist's prediction); off by default.
 fn predict_hot() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_PREDICT").is_ok_and(|v| v == "hotlist"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.predict == "hotlist")
 }
 
 /// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.

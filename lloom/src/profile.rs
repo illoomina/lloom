@@ -53,9 +53,114 @@ pub trait Rewind:
 }
 
 /// One sequence, or paged KV with row pools.
+///
+/// The axis selects a family's state type through [`Fork`]: a family names
+/// the two candidate types once, and `Pick<F>` is the one this axis takes,
+/// so a `State<P>` field typed `<P::Rows as Rows>::Pick<F>` holds exactly the
+/// selected arm — the other is not a field that allocates nothing, it is not
+/// a field (`profiles-and-memory-design.md` §3, §7.1).
 pub trait Rows: sealed::Rows + Copy + Default + std::fmt::Debug + Send + Sync + 'static {
     const NAME: &'static str;
     const PAGED: bool;
+    /// The arm of `F` this axis selects.
+    type Pick<F: Fork>: Picked<F>;
+    /// Build the selected arm: `one` on `One`, `paged` on `Paged`. The
+    /// unselected constructor is never called and compiles to nothing.
+    fn pick<F: Fork, E>(
+        one: impl FnOnce() -> std::result::Result<F::One, E>,
+        paged: impl FnOnce() -> std::result::Result<F::Paged, E>,
+    ) -> std::result::Result<Self::Pick<F>, E>;
+}
+
+/// A family's two candidate state types for the [`Rows`] axis: what a
+/// sequence's own store is, and what a row of a shared pool is. The axis
+/// picks one ([`Rows::Pick`]); generic code reads whichever it holds through
+/// [`Picked::arm`] — a `match` the monomorphization resolves to one arm, no
+/// `dyn`, no branch left at run time.
+pub trait Fork: 'static {
+    type One: Clone + std::fmt::Debug + Send + Sync + 'static;
+    type Paged: Clone + std::fmt::Debug + Send + Sync + 'static;
+}
+
+/// The selected arm, borrowed.
+pub enum Arm<'a, F: Fork> {
+    One(&'a F::One),
+    Paged(&'a F::Paged),
+}
+
+/// The selected arm, borrowed mutably.
+pub enum ArmMut<'a, F: Fork> {
+    One(&'a mut F::One),
+    Paged(&'a mut F::Paged),
+}
+
+/// What [`Rows::Pick`] holds: one arm of `F`, named by the axis.
+pub trait Picked<F: Fork>: Clone + std::fmt::Debug + Send + Sync + 'static {
+    fn arm(&self) -> Arm<'_, F>;
+    fn arm_mut(&mut self) -> ArmMut<'_, F>;
+}
+
+/// `One`'s pick: the sequence's own store.
+pub struct OneOf<F: Fork>(pub F::One);
+/// `Paged`'s pick: a row of the pool.
+pub struct PagedOf<F: Fork>(pub F::Paged);
+
+impl<F: Fork> Picked<F> for OneOf<F> {
+    #[inline]
+    fn arm(&self) -> Arm<'_, F> {
+        Arm::One(&self.0)
+    }
+    #[inline]
+    fn arm_mut(&mut self) -> ArmMut<'_, F> {
+        ArmMut::One(&mut self.0)
+    }
+}
+
+impl<F: Fork> Picked<F> for PagedOf<F> {
+    #[inline]
+    fn arm(&self) -> Arm<'_, F> {
+        Arm::Paged(&self.0)
+    }
+    #[inline]
+    fn arm_mut(&mut self) -> ArmMut<'_, F> {
+        ArmMut::Paged(&mut self.0)
+    }
+}
+
+impl<F: Fork> Clone for OneOf<F>
+where
+    F::One: Clone,
+{
+    fn clone(&self) -> Self {
+        OneOf(self.0.clone())
+    }
+}
+
+impl<F: Fork> Clone for PagedOf<F>
+where
+    F::Paged: Clone,
+{
+    fn clone(&self) -> Self {
+        PagedOf(self.0.clone())
+    }
+}
+
+impl<F: Fork> std::fmt::Debug for OneOf<F>
+where
+    F::One: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OneOf").field(&self.0).finish()
+    }
+}
+
+impl<F: Fork> std::fmt::Debug for PagedOf<F>
+where
+    F::Paged: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PagedOf").field(&self.0).finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -168,10 +273,26 @@ impl sealed::Rows for Paged {}
 impl Rows for One {
     const NAME: &'static str = "One";
     const PAGED: bool = false;
+    type Pick<F: Fork> = OneOf<F>;
+    #[inline]
+    fn pick<F: Fork, E>(
+        one: impl FnOnce() -> std::result::Result<F::One, E>,
+        _paged: impl FnOnce() -> std::result::Result<F::Paged, E>,
+    ) -> std::result::Result<Self::Pick<F>, E> {
+        one().map(OneOf)
+    }
 }
 impl Rows for Paged {
     const NAME: &'static str = "Paged";
     const PAGED: bool = true;
+    type Pick<F: Fork> = PagedOf<F>;
+    #[inline]
+    fn pick<F: Fork, E>(
+        _one: impl FnOnce() -> std::result::Result<F::One, E>,
+        paged: impl FnOnce() -> std::result::Result<F::Paged, E>,
+    ) -> std::result::Result<Self::Pick<F>, E> {
+        paged().map(PagedOf)
+    }
 }
 
 /// A profile: the three axes as one type parameter.
@@ -432,6 +553,15 @@ pub const QWEN4EXP: Bound = Bound {
     rewind: &["No", "Ring"],
     rows: &["One", "Paged"],
     except: &[PoolSpec::KEY, PoolSpecExact::KEY],
+};
+/// Qwen3.5 ships `No × One` (one sequence) and `Ring × One` (the MTP
+/// drafter's verify window over the generic decoder's per-layer state,
+/// `nn::decoder`); no rows.
+pub const QWEN3_5: Bound = Bound {
+    family: "qwen3_5",
+    rewind: &["No", "Ring"],
+    rows: &["One"],
+    except: &[],
 };
 /// Every shape Qwen4-exp can be instantiated at (`Ring × Paged` included:
 /// the harness's MTP over rows, `qwen4exp-chat --mtp --rows N`); the engine

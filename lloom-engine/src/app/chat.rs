@@ -23,7 +23,7 @@ use super::served::Served;
 use super::template::{Rejected, Unrenderable, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
 use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, DecodedImage};
-use super::{load_engine, ModelArgs, Shape};
+use super::{load_engine, Shape};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Map, Value};
@@ -33,91 +33,61 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(
     name = "lloom chat",
-    about = "Chat with a checkpoint on the lloom engine"
+    about = "Chat with a checkpoint on the lloom engine",
+    after_help = super::OPTIONS_HELP
 )]
 pub struct ChatArgs {
-    #[command(flatten)]
-    pub model: ModelArgs,
-
-    /// The option layers: `--config`, `--decode-config`, `--set`, and the
-    /// generated flags (`--readback`, `--lookahead`, `--commit-budget`, …).
-    /// `--readback auto` is `lloom serve`'s on both families: the flow on
-    /// LFM2 (the adaptive commit, the reader, the EOS gate — the forwards
-    /// past a turn's EOS write nothing, so the next turn extends the cache)
-    /// and the blocking arm on Qwen4-exp, where `--readback ring-fixed`
-    /// feeds the PLE from the host instead (faster while the streamed expert
-    /// pool holds the working set, slower while it misses).
-    /// `--readback ring-la0` is the ring without the lookahead, whose cache
-    /// also ends at the EOS.
+    /// The option layers (`--config`, `--set`, `--<group>-config`) and the
+    /// flags generated from the tree. `--readback auto` is `lloom serve`'s
+    /// on both families: the flow on LFM2 (the adaptive commit, the reader,
+    /// the EOS gate — the forwards past a turn's EOS write nothing, so the
+    /// next turn extends the cache) and the blocking arm on Qwen4-exp.
     #[command(flatten)]
     pub common: super::CommonArgs,
 
+    #[command(flatten)]
+    pub prefix: crate::options::PrefixConfigArgs,
+
+    #[command(flatten)]
+    pub reasoning: crate::options::ReasoningConfigArgs,
+
+    #[command(flatten)]
+    pub prompt_options: crate::options::PromptConfigArgs,
+
+    #[command(flatten)]
+    pub report: crate::options::ReportConfigArgs,
+
     /// A system message for the conversation.
-    #[arg(long)]
+    #[arg(long, help_heading = SESSION)]
     pub system: Option<String>,
 
-    /// Let the model think: the template's `enable_thinking` where it reads
-    /// one, and otherwise the thinking block its generation prompt opens
-    /// (LFM2.5's opens one on every turn). Refused where the prompt leaves no
-    /// block open and the template has no switch. Without `--think` or
-    /// `--no-think`, a template with the switch renders thinking off, so the
-    /// reply is the answer, and one without it renders as it does.
-    #[arg(long, conflicts_with = "no_think")]
-    pub think: bool,
-
-    /// Do not let the model think: the template's `enable_thinking=false`
-    /// where it reads one, and otherwise the engine closes the block the
-    /// generation prompt opens with the template's own end marker, so the
-    /// reply starts after an empty block.
-    #[arg(long)]
-    pub no_think: bool,
-
-    /// How long the model thinks: the chat template's `reasoning_effort`
-    /// (Qwen4-exp's: `low`, `medium`, `xhigh`, its default `xhigh`). The
-    /// values are the template's own, and so is the refusal of one it does
-    /// not accept. Refused, before the first turn, on a template that does
-    /// not read the variable (LFM2) or renders the same prompt for any value
-    /// of it (Qwen4-exp without `--think`).
-    #[arg(long, value_name = "EFFORT")]
-    pub reasoning_effort: Option<String>,
-
-    /// Re-prefill the whole conversation every turn instead of extending
-    /// the cache (a measurement arm).
-    #[arg(long)]
-    pub no_reuse: bool,
-
     /// One turn from the command line instead of the REPL, then exit.
-    #[arg(long, short = 'p')]
+    #[arg(long, short = 'p', help_heading = SESSION)]
     pub prompt: Option<String>,
 
     /// The prompt is already rendered: no chat template, the text encoded as
     /// given with the checkpoint's BOS — what a benchmark runner feeds, so a
     /// reply can be compared token for token.
-    #[arg(long)]
+    #[arg(long, help_heading = SESSION)]
     pub raw: bool,
 
     /// An image for the first message (PNG or JPEG), repeatable; in the REPL,
     /// `/image PATH` attaches one to the next message. A family or
     /// checkpoint without a vision tower refuses it by name.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help_heading = SESSION)]
     pub image: Vec<std::path::PathBuf>,
+}
 
-    /// Encode the prompt without the checkpoint's BOS (the template-off A/B:
-    /// LFM2's `generation_config.json` starts a sequence with it).
-    #[arg(long)]
-    pub no_bos: bool,
+const SESSION: &str = "Session";
 
-    /// Sample the memory gauges every 10 ms over each turn and print their
-    /// peaks (`MEMPEAK`): the device allocation, the pool's live / free /
-    /// pending bytes, the footprint. Off the hot thread.
-    #[arg(long)]
-    pub mem_sample: bool,
-
-    /// Print each turn's diagnostics: the first token's split, the visible
-    /// cadence, the hot thread and page faults, the churn, the lock
-    /// contention, the pacer's depth, the KV slab, the speculative rounds.
-    #[arg(long, short = 'v')]
-    pub verbose: bool,
+impl ChatArgs {
+    /// The chat's own flags, as the top layer.
+    pub fn front(&self, o: &mut crate::EngineOptions) -> std::result::Result<(), String> {
+        self.prefix.apply(&mut o.prefix)?;
+        self.reasoning.apply(&mut o.reasoning)?;
+        self.prompt_options.apply(&mut o.prompt)?;
+        self.report.apply(&mut o.report)
+    }
 }
 
 /// A turn-line value, `none` when unset.
@@ -247,50 +217,46 @@ fn check_thinking_budget(
 }
 
 pub fn run(args: ChatArgs) -> Result<()> {
-    if args.raw && args.reasoning_effort.is_some() {
+    let options = super::resolve_options(&args.common, &|o| args.front(o))?;
+    let want = options.reasoning.enabled;
+    let reasoning_effort = options.reasoning.effort.clone();
+    let add_bos = options.prompt.add_bos;
+    let verbose = options.report.verbose;
+    let mem_sample = options.report.memory_sample;
+    if args.raw && reasoning_effort.is_some() {
         anyhow::bail!(
             "--reasoning-effort sets a chat-template variable; --raw renders no template"
         );
     }
-    let want = match (args.think, args.no_think) {
-        (true, _) => Some(true),
-        (_, true) => Some(false),
-        _ => None,
-    };
     if args.raw && want.is_some() {
         anyhow::bail!(
             "--think / --no-think act on the chat template's prompt; --raw renders no template"
         );
     }
-    let options = super::resolve_options(&args.common)?;
     // After the tuning install: the trace switch is a tuning knob, and a knob
     // read before the install cannot be installed.
     report::arm_trace();
     // The chat's own default is a long turn; the group's 512 is the server's.
     let mut sampling = options.sampling.clone();
     if args.common.options.sampling.max_tokens.is_none()
-        && !args.common.set.iter().any(|s| s.starts_with("sampling.max_tokens"))
+        && !args.common.sets("generation.max_tokens")
         && sampling.max_tokens == 512
     {
         sampling.max_tokens = 1024;
     }
     let t = Instant::now();
-    let (engine, path) = load_engine(
-        &args.model,
-        Shape {
-            decode: options.decode.clone(),
-            model: options.model.clone(),
-            speculative: options.speculative.clone(),
-            executor: options.executor.clone(),
-            memory: options.memory.clone(),
-            reuse_prefix: !args.no_reuse,
-            seed_text: "The loom threads warp and weft into cloth. ".to_string(),
-            batch: 1,
-            mem_sample: false,
-            rows: "auto".to_string(),
-            share_prefix: false,
-        },
-    )?;
+    let mut shape = Shape::of(
+        &options,
+        true,
+        "The loom threads warp and weft into cloth. ".to_string(),
+    );
+    // One sequence; the memory probe is the turn's own (below).
+    shape.batch = 1;
+    shape.rows = "auto".to_string();
+    shape.share_prefix = false;
+    shape.mem_sample = false;
+    let reuse_prefix = shape.reuse_prefix;
+    let (engine, path) = load_engine(&options.load, shape)?;
     eprintln!(
         "[loaded {} from {} in {:.1}s on {:?}; readback={} reuse_prefix={} {}; load_warnings={}]",
         engine.model_name(),
@@ -298,7 +264,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         t.elapsed().as_secs_f64(),
         engine.device(),
         engine.readback().name(),
-        !args.no_reuse,
+        reuse_prefix,
         engine.describe(),
         lloom::load_warning::LoadWarning::line(&engine.load_warnings()),
     );
@@ -311,7 +277,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
     // reply is the answer; one without it renders as it does.
     let mut kwargs = Map::new();
     thinking::set_kwarg(engine.as_ref(), Some(want.unwrap_or(false)), &mut kwargs);
-    if let Some(effort) = &args.reasoning_effort {
+    if let Some(effort) = &reasoning_effort {
         kwargs.insert(REASONING_EFFORT.into(), json!(effort));
     }
     check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
@@ -326,7 +292,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         None => Vec::new(),
     };
     let prompt_mode = PromptMode::parse(&sampling.prompt_budget_mode);
-    let effort = args.reasoning_effort.as_deref().unwrap_or("default");
+    let effort = reasoning_effort.as_deref().unwrap_or("default");
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {
         messages.push(json!({ "role": "system", "content": sys }));
@@ -417,7 +383,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             expand_image_tokens(&rendered, &expansions)?
         };
-        let mut ids = engine.encode(&rendered, !args.no_bos)?;
+        let mut ids = engine.encode(&rendered, add_bos)?;
         let tags = engine.think_tags();
         let think: Option<Thinking> = if args.raw {
             None
@@ -449,7 +415,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 }
                 let fitted = budgets::fit_messages(&messages, k, ids.len(), |ms| {
                     let mut ids =
-                        engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, !args.no_bos)?;
+                        engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, add_bos)?;
                     thinking::apply(want, tags.as_ref(), &mut ids)
                         .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
                     Ok(ids)
@@ -466,6 +432,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         }
         let mut params =
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        params.logits_digest = options.decode.logits_digest;
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
             params.thinking =
@@ -474,14 +441,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
                     Err(why) => anyhow::bail!("--thinking-budget {n}: {why}"),
                 };
         }
-        let probe = report::RunProbe::start(engine.device(), args.mem_sample);
+        let probe = report::RunProbe::start(engine.device(), mem_sample);
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
         let mut first_device_allocated: Option<u64> = None;
         // One stamp a fragment at most, sized up front: the push never
         // allocates on the decode thread.
-        let mut stamps: Vec<f64> = Vec::with_capacity(if args.verbose { params.max_tokens + 1 } else { 0 });
-        let verbose = args.verbose;
+        let mut stamps: Vec<f64> =
+            Vec::with_capacity(if verbose { params.max_tokens + 1 } else { 0 });
         let device = engine.device().clone();
         // The terminal write happens on the sink's thread: this callback runs
         // on the decode thread, where a `write(2)` and the stdout lock per
@@ -519,7 +486,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -533,6 +500,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.commits,
             st.overrun,
             tokens_sha256(&decoded.tokens),
+            decoded.logits_sha256.as_deref().unwrap_or("-"),
             tokens_sha256(&ids),
             eos_gate_name(st.eos_gate),
             host_fill_name(st.host_feed.as_ref()),
@@ -587,7 +555,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 },
             );
         }
-        if args.verbose {
+        if verbose {
             eprintln!(
                 "[first-token: submit {:.2} ms (host encode, no GPU wait) | first fragment {} ms \
                  (received and detokenized, handed to the printer thread); tail after the loop {:.2} ms]",
@@ -622,7 +590,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             },
             engine.installed(),
             report::Wanted {
-                verbose: args.verbose,
+                verbose,
                 phase_sync: options.decode.phase_sync,
                 run_ahead: options.decode.readback.run_ahead,
             },

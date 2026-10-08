@@ -745,12 +745,12 @@ impl KvPool {
                 .append(slot, need - seq_len)
                 .map_err(lloom_tensor::Error::wrap)?;
         }
-        let out: Vec<u32> = {
-            let pages = g.pages.seq(slot).expect("a leased slot").pages();
-            (start..need)
-                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
-                .collect()
-        };
+        let out: Vec<u32> = g
+            .pages
+            .seq(slot)
+            .expect("a leased slot")
+            .cells(ps, start..need)
+            .collect();
         g.layers[layer].lens[slot] = need;
         Ok(out)
     }
@@ -831,9 +831,11 @@ impl KvPool {
                 None => return Ok(None),
             };
             let ps = g.page_size;
-            let pages = g.pages.seq(slot).expect("a leased slot").pages();
-            let ids: Vec<u32> = (0..len)
-                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
+            let ids: Vec<u32> = g
+                .pages
+                .seq(slot)
+                .expect("a leased slot")
+                .cells(ps, 0..len)
                 .collect();
             (pk, pv, ids)
         };
@@ -1416,6 +1418,31 @@ pub struct QsaAttention<P: Profile> {
     stem_cat: Option<QMatMul>,
 }
 
+/// What a gated-attention layer's blocks need of a family's config: the
+/// head geometry and the rotary embedding. A family builds one from its own
+/// config ([`From<&Config>`] is Qwen4-exp's).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttnGeometry {
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// The rotated dims, `head_dim · partial_rotary_factor`.
+    pub n_rot: usize,
+    pub rope_theta: f64,
+}
+
+impl From<&Config> for AttnGeometry {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            n_heads: cfg.n_heads,
+            n_kv_heads: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            n_rot: (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
+            rope_theta: cfg.rope_theta,
+        }
+    }
+}
+
 impl<P: Profile> QsaAttention<P> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1427,6 +1454,21 @@ impl<P: Profile> QsaAttention<P> {
         k_norm: RmsNorm,
         cfg: &Config,
     ) -> Self {
+        Self::with_geometry(wq, wk, wv, wo, q_norm, k_norm, &AttnGeometry::from(cfg))
+    }
+
+    /// [`Self::new`] from the geometry alone, for a family whose config is
+    /// not Qwen4-exp's: a dense gated GQA layer (no indexer).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_geometry(
+        wq: QMatMul,
+        wk: QMatMul,
+        wv: QMatMul,
+        wo: QMatMul,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
+        geo: &AttnGeometry,
+    ) -> Self {
         Self {
             profile: PhantomData,
             wq,
@@ -1435,11 +1477,11 @@ impl<P: Profile> QsaAttention<P> {
             wo,
             q_norm,
             k_norm,
-            n_heads: cfg.n_heads,
-            n_kv_heads: cfg.n_kv_heads,
-            head_dim: cfg.head_dim,
-            n_rot: (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
-            rope_theta: cfg.rope_theta,
+            n_heads: geo.n_heads,
+            n_kv_heads: geo.n_kv_heads,
+            head_dim: geo.head_dim,
+            n_rot: geo.n_rot,
+            rope_theta: geo.rope_theta,
             indexer: None,
             stem_cat: None,
         }
@@ -2993,6 +3035,20 @@ impl<P: Profile> QsaAttention<P> {
 /// ([`Indexer::visit_select`]); and the attention over keys that reach the
 /// 2-pass length is two launches.
 #[cfg(not(target_arch = "wasm32"))]
+/// The sparse attention as a level-0 block (`nn::blocks::Mixer`): one
+/// position is a decode step, more are a chunk (what `decode` computes
+/// position by position, up to fp32 reorder).
+impl<P: Profile> crate::nn::blocks::Mixer for QsaAttention<P> {
+    type State = KvCache;
+    fn execute(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
+        if x.dim(1)? == 1 {
+            self.decode(x, kv)
+        } else {
+            self.prefill(x, kv)
+        }
+    }
+}
+
 impl<P: Profile> crate::optimizer::Visit for QsaAttention<P> {
     type In = (crate::optimizer::NodeId, usize, KvPrecision);
     type Out = crate::optimizer::NodeId;

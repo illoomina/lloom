@@ -25,7 +25,8 @@ pub mod testing;
 
 pub use config::{Config, ConfigArgs, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
-pub use deltanet_block::GatedDeltaNet;
+pub use deltanet_block::{GatedDeltaNet, GdnGeometry, GdnState};
+pub use dflash::QwenHead;
 pub use hc::HyperConnection;
 pub use loader::{
     admit_load, LoadOptions, LoadPlan, SlotBudget, SlotPlan, StreamLoader, StreamOptions,
@@ -36,11 +37,10 @@ pub use model::{
     set_prefill_tiles, Layer, MemCheck, Mixer, PassPlan, Qwen4Exp, Shape, State, StatePools,
     DEFAULT_PREFILL_PAIR, DEFAULT_PREFILL_TILES, PREFILL_CHUNK, PREFILL_TRANSIENT_BYTES_PER_TOKEN,
 };
-pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
-pub use dflash::QwenHead;
+pub use moe::{ExpertResidency, MoeGeometry, MoeLayer, Resident, Streamed};
 pub use mtp::{GenerationProbe, MtpDrafter, MtpHead, MtpLanes};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
-pub use qsa::{Indexer, KvCache, KvPool, QsaAttention};
+pub use qsa::{AttnGeometry, Indexer, KvCache, KvPool, QsaAttention};
 
 /// Sub-block activation trace, for bisecting a non-finite forward on the real
 /// model. Off unless `QWEN4EXP_TRACE` is set (read once); when on, each

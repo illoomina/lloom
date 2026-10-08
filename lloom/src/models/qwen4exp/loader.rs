@@ -36,13 +36,13 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn md_u32(md: &HashMap<String, Value>, key: &str) -> Result<usize> {
+pub(crate) fn md_u32(md: &HashMap<String, Value>, key: &str) -> Result<usize> {
     match md.get(key) {
         Some(v) => Ok(v.to_u32()? as usize),
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
     }
 }
-fn md_f32(md: &HashMap<String, Value>, key: &str) -> Result<f64> {
+pub(crate) fn md_f32(md: &HashMap<String, Value>, key: &str) -> Result<f64> {
     match md.get(key) {
         Some(v) => Ok(v.to_f32()? as f64),
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
@@ -63,7 +63,7 @@ fn value_as_i64(v: &Value) -> Result<i64> {
 }
 /// An integer array of any width (the converter writes `ple.*` as u64, the
 /// layer arrays as i32).
-fn md_int_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
+pub(crate) fn md_int_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
     match md.get(key) {
         Some(v) => v.to_vec()?.iter().map(value_as_i64).collect(),
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
@@ -187,31 +187,31 @@ impl Config {
 
 /// One open shard: header, reader, and the path it was opened from (`None`
 /// for a caller-supplied reader).
-struct Shard<'a, R: Read + Seek> {
-    content: Content,
-    reader: &'a mut R,
-    path: Option<PathBuf>,
+pub(crate) struct Shard<'a, R: Read + Seek> {
+    pub(crate) content: Content,
+    pub(crate) reader: &'a mut R,
+    pub(crate) path: Option<PathBuf>,
 }
 
 /// The loader's view of a checkpoint: its shards, a name → shard index, the
 /// device.
-struct Gguf<'a, R: Read + Seek> {
-    shards: Vec<Shard<'a, R>>,
+pub(crate) struct Gguf<'a, R: Read + Seek> {
+    pub(crate) shards: Vec<Shard<'a, R>>,
     index: HashMap<String, usize>,
-    device: Device,
+    pub(crate) device: Device,
     /// Keep float matrices f32 (`QMatMul::Tensor`) rather than f16 stems:
     /// the CPU reference's precision ([`Qwen4Exp::from_gguf_reference`]).
-    dense_f32: bool,
+    pub(crate) dense_f32: bool,
     /// Read no data: every tensor a ghost of its header's kind and shape
     /// ([`Qwen4Exp::ghost_of_manifest`]), a model to walk, never to run.
-    ghost: bool,
+    pub(crate) ghost: bool,
     /// Every tensor read, for the schema's debug check (`build`).
     #[cfg(debug_assertions)]
     read: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl<'a, R: Read + Seek> Gguf<'a, R> {
-    fn new(shards: Vec<Shard<'a, R>>, device: &Device) -> Result<Self> {
+    pub(crate) fn new(shards: Vec<Shard<'a, R>>, device: &Device) -> Result<Self> {
         let mut index = HashMap::new();
         for (i, s) in shards.iter().enumerate() {
             for name in s.content.tensor_infos.keys() {
@@ -230,16 +230,16 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             read: Default::default(),
         })
     }
-    fn metadata(&self) -> &HashMap<String, Value> {
+    pub(crate) fn metadata(&self) -> &HashMap<String, Value> {
         &self.shards[0].content.metadata
     }
-    fn shard_of(&self, name: &str) -> Result<usize> {
+    pub(crate) fn shard_of(&self, name: &str) -> Result<usize> {
         match self.index.get(name) {
             Some(&i) => Ok(i),
             None => lloom_tensor::bail!("gguf has no tensor `{name}`"),
         }
     }
-    fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+    pub(crate) fn qtensor(&mut self, name: &str) -> Result<QTensor> {
         let i = self.shard_of(name)?;
         #[cfg(debug_assertions)]
         self.read.borrow_mut().insert(name.to_string());
@@ -259,7 +259,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
         crate::testing::ghost::tensor(shape, dtype, &self.device)
     }
     /// Every tensor of every shard, `(name, shape)`.
-    fn table(&self) -> impl Iterator<Item = (&str, &[usize])> {
+    pub(crate) fn table(&self) -> impl Iterator<Item = (&str, &[usize])> {
         self.shards.iter().flat_map(|s| {
             s.content
                 .tensor_infos
@@ -267,7 +267,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
                 .map(|(n, ti)| (n.as_str(), ti.shape.dims()))
         })
     }
-    fn shape(&self, name: &str) -> Result<Vec<usize>> {
+    pub(crate) fn shape(&self, name: &str) -> Result<Vec<usize>> {
         let i = self.shard_of(name)?;
         match self.shards[i].content.tensor_infos.get(name) {
             Some(ti) => Ok(ti.shape.dims().to_vec()),
@@ -276,7 +276,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     /// The shard holding `name`, as `(header, path)`; a shard without a path
     /// cannot be streamed from.
-    fn locate(&self, name: &str) -> Result<(&Content, &Path)> {
+    pub(crate) fn locate(&self, name: &str) -> Result<(&Content, &Path)> {
         let i = self.shard_of(name)?;
         #[cfg(debug_assertions)]
         self.read.borrow_mut().insert(name.to_string());
@@ -291,7 +291,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     /// A matrix as the matmul operand: quantized types stay packed; BF16/F16/
     /// F32 become f16 tensors (dense f16 GEMV, f32 accumulate — §8.1.4).
-    fn qmat(&mut self, name: &str) -> Result<QMatMul> {
+    pub(crate) fn qmat(&mut self, name: &str) -> Result<QMatMul> {
         if self.ghost {
             let dtype = self.shards[self.shard_of(name)?].content.tensor_infos[name].ggml_dtype;
             return match dtype {
@@ -321,7 +321,10 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     /// one gemv and split the output (`GatedDeltaNet::with_stem_cat`,
     /// `QsaAttention::with_stem_cat`) while every other path keeps its
     /// part. `None` when any part is quantized (then the parts stand alone).
-    fn qmat_stack(&mut self, names: &[String]) -> Result<(Vec<QMatMul>, Option<Tensor>)> {
+    pub(crate) fn qmat_stack(
+        &mut self,
+        names: &[String],
+    ) -> Result<(Vec<QMatMul>, Option<Tensor>)> {
         let parts: Vec<QMatMul> = names.iter().map(|n| self.qmat(n)).collect::<Result<_>>()?;
         let f16: Vec<&Tensor> = parts
             .iter()
@@ -356,11 +359,11 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     /// A quantized matrix kept packed whatever its type (the routed expert
     /// stacks and the embedding table, which must not be expanded).
-    fn packed(&mut self, name: &str) -> Result<Arc<QTensor>> {
+    pub(crate) fn packed(&mut self, name: &str) -> Result<Arc<QTensor>> {
         Ok(Arc::new(self.qtensor(name)?))
     }
     /// An f32 vector/tensor (norm weights, conv, SSM scalars).
-    fn f32(&mut self, name: &str) -> Result<Tensor> {
+    pub(crate) fn f32(&mut self, name: &str) -> Result<Tensor> {
         if self.ghost {
             return self.ghost_dense(name, lloom_tensor::DType::F32);
         }
@@ -636,7 +639,7 @@ fn plan_load_holding<Rd: Read + Seek>(
 }
 
 /// `recommendedMaxWorkingSetSize` of a Metal device; 0 elsewhere.
-fn working_set_of(device: &Device) -> usize {
+pub(crate) fn working_set_of(device: &Device) -> usize {
     #[cfg(feature = "metal")]
     if let Device::Metal(d) = device {
         return d.device().recommended_max_working_set_size();
@@ -793,7 +796,7 @@ impl LoadOptions {
 }
 
 /// §9.5k's fraction, `MemoryBudget::DEFAULT_FRACTION` (0.65) — asserted
-/// equal to it by `memory_fraction_matches_lfm2s`.
+/// equal to it by `memory_fraction_matches_the_budgets`.
 pub const DEFAULT_MEMORY_FRACTION: f64 = 0.65;
 
 /// What a load would hold on the device, from the headers: the resident
@@ -909,7 +912,7 @@ pub fn admit_load(plan: &LoadPlan) -> Result<()> {
 }
 
 /// Open every shard at `paths`, headers only.
-fn open_shards(paths: &[PathBuf]) -> Result<(Vec<Content>, Vec<File>)> {
+pub(crate) fn open_shards(paths: &[PathBuf]) -> Result<(Vec<Content>, Vec<File>)> {
     let mut contents = Vec::with_capacity(paths.len());
     let mut files = Vec::with_capacity(paths.len());
     for p in paths {
@@ -1209,7 +1212,11 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                 src(gg, format!("{p}.ffn_gate_exps.weight"))?,
                 src(gg, format!("{p}.ffn_up_exps.weight"))?,
                 src(gg, format!("{p}.ffn_down_exps.weight"))?,
-                if held == Some(l) { cfg0.n_experts } else { slots },
+                if held == Some(l) {
+                    cfg0.n_experts
+                } else {
+                    slots
+                },
                 arm.clone(),
                 device,
                 staging.clone(),
@@ -1554,7 +1561,8 @@ mod tests {
         let held = cfg.n_layers; // the MTP head's index
         let mut owned: Vec<(String, QTensor)> = Vec::new();
         for l in 0..=held {
-            let [g, u, d] = super::super::testing::expert_stacks(&cfg, l % cfg.n_layers, &dev, GgmlDType::F32);
+            let [g, u, d] =
+                super::super::testing::expert_stacks(&cfg, l % cfg.n_layers, &dev, GgmlDType::F32);
             owned.push((format!("blk.{l}.ffn_gate_exps.weight"), g));
             owned.push((format!("blk.{l}.ffn_up_exps.weight"), u));
             owned.push((format!("blk.{l}.ffn_down_exps.weight"), d));
@@ -1706,13 +1714,13 @@ mod tests {
         assert_eq!(per(&cfg), 12 * (2 * 2 * (128 + 8) + indexer));
     }
 
-    /// The default fraction is §9.5k's, the one LFM2's budget and the Metal
+    /// The default fraction is §9.5k's, the one `MemoryBudget` and the Metal
     /// admission share.
     #[test]
-    fn memory_fraction_matches_lfm2s() {
+    fn memory_fraction_matches_the_budgets() {
         assert_eq!(
             DEFAULT_MEMORY_FRACTION,
-            crate::models::lfm2::MemoryBudget::DEFAULT_FRACTION
+            crate::nn::memory::MemoryBudget::DEFAULT_FRACTION
         );
     }
 }

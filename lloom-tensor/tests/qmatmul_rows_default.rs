@@ -7,6 +7,7 @@
 //! Its own binary: the knobs are read once per process.
 #![cfg(feature = "metal")]
 
+#[path = "rows_identity/mod.rs"]
 mod rows_identity;
 
 use lloom_tensor::{Device, Result};

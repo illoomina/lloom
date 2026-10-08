@@ -47,6 +47,45 @@ impl GdnStepForm {
     }
 }
 
+/// The gated RMS norm's output gate, `rms_norm(o) · γ · gate(z)`: `sigmoid`
+/// (Qwen4-exp, `output_gate_type: sigmoid`) or `silu` (Qwen3.5, `swish`).
+/// A variant of the block, chosen at construction from the checkpoint's
+/// config; the Metal kernels are instantiated per gate, the composed path
+/// switches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OutGate {
+    #[default]
+    Sigmoid,
+    Silu,
+}
+
+impl OutGate {
+    pub fn is_silu(self) -> bool {
+        matches!(self, OutGate::Silu)
+    }
+    /// `gate(z)` as tensor ops (the composed path).
+    pub fn apply(self, z: &Tensor) -> Result<Tensor> {
+        match self {
+            OutGate::Sigmoid => crate::nn::ops::sigmoid(z),
+            OutGate::Silu => crate::nn::ops::silu(z),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            OutGate::Sigmoid => "sigmoid",
+            OutGate::Silu => "silu",
+        }
+    }
+    /// The gate `output_gate_type` names (`swish` = `silu`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sigmoid" => Some(OutGate::Sigmoid),
+            "silu" | "swish" => Some(OutGate::Silu),
+            _ => None,
+        }
+    }
+}
+
 /// A form of the step.
 pub trait StepForm:
     sealed::Sealed + Copy + Default + std::fmt::Debug + Send + Sync + 'static

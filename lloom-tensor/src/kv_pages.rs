@@ -231,6 +231,17 @@ impl SeqPages {
     pub fn pages(&self) -> &[PageIdx] {
         &self.pages
     }
+
+    /// The pool cell of each token in `tokens` — `page · page_size + offset`,
+    /// what a scatter writes to and a gather reads from. The one formula
+    /// behind every owner's slot list.
+    pub fn cells(
+        &self,
+        page_size: usize,
+        tokens: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = u32> + '_ {
+        tokens.map(move |t| self.pages[t / page_size].0 * page_size as u32 + (t % page_size) as u32)
+    }
 }
 
 /// A fixed pool of KV pages with a free list and per-page refcounts.

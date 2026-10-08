@@ -39,7 +39,7 @@ pub const LFM2_CONV_COMPACT_PAD: &str = "lfm2.conv.compact_pad";
 pub const LFM2_CONV_FIRST_STATE: &str = "lfm2.conv.first_state";
 /// The contiguous KV slab (`KvSlot`): positions past `len`.
 pub const LFM2_KV_SLAB: &str = "lfm2.kv.slab";
-/// The quantised KV planes (`QuantKvSlot`): positions past `len`.
+/// The quantised KV planes (`nn::kv_quant::QuantKvSlab`, LFM2's): positions past `len`.
 pub const LFM2_KV_QUANT: &str = "lfm2.kv.quant";
 /// The paged KV pools (`PagedKv`): slots no page has written.
 pub const LFM2_KV_PAGES: &str = "lfm2.kv.pages";

@@ -235,3 +235,70 @@ fn proc_footprint() -> Option<(u64, u64)> {
 fn proc_footprint() -> Option<(u64, u64)> {
     None
 }
+
+/// The budget a caller declares for admission (`DESIGN.md` §9.5d):
+/// what the device must hold beside the weights, predicted once before any
+/// allocation. Carried on a family's config as an `Option` so a caller that
+/// declares none keeps the unadmitted path.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryBudget {
+    /// Total weight bytes, from the checkpoint header. A number rather
+    /// than a reading because the loader's backing store is not visible
+    /// here, and a text-only load legitimately drops a vision tower; the
+    /// §9.5m reconciliation is the check that it is right, bounded by
+    /// `weight_tolerance`.
+    pub weight_bytes: usize,
+    /// Concurrent sequences.
+    pub batch: usize,
+    /// Fraction of `recommendedMaxWorkingSetSize` this process may claim
+    /// (§9.5k's table value, a settable default rather than a measurement).
+    pub fraction: f64,
+    /// How far `weight_bytes` may diverge from what was allocated before
+    /// the §9.5m reconciliation reports it: a bound on the unaccounted,
+    /// cleared ~6× by the measured non-weight residual and exceeded ~3× by
+    /// the vision tower it exists to catch.
+    pub weight_tolerance: usize,
+    /// The longest single forward pass this process will run: `1` for
+    /// decode, the prompt length for a single-shot prefill, the chunk size
+    /// for a chunked one (§13.2b). Admission runs before any pass, so the
+    /// figure cannot be inferred; a caller that prefills without stating it
+    /// gets the unchecked verdict.
+    pub max_seq_len: usize,
+    /// The rows the activation class is computed for: `None` = `batch`
+    /// (every row its own forward); `Some(1)` for the batched serving loop,
+    /// whose step is one ragged forward over every row's tokens. KV and
+    /// conv state are per row either way.
+    pub activation_rows: Option<usize>,
+}
+
+impl MemoryBudget {
+    /// §9.5k's fraction. A copy of `admission::DEFAULT_BUDGET_FRACTION`,
+    /// which is Metal-only where this type exists on every backend; the two
+    /// are asserted equal under the `metal` feature.
+    pub const DEFAULT_FRACTION: f64 = 0.65;
+
+    /// §9.5m's default tolerance for the weight reconciliation. A copy of
+    /// `admission::WEIGHT_RECONCILE_TOLERANCE` for `DEFAULT_FRACTION`'s
+    /// reason, asserted equal the same way.
+    pub const DEFAULT_WEIGHT_TOLERANCE: usize = 256 * 1_000_000;
+
+    /// A B=1 decode budget at §9.5k's fraction for a model whose weights are
+    /// `weight_bytes`.
+    pub fn new(weight_bytes: usize) -> Self {
+        Self {
+            weight_bytes,
+            batch: 1,
+            fraction: Self::DEFAULT_FRACTION,
+            weight_tolerance: Self::DEFAULT_WEIGHT_TOLERANCE,
+            max_seq_len: 1,
+            activation_rows: None,
+        }
+    }
+
+    /// The same budget, told the longest forward pass it will be asked for:
+    /// a single-shot prefill's length, or a chunked prefill's chunk size.
+    pub fn with_prefill(mut self, seq_len: usize) -> Self {
+        self.max_seq_len = seq_len;
+        self
+    }
+}

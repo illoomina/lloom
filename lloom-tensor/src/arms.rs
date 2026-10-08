@@ -155,9 +155,15 @@ impl<C: Capability> Set<C> {
     /// operator's explicit request, and ignoring it would run the arm it asked
     /// to withdraw.
     pub fn from_env(var: &str) -> Self {
-        match std::env::var(var) {
-            Ok(list) => Self::parse_list(&list).unwrap_or_else(|e| panic!("{var}: {e}")),
-            Err(_) => Self::empty(),
+        Self::from_list(std::env::var(var).ok().as_deref(), var)
+    }
+
+    /// The set a list names, empty for none; `what` names the option in the
+    /// panic, as [`Self::from_env`] does.
+    pub fn from_list(list: Option<&str>, what: &str) -> Self {
+        match list {
+            Some(list) => Self::parse_list(list).unwrap_or_else(|e| panic!("{what}: {e}")),
+            None => Self::empty(),
         }
     }
 

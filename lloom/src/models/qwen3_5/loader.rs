@@ -46,6 +46,10 @@ pub struct LoadOptions {
     /// its header keeps one (`nextn_predict_layers`), else from the sidecar
     /// the `*_with_mtp` constructors take. Refused when neither carries it.
     pub mtp: bool,
+    /// The longest verify window (positions, `k + 1`) a state built at the
+    /// `Ring` profile runs as one pass over phase rings
+    /// (`StateCapacity::window`); 0 runs a window as sequential steps.
+    pub window: usize,
 }
 
 impl Default for LoadOptions {
@@ -56,6 +60,7 @@ impl Default for LoadOptions {
             memory_fraction: None,
             dense_f32: false,
             mtp: false,
+            window: 0,
         }
     }
 }
@@ -205,6 +210,7 @@ fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
     StateCapacity {
         kv_tokens: opts.kv_capacity.max(1),
         kv_precision: opts.kv_precision.unwrap_or(cfg.kv_precision),
+        window: opts.window,
     }
 }
 

@@ -248,6 +248,8 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         memory_fraction: Some(opts.memory_fraction),
         dense_f32: false,
         mtp: opts.mtp,
+        // The verify window of `k + 1` positions as one pass over the rings.
+        window: if opts.mtp { opts.mtp_k.max(1) + 1 } else { 0 },
     };
     let t = Instant::now();
     let mut warnings = Vec::new();

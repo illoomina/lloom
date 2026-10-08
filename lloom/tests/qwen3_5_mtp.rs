@@ -359,6 +359,168 @@ fn mtp_on_the_decoder_is_byte_identical_to_greedy_on_metal() -> Result<()> {
     Ok(())
 }
 
+/// The window as ONE pass over the phase rings (`StateCapacity::window`,
+/// the `Ring` profile's state): on Metal the verify of `k + 1` positions
+/// runs the decode kernels' window forms and accepts by phase; the stream is
+/// greedy's and every round keeps what the sequential verify keeps, at
+/// k = 1, 2, 3, dense and MoE.
+#[cfg(feature = "metal")]
+#[test]
+fn the_window_runs_as_one_pass_on_the_rings_on_metal() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    fn rounds<M: Target>(
+        model: &M,
+        head: &NextnHead<M::Mtp>,
+        cfg: &Config,
+        dev: &Device,
+        k: usize,
+        prompt: &[u32],
+        max: usize,
+    ) -> Result<(Vec<u32>, Vec<usize>)> {
+        let mut d = NextnDrafter::new(
+            head,
+            model.embed_table(),
+            model.lm_head(),
+            dev,
+            model.capacity(),
+        )?
+        .with_k(k);
+        let mut cache = model.new_cache(cfg, dev)?;
+        M::arm_nextn(&mut cache);
+        let mut session = Session::new(model, cache);
+        let eos = [cfg.eos_token_id];
+        let mut rb = Blocking::new(&eos, dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let out = session.decode_speculative(
+            lloom::profile::RewindProof::of(),
+            &mut d,
+            &mut rb,
+            &mut sampler,
+            prompt,
+            &DecodeOptions::new(max),
+            &eos,
+            &mut |_| Ok(()),
+        )?;
+        Ok((
+            out.ids,
+            out.stats.rounds.iter().map(|r| r.accepted).collect(),
+        ))
+    }
+    let max = 24;
+    for k in [1usize, 2, 3] {
+        // dense
+        let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+        let bytes = gguf_bytes(&dense, None)?;
+        let load = |window: usize| -> Result<_> {
+            let mut r = std::io::Cursor::new(bytes.clone());
+            let content = Content::read(&mut r)?;
+            let (m, h) = Qwen3_5::<RewindableExact>::from_gguf_with_mtp(
+                content,
+                &mut r,
+                &dev,
+                &LoadOptions {
+                    mtp: true,
+                    window,
+                    ..Default::default()
+                },
+            )?;
+            Ok((m, h.expect("the block")))
+        };
+        let (seq_m, seq_h) = load(0)?;
+        let (ring_m, ring_h) = load(k + 1)?;
+        let (prompt, ref_ids, _) = long_prompt(&seq_m, &dense.cfg, &dev, max)?;
+        assert!(!seq_m.new_cache(&dense.cfg, &dev)?.ring_holds(k + 1));
+        assert!(
+            ring_m.new_cache(&dense.cfg, &dev)?.ring_holds(k + 1),
+            "k = {k}: the rings hold the window"
+        );
+        let (ids_s, acc_s) = rounds(&seq_m, &seq_h, &dense.cfg, &dev, k, &prompt, max)?;
+        let (ids_r, acc_r) = rounds(&ring_m, &ring_h, &dense.cfg, &dev, k, &prompt, max)?;
+        assert_eq!(
+            ids_s, ref_ids,
+            "dense k = {k}: sequential verify: not the greedy stream"
+        );
+        assert_eq!(
+            ids_r, ref_ids,
+            "dense k = {k}: ring verify: not the greedy stream"
+        );
+        assert_eq!(
+            acc_r, acc_s,
+            "dense k = {k}: ring vs sequential verify, the rounds' accepted counts"
+        );
+        println!(
+            "QWEN35RING dense k={k} rounds={} accepted={acc_r:?}",
+            acc_r.len()
+        );
+        if k == 3 {
+            // The real drafter at k = 1..3, the oracle (every window accepted
+            // whole, by phase) and the garbage drafter (every window cut at
+            // its anchor) on rings that hold the widest window.
+            identity_on(&ring_m, &ring_h, &dense.cfg, &dev, "dense-ring")?;
+            // Rings built for a shorter window refuse a longer one rather
+            // than stepping past their phases.
+            let (short_m, short_h) = load(2)?;
+            let mut d = NextnDrafter::new(
+                &short_h,
+                short_m.embed_table(),
+                short_m.lm_head(),
+                &dev,
+                short_m.capacity(),
+            )?
+            .with_k(2);
+            let err = speculative(&short_m, &dense.cfg, &dev, &mut d, &prompt, max)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains("rings built for a shorter one"), "{err}");
+        }
+        // MoE
+        let moe = TinyCheckpoint::<Qwen3_5MoeTiny>::new(moe_cfg(), Weights::default());
+        let bytes = gguf_bytes(&moe, None)?;
+        let load = |window: usize| -> Result<_> {
+            let mut r = std::io::Cursor::new(bytes.clone());
+            let content = Content::read(&mut r)?;
+            let (m, h) = Qwen3_5Moe::<RewindableExact>::from_gguf_with_mtp(
+                content,
+                &mut r,
+                &dev,
+                &LoadOptions {
+                    mtp: true,
+                    window,
+                    ..Default::default()
+                },
+            )?;
+            Ok((m, h.expect("the block")))
+        };
+        let (seq_m, seq_h) = load(0)?;
+        let (ring_m, ring_h) = load(k + 1)?;
+        let (prompt, ref_ids, _) = long_prompt(&seq_m, &moe.cfg, &dev, max)?;
+        let (ids_s, acc_s) = rounds(&seq_m, &seq_h, &moe.cfg, &dev, k, &prompt, max)?;
+        let (ids_r, acc_r) = rounds(&ring_m, &ring_h, &moe.cfg, &dev, k, &prompt, max)?;
+        assert_eq!(
+            ids_s, ref_ids,
+            "moe k = {k}: sequential verify: not the greedy stream"
+        );
+        assert_eq!(
+            ids_r, ref_ids,
+            "moe k = {k}: ring verify: not the greedy stream"
+        );
+        assert_eq!(
+            acc_r, acc_s,
+            "moe k = {k}: ring vs sequential verify, the rounds' accepted counts"
+        );
+        println!(
+            "QWEN35RING moe k={k} rounds={} accepted={acc_r:?}",
+            acc_r.len()
+        );
+        if k == 3 {
+            identity_on(&ring_m, &ring_h, &moe.cfg, &dev, "moe-ring")?;
+        }
+    }
+    Ok(())
+}
+
 /// The sidecar shape (bartowski's `mtp-*.gguf` beside a stripped main
 /// file): the main file written without the block (`block_count` =
 /// `n_layers`, no `nextn_predict_layers`), the sidecar with `blk.{n}.*`,

@@ -35,6 +35,11 @@ use std::marker::PhantomData;
 pub struct StateCapacity {
     pub kv_tokens: usize,
     pub kv_precision: KvPrecision,
+    /// The longest verify window (positions) a state built at the `Ring`
+    /// profile runs as ONE pass: its recurrent channels get `window + 1`
+    /// phases (`GatedDeltaNet::pooled_state`). 0: no rings; a window runs
+    /// as sequential steps inside a snapshot.
+    pub window: usize,
 }
 
 impl StateCapacity {
@@ -42,6 +47,7 @@ impl StateCapacity {
         Self {
             kv_tokens,
             kv_precision: KvPrecision::dense(DType::F32),
+            window: 0,
         }
     }
 }
@@ -78,6 +84,30 @@ pub trait MixerBlock: Mixer + Send + Sync {
     /// (an attention-only lane cut to a reused prefix, `Speculator::begin_at`).
     /// A recurrent state has no length to cut to and refuses.
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
+    /// Whether the state runs a window of `steps` positions as one pass
+    /// ([`Self::execute_window`]): phase rings with more than `steps` phases
+    /// on a recurrent state; always on a KV cache.
+    fn ring_holds(state: &Self::State, steps: usize) -> bool;
+    /// Whether the state lives on phase rings (a recurrent state at the
+    /// `Ring` profile): such a state rewinds by phase, so a window longer
+    /// than its rings cannot be stepped through and rewound.
+    fn pooled(state: &Self::State) -> bool;
+    /// `T` positions of one sequence at once, inside an open window: `x [T,
+    /// 1, hidden]` → `[T, 1, hidden]`, position for position the decode
+    /// step's arithmetic (the Qwen4-exp `decode_seq` forms), every
+    /// intermediate state kept so any prefix can be accepted. Pushes the
+    /// mark after each position onto `after` (a KV cache's lengths; a
+    /// recurrent state accepts by phase and pushes a blank).
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        state: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor>;
+    /// Accept the first `a` positions of the open window and close it: a
+    /// recurrent state to phase `base + a`, a KV cache to `at` (the mark
+    /// after position `a`; the opening mark when `a` is 0).
+    fn accept_window(state: &mut Self::State, a: usize, at: WindowMark) -> Result<()>;
 }
 
 /// A feed-forward the topology can own the state of (`()` for a dense MLP
@@ -86,6 +116,9 @@ pub trait FfnBlock: Ffn + Send + Sync {
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State>;
     fn reset_state(state: &mut Self::State);
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize) -> NodeId;
+    /// `T` rows of a verify window, `x [T, 1, hidden]`, each row the decode
+    /// step's arithmetic (a routed MoE through its window form).
+    fn execute_window(&self, x: &Tensor, state: &mut Self::State) -> Result<Tensor>;
 }
 
 /// One layer of a [`Decoder`]: a unit over `[1, seq, hidden]` with its own
@@ -101,6 +134,15 @@ pub trait Layer: Send + Sync {
     fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
     fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
+    fn ring_holds(state: &Self::State, steps: usize) -> bool;
+    fn pooled(state: &Self::State) -> bool;
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        state: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor>;
+    fn accept_window(state: &mut Self::State, a: usize, at: WindowMark) -> Result<()>;
 }
 
 /// The token embedding of a [`Decoder`].
@@ -272,6 +314,28 @@ where
     fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
         M::truncate_state(&mut state.mixer, tokens)
     }
+    fn ring_holds(state: &Self::State, steps: usize) -> bool {
+        M::ring_holds(&state.mixer, steps)
+    }
+    fn pooled(state: &Self::State) -> bool {
+        M::pooled(&state.mixer)
+    }
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        state: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor> {
+        let h = self.norm_in.execute(x)?;
+        let m = self.mixer.execute_window(&h, &mut state.mixer, after)?;
+        let x = (x + m)?;
+        let h = self.norm_mid.execute(&x)?;
+        let f = self.ffn.execute_window(&h, &mut state.ffn)?;
+        x + f
+    }
+    fn accept_window(state: &mut Self::State, a: usize, at: WindowMark) -> Result<()> {
+        M::accept_window(&mut state.mixer, a, at)
+    }
 }
 
 /// Two mixers, one chosen per layer by the checkpoint's layer-type array:
@@ -352,6 +416,36 @@ where
         match state {
             HybridState::A(s) => A::truncate_state(s, tokens),
             HybridState::B(s) => B::truncate_state(s, tokens),
+        }
+    }
+    fn ring_holds(state: &Self::State, steps: usize) -> bool {
+        match state {
+            HybridState::A(s) => A::ring_holds(s, steps),
+            HybridState::B(s) => B::ring_holds(s, steps),
+        }
+    }
+    fn pooled(state: &Self::State) -> bool {
+        match state {
+            HybridState::A(s) => A::pooled(s),
+            HybridState::B(s) => B::pooled(s),
+        }
+    }
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        state: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor> {
+        match (self, state) {
+            (Hybrid::A(m), HybridState::A(s)) => m.execute_window(x, s, after),
+            (Hybrid::B(m), HybridState::B(s)) => m.execute_window(x, s, after),
+            _ => lloom_tensor::bail!("a hybrid layer's state is the other mixer's"),
+        }
+    }
+    fn accept_window(state: &mut Self::State, a: usize, at: WindowMark) -> Result<()> {
+        match state {
+            HybridState::A(s) => A::accept_window(s, a, at),
+            HybridState::B(s) => B::accept_window(s, a, at),
         }
     }
 }
@@ -435,6 +529,53 @@ impl<L: Layer> DecoderState<L> {
 
     pub fn window_open(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Whether every layer runs a window of `steps` positions as one pass
+    /// (`Layer::ring_holds`): the `Ring` profile with a `StateCapacity::window`
+    /// of at least `steps`.
+    pub fn ring_holds(&self, steps: usize) -> bool {
+        self.layers.iter().all(|s| L::ring_holds(s, steps))
+    }
+
+    /// Whether any layer's state lives on phase rings (the `Ring` profile
+    /// with a `StateCapacity::window`).
+    pub fn pooled(&self) -> bool {
+        self.layers.iter().any(L::pooled)
+    }
+
+    /// Accept the first `a` positions of the open window and close it:
+    /// every layer to the mark after position `a` (`after[l][a − 1]`; the
+    /// opening mark when `a` is 0, a rewind), the position, the retained
+    /// probe cut to `a` rows of the window. The window's positions past `a`
+    /// cost nothing — no replay.
+    pub fn accept_window(&mut self, a: usize, after: &[Vec<WindowMark>]) -> Result<()> {
+        let Some(w) = self.window.take() else {
+            lloom_tensor::bail!("decoder state: no speculative window is open")
+        };
+        if after.len() != self.layers.len() {
+            lloom_tensor::bail!(
+                "decoder state: {} layers of marks for {} layers",
+                after.len(),
+                self.layers.len()
+            )
+        }
+        for (l, s) in self.layers.iter_mut().enumerate() {
+            let at = if a == 0 {
+                w.marks[l]
+            } else {
+                match after[l].get(a - 1) {
+                    Some(m) => *m,
+                    None => lloom_tensor::bail!(
+                        "decoder state: layer {l} accepts {a} positions of a {}-position window",
+                        after[l].len()
+                    ),
+                }
+            };
+            L::accept_window(s, a, at)?;
+        }
+        self.pos = w.pos + a;
+        self.nextn.keep_first(w.retained + a)
     }
 
     /// Cut every layer back to its first `tokens` positions outside a
@@ -742,15 +883,27 @@ pub struct DecoderPending {
     tokens: Vec<u32>,
     /// Whether `h_nextn` was being retained before the window.
     want_was: bool,
+    /// The window ran as one pass: every layer's mark after each position,
+    /// for the accept by phase / by length. `None`: the sequential steps,
+    /// rewound and replayed on a partial accept.
+    after: Option<Vec<Vec<WindowMark>>>,
 }
 
-/// The verify on the generic topology: the window `[anchor, proposed…]` as
-/// `k + 1` sequential decode steps inside an open window on every layer's
-/// state — greedy's own math, position by position, so the accepted stream
-/// is byte-identical to greedy by construction (`speculation.md` §10.2n) —
-/// the per-position argmax read back once; on a partial accept the window
-/// is rewound and the accepted prefix replayed (§10.2a: the recurrence is
-/// replayable). The probe is `h_nextn` at each accepted position.
+/// The verify on the generic topology: the window `[anchor, proposed…]`
+/// inside an open window on every layer's state, the per-position argmax
+/// read back once. On Metal with the rings holding it (the `Ring` profile,
+/// `StateCapacity::window`) the window is ONE pass — the stems and
+/// projections once over the `k + 1` rows, the recurrences and attentions
+/// position for position through the decode kernels' window forms
+/// (`GatedDeltaNet::decode_seq`, `QsaAttention::decode_seq`), every
+/// intermediate state in the phase rings — accepted by phase, no replay.
+/// Otherwise `k + 1` sequential decode steps, rewound and the accepted
+/// prefix replayed on a partial accept (§10.2a: the recurrence is
+/// replayable; the CPU's gemm sums in a row-count-dependent order, so the
+/// sequential form is the reference there). Either way greedy's own math
+/// position by position, so the accepted stream is byte-identical to
+/// greedy by construction (`speculation.md` §10.2n). The probe is `h_nextn`
+/// at each accepted position.
 impl<P, C, E, L, H> Probes<NextnHidden> for Decoder<P, C, E, L, H>
 where
     P: Profile,
@@ -808,16 +961,54 @@ where
         cache.drop_nextn();
         let want_was = cache.set_want_nextn(true);
         let dev = self.device_of(cache)?;
+        let t = tokens.len();
+        // A state on rings rewinds by phase: a window longer than its rings
+        // cannot be stepped through and put back (the rings are sized to
+        // the drafter's `k + 1`, `StateCapacity::window`).
+        if cache.pooled() && !cache.ring_holds(t) {
+            cache.set_want_nextn(want_was);
+            lloom_tensor::bail!(
+                "{} verify: a window of {t} positions on rings built for a shorter one \
+                 (`StateCapacity::window` must be >= {t})",
+                self.family
+            )
+        }
         cache.open_window()?;
-        let mut argmaxes = Vec::with_capacity(tokens.len());
-        for &t in &tokens {
-            argmaxes.push(self.step_argmax(t, cache, &dev)?);
+        if dev.is_metal() && cache.ring_holds(t) {
+            let input = Tensor::from_vec(tokens.clone(), (t, 1), &dev)?;
+            let mut h = self.embed.embed(&input)?; // [T, 1, hidden]
+            let mut after: Vec<Vec<WindowMark>> = Vec::with_capacity(self.layers.len());
+            for (l, layer) in self.layers.iter().enumerate() {
+                let mut marks = Vec::with_capacity(t);
+                h = layer.execute_window(&h, &mut cache.layers[l], &mut marks)?;
+                after.push(marks);
+            }
+            cache.pos += t;
+            let n = self.head.normed(&h)?; // [T, 1, hidden]
+            cache.keep_nextn(n.reshape((1, t, self.hidden))?);
+            let mut argmaxes = Vec::with_capacity(t);
+            for p in 0..t {
+                let logits = self.head.project(&n.narrow(0, p, 1)?)?;
+                argmaxes.push(logits.flatten_all()?.argmax(D::Minus1)?.reshape(1)?);
+            }
+            let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
+            return Ok(DecoderPending {
+                argmax,
+                tokens,
+                want_was,
+                after: Some(after),
+            });
+        }
+        let mut argmaxes = Vec::with_capacity(t);
+        for &tok in &tokens {
+            argmaxes.push(self.step_argmax(tok, cache, &dev)?);
         }
         let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
         Ok(DecoderPending {
             argmax,
             tokens,
             want_was,
+            after: None,
         })
     }
 
@@ -831,10 +1022,14 @@ where
             argmax,
             tokens,
             want_was,
+            after,
         } = pending;
         let a = accept_prefix(&argmax, &tokens[1..], eos_ids).len();
         let accepted: Vec<u32> = argmax[..a].to_vec();
-        if a == tokens.len() {
+        if let Some(after) = after {
+            // The accepted prefix by phase and by length: no replay.
+            cache.accept_window(a, &after)?;
+        } else if a == tokens.len() {
             cache.resolve_window()?;
         } else {
             cache.rewind_window()?;
@@ -905,7 +1100,13 @@ where
 // ---- The engine families' blocks as topology blocks ---------------------------
 
 impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
-    fn new_state(&self, _dev: &Device, _cap: &StateCapacity) -> Result<Self::State> {
+    /// At the `Ring` profile with a window, the two channels on their own
+    /// phase rings (`cap.window + 1` phases); else an unpooled pair that a
+    /// window snapshots.
+    fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State> {
+        if <P::Rewind as crate::profile::Rewind>::REWINDABLE && cap.window > 0 {
+            return self.pooled_state(dev, cap.window + 1);
+        }
         Ok(crate::models::qwen4exp::GdnState {
             layer: 0,
             s: crate::nn::RecurrentState::new(1),
@@ -941,6 +1142,27 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
         }
         lloom_tensor::bail!("a recurrent state has no length to cut to {tokens} positions")
     }
+    fn ring_holds(state: &Self::State, steps: usize) -> bool {
+        state.s.ring_holds(steps) && state.conv.ring_holds(steps)
+    }
+    fn pooled(state: &Self::State) -> bool {
+        state.s.is_pooled() || state.conv.is_pooled()
+    }
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        st: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor> {
+        let t = x.dim(0)?;
+        let out = self.decode_seq(x, st.layer, &mut st.s, &mut st.conv)?;
+        after.extend(std::iter::repeat_n(WindowMark::default(), t));
+        Ok(out)
+    }
+    fn accept_window(state: &mut Self::State, a: usize, _at: WindowMark) -> Result<()> {
+        state.s.accept_window(a)?;
+        state.conv.accept_window(a)
+    }
 }
 
 impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
@@ -975,6 +1197,29 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
         state.truncate(tokens, state.n_blocks().min(tokens));
         Ok(())
     }
+    fn ring_holds(_state: &Self::State, _steps: usize) -> bool {
+        true
+    }
+    fn pooled(_state: &Self::State) -> bool {
+        false
+    }
+    fn execute_window(
+        &self,
+        x: &Tensor,
+        kv: &mut Self::State,
+        after: &mut Vec<WindowMark>,
+    ) -> Result<Tensor> {
+        let (out, lens) = self.decode_seq(x, kv)?;
+        after.extend(
+            lens.into_iter()
+                .map(|(tokens, blocks)| WindowMark { tokens, blocks }),
+        );
+        Ok(out)
+    }
+    fn accept_window(state: &mut Self::State, _a: usize, at: WindowMark) -> Result<()> {
+        state.truncate(at.tokens, at.blocks);
+        Ok(())
+    }
 }
 
 impl FfnBlock for crate::nn::blocks::SwiGlu {
@@ -984,6 +1229,11 @@ impl FfnBlock for crate::nn::blocks::SwiGlu {
     fn reset_state(_state: &mut ()) {}
     fn visit_step(&self, w: &mut Walker, x: NodeId, _l: usize) -> NodeId {
         self.visit(w, x)
+    }
+    /// The rows through the same projections a decode step takes (the
+    /// shared expert's window form on Qwen4-exp).
+    fn execute_window(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        self.forward(x)
     }
 }
 
@@ -996,5 +1246,18 @@ impl<P: Profile, R: crate::models::qwen4exp::ExpertResidency + Send + Sync> FfnB
     fn reset_state(_state: &mut ()) {}
     fn visit_step(&self, w: &mut Walker, x: NodeId, _l: usize) -> NodeId {
         self.visit(w, x)
+    }
+    /// The routed experts' window form: every row real, the resident tier's
+    /// plain groups (`MoeLayer::decode_window`).
+    fn execute_window(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        let t = x.dim(0)?;
+        let (y, _) = self.decode_window(
+            x,
+            crate::models::qwen4exp::moe::WindowPlanKind::Host {
+                real_rows: t,
+                loaded_rows: t,
+            },
+        )?;
+        Ok(y)
     }
 }

@@ -1,8 +1,11 @@
 //! The Qwen3.5 engine: one sequence over the dense (`qwen35`) or the
 //! resident-MoE (`qwen35moe`) model on the generic decoder
 //! (`lloom::models::qwen3_5`), driven by the same `DecodeSession` the other
-//! families' engines drive. The `No × One` shapes only: no speculative body
-//! (the MTP head is not built), no rows (`--batch N`), no streamed expert
+//! families' engines drive. `speculative.method = mtp` puts the checkpoint's
+//! MTP block (`nn::mtp`, in the main file or the sidecar `speculative.model`
+//! names) on the speculative body, at the `Ring × One` shape: one drafted
+//! token a round (`speculative.k` more), verified by the target,
+//! byte-identical to greedy. No rows (`--batch N`), no streamed expert
 //! tier — each refused by name in `family.rs`.
 
 use super::common::{
@@ -15,10 +18,14 @@ use crate::{DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
 use anyhow::{Context, Result};
 use lloom::load_warning::LoadWarning;
 use lloom::models::qwen3_5::{arch_of, Config, LoadOptions as ModelLoad, Qwen3_5, Qwen3_5Moe};
+use lloom::nn::decoder::{Decoder, Layer, NormHead, StateCapacity, TokenEmbed};
 use lloom::nn::model::{CacheReset, CacheRewind, CausalLM};
-use lloom::nn::Sequence;
-use lloom::profile::{Profile, ProfileKey};
+use lloom::nn::mtp::{NextnDrafter, NextnHead, NextnLanes};
+use lloom::nn::speculator::NextnHidden;
+use lloom::nn::{Probes, RmsNorm, Sequence};
+use lloom::profile::{Profile, ProfileKey, RewindProof, Shaped};
 use lloom_tensor::quantized::gguf_file::Content;
+use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -47,6 +54,44 @@ pub struct LoadOptions {
     /// `--experts` as asked; the MoE loads resident whatever it says, and
     /// says so.
     pub experts: String,
+    /// `speculative.method = mtp`: decode through the speculative body on
+    /// the checkpoint's MTP block.
+    pub mtp: bool,
+    /// `speculative.model`: the MTP sidecar GGUF (bartowski's `mtp-*.gguf`)
+    /// when the main file does not keep the block.
+    pub mtp_sidecar: Option<PathBuf>,
+    /// `speculative.k`: tokens drafted a round.
+    pub mtp_k: usize,
+}
+
+/// A Qwen3.5 model as the engine drives it: a `Decoder` of either alias,
+/// with the shared tables its MTP drafter reads.
+pub trait Qwen3_5Model:
+    CausalLM<Config = Config> + Probes<NextnHidden> + Shaped + Send + Sync + 'static
+{
+    fn embed_table(&self) -> &QMatMul;
+    fn lm_head(&self) -> &QMatMul;
+    fn capacity(&self) -> StateCapacity;
+    /// Retain `h_nextn` on every forward of `cache` (the drafter's seeding
+    /// reads the prefill's rows).
+    fn arm_nextn(cache: &mut Self::Cache);
+}
+
+impl<P: Profile, L: Layer + 'static> Qwen3_5Model
+    for Decoder<P, Config, TokenEmbed, L, NormHead<RmsNorm>>
+{
+    fn embed_table(&self) -> &QMatMul {
+        self.embed_block().table()
+    }
+    fn lm_head(&self) -> &QMatMul {
+        self.head_block().proj()
+    }
+    fn capacity(&self) -> StateCapacity {
+        Decoder::capacity(self)
+    }
+    fn arm_nextn(cache: &mut Self::Cache) {
+        cache.set_want_nextn(true);
+    }
 }
 
 /// The one sequence every request drives, and the rings kept across
@@ -57,9 +102,16 @@ struct Single<C> {
     decode: crate::DecodeConfig,
 }
 
-/// The engine over a model `M` of this family (the dense or the MoE alias).
-pub struct Engine<M: CausalLM<Config = Config>> {
+/// The engine over a model `M` of this family (the dense or the MoE
+/// alias) and its MTP block's layer type `X`.
+pub struct Engine<M: Qwen3_5Model, X: Layer> {
     model: Arc<M>,
+    /// The MTP head, when the run decodes through the speculative body.
+    mtp: Option<NextnHead<X>>,
+    mtp_k: usize,
+    /// The drafter's lane across requests (its layer's KV follows the
+    /// single sequence's prefix reuse, `Speculator::begin_at`).
+    mtp_lanes: Mutex<Option<NextnLanes<X::State>>>,
     device: Device,
     text: Text,
     model_name: String,
@@ -143,11 +195,26 @@ fn resolve_text(
     }
 }
 
-/// Detect, hold the regime, load.
+/// Detect, hold the regime, load — at `Ring × One` under
+/// `speculative.method = mtp` (the verify window), `No × One` otherwise.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
-    use lloom::profile::{NoRewind, One, Rewind as _, Rows as _};
-    let key = ProfileKey::at_contract(NoRewind::NAME, One::NAME);
+    use lloom::profile::{NoRewind, One, Rewind as _, Ring, Rows as _};
+    let key = ProfileKey::at_contract(
+        if opts.mtp { Ring::NAME } else { NoRewind::NAME },
+        One::NAME,
+    );
     lloom::profile::dispatch!(key, lloom::profile::QWEN3_5, P => load_as::<P>(opts))
+}
+
+/// The evidence the speculative driver takes: the `Ring` shape gives it,
+/// the `No` shape refuses by name.
+fn rewindable<M: Shaped>() -> Result<RewindProof<M::Profile>> {
+    RewindProof::<M::Profile>::ask().with_context(|| {
+        format!(
+            "the speculative body on the {} shape: speculative.method = mtp runs on the `Ring` shape",
+            M::Profile::KEY
+        )
+    })
 }
 
 fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
@@ -163,11 +230,16 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         .with_context(|| format!("reading the GGUF header of {}", opts.first_shard.display()))?;
     let arch = arch_of(&content).context("not a qwen35 / qwen35moe GGUF")?;
     drop(f);
-    let installed = super::common::install_executor(&device, &opts.executor, false)?;
+    let installed = super::common::install_executor(&device, &opts.executor, opts.mtp)?;
     #[cfg(feature = "metal")]
     if let Some(mb) = opts.memory.free_budget_mb {
         if let Device::Metal(m) = &device {
             m.set_free_budget(mb * 1024 * 1024);
+        }
+    }
+    if let Some(p) = &opts.mtp_sidecar {
+        if !p.is_file() {
+            anyhow::bail!("speculative.model {}: no such file", p.display());
         }
     }
     let mload = ModelLoad {
@@ -175,16 +247,22 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         kv_precision: opts.kv_precision,
         memory_fraction: Some(opts.memory_fraction),
         dense_f32: false,
+        mtp: opts.mtp,
     };
     let t = Instant::now();
     let mut warnings = Vec::new();
     match arch {
         lloom::models::qwen3_5::ARCH_DENSE => {
-            let model: Qwen3_5<P> = Qwen3_5::from_gguf_shards(&shards, &device, &mload)
-                .context("loading Qwen3.5 (dense)")?;
+            let (model, head): (Qwen3_5<P>, _) = Qwen3_5::from_gguf_shards_with_mtp(
+                &shards,
+                opts.mtp_sidecar.as_ref(),
+                &device,
+                &mload,
+            )
+            .context("loading Qwen3.5 (dense)")?;
             let tier = json!({ "arch": arch, "shards": shards.len(), "load_ms": ms(t.elapsed()) });
             Engine::finish(
-                model, device, opts, &content, arch, tier, installed, warnings,
+                model, head, device, opts, &content, arch, tier, installed, warnings,
             )
         }
         _ => {
@@ -199,24 +277,32 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
                     note,
                 ));
             }
-            let model: Qwen3_5Moe<P> = Qwen3_5Moe::from_gguf_shards(&shards, &device, &mload)
-                .context("loading Qwen3.5 (MoE, resident)")?;
+            let (model, head): (Qwen3_5Moe<P>, _) = Qwen3_5Moe::from_gguf_shards_with_mtp(
+                &shards,
+                opts.mtp_sidecar.as_ref(),
+                &device,
+                &mload,
+            )
+            .context("loading Qwen3.5 (MoE, resident)")?;
             let tier = json!({ "arch": arch, "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()) });
             Engine::finish(
-                model, device, opts, &content, arch, tier, installed, warnings,
+                model, head, device, opts, &content, arch, tier, installed, warnings,
             )
         }
     }
 }
 
-impl<M> Engine<M>
+impl<M, X> Engine<M, X>
 where
-    M: CausalLM<Config = Config> + Send + Sync + 'static,
+    M: Qwen3_5Model,
     M::Cache: CacheReset + CacheRewind + Send + Sync + 'static,
+    X: Layer + 'static,
+    X::State: Send + Sync,
 {
     #[allow(clippy::too_many_arguments)]
     fn finish(
         model: M,
+        mtp: Option<NextnHead<X>>,
         device: Device,
         opts: LoadOptions,
         content: &Content,
@@ -225,6 +311,9 @@ where
         installed: super::report::Installed,
         load_warnings: Vec<LoadWarning>,
     ) -> Result<Box<dyn Served>> {
+        if opts.mtp && mtp.is_none() {
+            anyhow::bail!("speculative.method = mtp was given but the loader found no MTP block");
+        }
         let (tokenizer, template, text_source) = resolve_text(&opts, content)?;
         // The turn end and the checkpoint's own EOS (`generation_config.json`
         // lists both 248046 and 248044).
@@ -256,9 +345,19 @@ where
             });
         tier["tokenizer"] = json!(text_source);
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
-        let cache = model.new_cache(model_config(&model), &device)?;
+        tier["mtp"] = json!(mtp.is_some());
+        if let Some(p) = &opts.mtp_sidecar {
+            tier["mtp_sidecar"] = json!(p.display().to_string());
+        }
+        let mut cache = model.new_cache(model_config(&model), &device)?;
+        if mtp.is_some() {
+            M::arm_nextn(&mut cache);
+        }
         let mut engine = Engine {
             model: Arc::new(model),
+            mtp,
+            mtp_k: opts.mtp_k.max(1),
+            mtp_lanes: Mutex::new(None),
             installed,
             device,
             text: Text {
@@ -339,6 +438,25 @@ where
         }
         Ok(())
     }
+
+    /// The MTP drafter for one run: the head, the shared embedding and
+    /// `lm_head`, and `lanes` (a previous run's, else a fresh one-layer
+    /// state). Cheap to build per request.
+    fn drafter(&self, lanes: Option<NextnLanes<X::State>>) -> Result<NextnDrafter<'_, X>> {
+        let head = self
+            .mtp
+            .as_ref()
+            .context("no MTP head loaded (speculative.method = mtp)")?;
+        Ok(NextnDrafter::new(
+            head,
+            self.model.embed_table(),
+            self.model.lm_head(),
+            &self.device,
+            self.model.capacity(),
+        )?
+        .with_k(self.mtp_k)
+        .with_lanes(lanes))
+    }
 }
 
 /// The family config a decoder of either alias carries.
@@ -349,10 +467,12 @@ fn model_config<M: CausalLM<Config = Config>>(_m: &M) -> &'static Config {
     CFG.get_or_init(Config::tiny)
 }
 
-impl<M> Served for Engine<M>
+impl<M, X> Served for Engine<M, X>
 where
-    M: CausalLM<Config = Config> + Send + Sync + 'static,
+    M: Qwen3_5Model,
     M::Cache: CacheReset + CacheRewind + Send + Sync + 'static,
+    X: Layer + 'static,
+    X::State: Send + Sync,
 {
     fn device(&self) -> &Device {
         &self.device
@@ -393,9 +513,11 @@ where
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen3_5 arch={} batch=1 experts={} prefill_tile={} mem_sample={} {}",
+            "family=qwen3_5 arch={} batch=1 experts={} mtp={} mtp_k={} prefill_tile={} mem_sample={} {}",
             self.arch,
             self.tier["experts"].as_str().unwrap_or("-"),
+            self.mtp.is_some(),
+            self.mtp_k,
             self.prefill_tile,
             self.mem_sample,
             self.executor.line(),
@@ -447,7 +569,11 @@ where
         self.text.think_tags().cloned()
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
-        None
+        if self.mtp.is_some() {
+            Some(super::budgets::SPECULATIVE)
+        } else {
+            None
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;
@@ -466,8 +592,23 @@ where
             if !reuse {
                 s.reset();
             }
-            s.decode_until(prompt_ids, detok, params, |f| on_fragment(f))
-                .map_err(anyhow::Error::from)
+            if self.mtp.is_some() {
+                let lanes = lock(&self.mtp_lanes).take();
+                let mut drafter = self.drafter(lanes)?;
+                let out = s.decode_speculative_until(
+                    rewindable::<M>()?,
+                    &mut drafter,
+                    prompt_ids,
+                    detok,
+                    params,
+                    |f| on_fragment(f),
+                );
+                *lock(&self.mtp_lanes) = Some(drafter.into_lanes());
+                out.map_err(anyhow::Error::from)
+            } else {
+                s.decode_until(prompt_ids, detok, params, |f| on_fragment(f))
+                    .map_err(anyhow::Error::from)
+            }
         })
     }
     fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
@@ -517,6 +658,73 @@ where
         let mut timing = self.with_single(|s| {
             s.reset();
             let mut detok = detok;
+            if self.mtp.is_some() {
+                // One run of `D` tokens through the speculative body, the
+                // prompt's submit time subtracted (the prefill's GPU tail
+                // is inside the bracket), as the other engines bracket
+                // their drafters.
+                let params = DecodeParams {
+                    max_tokens: decode_tokens,
+                    eos_ids: NEVER_EOS.to_vec(),
+                    readback,
+                    prefill_tile,
+                    ..DecodeParams::default()
+                };
+                super::common::profile_reset();
+                let t = Instant::now();
+                let mut drafter = self.drafter(None)?;
+                let run = s.decode_speculative_until(
+                    rewindable::<M>()?,
+                    &mut drafter,
+                    &prompt,
+                    &mut detok,
+                    &params,
+                    |_| true,
+                )?;
+                device.synchronize()?;
+                let wall = ms(t.elapsed());
+                let prof = super::common::profile_take();
+                let prefill_ms = run.stats.prefill_ns as f64 / 1e6;
+                if run.tokens.len() != decode_tokens {
+                    anyhow::bail!(
+                        "the decode run produced {} tokens, expected {decode_tokens}",
+                        run.tokens.len()
+                    );
+                }
+                s.reset();
+                let rounds = run.stats.rounds.len();
+                let accepted: f64 = run
+                    .stats
+                    .rounds
+                    .iter()
+                    .map(|r| r.accepted as f64)
+                    .sum::<f64>()
+                    / rounds.max(1) as f64;
+                let phase_ms = |f: fn(&lloom::nn::speculator::RoundTiming) -> u64| -> f64 {
+                    run.stats
+                        .rounds
+                        .iter()
+                        .map(|r| f(&r.timing) as f64 / 1e6)
+                        .sum()
+                };
+                return Ok(DecodeTiming {
+                    prompt_tokens,
+                    decode_tokens,
+                    batch: 1,
+                    prefill_ms,
+                    decode_ms: wall - prefill_ms,
+                    readback: run.readback,
+                    bracket: "run wall minus the prompt's submit; the prefill's GPU tail is inside",
+                    row_tokens: vec![run.tokens.len()],
+                    row_rounds: vec![rounds],
+                    row_accepted: vec![accepted],
+                    row_draft_ms: vec![phase_ms(|t| t.draft_ns)],
+                    row_verify_ms: vec![phase_ms(|t| t.verify_ns)],
+                    row_observe_ms: vec![phase_ms(|t| t.observe_ns)],
+                    profile: prof,
+                    mem: MemReport::default(),
+                });
+            }
             let params = DecodeParams {
                 max_tokens: 1,
                 eos_ids: NEVER_EOS.to_vec(),

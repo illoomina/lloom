@@ -201,9 +201,9 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     ring: "by-name: the decoder keeps no standing window, so a forward past an unlearned EOS is not undone",
     batch: false,
     prefix_share: false,
-    speculation: &[],
+    speculation: &["mtp"],
     model_axes: false,
-    rewind: "none (the generic decoder's first rung keeps no window)",
+    rewind: "a verify window over every layer's state (speculative.method = mtp, the Ring shape); no standing window",
     executor_arms: false,
     kv_quant: &[KvQuant::Off],
     kv_dtype: "f32",
@@ -576,11 +576,15 @@ impl Family for Qwen3_5Family {
     fn resolve(&self, req: &Requested<'_>) -> Result<()> {
         resolve_common(&QWEN3_5_CAPABILITIES, req)?;
         let s = &req.shape;
-        if s.speculative.method != "none" && s.speculative.method != "auto" {
-            anyhow::bail!(
-                "speculative.method = {}: qwen3_5 has no speculative body yet (its MTP head is not built)",
-                s.speculative.method
-            );
+        if s.speculative.method == "mtp" {
+            if let Some(d) = &s.speculative.drafter {
+                if !d.is_file() {
+                    anyhow::bail!(
+                        "speculative.model {}: the MTP sidecar GGUF is not a file",
+                        d.display()
+                    );
+                }
+            }
         }
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen3_5 has no such arm");
@@ -614,6 +618,11 @@ impl Family for Qwen3_5Family {
             memory: shape.memory.clone(),
             kv_precision: None,
             experts: model.experts.clone(),
+            mtp: shape.speculative.method == "mtp",
+            mtp_sidecar: (shape.speculative.method == "mtp")
+                .then(|| shape.speculative.drafter.clone())
+                .flatten(),
+            mtp_k: shape.speculative.k.unwrap_or(1),
         })
     }
 }
@@ -654,7 +663,13 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
         "lfm2" => (spec.drafter.is_some()
             || super::common::newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").is_some())
         .then_some("dspark"),
-        "qwen3_5" => None,
+        // The block in the main file is not known here (the header is read
+        // at load): `auto` takes MTP when a sidecar is named.
+        "qwen3_5" => spec
+            .drafter
+            .as_ref()
+            .is_some_and(|d| d.is_file())
+            .then_some("mtp"),
         "qwen4exp" => {
             if spec.drafter.is_none() {
                 spec.drafter = std::env::var("HOME")
@@ -1105,15 +1120,64 @@ mod tests {
 
     /// `--flash-k` is LFM2's FlashDecoding chunk: Qwen4-exp refuses it by
     /// name, LFM2 resolves it (the load refuses it off `--attn flash`).
+    /// qwen3_5 serves `speculative.method = mtp` (the block in the file, or
+    /// the sidecar `speculative.model` names, which must be a file), and
+    /// `auto` takes it only when a sidecar is named.
+    #[test]
+    fn qwen3_5_serves_mtp_and_auto_takes_a_named_sidecar() {
+        let m = model_args(&[]);
+        let mut s = shape();
+        s.speculative.method = "mtp".into();
+        Qwen3_5Family
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap();
+        let mut s = shape();
+        s.speculative.method = "mtp".into();
+        s.speculative.drafter = Some("/no/such/mtp.gguf".into());
+        let err = Qwen3_5Family
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a file"), "{err}");
+        let mut s = shape();
+        s.speculative.method = "auto".into();
+        resolve_auto_speculation("qwen3_5", &mut s);
+        assert_eq!(s.speculative.method, "none");
+        let sidecar =
+            std::env::temp_dir().join(format!("lloom-q35-mtp-{}.gguf", std::process::id()));
+        std::fs::write(&sidecar, b"x").unwrap();
+        let mut s = shape();
+        s.speculative.method = "auto".into();
+        s.speculative.drafter = Some(sidecar.clone());
+        resolve_auto_speculation("qwen3_5", &mut s);
+        assert_eq!(s.speculative.method, "mtp");
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
     /// Qwen4-exp's own keys are refused on qwen3_5 by name, and its
     /// defaults pass (`LoadConfig::default` carries them for every family).
     #[test]
     fn qwen4exps_keys_are_refused_on_qwen3_5_by_name() {
         for (argv, key) in [
-            (&["--moe-act", "f16"][..], "models.qwen4exp.moe.activation_dtype"),
+            (
+                &["--moe-act", "f16"][..],
+                "models.qwen4exp.moe.activation_dtype",
+            ),
             (&["--no-ple"][..], "models.qwen4exp.ple.enabled"),
-            (&["--ple-cache-rows", "8"][..], "models.qwen4exp.ple.cache_rows"),
-            (&["--prefill-mode", "replay"][..], "models.qwen4exp.prefill_mode"),
+            (
+                &["--ple-cache-rows", "8"][..],
+                "models.qwen4exp.ple.cache_rows",
+            ),
+            (
+                &["--prefill-mode", "replay"][..],
+                "models.qwen4exp.prefill_mode",
+            ),
         ] {
             let m = model_args(argv);
             let err = Qwen3_5Family

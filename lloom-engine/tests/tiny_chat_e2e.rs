@@ -63,6 +63,14 @@ fn sha(ids: &[u32]) -> String {
 
 /// One `lloom chat --raw` turn; the `[turn 1: …]` line's fields.
 fn chat(model: &Path, extra: &[&str]) -> std::collections::BTreeMap<String, String> {
+    chat_with_stderr(model, extra).0
+}
+
+/// [`chat`], with the process's stderr beside the turn's fields.
+fn chat_with_stderr(
+    model: &Path,
+    extra: &[&str],
+) -> (std::collections::BTreeMap<String, String>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
         .args(["chat", "--model"])
         .arg(model)
@@ -81,12 +89,14 @@ fn chat(model: &Path, extra: &[&str]) -> std::collections::BTreeMap<String, Stri
         .find(|l| l.starts_with("[turn 1:"))
         .unwrap_or_else(|| panic!("no turn line:\n{stderr}"));
     eprintln!("{line}");
-    line.trim_start_matches("[turn 1:")
+    let fields = line
+        .trim_start_matches("[turn 1:")
         .trim_end_matches(']')
         .split_whitespace()
         .filter_map(|kv| kv.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+        .collect();
+    (fields, stderr.to_string())
 }
 
 fn check(model: &Path, extra: &[&str], want_prompt: &[u32]) {
@@ -170,6 +180,104 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     check(&model, &cpu, &want);
     #[cfg(feature = "metal")]
     check(&model, &base, &want);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Qwen3.5 through the speculative body: a tiny checkpoint that keeps its
+/// MTP block (`block_count` = `n_layers` + 1, `nextn_predict_layers` 1,
+/// unsloth's Qwen3.8-27B shape) served with `--speculate mtp` emits the
+/// greedy run's tokens, at `--spec-tokens` 1 and 2, on the CPU and on
+/// Metal; the turn reports its rounds. A checkpoint without the block
+/// refuses the method by name.
+#[test]
+fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
+    let dir = scratch("qwen3_5_mtp");
+    let mut cfg = Qwen3_5Tiny::template();
+    TinyConfig::set_axis(
+        &mut cfg,
+        "vocab_size",
+        Qwen3_5Tiny::tokenizer().vocab_size(),
+    );
+    TinyConfig::derive(&mut cfg);
+    cfg.n_nextn_layers = 1;
+    let model = TinyCheckpoint::<Qwen3_5Tiny>::new(cfg, Weights::default())
+        .write(&dir)
+        .expect("the tiny checkpoint writes");
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap();
+    let want = bytes(PROMPT);
+    let mut devices: Vec<&[&str]> = vec![&["--cpu"]];
+    if cfg!(feature = "metal") {
+        devices.push(&[]);
+    }
+    for dev in devices {
+        let mut base = vec![
+            "--tokenizer",
+            tok,
+            "--sampling-defaults",
+            "greedy",
+            "-n",
+            "12",
+        ];
+        base.extend_from_slice(dev);
+        let greedy = chat(&model, &base);
+        assert_eq!(greedy["prompt_ids_sha256"], sha(&want));
+        assert_eq!(greedy["completion_tokens"], "12");
+        for k in ["1", "2"] {
+            let mut args = base.clone();
+            args.extend_from_slice(&["--speculate", "mtp", "--spec-tokens", k]);
+            let (spec, stderr) = chat_with_stderr(&model, &args);
+            assert_eq!(
+                spec["tokens_sha256"], greedy["tokens_sha256"],
+                "{dev:?} k={k}: the speculative body's tokens are not greedy's"
+            );
+            assert_eq!(spec["completion_tokens"], "12");
+            // The acceptance line (`report::print_rounds`): rounds and the
+            // tokens they kept, the bonus counted.
+            let accept = stderr
+                .lines()
+                .find(|l| l.starts_with("DSPARK_ACCEPT "))
+                .unwrap_or_else(|| panic!("{dev:?} k={k}: no acceptance line:\n{stderr}"));
+            eprintln!("{accept}");
+            let field = |name: &str| -> usize {
+                accept
+                    .split_whitespace()
+                    .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("no {name} on {accept}"))
+            };
+            let (rounds, tokens) = (field("rounds"), field("tokens"));
+            assert!(
+                rounds >= 1 && rounds <= 12,
+                "{dev:?} k={k}: {rounds} rounds"
+            );
+            // The first token is the prefill's, before round 0.
+            assert!(
+                tokens + 1 >= 12,
+                "{dev:?} k={k}: the rounds kept {tokens} tokens for 12 emitted"
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+
+    // Without the block, the method is refused by name.
+    let dir = scratch("qwen3_5_no_mtp");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--raw", "-p", PROMPT, "-n", "4", "--cpu", "--tokenizer"])
+        .arg(&tok)
+        .args(["--speculate", "mtp"])
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a checkpoint without the block served MTP:\n{stderr}"
+    );
+    assert!(stderr.contains("no MTP block"), "{stderr}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

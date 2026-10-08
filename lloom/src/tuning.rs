@@ -29,6 +29,7 @@ pub fn tuning() -> &'static Tuning {
 /// Install the group before anything reads it; `Err` hands it back if a read
 /// already fixed the defaults.
 pub fn install(t: Tuning) -> Result<(), Tuning> {
+    lloom_tensor::isolation::claim("lloom::tuning");
     TUNING.set(t)
 }
 

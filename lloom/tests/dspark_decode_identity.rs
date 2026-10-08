@@ -1888,3 +1888,195 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
     }
     Ok(())
 }
+
+/// **The sampled identity (#943 §2).** At `t > 0`, speculative decode is
+/// byte-identical to non-speculative decode at the same seed: the verify
+/// draws the target's token per window position with noise keyed to that
+/// position, so a rejected row consumes nothing the next position's draw
+/// depends on, and the K=1 loop keys its draws the same way.
+///
+/// The garbage drafter is the hardest case for it: every round proposes
+/// wrong tokens, so every round draws `k` rows it then throws away — the
+/// draws a draw-count-keyed stream would be shifted by. N seeds, both
+/// gumbel-max arms (plain temperature and `--gumbel`), and the non-vacuity
+/// arm beside it: the sampled stream must differ from greedy's, or a verify
+/// that ignored the temperature would pass.
+#[test]
+fn sampled_speculative_decode_is_byte_identical_to_sampled_decode_at_one_seed() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let max_tokens = 40usize;
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+
+    let greedy = {
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        session
+            .decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &DecodeOptions::new(max_tokens),
+                &mut |_: &[u32]| Ok(()),
+            )?
+            .ids
+    };
+
+    let mut cells = 0usize;
+    let mut informative = 0usize;
+    // `GumbelSoftmax` is the arm one mechanism serves on both paths: the
+    // identity. `All { temperature }` is the pre-existing asymmetry
+    // (`generation_tests::the_all_arm_draws_by_a_different_mechanism_on_each_path`):
+    // the Blocking arm's `sample` draws it through a host multinomial while
+    // the verify (as the Ring arm) draws gumbel-max, so against the blocking
+    // K=1 arm the two streams DIFFER by mechanism and this test pins that
+    // divergence at the driver level rather than asserting an identity the
+    // tree does not have. Against the Ring arm (Metal) they would agree.
+    for (sampling, expect_identity) in [
+        (Sampling::GumbelSoftmax { temperature: 0.9 }, true),
+        (Sampling::All { temperature: 1.2 }, false),
+    ] {
+        for seed in [0u64, 7, 42, 1234] {
+            let non_spec = {
+                let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+                let mut session = Session::new(&model, cache);
+                let mut rb = Blocking::new(&eos_ids, &dev)?;
+                let mut sampler = LogitsProcessor::from_sampling(seed, sampling.clone());
+                let out = session.decode(
+                    &mut IdentityProposer,
+                    &mut rb,
+                    &mut sampler,
+                    &prompt,
+                    &DecodeOptions::new(max_tokens),
+                    &mut |_: &[u32]| Ok(()),
+                )?;
+                (out.ids, out.eos)
+            };
+            let spec = {
+                let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+                let mut session = Session::new(&model, cache);
+                let mut drafter = GarbageDrafter { k, token: 0 };
+                let mut rb = Blocking::new(&eos_ids, &dev)?;
+                let mut sampler = LogitsProcessor::from_sampling(seed, sampling.clone());
+                let mut streamed = Vec::new();
+                let out = session.decode_speculative(
+                    lloom::profile::RewindProof::of(),
+                    &mut drafter,
+                    &mut rb,
+                    &mut sampler,
+                    &prompt,
+                    &DecodeOptions::new(max_tokens),
+                    &eos_ids,
+                    &mut |b: &[u32]| {
+                        streamed.extend_from_slice(b);
+                        Ok(())
+                    },
+                )?;
+                assert_eq!(out.ids, streamed, "the stream must equal the returned ids");
+                // A run the model ends on EOS inside its first round shows
+                // nothing about rejected rows; such a cell still must agree,
+                // and enough cells must run past one round (below).
+                (out.ids, out.eos, out.stats.rounds.len())
+            };
+            let (spec, rounds) = ((spec.0, spec.1), spec.2);
+            // The cell is informative when the run spans more than one
+            // round, is longer than a block, and is not greedy's stream
+            // (a draw the temperature never reached would agree trivially);
+            // seed 1234 at t = 0.9 draws EOS first and is an empty reply on
+            // both arms. Every cell must agree; enough must be informative.
+            if rounds > 1 && non_spec.0.len() > k && non_spec.0 != greedy {
+                informative += 1;
+            }
+            if expect_identity {
+                assert_eq!(
+                    non_spec, spec,
+                    "{sampling:?} seed {seed}: sampled speculative decode must be byte-identical \
+                     to sampled non-speculative decode at one seed (#943 §2) — a divergence here \
+                     means a rejected row's draw moved a later position's noise"
+                );
+            } else if non_spec.0.len() > k && spec.0.len() > k {
+                assert_ne!(
+                    non_spec, spec,
+                    "{sampling:?} seed {seed}: the blocking K=1 arm's `All` (a host \
+                     multinomial) now equals the verify's gumbel-max draw; if the two \
+                     mechanisms were reconciled deliberately, move this arm to the identity \
+                     set and say so"
+                );
+            }
+            cells += 1;
+        }
+    }
+    assert_eq!(cells, 8);
+    assert!(
+        informative >= 5,
+        "only {informative} of 8 cells ran past one round with a non-greedy stream; a \
+         rejected row's effect needs a second round to show"
+    );
+    Ok(())
+}
+
+/// The arms the sampled verify cannot serve are refused by name before any
+/// state is touched — the host-sort samplers and active processors — rather
+/// than served as argmax under a sampled label (§7.1a-i).
+#[test]
+fn decode_speculative_refuses_what_it_cannot_sample_by_name() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 3usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3];
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    let run = |sampler: &mut LogitsProcessor| -> Result<()> {
+        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut drafter = GarbageDrafter { k, token: 0 };
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        session
+            .decode_speculative(
+                lloom::profile::RewindProof::of(),
+                &mut drafter,
+                &mut rb,
+                sampler,
+                &prompt,
+                &DecodeOptions::new(8),
+                &eos_ids,
+                &mut |_: &[u32]| Ok(()),
+            )
+            .map(|_| ())
+    };
+    for sampling in [
+        Sampling::TopP {
+            p: 0.9,
+            temperature: 0.8,
+        },
+        Sampling::TopK {
+            k: 4,
+            temperature: 0.8,
+        },
+        Sampling::TopKThenTopP {
+            k: 4,
+            p: 0.9,
+            temperature: 0.8,
+        },
+    ] {
+        let err = run(&mut LogitsProcessor::from_sampling(1, sampling.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host sort"), "{sampling:?}: {err}");
+    }
+    let procs = lloom::generation::Processors {
+        repetition_penalty: 1.2,
+        ..Default::default()
+    };
+    let mut p = LogitsProcessor::from_sampling(1, Sampling::GumbelSoftmax { temperature: 0.8 })
+        .with_processors(procs);
+    let err = run(&mut p).unwrap_err().to_string();
+    assert!(err.contains("history"), "processors: {err}");
+    Ok(())
+}

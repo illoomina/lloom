@@ -7,6 +7,7 @@
 //! parallel threads would count each other's launches.
 #![cfg(feature = "metal")]
 
+#[path = "quant_parity/mod.rs"]
 mod quant_parity;
 
 use lloom_tensor::{Device, Result};

@@ -206,6 +206,58 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
         .fold(0f32, f32::max))
 }
 
+/// Every conv layer's state in `got` against `want`, bit for bit.
+fn conv_states_equal<P: lloom::profile::Profile>(
+    tag: &str,
+    got: &State<P>,
+    want: &State<P>,
+    layers: usize,
+) -> Result<()> {
+    for l in 0..layers {
+        let (Some(a), Some(b)) = (got.conv_state_for_test(l), want.conv_state_for_test(l)) else {
+            continue;
+        };
+        let d = max_abs_diff(&a, &b)?;
+        assert!(
+            d == 0.0,
+            "{tag}: layer {l} conv state differs from the same passes replayed by {d}"
+        );
+    }
+    Ok(())
+}
+
+/// Every conv layer's state in `got` within `REL` of a fresh prefill of the
+/// same tokens in one pass, `want`. One pass and several are not promised the
+/// same bits (`profiles-and-memory-design.md` §3: `deterministic` holds across
+/// runs, not across pass splits), and differ by a rounding; a restore from a
+/// stale checkpoint or a misplaced window is off by whole columns of other
+/// tokens, which this bound sees.
+fn conv_states_near_one_pass<P: lloom::profile::Profile>(
+    tag: &str,
+    got: &State<P>,
+    want: &State<P>,
+    layers: usize,
+) -> Result<()> {
+    const REL: f32 = 1e-5;
+    for l in 0..layers {
+        let (Some(a), Some(b)) = (got.conv_state_for_test(l), want.conv_state_for_test(l)) else {
+            continue;
+        };
+        let d = max_abs_diff(&a, &b)?;
+        let scale = b
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .fold(0f32, |m, x| m.max(x.abs()));
+        assert!(
+            d <= REL * scale,
+            "{tag}: layer {l} conv state is {d:e} from a fresh one-pass prefill at scale {scale:e} \
+             (bound {REL} x scale): the restore read the wrong columns"
+        );
+    }
+    Ok(())
+}
+
 fn greedy_decode<P: Lfm2Shape>(
     model: &Model<P>,
     session: &mut Session<'_, Model<P>>,
@@ -271,8 +323,8 @@ fn re_render_case<P: Lfm2Shape>(
     conv_state: ConvState,
     kv_append: KvAppend,
 ) -> Result<()> {
-    let model = build::<P>(&cfg, &dev)?;
-    let mut session = Session::new(&model, State::<P>::new(true, DType::F32, &cfg, &dev)?);
+    let model = build::<P>(cfg, dev)?;
+    let mut session = Session::new(&model, State::<P>::new(true, DType::F32, cfg, dev)?);
     let reply = greedy_decode(&model, &mut session, &prompt1, 8)?;
     assert!(
         reply.len() >= 4,
@@ -306,40 +358,33 @@ fn re_render_case<P: Lfm2Shape>(
         "the token log was cut to the kept prefix"
     );
 
-    // The reference: a fresh prefill of exactly the kept tokens.
-    let mut fresh = State::<P>::new(true, DType::F32, &cfg, &dev)?;
-    let input = Tensor::new(&full2[..keep], &dev)?.unsqueeze(0)?;
+    // The reference runs the session's passes on a state of its own — the
+    // turn's prefill, then the restore to the kept prefix — so the bits are
+    // comparable: `deterministic` promises nothing across pass splits
+    // (`profiles-and-memory-design.md` §3).
+    let mut same = State::<P>::new(true, DType::F32, cfg, dev)?;
+    model.forward(&Tensor::new(prompt1, dev)?.unsqueeze(0)?, 0, &mut same)?;
+    same.restore(keep)?;
+    let cache = session.sequence().cache();
+    assert_eq!(cache.kv_len(), same.kv_len(), "KV length");
+    assert_eq!(cache.conv_phase(), same.conv_phase(), "conv phase");
+    let tag = format!("{conv_state:?}");
+    conv_states_equal(&tag, cache, &same, cfg.num_hidden_layers)?;
+    // The replay shares the restore, so the columns it read are checked
+    // against a mechanism that has none: a fresh prefill of the kept tokens.
+    let mut fresh = State::<P>::new(true, DType::F32, cfg, dev)?;
+    let input = Tensor::new(&full2[..keep], dev)?.unsqueeze(0)?;
     model.forward(&input, 0, &mut fresh)?;
-    assert_eq!(
-        session.sequence().cache().kv_len(),
-        fresh.kv_len(),
-        "KV length"
-    );
-    assert_eq!(
-        session.sequence().cache().conv_phase(),
-        fresh.conv_phase(),
-        "conv phase"
-    );
-    for l in 0..cfg.num_hidden_layers {
-        let (Some(a), Some(b)) = (
-            session.sequence().cache().conv_state_for_test(l),
-            fresh.conv_state_for_test(l),
-        ) else {
-            return Ok(());
-        };
-        let d = max_abs_diff(&a, &b)?;
-        assert!(
-            d == 0.0,
-            "{conv_state:?}: layer {l} conv state after restore differs from a fresh prefill by {d}"
-        );
-    }
-    // And the continuation is the fresh session's, token for token.
-    let mut fresh_session = Session::new(&model, State::<P>::new(true, DType::F32, &cfg, &dev)?);
-    let want = greedy_decode(&model, &mut fresh_session, &full2, 12)?;
+    assert_eq!(cache.kv_len(), fresh.kv_len(), "KV length");
+    assert_eq!(cache.conv_phase(), fresh.conv_phase(), "conv phase");
+    conv_states_near_one_pass(&tag, cache, &fresh, cfg.num_hidden_layers)?;
+    // And the continuation is the replay's, token for token.
+    let mut same_session = Session::with_pos(&model, same, keep);
+    let want = greedy_decode(&model, &mut same_session, &prepared.suffix, 12)?;
     let got = greedy_decode(&model, &mut session, &prepared.suffix, 12)?;
     assert_eq!(
         got, want,
-        "{conv_state:?}: the reused turn's stream is the fresh turn's"
+        "{conv_state:?}: the reused turn's stream is the replayed turn's"
     );
     Ok(())
 }
@@ -852,25 +897,35 @@ fn a_rewound_sequence_does_not_restore_from_a_stale_checkpoint() -> Result<()> {
         p3.action
     );
     assert_eq!(p3.reused, 23);
+    // The reference runs the session's passes on a state of its own: the
+    // first prompt (24), the restore to 22, the second turn's pass (8), the
+    // restore to 23 — comparable bits, since `deterministic` promises nothing
+    // across pass splits (`profiles-and-memory-design.md` §3).
+    let mut same = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
+    model.forward(
+        &Tensor::new(prompt1.as_slice(), &dev)?.unsqueeze(0)?,
+        0,
+        &mut same,
+    )?;
+    same.restore(22)?;
+    model.forward(
+        &Tensor::new(&full2[22..], &dev)?.unsqueeze(0)?,
+        22,
+        &mut same,
+    )?;
+    same.restore(23)?;
+    let cache = session.sequence().cache();
+    conv_states_equal("rewound", cache, &same, cfg.num_hidden_layers)?;
+    // The replay shares the restore and the checkpoint bookkeeping, so a stale
+    // read would be in both; a fresh prefill of the 23 tokens has neither,
+    // and the stale checkpoint's columns are other tokens'.
     let mut fresh = State::<CrownExact>::new(true, DType::F32, &cfg, &dev)?;
     model.forward(
         &Tensor::new(&full3[..23], &dev)?.unsqueeze(0)?,
         0,
         &mut fresh,
     )?;
-    for l in 0..cfg.num_hidden_layers {
-        let (Some(a), Some(b)) = (
-            session.sequence().cache().conv_state_for_test(l),
-            fresh.conv_state_for_test(l),
-        ) else {
-            continue;
-        };
-        let d = max_abs_diff(&a, &b)?;
-        assert!(
-            d == 0.0,
-            "layer {l}: the restore read a stale checkpoint (differs from a fresh prefill by {d})"
-        );
-    }
+    conv_states_near_one_pass("rewound", cache, &fresh, cfg.num_hidden_layers)?;
     Ok(())
 }
 

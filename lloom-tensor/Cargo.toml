@@ -8,6 +8,10 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
+# One integration-test binary (`tests/main.rs`, lloom #939): the `tests/*.rs`
+# files are its modules, declared there. A file that owns its binary (a
+# `#[global_allocator]`) is listed below.
+autotests = false
 
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
@@ -68,6 +72,14 @@ tokenizers = { workspace = true, features = ["unstable_wasm"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
+
+[[test]]
+name = "main"
+path = "tests/main.rs"
+
+[[test]]
+name = "metal_pool_alloc_free"
+path = "tests/metal_pool_alloc_free.rs"
 
 [dev-dependencies]
 anyhow = { workspace = true }

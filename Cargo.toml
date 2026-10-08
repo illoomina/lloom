@@ -45,7 +45,7 @@ resolver = "2"
 version = "0.11.0"
 edition = "2021"
 description = "Minimalist ML framework."
-repository = "https://github.com/huggingface/candle"
+repository = "https://github.com/illoomina/lloom"
 keywords = ["blas", "tensor", "machine-learning"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
@@ -180,6 +180,22 @@ codegen-units = 1
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# The CI test tier: the dev profile's checks (debug assertions, overflow
+# checks) at a codegen that links a test binary a runner's disk can hold.
+# Full debug info on every test binary of `lloom` (129 of them, each
+# statically linking the engine) filled a 72 GB runner (lloom #939);
+# `line-tables-only` keeps the panic backtraces and drops the type
+# information nobody reads in CI. A failing test is rerun under `dev` for
+# the debugger. `opt-level = 2` changes no result: Rust emits no fused or
+# reassociated float arithmetic at any opt level, and
+# `measurements/issue-939.md` §6 shows the digests unmoved.
+[profile.ci]
+inherits = "dev"
+opt-level = 2
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
 
 # The sanitizer tier (#475). A CORRECTNESS arm, and the profile exists so that
 # is a property of the tree rather than of an invocation nobody recorded —

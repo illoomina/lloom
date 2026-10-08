@@ -279,9 +279,8 @@ fn the_recurrences_are_marked() {
 /// read from), every `TRACE … kernel=<label> n=<count>` line in the IR's
 /// families.
 fn traced(step: usize) -> Census {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../../design/measurements/issue-732-raw/walker/qwen4exp-trace-dev-bfc70b8f4.txt",
-    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen4exp-trace-dev-bfc70b8f4.txt");
     let text = std::fs::read_to_string(&path).expect("the committed trace");
     let prefix = format!("TRACE run=1 step={step} kernel=");
     census_of_labels(text.lines().filter_map(|l| {
@@ -333,9 +332,8 @@ fn the_block_completing_walk_is_the_traced_step_10() {
 #[test]
 fn the_past_dense_walk_is_the_needle_step() {
     use lloom::models::qwen4exp::testing::ghost_model_host_planned;
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../../design/measurements/issue-732-raw/walker/qwen4exp-trace-needle-dev-a5c815f13.txt",
-    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/qwen4exp-trace-needle-dev-a5c815f13.txt");
     let text = std::fs::read_to_string(&path).expect("the committed needle trace");
     let prefix = "TRACE run=1 step=9 kernel=";
     let mut loads = 0u64;

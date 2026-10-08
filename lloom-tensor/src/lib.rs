@@ -68,6 +68,7 @@ pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod error;
 mod indexer;
+pub mod isolation;
 pub mod layout;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their

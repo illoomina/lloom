@@ -1,0 +1,97 @@
+# CPU build, no `metal` feature, in the project's container image
+# (`Dockerfile`, stage `test`; `.github/ci/in-container.sh`).
+#
+# The CPU backend is the reference the Metal kernels are tested against, and a
+# backend nobody builds decays silently. This job builds it with NO `metal`
+# feature, so a CPU regression surfaces here rather than inside a tolerance
+# comparison. `lloom-engine` is also built with `serve`, the feature behind the
+# `lloom` and `lloom-serve` binaries. ci-cpu-tests.yml runs the tests.
+#
+# These are the development repository's gates, ported: the same image, the
+# same scripts, paths at this repository's root.
+
+name: CI / CPU (no metal)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  cpu-no-metal:
+    name: cargo build, no metal feature, in the container
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: test
+          tags: lloom-ci:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Restored here and saved at the end whatever the job's verdict
+      # (`actions/cache` alone saves only on success, so a red run left the
+      # next one cold, #939). The save reuses the key computed here:
+      # `hashFiles` evaluated after the build read a different Cargo.lock
+      # hash than before it, and the next run's exact key never matched.
+      - name: Restore cargo registry and target
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-cpu-build-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            ci-cpu-build-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-
+            ci-cpu-build-${{ runner.os }}-
+
+      - name: lloom-tensor (no metal)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cargo build -p lloom-tensor
+
+      - name: lloom-engine (no metal)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cargo build -p lloom-engine
+
+      - name: lloom (no metal)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cargo build -p lloom
+
+      - name: lloom-engine binaries (serve, no metal)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cargo build -p lloom-engine --features serve --bins
+
+      - name: shape-probe stays out of lloom-engine
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- shape-probe-release.sh
+
+      - name: Save cargo registry and target
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

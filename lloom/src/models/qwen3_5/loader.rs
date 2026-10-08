@@ -5,11 +5,15 @@
 //! in the crate, not a second.
 
 use super::config::{Config, ARCH_DENSE, ARCH_MOE};
-use super::{Qwen3_5, Qwen3_5Layer, Qwen3_5Mixer, Qwen3_5Moe, Qwen3_5MoeLayer};
+use super::{
+    Qwen3_5, Qwen3_5Layer, Qwen3_5Mixer, Qwen3_5Moe, Qwen3_5MoeLayer, Qwen3_5MoeMtpHead,
+    Qwen3_5MtpHead,
+};
 use crate::models::qwen4exp::loader::{md_f32, md_u32, open_shards, working_set_of, Gguf, Shard};
 use crate::models::qwen4exp::{GatedDeltaNet, LayerKind, MoeLayer, QsaAttention, Resident};
 use crate::nn::blocks::SwiGlu;
 use crate::nn::decoder::{Decoder, Hybrid, NormHead, PreNorm, StateCapacity, TokenEmbed};
+use crate::nn::mtp::NextnHead;
 use crate::nn::RmsNorm;
 use crate::profile::Profile;
 use lloom_tensor::quantized::gguf_file::{Content, Value};
@@ -37,6 +41,11 @@ pub struct LoadOptions {
     /// Keep every float matrix f32 (`QMatMul::Tensor`) instead of an f16
     /// stem: the CPU reference's precision, not a serving arm.
     pub dense_f32: bool,
+    /// Load the MTP block (`blk.{n_layers}` + its `nextn.*`) as a
+    /// [`NextnHead`](crate::nn::mtp::NextnHead): from the main file when
+    /// its header keeps one (`nextn_predict_layers`), else from the sidecar
+    /// the `*_with_mtp` constructors take. Refused when neither carries it.
+    pub mtp: bool,
 }
 
 impl Default for LoadOptions {
@@ -46,6 +55,7 @@ impl Default for LoadOptions {
             kv_precision: None,
             memory_fraction: None,
             dense_f32: false,
+            mtp: false,
         }
     }
 }
@@ -321,6 +331,23 @@ fn open<R: Read + Seek>(
     want_moe: bool,
 ) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>)> {
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
+    // A sidecar's MTP block (bartowski's `mtp-*.gguf`): the main header
+    // says nothing of it, the table carries `blk.{n_layers}.nextn.*`.
+    if cfg.n_nextn_layers == 0
+        && gg
+            .shape(&format!("blk.{}.nextn.eh_proj.weight", cfg.n_layers))
+            .is_ok()
+    {
+        cfg.n_nextn_layers = 1;
+    }
+    if opts.mtp && cfg.n_nextn_layers == 0 {
+        lloom_tensor::bail!(
+            "qwen3_5: the checkpoint carries no MTP block (`nextn_predict_layers` 0 and no \
+             `blk.{}.nextn.*` in the shards); the MTP needs the block in the main file or a \
+             sidecar GGUF",
+            cfg.n_layers
+        )
+    }
     if cfg.is_moe() != want_moe {
         lloom_tensor::bail!(
             "qwen3_5: the checkpoint is {} and the loader asked for {}",
@@ -351,10 +378,44 @@ fn open<R: Read + Seek>(
     Ok((cfg, embed, head))
 }
 
+/// The MTP block's attention layer, `blk.{n_layers}`: the full-attention
+/// mixer of the family's shape (llama.cpp `load_block_mtp`).
+fn load_mtp_attention<P: Profile, R: Read + Seek>(
+    gg: &mut Gguf<'_, R>,
+    l: usize,
+    cfg: &Config,
+) -> Result<QsaAttention<P>> {
+    match load_mixer::<P, R>(gg, l, LayerKind::Full, cfg)? {
+        Hybrid::B(attn) => Ok(attn),
+        Hybrid::A(_) => lloom_tensor::bail!("the MTP block is a full-attention layer"),
+    }
+}
+
+/// The `nextn.*` projections around the MTP block's layer.
+fn load_nextn<L: crate::nn::decoder::Layer, R: Read + Seek>(
+    gg: &mut Gguf<'_, R>,
+    l: usize,
+    layer: L,
+    cfg: &Config,
+) -> Result<NextnHead<L>> {
+    let p = format!("blk.{l}.nextn");
+    Ok(NextnHead::new(
+        RmsNorm::new(gg.f32(&format!("{p}.enorm.weight"))?, cfg.norm_eps),
+        RmsNorm::new(gg.f32(&format!("{p}.hnorm.weight"))?, cfg.norm_eps),
+        gg.qmat(&format!("{p}.eh_proj.weight"))?,
+        layer,
+        RmsNorm::new(
+            gg.f32(&format!("{p}.shared_head_norm.weight"))?,
+            cfg.norm_eps,
+        ),
+        cfg.hidden_size,
+    ))
+}
+
 fn build_dense<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
-) -> Result<Qwen3_5<P>> {
+) -> Result<(Qwen3_5<P>, Option<Qwen3_5MtpHead<P>>)> {
     let (cfg, embed, head) = open(gg, opts, false)?;
     let mut layers: Vec<Qwen3_5Layer<P>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
@@ -369,14 +430,35 @@ fn build_dense<P: Profile, R: Read + Seek>(
             ffn: load_dense_ffn(gg, l, &cfg)?,
         });
     }
+    let mtp = if opts.mtp {
+        let l = cfg.n_layers;
+        let p = format!("blk.{l}");
+        let layer = PreNorm {
+            norm_in: RmsNorm::new(gg.f32(&format!("{p}.attn_norm.weight"))?, cfg.norm_eps),
+            mixer: load_mtp_attention::<P, R>(gg, l, &cfg)?,
+            norm_mid: RmsNorm::new(
+                gg.f32(&format!("{p}.post_attention_norm.weight"))?,
+                cfg.norm_eps,
+            ),
+            ffn: load_dense_ffn(gg, l, &cfg)?,
+        };
+        Some(load_nextn(gg, l, layer, &cfg)?)
+    } else {
+        None
+    };
     let cap = capacity(&cfg, opts);
-    Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap)
+    let hidden = cfg.hidden_size;
+    let device = gg.device.clone();
+    Ok((
+        Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?,
+        mtp,
+    ))
 }
 
 fn build_moe<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
-) -> Result<Qwen3_5Moe<P>> {
+) -> Result<(Qwen3_5Moe<P>, Option<Qwen3_5MoeMtpHead<P>>)> {
     let (cfg, embed, head) = open(gg, opts, true)?;
     let mut layers: Vec<Qwen3_5MoeLayer<P, Resident>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
@@ -391,8 +473,56 @@ fn build_moe<P: Profile, R: Read + Seek>(
             ffn: load_moe_ffn::<P, R>(gg, l, &cfg)?,
         });
     }
+    let mtp = if opts.mtp {
+        let l = cfg.n_layers;
+        let p = format!("blk.{l}");
+        let layer = PreNorm {
+            norm_in: RmsNorm::new(gg.f32(&format!("{p}.attn_norm.weight"))?, cfg.norm_eps),
+            mixer: load_mtp_attention::<P, R>(gg, l, &cfg)?,
+            norm_mid: RmsNorm::new(
+                gg.f32(&format!("{p}.post_attention_norm.weight"))?,
+                cfg.norm_eps,
+            ),
+            ffn: load_moe_ffn::<P, R>(gg, l, &cfg)?,
+        };
+        Some(load_nextn(gg, l, layer, &cfg)?)
+    } else {
+        None
+    };
     let cap = capacity(&cfg, opts);
-    Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap)
+    let hidden = cfg.hidden_size;
+    let device = gg.device.clone();
+    Ok((
+        Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?,
+        mtp,
+    ))
+}
+
+/// The shards and, after them, an MTP sidecar GGUF (bartowski's
+/// `mtp-*.gguf`) with the tensors it duplicates from the main file
+/// (`token_embd`, `output`, `output_norm`) dropped: the head reads the
+/// target's, as the reference does without `nextn.embed_tokens` /
+/// `shared_head_head` in the block.
+fn open_shards_with_sidecar(
+    paths: &[PathBuf],
+    sidecar: Option<&PathBuf>,
+) -> Result<(Vec<Content>, Vec<std::fs::File>, Vec<PathBuf>)> {
+    let mut all: Vec<PathBuf> = paths.to_vec();
+    if let Some(s) = sidecar {
+        all.push(s.clone());
+    }
+    let (mut contents, files) = open_shards(&all)?;
+    if sidecar.is_some() {
+        let main: std::collections::HashSet<String> = contents[..paths.len()]
+            .iter()
+            .flat_map(|c| c.tensor_infos.keys().cloned())
+            .collect();
+        let last = contents.len() - 1;
+        contents[last]
+            .tensor_infos
+            .retain(|name, _| !main.contains(name));
+    }
+    Ok((contents, files, all))
 }
 
 /// The architecture a GGUF's header names, when it is this family's.
@@ -410,13 +540,25 @@ pub fn arch_of(content: &Content) -> Option<&'static str> {
 }
 
 impl<P: Profile> Qwen3_5<P> {
-    /// The dense model from one open GGUF.
+    /// The dense model from one open GGUF (`opts.mtp` off).
     pub fn from_gguf<R: Read + Seek>(
         content: Content,
         reader: &mut R,
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
+        no_mtp(opts)?;
+        Self::from_gguf_with_mtp(content, reader, device, opts).map(|(m, _)| m)
+    }
+
+    /// The dense model from one open GGUF, with its MTP head when
+    /// `opts.mtp` and the file keeps the block.
+    pub fn from_gguf_with_mtp<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<(Self, Option<Qwen3_5MtpHead<P>>)> {
         let mut gg = Gguf::new(
             vec![Shard {
                 content,
@@ -429,17 +571,29 @@ impl<P: Profile> Qwen3_5<P> {
         build_dense::<P, R>(&mut gg, opts)
     }
 
-    /// The dense model from a checkpoint's shards.
+    /// The dense model from a checkpoint's shards (`opts.mtp` off).
     pub fn from_gguf_shards(
         paths: &[PathBuf],
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
-        let (contents, mut files) = open_shards(paths)?;
+        no_mtp(opts)?;
+        Self::from_gguf_shards_with_mtp(paths, None, device, opts).map(|(m, _)| m)
+    }
+
+    /// The dense model from a checkpoint's shards, with its MTP head when
+    /// `opts.mtp`: from the main file's block, else from `sidecar`.
+    pub fn from_gguf_shards_with_mtp(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<(Self, Option<Qwen3_5MtpHead<P>>)> {
+        let (contents, mut files, all) = open_shards_with_sidecar(paths, sidecar)?;
         let shards = contents
             .into_iter()
             .zip(files.iter_mut())
-            .zip(paths)
+            .zip(&all)
             .map(|((content, reader), path)| Shard {
                 content,
                 reader,
@@ -453,13 +607,26 @@ impl<P: Profile> Qwen3_5<P> {
 }
 
 impl<P: Profile> Qwen3_5Moe<P> {
-    /// The MoE model from one open GGUF, every expert resident.
+    /// The MoE model from one open GGUF, every expert resident (`opts.mtp`
+    /// off).
     pub fn from_gguf<R: Read + Seek>(
         content: Content,
         reader: &mut R,
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
+        no_mtp(opts)?;
+        Self::from_gguf_with_mtp(content, reader, device, opts).map(|(m, _)| m)
+    }
+
+    /// The MoE model from one open GGUF, with its MTP head when `opts.mtp`
+    /// and the file keeps the block.
+    pub fn from_gguf_with_mtp<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<(Self, Option<Qwen3_5MoeMtpHead<P>>)> {
         let mut gg = Gguf::new(
             vec![Shard {
                 content,
@@ -472,17 +639,30 @@ impl<P: Profile> Qwen3_5Moe<P> {
         build_moe::<P, R>(&mut gg, opts)
     }
 
-    /// The MoE model from a checkpoint's shards, every expert resident.
+    /// The MoE model from a checkpoint's shards, every expert resident
+    /// (`opts.mtp` off).
     pub fn from_gguf_shards(
         paths: &[PathBuf],
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
-        let (contents, mut files) = open_shards(paths)?;
+        no_mtp(opts)?;
+        Self::from_gguf_shards_with_mtp(paths, None, device, opts).map(|(m, _)| m)
+    }
+
+    /// The MoE model from a checkpoint's shards, with its MTP head when
+    /// `opts.mtp`: from the main file's block, else from `sidecar`.
+    pub fn from_gguf_shards_with_mtp(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<(Self, Option<Qwen3_5MoeMtpHead<P>>)> {
+        let (contents, mut files, all) = open_shards_with_sidecar(paths, sidecar)?;
         let shards = contents
             .into_iter()
             .zip(files.iter_mut())
-            .zip(paths)
+            .zip(&all)
             .map(|((content, reader), path)| Shard {
                 content,
                 reader,
@@ -493,4 +673,12 @@ impl<P: Profile> Qwen3_5Moe<P> {
         gg.dense_f32 = opts.dense_f32;
         build_moe::<P, _>(&mut gg, opts)
     }
+}
+
+/// The constructors that return the model alone take no MTP request.
+fn no_mtp(opts: &LoadOptions) -> Result<()> {
+    if opts.mtp {
+        lloom_tensor::bail!("qwen3_5: `LoadOptions::mtp` wants a `*_with_mtp` constructor")
+    }
+    Ok(())
 }

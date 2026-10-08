@@ -18,6 +18,7 @@ pub use loader::{arch_of, LoadOptions, DEFAULT_MEMORY_FRACTION};
 use crate::models::qwen4exp::{GatedDeltaNet, MoeLayer, QsaAttention, Resident};
 use crate::nn::blocks::SwiGlu;
 use crate::nn::decoder::{Decoder, DecoderState, Hybrid, NormHead, PreNorm, TokenEmbed};
+use crate::nn::mtp::NextnHead;
 use crate::nn::RmsNorm;
 
 /// A layer's token mixer: the Gated DeltaNet (`linear_attention`) or the
@@ -35,3 +36,10 @@ pub type Qwen3_5Moe<P, R = Resident> =
 /// The states.
 pub type Qwen3_5State<P> = DecoderState<Qwen3_5Layer<P>>;
 pub type Qwen3_5MoeState<P, R = Resident> = DecoderState<Qwen3_5MoeLayer<P, R>>;
+/// The MTP block (`blk.{n_layers}`): a full-attention layer of the family's
+/// shape, with its own KV; the `nextn.*` projections around it
+/// (`nn::mtp`).
+pub type Qwen3_5MtpLayer<P> = PreNorm<RmsNorm, QsaAttention<P>, SwiGlu>;
+pub type Qwen3_5MoeMtpLayer<P, R = Resident> = PreNorm<RmsNorm, QsaAttention<P>, MoeLayer<P, R>>;
+pub type Qwen3_5MtpHead<P> = NextnHead<Qwen3_5MtpLayer<P>>;
+pub type Qwen3_5MoeMtpHead<P, R = Resident> = NextnHead<Qwen3_5MoeMtpLayer<P, R>>;

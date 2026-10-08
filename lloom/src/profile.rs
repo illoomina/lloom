@@ -554,12 +554,12 @@ pub const QWEN4EXP: Bound = Bound {
     rows: &["One", "Paged"],
     except: &[PoolSpec::KEY, PoolSpecExact::KEY],
 };
-/// Qwen3.5 ships `No × One` only (one sequence, no speculative body, no
-/// rows): the generic decoder's first rung carries one state per layer and
-/// no rewind ring yet.
+/// Qwen3.5 ships `No × One` (one sequence) and `Ring × One` (the MTP
+/// drafter's verify window over the generic decoder's per-layer state,
+/// `nn::decoder`); no rows.
 pub const QWEN3_5: Bound = Bound {
     family: "qwen3_5",
-    rewind: &["No"],
+    rewind: &["No", "Ring"],
     rows: &["One"],
     except: &[],
 };

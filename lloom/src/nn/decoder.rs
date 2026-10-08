@@ -20,11 +20,13 @@
 use crate::nn::blocks::{Ffn, Mixer, Norm};
 use crate::nn::model::{CacheReset, CacheRewind, CausalLM, Model};
 use crate::nn::ops::KvPrecision;
+use crate::nn::row_log::RowLog;
+use crate::nn::speculator::{accept_prefix, Anchor, Draft, DraftTokens, NextnHidden, Probes};
 use crate::nn::var_builder::VarBuilder;
 use crate::optimizer::{NodeId, Shape, Visit, Walker};
 use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
-use lloom_tensor::{DType, Device, Module, Result, Tensor};
+use lloom_tensor::{DType, Device, Module, Result, Tensor, D};
 use std::marker::PhantomData;
 
 /// What a sequence's state is sized by: the KV capacity in tokens and the
@@ -44,14 +46,38 @@ impl StateCapacity {
     }
 }
 
+/// What a mixer's state records when a speculative window opens, for its
+/// rewind: a KV cache its lengths (tokens, compressed blocks); a recurrent
+/// state snapshots in place (`RecurrentState::open_window`) and records
+/// nothing here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowMark {
+    pub tokens: usize,
+    pub blocks: usize,
+}
+
 /// A token mixer the topology can own the state of: how to make a fresh
-/// state for one layer, clear it, and walk the mixer's step.
+/// state for one layer, clear it, walk the mixer's step, and roll the state
+/// back over a speculative window (`sequence-state.md` §10.2a: a KV cache
+/// by a length, a recurrent state by a snapshot and a replay).
 pub trait MixerBlock: Mixer + Send + Sync {
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State>;
     fn reset_state(state: &mut Self::State);
     /// The mixer's decode step as IR, layer `l` (`Visit`, with the layer index
     /// and the capacity a cache-bearing mixer's walk reads).
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId;
+    /// Open a speculative window: record what [`Self::rewind_window`]
+    /// restores. One window at a time.
+    fn open_window(state: &mut Self::State) -> Result<WindowMark>;
+    /// Put the state back where the window opened (the caller replays the
+    /// accepted prefix afterwards).
+    fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
+    /// Close the window keeping everything written inside it.
+    fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
+    /// Cut the state back to its first `tokens` positions outside a window
+    /// (an attention-only lane cut to a reused prefix, `Speculator::begin_at`).
+    /// A recurrent state has no length to cut to and refuses.
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
 }
 
 /// A feed-forward the topology can own the state of (`()` for a dense MLP
@@ -63,13 +89,18 @@ pub trait FfnBlock: Ffn + Send + Sync {
 }
 
 /// One layer of a [`Decoder`]: a unit over `[1, seq, hidden]` with its own
-/// per-sequence state.
+/// per-sequence state, rolled back over a speculative window as its mixer's
+/// ([`MixerBlock`]).
 pub trait Layer: Send + Sync {
     type State: Send + Sync;
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State>;
     fn reset_state(state: &mut Self::State);
     fn execute(&self, x: &Tensor, state: &mut Self::State) -> Result<Tensor>;
     fn visit_layer(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId;
+    fn open_window(state: &mut Self::State) -> Result<WindowMark>;
+    fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
+    fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()>;
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()>;
 }
 
 /// The token embedding of a [`Decoder`].
@@ -79,10 +110,20 @@ pub trait Embed: Send + Sync {
     fn visit_embed(&self, w: &mut Walker, ids: NodeId) -> NodeId;
 }
 
-/// The head of a [`Decoder`]: the last position's residual → logits.
+/// The head of a [`Decoder`]: the last position's residual → logits, in
+/// two halves — the final norm over every position ([`Self::normed`], what
+/// an MTP head reads as `h_nextn`: llama.cpp `qwen35.cpp` takes it after
+/// `output_norm`) and the projection of one position ([`Self::project`]).
 pub trait Head: Send + Sync {
+    /// `[1, seq, hidden]` → `[1, seq, hidden]`: the residual after the
+    /// final norm.
+    fn normed(&self, h: &Tensor) -> Result<Tensor>;
+    /// `[1, 1, hidden]` (normed) → `[1, vocab]`.
+    fn project(&self, normed: &Tensor) -> Result<Tensor>;
     /// `[1, 1, hidden]` → `[1, vocab]`.
-    fn head(&self, h: &Tensor) -> Result<Tensor>;
+    fn head(&self, h: &Tensor) -> Result<Tensor> {
+        self.project(&self.normed(h)?)
+    }
     fn visit_head(&self, w: &mut Walker, x: NodeId) -> NodeId;
     fn vocab_size(&self) -> usize;
 }
@@ -143,14 +184,16 @@ impl<N: Norm> NormHead<N> {
 }
 
 impl<N: Norm + Send + Sync> Head for NormHead<N> {
-    fn head(&self, h: &Tensor) -> Result<Tensor> {
-        let (b, seq, hidden) = h.dims3()?;
+    fn normed(&self, h: &Tensor) -> Result<Tensor> {
+        self.norm.execute(h)
+    }
+    fn project(&self, normed: &Tensor) -> Result<Tensor> {
+        let (b, seq, hidden) = normed.dims3()?;
         if b != 1 || seq != 1 {
-            lloom_tensor::bail!("the head takes one position, got {:?}", h.shape())
+            lloom_tensor::bail!("the head takes one position, got {:?}", normed.shape())
         }
-        let n = self.norm.execute(h)?;
         self.proj
-            .forward(&n.reshape((1, hidden))?)?
+            .forward(&normed.reshape((1, hidden))?)?
             .reshape((1, self.vocab))
     }
     fn visit_head(&self, w: &mut Walker, x: NodeId) -> NodeId {
@@ -215,6 +258,20 @@ where
         let f = self.ffn.visit_step(w, h, l);
         w.add(x, f)
     }
+    /// The feed-forward's state is `()` on every block here (a dense MLP, a
+    /// resident MoE): the window is the mixer's.
+    fn open_window(state: &mut Self::State) -> Result<WindowMark> {
+        M::open_window(&mut state.mixer)
+    }
+    fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()> {
+        M::rewind_window(&mut state.mixer, mark)
+    }
+    fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()> {
+        M::resolve_window(&mut state.mixer, mark)
+    }
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
+        M::truncate_state(&mut state.mixer, tokens)
+    }
 }
 
 /// Two mixers, one chosen per layer by the checkpoint's layer-type array:
@@ -273,12 +330,164 @@ where
             Hybrid::B(m) => m.visit_step(w, x, l, cap),
         }
     }
+    fn open_window(state: &mut Self::State) -> Result<WindowMark> {
+        match state {
+            HybridState::A(s) => A::open_window(s),
+            HybridState::B(s) => B::open_window(s),
+        }
+    }
+    fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()> {
+        match state {
+            HybridState::A(s) => A::rewind_window(s, mark),
+            HybridState::B(s) => B::rewind_window(s, mark),
+        }
+    }
+    fn resolve_window(state: &mut Self::State, mark: WindowMark) -> Result<()> {
+        match state {
+            HybridState::A(s) => A::resolve_window(s, mark),
+            HybridState::B(s) => B::resolve_window(s, mark),
+        }
+    }
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
+        match state {
+            HybridState::A(s) => A::truncate_state(s, tokens),
+            HybridState::B(s) => B::truncate_state(s, tokens),
+        }
+    }
 }
 
-/// A decoder's per-sequence state: one per layer, and the position.
+/// A decoder's per-sequence state: one per layer, the position, and the
+/// speculative window a verify rolls the layers back over
+/// (`sequence-state.md` §10.2a, `speculation.md` §10.2h): every layer's
+/// mark, the position, and the rows of the retained probe when it opened.
 pub struct DecoderState<L: Layer> {
     pub layers: Vec<L::State>,
     pub pos: usize,
+    window: Option<DecoderWindow>,
+    /// The final norm's output per position (`h_nextn`), retained for an
+    /// MTP drafter while [`Self::set_want_nextn`] is on.
+    nextn: RowLog,
+    want_nextn: bool,
+    nextn_drops: u64,
+}
+
+#[derive(Debug)]
+struct DecoderWindow {
+    pos: usize,
+    marks: Vec<WindowMark>,
+    retained: usize,
+}
+
+impl<L: Layer> DecoderState<L> {
+    pub fn new(layers: Vec<L::State>) -> Self {
+        Self {
+            layers,
+            pos: 0,
+            window: None,
+            nextn: RowLog::default(),
+            want_nextn: false,
+            nextn_drops: 0,
+        }
+    }
+
+    /// Open a speculative window over every layer's state and the
+    /// position. One at a time.
+    pub fn open_window(&mut self) -> Result<()> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("decoder state: a speculative window is already open")
+        }
+        let mut marks = Vec::with_capacity(self.layers.len());
+        for s in &mut self.layers {
+            marks.push(L::open_window(s)?);
+        }
+        self.window = Some(DecoderWindow {
+            pos: self.pos,
+            marks,
+            retained: self.nextn.rows(),
+        });
+        Ok(())
+    }
+
+    /// Put every layer and the position back where the window opened; what
+    /// the window's passes retained goes with them. The caller replays the
+    /// accepted prefix.
+    pub fn rewind_window(&mut self) -> Result<()> {
+        let Some(w) = self.window.take() else {
+            lloom_tensor::bail!("decoder state: no speculative window is open")
+        };
+        for (s, m) in self.layers.iter_mut().zip(&w.marks) {
+            L::rewind_window(s, *m)?;
+        }
+        self.pos = w.pos;
+        self.nextn.keep_first(w.retained)
+    }
+
+    /// Close the window keeping everything the passes wrote.
+    pub fn resolve_window(&mut self) -> Result<()> {
+        let Some(w) = self.window.take() else {
+            lloom_tensor::bail!("decoder state: no speculative window is open")
+        };
+        for (s, m) in self.layers.iter_mut().zip(&w.marks) {
+            L::resolve_window(s, *m)?;
+        }
+        Ok(())
+    }
+
+    pub fn window_open(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Cut every layer back to its first `tokens` positions outside a
+    /// window (an attention-only lane, `MixerBlock::truncate_state`).
+    pub fn truncate(&mut self, tokens: usize) -> Result<()> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("decoder state: truncating under an open window")
+        }
+        if tokens > self.pos {
+            lloom_tensor::bail!(
+                "decoder state: truncating {} positions to {tokens}",
+                self.pos
+            )
+        }
+        for s in &mut self.layers {
+            L::truncate_state(s, tokens)?;
+        }
+        self.pos = tokens;
+        self.nextn.clear();
+        Ok(())
+    }
+
+    /// Retain `h_nextn` on every forward from now (`on`); returns the
+    /// previous setting.
+    pub fn set_want_nextn(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.want_nextn, on)
+    }
+
+    pub fn want_nextn(&self) -> bool {
+        self.want_nextn
+    }
+
+    /// The rows retained since the last take, `[1, positions, hidden]`, or
+    /// `None` if nothing was.
+    pub fn take_nextn(&mut self) -> Result<Option<Tensor>> {
+        self.nextn.take()
+    }
+
+    /// Discard whatever is retained, counting it as a dropped probe.
+    pub fn drop_nextn(&mut self) {
+        if !self.nextn.is_empty() {
+            self.nextn_drops += 1;
+            self.nextn.clear();
+        }
+    }
+
+    pub fn nextn_drops(&self) -> u64 {
+        self.nextn_drops
+    }
+
+    fn keep_nextn(&mut self, rows: Tensor) {
+        self.nextn.push(rows);
+    }
 }
 
 impl<L: Layer> CacheReset for DecoderState<L> {
@@ -287,6 +496,8 @@ impl<L: Layer> CacheReset for DecoderState<L> {
             L::reset_state(s);
         }
         self.pos = 0;
+        self.window = None;
+        self.nextn.clear();
     }
 }
 
@@ -321,6 +532,10 @@ pub struct Decoder<P: Profile, C, E, L, H> {
     /// once (a prefill's attention is `chunk × context`).
     chunk: usize,
     family: &'static str,
+    /// The residual width, for a probe of no rows.
+    hidden: usize,
+    /// The device the weights live on (a zero-row probe is made there).
+    device: Device,
 }
 
 /// The chunk a prefill runs through the layers at once.
@@ -344,6 +559,8 @@ where
         layers: Vec<L>,
         head: H,
         cap: StateCapacity,
+        hidden: usize,
+        device: &Device,
     ) -> Result<Self> {
         crate::profile::hold::<P::Regime>(family)?;
         Ok(Self {
@@ -355,7 +572,21 @@ where
             cap,
             chunk: PREFILL_CHUNK,
             family,
+            hidden,
+            device: device.clone(),
         })
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn device_of(&self, _state: &DecoderState<L>) -> Result<Device> {
+        Ok(self.device.clone())
+    }
+
+    fn hidden_of(&self) -> usize {
+        self.hidden
     }
 
     pub fn config(&self) -> &C {
@@ -408,10 +639,26 @@ where
                 h = layer.execute(&h, &mut state.layers[l])?;
             }
             state.pos += len;
-            last = Some(h.narrow(1, len - 1, 1)?);
+            last = Some(if state.want_nextn {
+                // The final norm over the whole chunk, retained for the
+                // drafter; the head projects its last row.
+                let n = self.head.normed(&h)?;
+                state.keep_nextn(n.clone());
+                self.head.project(&n.narrow(1, len - 1, 1)?)?
+            } else {
+                self.head.head(&h.narrow(1, len - 1, 1)?)?
+            });
             start += len;
         }
-        self.head.head(&last.expect("seq >= 1"))
+        last.ok_or_else(|| lloom_tensor::Error::msg("seq >= 1"))
+    }
+
+    /// One decode step of `tok` at the state's position, returning the
+    /// device-side argmax (no readback).
+    fn step_argmax(&self, tok: u32, state: &mut DecoderState<L>, dev: &Device) -> Result<Tensor> {
+        let input = Tensor::from_vec(vec![tok], (1, 1), dev)?;
+        let logits = CausalLM::forward(self, &input, state.pos, state)?;
+        logits.flatten_all()?.argmax(D::Minus1)?.reshape(1)
     }
 }
 
@@ -447,7 +694,7 @@ where
             .iter()
             .map(|l| l.new_state(dev, &self.cap))
             .collect::<Result<Vec<_>>>()?;
-        Ok(DecoderState { layers, pos: 0 })
+        Ok(DecoderState::new(layers))
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -472,6 +719,163 @@ where
 
     fn vocab_size(&self) -> usize {
         self.head.vocab_size()
+    }
+}
+
+impl<P, C, E, L, H> crate::profile::Shaped for Decoder<P, C, E, L, H>
+where
+    P: Profile,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    E: Embed,
+    L: Layer,
+    H: Head,
+{
+    type Profile = P;
+}
+
+/// A verify window encoded and read back, awaiting the accept decision.
+#[derive(Debug)]
+pub struct DecoderPending {
+    /// The target's argmax at each of the `k + 1` window positions.
+    argmax: Vec<u32>,
+    /// The window's input tokens `[anchor, proposed…]`.
+    tokens: Vec<u32>,
+    /// Whether `h_nextn` was being retained before the window.
+    want_was: bool,
+}
+
+/// The verify on the generic topology: the window `[anchor, proposed…]` as
+/// `k + 1` sequential decode steps inside an open window on every layer's
+/// state — greedy's own math, position by position, so the accepted stream
+/// is byte-identical to greedy by construction (`speculation.md` §10.2n) —
+/// the per-position argmax read back once; on a partial accept the window
+/// is rewound and the accepted prefix replayed (§10.2a: the recurrence is
+/// replayable). The probe is `h_nextn` at each accepted position.
+impl<P, C, E, L, H> Probes<NextnHidden> for Decoder<P, C, E, L, H>
+where
+    P: Profile,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    E: Embed,
+    L: Layer,
+    H: Head,
+{
+    type Pending = DecoderPending;
+    type PendingRows = Vec<DecoderPending>;
+
+    fn verify_and_probe(
+        &self,
+        drafts: &[Draft],
+        anchors: &[Anchor],
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+    ) -> Result<(Vec<Vec<u32>>, Tensor)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
+            lloom_tensor::bail!(
+                "{} verify_and_probe: one sequence; got {} drafts and {} anchors",
+                self.family,
+                drafts.len(),
+                anchors.len()
+            )
+        }
+        let pending = self.verify_enqueue(&drafts[0], &anchors[0], cache)?;
+        let (accepted, probe) = self.verify_complete(pending, cache, eos_ids)?;
+        Ok((vec![accepted], probe))
+    }
+
+    fn verify_enqueue(
+        &self,
+        draft: &Draft,
+        anchor: &Anchor,
+        cache: &mut Self::Cache,
+    ) -> Result<DecoderPending> {
+        if anchor.pos != cache.pos {
+            lloom_tensor::bail!(
+                "{} verify: anchor pos {} != the state's position {}",
+                self.family,
+                anchor.pos,
+                cache.pos
+            )
+        }
+        let proposed: Vec<u32> = match &draft.tokens {
+            DraftTokens::Host(v) => v.clone(),
+            DraftTokens::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
+        };
+        let mut tokens = Vec::with_capacity(proposed.len() + 1);
+        tokens.push(anchor.last);
+        tokens.extend_from_slice(&proposed);
+        // Anything retained untaken is a dropped probe; the window retains
+        // its own rows.
+        cache.drop_nextn();
+        let want_was = cache.set_want_nextn(true);
+        let dev = self.device_of(cache)?;
+        cache.open_window()?;
+        let mut argmaxes = Vec::with_capacity(tokens.len());
+        for &t in &tokens {
+            argmaxes.push(self.step_argmax(t, cache, &dev)?);
+        }
+        let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
+        Ok(DecoderPending {
+            argmax,
+            tokens,
+            want_was,
+        })
+    }
+
+    fn verify_complete(
+        &self,
+        pending: DecoderPending,
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+    ) -> Result<(Vec<u32>, Tensor)> {
+        let DecoderPending {
+            argmax,
+            tokens,
+            want_was,
+        } = pending;
+        let a = accept_prefix(&argmax, &tokens[1..], eos_ids).len();
+        let accepted: Vec<u32> = argmax[..a].to_vec();
+        if a == tokens.len() {
+            cache.resolve_window()?;
+        } else {
+            cache.rewind_window()?;
+            cache.drop_nextn();
+            let dev = self.device_of(cache)?;
+            for &t in &tokens[..a] {
+                let _ = self.step_argmax(t, cache, &dev)?;
+            }
+        }
+        let probe = cache.take_nextn()?;
+        cache.set_want_nextn(want_was);
+        let Some(probe) = probe else {
+            lloom_tensor::bail!("{} verify: the window retained no probe", self.family)
+        };
+        let rows = probe.dim(1)?;
+        if rows != a {
+            lloom_tensor::bail!(
+                "{} verify: the probe covers {rows} positions for {a} accepted",
+                self.family
+            )
+        }
+        Ok((accepted, probe))
+    }
+
+    fn take_probe(&self, cache: &mut Self::Cache) -> Result<Tensor> {
+        match cache.take_nextn()? {
+            Some(t) => Ok(t),
+            None => {
+                let dev = self.device_of(cache)?;
+                Tensor::zeros((1, 0, self.hidden_of()), DType::F32, &dev)
+            }
+        }
+    }
+
+    fn probe_drops(&self, cache: &Self::Cache) -> u64 {
+        cache.nextn_drops()
+    }
+
+    /// The window `[anchor]` is a decode step.
+    fn verifies_anchor_alone(&self) -> bool {
+        true
     }
 }
 
@@ -515,6 +919,28 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, _cap: &StateCapacity) -> NodeId {
         self.visit(w, (x, l))
     }
+    /// The recurrence's two channels snapshot in place
+    /// (`RecurrentState::open_window`); nothing to mark.
+    fn open_window(state: &mut Self::State) -> Result<WindowMark> {
+        state.s.open_window()?;
+        state.conv.open_window()?;
+        Ok(WindowMark::default())
+    }
+    fn rewind_window(state: &mut Self::State, _mark: WindowMark) -> Result<()> {
+        state.s.rewind_to_window()?;
+        state.conv.rewind_to_window()
+    }
+    fn resolve_window(state: &mut Self::State, _mark: WindowMark) -> Result<()> {
+        state.s.resolve_window()?;
+        state.conv.resolve_window()
+    }
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
+        if tokens == 0 {
+            Self::reset_state(state);
+            return Ok(());
+        }
+        lloom_tensor::bail!("a recurrent state has no length to cut to {tokens} positions")
+    }
 }
 
 impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
@@ -526,6 +952,28 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
     }
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId {
         self.visit(w, (x, l, cap.kv_precision))
+    }
+    /// A KV cache rewinds by its lengths.
+    fn open_window(state: &mut Self::State) -> Result<WindowMark> {
+        let (tokens, blocks) = state.lens();
+        Ok(WindowMark { tokens, blocks })
+    }
+    fn rewind_window(state: &mut Self::State, mark: WindowMark) -> Result<()> {
+        state.truncate(mark.tokens, mark.blocks);
+        Ok(())
+    }
+    fn resolve_window(_state: &mut Self::State, _mark: WindowMark) -> Result<()> {
+        Ok(())
+    }
+    fn truncate_state(state: &mut Self::State, tokens: usize) -> Result<()> {
+        if tokens > state.len() {
+            lloom_tensor::bail!(
+                "a KV cache of {} positions cannot be cut to {tokens}",
+                state.len()
+            )
+        }
+        state.truncate(tokens, state.n_blocks().min(tokens));
+        Ok(())
     }
 }
 

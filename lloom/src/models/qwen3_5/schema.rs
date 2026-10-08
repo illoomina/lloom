@@ -143,6 +143,18 @@ pub fn tensor_schema(cfg: &Config, kinds: &Kinds) -> Schema {
     for (l, kind) in cfg.layer_types.iter().enumerate() {
         b.layer(cfg, l, *kind);
     }
+    // The MTP blocks a file keeps after the stack (`nextn_predict_layers`):
+    // each a full-attention layer plus its `nextn.*` projections
+    // (llama.cpp `load_block_mtp`).
+    for m in 0..cfg.n_nextn_layers {
+        let l = cfg.n_layers + m;
+        b.layer(cfg, l, LayerKind::Full);
+        let p = format!("blk.{l}.nextn");
+        b.matrix(format!("{p}.eh_proj.weight"), &[d, 2 * d]);
+        b.vector(format!("{p}.enorm.weight"), d, Role::GAIN);
+        b.vector(format!("{p}.hnorm.weight"), d, Role::GAIN);
+        b.vector(format!("{p}.shared_head_norm.weight"), d, Role::GAIN);
+    }
     Schema { tensors: b.out }
 }
 
@@ -151,19 +163,25 @@ mod tests {
     use super::*;
 
     /// The real checkpoints' geometry reproduces their headers' tensor
-    /// counts: unsloth's Qwen3.6-27B-Q4_K_M has 851 tensors (3 + 48 × 14 +
-    /// 16 × 11, read 2026-10-07, the MTP block stripped); the 35B-A3B's MoE
-    /// layers carry 8 FFN tensors each (733). Qwen3.8-27B-UD-Q4_K_M keeps
-    /// the MTP block: 866 = 851 + a 65th full-attention layer's 11 + its 4
-    /// `nextn.*` — tensors the schema does not list and the loader does not
-    /// read (`Config::n_nextn_layers`).
+    /// counts: unsloth's Qwen3.8-27B-UD-Q4_K_M keeps the MTP block, 866
+    /// tensors = 3 + 48 × 14 + 16 × 11 + a 65th full-attention layer's 11
+    /// + its 4 `nextn.*` (read 2026-10-08); unsloth's Qwen3.6-27B-Q4_K_M
+    /// strips it, 851 (`nextn_predict_layers` absent from its header, so
+    /// `n_nextn_layers` 0); the 35B-A3B's MoE layers carry 8 FFN tensors
+    /// each, 733 stripped.
     #[test]
     fn the_schema_counts_match_the_real_checkpoints() {
-        let dense = tensor_schema(&Config::qwen3_6_27b(), &Kinds::default());
+        let with_mtp = tensor_schema(&Config::qwen3_6_27b(), &Kinds::default());
+        assert_eq!(with_mtp.tensors.len(), 851 + 11 + 4);
+        let mut stripped = Config::qwen3_6_27b();
+        stripped.n_nextn_layers = 0;
+        let dense = tensor_schema(&stripped, &Kinds::default());
         assert_eq!(dense.tensors.len(), 851);
-        let moe = tensor_schema(&Config::qwen3_6_35b_a3b(), &Kinds::default());
+        let mut moe_cfg = Config::qwen3_6_35b_a3b();
+        moe_cfg.n_nextn_layers = 0;
+        let moe = tensor_schema(&moe_cfg, &Kinds::default());
         assert_eq!(moe.tensors.len(), 3 + 30 * (2 + 9 + 8) + 10 * (2 + 6 + 8));
-        for s in [&dense, &moe] {
+        for s in [&with_mtp, &dense, &moe] {
             let names: std::collections::BTreeSet<&str> =
                 s.tensors.iter().map(|t| t.name.as_str()).collect();
             assert_eq!(names.len(), s.tensors.len(), "a name twice");
@@ -176,7 +194,14 @@ mod tests {
             dense.get("blk.3.attn_q.weight").unwrap().shape,
             vec![12288, 5120]
         );
-        assert_eq!(851 + 11 + 4, 866);
         assert!(dense.get("blk.64.attn_norm.weight").is_none());
+        assert_eq!(
+            with_mtp.get("blk.64.nextn.eh_proj.weight").unwrap().shape,
+            vec![5120, 10240]
+        );
+        assert_eq!(
+            with_mtp.get("blk.64.attn_q.weight").unwrap().shape,
+            vec![12288, 5120]
+        );
     }
 }

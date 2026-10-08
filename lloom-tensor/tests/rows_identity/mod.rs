@@ -98,7 +98,10 @@ pub fn a_row_is_the_same_bits_whatever_rows_share_its_launch(
                 .map(|(_, n)| *n)
                 .sum();
             if expect_rows {
-                assert!(cap > 1, "{dtype:?} m={m}: the dispatch names no capacity under fast");
+                assert!(
+                    cap > 1,
+                    "{dtype:?} m={m}: the dispatch names no capacity under fast"
+                );
                 let at_cap = census
                     .iter()
                     .filter(|(l, _)| l.ends_with(&format!("_r{cap}")))

@@ -214,8 +214,14 @@ fn rows_are_the_incumbent(dev: &Device, dtype: GgmlDType, act: DType) -> Result<
                 ("pair up", &uni_u, &inc_u),
             ] {
                 let (worst, same) = against_incumbent(&values(a)?, &values(b)?);
-                println!("ROWS_ID {tag} {what}: worst_rel_vs_per_plane={worst:e} bit_equal={same}/{}", n * batch * topk);
-                assert!(worst < 1e-4, "{tag} {what}: {worst:e} off the per-plane launch");
+                println!(
+                    "ROWS_ID {tag} {what}: worst_rel_vs_per_plane={worst:e} bit_equal={same}/{}",
+                    n * batch * topk
+                );
+                assert!(
+                    worst < 1e-4,
+                    "{tag} {what}: {worst:e} off the per-plane launch"
+                );
             }
             // The absolute reference, as `moe_routed_metal` bounds the incumbent.
             let xr = x.to_dtype(DType::F32)?;

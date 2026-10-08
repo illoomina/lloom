@@ -389,7 +389,15 @@ pub fn parse_quantized(name: &str) -> Option<Key> {
     if let Some(r) = name.strip_prefix("kernel_mul_mv_id2_") {
         let (r, rows) = rows_suffix(r);
         let (s, a) = act_suffix(r)?;
-        return cell(if rows { Entry::RowsId2 } else { Entry::MulMvId2 }, s, a);
+        return cell(
+            if rows {
+                Entry::RowsId2
+            } else {
+                Entry::MulMvId2
+            },
+            s,
+            a,
+        );
     }
     if let Some(r) = name.strip_prefix("kernel_mul_mv_id_") {
         let (r, rows) = rows_suffix(r);
@@ -884,7 +892,10 @@ impl Matrix {
                     let (out, census) = self.census(|| x.apply_op1_no_bwd(&w.q))?;
                     let expect = if rows_arm {
                         let nr = lloom_tensor::kernels::mv_rows_capacity(d.into(), m, false);
-                        assert!(nr > 1, "{d:?} m={m}: the row axis is not on in this process");
+                        assert!(
+                            nr > 1,
+                            "{d:?} m={m}: the row axis is not on in this process"
+                        );
                         format!("kernel_mul_mv_{}_{}_r{nr}", stem(d), act.mv_suffix())
                     } else {
                         format!("kernel_mul_mv_{}_{}", stem(d), act.mv_suffix())
@@ -998,7 +1009,10 @@ impl Matrix {
         let suffix = |batch: usize| {
             if rows {
                 let nr = lloom_tensor::kernels::mv_rows_capacity(d.into(), batch, true);
-                assert!(nr > 1, "{d:?} batch={batch}: the row axis is not on in this process");
+                assert!(
+                    nr > 1,
+                    "{d:?} batch={batch}: the row axis is not on in this process"
+                );
                 format!("_r{nr}")
             } else {
                 String::new()
@@ -1051,7 +1065,8 @@ impl Matrix {
                             self.check_census(&key, &at, &census, &[expect]);
                             let gv = to_f32(&go)?;
                             let uv = to_f32(&uo)?;
-                            self.cell(&key).absorb(gv.iter().chain(&uv).map(|v| v.to_bits()));
+                            self.cell(&key)
+                                .absorb(gv.iter().chain(&uv).map(|v| v.to_bits()));
                             self.score_rows(
                                 &key,
                                 &format!("{at} gate"),
@@ -1348,7 +1363,8 @@ impl Matrix {
                     &[format!("kernel_dequant_rows_f16_{}", stem(d))],
                 );
                 let got = out.to_device(&Device::Cpu)?.to_vec1::<f16>()?;
-                self.cell(&key).absorb(got.iter().map(|v| v.to_bits() as u32));
+                self.cell(&key)
+                    .absorb(got.iter().map(|v| v.to_bits() as u32));
                 let mut worst = 0f64;
                 let mut where_ = String::new();
                 for (i, g) in got.iter().enumerate() {
@@ -1743,7 +1759,11 @@ impl Matrix {
                 | Entry::MmId16 => {
                     let w = weight(&self.dev, d, &[e, 4, k], 1, 1.0)?;
                     // Two rows naming one slot for the row axis's entries.
-                    let rows = if matches!(entry, Entry::RowsId | Entry::RowsId2) { 2 } else { 1 };
+                    let rows = if matches!(entry, Entry::RowsId | Entry::RowsId2) {
+                        2
+                    } else {
+                        1
+                    };
                     let (x, _) = activations(&self.dev, &[rows, 1, k], act, 1)?;
                     let ids = Tensor::from_vec(vec![1u32; rows * topk], (rows, topk), &self.dev)?;
                     let arm = if matches!(entry, Entry::MmId32 | Entry::MmId16) {

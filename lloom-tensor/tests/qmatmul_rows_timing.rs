@@ -114,7 +114,10 @@ fn every_kind_at_every_capacity() {
     if std::env::var("QMM_TABLE").is_ok() {
         lloom_tensor::kernels::set_qmv_rows_max(None);
     }
-    println!("TIMING shape=[{n} x {k}] contract=fast table={} iters=50 reps=7 median ms per launch", std::env::var("QMM_TABLE").is_ok());
+    println!(
+        "TIMING shape=[{n} x {k}] contract=fast table={} iters=50 reps=7 median ms per launch",
+        std::env::var("QMM_TABLE").is_ok()
+    );
     println!("| kind | m=1 | m | per-row (axis off) | axis _rN | per-row/row ms | axis/row ms | axis vs per-row |");
     for dtype in kinds {
         if !only.is_empty() && !only.iter().any(|s| *s == format!("{dtype:?}")) {
@@ -123,14 +126,35 @@ fn every_kind_at_every_capacity() {
         let q = weight(dtype, (n, k), &dev);
         let x1 = Tensor::randn(0f32, 1.0, (1, k), &dev).unwrap();
         lloom_tensor::kernels::set_qmv_rows(false);
-        let m1 = time(&dev, || { q.forward(&x1).unwrap(); }, 50, 7);
+        let m1 = time(
+            &dev,
+            || {
+                q.forward(&x1).unwrap();
+            },
+            50,
+            7,
+        );
         for m in [2usize, 3, 4, 5, 6, 8] {
             let xm = Tensor::randn(0f32, 1.0, (m, k), &dev).unwrap();
             lloom_tensor::kernels::set_qmv_rows(false);
-            let per_row = time(&dev, || { q.forward(&xm).unwrap(); }, 50, 7);
+            let per_row = time(
+                &dev,
+                || {
+                    q.forward(&xm).unwrap();
+                },
+                50,
+                7,
+            );
             lloom_tensor::kernels::set_qmv_rows(true);
             let cap = lloom_tensor::kernels::mv_rows_capacity(dtype.into(), m, false);
-            let axis = time(&dev, || { q.forward(&xm).unwrap(); }, 50, 7);
+            let axis = time(
+                &dev,
+                || {
+                    q.forward(&xm).unwrap();
+                },
+                50,
+                7,
+            );
             println!(
                 "| {dtype:?} | {m1:.4} | {m} | {per_row:.4} | _r{cap} {axis:.4} | {:.4} | {:.4} | {:+.1}% |",
                 per_row / m as f64,
@@ -168,7 +192,9 @@ fn every_routed_kind_at_every_capacity() {
         GgmlDType::Q2_0,
     ];
     println!("TIMING_ID experts={e} [{n} x {k}] topk={topk} share={share} contract=fast iters=50 reps=7 median ms per launch");
-    println!("| kind | batch | slots named | per-plane (axis off) | axis _rN | axis vs per-plane |");
+    println!(
+        "| kind | batch | slots named | per-plane (axis off) | axis _rN | axis vs per-plane |"
+    );
     for dtype in kinds {
         let (bs, ts) = (dtype.block_size(), dtype.type_size());
         let blocks = e * n * k / bs;
@@ -182,7 +208,11 @@ fn every_routed_kind_at_every_capacity() {
             let d = f16::from_f32(0.01 + 0.006 * ((i as f32) * 0.37).sin());
             raw[i * ts..i * ts + 2].copy_from_slice(&d.to_le_bytes());
         }
-        let w = QTensor::new(QStorage::from_data(Cow::Borrowed(&raw), &dev, dtype).unwrap(), (e, n, k)).unwrap();
+        let w = QTensor::new(
+            QStorage::from_data(Cow::Borrowed(&raw), &dev, dtype).unwrap(),
+            (e, n, k),
+        )
+        .unwrap();
         for batch in [2usize, 3, 4, 6, 8] {
             let mut s = 7u32;
             let mut ids = Vec::with_capacity(batch * topk);
@@ -202,10 +232,26 @@ fn every_routed_kind_at_every_capacity() {
             let ids_t = Tensor::from_vec(ids, (batch, topk), &dev).unwrap();
             let x = Tensor::randn(0f32, 1.0, (batch, 1, k), &dev).unwrap();
             lloom_tensor::kernels::set_qmv_rows(false);
-            let per_plane = time(&dev, || { w.indexed_moe_forward_as(&x, &ids_t, MoeArm::MatVec, lloom_tensor::DType::F32).unwrap(); }, 50, 7);
+            let per_plane = time(
+                &dev,
+                || {
+                    w.indexed_moe_forward_as(&x, &ids_t, MoeArm::MatVec, lloom_tensor::DType::F32)
+                        .unwrap();
+                },
+                50,
+                7,
+            );
             lloom_tensor::kernels::set_qmv_rows(true);
             let cap = lloom_tensor::kernels::mv_rows_capacity(dtype.into(), batch, true);
-            let axis = time(&dev, || { w.indexed_moe_forward_as(&x, &ids_t, MoeArm::MatVec, lloom_tensor::DType::F32).unwrap(); }, 50, 7);
+            let axis = time(
+                &dev,
+                || {
+                    w.indexed_moe_forward_as(&x, &ids_t, MoeArm::MatVec, lloom_tensor::DType::F32)
+                        .unwrap();
+                },
+                50,
+                7,
+            );
             println!(
                 "| {dtype:?} | {batch} | {} of {} | {per_plane:.4} | _r{cap} {axis:.4} | {:+.1}% |",
                 named.len(),

@@ -37,7 +37,10 @@ fn device() -> Device {
         let _ = lloom_tensor::tuning::install(t);
     });
     assert!(lloom_tensor::tuning::contract().is_fast());
-    assert!(lloom_tensor::tuning::tuning().qmv.rows, "the axis is on by default");
+    assert!(
+        lloom_tensor::tuning::tuning().qmv.rows,
+        "the axis is on by default"
+    );
     Device::new_metal(0).expect("a Metal device")
 }
 
@@ -166,7 +169,9 @@ fn the_row_axis_matches_the_cpu_reference_at_every_row() -> Result<()> {
                 let err = worst_rel(&got, &want)?;
                 let cap = lloom_tensor::kernels::mv_rows_capacity(dtype.into(), m, false);
                 let suffix = format!("_r{cap}");
-                let rows = count(&census, |l| l.contains("kernel_mul_mv_") && l.ends_with(&suffix));
+                let rows = count(&census, |l| {
+                    l.contains("kernel_mul_mv_") && l.ends_with(&suffix)
+                });
                 let again = w.forward(&xd)?.to_device(&Device::Cpu)?;
                 let same = got
                     .to_device(&Device::Cpu)?
@@ -191,11 +196,16 @@ fn the_row_axis_matches_the_cpu_reference_at_every_row() -> Result<()> {
     }
     let counted = lloom_tensor::kernels::qmv_rows_launches() - before;
     if counted != calls {
-        failures.push(format!("the counter read {counted} launches for {calls} calls"));
+        failures.push(format!(
+            "the counter read {counted} launches for {calls} calls"
+        ));
     }
     // Past the ceiling: a second group.
     let dtype = GgmlDType::Q4K;
-    let ceiling = lloom_tensor::tuning::tuning().qmv.rows_max.expect("the override this binary sets");
+    let ceiling = lloom_tensor::tuning::tuning()
+        .qmv
+        .rows_max
+        .expect("the override this binary sets");
     let m = ceiling + 3;
     let (w, w_ref) = weight(dtype, 40, 3, &dev)?;
     let x = activations(m)?;
@@ -206,7 +216,9 @@ fn the_row_axis_matches_the_cpu_reference_at_every_row() -> Result<()> {
     let err = worst_rel(&got.unwrap(), &want)?;
     println!("GROUPS {dtype:?} ceiling={ceiling} m={m} worst_rel={err:e} census={census:?}");
     if err.is_nan() || err >= 2e-3 {
-        failures.push(format!("{dtype:?} m={m} past the ceiling {ceiling}: worst rel err {err}"));
+        failures.push(format!(
+            "{dtype:?} m={m} past the ceiling {ceiling}: worst rel err {err}"
+        ));
     }
     assert!(
         failures.is_empty(),

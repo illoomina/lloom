@@ -24,13 +24,21 @@ fn device() -> Device {
         let _ = lloom_tensor::tuning::install(t);
     });
     assert!(lloom_tensor::tuning::contract().is_fast());
-    assert_eq!(lloom_tensor::tuning::tuning().qmv.rows_max, None, "the table's ceilings");
+    assert_eq!(
+        lloom_tensor::tuning::tuning().qmv.rows_max,
+        None,
+        "the table's ceilings"
+    );
     Device::new_metal(0).expect("a Metal device")
 }
 
 fn rows_kernels(dev: &Device, f: impl FnOnce() -> Result<()>) -> Result<Vec<(String, u64)>> {
     dev.synchronize()?;
-    let window = dev.as_metal_device()?.dispatch_census().open().expect("a window");
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("a window");
     f()?;
     dev.synchronize()?;
     Ok(window
@@ -64,7 +72,9 @@ fn a_kind_takes_the_axis_where_its_ceiling_says() -> Result<()> {
         let expect: Vec<(String, u64)> = want.map(|n| vec![(n.to_string(), 1)]).unwrap_or_default();
         println!("CEILING {dtype:?} m={m} ran={ran:?}");
         if ran != expect {
-            failures.push(format!("{dtype:?} m={m}: ran {ran:?}, the table says {expect:?}"));
+            failures.push(format!(
+                "{dtype:?} m={m}: ran {ran:?}, the table says {expect:?}"
+            ));
         }
     }
     // The routed launch: no kind's routed ceiling admits the axis.
@@ -76,13 +86,18 @@ fn a_kind_takes_the_axis_where_its_ceiling_says() -> Result<()> {
         )?
         .data()?
         .into_owned();
-        let q = QTensor::new(QStorage::from_data(Cow::Borrowed(&raw), &dev, dtype)?, (e, n, 256))?;
+        let q = QTensor::new(
+            QStorage::from_data(Cow::Borrowed(&raw), &dev, dtype)?,
+            (e, n, 256),
+        )?;
         let ids = Tensor::from_vec(vec![1u32, 2, 1, 3], (2, 2), &dev)?;
         let x = Tensor::randn(0f32, 1.0, (2, 1, 256), &dev)?;
         let ran = rows_kernels(&dev, || q.indexed_moe_forward(&x, &ids).map(|_| ()))?;
         println!("CEILING routed {dtype:?} ran={ran:?}");
         if !ran.is_empty() {
-            failures.push(format!("routed {dtype:?}: ran {ran:?}, no routed ceiling admits the axis"));
+            failures.push(format!(
+                "routed {dtype:?}: ran {ran:?}, no routed ceiling admits the axis"
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

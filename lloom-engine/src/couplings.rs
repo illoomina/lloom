@@ -118,9 +118,9 @@ pub const COUPLINGS: &[Coupling] = &[
     Coupling {
         id: "C11",
         kind: "refuses",
-        when: "speculative.method is a drafter, and a temperature, a logits processor or a thinking budget is set",
-        effect: "refused: the verify accepts the target's argmax over a drafted block, so a draw or a forced token cannot be fed",
-        keys: &["speculative.method", "generation.temperature", "generation.min_p", "generation.repetition_penalty", "generation.presence_penalty", "generation.frequency_penalty", "generation.logit_bias", "reasoning.budget"],
+        when: "speculative.method is a drafter, and a host-side sampler (top-k / top-p), a logits processor or a thinking budget is set; or the drafter is mtp / dflash and a temperature is set",
+        effect: "refused: a verify window draws each position with position-keyed noise (dspark serves argmax, plain temperature and --gumbel), which a host sort cannot take and a processor's history would be corrupted by; the mtp and dflash targets' verifies read an argmax back and draw nothing",
+        keys: &["speculative.method", "generation.temperature", "generation.top_k", "generation.top_p", "generation.min_p", "generation.repetition_penalty", "generation.presence_penalty", "generation.frequency_penalty", "generation.logit_bias", "reasoning.budget"],
         site: "lloom-engine/src/decode.rs DecodeSession::decode_speculative_until; at resolve and after `auto` resolves: couplings::refuse",
         is_static: true,
     },
@@ -216,6 +216,12 @@ fn host_side(s: &Sampling) -> bool {
 }
 
 const DRAFTERS: [&str; 3] = ["dspark", "mtp", "dflash"];
+/// The drafters whose target verifies by sampling each window position
+/// (`Probes::verify_and_probe_sampled`): LFM2 under DSpark. The Qwen4-exp
+/// and `Decoder` verifies read an argmax back inside the pass and draw
+/// nothing, so a temperature is refused there until a sampled verify is
+/// built for them.
+const SAMPLED_VERIFY: [&str; 1] = ["dspark"];
 
 /// C11 for a resolved speculative method.
 pub fn refuse_speculative(method: &str, sampling: &crate::SamplingConfig) -> Result<(), String> {
@@ -223,8 +229,11 @@ pub fn refuse_speculative(method: &str, sampling: &crate::SamplingConfig) -> Res
         return Ok(());
     }
     let mut why = Vec::new();
-    if sampling.sampling() != Sampling::ArgMax {
-        why.push("a temperature (generation.temperature)");
+    let s = sampling.sampling();
+    if host_side(&s) {
+        why.push("a host-side sampler (generation.top_k / top_p: a host sort on one running rng, which a verify window cannot key by position)");
+    } else if s != Sampling::ArgMax && !SAMPLED_VERIFY.contains(&method) {
+        why.push("a temperature (generation.temperature: this target's verify reads an argmax back and draws nothing; a sampled verify is built for dspark only)");
     }
     if sampling.processors().is_active() {
         why.push("a logits processor (generation.min_p, the penalties, generation.logit_bias)");
@@ -236,7 +245,7 @@ pub fn refuse_speculative(method: &str, sampling: &crate::SamplingConfig) -> Res
         return Ok(());
     }
     Err(format!(
-        "C11: speculative.method = {method} refuses {}: the verify accepts the target's argmax over a drafted block",
+        "C11: speculative.method = {method} refuses {}",
         why.join(", ")
     ))
 }
@@ -404,12 +413,18 @@ pub fn static_rules() -> Value {
         {"$comment": "C10: at most one forward past an unlearned EOS",
          "if": {"properties": {"decode": {"properties": {"readback": {"properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
          "then": false},
-        {"$comment": "C11: a drafter refuses a temperature, a logits processor and a thinking budget",
+        {"$comment": "C11: a drafter refuses a host-side sampler, a logits processor and a thinking budget",
          "if": {"properties": {"speculative": {"properties": {"method": {"enum": DRAFTERS}}, "required": ["method"]}}, "required": ["speculative"]},
          "then": {"allOf": [
-            {"not": {"properties": {"generation": {"properties": {"temperature": hot}, "required": ["temperature"]}}, "required": ["generation"]}},
+            {"not": {"properties": {"generation": {"allOf": [
+                {"properties": {"temperature": hot}, "required": ["temperature"]},
+                host_sampler,
+                {"not": {"properties": {"device_sampler": {"const": true}}, "required": ["device_sampler"]}}]}}, "required": ["generation"]}},
             {"not": {"properties": {"generation": active}, "required": ["generation"]}},
             {"not": budget}]}},
+        {"$comment": "C11: a drafter whose target's verify draws nothing (mtp, dflash) refuses a temperature",
+         "if": {"properties": {"speculative": {"properties": {"method": {"enum": ["mtp", "dflash"]}}, "required": ["method"]}}, "required": ["speculative"]},
+         "then": {"not": {"properties": {"generation": {"properties": {"temperature": hot}, "required": ["temperature"]}}, "required": ["generation"]}}},
         {"$comment": "C12: the batch scheduler refuses a logits processor and a thinking budget",
          "if": {"properties": {"scheduler": {"properties": {"max_sequences": {"type": "integer", "minimum": 2}}, "required": ["max_sequences"]}}, "required": ["scheduler"]},
          "then": {"allOf": [
@@ -459,6 +474,21 @@ mod tests {
                 "C11",
             ),
             (
+                &[
+                    ("speculative.method", "dspark"),
+                    ("generation.temperature", "0.7"),
+                    ("generation.top_p", "0.9"),
+                ][..],
+                "C11",
+            ),
+            (
+                &[
+                    ("speculative.method", "dflash"),
+                    ("generation.temperature", "0.7"),
+                ][..],
+                "C11",
+            ),
+            (
                 &[("speculative.method", "mtp"), ("reasoning.budget", "64")][..],
                 "C11",
             ),
@@ -498,6 +528,15 @@ mod tests {
                 ("generation.temperature", "0.7"),
             ][..],
             &[("speculative.method", "mtp"), ("generation.top_p", "0.9")][..],
+            &[
+                ("speculative.method", "dspark"),
+                ("generation.temperature", "0.7"),
+            ][..],
+            &[
+                ("speculative.method", "dspark"),
+                ("generation.temperature", "0.7"),
+                ("generation.device_sampler", "true"),
+            ][..],
             &[
                 ("speculative.method", "mtp"),
                 ("generation.repetition_penalty", "1"),

@@ -1,6 +1,6 @@
 //! Every spelling an option has ever had still reaches it.
 //!
-//! The reviewed map (`design/.dev/options-v1/rows.v1.json`, 275 rows: every
+//! The reviewed map (`options-v1/rows.v1.json`, 275 rows: every
 //! `lloom knobs` row, every flag outside the tree, every env name read
 //! directly) names, for each option, its key and the flag, dotted key and
 //! env name it had before the tree. Each of those is run through the real
@@ -18,10 +18,10 @@ use clap::{CommandFactory, FromArgMatches};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-const ROWS: &str = include_str!("../../../../design/.dev/options-v1/rows.v1.json");
-const CHAT_HELP: &str = include_str!("../../../../design/.dev/options-v1/inputs/chat-help.txt");
-const SERVE_HELP: &str = include_str!("../../../../design/.dev/options-v1/inputs/serve-help.txt");
-const BENCH_HELP: &str = include_str!("../../../../design/.dev/options-v1/inputs/bench-help.txt");
+const ROWS: &str = include_str!("options-v1/rows.v1.json");
+const CHAT_HELP: &str = include_str!("options-v1/inputs/chat-help.txt");
+const SERVE_HELP: &str = include_str!("options-v1/inputs/serve-help.txt");
+const BENCH_HELP: &str = include_str!("options-v1/inputs/bench-help.txt");
 
 const SUBCOMMANDS: [&str; 3] = ["chat", "serve", "bench"];
 

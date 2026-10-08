@@ -1,9 +1,12 @@
 # The one image for development, the CPU test suites and CI, on amd64 and
 # arm64 (lloom #939). A red CI run reproduces on any host that can run it:
 #
-#   docker build --target test -t lloom-ci:test -f candle/Dockerfile .   # the repo root
-#   docker run --rm -v "$PWD:/work" -w /work/candle lloom-ci:test \
+#   docker build --target test -t lloom-ci:test .      # from the engine tree
+#   docker run --rm -v "$PWD:/work" -w /work lloom-ci:test \
 #       cpu-tests.sh lloom 290 token_ring_fuzz
+#
+# The engine tree is `candle/` in the development repository and the root of
+# the public one; the image sees that tree alone, at /work.
 #
 # `.github/ci/in-container.sh` wraps the two commands with the cache mounts
 # the workflows use. Stages:

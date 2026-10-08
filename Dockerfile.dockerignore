@@ -1,5 +1,4 @@
-candle/target
-candle/target-*
+target
+target-*
 **/target
 .git
-design/measurements

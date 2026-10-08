@@ -339,6 +339,81 @@ impl LogitsProcessor {
         Ok(token)
     }
 
+    /// One drawn token per row of a verify window's logits — the target's own
+    /// token at each of the `t` positions `[anchor, draft…]` covers.
+    ///
+    /// This is what a sampled verify compares the draft against, in place of
+    /// the single `logits.argmax(D::Minus1)` the greedy verify takes. The
+    /// acceptance rule is unchanged ([`crate::nn::speculator::accept_prefix`]
+    /// compares the target's token to the draft's and keeps the target's at
+    /// the first disagreement); what changes is only how that token is
+    /// produced, so the window's output is the target's own distribution
+    /// rather than its mode.
+    ///
+    /// `logits` is `[1, t, vocab]` or `[t, vocab]`; `first_pos` is the
+    /// ABSOLUTE position of row 0. Row `i` draws with its noise keyed to
+    /// `first_pos + i`, so the token at a position does not depend on how
+    /// many rows before it were drawn and then rejected — which is what makes
+    /// the sampled window reproduce a sampled step-by-step decode at one seed.
+    ///
+    /// Returns the `[t]` U32 ids on the host. The rows are drawn on the
+    /// device (one gumbel-max per row) and read back together, inside the one
+    /// readback the verify already pays.
+    ///
+    /// Refuses the host-sort arms (`TopK`, `TopP`, `TopKThenTopP`): those draw
+    /// through a host multinomial on the running rng, which has no
+    /// position-keyed form, so serving them here would advance one shared
+    /// stream per discarded row — the defect this method exists to avoid.
+    /// Processors are refused for the same reason: their history advances per
+    /// recorded token, and a rejected row's token is not one the run emitted.
+    pub fn window_draw(&mut self, logits: &Tensor, first_pos: u64) -> Result<Vec<u32>> {
+        let rows = match logits.rank() {
+            3 => {
+                let (b, t, _v) = logits.dims3()?;
+                if b != 1 {
+                    lloom_tensor::bail!(
+                        "window_draw: the window is single-sequence (B=1), got batch {b}"
+                    );
+                }
+                logits.squeeze(0)?.contiguous()?
+            }
+            2 => logits.contiguous()?,
+            r => lloom_tensor::bail!("window_draw: expected [1, t, vocab] or [t, vocab], rank {r}"),
+        };
+        let (t, _vocab) = rows.dims2()?;
+        if t == 0 {
+            lloom_tensor::bail!("window_draw: an empty window");
+        }
+        if self.stage.is_some() {
+            lloom_tensor::bail!(
+                "window_draw: logits processors (logit_bias, repetition/presence/frequency \
+                 penalties, min_p) have per-token history, and a verify window draws rows it \
+                 may reject — their history would count a token the run never emitted"
+            );
+        }
+        match self.sampling {
+            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
+            ref other => lloom_tensor::bail!(
+                "window_draw: {other:?} draws through a host sort on one running rng, which has \
+                 no position-keyed form; a window would advance it per rejected row"
+            ),
+        }
+        let keyed_was = self.position;
+        let mut ids = Vec::with_capacity(t);
+        for i in 0..t {
+            let row = rows.narrow(0, i, 1)?;
+            // Argmax needs no noise, so it needs no key; the sampled arms key
+            // every row to its own absolute position.
+            if !matches!(self.sampling, Sampling::ArgMax) {
+                self.position = Some(first_pos + i as u64);
+            }
+            let drawn = self.draw_on_device(&row)?;
+            ids.push(drawn.flatten_all()?.to_vec1::<u32>()?[0]);
+        }
+        self.position = keyed_was;
+        Ok(ids)
+    }
+
     fn draw_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
         match self.sampling {
             // t = 0 -- a bare device argmax, the original mechanism.

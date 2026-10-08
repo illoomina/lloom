@@ -507,13 +507,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         let tags = engine.think_tags();
         facts.thinking = Some(apply_thinking(engine, want, tags.as_ref(), &mut ids)?);
         // A suffix property: dropping the oldest turns below leaves it.
-        params.turn_tail = thinking::turn_tail(
-            engine,
-            messages.as_array().map(Vec::as_slice).unwrap_or(&[]),
-            &kwargs,
-            true,
-            &ids,
-        );
+        params.turn_tail = thinking::checkpoint_tail(engine, &kwargs, want, &ids);
         // The prompt budget, before the engine sees the prompt: the oldest
         // turns go whole, so what runs is the template's own rendering.
         let mut dropped = Dropped::default();

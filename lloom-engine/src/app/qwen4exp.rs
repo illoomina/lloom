@@ -422,6 +422,22 @@ fn rewindable<P: Profile>() -> Result<lloom::profile::RewindProof<P>> {
 }
 
 /// Load the family `opts` names, on the tier `opts.experts` names, at `P`.
+/// The turn checkpoints the device's ledger admits: `want`, or as many
+/// frames of `frame_bytes` as the quota leaves uncommitted; `want` where
+/// there is no ledger (CPU) or no quota.
+fn admitted_checkpoints(device: &Device, frame_bytes: usize, want: usize) -> usize {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        let quota = m.ledger().quota();
+        if quota > 0 && frame_bytes > 0 {
+            let free = quota.saturating_sub(m.ledger().committed());
+            return want.min(free / frame_bytes);
+        }
+    }
+    let _ = (device, frame_bytes);
+    want
+}
+
 fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
     {
         // The DFlash drafter's directory and config first: the slot plan
@@ -570,7 +586,7 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
 
 impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<P, R> {
     fn finish(
-        model: Qwen4Exp<P, R>,
+        mut model: Qwen4Exp<P, R>,
         device: Device,
         opts: LoadOptions,
         mut tier: Value,
@@ -648,6 +664,21 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             Some((spec, _)) => lloom::nn::Speculator::max_draft(spec),
             None => opts.mtp_k.max(1),
         };
+        // The turn-checkpoint ring (`sequence-reuse-design.md` §2.3b)
+        // beside the experts' budget: as many of the model's frames as the
+        // ledger's quota leaves uncommitted after the load (the streamed
+        // tier's pool is a `Cache` claim the arbiter already sized; the
+        // ring is a capability a sequence holds).
+        let frame = model.checkpoint_frame_bytes();
+        let slots = admitted_checkpoints(&device, frame, model.turn_checkpoints());
+        model.set_turn_checkpoints(slots);
+        eprintln!(
+            "[checkpoint ring: {slots} × {:.1} MiB ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
+            frame as f64 / (1024.0 * 1024.0),
+            (slots * frame) as f64 / (1024.0 * 1024.0)
+        );
+        tier["turn_checkpoints"] =
+            json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
         let mut cache = P::single(&model, &device, k)?;
         if let Some((_, taps)) = &dflash {
             cache.set_tap_layers(taps)?;
@@ -677,6 +708,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 eos_ids,
                 seed_tokens,
                 think: Default::default(),
+                gen_prompts: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -755,6 +787,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 ms(t.elapsed())
             );
         }
+        engine.text.prime();
         Ok(Box::new(engine))
     }
 
@@ -1187,6 +1220,14 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     }
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         self.text.think_tags().cloned()
+    }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.text
+            .generation_prompt(kwarg, want)
+            .map(<[u32]>::to_vec)
+    }
+    fn template_renders(&self) -> u64 {
+        self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {

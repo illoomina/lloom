@@ -183,67 +183,60 @@ fn qwen3_5_tiny_chats_on_the_cpu_and_metal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Turn reuse on the generic decoder (issue #940): three turns on stdin
-/// through the tiny Qwen3.5's template, both think modes, on the CPU and on
-/// Metal. Turn 1 prefills whole and leaves its checkpoint `tail` tokens
-/// before the end (the generation prompt's `<think>\n`, or the closed
-/// block with thinking off, which the re-render drops); turns 2 and 3 are
-/// `Rewound(reply + tail)` to it, prefilling the changed suffix only; and
-/// every turn's tokens are the `--no-reuse` run's (a fresh prefill of the
-/// same conversation). The load reports the ring.
-#[test]
-fn qwen3_5_tiny_reuses_the_conversation_across_turns() {
-    let dir = scratch("qwen3_5_turns");
-    let model = write::<Qwen3_5Tiny>(&dir);
-    let tok = dir.join("tokenizer.json");
-    let tok = tok.to_str().unwrap().to_string();
-    let turns_of = |extra: &[&str]| -> (Vec<std::collections::BTreeMap<String, String>>, String) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
-            .args(["chat", "--model"])
-            .arg(&model)
-            .args(["--tokenizer", &tok, "-n", "4", "--profile", "deterministic"])
-            .args(extra)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("lloom runs");
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            for line in ["first question", "second one", "third"] {
-                writeln!(stdin, "{line}").unwrap();
-            }
+/// Three turns of `lloom chat` on `model` with `extra` flags: the three
+/// `[turn N: …]` lines' fields, and the process's stderr.
+fn three_turns(
+    model: &Path,
+    tok: &str,
+    extra: &[&str],
+) -> (Vec<std::collections::BTreeMap<String, String>>, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(model)
+        .args(["--tokenizer", tok, "-n", "4", "--profile", "deterministic"])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom runs");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in ["first question", "second one", "third"] {
+            writeln!(stdin, "{line}").unwrap();
         }
-        let out = child.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        assert!(out.status.success(), "lloom chat {extra:?}:\n{stderr}");
-        let turns = stderr
-            .lines()
-            .filter(|l| l.starts_with("[turn ") && l[6..].starts_with(|c: char| c.is_ascii_digit()))
-            .map(|l| {
-                l.split_whitespace()
-                    .filter_map(|kv| kv.split_once('='))
-                    .map(|(k, v)| (k.to_string(), v.trim_end_matches(']').to_string()))
-                    .collect()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(turns.len(), 3, "{stderr}");
-        (turns, stderr)
-    };
-    let mut arms: Vec<Vec<&str>> = vec![vec!["--cpu"], vec!["--cpu", "--no-think"]];
-    if cfg!(feature = "metal") {
-        arms.push(vec![]);
-        arms.push(vec!["--no-think"]);
     }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "lloom chat {extra:?}:\n{stderr}");
+    let turns = stderr
+        .lines()
+        .filter(|l| l.starts_with("[turn ") && l[6..].starts_with(|c: char| c.is_ascii_digit()))
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.trim_end_matches(']').to_string()))
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(turns.len(), 3, "{stderr}");
+    (turns, stderr)
+}
+
+/// The reuse of three turns against their `--no-reuse` run, on `model`
+/// with `arms`: turns 2 and 3 reuse what the template keeps — `Rewound`
+/// to the previous turn's checkpoint when its render drops a tail, else
+/// `Extend` — and every turn's tokens are the fresh run's.
+fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
     for arm in arms {
-        let (reused, stderr) = turns_of(&arm);
+        let (reused, stderr) = three_turns(model, tok, &arm);
         assert!(
             stderr.contains("[checkpoint ring: 2 ×"),
             "{arm:?}: the load reports the checkpoint ring:\n{stderr}"
         );
         let mut fresh_arm = arm.clone();
         fresh_arm.push("--no-reuse");
-        let (fresh, _) = turns_of(&fresh_arm);
+        let (fresh, _) = three_turns(model, tok, &fresh_arm);
         assert_eq!(reused[0]["reuse"], "Fresh", "{arm:?}:\n{stderr}");
         for t in 1..3 {
             let prompt: usize = reused[t]["prompt_tokens"].parse().unwrap();
@@ -251,16 +244,23 @@ fn qwen3_5_tiny_reuses_the_conversation_across_turns() {
             let reply: usize = reused[t - 1]["completion_tokens"].parse().unwrap();
             let kept: usize = reused[t]["reused"].parse().unwrap();
             let prefilled: usize = reused[t]["prefilled"].parse().unwrap();
-            // The previous prompt without the tail its re-render drops (the
-            // generation prompt's think block; the engine measures it per
-            // request, `thinking::turn_tail`, and the real templates' tails
-            // are pinned in `measurements/issue-940-raw/lcp.txt`), the reply
-            // after it dropped with the tail.
-            let tail = prev.saturating_sub(kept);
+            // The previous prompt up to its generation prompt (the
+            // load-time constant the checkpoint is placed at,
+            // `thinking::checkpoint_tail`), the reply dropped with the
+            // generation prompt's tokens; a template that drops nothing
+            // extends the log.
+            let ok = if kept > prev {
+                reused[t]["reuse"] == "Extend" && kept >= prev + reply
+            } else {
+                let tail = prev - kept;
+                let gen: usize = reused[t - 1]["gen_prompt"].parse().unwrap();
+                reused[t]["reuse"] == format!("Rewound({})", reply + tail) && tail == gen && gen > 0
+            };
             assert!(
-                reused[t]["reuse"] == format!("Rewound({})", reply + tail) && tail > 0 && tail < 12,
+                ok,
                 "{arm:?} turn {}: {} reused={kept} of the previous {prev} (the re-render restores \
-                 to the previous turn's checkpoint: {reply} reply tokens and a short tail dropped):\n{stderr}",
+                 to the previous turn's checkpoint: {reply} reply tokens and a short tail dropped, \
+                 or extends the log):\n{stderr}",
                 t + 1,
                 reused[t]["reuse"]
             );
@@ -286,8 +286,57 @@ fn qwen3_5_tiny_reuses_the_conversation_across_turns() {
                 reused[t]["prompt_ids_sha256"],
                 fresh[t]["prompt_ids_sha256"]
             );
+            assert_eq!(
+                reused[t]["renders"],
+                "1",
+                "{arm:?} turn {}: one render a request, the conversation's own:\n{stderr}",
+                t + 1
+            );
         }
     }
+}
+
+/// Turn reuse on the generic decoder (issue #940): three turns on stdin
+/// through the tiny Qwen3.5's template, both think modes, on the CPU and on
+/// Metal. Turn 1 prefills whole and leaves its checkpoint `tail` tokens
+/// before the end (the generation prompt's `<think>\n`, or the closed
+/// block with thinking off, which the re-render drops); turns 2 and 3 are
+/// `Rewound(reply + tail)` to it, prefilling the changed suffix only; and
+/// every turn's tokens are the `--no-reuse` run's (a fresh prefill of the
+/// same conversation). The load reports the ring.
+#[test]
+fn qwen3_5_tiny_reuses_the_conversation_across_turns() {
+    let dir = scratch("qwen3_5_turns");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap().to_string();
+    let mut arms: Vec<Vec<&str>> = vec![vec!["--cpu"], vec!["--cpu", "--no-think"]];
+    if cfg!(feature = "metal") {
+        arms.push(vec![]);
+        arms.push(vec!["--no-think"]);
+    }
+    assert_three_turns_reuse(&model, &tok, arms);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Turn reuse on Qwen4-exp's own state (issue #940, review 1): the same
+/// three turns on the tiny resident model, thinking unset and off, on the
+/// CPU, beside `--no-reuse`.
+#[test]
+fn qwen4exp_tiny_reuses_the_conversation_across_turns() {
+    let dir = scratch("qwen4exp_turns");
+    let model = write::<Qwen4ExpTiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let tok = tok.to_str().unwrap().to_string();
+    let arms: Vec<Vec<&str>> = vec![
+        vec!["--experts", "resident", "--cpu"],
+        vec!["--experts", "resident", "--cpu", "--no-think"],
+    ];
+    // Not on Metal: the tiny Qwen4-exp's routed f16 pair has no arm there
+    // (`qwen4exp_tiny_chats_on_the_cpu_and_metal` is red on dev for it,
+    // `measurements/issue-932.md` §1); the restore itself is held on Metal
+    // by `lloom/tests/qwen4exp_turn_checkpoint.rs`.
+    assert_three_turns_reuse(&model, &tok, arms);
     std::fs::remove_dir_all(&dir).ok();
 }
 

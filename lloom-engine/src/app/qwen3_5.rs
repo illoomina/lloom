@@ -387,6 +387,7 @@ where
                 eos_ids,
                 seed_tokens,
                 think: Default::default(),
+                gen_prompts: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -418,6 +419,7 @@ where
             );
         }
         let _ = &mut engine;
+        engine.text.prime();
         Ok(Box::new(engine))
     }
 
@@ -586,6 +588,14 @@ where
     }
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         self.text.think_tags().cloned()
+    }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.text
+            .generation_prompt(kwarg, want)
+            .map(<[u32]>::to_vec)
+    }
+    fn template_renders(&self) -> u64 {
+        self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.mtp.is_some() {

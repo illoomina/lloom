@@ -257,11 +257,11 @@ pub struct DecodeParams {
     /// K=1 body carries it on every readback arm; the speculative body and
     /// the batch scheduler refuse it.
     pub thinking: Option<ThinkingBudget>,
-    /// Tokens at the end of the prompt the next turn's render drops (the
-    /// generation prompt's `<think>…`, read off the template:
-    /// `thinking::turn_tail`): the prefill leaves its turn checkpoint
-    /// before them (`CausalLM::checkpoint_at`), so the next request is a
-    /// restore there rather than a fresh prefill. 0: the pass's end.
+    /// The generation prompt's length at the end of the prompt
+    /// (`thinking::checkpoint_tail`, the load-time constant): the prefill
+    /// leaves its turn checkpoint before it (`CausalLM::checkpoint_at`), so
+    /// the next request, whose render keeps everything before it, is a
+    /// restore there rather than a fresh prefill. 0: no hint.
     pub turn_tail: usize,
 }
 

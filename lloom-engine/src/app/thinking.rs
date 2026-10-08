@@ -67,36 +67,24 @@ pub fn set_kwarg(engine: &dyn Served, want: Option<bool>, kwargs: &mut Map<Strin
     }
 }
 
-/// A user message no template writes on its own, for the re-render probe.
-const PROBE_USER: &str = "lloom-probe-user";
-
-/// How many of `ids`' last tokens the NEXT turn's render drops: the
-/// generation prompt's tail (`<think>\n`, `<think>\n\n</think>\n\n`, the
-/// end marker the engine appended) that the history's rendering of the
-/// assistant turn does not carry (`sequence-reuse-design.md` §2.3a: the
-/// re-render diverges there, past every rewind horizon). Read by rendering
-/// `messages` with an empty assistant reply and a user turn after it
-/// appended — the reply must not be the last turn, whose reasoning the
-/// Qwen templates keep — and comparing ids; 0 when nothing is dropped or
-/// the probe does not render.
-pub fn turn_tail(
+/// Where the turn checkpoint goes in a prompt rendered with `kwargs` and
+/// passed through the thinking switch `want`: the length of the generation
+/// prompt the ids end with (the load-time constant,
+/// `Served::generation_prompt`), so the prefill leaves its checkpoint at the
+/// generation prompt's start — the position the next turn's render keeps
+/// (`sequence-reuse-design.md` §2.3b). 0 — no hint, the next turn
+/// prefills — where the ids do not end with it.
+pub fn checkpoint_tail(
     engine: &dyn Served,
-    messages: &[Value],
     kwargs: &Map<String, Value>,
-    add_bos: bool,
+    want: Option<bool>,
     ids: &[u32],
 ) -> usize {
-    let mut probe = messages.to_vec();
-    probe.push(serde_json::json!({ "role": "assistant", "content": "" }));
-    probe.push(serde_json::json!({ "role": "user", "content": PROBE_USER }));
-    let Ok(text) = engine.render_chat(&Value::Array(probe), kwargs) else {
-        return 0;
-    };
-    let Ok(next) = engine.encode(&text, add_bos) else {
-        return 0;
-    };
-    let lcp = ids.iter().zip(&next).take_while(|(a, b)| a == b).count();
-    ids.len() - lcp
+    let kwarg = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
+    engine
+        .generation_prompt(kwarg, want)
+        .filter(|g| !g.is_empty() && ids.ends_with(g))
+        .map_or(0, |g| g.len())
 }
 
 /// Apply `want` to a rendered and encoded prompt: off closes a block the

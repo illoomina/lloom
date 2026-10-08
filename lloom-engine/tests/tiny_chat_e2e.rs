@@ -194,6 +194,11 @@ fn three_turns(
         .args(["chat", "--model"])
         .arg(model)
         .args(["--tokenizer", tok, "-n", "4", "--profile", "deterministic"])
+        // The blocking readback: under a GPU stall the ring arm's streamed
+        // text was measured short of its tokens (a reply two ids shorter,
+        // and the next prompt with it; `measurements/issue-940.md` §2) —
+        // no reuse causes it, and it would read as one here.
+        .args(["--readback", "blocking"])
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -236,7 +241,7 @@ fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
         );
         let mut fresh_arm = arm.clone();
         fresh_arm.push("--no-reuse");
-        let (fresh, _) = three_turns(model, tok, &fresh_arm);
+        let (fresh, fresh_stderr) = three_turns(model, tok, &fresh_arm);
         assert_eq!(reused[0]["reuse"], "Fresh", "{arm:?}:\n{stderr}");
         for t in 1..3 {
             let prompt: usize = reused[t]["prompt_tokens"].parse().unwrap();
@@ -284,7 +289,9 @@ fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
             );
             assert_eq!(
                 reused[t]["prompt_ids_sha256"],
-                fresh[t]["prompt_ids_sha256"]
+                fresh[t]["prompt_ids_sha256"],
+                "{arm:?} turn {}: the same conversation's prompt\n--- reused:\n{stderr}\n--- fresh:\n{fresh_stderr}",
+                t + 1
             );
             assert_eq!(
                 reused[t]["renders"],

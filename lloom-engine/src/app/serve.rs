@@ -813,6 +813,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         eos_ids,
         stop_strings,
         readback,
+        logits_digest: false,
         prefill_tile: shared.engine.prefill_tile(),
         thinking: None,
     })
@@ -899,10 +900,8 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             format!("data: {chunk}\n\n")
         }
     };
-    let sw = StreamWriter::start_with_deltas(
-        ChunkedWriter::start(request, "text/event-stream")?,
-        wrap,
-    );
+    let sw =
+        StreamWriter::start_with_deltas(ChunkedWriter::start(request, "text/event-stream")?, wrap);
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -1372,6 +1371,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             eos_ids: engine.eos_ids().to_vec(),
                             stop_strings: Vec::new(),
                             readback: engine.readback(),
+                            logits_digest: false,
                             prefill_tile: engine.prefill_tile(),
                             thinking: None,
                         };
@@ -1631,7 +1631,8 @@ impl StreamWriter {
                 let next = if buf.is_some() {
                     rx.recv_timeout(DRAIN_PERIOD)
                 } else {
-                    rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    rx.recv()
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 match next {
                     Ok(payload) => write(&mut w, &payload, &mut err),

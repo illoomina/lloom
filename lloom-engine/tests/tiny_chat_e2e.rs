@@ -258,6 +258,51 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
             );
         }
     }
+    // The logits digest (`--logits-digest`): the same tokens as the run
+    // without it, a digest the same on a second run, and refused by the
+    // speculative body.
+    let mut args = vec![
+        "--tokenizer",
+        tok,
+        "--sampling-defaults",
+        "greedy",
+        "-n",
+        "12",
+        "--cpu",
+    ];
+    let greedy = chat(&model, &args);
+    assert_eq!(greedy["logits_sha256"], "-");
+    args.push("--logits-digest");
+    let a = chat(&model, &args);
+    let b = chat(&model, &args);
+    assert_eq!(a["tokens_sha256"], greedy["tokens_sha256"]);
+    assert_eq!(a["logits_sha256"].len(), 64, "{a:?}");
+    assert_eq!(a["logits_sha256"], b["logits_sha256"]);
+    assert_eq!(
+        a["readback"], "blocking",
+        "the digest reads the logits on the host"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args([
+            "--raw",
+            "-p",
+            PROMPT,
+            "-n",
+            "4",
+            "--cpu",
+            "--tokenizer",
+            tok,
+        ])
+        .args(["--speculate", "mtp", "--logits-digest"])
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && stderr.contains("logits_digest"),
+        "{stderr}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 
     // Without the block, the method is refused by name.

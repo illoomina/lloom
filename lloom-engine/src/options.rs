@@ -508,6 +508,9 @@ pub struct DecodeConfig {
     /// Diagnostic, perturbs what it measures: drain the GPU per phase of a speculative round.
     #[opt(bool, path = "diagnostics.phase_sync", status = "instrument", cli = "phase-sync", facets = ["wait"], flows = ["commands-out"])]
     pub phase_sync: bool,
+    /// Diagnostic, perturbs what it measures: hash every decode step's logits (each value's f32 bits, little-endian, one SHA-256 over the run — the harnesses' `logits_sha256`) and report it beside the tokens' digest; runs the blocking readback, refused by the speculative body.
+    #[opt(bool, path = "diagnostics.logits_digest", status = "instrument", cli = "logits-digest", facets = ["consume"], flows = ["token-out"])]
+    pub logits_digest: bool,
     /// The prefill's shape.
     #[opt(nested)]
     pub prefill: PrefillConfig,
@@ -1164,6 +1167,7 @@ impl SamplingConfig {
             },
             stop_strings: self.stop.clone(),
             readback,
+            logits_digest: false,
             prefill_tile,
             thinking: None,
         }
@@ -1209,7 +1213,12 @@ pub struct SpeculativeConfig {
     #[opt(flag = "drafter", path = "speculative.model", status = "stable", cli = "spec-model", aliases = ["draft-dir"])]
     pub drafter: Option<std::path::PathBuf>,
     /// Reserved: the drafter's own options where it is a checkpoint of the target's family (its own `models.<family>` keys, which today it shares with the target). Not built; any value is refused.
-    #[opt(flag = "spec-draft-overrides", parser = "parse_reserved_overrides", path = "speculative.draft.overrides", status = "advanced")]
+    #[opt(
+        flag = "spec-draft-overrides",
+        parser = "parse_reserved_overrides",
+        path = "speculative.draft.overrides",
+        status = "advanced"
+    )]
     pub draft_overrides: Option<String>,
 }
 

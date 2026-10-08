@@ -39,14 +39,15 @@ RUN set -eu; \
     curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/${nextest}" | tar zxf - -C /usr/local/cargo/bin; \
     cargo nextest --version
 # The tree's `.cargo/config.toml` says `build.rustflags = target-cpu=native`
-# (the dev machine's); a `target.<triple>.rustflags` in CARGO_HOME takes
-# precedence over any `build.rustflags`, so the container builds the
-# baseline x86-64 the CI runner builds, and arm64 adds the `fp16` gemm-f16
-# needs (above). Verified in `design/measurements/issue-939.md` §5: the
-# container's `lloom-tensor` SIMD paths are the scalar ones the runner takes.
+# (the dev machine's). cargo takes the first NON-EMPTY rustflags source in
+# its order (RUSTFLAGS, target.<triple>.rustflags, build.rustflags), so the
+# CARGO_HOME entry below names the baseline explicitly: an empty list fell
+# through to the tree's `native` and the container built the host's AVX2
+# paths (measured, `design/measurements/issue-939.md` §5). x86-64 pins the
+# baseline the CI runner built before; arm64 adds the `fp16` gemm-f16 needs.
 RUN set -eu; \
     case "$(uname -m)" in \
-      x86_64) printf '[target.x86_64-unknown-linux-gnu]\nrustflags = []\n' ;; \
+      x86_64) printf '[target.x86_64-unknown-linux-gnu]\nrustflags = ["-C", "target-cpu=x86-64"]\n' ;; \
       aarch64) printf '[target.aarch64-unknown-linux-gnu]\nrustflags = ["-C", "target-feature=+fp16"]\n' ;; \
     esac > /usr/local/cargo/config.toml; \
     cat /usr/local/cargo/config.toml

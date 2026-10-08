@@ -52,6 +52,14 @@ pub enum Sampling {
 
 pub struct LogitsProcessor {
     rng: rand::rngs::StdRng,
+    /// The seed the run was given, kept so a per-position noise stream can be
+    /// derived from `(seed, position)` ([`Self::at_position`]).
+    seed: u64,
+    /// The absolute position the next draw is for, when the caller keys the
+    /// noise by position rather than by draw count. `None` is the running
+    /// `rng` — the incumbent behaviour, and what every non-speculative caller
+    /// takes unless it arms one.
+    position: Option<u64>,
     sampling: Sampling,
     /// The processors between the logits and the draw; `None` when every one
     /// is neutral, so the sampler's path is exactly the one it has without them.
@@ -82,6 +90,8 @@ impl LogitsProcessor {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
         Self {
             rng,
+            seed,
+            position: None,
             sampling,
             stage: None,
             #[cfg(feature = "metal")]
@@ -155,6 +165,41 @@ impl LogitsProcessor {
     /// Put the sampler back to `mark` ([`Self::mark`]).
     pub fn rewind(&mut self, mark: DrawMark) {
         self.rng = mark.rng;
+    }
+
+    /// Key this sampler's noise by the ABSOLUTE position a draw is for,
+    /// rather than by how many draws preceded it.
+    ///
+    /// A speculative round draws a token per window position and keeps only
+    /// the accepted prefix, so the rows past the first mismatch are drawn and
+    /// thrown away. On the running stream those discarded draws advance it,
+    /// and every later token's noise moves with the drafter's luck — so the
+    /// same seed gives a different reply depending on what was accepted,
+    /// which is not a sampler a `deterministic` run can carry. Armed with a
+    /// position, each draw derives its own stream from `(seed, position)`:
+    /// the row at position `p` is the same row whether or not any row before
+    /// it was rejected, and a sampled speculative decode reproduces a
+    /// sampled non-speculative one at one seed.
+    ///
+    /// `None` returns to the running stream. Only the gumbel-max arms read
+    /// the noise (`Sampling::{All, GumbelSoftmax}`); the host-sort arms draw
+    /// through `sample_multinomial` on the running `rng` and are unaffected,
+    /// which is why the speculative body refuses them.
+    pub fn at_position(&mut self, position: Option<u64>) {
+        self.position = position;
+    }
+
+    /// The position this sampler's noise is keyed to, when any
+    /// ([`Self::at_position`]).
+    pub fn position(&self) -> Option<u64> {
+        self.position
+    }
+
+    /// Whether this sampler's draws are position-keyed — so a caller that
+    /// must not advance a shared stream (a verify's per-row draw) can check
+    /// rather than assume.
+    pub fn position_keyed(&self) -> bool {
+        self.position.is_some()
     }
 
     /// The processors this sampler runs, when any is active. A caller whose
@@ -329,21 +374,61 @@ impl LogitsProcessor {
     /// (the ring's `to_cpu_blit` stays 0 at t > 0). Sampling from `softmax(z/T)`
     /// is `argmax(z/T + G)`, i.e. `argmax(z + T·G)` up to the shared `1/T`.
     fn gumbel_max_host_noise(&mut self, logits: &Tensor, temperature: f64) -> Result<Tensor> {
-        use rand::Rng;
         let logits = logits.to_dtype(DType::F32)?;
         let n = logits.elem_count();
         let dev = logits.device();
-        // Host RNG -> Gumbel variates. Uniform in the tight open interval, then
-        // G = -log(-log u).
-        let mut g = Vec::<f32>::with_capacity(n);
-        for _ in 0..n {
-            let u: f64 = self.rng.random_range(1e-9..0.9999999);
-            g.push((-((-u.ln()).ln())) as f32);
-        }
-        let noise = Tensor::from_vec(g, logits.shape(), dev)?;
+        let noise = Tensor::from_vec(self.gumbel_variates(n), logits.shape(), dev)?;
         // argmax(z + T·G): scaling G by T is the temperature, and the shared
         // 1/T on z is monotone so it drops out of the argmax.
         (logits + noise.affine(temperature, 0.0)?)?.argmax(lloom_tensor::D::Minus1)
+    }
+
+    /// `n` Gumbel variates for one draw: `G = -log(-log u)`,
+    /// `u ~ U(1e-9, 0.9999999)`.
+    ///
+    /// The stream is the position's when one is armed ([`Self::at_position`])
+    /// and the running `rng`'s otherwise. The two differ in what a draw
+    /// COSTS the next one: the running stream advances `n` variates per
+    /// draw, so a draw's noise is a function of how many draws preceded it,
+    /// and a speculative round that draws rows for drafts its verify then
+    /// rejects shifts every later token's noise. A position's stream is
+    /// derived from `(seed, position)` and shares no state, so a rejected
+    /// row consumes nothing the next position needs — which is what makes a
+    /// sampled verify reproduce a sampled non-speculative decode at one seed
+    /// (`design/docs/speculation.md` §10.2z-viii).
+    fn gumbel_variates(&mut self, n: usize) -> Vec<f32> {
+        use rand::{Rng, SeedableRng};
+        let gumbel = |u: f64| (-((-u.ln()).ln())) as f32;
+        match self.position {
+            Some(pos) => {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
+                (0..n)
+                    .map(|_| gumbel(rng.random_range(1e-9..0.9999999)))
+                    .collect()
+            }
+            None => (0..n)
+                .map(|_| gumbel(self.rng.random_range(1e-9..0.9999999)))
+                .collect(),
+        }
+    }
+
+    /// The per-position stream key: splitmix64 over `seed + pos·φ`.
+    ///
+    /// What is MEASURED is the key's two-halves property — a stream is a
+    /// function of the seed and of the position, and neither may be dropped
+    /// (`generation_tests.rs`, and a mutation that drops either is killed).
+    /// The splitmix itself is **not** load-bearing and is not claimed to be:
+    /// removing it leaves every assertion green, because `StdRng` is ChaCha12
+    /// and already avalanches its seed — measured over 64 adjacent position
+    /// pairs at 4096 variates, worst |corr| 0.0332 unmixed against 0.0399
+    /// mixed, i.e. both at the noise floor. It is kept as the conventional
+    /// derivation of a sub-stream from a counter, not as a fix for a defect
+    /// that was demonstrated.
+    fn stream_key(seed: u64, pos: u64) -> u64 {
+        let mut z = seed.wrapping_add(pos.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// The slot the host-sort arms read their probabilities from, made on

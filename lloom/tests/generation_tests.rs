@@ -182,3 +182,175 @@ fn a_seeded_gumbel_host_draw_reproduces() -> Result<()> {
     assert_ne!(a, c, "seeds 7 and 8 drew the same 64 tokens");
     Ok(())
 }
+
+fn spread_logits() -> Result<Tensor> {
+    Tensor::new(
+        &[
+            0.1f32, 0.9, -0.3, 0.4, 0.0, 0.7, -1.0, 0.2, 0.5, 0.3, -0.2, 0.8, 0.6, -0.5, 0.05, 0.35,
+        ],
+        &Device::Cpu,
+    )
+}
+
+/// The default stream is keyed by DRAW COUNT: a draw's noise is a function of
+/// how many draws preceded it. This is the incumbent contract — the one
+/// `a_seeded_gumbel_host_draw_reproduces` above rests on — and it is what
+/// makes a naive sampled verify non-reproducible, since a speculative round
+/// draws rows for drafts it then rejects. Pinned so the position-keyed arm
+/// below is a visible departure rather than a silent change of default.
+#[test]
+fn the_unkeyed_gumbel_draw_depends_on_how_many_draws_preceded_it() -> Result<()> {
+    let logits = spread_logits()?;
+    let draw_after = |skipped: usize| -> Result<u32> {
+        let mut p = LogitsProcessor::from_sampling(
+            42,
+            lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+        );
+        for _ in 0..skipped {
+            let _ = p.sample(&logits)?;
+        }
+        p.sample(&logits)
+    };
+    let clean = draw_after(0)?;
+    assert!(
+        (1..=3).any(|skipped| draw_after(skipped).map(|t| t != clean).unwrap_or(false)),
+        "the unkeyed stream gave the same token at a position however many \
+         draws preceded it; if that is now true by construction the noise is \
+         already position-keyed and this test has lost its subject"
+    );
+    Ok(())
+}
+
+/// Armed with a position, a draw is a function of `(seed, position)` ALONE:
+/// the row at a position is the same row however many rows were drawn and
+/// discarded before it. That is the property a sampled verify needs — a
+/// rejected row must consume nothing the next position's noise depends on.
+#[test]
+fn a_position_keyed_gumbel_draw_ignores_the_draws_before_it() -> Result<()> {
+    let logits = spread_logits()?;
+    // The draw for absolute position 7, reached after `skipped` discarded
+    // draws (the rows of a round whose drafts the verify rejected).
+    let at_seven_after = |skipped: usize| -> Result<u32> {
+        let mut p = LogitsProcessor::from_sampling(
+            42,
+            lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+        );
+        for s in 0..skipped {
+            p.at_position(Some(100 + s as u64));
+            let _ = p.sample(&logits)?;
+        }
+        p.at_position(Some(7));
+        p.sample(&logits)
+    };
+    let clean = at_seven_after(0)?;
+    for skipped in 1..=5 {
+        assert_eq!(
+            clean,
+            at_seven_after(skipped)?,
+            "position 7's draw moved when {skipped} rows were drawn and \
+             discarded before it; the noise is still keyed by draw count, so a \
+             sampled speculative round cannot reproduce a sampled greedy one"
+        );
+    }
+    // And the key is both halves: a different position or a different seed
+    // draws a different stream, or the "keying" is a constant.
+    let at = |seed: u64, pos: u64| -> Result<Vec<u32>> {
+        let mut p = LogitsProcessor::from_sampling(
+            seed,
+            lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+        );
+        p.at_position(Some(pos));
+        // One position, drawn repeatedly: the stream is the position's, so
+        // every draw of it is the same token.
+        (0..4).map(|_| p.sample(&logits)).collect()
+    };
+    let p7 = at(42, 7)?;
+    assert!(
+        p7.iter().all(|t| *t == p7[0]),
+        "one armed position drew {p7:?}: a position's stream must not advance \
+         between draws of that same position"
+    );
+    // Both halves of the key matter — asserted over a STREAM of positions,
+    // never over one. A single position is a 1-in-vocab coin flip: seeds 42
+    // and 43 both draw token 7 at position 7 over these 16 logits, and they
+    // agree at 30 of 512 positions, which is the 1/16 chance rate (0.0586
+    // against 0.0625) rather than a shared stream. A one-position assertion
+    // here failed for exactly that reason.
+    let stream = |seed: u64, from: u64| -> Result<Vec<u32>> {
+        (from..from + 32)
+            .map(|pos| {
+                let mut p = LogitsProcessor::from_sampling(
+                    seed,
+                    lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+                );
+                p.at_position(Some(pos));
+                p.sample(&logits)
+            })
+            .collect()
+    };
+    assert_eq!(
+        stream(42, 0)?,
+        stream(42, 0)?,
+        "one seed drew two different streams"
+    );
+    assert_ne!(
+        stream(42, 0)?,
+        stream(43, 0)?,
+        "seeds 42 and 43 drew identical 32-position streams: the seed is dropped"
+    );
+    assert_ne!(
+        stream(42, 0)?,
+        stream(42, 32)?,
+        "positions 0..32 and 32..64 drew identical streams: the position is dropped"
+    );
+    // Disarming returns to the running stream.
+    let mut p = LogitsProcessor::from_sampling(
+        42,
+        lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+    );
+    p.at_position(Some(7));
+    assert!(p.position_keyed());
+    p.at_position(None);
+    assert!(!p.position_keyed() && p.position().is_none());
+    Ok(())
+}
+
+/// The position-keyed stream is a Gumbel: its mean is the Euler–Mascheroni
+/// constant. A keying that avalanched the seed into a degenerate stream would
+/// still reproduce and still decorrelate, and would sample from the wrong
+/// distribution — so the draw's correctness is asserted against the
+/// distribution's own constant, not against the mechanism's self-consistency
+/// (`CONTRIBUTING.md` §3.1b rule 1: an absolute reference, not a shape).
+#[test]
+fn the_position_keyed_stream_is_gumbel_distributed() -> Result<()> {
+    // `sample` over equal logits draws uniformly iff the noise is i.i.d.
+    // Gumbel; a 16-way uniform over 16 000 position-keyed draws is the
+    // argmax property gumbel-max needs (the one #345's χ² tested on the GPU).
+    let logits = Tensor::new(&[0.0f32; 16], &Device::Cpu)?;
+    let mut counts = vec![0usize; 16];
+    let draws = 16_000usize;
+    let mut p = LogitsProcessor::from_sampling(
+        42,
+        lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+    );
+    for pos in 0..draws {
+        p.at_position(Some(pos as u64));
+        counts[p.sample(&logits)? as usize] += 1;
+    }
+    let expected = draws as f64 / 16.0;
+    let chi2: f64 = counts
+        .iter()
+        .map(|c| {
+            let d = *c as f64 - expected;
+            d * d / expected
+        })
+        .sum();
+    // 15 d.f., p = 0.001 critical value 37.70.
+    eprintln!("position-keyed argmax chi2(15) = {chi2:.2} over {draws} draws: {counts:?}");
+    assert!(
+        chi2 < 37.70,
+        "the position-keyed argmax is not uniform over equal logits: \
+         chi2(15) = {chi2:.2} against a p=0.001 critical 37.70, counts {counts:?}"
+    );
+    Ok(())
+}

@@ -21,8 +21,9 @@
 //! elementwise entries compare in ulps. [`tolerance`] states each bound and
 //! why.
 //!
-//! Shared by `quant_parity_matrix` (default tuning) and
-//! `quant_parity_matrix_rows` (the rows arm, a process-wide switch).
+//! Shared by `quant_parity_matrix` (`deterministic`: the one-row cores) and
+//! `quant_parity_matrix_rows` (`fast`: the row axis, every capacity, plain
+//! and routed — the contract is read once per process).
 #![allow(dead_code)]
 
 use half::f16;
@@ -123,6 +124,8 @@ pub const NO_GGML_DTYPE: &[&str] = &[];
 pub enum Entry {
     MulMv,
     Rows,
+    RowsId,
+    RowsId2,
     MulMvId,
     MulMvId2,
     MulMm,
@@ -141,6 +144,8 @@ impl Entry {
         match self {
             Entry::MulMv => "mul_mv",
             Entry::Rows => "rows",
+            Entry::RowsId => "rows_id",
+            Entry::RowsId2 => "rows_id2",
             Entry::MulMvId => "mul_mv_id",
             Entry::MulMvId2 => "mul_mv_id2",
             Entry::MulMm => "mul_mm",
@@ -299,7 +304,12 @@ impl Cell {
 /// launches.
 pub fn tolerance(entry: Entry, _act: Act) -> (Unit, f64, &'static str) {
     match entry {
-        Entry::MulMv | Entry::Rows | Entry::MulMvId | Entry::MulMvId2 => (
+        Entry::MulMv
+        | Entry::Rows
+        | Entry::RowsId
+        | Entry::RowsId2
+        | Entry::MulMvId
+        | Entry::MulMvId2 => (
             Unit::Norm,
             TOL_NORM,
             "f32 accumulate of the dequantized products",
@@ -362,25 +372,34 @@ fn is_kv_read_family(name: &str) -> bool {
     name.starts_with("sdpa_vector_quant") || name.starts_with("dequantize_kv_")
 }
 
+/// `rest` without its row-axis capacity suffix (`_r2`, `_r4`, `_r8`), and
+/// whether it had one.
+fn rows_suffix(rest: &str) -> (&str, bool) {
+    for cap in lloom_tensor::kernels::MV_ROWS_CAPACITIES {
+        if let Some(s) = rest.strip_suffix(&format!("_r{cap}")) {
+            return (s, true);
+        }
+    }
+    (rest, false)
+}
+
 /// One quantized-library name as its cell.
 pub fn parse_quantized(name: &str) -> Option<Key> {
     let cell = |e: Entry, s: &str, a: Act| Some((e, s.to_string(), a));
     if let Some(r) = name.strip_prefix("kernel_mul_mv_id2_") {
+        let (r, rows) = rows_suffix(r);
         let (s, a) = act_suffix(r)?;
-        return cell(Entry::MulMvId2, s, a);
+        return cell(if rows { Entry::RowsId2 } else { Entry::MulMvId2 }, s, a);
     }
     if let Some(r) = name.strip_prefix("kernel_mul_mv_id_") {
+        let (r, rows) = rows_suffix(r);
         let (s, a) = act_suffix(r)?;
-        return cell(Entry::MulMvId, s, a);
+        return cell(if rows { Entry::RowsId } else { Entry::MulMvId }, s, a);
     }
     if let Some(r) = name.strip_prefix("kernel_mul_mv_") {
-        for nr in ["_f32_r2", "_f32_r4"] {
-            if let Some(s) = r.strip_suffix(nr) {
-                return cell(Entry::Rows, s, Act::F32);
-            }
-        }
+        let (r, rows) = rows_suffix(r);
         let (s, a) = act_suffix(r)?;
-        return cell(Entry::MulMv, s, a);
+        return cell(if rows { Entry::Rows } else { Entry::MulMv }, s, a);
     }
     if let Some(r) = name.strip_prefix("kernel_mul_mm_id_mapped16_") {
         return cell(Entry::MmId16, r.strip_suffix("_f32")?, Act::F32);
@@ -864,8 +883,9 @@ impl Matrix {
                     let (x, xv) = activations(&self.dev, &[m, k], act, m as u32 * 31 + k as u32)?;
                     let (out, census) = self.census(|| x.apply_op1_no_bwd(&w.q))?;
                     let expect = if rows_arm {
-                        let nr = if m <= 2 { 2 } else { 4 };
-                        format!("kernel_mul_mv_{}_f32_r{nr}", stem(d))
+                        let nr = lloom_tensor::kernels::mv_rows_capacity(d.into(), m, false);
+                        assert!(nr > 1, "{d:?} m={m}: the row axis is not on in this process");
+                        format!("kernel_mul_mv_{}_{}_r{nr}", stem(d), act.mv_suffix())
                     } else {
                         format!("kernel_mul_mv_{}_{}", stem(d), act.mv_suffix())
                     };
@@ -963,14 +983,27 @@ impl Matrix {
             .collect()
     }
 
-    pub fn run_mv_id(&mut self, d: GgmlDType, act: Act, pair: bool) -> Result<()> {
-        let entry = if pair {
-            Entry::MulMvId2
-        } else {
-            Entry::MulMvId
+    pub fn run_mv_id(&mut self, d: GgmlDType, act: Act, pair: bool, rows: bool) -> Result<()> {
+        let entry = match (pair, rows) {
+            (true, false) => Entry::MulMvId2,
+            (false, false) => Entry::MulMvId,
+            (true, true) => Entry::RowsId2,
+            (false, true) => Entry::RowsId,
         };
         let key: Key = (entry, stem(d).into(), act);
         let (e, topk) = (5usize, 2usize);
+        // The row axis at every capacity (2 at two rows, 4, 8), the pair
+        // and the single on the batches a window gives them.
+        let batches: &[usize] = if rows { &[2, 3, 5, 8] } else { &[1, 3] };
+        let suffix = |batch: usize| {
+            if rows {
+                let nr = lloom_tensor::kernels::mv_rows_capacity(d.into(), batch, true);
+                assert!(nr > 1, "{d:?} batch={batch}: the row axis is not on in this process");
+                format!("_r{nr}")
+            } else {
+                String::new()
+            }
+        };
         let mut first = true;
         for (k, mag) in Self::kmags(d) {
             for n in [1usize, 2, 37, 69] {
@@ -986,7 +1019,7 @@ impl Matrix {
                 } else {
                     None
                 };
-                for batch in [1usize, 3] {
+                for &batch in batches {
                     for in1 in [1usize, topk] {
                         let at = format!("batch={batch} in_dim1={in1} n={n} k={k} mag={mag}");
                         let ids = Self::routed_ids(batch, topk, e);
@@ -1009,8 +1042,12 @@ impl Matrix {
                                     act.compute(),
                                 )
                             })?;
-                            let expect =
-                                format!("kernel_mul_mv_id2_{}_{}", stem(d), act.mv_suffix());
+                            let expect = format!(
+                                "kernel_mul_mv_id2_{}_{}{}",
+                                stem(d),
+                                act.mv_suffix(),
+                                suffix(batch)
+                            );
                             self.check_census(&key, &at, &census, &[expect]);
                             let gv = to_f32(&go)?;
                             let uv = to_f32(&uo)?;
@@ -1042,7 +1079,8 @@ impl Matrix {
                                 act.stores_f16(),
                             );
                             // The same core in the same order: the pair is the two
-                            // single launches bit for bit.
+                            // single launches bit for bit (on the row axis the
+                            // single takes the same capacity, so the same core).
                             let g1 = g.q.indexed_moe_forward_as(
                                 &x,
                                 &ids_t,
@@ -1080,8 +1118,12 @@ impl Matrix {
                                     act.compute(),
                                 )
                             })?;
-                            let expect =
-                                format!("kernel_mul_mv_id_{}_{}", stem(d), act.mv_suffix());
+                            let expect = format!(
+                                "kernel_mul_mv_id_{}_{}{}",
+                                stem(d),
+                                act.mv_suffix(),
+                                suffix(batch)
+                            );
                             self.check_census(&key, &at, &census, &[expect]);
                             let got = to_f32(&out)?;
                             self.cell(&key).absorb(got.iter().map(|v| v.to_bits()));
@@ -1098,9 +1140,15 @@ impl Matrix {
                                 false,
                                 act.stores_f16(),
                             );
-                            self.mv_id_is_mul_mv(
-                                &key, &at, &g, &x, &out, &ids, batch, topk, in1, n, k,
-                            )?;
+                            // A routed plane on the row axis shares its weight read
+                            // with the other planes of its slot: another launch
+                            // shape than the one-row plain matmul-vec, so the bit
+                            // claim is the single-row entry's, not this one's.
+                            if !rows {
+                                self.mv_id_is_mul_mv(
+                                    &key, &at, &g, &x, &out, &ids, batch, topk, in1, n, k,
+                                )?;
+                            }
                             if first {
                                 let again = g.q.indexed_moe_forward_as(
                                     &x,
@@ -1629,8 +1677,10 @@ impl Matrix {
             match entry {
                 Entry::MulMv => self.run_mul_mv(d, act, false)?,
                 Entry::Rows => self.run_mul_mv(d, act, true)?,
-                Entry::MulMvId => self.run_mv_id(d, act, false)?,
-                Entry::MulMvId2 => self.run_mv_id(d, act, true)?,
+                Entry::MulMvId => self.run_mv_id(d, act, false, false)?,
+                Entry::MulMvId2 => self.run_mv_id(d, act, true, false)?,
+                Entry::RowsId => self.run_mv_id(d, act, false, true)?,
+                Entry::RowsId2 => self.run_mv_id(d, act, true, true)?,
                 Entry::MulMm => self.run_mul_mm(d, false)?,
                 Entry::MmId32 => self.run_mm_id(d, 32)?,
                 Entry::MmId16 => self.run_mm_id(d, 16)?,
@@ -1685,16 +1735,23 @@ impl Matrix {
                     }
                     self.census(|| x.apply_op1_no_bwd(&w.q))
                 }
-                Entry::MulMvId | Entry::MulMvId2 | Entry::MmId32 | Entry::MmId16 => {
+                Entry::MulMvId
+                | Entry::MulMvId2
+                | Entry::RowsId
+                | Entry::RowsId2
+                | Entry::MmId32
+                | Entry::MmId16 => {
                     let w = weight(&self.dev, d, &[e, 4, k], 1, 1.0)?;
-                    let (x, _) = activations(&self.dev, &[1, 1, k], act, 1)?;
-                    let ids = Tensor::from_vec(vec![1u32], (1, topk), &self.dev)?;
+                    // Two rows naming one slot for the row axis's entries.
+                    let rows = if matches!(entry, Entry::RowsId | Entry::RowsId2) { 2 } else { 1 };
+                    let (x, _) = activations(&self.dev, &[rows, 1, k], act, 1)?;
+                    let ids = Tensor::from_vec(vec![1u32; rows * topk], (rows, topk), &self.dev)?;
                     let arm = if matches!(entry, Entry::MmId32 | Entry::MmId16) {
                         MoeArm::Gemm
                     } else {
                         MoeArm::MatVec
                     };
-                    if entry == Entry::MulMvId2 {
+                    if matches!(entry, Entry::MulMvId2 | Entry::RowsId2) {
                         self.census(|| {
                             Ok(w.q.indexed_moe_forward_pair_with(&w.q, &x, &ids, arm)?.0)
                         })

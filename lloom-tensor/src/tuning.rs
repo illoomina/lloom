@@ -502,7 +502,7 @@ pub struct QmvTuning {
         status = "advanced"
     )]
     pub q6k_nr0: usize,
-    /// The small-batch quantized gemv (NR1 rows per weight read) instead of per-row launches — measured no faster here; not bit-identical.
+    /// The row axis of the quantized matmul-vec under `fast`: 2 to 8 activation rows (a verify window, a small batch, the routed planes sharing a slot) read each weight block once; off = one weight read per row. `deterministic` never takes it (a row's bits then never depend on the row count).
     #[opt(
         flag = "qmv-rows",
         env = "LLOOM_QMV_ROWS",
@@ -519,15 +519,6 @@ pub struct QmvTuning {
         status = "advanced"
     )]
     pub mm_from: Option<usize>,
-    /// The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic; a function constant).
-    #[opt(
-        flag = "qmv-id-union",
-        env = "LLOOM_QMV_ID_UNION",
-        bool,
-        path = "kernels.quant_matvec.routed_union",
-        status = "arm"
-    )]
-    pub id_union: bool,
 }
 
 impl Default for QmvTuning {
@@ -539,9 +530,8 @@ impl Default for QmvTuning {
             q4k_nr0: None,
             q5k_nr0: None,
             q6k_nr0: 2,
-            rows: false,
+            rows: true,
             mm_from: None,
-            id_union: false,
         }
     }
 }

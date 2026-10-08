@@ -1,53 +1,52 @@
-//! The small-batch quantized matmul-vec (`LLOOM_QMV_ROWS=on`): `m`
-//! activation rows (2..=8) share one weight read (`kernel_mul_mv_*_rows_impl`,
-//! `NR1` rows a threadgroup) for the five stem types it is built for. Every
-//! output row is checked against the CPU dequant reference, at a row count
-//! that fills the last threadgroup (`n = 40`) and one that does not (`n = 37`),
-//! and the dispatch census shows the rows kernels ran — a parity test the
-//! per-row launches pass is not a test of this arm. Each rows kernel indexes
-//! its rows for its own threadgroup geometry, so a one-row core whose
-//! geometry is tuned (`q6k_nr0`, `iq_nsg`) must not lend it its grid.
+//! The row axis of the quantized matmul-vec under `fast`: `m` activation
+//! rows (2..=8) share one weight read (`kernel_mul_mv_<stem>_<triple>_r<N>`,
+//! the core at capacity `N`). Every output row is checked against the CPU
+//! dequant reference, at a row count that fills the last threadgroup
+//! (`n = 40`) and one that does not (`n = 37`), the dispatch census shows
+//! the kernel at the capacity the dispatch names ran once, and the same call
+//! twice gives the same bits. A parity test the per-row launches pass is not
+//! a test of this axis; the census is what makes it one.
 //!
-//! Its own binary: the arm's switch is read once per process, installed here
-//! before any tensor exists. The default (the per-row launches, bit-identical
-//! to `m` one-row launches) is `qmatmul_rows_default`.
+//! The mutation harness `design/measurements/issue-942-raw/mutate-rows.sh`
+//! breaks a row's index, the row loop's bound and the dispatch's grid and
+//! shows this binary red each time.
+//!
+//! Its own binary: the contract is read once per process.
 #![cfg(feature = "metal")]
 
-use half::f16;
+mod rows_identity;
+
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use lloom_tensor::{Device, Module, Result, Tensor};
+use rows_identity::KINDS;
 use std::borrow::Cow;
 
-const TYPES: [GgmlDType; 5] = [
-    GgmlDType::Q6K,
-    GgmlDType::Q4K,
-    GgmlDType::IQ4XS,
-    GgmlDType::IQ4NL,
-    GgmlDType::IQ3S,
-];
 const K: usize = 512;
 
 fn device() -> Device {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
-        t.contract.profile = "deterministic".into();
-        t.qmv.rows = true;
+        t.contract.profile = "fast".into();
         t.instrument.profile = true;
+        // Rows past the ceiling stay on the matmul-vec (the mm kernel takes
+        // over at 9 by default): the grouping check below needs 11.
+        t.qmv.mm_from = Some(12);
         let _ = lloom_tensor::tuning::install(t);
     });
-    assert!(
-        lloom_tensor::tuning::tuning().qmv.rows,
-        "the switch was read before this binary installed it"
-    );
+    assert!(lloom_tensor::tuning::contract().is_fast());
+    assert!(lloom_tensor::tuning::tuning().qmv.rows, "the axis is on by default");
     Device::new_metal(0).expect("a Metal device")
 }
 
-/// The raw blocks of an `[n, K]` weight: LCG bytes with a sane f16 scale at
-/// offset 0 of every block for the codebook types (`iq_metal`'s fixture),
-/// the CPU quantizer's output for the K-quants.
+/// The raw blocks of an `[n, K]` weight: the CPU quantizer's output for the
+/// kinds with a quantizer, LCG bytes with a sane f16 scale at offset 0 of
+/// every block for the codebook kinds (`iq_metal`'s fixture).
 fn raw_weight(dtype: GgmlDType, n: usize, seed: u32) -> Result<Vec<u8>> {
-    if matches!(dtype, GgmlDType::Q6K | GgmlDType::Q4K) {
+    if matches!(
+        dtype,
+        GgmlDType::Q6K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q8_0 | GgmlDType::Q4_0
+    ) {
         let w: Vec<f32> = (0..n * K)
             .map(|i| (i as f32 * 0.61 + seed as f32).sin() * 0.05)
             .collect();
@@ -63,7 +62,7 @@ fn raw_weight(dtype: GgmlDType, n: usize, seed: u32) -> Result<Vec<u8>> {
         *b = (state >> 24) as u8;
     }
     for i in 0..n_blocks {
-        let d = f16::from_f32(0.02 + 0.015 * ((i as f32) * 0.37).sin());
+        let d = half::f16::from_f32(0.02 + 0.015 * ((i as f32) * 0.37).sin());
         raw[i * ts..i * ts + 2].copy_from_slice(&d.to_le_bytes());
     }
     Ok(raw)
@@ -135,18 +134,23 @@ fn count(census: &[(String, u64)], pred: impl Fn(&str) -> bool) -> u64 {
         .sum()
 }
 
-/// Every output row of the rows arm against the CPU reference, `m` 2..=8,
-/// the rows kernels shown to have run (one launch per call, `_r2` at two
-/// rows and `_r4` above), and the same call twice giving the same bits.
+/// Every output row of the row axis against the CPU reference, `m` 2..=8,
+/// the kernel at the dispatch's capacity shown to have run (one launch per
+/// call), the same call twice giving the same bits, and the engagement
+/// counter reading one launch per call; then a launch past the kind's
+/// ceiling, whose rows past it form a second group on the grid rather than
+/// being dropped. One test: the census is a per-device window.
 #[test]
-fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
+fn the_row_axis_matches_the_cpu_reference_at_every_row() -> Result<()> {
     let dev = device();
     assert!(
         lloom_tensor::kernels::metal::profile::enabled(),
         "the census decides which kernels ran"
     );
+    let before = lloom_tensor::kernels::qmv_rows_launches();
     let mut failures = Vec::new();
-    for dtype in TYPES {
+    let mut calls = 0u64;
+    for dtype in KINDS {
         for n in [37usize, 40] {
             let (w, w_ref) = weight(dtype, n, 7, &dev)?;
             for m in 2..=8usize {
@@ -155,23 +159,26 @@ fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
                 let xd = x.to_device(&dev)?;
                 let mut got = None;
                 let census = launches(&dev, || got = Some(w.forward(&xd).unwrap()));
+                calls += 1;
                 let got = got.unwrap();
                 let err = worst_rel(&got, &want)?;
-                let nr1 = if m <= 2 { "_r2" } else { "_r4" };
-                let rows = count(&census, |l| l.contains("kernel_mul_mv_") && l.contains(nr1));
+                let cap = lloom_tensor::kernels::mv_rows_capacity(dtype.into(), m, false);
+                let suffix = format!("_r{cap}");
+                let rows = count(&census, |l| l.contains("kernel_mul_mv_") && l.ends_with(&suffix));
                 let again = w.forward(&xd)?.to_device(&Device::Cpu)?;
                 let same = got
                     .to_device(&Device::Cpu)?
                     .flatten_all()?
                     .to_vec1::<f32>()?
                     == again.flatten_all()?.to_vec1::<f32>()?;
-                println!("ROWS {dtype:?} n={n} m={m} worst_rel={err:e} {nr1}_launches={rows} repeat_identical={same}");
+                calls += 1;
+                println!("ROWS {dtype:?} n={n} m={m} worst_rel={err:e} {suffix}_launches={rows} repeat_identical={same}");
                 if err.is_nan() || err >= 2e-3 {
                     failures.push(format!("{dtype:?} n={n} m={m}: worst rel err {err}"));
                 }
-                if rows != 1 {
+                if cap < 2 || rows != 1 {
                     failures.push(format!(
-                        "{dtype:?} n={n} m={m}: {rows} {nr1} launches ({census:?})"
+                        "{dtype:?} n={n} m={m}: {rows} {suffix} launches ({census:?})"
                     ));
                 }
                 if !same {
@@ -180,36 +187,30 @@ fn the_rows_arm_matches_the_cpu_reference_at_every_row() -> Result<()> {
             }
         }
     }
+    let counted = lloom_tensor::kernels::qmv_rows_launches() - before;
+    if counted != calls {
+        failures.push(format!("the counter read {counted} launches for {calls} calls"));
+    }
+    // Past the ceiling: a second group.
+    let dtype = GgmlDType::Q4K;
+    let ceiling = lloom_tensor::kernels::GgmlDType::from(dtype).kind().rows_max;
+    let m = ceiling + 3;
+    let (w, w_ref) = weight(dtype, 40, 3, &dev)?;
+    let x = activations(m)?;
+    let want = x.matmul(&w_ref.t()?)?;
+    let xd = x.to_device(&dev)?;
+    let mut got = None;
+    let census = launches(&dev, || got = Some(w.forward(&xd).unwrap()));
+    let err = worst_rel(&got.unwrap(), &want)?;
+    println!("GROUPS {dtype:?} ceiling={ceiling} m={m} worst_rel={err:e} census={census:?}");
+    if err.is_nan() || err >= 2e-3 {
+        failures.push(format!("{dtype:?} m={m} past the ceiling {ceiling}: worst rel err {err}"));
+    }
     assert!(
         failures.is_empty(),
         "{} failures:\n{}",
         failures.len(),
         failures.join("\n")
     );
-    Ok(())
-}
-
-/// The arm is a different contraction of the same sum, not a different sum:
-/// each row against the one-row core's result for that row, far inside the
-/// reference bound above.
-#[test]
-fn the_rows_arm_is_a_reordering_of_the_one_row_core() -> Result<()> {
-    let dev = device();
-    let mut failures = Vec::new();
-    for dtype in TYPES {
-        let (w, _) = weight(dtype, 40, 11, &dev)?;
-        let m = 4;
-        let x = activations(m)?.to_device(&dev)?;
-        let rows = w.forward(&x)?;
-        for r in 0..m {
-            let one = w.forward(&x.narrow(0, r, 1)?.contiguous()?)?;
-            let err = worst_rel(&rows.narrow(0, r, 1)?, &one.to_device(&Device::Cpu)?)?;
-            println!("REORDER {dtype:?} row={r} worst_rel_vs_one_row={err:e}");
-            if err.is_nan() || err >= 1e-5 {
-                failures.push(format!("{dtype:?} row {r}: {err} against the one-row core"));
-            }
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }

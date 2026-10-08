@@ -77,6 +77,10 @@ pub struct QuantKind {
     pub dequant_rows_f16: bool,
     /// The core stages a codebook into threadgroup memory (8192 bytes).
     pub iq_shared: bool,
+    /// The row axis's ceiling: the most activation rows one weight read
+    /// serves under `fast` (`docs/tuning.md` §13.5q); 1 for a kind whose core
+    /// has no row axis (the dense template).
+    pub rows_max: usize,
 }
 
 const fn kind(
@@ -88,6 +92,7 @@ const fn kind(
     mul_mm: Option<&'static str>,
     get_rows: Option<&'static str>,
     iq_shared: bool,
+    rows_max: usize,
 ) -> QuantKind {
     let quant = matches!(mul_mv, MulMv::Quant(_));
     let dense = matches!(mul_mv, MulMv::Dense(_));
@@ -104,38 +109,40 @@ const fn kind(
         get_rows,
         dequant_rows_f16: quant,
         iq_shared,
+        rows_max: if quant { rows_max } else { 1 },
     }
 }
 
 /// The table, in the enum's order ([`GgmlDType::kind`] indexes it by the
-/// discriminant; a test pins the order).
+/// discriminant; a test pins the order). The last column is the row axis's
+/// ceiling (`rows_max`; the dense rows read 1 whatever it says).
 #[rustfmt::skip]
 const KINDS: [QuantKind; 25] = [
-    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false),
-    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false),
-    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false),
-    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some("kernel_get_rows_q5_1"),    false),
-    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some("kernel_get_rows_q8_0"),    false),
-    kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false),
-    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some("kernel_get_rows_q2_K"),    false),
-    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some("kernel_get_rows_q3_K"),    false),
-    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some("kernel_get_rows_q4_K"),    false),
-    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some("kernel_get_rows_q5_K"),    false),
-    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some("kernel_get_rows_q6_K"),    false),
-    kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false),
-    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some("kernel_get_rows_f16"),     false),
-    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some("kernel_get_rows_f32"),     false),
-    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some("kernel_get_rows_bf16"),    false),
-    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some("kernel_get_rows_iq2_xxs"), true),
-    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some("kernel_get_rows_iq2_xs"),  true),
-    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some("kernel_get_rows_iq2_s"),   true),
-    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some("kernel_get_rows_iq3_xxs"), true),
-    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some("kernel_get_rows_iq3_s"),   true),
-    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true),
-    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true),
-    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false),
-    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some("kernel_get_rows_mxfp4"),   true),
-    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some("kernel_get_rows_fp8_e4m3"), false),
+    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false,  8),
+    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false,  8),
+    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false,  8),
+    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some("kernel_get_rows_q5_1"),    false,  8),
+    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some("kernel_get_rows_q8_0"),    false,  8),
+    kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false,  8),
+    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some("kernel_get_rows_q2_K"),    false,  8),
+    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some("kernel_get_rows_q3_K"),    false,  8),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some("kernel_get_rows_q4_K"),    false,  8),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some("kernel_get_rows_q5_K"),    false,  8),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some("kernel_get_rows_q6_K"),    false,  8),
+    kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false,  8),
+    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some("kernel_get_rows_f16"),     false,  8),
+    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some("kernel_get_rows_f32"),     false,  8),
+    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some("kernel_get_rows_bf16"),    false,  8),
+    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some("kernel_get_rows_iq2_xxs"), true,  8),
+    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some("kernel_get_rows_iq2_xs"),  true,  8),
+    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some("kernel_get_rows_iq2_s"),   true,  8),
+    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some("kernel_get_rows_iq3_xxs"), true,  8),
+    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some("kernel_get_rows_iq3_s"),   true,  8),
+    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true,  8),
+    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true,  8),
+    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false,  8),
+    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some("kernel_get_rows_mxfp4"),   true,  8),
+    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some("kernel_get_rows_fp8_e4m3"), false,  8),
 ];
 
 impl GgmlDType {
@@ -495,106 +502,105 @@ fn mv_constant(dtype: GgmlDType) -> Option<(usize, Value)> {
     }
 }
 
-/// The most rows a routed launch takes the union form for. Its threadgroup
-/// of a slot runs every plane naming the slot one after another, so over
-/// many rows sharing experts — a prefill tile's — it serialises what the
-/// incumbent runs side by side; over a verify window or a few rows the
-/// planes a slot gathers are few.
-pub const MV_ID_UNION_MAX_ROWS: usize = 8;
-
-/// Whether a routed launch of `batch` rows takes the union form
-/// (`MV_ID_UNION`, function constant 917): `LLOOM_QMV_ID_UNION` on and
-/// 2 to [`MV_ID_UNION_MAX_ROWS`] rows sharing the launch. Counted, so a
-/// test can show the arm engaged.
-fn mv_id_union(batch: usize) -> (usize, Value) {
-    let on = (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on();
-    if on {
-        ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    (917, Value::Bool(on))
-}
-
-/// [`mv_constants`] plus the union form, which every `kernel_mul_mv_id` and
-/// `kernel_mul_mv_id_f16` names and so is always supplied.
-fn mv_id_constants(dtype: GgmlDType, batch: usize) -> ConstantValues {
-    let union = mv_id_union(batch);
-    ConstantValues::new(match mv_constant(dtype) {
-        Some(c) => vec![c, union],
-        None => vec![union],
-    })
+/// [`mv_constants`], which every `kernel_mul_mv_id` names (the row axis is
+/// a pipeline name, `_r<N>`, not a constant).
+fn mv_id_constants(dtype: GgmlDType) -> Option<ConstantValues> {
+    mv_constants(dtype)
 }
 
 /// [`mv_id_constants`] plus the pair's grid order, which every
-/// `kernel_mul_mv_id2` names and so is always supplied. The union form
-/// decodes order 0's grid (`z = half·planes + plane`), so a pair on any
-/// other order takes the incumbent: each order is its own grid shape, and a
-/// kernel that decoded another's would compute the wrong planes.
-fn mv_id2_constants(dtype: GgmlDType, batch: usize, grid: PairGrid) -> ConstantValues {
-    let union_rows = if grid.order() == 0 { batch } else { 0 };
-    let mut values = mv_id_constants(dtype, union_rows).into_values();
+/// `kernel_mul_mv_id2` names and so is always supplied.
+fn mv_id2_constants(dtype: GgmlDType, grid: PairGrid) -> ConstantValues {
+    let mut values = match mv_constant(dtype) {
+        Some(c) => vec![c],
+        None => vec![],
+    };
     values.push((916, Value::USize(grid.order())));
     ConstantValues::new(values)
 }
 
-/// Routed matvec launches specialised to the union form, since process
-/// start: the arm's engagement count.
-static ID_UNION_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The capacities the row axis is instantiated at (`_r2`, `_r4`, `_r8`): a
+/// launch takes the smallest at or above its rows, so one weight read
+/// serves every row of a window up to the kind's ceiling.
+pub const MV_ROWS_CAPACITIES: [usize; 3] = [2, 4, 8];
 
-/// [`ID_UNION_LAUNCHES`] now.
-pub fn qmv_id_union_launches() -> u64 {
-    ID_UNION_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+/// Rows a matmul-vec launch of `m` activation rows takes per weight read
+/// (`docs/tuning.md` §13.5q): under `fast` with the axis on, the capacity at
+/// or above `min(m, the kind's ceiling)`; 1 — the launch whose every row is
+/// the one-row core's bits — under `deterministic`, with the axis off
+/// (`qmv.rows`), at one row, or for a kind without a row axis. A routed
+/// launch takes it up to the largest capacity's rows: past that a slot's
+/// threadgroup would run most of the planes one after another.
+pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
+    let ceiling = dtype.kind().rows_max;
+    if m < 2 || ceiling < 2 || !rows_on() || !crate::tuning::contract().is_fast() {
+        return 1;
+    }
+    if routed && m > MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1] {
+        return 1;
+    }
+    let want = m.min(ceiling);
+    MV_ROWS_CAPACITIES
+        .iter()
+        .copied()
+        .find(|&c| c >= want)
+        .unwrap_or(MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1])
 }
 
-/// `LLOOM_QMV_ID_UNION=on` (read once, or [`set_qmv_id_union`]): the routed
-/// matvec's union form.
-fn id_union_on() -> bool {
+/// `qmv.rows` (`LLOOM_QMV_ROWS`, read once; or [`set_qmv_rows`]): the row
+/// axis under `fast`.
+fn rows_on() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    match ID_UNION.load(Relaxed) {
+    match ROWS.load(Relaxed) {
         1 => false,
         2 => true,
         _ => {
-            let on = crate::tuning::tuning().qmv.id_union;
-            ID_UNION.store(if on { 2 } else { 1 }, Relaxed);
+            let on = crate::tuning::tuning().qmv.rows;
+            ROWS.store(if on { 2 } else { 1 }, Relaxed);
             on
         }
     }
 }
 
 /// 0 unread, 1 off, 2 on.
-static ID_UNION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static ROWS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Select the routed matvec's union form for this process (a test runs both
-/// forms; `LLOOM_QMV_ID_UNION` otherwise). The two are separate pipelines.
-pub fn set_qmv_id_union(on: bool) {
-    ID_UNION.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+/// Select the row axis for this process (a test runs both forms;
+/// `qmv.rows` otherwise). The contract still gates it: `deterministic`
+/// never takes it.
+pub fn set_qmv_rows(on: bool) {
+    ROWS.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
-/// activation rows per weight read (`kernel_mul_mv_*_rows_impl`). Off by
-/// default, and not taken by the `fast` contract either: a row's bits
-/// depend on how many rows share its launch, which only `fast` licenses,
-/// and on the real checkpoint it is slower than the per-row launches at
-/// three rows and up (`architecture.md` §2.3.5b).
-fn rows_arm_on() -> bool {
-    crate::tuning::tuning().qmv.rows
+/// Launches on the row axis since process start, the plain matmul-vec's and
+/// the routed ones': the arm's engagement count, beside the census's
+/// `_r<N>` names.
+static ROWS_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ID_ROWS_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`ROWS_LAUNCHES`] now.
+pub fn qmv_rows_launches() -> u64 {
+    ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The threadgroup geometry each rows kernel is written for: the rows a
-/// threadgroup covers are a property of the kernel's own row indexing, not
-/// of the one-row core's tunable geometry (`q6k_nr0`, `iq_nsg`), which the
-/// rows kernels do not read.
-fn rows_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
-    match dtype {
-        // `row = 2 * r0 + sgitg`: two simdgroups of one row.
-        GgmlDType::Q6K => (2, 32, 2),
-        // `first_row = r0 * N_DST`: one simdgroup of four rows.
-        GgmlDType::Q4K => (4, 8, 4),
-        // `first_row = (r0 * 2 + sgitg) * 2`: two simdgroups of two rows.
-        GgmlDType::IQ4XS | GgmlDType::IQ4NL | GgmlDType::MXFP4 => (4, 16, 4),
-        // `first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST`: two of four.
-        GgmlDType::IQ3S => (4, 16, 8),
-        _ => mv_threadgroup(dtype),
+/// [`ID_ROWS_LAUNCHES`] now.
+pub fn qmv_id_rows_launches() -> u64 {
+    ID_ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `name` at capacity `nr1`: the kernel on the row axis when `nr1 > 1`,
+/// counted.
+fn rows_name(name: String, nr1: usize, routed: bool) -> String {
+    if nr1 <= 1 {
+        return name;
     }
+    let counter = if routed {
+        &ID_ROWS_LAUNCHES
+    } else {
+        &ROWS_LAUNCHES
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{name}_r{nr1}")
 }
 
 /// Whether the dtype's matmul-vec core stages a codebook into threadgroup
@@ -689,49 +695,15 @@ pub fn call_quantized_matmul_mv_t(
         }
     };
 
-    // The small-batch arm: `m` activation rows (2..=8) share the weight
-    // read (`kernel_mul_mv_*_rows_impl`, the f32 triple, the seven stem
-    // types it is built for) — `NR1` rows per threadgroup, the grid's
-    // second axis over the row groups, at the rows kernel's own geometry; a
-    // row is a reordering of the one-row kernel's, not its bits. Elsewhere
-    // the rows stay the grid's second axis, one weight read each.
-    let (name, rows_per_group) = match (triple, dtype, m) {
-        (
-            GemvTriple::F32F32F32,
-            GgmlDType::Q6K
-            | GgmlDType::Q4K
-            | GgmlDType::IQ4XS
-            | GgmlDType::IQ3S
-            | GgmlDType::IQ4NL
-            | GgmlDType::MXFP4
-            | GgmlDType::FP8E4M3,
-            2..=8,
-            // The rows kernels keep the incumbent Q4_K geometry (one simdgroup of
-            // four rows); under the Q4_K rows-a-simdgroup arm (P31 (5)) they
-            // would be dispatched at the other shape, so the two arms do not
-            // compose — the per-row launches instead.
-        ) if rows_arm_on() && !(matches!(dtype, GgmlDType::Q4K) && q4k_nr0().is_some()) => {
-            let nr1 = if m <= 2 { 2 } else { 4 };
-            (format!("{name}_r{nr1}"), nr1)
-        }
-        _ => (name, 1),
-    };
-    let (thread_groups_count, threads_per_threadgroup) = if rows_per_group > 1 {
-        let (nth0, nth1, align) = rows_threadgroup(dtype);
-        (
-            MTLSize {
-                width: divide(ne01 as usize, align),
-                height: (ne11 as usize).div_ceil(rows_per_group),
-                depth: thread_groups_count.depth,
-            },
-            MTLSize {
-                width: nth0,
-                height: nth1,
-                depth: 1,
-            },
-        )
-    } else {
-        (thread_groups_count, threads_per_threadgroup)
+    // The row axis: `nr1` activation rows a weight read (`_r<nr1>`, the
+    // core at that capacity, at the core's own geometry), the grid's second
+    // axis over the row groups.
+    let nr1 = mv_rows_capacity(dtype, m, false);
+    let name = rows_name(name, nr1, false);
+    let thread_groups_count = MTLSize {
+        width: thread_groups_count.width,
+        height: (ne11 as usize).div_ceil(nr1),
+        depth: thread_groups_count.depth,
     };
 
     let iq_shared = needs_iq_shared(dtype);
@@ -952,7 +924,14 @@ pub fn call_quantized_matmul_mv_id_t(
         ));
     }
     let stem = mv_id_stem(dtype)?;
-    let name = format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix());
+    // The row axis: the planes of a slot the window's rows share, `nr1` a
+    // core call (`_r<nr1>`); the grid stays the plane grid.
+    let nr1 = mv_rows_capacity(dtype, batch, true);
+    let name = rows_name(
+        format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix()),
+        nr1,
+        true,
+    );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
@@ -1004,7 +983,7 @@ pub fn call_quantized_matmul_mv_id_t(
         device,
         Source::Quantized,
         name.clone(),
-        Some(mv_id_constants(dtype, batch)),
+        mv_id_constants(dtype),
     )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -1523,7 +1502,12 @@ pub fn call_quantized_matmul_mv_id2_t(
         ));
     }
     let stem = mv_id_stem(dtype)?;
-    let name = format!("kernel_mul_mv_id2_{stem}_{}", triple.name_suffix());
+    let nr1 = mv_rows_capacity(dtype, batch, true);
+    let name = rows_name(
+        format!("kernel_mul_mv_id2_{stem}_{}", triple.name_suffix()),
+        nr1,
+        true,
+    );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
@@ -1575,7 +1559,7 @@ pub fn call_quantized_matmul_mv_id2_t(
         device,
         Source::Quantized,
         name.clone(),
-        Some(mv_id2_constants(dtype, batch, grid)),
+        Some(mv_id2_constants(dtype, grid)),
     )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

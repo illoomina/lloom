@@ -554,6 +554,15 @@ pub const QWEN4EXP: Bound = Bound {
     rows: &["One", "Paged"],
     except: &[PoolSpec::KEY, PoolSpecExact::KEY],
 };
+/// Qwen3.5 ships `No × One` (one sequence) and `Ring × One` (the MTP
+/// drafter's verify window over the generic decoder's per-layer state,
+/// `nn::decoder`); no rows.
+pub const QWEN3_5: Bound = Bound {
+    family: "qwen3_5",
+    rewind: &["No", "Ring"],
+    rows: &["One"],
+    except: &[],
+};
 /// Every shape Qwen4-exp can be instantiated at (`Ring × Paged` included:
 /// the harness's MTP over rows, `qwen4exp-chat --mtp --rows N`); the engine
 /// serves `QWEN4EXP`.

@@ -28,6 +28,7 @@ use std::path::PathBuf;
 enum Family {
     Lfm2,
     Qwen4Exp,
+    Qwen3_5,
 }
 
 impl Family {
@@ -35,15 +36,17 @@ impl Family {
         match self {
             Family::Lfm2 => TinyTokenizer::lfm2(),
             Family::Qwen4Exp => TinyTokenizer::qwen4exp(),
+            Family::Qwen3_5 => TinyTokenizer::qwen3_5(),
         }
     }
 
     /// The `bos_token` the engine renders with (`app/lfm2.rs` takes the
-    /// tokenizer's `<|startoftext|>`; `app/qwen4exp.rs` renders none).
+    /// tokenizer's `<|startoftext|>`; `app/qwen4exp.rs` and `app/qwen3_5.rs`
+    /// render none).
     fn bos(self) -> &'static str {
         match self {
             Family::Lfm2 => "<|startoftext|>",
-            Family::Qwen4Exp => "",
+            Family::Qwen4Exp | Family::Qwen3_5 => "",
         }
     }
 }
@@ -481,6 +484,169 @@ fn paths() -> Vec<Path> {
             "unknown_role",
             json!([user("Hi"), { "role": "developer", "content": "x" }]),
         )
+        .kwargs(off.clone())
+        .rejected(),
+        // Qwen3.5 (Qwen3.6's template): no effort; thinking on unless
+        // `enable_thinking` is false; a reply's reasoning kept after the last
+        // user turn (everywhere with `preserve_thinking`); tool calls as
+        // `<tool_call><function=…>` and results as user turns.
+        path(Qwen3_5, "user", json!([user("Hi")]))
+            .kwargs(off.clone())
+            .tokens(&[USER, END, ASST, THINK, UNTHINK]),
+        path(Qwen3_5, "thinking_by_default", json!([user("Hi")]))
+            .tokens(&[USER, END, ASST, THINK]),
+        path(Qwen3_5, "system", json!([system("Be brief."), user("Hi")]))
+            .kwargs(off.clone())
+            .tokens(&[SYS, END, USER, END, ASST, THINK, UNTHINK])
+            .has(&["Be brief."]),
+        // An empty system message still opens a system turn (the
+        // checkpoint's template renders it; LFM2's and Qwen4-exp's drop it).
+        path(Qwen3_5, "empty_system", json!([system(""), user("Hi")]))
+            .kwargs(off.clone())
+            .tokens(&[SYS, END, USER, END, ASST, THINK, UNTHINK]),
+        path(
+            Qwen3_5,
+            "text_parts",
+            json!([{ "role": "user", "content": [
+            { "type": "text", "text": "Hi " }, { "type": "text", "text": "there" } ] }]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, THINK, UNTHINK])
+        .has(&["Hi there"]),
+        path(
+            Qwen3_5,
+            "image",
+            json!([{ "role": "user", "content": [
+            { "type": "image" }, { "type": "text", "text": "What is this?" } ] }]),
+        )
+        .kwargs(off.clone())
+        .rejected()
+        .real_differs("the checkpoint's template renders an image part; the engine has no Qwen3.5 vision, and the tiny template refuses the part"),
+        path(
+            Qwen3_5,
+            "multi_turn",
+            json!([user("Hi"), assistant("Hello"), user("More")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, END, USER, END, ASST, THINK, UNTHINK])
+        .has(&["Hello", "More"]),
+        path(
+            Qwen3_5,
+            "thinking_in_content_dropped",
+            json!([user("Hi"), assistant("<think>\nmull\n</think>\n\nHello"), user("More")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, END, USER, END, ASST, THINK, UNTHINK])
+        .lacks(&["mull"]),
+        path(
+            Qwen3_5,
+            "thinking_in_content_kept_last",
+            json!([user("Hi"), assistant("<think>\nmull\n</think>\n\nHello")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, THINK, UNTHINK, END, ASST, THINK, UNTHINK])
+        .has(&["mull"]),
+        path(
+            Qwen3_5,
+            "reasoning_content_kept_last",
+            json!([user("Hi"), reasoned("mull", "Hello")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, THINK, UNTHINK, END, ASST, THINK, UNTHINK])
+        .has(&["mull"]),
+        path(
+            Qwen3_5,
+            "reasoning_content_dropped",
+            json!([user("Hi"), reasoned("mull", "Hello"), user("More")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, END, USER, END, ASST, THINK, UNTHINK])
+        .lacks(&["mull"]),
+        path(
+            Qwen3_5,
+            "preserve_thinking",
+            json!([user("Hi"), reasoned("mull", "Hello"), user("More")]),
+        )
+        .kwargs(json!({ "enable_thinking": false, "preserve_thinking": true }))
+        .tokens(&[USER, END, ASST, THINK, UNTHINK, END, USER, END, ASST, THINK, UNTHINK])
+        .has(&["mull"]),
+        path(Qwen3_5, "tools", json!([user("Weather?")]))
+            .kwargs(json!({ "enable_thinking": false, "tools": tools() }))
+            .tokens(&[
+                SYS, CALL, UNCALL, CALL, UNCALL, END, USER, END, ASST, THINK, UNTHINK,
+            ])
+            .has(&["get_weather", "get_time"]),
+        path(
+            Qwen3_5,
+            "tools_and_system",
+            json!([system("Be brief."), user("Weather?")]),
+        )
+        .kwargs(json!({ "enable_thinking": false, "tools": tools() }))
+        .tokens(&[
+            SYS, CALL, UNCALL, CALL, UNCALL, END, USER, END, ASST, THINK, UNTHINK,
+        ])
+        .has(&["get_weather", "Be brief."]),
+        path(
+            Qwen3_5,
+            "tool_call_and_result",
+            json!([user("Weather?"),
+            { "role": "assistant", "content": null, "tool_calls": [weather_call()] },
+            tool_result("sunny")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[
+            USER, END, ASST, THINK, UNTHINK, CALL, UNCALL, END, USER, RESP, UNRESP, END, ASST,
+            THINK, UNTHINK,
+        ])
+        .has(&["get_weather", "Paris", "sunny"]),
+        path(
+            Qwen3_5,
+            "two_calls_two_results",
+            json!([user("Weather?"),
+            { "role": "assistant", "content": "Checking.", "tool_calls": [weather_call(),
+                { "name": "get_time", "arguments": {} }] },
+            tool_result("sunny"), tool_result("noon"), assistant("Sunny at noon."),
+            user("Thanks")]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[
+            USER, END, ASST, CALL, UNCALL, CALL, UNCALL, END, USER, RESP, UNRESP, RESP, UNRESP,
+            END, ASST, END, USER, END, ASST, THINK, UNTHINK,
+        ])
+        .has(&["Checking.", "get_time", "noon"]),
+        path(
+            Qwen3_5,
+            "tool_call_arguments_as_a_string",
+            json!([user("Weather?"),
+            { "role": "assistant", "content": null, "tool_calls": [
+                { "type": "function", "function": { "name": "get_weather",
+                  "arguments": "{\"city\": \"Paris\"}" } } ] }]),
+        )
+        .kwargs(off.clone())
+        .tokens(&[USER, END, ASST, THINK, UNTHINK, CALL, UNCALL, END, ASST, THINK, UNTHINK])
+        .real_differs(
+            "the checkpoint's template iterates the arguments as a mapping and fails on a \
+             string outside raise_exception; the tiny template renders the string",
+        ),
+        path(
+            Qwen3_5,
+            "system_not_first",
+            json!([user("Hi"), system("Be brief.")]),
+        )
+        .kwargs(off.clone())
+        .rejected(),
+        path(
+            Qwen3_5,
+            "no_user_message",
+            json!([system("Be brief."), assistant("Hello")]),
+        )
+        .kwargs(off.clone())
+        .rejected(),
+        path(
+            Qwen3_5,
+            "unknown_role",
+            json!([user("Hi"), { "role": "developer", "content": "x" }]),
+        )
         .kwargs(off)
         .rejected(),
     ]
@@ -679,12 +845,63 @@ const QWEN_BRANCHES: &[(&str, &str, Branch)] = &[
     ("8ac0517e", "thinking off", Branch::Paths(&["user", "effort_unread_with_thinking_off"])),
 ];
 
+/// Qwen3.6-27B's branch conditions (snapshot `6a9e13bd`): Qwen3.8-Flash-Next's
+/// minus the effort, plus thinking split out of a reply's content.
+const QWEN3_5_BRANCHES: &[(&str, &str, Branch)] = &[
+    ("d90613f7", "content is a string", Branch::Paths(&["user"])),
+    ("f917e1f1", "content is a list of parts", Branch::Paths(&["text_parts"])),
+    ("7bd9b1a8", "an image part", Branch::Paths(&["image"])),
+    ("c47ba6e8", "a picture or video in the system message", Branch::Gap("no Qwen3.5 vision (the image path above)")),
+    ("2e1e5b7e", "counting pictures and videos", Branch::Gap("no Qwen3.5 vision")),
+    ("e48de17e", "numbering pictures and videos (`add_vision_id`)", Branch::Gap("no Qwen3.5 vision")),
+    ("03ae1314", "a video part", Branch::Gap("the engine has no video input on any family")),
+    ("b45c5c74", "a text part", Branch::Paths(&["text_parts"])),
+    ("5d8fa582", "no content", Branch::Paths(&["tool_call_and_result"])),
+    ("fc0426af", "no messages", Branch::Gap(
+        "unreachable: `lloom serve` refuses an empty `messages` before rendering (serve.rs), \
+         and `lloom chat` renders a user turn")),
+    ("ec63cb04", "tools given", Branch::Paths(&["tools", "tools_and_system"])),
+    ("0ba81dc8", "a system message first", Branch::Paths(&["system", "tools_and_system", "empty_system"])),
+    ("ed7002b4", "the system message has content", Branch::Paths(&["system", "empty_system"])),
+    ("af6225a0", "the last user turn, searched from the end", Branch::Paths(&["multi_turn", "two_calls_two_results"])),
+    ("bad247f2", "a user turn that is only a tool response", Branch::Gap(
+        "tool results as user text, the older form; a client sends tool results as `role: tool` messages \
+         (the tool_call_and_result path), which neither template counts as a user turn")),
+    ("2ae62c5b", "no user turn", Branch::Paths(&["no_user_message"])),
+    ("2aaadc85", "a system message in the loop", Branch::Paths(&["system", "system_not_first"])),
+    ("83f54756", "not the first message", Branch::Paths(&["system_not_first"])),
+    ("52158fa7", "a user turn", Branch::Paths(&["user"])),
+    ("4f5e9f97", "an assistant turn", Branch::Paths(&["multi_turn"])),
+    ("6740d105", "the reply's reasoning is a string", Branch::Paths(&["reasoning_content_kept_last"])),
+    ("ba988e9c", "thinking in the reply's content", Branch::Paths(&["thinking_in_content_dropped", "thinking_in_content_kept_last"])),
+    ("e55eddaf", "the reply's reasoning is kept", Branch::Paths(&["reasoning_content_kept_last", "reasoning_content_dropped", "preserve_thinking"])),
+    ("1f8db93c", "the reply has tool calls", Branch::Paths(&["tool_call_and_result"])),
+    ("ea9bf765", "a tool call wrapped in `function`", Branch::Paths(&["tool_call_and_result", "two_calls_two_results"])),
+    ("a72e26ea", "the first tool call", Branch::Paths(&["two_calls_two_results"])),
+    ("faa03a05", "the reply has text before its calls", Branch::Paths(&["two_calls_two_results", "tool_call_and_result"])),
+    ("1c5cb22a", "tool call arguments given", Branch::Paths(&["tool_call_and_result", "two_calls_two_results"])),
+    ("8e840415", "an argument value is a string", Branch::Paths(&["tool_call_and_result"])),
+    ("20efedc9", "a tool result", Branch::Paths(&["tool_call_and_result"])),
+    ("fdb2e860", "the first of consecutive tool results", Branch::Paths(&["two_calls_two_results"])),
+    ("46e61003", "the last of consecutive tool results", Branch::Paths(&["two_calls_two_results"])),
+    ("5b500bf7", "a tool result ends the conversation", Branch::Paths(&["tool_call_and_result"])),
+    ("d86f4175", "the generation prompt", EVERY_PATH),
+    ("8ac0517e", "thinking off", Branch::Paths(&["user"])),
+];
+
 /// The variables a checkpoint's template reads that the tiny one does not.
-const VARIABLE_GAPS: &[(Family, &str, &str)] = &[(
-    Family::Qwen4Exp,
-    "add_vision_id",
-    "numbers pictures and videos; no Qwen4-exp vision in the engine",
-)];
+const VARIABLE_GAPS: &[(Family, &str, &str)] = &[
+    (
+        Family::Qwen4Exp,
+        "add_vision_id",
+        "numbers pictures and videos; no Qwen4-exp vision in the engine",
+    ),
+    (
+        Family::Qwen3_5,
+        "add_vision_id",
+        "numbers pictures and videos; no Qwen3.5 vision in the engine",
+    ),
+];
 
 /// The checkpoints whose templates are checked. `opens_think`: the
 /// generation prompt opens the think block (LFM2.5-VL-3B's does not; the
@@ -693,6 +910,7 @@ const REAL: &[(Family, &str, bool)] = &[
     (Family::Lfm2, "LiquidAI/LFM2.5-2.6B", true),
     (Family::Lfm2, "LiquidAI/LFM2.5-VL-3B", false),
     (Family::Qwen4Exp, "Qwen/Qwen3.8-Flash-Next", true),
+    (Family::Qwen3_5, "Qwen/Qwen3.6-27B", true),
 ];
 
 fn tiny(family: Family) -> Template {
@@ -806,12 +1024,24 @@ mod qwen4exp {
     );
 }
 
+mod qwen3_5 {
+    use super::*;
+    path_tests!(Qwen3_5:
+        user, thinking_by_default, system, empty_system, text_parts, image, multi_turn,
+        thinking_in_content_dropped, thinking_in_content_kept_last,
+        reasoning_content_kept_last, reasoning_content_dropped, preserve_thinking, tools,
+        tools_and_system, tool_call_and_result, two_calls_two_results,
+        tool_call_arguments_as_a_string, system_not_first, no_user_message, unknown_role,
+    );
+}
+
 /// Every path has its test, and no test names a missing path.
 #[test]
 fn every_path_has_a_test() {
     for (family, tested) in [
         (Family::Lfm2, lfm2::TESTED),
         (Family::Qwen4Exp, qwen4exp::TESTED),
+        (Family::Qwen3_5, qwen3_5::TESTED),
     ] {
         let listed: BTreeSet<&str> = paths()
             .iter()
@@ -829,11 +1059,18 @@ fn every_path_has_a_test() {
 /// template does not read keeps a subject (`tiny_chat_e2e.rs`).
 #[test]
 fn the_engine_variables_each_tiny_template_reads() {
-    let (l, q) = (tiny(Family::Lfm2), tiny(Family::Qwen4Exp));
+    let (l, q, q35) = (
+        tiny(Family::Lfm2),
+        tiny(Family::Qwen4Exp),
+        tiny(Family::Qwen3_5),
+    );
     for v in ["enable_thinking", "reasoning_effort"] {
         assert_eq!(q.reads(v), Some(true), "{v}");
         assert_eq!(l.reads(v), Some(false), "{v}");
     }
+    // Qwen3.5's reads the switch and no effort (Qwen3.6's template has none).
+    assert_eq!(q35.reads("enable_thinking"), Some(true));
+    assert_eq!(q35.reads("reasoning_effort"), Some(false));
     for v in [
         "messages",
         "tools",
@@ -842,6 +1079,7 @@ fn the_engine_variables_each_tiny_template_reads() {
     ] {
         assert_eq!(q.reads(v), Some(true), "{v}");
         assert_eq!(l.reads(v), Some(true), "{v}");
+        assert_eq!(q35.reads(v), Some(true), "{v}");
     }
     assert_eq!(l.reads("bos_token"), Some(true));
 }
@@ -967,6 +1205,7 @@ fn branches(family: Family) -> &'static [(&'static str, &'static str, Branch)] {
     match family {
         Family::Lfm2 => LFM2_BRANCHES,
         Family::Qwen4Exp => QWEN_BRANCHES,
+        Family::Qwen3_5 => QWEN3_5_BRANCHES,
     }
 }
 

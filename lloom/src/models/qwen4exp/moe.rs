@@ -172,6 +172,26 @@ pub struct MoeLayer<P: Profile, R: ExpertResidency> {
     shared_store: bool,
 }
 
+/// What a routed MoE layer needs of a family's config: the expert count,
+/// the top-k and the experts' width. A family builds one from its own
+/// config ([`From<&Config>`] is Qwen4-exp's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeGeometry {
+    pub n_experts: usize,
+    pub n_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+}
+
+impl From<&Config> for MoeGeometry {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            n_experts: cfg.n_experts,
+            n_experts_per_tok: cfg.n_experts_per_tok,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+        }
+    }
+}
+
 impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -183,6 +203,29 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
         sh_router: QMatMul,
         cfg: &Config,
     ) -> Self {
+        Self::with_geometry(
+            router,
+            experts,
+            sh_gate,
+            sh_up,
+            sh_down,
+            sh_router,
+            &MoeGeometry::from(cfg),
+        )
+    }
+
+    /// [`Self::new`] from the geometry alone, for a family whose config is
+    /// not Qwen4-exp's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_geometry(
+        router: QMatMul,
+        experts: R,
+        sh_gate: QMatMul,
+        sh_up: QMatMul,
+        sh_down: QMatMul,
+        sh_router: QMatMul,
+        geo: &MoeGeometry,
+    ) -> Self {
         Self {
             profile: PhantomData,
             router,
@@ -191,9 +234,9 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
             sh_up,
             sh_down,
             sh_router,
-            n_experts_per_tok: cfg.n_experts_per_tok,
-            n_experts: cfg.n_experts,
-            moe_intermediate_size: cfg.moe_intermediate_size,
+            n_experts_per_tok: geo.n_experts_per_tok,
+            n_experts: geo.n_experts,
+            moe_intermediate_size: geo.moe_intermediate_size,
             routed_act: DType::F32,
             f16_fuse: crate::tuning::tuning().qwen4exp.f16_fuse,
             f16_fold: crate::tuning::tuning().qwen4exp.f16_fold,
@@ -700,7 +743,13 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     /// on — and its gate's logit `[seq, 1]`.
     fn shared_expert(&self, r: &PrefillRouted) -> Result<(Tensor, Tensor)> {
         let x1 = &r.x1;
-        let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down, self.shared_store)?;
+        let shared = swiglu(
+            x1,
+            &self.sh_gate,
+            &self.sh_up,
+            &self.sh_down,
+            self.shared_store,
+        )?;
         let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
         Ok((shared, sh_logit))
     }
@@ -896,7 +945,13 @@ impl<P: Profile, R: ExpertResidency> MoeLayer<P, R> {
     }
 }
 
-fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul, store: bool) -> Result<Tensor> {
+pub(crate) fn swiglu(
+    x: &Tensor,
+    gate: &QMatMul,
+    up: &QMatMul,
+    down: &QMatMul,
+    store: bool,
+) -> Result<Tensor> {
     // On the projections' stores, where both serve the row: the SiLU on the
     // gate's, the up projection multiplied into the gate's buffer (which
     // nothing else reads).

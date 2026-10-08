@@ -671,6 +671,7 @@ fn main() -> anyhow::Result<()> {
             geometry,
         } => {
             use lloom::models::lfm2_testing::Lfm2Tiny;
+            use lloom::models::qwen3_5::testing::{Qwen3_5MoeTiny, Qwen3_5Tiny};
             use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
             let kind = |s: &str| -> anyhow::Result<GgmlDType> {
                 lloom::testing::tiny::packed::ALL_KINDS
@@ -690,7 +691,9 @@ fn main() -> anyhow::Result<()> {
             let path = match family.as_str() {
                 "lfm2" => write_tiny::<Lfm2Tiny>(&out, weights, geometry.as_deref())?,
                 "qwen4exp" => write_tiny::<Qwen4ExpTiny>(&out, weights, geometry.as_deref())?,
-                other => anyhow::bail!("--family {other}: lfm2 | qwen4exp"),
+                "qwen3_5" => write_tiny::<Qwen3_5Tiny>(&out, weights, geometry.as_deref())?,
+                "qwen3_5_moe" => write_tiny::<Qwen3_5MoeTiny>(&out, weights, geometry.as_deref())?,
+                other => anyhow::bail!("--family {other}: lfm2 | qwen4exp | qwen3_5 | qwen3_5_moe"),
             };
             println!("{}", path.display());
         }

@@ -239,6 +239,12 @@ pub struct DecodeParams {
     pub stop_strings: Vec<String>,
     /// Which readback arm the run takes; [`ReadbackArm::Auto`] by default.
     pub readback: ReadbackArm,
+    /// Hash every decode step's logits beside the tokens
+    /// (`LogitsProcessor::with_logits_digest`, the harnesses' `logits_sha256`):
+    /// a diagnostic that runs the blocking readback (the ring arms draw on
+    /// the device and the host never sees the logits) and is refused by the
+    /// speculative body (its verify keeps no per-position logits).
+    pub logits_digest: bool,
     /// The TILE: the most prompt tokens one prefill forward takes
     /// (`DecodeOptions::prefill_tile`, lloom #728). `0` is one forward over
     /// the whole prompt, whose activation working set grows with the prompt
@@ -287,6 +293,7 @@ impl DecodeParams {
     pub fn sampler(&self) -> LogitsProcessor {
         LogitsProcessor::from_sampling(self.seed, self.sampling())
             .with_processors(self.processors.clone())
+            .with_logits_digest(self.logits_digest)
     }
 
     /// Refuse the processors on a path that draws without this request's
@@ -328,6 +335,7 @@ impl Default for DecodeParams {
             eos_ids: Vec::new(),
             stop_strings: Vec::new(),
             readback: ReadbackArm::Auto,
+            logits_digest: false,
             prefill_tile: 0,
             thinking: None,
         }
@@ -351,6 +359,9 @@ pub struct Decoded {
     /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
     /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
+    /// The run's logits digest, when `DecodeParams::logits_digest` asked for
+    /// one.
+    pub logits_sha256: Option<String>,
     /// The loop's own counters — prefill submit time, per-step host time,
     /// commits, ring engagement — so a consumer that reports throughput reads
     /// the loop's clock rather than bracketing the call.
@@ -681,9 +692,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
-        let arm = params
-            .readback
-            .resolve(sampler.sampling(), self.config.readback.ring_arm());
+        let arm = if params.logits_digest {
+            ReadbackArm::Blocking
+        } else {
+            params
+                .readback
+                .resolve(sampler.sampling(), self.config.readback.ring_arm())
+        };
         if let Err(e) = self.config.check() {
             lloom_tensor::bail!("DecodeSession::decode: {e}");
         }
@@ -899,6 +914,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             readback: ran,
+            logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
         })
@@ -942,6 +958,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             "its verify accepts the target's argmax over a drafted block, so a forced token \
              cannot be fed in place of a draw",
         )?;
+        if params.logits_digest {
+            lloom_tensor::bail!(
+                "DecodeSession::decode_speculative: the speculative body keeps no per-position \
+                 logits (its verify reads the argmax back), so diagnostics.logits_digest has \
+                 nothing to hash"
+            );
+        }
         let mut sampler = params.sampler();
         if sampler.sampling() != &Sampling::ArgMax {
             lloom_tensor::bail!(
@@ -1022,6 +1045,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             readback: ReadbackArm::Speculative { k },
+            logits_sha256: None,
             stats: out.stats,
             thinking: None,
         })

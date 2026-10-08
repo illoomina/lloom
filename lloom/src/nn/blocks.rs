@@ -91,7 +91,12 @@ rope_style!(
     crate::nn::rotary_emb::rope_i,
     "rope_i"
 );
-rope_style!(Thd, RopeStyle::Thd, crate::nn::rotary_emb::rope_thd, "rope_thd");
+rope_style!(
+    Thd,
+    RopeStyle::Thd,
+    crate::nn::rotary_emb::rope_thd,
+    "rope_thd"
+);
 
 impl Visit for crate::nn::layer_norm::RmsNorm {
     type In = NodeId;
@@ -161,5 +166,68 @@ impl Visit for crate::nn::fusion::Silu {
 impl Activation for crate::nn::fusion::Silu {
     fn execute(&self, x: &Tensor) -> Result<Tensor> {
         x.silu()
+    }
+}
+
+/// A dense SwiGLU feed-forward over quantized or f16 stems: `down(silu(gate(x))
+/// · up(x))` — the shared expert's arithmetic (`qwen4exp::moe::swiglu`) as a
+/// block of its own, so a dense family (Qwen3.5) and the routed MoE's shared
+/// expert compute one definition.
+#[derive(Debug, Clone)]
+pub struct SwiGlu {
+    gate: lloom_tensor::quantized::QMatMul,
+    up: lloom_tensor::quantized::QMatMul,
+    down: lloom_tensor::quantized::QMatMul,
+    /// `(hidden, intermediate)`.
+    dims: (usize, usize),
+    /// Whether a one-row step runs the SiLU and the product on the
+    /// projections' stores (`qwen4exp.shared_store`); off, a `silu_mul`
+    /// launch after the two projections.
+    store: bool,
+}
+
+impl SwiGlu {
+    pub fn new(
+        gate: lloom_tensor::quantized::QMatMul,
+        up: lloom_tensor::quantized::QMatMul,
+        down: lloom_tensor::quantized::QMatMul,
+        hidden: usize,
+        intermediate: usize,
+    ) -> Self {
+        Self {
+            gate,
+            up,
+            down,
+            dims: (hidden, intermediate),
+            store: crate::tuning::tuning().qwen4exp.shared_store,
+        }
+    }
+
+    pub fn dims(&self) -> (usize, usize) {
+        self.dims
+    }
+
+    /// `[.., hidden]` → `[.., hidden]`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        crate::models::qwen4exp::moe::swiglu(x, &self.gate, &self.up, &self.down, self.store)
+    }
+}
+
+impl Visit for SwiGlu {
+    type In = NodeId;
+    type Out = NodeId;
+    fn visit(&self, w: &mut Walker, x: Self::In) -> Self::Out {
+        let gate = w.project_qmat("ffn_gate.weight", &self.gate, x);
+        let gate = w.silu(gate);
+        let up = w.project_qmat("ffn_up.weight", &self.up, x);
+        let h = w.mul(gate, up);
+        w.project_qmat("ffn_down.weight", &self.down, h)
+    }
+}
+
+impl Ffn for SwiGlu {
+    type State = ();
+    fn execute(&self, x: &Tensor, _state: &mut ()) -> Result<Tensor> {
+        self.forward(x)
     }
 }

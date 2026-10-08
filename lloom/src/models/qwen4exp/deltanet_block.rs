@@ -12,7 +12,7 @@ use super::deltanet::{
     chunk_forward, conv_decode_step, conv_prefill, decode_step, gate_and_beta, gqa_expand,
     gqa_expand_seq, l2_norm_last, q_scale, DeltaNetDims, CHUNK_SIZE,
 };
-use crate::nn::gdn::{GdnStepArm, GdnStepForm};
+use crate::nn::gdn::{GdnStepArm, GdnStepForm, OutGate};
 use crate::nn::short_conv::{Shift, ShortConv};
 use crate::nn::{ops, RecurrentState};
 use crate::profile::Profile;
@@ -61,6 +61,44 @@ pub struct GatedDeltaNet<P: Profile> {
     value_dim: usize,
     key_dim: usize,
     norm_eps: f64,
+    /// The gated norm's output gate (`OutGate`): sigmoid on Qwen4-exp, SiLU
+    /// on Qwen3.5.
+    gate: OutGate,
+}
+
+/// What a Gated DeltaNet layer's blocks need of a family's config: the head
+/// geometry, the conv width, the norm epsilon and the output gate. A family
+/// builds one from its own config ([`From<&Config>`] is Qwen4-exp's).
+#[derive(Debug, Clone, Copy)]
+pub struct GdnGeometry {
+    pub dims: DeltaNetDims,
+    pub conv_kernel: usize,
+    pub norm_eps: f64,
+    pub gate: OutGate,
+}
+
+impl GdnGeometry {
+    /// The concat-QKV conv channel count, `key_dim · 2 + value_dim`.
+    pub fn conv_channels(&self) -> usize {
+        self.key_dim() * 2 + self.value_dim()
+    }
+    pub fn value_dim(&self) -> usize {
+        self.dims.d_v * self.dims.h_v
+    }
+    pub fn key_dim(&self) -> usize {
+        self.dims.d_k * self.dims.h_k
+    }
+}
+
+impl From<&Config> for GdnGeometry {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            dims: cfg.deltanet_dims(),
+            conv_kernel: cfg.ssm_conv_kernel,
+            norm_eps: cfg.norm_eps,
+            gate: OutGate::Sigmoid,
+        }
+    }
 }
 
 impl<P: Profile> GatedDeltaNet<P> {
@@ -78,12 +116,41 @@ impl<P: Profile> GatedDeltaNet<P> {
         ssm_out: QMatMul,
         cfg: &Config,
     ) -> Self {
-        let dims = cfg.deltanet_dims();
+        Self::with_geometry(
+            wqkv,
+            wqkv_gate,
+            conv_weight,
+            ssm_a,
+            ssm_dt,
+            ssm_alpha,
+            ssm_beta,
+            ssm_norm,
+            ssm_out,
+            &GdnGeometry::from(cfg),
+        )
+    }
+
+    /// [`Self::new`] from the geometry alone, for a family whose config is
+    /// not Qwen4-exp's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_geometry(
+        wqkv: QMatMul,
+        wqkv_gate: QMatMul,
+        conv_weight: Tensor,
+        ssm_a: Tensor,
+        ssm_dt: Tensor,
+        ssm_alpha: QMatMul,
+        ssm_beta: QMatMul,
+        ssm_norm: Tensor,
+        ssm_out: QMatMul,
+        geo: &GdnGeometry,
+    ) -> Self {
+        let dims = geo.dims;
         Self {
             profile: PhantomData,
             wqkv,
             wqkv_gate,
-            conv: ShortConv::<Shift>::new(conv_weight, cfg.ssm_conv_kernel),
+            conv: ShortConv::<Shift>::new(conv_weight, geo.conv_kernel),
             step: GdnStepArm::configured(dims.d_k, dims.h_v, &ssm_dt, &ssm_a),
             ssm_a,
             ssm_dt,
@@ -94,11 +161,17 @@ impl<P: Profile> GatedDeltaNet<P> {
             stem_cat: None,
             gate_stems_cat: None,
             dims,
-            conv_channels: cfg.conv_channels(),
-            value_dim: cfg.ssm_state_size * cfg.ssm_dt_rank,
-            key_dim: cfg.ssm_state_size * cfg.ssm_n_group,
-            norm_eps: cfg.norm_eps,
+            conv_channels: geo.conv_channels(),
+            value_dim: geo.value_dim(),
+            key_dim: geo.key_dim(),
+            norm_eps: geo.norm_eps,
+            gate: geo.gate,
         }
+    }
+
+    /// The gated norm's output gate.
+    pub fn out_gate(&self) -> OutGate {
+        self.gate
     }
 
     /// This layer with its recurrence step in `form`, where the construction
@@ -254,6 +327,7 @@ impl<P: Profile> GatedDeltaNet<P> {
                 d,
                 h_v,
                 eps: self.norm_eps as f32,
+                gate: self.gate,
             },
         )?; // [B, value_dim]
         Ok(Some(gated))
@@ -375,6 +449,7 @@ impl<P: Profile> GatedDeltaNet<P> {
                 d,
                 h_v,
                 eps: self.norm_eps as f32,
+                gate: self.gate,
             },
         )?; // [T, value_dim]
         Ok(Some(self.ssm_out.forward(&gated.reshape((
@@ -443,10 +518,10 @@ impl<P: Profile> GatedDeltaNet<P> {
         let (o, new_s) = decode_step::<false>(dims, &q, &k, &v, &g, &beta, s_state.get(l))?;
         s_state.write(l, new_s)?;
 
-        // gated norm: rms_norm(o, ssm_norm) · sigmoid(z). o is [h_v, d_v].
+        // gated norm: rms_norm(o, ssm_norm) · gate(z). o is [h_v, d_v].
         let o_flat = o.reshape((1, 1, self.value_dim))?; // back to [1,1,value_dim]
         let normed = self.gated_rms_norm(&o_flat)?;
-        let z_gate = ops::sigmoid(&z.to_dtype(normed.dtype())?)?;
+        let z_gate = self.gate.apply(&z.to_dtype(normed.dtype())?)?;
         let gated = (normed * z_gate)?;
 
         // out-proj → [1,1,hidden].
@@ -543,6 +618,7 @@ impl<P: Profile> GatedDeltaNet<P> {
                     d,
                     h_v,
                     eps: self.norm_eps as f32,
+                    gate: self.gate,
                 },
             )?; // [value_dim]
             gated_rows.push(gated.reshape((1, self.value_dim))?);
@@ -621,7 +697,7 @@ impl<P: Profile> GatedDeltaNet<P> {
 
         let o_flat = o.reshape((1, seq, self.value_dim))?;
         let normed = self.gated_rms_norm(&o_flat)?;
-        let z_gate = ops::sigmoid(&z.to_dtype(normed.dtype())?)?;
+        let z_gate = self.gate.apply(&z.to_dtype(normed.dtype())?)?;
         let gated = (normed * z_gate)?;
         self.ssm_out.forward(&gated)
     }
@@ -818,6 +894,7 @@ impl<P: Profile> GatedDeltaNet<P> {
                 h_v,
                 eps: self.norm_eps as f32,
                 gamma: self.ssm_norm.to_dtype(f32)?,
+                gate: self.gate,
             },
         )?; // [seq, h_v·d]
         s_state.write(l, s.permute((1, 2, 0))?.contiguous()?)?;
@@ -843,6 +920,36 @@ impl<P: Profile> GatedDeltaNet<P> {
     /// The head dim, for the caller (used nowhere yet; keeps the API discoverable).
     pub fn value_dim(&self) -> usize {
         self.value_dim
+    }
+
+    /// One layer's state on its own phase rings (`StatePool::with_phases`,
+    /// one slot, `phases` phases): what a verify window of `phases − 1`
+    /// positions runs through as one pass (`Self::decode_seq`) and accepts by
+    /// phase (`RecurrentState::accept_window`) — the Qwen4-exp `spec_pools`
+    /// shape, built per layer for a `Decoder` at the `Ring` profile.
+    pub fn pooled_state(&self, dev: &lloom_tensor::Device, phases: usize) -> Result<GdnState> {
+        let f32 = lloom_tensor::DType::F32;
+        let s = crate::nn::StatePool::with_phases(
+            1,
+            phases,
+            1,
+            &[self.dims.d_k, self.dims.d_v, self.dims.h_v],
+            f32,
+            dev,
+        );
+        let conv = crate::nn::StatePool::with_phases(
+            1,
+            phases,
+            1,
+            &[self.conv_channels, self.conv.k()],
+            f32,
+            dev,
+        );
+        Ok(GdnState {
+            layer: 0,
+            s: RecurrentState::in_pool(&s)?,
+            conv: RecurrentState::in_pool(&conv)?,
+        })
     }
 
     /// Attach the stacked input stems (`[conv_channels + value_dim + 2·h_v,

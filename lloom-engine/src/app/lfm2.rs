@@ -1650,6 +1650,7 @@ impl<P: Lfm2Shape> Engine<P> {
             text,
             tokens: done.tokens,
             stop,
+            logits_sha256: None,
             reuse: done.reuse,
             reused: done.reused,
             prefilled: done.prefilled,

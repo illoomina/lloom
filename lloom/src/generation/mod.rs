@@ -66,6 +66,9 @@ pub struct LogitsProcessor {
     /// The drawn id's host-read slot ([`Self::draw_and_read`]).
     #[cfg(feature = "metal")]
     draw_slot: Option<lloom_tensor::metal_backend::HostSlot>,
+    /// A running SHA-256 over every step's raw logits
+    /// ([`Self::with_logits_digest`]): a diagnostic, off by default.
+    digest: Option<sha2::Sha256>,
 }
 
 /// A [`LogitsProcessor`]'s state before a draw ([`LogitsProcessor::mark`]).
@@ -85,7 +88,47 @@ impl LogitsProcessor {
             prs_slot: None,
             #[cfg(feature = "metal")]
             draw_slot: None,
+            digest: None,
         }
+    }
+
+    /// Hash every step's raw logits — before the processors, as the
+    /// harnesses' `logits_sha256` does: each value's f32 bits little-endian,
+    /// one running SHA-256 over the run — beside the draw. A diagnostic: it
+    /// reads the whole vocabulary back every step, so a caller runs it on a
+    /// host-drawing arm and says so.
+    pub fn with_logits_digest(mut self, on: bool) -> Self {
+        self.digest = on.then(sha2::Sha256::default);
+        self
+    }
+
+    pub fn digests(&self) -> bool {
+        self.digest.is_some()
+    }
+
+    /// The digest so far, hex; `None` unless [`Self::with_logits_digest`].
+    pub fn logits_digest(&self) -> Option<String> {
+        use sha2::Digest as _;
+        self.digest
+            .as_ref()
+            .map(|h| format!("{:x}", h.clone().finalize()))
+    }
+
+    fn digest_step(&mut self, logits: &Tensor) -> Result<()> {
+        use sha2::Digest as _;
+        let Some(h) = self.digest.as_mut() else {
+            return Ok(());
+        };
+        let v = logits
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let mut bytes = Vec::with_capacity(v.len() * 4);
+        for x in &v {
+            bytes.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+        h.update(&bytes);
+        Ok(())
     }
 
     /// Run `processors` before every draw (bias, penalties, min-p;
@@ -408,6 +451,7 @@ impl LogitsProcessor {
         f: impl FnOnce(&mut [f32]),
         feed: impl FnOnce(u32) -> u32,
     ) -> Result<u32> {
+        self.digest_step(logits)?;
         let temperature = self.temperature();
         let Some(stage) = self.stage.as_mut() else {
             return Ok(feed(self.draw(logits, f)?));

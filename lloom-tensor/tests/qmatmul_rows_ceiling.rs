@@ -9,6 +9,7 @@
 //! Its own binary: the contract and the ceilings are read once per process.
 #![cfg(feature = "metal")]
 
+#[path = "rows_identity/mod.rs"]
 mod rows_identity;
 
 use lloom_tensor::quantized::{GgmlDType, QStorage, QTensor};

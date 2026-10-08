@@ -1,5 +1,6 @@
-//! The body `qmatmul_rows_default` and `qmatmul_rows_under_fast` share: an
-//! `m`-row quantized matmul-vec (2..=8 rows) against a one-row launch of
+//! The fixtures and the identity body the row-axis tests share
+//! (`qmatmul_rows_{default,under_fast,arm,ceiling}`): an `m`-row quantized
+//! matmul-vec (2..=8 rows) against a one-row launch of
 //! each of its rows, with the census read for the row axis
 //! (`kernel_mul_mv_*_r<N>`). Under `deterministic` no rows kernel runs and
 //! every row is the one-row launch's bits; under `fast` the rows kernel at
@@ -7,6 +8,7 @@
 //! sum in the one-row core's order — reported bit for bit, bounded at 1e-5
 //! relative (the compiler's contraction is the one thing the row loop may
 //! move).
+#![allow(dead_code)]
 
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QStorage, QTensor};
 use lloom_tensor::{Device, Module, Result, Tensor};

@@ -765,9 +765,11 @@ impl<L: Layer> DecoderState<L> {
                 self.layers.len()
             )
         }
-        for l in 0..self.layers.len() {
-            let frame = self.frame_view(idx, l)?;
-            L::restore_checkpoint(&mut self.layers[l], frame.as_ref(), marks[l])?;
+        let frames = (0..self.layers.len())
+            .map(|l| self.frame_view(idx, l))
+            .collect::<Result<Vec<_>>>()?;
+        for ((s, frame), mark) in self.layers.iter_mut().zip(&frames).zip(&marks) {
+            L::restore_checkpoint(s, frame.as_ref(), *mark)?;
         }
         self.pos = pos;
         self.nextn.clear();

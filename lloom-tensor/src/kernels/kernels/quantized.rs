@@ -78,9 +78,13 @@ pub struct QuantKind {
     /// The core stages a codebook into threadgroup memory (8192 bytes).
     pub iq_shared: bool,
     /// The row axis's ceiling: the most activation rows one weight read
-    /// serves under `fast` (`docs/tuning.md` §13.5q); 1 for a kind whose core
-    /// has no row axis (the dense template).
+    /// serves under `fast` on the plain matmul-vec, measured per kind at the
+    /// stems' shapes (`docs/tuning.md` §13.5v); 1 where the axis reads slower
+    /// than a launch row per row, and for the dense template.
     pub rows_max: usize,
+    /// The same for the routed matmul-vec (a slot's planes in one
+    /// threadgroup).
+    pub rows_max_routed: usize,
 }
 
 const fn kind(
@@ -92,7 +96,7 @@ const fn kind(
     mul_mm: Option<&'static str>,
     get_rows: Option<&'static str>,
     iq_shared: bool,
-    rows_max: usize,
+    (rows_max, rows_max_routed): (usize, usize),
 ) -> QuantKind {
     let quant = matches!(mul_mv, MulMv::Quant(_));
     let dense = matches!(mul_mv, MulMv::Dense(_));
@@ -110,40 +114,50 @@ const fn kind(
         dequant_rows_f16: quant,
         iq_shared,
         rows_max: if quant { rows_max } else { 1 },
+        rows_max_routed: if quant { rows_max_routed } else { 1 },
     }
 }
 
 /// The table, in the enum's order ([`GgmlDType::kind`] indexes it by the
 /// discriminant; a test pins the order). The last column is the row axis's
-/// ceiling (`rows_max`; the dense rows read 1 whatever it says).
+/// ceilings, plain and routed (`rows_max`, `rows_max_routed`; the dense rows
+/// read 1 whatever it says), from `measurements/issue-942-rows-axis.md` §3.
 #[rustfmt::skip]
 const KINDS: [QuantKind; 25] = [
-    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false,  8),
-    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false,  8),
-    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false,  8),
-    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some("kernel_get_rows_q5_1"),    false,  8),
-    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some("kernel_get_rows_q8_0"),    false,  8),
-    kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false,  8),
-    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some("kernel_get_rows_q2_K"),    false,  8),
-    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some("kernel_get_rows_q3_K"),    false,  8),
-    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some("kernel_get_rows_q4_K"),    false,  8),
-    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some("kernel_get_rows_q5_K"),    false,  8),
-    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some("kernel_get_rows_q6_K"),    false,  8),
-    kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false,  8),
-    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some("kernel_get_rows_f16"),     false,  8),
-    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some("kernel_get_rows_f32"),     false,  8),
-    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some("kernel_get_rows_bf16"),    false,  8),
-    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some("kernel_get_rows_iq2_xxs"), true,  8),
-    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some("kernel_get_rows_iq2_xs"),  true,  8),
-    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some("kernel_get_rows_iq2_s"),   true,  8),
-    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some("kernel_get_rows_iq3_xxs"), true,  8),
-    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some("kernel_get_rows_iq3_s"),   true,  8),
-    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true,  8),
-    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true,  8),
-    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false,  8),
-    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some("kernel_get_rows_mxfp4"),   true,  8),
-    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some("kernel_get_rows_fp8_e4m3"), false,  8),
+    kind(GgmlDType::Q4_0,   "q4_0",    32,  18, MulMv::Quant("kernel_mul_mv_q4_0"),    Some("kernel_mul_mm_q4_0_f32"),    Some("kernel_get_rows_q4_0"),    false, (1, 1)),
+    kind(GgmlDType::Q4_1,   "q4_1",    32,  20, MulMv::Quant("kernel_mul_mv_q4_1"),    Some("kernel_mul_mm_q4_1_f32"),    Some("kernel_get_rows_q4_1"),    false, (1, 1)),
+    kind(GgmlDType::Q5_0,   "q5_0",    32,  22, MulMv::Quant("kernel_mul_mv_q5_0"),    Some("kernel_mul_mm_q5_0_f32"),    Some("kernel_get_rows_q5_0"),    false, (1, 1)),
+    kind(GgmlDType::Q5_1,   "q5_1",    32,  24, MulMv::Quant("kernel_mul_mv_q5_1"),    Some("kernel_mul_mm_q5_1_f32"),    Some("kernel_get_rows_q5_1"),    false, (1, 1)),
+    kind(GgmlDType::Q8_0,   "q8_0",    32,  34, MulMv::Quant("kernel_mul_mv_q8_0"),    Some("kernel_mul_mm_q8_0_f32"),    Some("kernel_get_rows_q8_0"),    false, (2, 1)),
+    kind(GgmlDType::Q8_1,   "q8_1",    32,  36, MulMv::None,                           None,                              None,                            false, (1, 1)),
+    kind(GgmlDType::Q2K,    "q2_K",   256,  84, MulMv::Quant("kernel_mul_mv_q2_K"),    Some("kernel_mul_mm_q2_K_f32"),    Some("kernel_get_rows_q2_K"),    false, (8, 1)),
+    kind(GgmlDType::Q3K,    "q3_K",   256, 110, MulMv::Quant("kernel_mul_mv_q3_K"),    Some("kernel_mul_mm_q3_K_f32"),    Some("kernel_get_rows_q3_K"),    false, (1, 1)),
+    kind(GgmlDType::Q4K,    "q4_K",   256, 144, MulMv::Quant("kernel_mul_mv_q4_K"),    Some("kernel_mul_mm_q4_K_f32"),    Some("kernel_get_rows_q4_K"),    false, (1, 1)),
+    kind(GgmlDType::Q5K,    "q5_K",   256, 176, MulMv::Quant("kernel_mul_mv_q5_K"),    Some("kernel_mul_mm_q5_K_f32"),    Some("kernel_get_rows_q5_K"),    false, (1, 1)),
+    kind(GgmlDType::Q6K,    "q6_K",   256, 210, MulMv::Quant("kernel_mul_mv_q6_K"),    Some("kernel_mul_mm_q6_K_f32"),    Some("kernel_get_rows_q6_K"),    false, (1, 1)),
+    kind(GgmlDType::Q8K,    "q8_K",   256, 292, MulMv::None,                           None,                              None,                            false, (1, 1)),
+    kind(GgmlDType::F16,    "f16",      1,   2, MulMv::Dense("kernel_mul_mv_f16_f32"), Some("kernel_mul_mm_f16_f32"),     Some("kernel_get_rows_f16"),     false, (1, 1)),
+    kind(GgmlDType::F32,    "f32",      1,   4, MulMv::Dense("kernel_mul_mv_f32_f32"), Some("kernel_mul_mm_f32_f32"),     Some("kernel_get_rows_f32"),     false, (1, 1)),
+    kind(GgmlDType::BF16,   "bf16",     1,   2, MulMv::None,                           Some("kernel_mul_mm_bf16_f32"),    Some("kernel_get_rows_bf16"),    false, (1, 1)),
+    kind(GgmlDType::IQ2XXS, "iq2_xxs", 256,  66, MulMv::Quant("kernel_mul_mv_iq2_xxs"), Some("kernel_mul_mm_iq2_xxs_f32"), Some("kernel_get_rows_iq2_xxs"), true, (1, 1)),
+    kind(GgmlDType::IQ2XS,  "iq2_xs",  256,  74, MulMv::Quant("kernel_mul_mv_iq2_xs"),  Some("kernel_mul_mm_iq2_xs_f32"),  Some("kernel_get_rows_iq2_xs"),  true, (1, 1)),
+    kind(GgmlDType::IQ2S,   "iq2_s",   256,  82, MulMv::Quant("kernel_mul_mv_iq2_s"),   Some("kernel_mul_mm_iq2_s_f32"),   Some("kernel_get_rows_iq2_s"),   true, (1, 1)),
+    kind(GgmlDType::IQ3XXS, "iq3_xxs", 256,  98, MulMv::Quant("kernel_mul_mv_iq3_xxs"), Some("kernel_mul_mm_iq3_xxs_f32"), Some("kernel_get_rows_iq3_xxs"), true, (1, 1)),
+    kind(GgmlDType::IQ3S,   "iq3_s",   256, 110, MulMv::Quant("kernel_mul_mv_iq3_s"),   Some("kernel_mul_mm_iq3_s_f32"),   Some("kernel_get_rows_iq3_s"),   true, (1, 1)),
+    kind(GgmlDType::IQ4NL,  "iq4_nl",   32,  18, MulMv::Quant("kernel_mul_mv_iq4_nl"),  Some("kernel_mul_mm_iq4_nl_f32"),  Some("kernel_get_rows_iq4_nl"),  true, (1, 1)),
+    kind(GgmlDType::IQ4XS,  "iq4_xs",  256, 136, MulMv::Quant("kernel_mul_mv_iq4_xs"),  Some("kernel_mul_mm_iq4_xs_f32"),  Some("kernel_get_rows_iq4_xs"),  true, (1, 1)),
+    kind(GgmlDType::Q2_0,   "q2_0",    64,  18, MulMv::Quant("kernel_mul_mv_q2_0"),    Some("kernel_mul_mm_q2_0_f32"),    Some("kernel_get_rows_q2_0"),    false, (1, 1)),
+    kind(GgmlDType::MXFP4,  "mxfp4",   32,  17, MulMv::Quant("kernel_mul_mv_mxfp4"),   Some("kernel_mul_mm_mxfp4_f32"),   Some("kernel_get_rows_mxfp4"),   true, (1, 1)),
+    kind(GgmlDType::FP8E4M3, "fp8_e4m3", 32, 34, MulMv::Quant("kernel_mul_mv_fp8_e4m3"), Some("kernel_mul_mm_fp8_e4m3_f32"), Some("kernel_get_rows_fp8_e4m3"), false, (1, 1)),
 ];
+
+impl QuantKind {
+    /// Whether the plain matmul-vec is a quantized core (the row axis's
+    /// kinds; the dense template has none).
+    pub fn mul_mv_quant(&self) -> bool {
+        matches!(self.mul_mv, MulMv::Quant(_))
+    }
+}
 
 impl GgmlDType {
     /// Every kind, in the enum's order.
@@ -525,14 +539,23 @@ fn mv_id2_constants(dtype: GgmlDType, grid: PairGrid) -> ConstantValues {
 pub const MV_ROWS_CAPACITIES: [usize; 3] = [2, 4, 8];
 
 /// Rows a matmul-vec launch of `m` activation rows takes per weight read
-/// (`docs/tuning.md` §13.5q): under `fast` with the axis on, the capacity at
+/// (`docs/tuning.md` §13.5v): under `fast` with the axis on, the capacity at
 /// or above `min(m, the kind's ceiling)`; 1 — the launch whose every row is
 /// the one-row core's bits — under `deterministic`, with the axis off
 /// (`qmv.rows`), at one row, or for a kind without a row axis. A routed
 /// launch takes it up to the largest capacity's rows: past that a slot's
 /// threadgroup would run most of the planes one after another.
 pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
-    let ceiling = dtype.kind().rows_max;
+    let kind = dtype.kind();
+    let ceiling = if kind.mul_mv_quant() {
+        rows_max_override().unwrap_or(if routed {
+            kind.rows_max_routed
+        } else {
+            kind.rows_max
+        })
+    } else {
+        1
+    };
     if m < 2 || ceiling < 2 || !rows_on() || !crate::tuning::contract().is_fast() {
         return 1;
     }
@@ -545,6 +568,30 @@ pub fn mv_rows_capacity(dtype: GgmlDType, m: usize, routed: bool) -> usize {
         .copied()
         .find(|&c| c >= want)
         .unwrap_or(MV_ROWS_CAPACITIES[MV_ROWS_CAPACITIES.len() - 1])
+}
+
+/// `qmv.rows_max` (`LLOOM_QMV_ROWS_MAX`, read once; or
+/// [`set_qmv_rows_max`]): one ceiling for every kind in place of the
+/// table's.
+fn rows_max_override() -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ROWS_MAX.load(Relaxed) {
+        0 => {
+            let v = crate::tuning::tuning().qmv.rows_max;
+            ROWS_MAX.store(v.map_or(1, |n| n + 2), Relaxed);
+            v
+        }
+        1 => None,
+        n => Some(n - 2),
+    }
+}
+
+/// 0 unread, 1 none, `n + 2` a ceiling of `n`.
+static ROWS_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the ceiling override for this process (`None`: the table's).
+pub fn set_qmv_rows_max(n: Option<usize>) {
+    ROWS_MAX.store(n.map_or(1, |n| n + 2), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `qmv.rows` (`LLOOM_QMV_ROWS`, read once; or [`set_qmv_rows`]): the row

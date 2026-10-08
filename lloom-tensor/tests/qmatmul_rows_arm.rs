@@ -28,6 +28,8 @@ fn device() -> Device {
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
         t.contract.profile = "fast".into();
+        // Every kind at every capacity, whatever its measured ceiling.
+        t.qmv.rows_max = Some(8);
         t.instrument.profile = true;
         // Rows past the ceiling stay on the matmul-vec (the mm kernel takes
         // over at 9 by default): the grouping check below needs 11.
@@ -193,7 +195,7 @@ fn the_row_axis_matches_the_cpu_reference_at_every_row() -> Result<()> {
     }
     // Past the ceiling: a second group.
     let dtype = GgmlDType::Q4K;
-    let ceiling = lloom_tensor::kernels::GgmlDType::from(dtype).kind().rows_max;
+    let ceiling = lloom_tensor::tuning::tuning().qmv.rows_max.expect("the override this binary sets");
     let m = ceiling + 3;
     let (w, w_ref) = weight(dtype, 40, 3, &dev)?;
     let x = activations(m)?;

@@ -17,6 +17,8 @@ fn device() -> Device {
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
         t.contract.profile = "fast".into();
+        // Every kind at every capacity, whatever its measured ceiling.
+        t.qmv.rows_max = Some(8);
         t.instrument.profile = true;
         let _ = lloom_tensor::tuning::install(t);
     });

@@ -211,6 +211,12 @@ fn parse_opt_nr0_4(v: &str) -> Result<Option<usize>, String> {
     }
     ranged(v, "rows a simdgroup", 1, 4).map(Some)
 }
+fn parse_opt_rows_max(v: &str) -> Result<Option<usize>, String> {
+    if v.is_empty() || v.eq_ignore_ascii_case("none") || v == "0" {
+        return Ok(None);
+    }
+    ranged(v, "rows a weight read", 1, 8).map(Some)
+}
 fn parse_gdn_split(v: &str) -> Result<usize, String> {
     ranged(v, "gdn split", 1, 32)
 }
@@ -511,6 +517,16 @@ pub struct QmvTuning {
         status = "arm"
     )]
     pub rows: bool,
+    /// The row axis's ceiling for every kind (1..8): none = each kind's measured ceiling (`QuantKind::rows_max`). An A/B arm, and how a test reaches every capacity of every kind.
+    #[opt(
+        flag = "qmv-rows-max",
+        env = "LLOOM_QMV_ROWS_MAX",
+        parser = "parse_opt_rows_max",
+        variants = ["none", "1", "2", "4", "8"],
+        path = "kernels.quant_matvec.rows_max",
+        status = "arm"
+    )]
+    pub rows_max: Option<usize>,
     /// Rows from which a quantized stem takes the mm kernel instead of the row gemvs (none = 9: up to 8 rows on the gemv).
     #[opt(
         flag = "qmv-mm-from",
@@ -531,6 +547,7 @@ impl Default for QmvTuning {
             q5k_nr0: None,
             q6k_nr0: 2,
             rows: true,
+            rows_max: None,
             mm_from: None,
         }
     }

@@ -77,6 +77,8 @@ mod optimizer_walk;
 mod page_cache_probe;
 mod pos_embed_resample_tests;
 mod quant_kind_throughput;
+mod qwen3_5_mtp;
+mod qwen3_5_tiny;
 mod qwen4exp_batched_rows;
 mod qwen4exp_chunk_past_dense;
 mod qwen4exp_decode_plan_variants;

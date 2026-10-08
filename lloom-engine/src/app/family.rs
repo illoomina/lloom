@@ -567,7 +567,9 @@ impl Family for Qwen3_5Family {
     }
     fn detect(&self, path: &Path) -> Option<PathBuf> {
         let (first, arch) = gguf_checkpoint(path)?;
-        (arch == lloom::models::qwen3_5::ARCH_DENSE || arch == lloom::models::qwen3_5::ARCH_MOE)
+        (arch == lloom::models::qwen3_5::ARCH_DENSE
+            || arch == lloom::models::qwen3_5::ARCH_MOE
+            || arch == lloom::models::qwen3_5::ARCH_CLEF)
             .then_some(first)
     }
     fn capabilities(&self) -> Capabilities {

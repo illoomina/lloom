@@ -4,7 +4,7 @@
 //! shard reader is Qwen4-exp's (`qwen4exp::loader::Gguf`): one GGUF reader
 //! in the crate, not a second.
 
-use super::config::{Config, ARCH_DENSE, ARCH_MOE};
+use super::config::{Config, ARCH_CLEF, ARCH_DENSE, ARCH_MOE};
 use super::{
     Qwen3_5, Qwen3_5Layer, Qwen3_5Mixer, Qwen3_5Moe, Qwen3_5MoeLayer, Qwen3_5MoeMtpHead,
     Qwen3_5MtpHead,
@@ -81,10 +81,10 @@ impl Config {
             .map(|s| s.as_str())
             .unwrap_or("");
         let moe = match arch {
-            ARCH_DENSE => false,
+            ARCH_DENSE | ARCH_CLEF => false,
             ARCH_MOE => true,
             other => lloom_tensor::bail!(
-                "general.architecture = {other:?}: not a Qwen3.5 checkpoint ({ARCH_DENSE} | {ARCH_MOE})"
+                "general.architecture = {other:?}: not a Qwen3.5 checkpoint ({ARCH_DENSE} | {ARCH_MOE} | {ARCH_CLEF})"
             ),
         };
         let k = |s: &str| format!("{arch}.{s}");
@@ -541,6 +541,7 @@ pub fn arch_of(content: &Content) -> Option<&'static str> {
     {
         Some(ARCH_DENSE) => Some(ARCH_DENSE),
         Some(ARCH_MOE) => Some(ARCH_MOE),
+        Some(ARCH_CLEF) => Some(ARCH_CLEF),
         _ => None,
     }
 }

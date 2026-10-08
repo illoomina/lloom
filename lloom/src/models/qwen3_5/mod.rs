@@ -12,7 +12,7 @@ pub mod loader;
 pub mod schema;
 pub mod testing;
 
-pub use config::{Config, ConfigArgs, ARCH_DENSE, ARCH_MOE};
+pub use config::{Config, ConfigArgs, ARCH_CLEF, ARCH_DENSE, ARCH_MOE};
 pub use loader::{arch_of, LoadOptions, DEFAULT_MEMORY_FRACTION};
 
 use crate::models::qwen4exp::{GatedDeltaNet, MoeLayer, QsaAttention, Resident};

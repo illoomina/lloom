@@ -254,7 +254,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
     let t = Instant::now();
     let mut warnings = Vec::new();
     match arch {
-        lloom::models::qwen3_5::ARCH_DENSE => {
+        lloom::models::qwen3_5::ARCH_DENSE | lloom::models::qwen3_5::ARCH_CLEF => {
             let (model, head): (Qwen3_5<P>, _) = Qwen3_5::from_gguf_shards_with_mtp(
                 &shards,
                 opts.mtp_sidecar.as_ref(),

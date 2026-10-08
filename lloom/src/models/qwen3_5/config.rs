@@ -15,6 +15,11 @@ use lloom_tensor::DType;
 /// The GGUF architecture names this family loads.
 pub const ARCH_DENSE: &str = "qwen35";
 pub const ARCH_MOE: &str = "qwen35moe";
+/// Cloudflare's clef (`general.architecture = clef`): Qwen3.8-27B's text
+/// stack under its own name, every `qwen35.*` key spelled `clef.*`, plus a
+/// decision head's tensors and keys (`clef.decision.*`) the text path does
+/// not read. Loaded as the dense architecture.
+pub const ARCH_CLEF: &str = "clef";
 
 /// The verified geometry and the runtime axes; `#[tiny]` marks what the
 /// shape campaign may search from [`Config::tiny`].

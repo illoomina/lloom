@@ -284,6 +284,7 @@ mod tests {
     use crate::nn::model::CausalLM;
     use crate::profile::CrownExact;
     use crate::testing::tiny::Weights;
+    use std::collections::HashMap;
 
     /// The header round-trips: a tiny checkpoint's GGUF reads back to the
     /// config it was written from, on both variants.
@@ -309,6 +310,29 @@ mod tests {
         assert_eq!(cfg.norm_eps as f32, moe.cfg.norm_eps as f32);
         cfg.norm_eps = moe.cfg.norm_eps;
         assert_eq!(format!("{cfg:?}"), format!("{:?}", moe.cfg));
+        Ok(())
+    }
+
+    /// A `clef` header (Cloudflare's decision model: Qwen3.8-27B's text
+    /// stack under its own architecture name, the keys spelled `clef.*`)
+    /// reads as the dense config, its decision keys unread.
+    #[test]
+    fn a_clef_header_reads_as_the_dense_config() -> Result<()> {
+        let dense = TinyCheckpoint::<Qwen3_5Tiny>::template();
+        let mut md: HashMap<String, Value> = gguf_metadata(&dense.cfg, None)
+            .into_iter()
+            .map(|(k, v)| (k.replace("qwen35.", "clef."), v))
+            .collect();
+        md.insert(
+            "general.architecture".into(),
+            Value::String(super::super::ARCH_CLEF.into()),
+        );
+        md.insert("clef.decision.block_count".into(), Value::U32(4));
+        let mut cfg = Config::from_gguf_metadata(&md)?;
+        cfg.vocab_size = dense.cfg.vocab_size;
+        cfg.norm_eps = dense.cfg.norm_eps;
+        assert!(!cfg.is_moe());
+        assert_eq!(format!("{cfg:?}"), format!("{:?}", dense.cfg));
         Ok(())
     }
 

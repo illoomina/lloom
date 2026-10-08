@@ -369,7 +369,7 @@ impl LogitsProcessor {
     pub fn window_draw(&mut self, logits: &Tensor, first_pos: u64) -> Result<Vec<u32>> {
         let rows = match logits.rank() {
             3 => {
-                let (b, t, _v) = logits.dims3()?;
+                let (b, _t, _v) = logits.dims3()?;
                 if b != 1 {
                     lloom_tensor::bail!(
                         "window_draw: the window is single-sequence (B=1), got batch {b}"

@@ -517,6 +517,39 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
 
+    /// [`Self::verify_and_probe`] where the target's token at each window
+    /// position is **drawn by `sampler`** rather than read as the argmax —
+    /// the sampled verify (#943 §2). The acceptance rule is unchanged
+    /// ([`accept_prefix`]): the run accepts while the target's token equals
+    /// the draft's and keeps the target's at the first disagreement, so the
+    /// emitted sequence is a draw from the target's own distribution and
+    /// the drafter moves only how many tokens a round keeps. Each row is
+    /// drawn with noise keyed to its own absolute position
+    /// ([`crate::generation::LogitsProcessor::window_draw`]), which is what
+    /// makes the sampled run reproduce a sampled non-speculative one at one
+    /// seed.
+    ///
+    /// The default refuses by name: a target whose verify keeps no
+    /// per-position logits (one that reads an argmax back inside the pass)
+    /// cannot draw, and a driver must learn that before it touches any
+    /// state. A target that implements it serves the sampler's device
+    /// arms; the host-sort arms and active processors are refused inside
+    /// `window_draw`.
+    fn verify_and_probe_sampled(
+        &self,
+        drafts: &[Draft],
+        anchors: &[Anchor],
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<(Vec<Vec<u32>>, P::Output)> {
+        let _ = (drafts, anchors, cache, eos_ids, sampler);
+        lloom_tensor::bail!(
+            "this target's verify accepts the argmax only: a sampled verify (a temperature \
+             under speculation) is not built for it"
+        )
+    }
+
     /// Called by a driver just before it opens the planned pass of a verify
     /// window of `t` positions on `cache` (`PassShape::Verify`): a model
     /// whose verify windows of one length run several allocation sequences
@@ -1238,7 +1271,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        self.speculative_round_keyed(spec, active, anchors, p_min, eos_ids, probe, None, usize::MAX)
+        self.speculative_round_keyed(
+            spec,
+            active,
+            anchors,
+            p_min,
+            eos_ids,
+            probe,
+            None,
+            usize::MAX,
+            None,
+        )
     }
 
     /// [`Self::speculative_round`] with the VERIFY phase bracketed as a
@@ -1262,6 +1305,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         probe: RoundProbe<'_>,
         verify_key: Option<(&Device, crate::nn::decode::PassShape)>,
         room: usize,
+        sampler: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
     where
         S: Speculator,
@@ -1310,9 +1354,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
             crate::nn::decode::begin_pass(device, shape)?;
         }
-        let verified = self
-            .model
-            .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids);
+        // The sampled verify draws the target's token per row with `sampler`
+        // (#943 §2); the greedy one reads the argmax, as before.
+        let verified = match sampler {
+            Some(s) => self.model.verify_and_probe_sampled(
+                &drafts,
+                anchors,
+                &mut self.seq.cache,
+                eos_ids,
+                s,
+            ),
+            None => self
+                .model
+                .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids),
+        };
         if let Some((device, _)) = verify_key {
             crate::nn::decode::end_pass(device)?;
         }

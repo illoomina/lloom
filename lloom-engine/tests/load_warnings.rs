@@ -245,15 +245,13 @@ fn qwen4exp_readback_that_reads_its_id_back_warns() {
 #[test]
 fn an_admitted_emulated_type_reaches_the_engine() {
     use clap::Parser;
-    use lloom_engine::app::{
-        load_engine, resolve_options_uninstalled, CommonArgs, ModelArgs, Shape,
-    };
+    use lloom_engine::app::{load_engine, resolve_options_uninstalled, CommonArgs, Shape};
     use lloom_tensor::{DType, Device};
 
     #[derive(Parser)]
     struct Args {
         #[command(flatten)]
-        model: ModelArgs,
+        common: CommonArgs,
     }
     let dir = scratch("emulated");
     let lfm2 = write::<Lfm2Tiny>(&dir.join("lfm2"), None);
@@ -274,21 +272,15 @@ fn an_admitted_emulated_type_reaches_the_engine() {
         "resident".into(),
     ];
     for argv in [lfm2_args, qwen_args] {
-        let model = Args::parse_from(&argv).model;
-        let options = resolve_options_uninstalled(&CommonArgs::default()).unwrap();
-        let shape = Shape {
-            decode: options.decode.clone(),
-            model: options.model.clone(),
-            speculative: options.speculative.clone(),
-            executor: options.executor.clone(),
-            memory: options.memory.clone(),
-            reuse_prefix: true,
-            seed_text: "The loom threads warp and weft into cloth. ".to_string(),
-            batch: 1,
-            mem_sample: false,
-            rows: "auto".to_string(),
-            share_prefix: false,
-        };
+        let common = Args::parse_from(&argv).common;
+        let options = resolve_options_uninstalled(&common, &lloom_engine::app::no_front).unwrap();
+        let mut shape = Shape::of(
+            &options,
+            true,
+            "The loom threads warp and weft into cloth. ".to_string(),
+        );
+        shape.batch = 1;
+        let model = options.load.clone();
         let (engine, _) = load_engine(&model, shape).unwrap();
         let dev = engine.device().clone();
         let Device::Metal(m) = &dev else {

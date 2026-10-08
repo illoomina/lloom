@@ -144,15 +144,14 @@ fn retain_evicted_allocations() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        // `CANDLE_METAL_EAGER_RESIDENCY_RELEASE=0` is #206's probe spelled the
-        // other way round, and it selected the arm that is now the default.
-        // Honoured so an existing script that pins the arm explicitly still
-        // selects the arm it names rather than silently getting the new default
-        // -- an A/B whose arms both moved is worse than one that fails.
-        if let Ok(v) = std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE") {
-            return !(v == "1" || v.eq_ignore_ascii_case("true"));
+        // The legacy switch is the retain arm spelled the other way round;
+        // where it is set it names the arm, so an old script still selects
+        // the arm it pins.
+        let t = crate::tuning::tuning();
+        match t.metal.eager_residency_release {
+            Some(eager) => !eager,
+            None => t.pool.retain_evicted,
         }
-        crate::tuning::tuning().pool.retain_evicted
     })
 }
 

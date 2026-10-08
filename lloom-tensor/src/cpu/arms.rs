@@ -175,7 +175,10 @@ impl Set<Feature> {
 pub fn host() -> Features {
     static HOST: OnceLock<Features> = OnceLock::new();
     *HOST.get_or_init(|| {
-        let detected = Features::detect().minus(Features::from_env("LLOOM_CPU_DISABLE"));
+        let detected = Features::detect().minus(Features::from_list(
+            crate::tuning::tuning().cpu.disable_features.as_deref(),
+            "backend.cpu.disable_features",
+        ));
         Feature::ALL
             .into_iter()
             .filter(|f| f.compiled_in())

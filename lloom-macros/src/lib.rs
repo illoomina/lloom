@@ -51,6 +51,24 @@ struct AxisAttr {
     /// How the flag string maps to the field: `Parsed` routes a string value
     /// through a named `parse` fn; `Bool` is a plain switch.
     kind: AxisKind,
+    /// The axis as a key of the engine's option tree (`#[derive(Options)]`'s
+    /// `path`, `status`, `cli`, `aliases`, `facets`, `flows`), its flag
+    /// spellings (`arms`) and its user-facing description (`doc`).
+    key: AxisKey,
+    /// The field's doc comment (`lloom options --internal`).
+    doc_comment: String,
+}
+
+#[derive(Default)]
+struct AxisKey {
+    path: Option<String>,
+    status: Option<String>,
+    cli: Option<String>,
+    aliases: Vec<String>,
+    arms: Vec<String>,
+    doc: Option<String>,
+    facets: Vec<String>,
+    flows: Vec<String>,
 }
 
 #[derive(PartialEq)]
@@ -69,10 +87,18 @@ impl Parse for AxisAttr {
         let mut default = None;
         let mut parser = None;
         let mut is_bool = false;
+        let mut key = AxisKey::default();
+        let list = |input: ParseStream| -> syn::Result<Vec<String>> {
+            input.parse::<Token![=]>()?;
+            let content;
+            syn::bracketed!(content in input);
+            let items = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
+            Ok(items.into_iter().map(|s| s.value()).collect())
+        };
 
         while !input.is_empty() {
-            let key: syn::Ident = input.parse()?;
-            match key.to_string().as_str() {
+            let ident: syn::Ident = input.parse()?;
+            match ident.to_string().as_str() {
                 "bool" => {
                     is_bool = true;
                 }
@@ -92,16 +118,30 @@ impl Parse for AxisAttr {
                     input.parse::<Token![=]>()?;
                     parser = Some(input.parse::<LitStr>()?.value());
                 }
-                "variants" => {
+                "variants" => variants = list(input)?,
+                "path" => {
                     input.parse::<Token![=]>()?;
-                    let content;
-                    syn::bracketed!(content in input);
-                    let items = content.parse_terminated(<LitStr as Parse>::parse, Token![,])?;
-                    variants = items.into_iter().map(|s| s.value()).collect();
+                    key.path = Some(input.parse::<LitStr>()?.value());
                 }
+                "status" => {
+                    input.parse::<Token![=]>()?;
+                    key.status = Some(input.parse::<LitStr>()?.value());
+                }
+                "cli" => {
+                    input.parse::<Token![=]>()?;
+                    key.cli = Some(input.parse::<LitStr>()?.value());
+                }
+                "doc" => {
+                    input.parse::<Token![=]>()?;
+                    key.doc = Some(input.parse::<LitStr>()?.value());
+                }
+                "aliases" => key.aliases = list(input)?,
+                "arms" => key.arms = list(input)?,
+                "facets" => key.facets = list(input)?,
+                "flows" => key.flows = list(input)?,
                 other => {
                     return Err(syn::Error::new(
-                        key.span(),
+                        ident.span(),
                         format!("unknown #[axis] key `{other}`"),
                     ));
                 }
@@ -127,6 +167,8 @@ impl Parse for AxisAttr {
             variants,
             default,
             kind,
+            key,
+            doc_comment: String::new(),
         })
     }
 }
@@ -345,10 +387,26 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
             if !attr.path().is_ident("axis") {
                 continue;
             }
-            let parsed: AxisAttr = match attr.parse_args() {
+            let mut parsed: AxisAttr = match attr.parse_args() {
                 Ok(a) => a,
                 Err(e) => return e.to_compile_error().into(),
             };
+            parsed.doc_comment = field
+                .attrs
+                .iter()
+                .filter(|a| a.path().is_ident("doc"))
+                .filter_map(|a| match &a.meta {
+                    syn::Meta::NameValue(nv) => match &nv.value {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }) => Some(s.value().trim().to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             axes.push((ident.clone(), field.ty.clone(), parsed));
         }
     }
@@ -387,15 +445,39 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
     let args_ident = format_ident!("{}Args", struct_ident);
 
     let arg_fields = axes.iter().map(|(ident, ty, attr)| {
-        let flag = &attr.flag;
         let variants_help = attr.variants.join(", ");
+        // The key's dedicated flag is shown; without one the legacy flag is
+        // hidden (`lloom options` lists it). An axis without a key keeps the
+        // old behaviour.
+        let (flag, mut aliases) = match &attr.key.cli {
+            Some(cli) => (cli.clone(), vec![attr.flag.clone()]),
+            None => (attr.flag.clone(), vec![]),
+        };
+        aliases.extend(attr.key.aliases.iter().cloned());
+        let flag = &flag;
+        let hidden = attr.key.path.is_some() && attr.key.cli.is_none();
+        let extra = {
+            let heading = match &attr.key.path {
+                Some(p) => quote! { help_heading = ::lloom_tensor::options::heading(#p), },
+                None => quote! {},
+            };
+            let aliases = if aliases.is_empty() {
+                quote! {}
+            } else {
+                quote! { aliases = [#(#aliases),*], }
+            };
+            quote! { #aliases hide = #hidden, #heading }
+        };
         match &attr.kind {
             AxisKind::Bool => {
-                let doc = format!("Axis `{}`: `--{flag}` / `--{flag}=false`; absent keeps the preset's arm.", attr.name);
+                let doc = match (&attr.key.doc, &attr.key.path) {
+                    (Some(d), Some(p)) => format!("{d} [key: {p}]"),
+                    _ => format!("Axis `{}`: `--{flag}` / `--{flag}=false`; absent keeps the preset's arm.", attr.name),
+                };
                 let id = format!("{}.{}", struct_ident, ident);
                 quote! {
                     #[doc = #doc]
-                    #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
+                    #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL", #extra)]
                     pub #ident: Option<bool>,
                 }
             }
@@ -404,14 +486,17 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                 // the parser accepts are that type's `parse`. Help names the
                 // axis and its arms rather than claiming a spelling set, so it
                 // cannot drift from the parser.
-                let doc = format!("Axis `{}` (arms: {}).", attr.name, variants_help);
+                let doc = match (&attr.key.doc, &attr.key.path) {
+                    (Some(d), Some(p)) => format!("{d} [key: {p}]"),
+                    _ => format!("Axis `{}` (arms: {}).", attr.name, variants_help),
+                };
                 // Optional so "flag absent" means "keep the base config's value"
                 // rather than forcing a default the base already carries.
                 let _ = ty;
                 let id = format!("{}.{}", struct_ident, ident);
                 quote! {
                     #[doc = #doc]
-                    #[arg(id = #id, long = #flag)]
+                    #[arg(id = #id, long = #flag, value_name = "ARM", #extra)]
                     pub #ident: Option<String>,
                 }
             }
@@ -440,7 +525,7 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
     // 3. The other front-ends, from the same tags: `set_axis(flag, value)`
     //    (the dotted key and `--set`), `merge_axes_json` (a `{flag: value}`
     //    object), `axes_line()` (the resolved arms for a report line, read
-    //    back from the fields — §7.1a-i), `AXES_META` (the knobs table), and
+    //    back from the fields — §7.1a-i), `AXES_META` (the option tree's axis keys), and
     //    `ConfigArgs::overrides()` (the flags that were given, as pairs).
     let set_arms = axes.iter().map(|(ident, _ty, attr)| {
         let flag = &attr.flag;
@@ -472,17 +557,41 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
     let meta_items = axes.iter().map(|(ident, _ty, attr)| {
         let flag = &attr.flag;
         let name = &attr.name;
-        let variants = &attr.variants;
+        let variants = if attr.key.arms.is_empty() {
+            &attr.variants
+        } else {
+            &attr.key.arms
+        };
         let default = &attr.default;
-        let doc = format!("Axis `{name}` (default {default}).");
+        let doc = attr
+            .key
+            .doc
+            .clone()
+            .unwrap_or_else(|| format!("Axis `{name}` (default {default})."));
         let is_bool = attr.kind == AxisKind::Bool;
         let ty = format!("{}", quote!(#ident)).replace(' ', "");
         let _ = ty;
+        let path = attr.key.path.clone().unwrap_or_default();
+        let status = match attr.key.status.as_deref() {
+            Some("stable") => quote!(::lloom_tensor::options::Status::Stable),
+            Some("arm") => quote!(::lloom_tensor::options::Status::Arm),
+            Some("reference") => quote!(::lloom_tensor::options::Status::Reference),
+            Some("instrument") => quote!(::lloom_tensor::options::Status::Instrument),
+            _ => quote!(::lloom_tensor::options::Status::Advanced),
+        };
+        let cli = attr.key.cli.clone().unwrap_or_default();
+        let aliases = &attr.key.aliases;
+        let facets = &attr.key.facets;
+        let flows = &attr.key.flows;
+        let internal = &attr.doc_comment;
         quote! {
             ::lloom_tensor::options::KnobMeta {
                 key: #flag, flag: #flag, env: ::std::option::Option::None, doc: #doc,
                 variants: &[#(#variants),*], ty: #name, nested: ::std::option::Option::None,
                 is_bool: #is_bool,
+                path: #path, status: #status, cli: #cli, aliases: &[#(#aliases),*],
+                facets: &[#(#facets),*], flows: &[#(#flows),*], internal: #internal,
+                ..::lloom_tensor::options::KnobMeta::BASE
             }
         }
     });
@@ -544,7 +653,7 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
         }
 
         impl #struct_ident {
-            /// The axes as knobs (flag, arms, default), for the knobs table.
+            /// The axes as option-tree keys (flag, arms, key, status, description).
             pub const AXES_META: &'static [::lloom_tensor::options::KnobMeta] = &[#(#meta_items),*];
 
             /// Set one axis by its flag name, the value in its flag spelling

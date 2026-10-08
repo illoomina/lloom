@@ -664,7 +664,7 @@ where
             // last shared page may not exist yet (it is taken when the NEXT
             // pass begins): wait for the whole prompt, not for the pages.
             if could > idle_best {
-                if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+                if lloom::tuning::tuning().lfm2.share_trace {
                     eprintln!(
                         "[share: waiting for row {id:?}: {could} pages of its {}-token prompt \
                          ({} fed), idle slots give {idle_best}]",
@@ -718,7 +718,7 @@ where
                     continue;
                 }
             };
-            if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+            if lloom::tuning::tuning().lfm2.share_trace {
                 eprintln!(
                     "[share: prepared slot {slot} {:?} reused {} suffix {} in {:.1} ms; live {} waiting {}]",
                     prepared.action,
@@ -783,7 +783,7 @@ where
         })?;
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
-        if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+        if lloom::tuning::tuning().lfm2.share_trace {
             eprintln!(
                 "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
                 self.counters.steps,

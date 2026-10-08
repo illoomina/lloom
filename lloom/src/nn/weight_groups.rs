@@ -726,7 +726,7 @@ impl WeightGroups {
                 reader,
             })
             .map_err(|_| lloom_tensor::Error::Msg("weight groups: the loader is gone".into()))?;
-            if std::env::var("LLOOM_WG_SYNC").is_ok() {
+            if crate::tuning::tuning().wg.sync {
                 self.drain()?;
             }
             return Ok(());
@@ -782,7 +782,7 @@ impl WeightGroups {
     /// and writes under the stage's kernels). A diagnosis knob.
     pub fn cut_after_ensure(&self) -> Result<()> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("LLOOM_WG_CUT_AFTER_ENSURE").is_ok()) {
+        if !*ON.get_or_init(|| crate::tuning::tuning().wg.cut_after_ensure) {
             return Ok(());
         }
         #[cfg(feature = "metal")]
@@ -831,9 +831,9 @@ impl WeightGroups {
             if self.loader.is_some() {
                 return Ok(true);
             }
-            // `LLOOM_WG_NO_LOADER=1`: the blocking path on purpose (the
+            // `weights.groups.no_loader`: the blocking path on purpose (the
             // harness's arms for its own hazards; a diagnosis arm).
-            if std::env::var("LLOOM_WG_NO_LOADER").is_ok() {
+            if crate::tuning::tuning().wg.no_loader {
                 return Ok(false);
             }
             let Some(base) = self.slot_host_ptr(SlotId(0)) else {
@@ -849,9 +849,9 @@ impl WeightGroups {
             if !source.write(first.id, 0, self.dtype, &mut probe)? {
                 return Ok(false);
             }
-            let slow = std::env::var("LLOOM_WG_SLOW_LOADER_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
+            let slow = crate::tuning::tuning()
+                .wg
+                .slow_loader_ms
                 .map(std::time::Duration::from_millis);
             let shared = std::sync::Arc::new(loader::Shared {
                 event: lloom_tensor::metal_backend::HostEvent::new(m)?,
@@ -1035,10 +1035,10 @@ impl WeightGroups {
                 let dst = unsafe { std::slice::from_raw_parts_mut(p.add(part.offset * elem), len) };
                 if source.write(g, i, self.dtype, dst)? {
                     bytes += len;
-                    // A diagnosis knob: `LLOOM_WG_SYNC=1` waits the queue out
-                    // after every host write (never on by default).
+                    // A diagnosis knob: `weights.groups.sync` waits the queue
+                    // out after every host write (never on by default).
                     #[cfg(feature = "metal")]
-                    if std::env::var("LLOOM_WG_SYNC").is_ok() {
+                    if crate::tuning::tuning().wg.sync {
                         if let Device::Metal(m) = &self.device {
                             m.wait_until_completed()?;
                         }
@@ -1143,11 +1143,11 @@ impl Drop for WeightGroups {
     }
 }
 
-/// `LLOOM_WG_TRACE=1` (read once): the tier and its loader narrate every
-/// request, wait and write on stderr. A diagnosis knob.
+/// `diagnostics.trace.weight_groups` (read once): the tier and its loader
+/// narrate every request, wait and write on stderr. A diagnosis knob.
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LLOOM_WG_TRACE").is_ok())
+    *ON.get_or_init(|| crate::tuning::tuning().wg.trace)
 }
 
 /// The non-blocking loader (§4.8): one thread, one shared event. A request

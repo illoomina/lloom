@@ -398,20 +398,42 @@ impl LogitsProcessor {
                  no position-keyed form; a window would advance it per rejected row"
             ),
         }
-        let keyed_was = self.position;
-        let mut ids = Vec::with_capacity(t);
-        for i in 0..t {
-            let row = rows.narrow(0, i, 1)?;
-            // Argmax needs no noise, so it needs no key; the sampled arms key
-            // every row to its own absolute position.
-            if !matches!(self.sampling, Sampling::ArgMax) {
-                self.position = Some(first_pos + i as u64);
+        // One draw for the whole window: the rows' noise is generated in
+        // parallel (each row's stream is its own position's and shares no
+        // state with another's), uploaded once, and reduced by one argmax
+        // over the last dimension with one readback — the per-row arithmetic
+        // of `gumbel_max_host_noise`, element for element.
+        let _ = t;
+        let ids = match self.sampling {
+            Sampling::ArgMax => rows.argmax(lloom_tensor::D::Minus1)?.to_vec1::<u32>()?,
+            Sampling::All { temperature } | Sampling::GumbelSoftmax { temperature } => {
+                use rayon::prelude::*;
+                let rows = rows.to_dtype(DType::F32)?;
+                let (t, vocab) = rows.dims2()?;
+                let seed = self.seed;
+                let mut g = vec![0f32; t * vocab];
+                g.par_chunks_mut(vocab)
+                    .enumerate()
+                    .for_each(|(i, row)| Self::fill_gumbel(seed, first_pos + i as u64, row));
+                let noise = Tensor::from_vec(g, (t, vocab), rows.device())?;
+                (rows + noise.affine(temperature, 0.0)?)?
+                    .argmax(lloom_tensor::D::Minus1)?
+                    .to_vec1::<u32>()?
             }
-            let drawn = self.draw_on_device(&row)?;
-            ids.push(drawn.flatten_all()?.to_vec1::<u32>()?[0]);
-        }
-        self.position = keyed_was;
+            _ => unreachable!("refused above"),
+        };
         Ok(ids)
+    }
+
+    /// Fill `out` with the Gumbel variates of `(seed, pos)`'s stream: the
+    /// position-keyed noise one draw at `pos` adds (`gumbel_variates`).
+    fn fill_gumbel(seed: u64, pos: u64, out: &mut [f32]) {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(Self::stream_key(seed, pos));
+        for g in out.iter_mut() {
+            let u: f64 = rng.random_range(1e-9..0.9999999);
+            *g = (-((-u.ln()).ln())) as f32;
+        }
     }
 
     fn draw_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
@@ -472,14 +494,13 @@ impl LogitsProcessor {
     /// sampled verify reproduce a sampled non-speculative decode at one seed
     /// (`design/docs/speculation.md` §10.2z-viii).
     fn gumbel_variates(&mut self, n: usize) -> Vec<f32> {
-        use rand::{Rng, SeedableRng};
+        use rand::Rng;
         let gumbel = |u: f64| (-((-u.ln()).ln())) as f32;
         match self.position {
             Some(pos) => {
-                let mut rng = rand::rngs::StdRng::seed_from_u64(Self::stream_key(self.seed, pos));
-                (0..n)
-                    .map(|_| gumbel(rng.random_range(1e-9..0.9999999)))
-                    .collect()
+                let mut g = vec![0f32; n];
+                Self::fill_gumbel(self.seed, pos, &mut g);
+                g
             }
             None => (0..n)
                 .map(|_| gumbel(self.rng.random_range(1e-9..0.9999999)))

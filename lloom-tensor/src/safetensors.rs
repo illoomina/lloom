@@ -837,9 +837,11 @@ mod tests {
         assert_eq!(resolve(None).unwrap(), MmapAdvice::WillNeed);
 
         // Unset and `none` must NOT agree: unset follows the default, `none`
-        // (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
-        // an explicit request to disable. A parser that clears `none` to
-        // "unset" makes `--mmap-advice none` run the advised default.
+        // is an explicit request to disable. A parser that clears `none` to
+        // "unset" makes `--mmap-advice none` run the advised default. The
+        // empty value (`CANDLE_MMAP_ADVICE=`) is neither: it is refused, as
+        // every typed key refuses it, so an unexpanded variable cannot pick
+        // either arm silently.
         assert_ne!(
             resolve(None).unwrap(),
             MmapAdvice::None,
@@ -850,7 +852,6 @@ mod tests {
         // no measurement can select.
         for (value, want) in [
             ("none", MmapAdvice::None),
-            ("", MmapAdvice::None),
             ("NONE", MmapAdvice::None),
             ("willneed", MmapAdvice::WillNeed),
             ("will_need", MmapAdvice::WillNeed),
@@ -874,6 +875,10 @@ mod tests {
         assert!(
             resolve(Some("wilneed")).is_err(),
             "a misspelled arm fell back to the default instead of failing"
+        );
+        assert!(
+            resolve(Some("")).is_err(),
+            "the empty value selected an arm instead of failing"
         );
         assert!(
             MmapAdvice::from_knob(Some("wilneed")).is_err(),

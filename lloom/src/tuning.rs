@@ -10,6 +10,7 @@
 //! changes.
 
 use lloom_macros::Options;
+use lloom_tensor::options::{non_empty, parse_arm, parse_count};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -33,18 +34,12 @@ pub fn install(t: Tuning) -> Result<(), Tuning> {
 }
 
 fn one_of(v: &str, what: &str, arms: &[&str]) -> Result<String, String> {
-    let s = v.trim().to_ascii_lowercase();
-    if arms.contains(&s.as_str()) {
-        Ok(s)
-    } else {
-        Err(format!("{what}: `{v}` is not one of {}", arms.join(", ")))
-    }
+    parse_arm(v, arms)
+        .map(str::to_string)
+        .map_err(|e| format!("{what}: {e}"))
 }
 fn parse_at_least_one(v: &str) -> Result<usize, String> {
-    let n: usize = v
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{v}` is not an integer"))?;
+    let n: usize = parse_count(v)?;
     if n == 0 {
         return Err("must be >= 1".into());
     }
@@ -58,27 +53,24 @@ fn parse_at_least_two(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 fn parse_spec_ahead(v: &str) -> Result<usize, String> {
-    match v.trim() {
-        "0" => Ok(0),
-        "1" => Ok(1),
+    match parse_count::<usize>(v).map_err(|e| format!("spec ahead: {e}"))? {
+        n @ (0 | 1) => Ok(n),
         other => Err(format!("spec ahead: `{other}` is not 0 or 1")),
     }
 }
 fn parse_flash_bn(v: &str) -> Result<usize, String> {
-    match v.trim() {
-        "8" => Ok(8),
-        "32" => Ok(32),
+    match parse_count::<usize>(v).map_err(|e| format!("flash partial bn: {e}"))? {
+        n @ (8 | 32) => Ok(n),
         other => Err(format!("flash partial bn: `{other}` is not 8 or 32")),
     }
 }
 fn parse_ctx_kv(v: &str) -> Result<String, String> {
-    if v.trim()
-        .eq_ignore_ascii_case(crate::models::lfm2_dspark::CtxKv::AUTO)
-    {
-        return Ok(crate::models::lfm2_dspark::CtxKv::AUTO.to_string());
+    let v = non_empty(v)?.to_ascii_lowercase();
+    if v == crate::models::lfm2_dspark::CtxKv::AUTO {
+        return Ok(v);
     }
-    crate::models::lfm2_dspark::CtxKv::parse(v)
-        .map(|_| v.trim().to_string())
+    crate::models::lfm2_dspark::CtxKv::parse(&v)
+        .map(|_| v.clone())
         .map_err(|e| e.to_string())
 }
 fn parse_hot_thread(v: &str) -> Result<String, String> {
@@ -95,10 +87,7 @@ fn parse_mem_check(v: &str) -> Result<String, String> {
     one_of(v, "mem check", &["off", "report", "refuse"])
 }
 fn parse_draft_loads(v: &str) -> Result<String, String> {
-    match v {
-        "auto" | "on" | "off" => Ok(v.to_string()),
-        _ => Err(format!("{v:?}: expected auto, on or off")),
-    }
+    one_of(v, "MTP draft loads", &["auto", "on", "off"])
 }
 
 fn parse_fusion_budget(v: &str) -> Result<String, String> {
@@ -107,7 +96,12 @@ fn parse_fusion_budget(v: &str) -> Result<String, String> {
 fn parse_mtp_experts(v: &str) -> Result<String, String> {
     one_of(v, "MTP experts", &["resident", "streamed"])
 }
+/// `none` is the family's own policy, as for the key it shares with LFM2's
+/// axis (`kernels.fusion.policy`, unset by default): `manual`.
 fn parse_fusion(v: &str) -> Result<String, String> {
+    if lloom_tensor::options::is_none(v) {
+        return Ok("manual".into());
+    }
     one_of(v, "fusion", &["manual", "derived"])
 }
 fn parse_verify_key(v: &str) -> Result<String, String> {
@@ -684,10 +678,11 @@ pub struct RingTuning {
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
-    crate::generation::hot_thread::parse_spawned_arm(v)
+    crate::generation::hot_thread::parse_spawned_arm(&non_empty(v)?.to_ascii_lowercase())
 }
 fn parse_poll(v: &str) -> Result<String, String> {
-    v.trim()
+    non_empty(v)?
+        .to_ascii_lowercase()
         .parse::<crate::nn::decode::FeedWait>()
         .map(|w| w.to_string())
 }

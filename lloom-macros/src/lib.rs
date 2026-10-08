@@ -477,7 +477,7 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                 let id = format!("{}.{}", struct_ident, ident);
                 quote! {
                     #[doc = #doc]
-                    #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL", #extra)]
+                    #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::lloom_tensor::options::parse_bool, value_name = "BOOL", #extra)]
                     pub #ident: Option<bool>,
                 }
             }
@@ -515,7 +515,7 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
             let flag = &attr.flag;
             quote! {
                 if let Some(raw) = &args.#ident {
-                    base.#ident = #parse_fn(raw)
+                    base.#ident = #parse_fn(&raw.trim().to_ascii_lowercase())
                         .map_err(|e| format!("--{}: {}", #flag, e))?;
                 }
             }
@@ -542,7 +542,8 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                     parser.parse().unwrap_or_else(|_| quote!(parse));
                 quote! {
                     #flag => {
-                        self.#ident = #parse_fn(value).map_err(|e| format!("--{}: {}", #flag, e))?;
+                        self.#ident = #parse_fn(&value.trim().to_ascii_lowercase())
+                            .map_err(|e| format!("--{}: {}", #flag, e))?;
                         Ok(())
                     }
                 }

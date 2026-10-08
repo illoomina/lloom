@@ -128,6 +128,12 @@ impl Key {
         out
     }
 
+    /// A merged key over a field that is unset by default (an axis) is
+    /// unset until one of its fields moves.
+    pub fn unset_by_default(&self) -> bool {
+        self.targets.len() > 1 && self.targets.iter().any(|t| t.default.is_null())
+    }
+
     fn map_like(&self) -> bool {
         self.meta().ty.contains("Map")
     }
@@ -348,6 +354,25 @@ impl Index {
         }
     }
 
+    /// The field a legacy dotted spelling writes; `None` for a key or an
+    /// unknown spelling.
+    pub fn storage_of(&self, spelling: &str) -> Option<&str> {
+        match self.spellings.get(spelling)? {
+            Spelling::Storage { storage, .. } => Some(storage),
+            Spelling::Key(_) => None,
+        }
+    }
+
+    /// The key a field (by storage path) belongs to.
+    pub fn key_of_storage(&self, storage: &str) -> Option<&Key> {
+        self.keys.values().find(|k| {
+            k.targets
+                .iter()
+                .chain(&k.legacy)
+                .any(|l| l.storage == storage)
+        })
+    }
+
     /// Every dotted spelling the index accepts.
     pub fn spellings(&self) -> impl Iterator<Item = &str> {
         self.spellings.keys().map(String::as_str)
@@ -396,6 +421,18 @@ impl Index {
                     };
                     return o.set(storage, s);
                 }
+                // `none` is `null` for a merged key that is unset by default
+                // (it renders `null` until a field moves): every field
+                // returns to its own default.
+                let null = Value::Null;
+                let value = match value {
+                    Value::String(s)
+                        if key.unset_by_default() && lloom_tensor::options::is_none(s) =>
+                    {
+                        &null
+                    }
+                    v => v,
+                };
                 for t in &key.targets {
                     once(&t.storage)?;
                     write_leaf(o, t, value, true)?;
@@ -546,11 +583,7 @@ impl Index {
             .collect();
         let moved: Vec<&Value> = vals.iter().filter(|(_, m)| *m).map(|(v, _)| v).collect();
         match moved.as_slice() {
-            // A merged key over a field whose default is "unset" (an axis:
-            // the preset's arm) is unset until one of its fields moves.
-            [] if key.targets.len() > 1 && key.targets.iter().any(|t| t.default.is_null()) => {
-                Value::Null
-            }
+            [] if key.unset_by_default() => Value::Null,
             [] => vals.first().map(|(v, _)| v.clone()).unwrap_or(Value::Null),
             [one] => (*one).clone(),
             many if many.iter().all(|v| *v == many[0]) => many[0].clone(),

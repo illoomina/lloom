@@ -21,7 +21,7 @@
 //! believes otherwise is the failure the whole knob exists to avoid); where a
 //! site used to fall back silently, this is a deliberate tightening.
 
-use crate::options::parse_bool;
+use crate::options::{is_none, non_empty, parse_arm, parse_count, parse_number};
 use lloom_macros::Options;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -189,10 +189,7 @@ pub fn installed() -> bool {
 }
 
 fn ranged(value: &str, what: &str, lo: usize, hi: usize) -> Result<usize, String> {
-    let n: usize = value
-        .trim()
-        .parse()
-        .map_err(|_| format!("{what}: `{value}` is not an integer"))?;
+    let n: usize = parse_count(value).map_err(|e| format!("{what}: {e}"))?;
     if !(lo..=hi).contains(&n) {
         return Err(format!("{what}: {n} is outside {lo}..={hi}"));
     }
@@ -205,8 +202,9 @@ fn parse_nsg(v: &str) -> Result<usize, String> {
 fn parse_nr0(v: &str) -> Result<usize, String> {
     ranged(v, "rows a simdgroup", 1, 4)
 }
+/// `0` is the rule's own choice, as `none` is.
 fn parse_opt_nr0_4(v: &str) -> Result<Option<usize>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v == "0" {
+    if is_none(v) || v.trim() == "0" {
         return Ok(None);
     }
     ranged(v, "rows a simdgroup", 1, 4).map(Some)
@@ -228,18 +226,27 @@ fn parse_pow2_align(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 fn one_of(v: &str, what: &str, arms: &[&str]) -> Result<String, String> {
-    let s = v.trim().to_ascii_lowercase();
-    if arms.contains(&s.as_str()) {
-        Ok(s)
-    } else {
-        Err(format!("{what}: `{v}` is not one of {}", arms.join(", ")))
-    }
+    parse_arm(v, arms)
+        .map(str::to_string)
+        .map_err(|e| format!("{what}: {e}"))
 }
+/// An optional enum: `none` unsets, anything else is `f`'s.
 fn optional(v: &str, f: impl Fn(&str) -> Result<String, String>) -> Result<Option<String>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+    if is_none(v) {
         Ok(None)
     } else {
         f(v).map(Some)
+    }
+}
+/// An optional comma list (a text): `none` or the empty list unsets.
+fn optional_list(
+    v: &str,
+    f: impl Fn(&str) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    if v.trim().is_empty() || is_none(v) {
+        Ok(None)
+    } else {
+        f(v.trim()).map(Some)
     }
 }
 fn parse_tile(v: &str) -> Result<Option<String>, String> {
@@ -252,12 +259,11 @@ fn parse_tile(v: &str) -> Result<Option<String>, String> {
     })
 }
 fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+    if is_none(v) {
         return Ok(None);
     }
-    match v.trim() {
-        "4" => Ok(Some(4)),
-        "8" => Ok(Some(8)),
+    match parse_count::<usize>(v).map_err(|e| format!("gemv bm: {e}"))? {
+        n @ (4 | 8) => Ok(Some(n)),
         other => Err(format!(
             "gemv bm: `{other}` is not 4 or 8 (the two instantiated decode tiles)"
         )),
@@ -267,14 +273,16 @@ fn parse_force_gemm(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "force gemm", &["m", "n", "both"]))
 }
 fn parse_cut_policy(v: &str) -> Result<String, String> {
+    let v = non_empty(v)?.to_ascii_lowercase();
     #[cfg(feature = "metal")]
-    crate::kernels::metal::commands::CutPolicy::from_env_str(v.trim())?;
-    Ok(v.trim().to_string())
+    crate::kernels::metal::commands::CutPolicy::from_env_str(&v)?;
+    Ok(v)
 }
 fn parse_completion_wait(v: &str) -> Result<String, String> {
+    let v = non_empty(v)?.to_ascii_lowercase();
     #[cfg(feature = "metal")]
-    crate::kernels::metal::completion::CompletionWait::from_str_arm(v.trim())?;
-    Ok(v.trim().to_string())
+    crate::kernels::metal::completion::CompletionWait::from_str_arm(&v)?;
+    Ok(v)
 }
 /// `backend.metal.completion_wait` in the key's spelling; a bare
 /// `shared-event-wait` is the timed wait at its default timeout.
@@ -290,53 +298,29 @@ fn completion_wait_to(s: &str) -> String {
 fn nodes_to_cut_policy(s: &str) -> String {
     format!("nodes:{s}")
 }
-/// `CANDLE_METAL_ENABLE_FAST_MATH`'s spellings: on for `true|t|yes|y|1`,
-/// off for `false|f|no|n|0|off`. Anything else was silently off before the
-/// variable joined the option tree and is refused now, since the two arms
-/// produce different digests.
-fn parse_fast_math(v: &str) -> Result<bool, String> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "true" | "t" | "yes" | "y" | "1" => Ok(true),
-        "false" | "f" | "no" | "n" | "0" | "off" => Ok(false),
-        other => Err(format!(
-            "fast math: `{other}` is not one of true, t, yes, y, 1 (on) or false, f, no, n, 0, off (off)"
-        )),
-    }
-}
-/// The legacy switch's spellings: `1|true` is the eager release, `0|false`
-/// keeps the evicted buffers resident; none = `pool.retain_evicted` decides.
-fn parse_eager_release(v: &str) -> Result<Option<bool>, String> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "" | "none" => Ok(None),
-        "1" | "true" => Ok(Some(true)),
-        "0" | "false" => Ok(Some(false)),
-        other => Err(format!(
-            "eager residency release: `{other}` is not 1, true, 0 or false"
-        )),
-    }
-}
 #[cfg(feature = "metal")]
 fn parse_metal_disable(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| {
+    optional_list(v, |s| {
         crate::kernels::metal::arms::Features::parse_list(s).map_err(|e| e.to_string())?;
-        Ok(s.trim().to_string())
+        Ok(s.to_string())
     })
 }
 #[cfg(not(feature = "metal"))]
 fn parse_metal_disable(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| Ok(s.trim().to_string()))
+    optional_list(v, |s| Ok(s.to_string()))
 }
 fn parse_cpu_disable(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| {
+    optional_list(v, |s| {
         crate::cpu::arms::Features::parse_list(s).map_err(|e| e.to_string())?;
-        Ok(s.trim().to_string())
+        Ok(s.to_string())
     })
 }
 fn parse_allow_emulated(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| {
+        let s = non_empty(s)?.to_ascii_lowercase();
         #[cfg(feature = "metal")]
-        crate::kernels::metal::arms::parse_allow_emulated(s)?;
-        Ok(s.trim().to_string())
+        crate::kernels::metal::arms::parse_allow_emulated(&s)?;
+        Ok(s)
     })
 }
 fn parse_eviction(v: &str) -> Result<String, String> {
@@ -349,41 +333,35 @@ fn parse_eviction(v: &str) -> Result<String, String> {
 fn parse_hazard_key(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "hazard key", &["range", "pointer", "ptr"]))
 }
-/// `none` (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
-/// kept as `"none"`, not cleared: unset takes the default, which is an advised
-/// arm, so clearing would turn a request to disable into the default.
+/// `none` is the arm that advises nothing, kept as `"none"` rather than
+/// cleared: unset takes the default, an advised arm.
 fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
-    let v = v.trim();
-    if v.is_empty() || v.eq_ignore_ascii_case("none") {
-        return Ok(Some("none".to_string()));
-    }
     one_of(
         v,
         "mmap advice",
-        &["willneed", "will_need", "sequential", "seq"],
+        &["none", "willneed", "will_need", "sequential", "seq"],
     )
     .map(Some)
 }
 fn parse_profile(v: &str) -> Result<String, String> {
+    non_empty(v)?;
     Contract::parse(v).map(|c| c.name().to_string())
 }
 fn parse_dequant_gemm(v: &str) -> Result<String, String> {
     one_of(v, "dequant gemm", &["qmm", "steel"])
 }
 fn parse_pair_order(v: &str) -> Result<String, String> {
+    non_empty(v)?;
     crate::quantized::PairOrder::parse(v).map(|o| o.name().to_string())
 }
 fn parse_icb_residency(v: &str) -> Result<String, String> {
     one_of(v, "icb residency", &["per-run", "plan-wide"])
 }
 fn parse_oversize_bound(v: &str) -> Result<Option<f64>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+    if is_none(v) {
         return Ok(None);
     }
-    let f: f64 = v
-        .trim()
-        .parse()
-        .map_err(|_| format!("reuse oversize bound: `{v}` is not a number"))?;
+    let f = parse_number(v).map_err(|e| format!("reuse oversize bound: {e}"))?;
     if !(f >= 1.0) {
         return Err(format!("reuse oversize bound {f} must be >= 1.0"));
     }
@@ -395,7 +373,7 @@ fn parse_cflags(v: &str) -> Result<Option<String>, String> {
         // (`LLOOM_434_METAL_CFLAGS=$UNSET`); refused, as the site did.
         return Err("metal cflags: set but empty — unset it for the default arm".into());
     }
-    if v.eq_ignore_ascii_case("none") {
+    if is_none(v) {
         return Ok(None);
     }
     Ok(Some(v.to_string()))
@@ -777,13 +755,13 @@ pub struct MetalTuning {
     #[opt(
         flag = "metal-fast-math",
         env = "CANDLE_METAL_ENABLE_FAST_MATH",
-        parser = "parse_fast_math",
+        bool,
         path = "backend.metal.compiler.fast_math",
         status = "advanced"
     )]
     pub fast_math: bool,
     /// The legacy residency switch, honoured so an old script selects the arm it names: `true` releases an evicted buffer's residency at once, `false` keeps it resident; none = `backend.pool.retain_evicted` decides.
-    #[opt(flag = "eager-residency-release", env = "CANDLE_METAL_EAGER_RESIDENCY_RELEASE", parser = "parse_eager_release", path = "backend.metal.eager_residency_release", status = "arm", facets = ["liveness"], flows = ["memory-return"])]
+    #[opt(flag = "eager-residency-release", env = "CANDLE_METAL_EAGER_RESIDENCY_RELEASE", bool, path = "backend.metal.eager_residency_release", status = "arm", facets = ["liveness"], flows = ["memory-return"])]
     pub eager_residency_release: Option<bool>,
     /// Withdraw these device features (a comma list) from the device's set, so the arms that need them are refused: a reference switch.
     #[opt(
@@ -1090,14 +1068,6 @@ pub struct Tuning {
     pub cpu: CpuTuning,
 }
 
-impl Tuning {
-    /// The bool spelling every env alias accepts, for the sites that still
-    /// read one variable of their own.
-    pub fn bool_env(name: &str) -> Option<bool> {
-        std::env::var(name).ok().and_then(|v| parse_bool(&v).ok())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,7 +1129,11 @@ mod tests {
         t.set("metal.completion_wait", "shared-event-wait:5")
             .unwrap();
         t.set("pool.reuse_oversize_bound", "1.5").unwrap();
-        t.set("pool.reuse_oversize_bound", "off").unwrap();
+        assert!(
+            t.set("pool.reuse_oversize_bound", "off").is_err(),
+            "`none` unsets an optional key; `off` is not a number"
+        );
+        t.set("pool.reuse_oversize_bound", "none").unwrap();
         assert_eq!(t.pool.reuse_oversize_bound, None);
         assert_eq!(t.gemm.tile.as_deref(), Some("64x64"));
         t.set("metal.allow_emulated", "bf16").unwrap();

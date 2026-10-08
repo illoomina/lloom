@@ -199,12 +199,74 @@ pub fn heading(path: &str) -> &'static str {
         .unwrap_or("Options")
 }
 
-/// The bool spellings every front-end accepts (`1|true|yes|on` / `0|false|no|off`).
+// ---- the value grammar --------------------------------------------------------
+//
+// One grammar per value type, the same for every flag, dotted key, JSON value
+// and env name: a site parses through these, so a spelling means one thing
+// wherever it is written. Surrounding whitespace is not part of a typed value,
+// and an empty typed value is refused rather than read as unset: an unexpanded
+// shell variable must not select the default arm silently.
+
+/// The spellings that mean `true`, any ASCII case.
+pub const TRUE_SPELLINGS: &[&str] = &["true", "t", "yes", "y", "1", "on"];
+/// The spellings that mean `false`, any ASCII case.
+pub const FALSE_SPELLINGS: &[&str] = &["false", "f", "no", "n", "0", "off"];
+
+/// A bool: one of [`TRUE_SPELLINGS`] or [`FALSE_SPELLINGS`], any case.
+/// Anything else, the empty value included, is refused.
 pub fn parse_bool(value: &str) -> Result<bool, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(format!("`{other}` is not a bool (1/true/yes/on or 0/false/no/off)")),
+    let v = value.trim();
+    if TRUE_SPELLINGS.iter().any(|s| s.eq_ignore_ascii_case(v)) {
+        Ok(true)
+    } else if FALSE_SPELLINGS.iter().any(|s| s.eq_ignore_ascii_case(v)) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "`{value}` is not a bool ({} or {})",
+            TRUE_SPELLINGS.join("|"),
+            FALSE_SPELLINGS.join("|")
+        ))
+    }
+}
+
+/// `none`, any case: the spelling that unsets an optional key (JSON's
+/// `null` is the other).
+pub fn is_none(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("none")
+}
+
+/// The value without its surrounding whitespace; the empty value refused.
+pub fn non_empty(value: &str) -> Result<&str, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        Err("an empty value is refused (`none` unsets an optional key)".into())
+    } else {
+        Ok(v)
+    }
+}
+
+/// An arm of an enum: one of `arms`, any case; the arm as declared.
+pub fn parse_arm<'a>(value: &str, arms: &[&'a str]) -> Result<&'a str, String> {
+    let v = non_empty(value)?;
+    arms.iter()
+        .find(|a| a.eq_ignore_ascii_case(v))
+        .copied()
+        .ok_or_else(|| format!("`{value}` is not one of {}", arms.join(", ")))
+}
+
+/// A count: an unsigned decimal integer.
+pub fn parse_count<T: std::str::FromStr>(value: &str) -> Result<T, String> {
+    let v = non_empty(value)?;
+    v.parse::<T>()
+        .map_err(|_| format!("`{value}` is not a count (an unsigned integer)"))
+}
+
+/// A number: decimal (`0.7`, `1e-3`) and finite.
+pub fn parse_number(value: &str) -> Result<f64, String> {
+    let v = non_empty(value)?;
+    match v.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(f),
+        _ => Err(format!("`{value}` is not a finite number")),
     }
 }
 
@@ -301,11 +363,15 @@ macro_rules! serde_via_str {
 /// the keys whose vocabulary moved to a shared type (`Wait`, `ThreadQos`).
 /// Each `*_from` takes either vocabulary and returns the stored spelling (a
 /// stored spelling passes through, for its field's parser to check); each
-/// `*_to` renders a stored spelling in the key's.
+/// `*_to` renders a stored spelling in the key's. An arm is matched in any
+/// case, and a duration's unit too, as every enum and duration is (the value
+/// grammar above).
 pub mod v1 {
-    /// A `Duration` (`50us`, `1ms`, `2s`) in microseconds.
+
+    /// A `Duration` (`50us`, `1ms`, `2s`, the unit any case) in microseconds.
     pub fn duration_us(s: &str) -> Result<u64, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         let (digits, scale) = if let Some(d) = s.strip_suffix("us") {
             (d, 1)
         } else if let Some(d) = s.strip_suffix("ms") {
@@ -356,7 +422,8 @@ pub mod v1 {
 
     /// `decode.readback.wait`: `sleep:<dur>` is stored `sleep:<µs>`.
     pub fn poll_from(s: &str) -> Result<String, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         match split(s) {
             ("sleep", rest) => with_us("sleep", rest),
             _ => Ok(s.to_string()),
@@ -373,7 +440,8 @@ pub mod v1 {
     /// `decode.host_feed.wait`: `adaptive` is stored `on-demand`, durations
     /// in µs.
     pub fn feed_wait_from(s: &str) -> Result<String, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         match split(s) {
             ("adaptive", rest) | ("on-demand", rest) => with_us("on-demand", rest),
             ("event", rest) => with_us("event", rest),
@@ -396,7 +464,8 @@ pub mod v1 {
     /// and `event-listener` their shared-event arms. `bare_wait_ms` is the
     /// timed wait's default, which a bare `shared-event-wait` renders as.
     pub fn completion_wait_from(s: &str) -> Result<String, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         let ms = |arm: &str, d: &str| -> Result<String, String> {
             if is_count(d) {
                 Ok(format!("{arm}:{d}"))
@@ -431,7 +500,8 @@ pub mod v1 {
 
     /// `weights.experts.fetch.wait`: `sleep:<dur>` is stored as the µs count.
     pub fn fetch_wait_from(s: &str) -> Result<String, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         match split(s) {
             ("sleep", None) => Ok("50".into()),
             ("sleep", Some(d)) if is_count(d) => Ok(d.to_string()),
@@ -450,7 +520,8 @@ pub mod v1 {
 
     /// `decode.thread_qos`: `user-interactive` is stored `interactive`.
     pub fn hot_thread_from(s: &str) -> Result<String, String> {
-        let s = s.trim();
+        let lower = s.trim().to_ascii_lowercase();
+        let s = lower.as_str();
         Ok(match s {
             "user-interactive" => "interactive".into(),
             other => other.to_string(),

@@ -567,11 +567,40 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         if params.max_tokens != 1 {
             return Err(bad("logprobs is supported for max_tokens = 1 only"));
         }
+        // The decision scoring: `options` (strings), each scored by the
+        // log-probability of its first token under the same forward — a
+        // decision model's (JEV, clef) one-forward choice. An option is a
+        // token or the tokens it encodes to, scored at its first.
+        let options: Vec<String> = match v.get("options") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => {
+                let mut out = Vec::with_capacity(a.len());
+                for o in a {
+                    match o.as_str() {
+                        Some(s) if !s.is_empty() => out.push(s.to_string()),
+                        _ => return Err(bad("options: every option is a non-empty string")),
+                    }
+                }
+                if out.len() < 2 {
+                    return Err(bad("options: a decision takes at least two"));
+                }
+                out
+            }
+            Some(_) => return Err(bad("options: an array of strings")),
+        };
         // One forward: the argmax is the token, and its distribution is the
-        // logprobs block. Temperature does not apply on this path.
+        // logprobs block. Temperature does not apply on this path. With
+        // options the whole distribution comes back, so each option's first
+        // token is scored wherever it ranks.
         let engine = shared.engine.as_ref();
         let started = Instant::now();
-        let (argmax, top) = engine.next_token_logprobs(&prompt_ids, top_k)?;
+        let want = if options.is_empty() {
+            top_k
+        } else {
+            usize::MAX
+        };
+        let (argmax, all) = engine.next_token_logprobs(&prompt_ids, want)?;
+        let top = &all[..top_k.min(all.len())];
         let content = engine.token_str(argmax);
         let token_lp = top
             .iter()
@@ -582,9 +611,56 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             .iter()
             .map(|(t, lp)| json!({ "token": engine.token_str(*t), "logprob": lp }))
             .collect();
+        let decision = if options.is_empty() {
+            Value::Null
+        } else {
+            let mut scored = Vec::with_capacity(options.len());
+            let mut best: Option<(usize, f32)> = None;
+            for (i, text) in options.iter().enumerate() {
+                let ids = engine.encode(text, false)?;
+                let Some(&first) = ids.first() else {
+                    return Err(bad(format!("options[{i}] encodes to no token")));
+                };
+                let (rank, lp) = all
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (t, _))| *t == first)
+                    .map(|(r, (_, lp))| (r, *lp))
+                    .unwrap_or((all.len(), f32::NEG_INFINITY));
+                if best.is_none_or(|(_, b)| lp > b) {
+                    best = Some((i, lp));
+                }
+                scored.push(json!({
+                    "text": text,
+                    "token": engine.token_str(first),
+                    "token_id": first,
+                    "tokens": ids.len(),
+                    "logprob": lp,
+                    "rank": rank,
+                }));
+            }
+            let firsts: Vec<u64> = scored
+                .iter()
+                .map(|o| o["token_id"].as_u64().unwrap_or(0))
+                .collect();
+            let mut ambiguous: Vec<usize> = Vec::new();
+            for (i, t) in firsts.iter().enumerate() {
+                if firsts.iter().enumerate().any(|(j, u)| j != i && u == t) {
+                    ambiguous.push(i);
+                }
+            }
+            let (choice, _) = best.expect("at least two options");
+            json!({
+                "choice": choice,
+                "text": options[choice],
+                "options": scored,
+                "ambiguous": ambiguous,
+            })
+        };
         eprintln!(
-            "[/v1/chat/completions logprobs: prompt_tokens={} top_logprobs={top_k} {:.1} ms]",
+            "[/v1/chat/completions logprobs: prompt_tokens={} top_logprobs={top_k} options={} {:.1} ms]",
             prompt_ids.len(),
+            options.len(),
             ms(started.elapsed())
         );
         return Ok(Reply::Json(json!({
@@ -600,6 +676,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                     "logprob": token_lp,
                     "top_logprobs": top_entries,
                 }] },
+                "decision": decision,
                 "finish_reason": "length",
             }],
             "usage": usage(prompt_ids.len(), 1),
@@ -813,6 +890,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         eos_ids,
         stop_strings,
         readback,
+        logits_digest: false,
         prefill_tile: shared.engine.prefill_tile(),
         thinking: None,
     })
@@ -899,10 +977,8 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             format!("data: {chunk}\n\n")
         }
     };
-    let sw = StreamWriter::start_with_deltas(
-        ChunkedWriter::start(request, "text/event-stream")?,
-        wrap,
-    );
+    let sw =
+        StreamWriter::start_with_deltas(ChunkedWriter::start(request, "text/event-stream")?, wrap);
     if let StreamKind::Chat = run.kind {
         sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
@@ -1372,6 +1448,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             eos_ids: engine.eos_ids().to_vec(),
                             stop_strings: Vec::new(),
                             readback: engine.readback(),
+                            logits_digest: false,
                             prefill_tile: engine.prefill_tile(),
                             thinking: None,
                         };
@@ -1631,7 +1708,8 @@ impl StreamWriter {
                 let next = if buf.is_some() {
                     rx.recv_timeout(DRAIN_PERIOD)
                 } else {
-                    rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    rx.recv()
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
                 };
                 match next {
                     Ok(payload) => write(&mut w, &payload, &mut err),

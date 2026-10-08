@@ -431,7 +431,8 @@ impl ReadbackStrategy for Blocking {
         // other arms are host draws by construction (a sort, a multinomial),
         // so they read the id and upload it as they always did.
         self.forcing_before = self.forcing.as_ref().map(HostForcing::mark);
-        if self.forcing.is_none() && *sampler.sampling() == Sampling::ArgMax {
+        // A digesting sampler reads the logits back anyway: the host draw.
+        if self.forcing.is_none() && *sampler.sampling() == Sampling::ArgMax && !sampler.digests() {
             if let Some((draw, id)) = sampler.draw_and_read(logits)? {
                 self.ids.push(id);
                 self.last = Some(id);

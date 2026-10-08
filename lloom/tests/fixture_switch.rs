@@ -10,7 +10,12 @@ const CHILD: &str = "LLOOM_FIXTURE_SWITCH_CHILD";
 
 fn child(value: Option<&str>, want: &str) -> bool {
     let mut c = Command::new(std::env::current_exe().expect("the test binary"));
-    c.args(["the_switch_names_the_backend", "--exact", "--nocapture"])
+    // The harness names this thread after the test, module path included,
+    // so the child filter is right whether this file is its own binary or a
+    // module of `tests/main.rs`.
+    let me = std::thread::current();
+    let name = me.name().expect("a test harness thread").to_string();
+    c.args([name.as_str(), "--exact", "--nocapture"])
         .env(CHILD, want);
     match value {
         Some(v) => c.env(SWITCH, v),

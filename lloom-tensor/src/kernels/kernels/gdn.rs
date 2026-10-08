@@ -9,6 +9,22 @@ use crate::kernels::{
 };
 use objc2_metal::MTLSize;
 
+/// The kernel `base` at the output gate: `sigmoid(z)` (`_f32`) or `silu(z)`
+/// (`_silu_f32`, Qwen3.5's `output_gate_type: swish`). The gate is the
+/// block's (`lloom::nn::gdn::OutGate`); the kernels are instantiated per
+/// gate. A static name: no allocation per dispatch.
+fn gated_kernel(base: &str, silu_gate: bool) -> &'static str {
+    match (base, silu_gate) {
+        ("gdn_gated_norm", false) => "gdn_gated_norm_f32",
+        ("gdn_gated_norm", true) => "gdn_gated_norm_silu_f32",
+        ("gdn_gated_norm_rows", false) => "gdn_gated_norm_rows_f32",
+        ("gdn_gated_norm_rows", true) => "gdn_gated_norm_rows_silu_f32",
+        ("gdn_chunk_epilogue", false) => "gdn_chunk_epilogue_f32",
+        ("gdn_chunk_epilogue", true) => "gdn_chunk_epilogue_silu_f32",
+        _ => unreachable!("no gated kernel named {base}"),
+    }
+}
+
 /// `(I + A)⁻¹` for `batch` strictly-lower `[n, n]` f32 matrices at `a`, into
 /// `out` (`batch · n · n` f32, contiguous). One threadgroup of `min(n, max)`
 /// threads per matrix.
@@ -206,8 +222,13 @@ pub fn call_gdn_gated_norm(
     gamma: BufferOffset,
     z: BufferOffset,
     out: &Buffer,
+    silu_gate: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_gated_norm_f32")?;
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Gdn,
+        gated_kernel("gdn_gated_norm", silu_gate),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -482,8 +503,13 @@ pub fn call_gdn_chunk_epilogue(
     gamma: BufferOffset,
     z: BufferOffset,
     out: &Buffer,
+    silu_gate: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_chunk_epilogue_f32")?;
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Gdn,
+        gated_kernel("gdn_chunk_epilogue", silu_gate),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -747,8 +773,13 @@ pub fn call_gdn_gated_norm_rows(
     gamma: BufferOffset,
     z: BufferOffset,
     out: &Buffer,
+    silu_gate: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_gated_norm_rows_f32")?;
+    let pipeline = kernels.load_pipeline(
+        device,
+        Source::Gdn,
+        gated_kernel("gdn_gated_norm_rows", silu_gate),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

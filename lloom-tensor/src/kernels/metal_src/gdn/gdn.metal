@@ -296,22 +296,32 @@ static inline void gdn_step_column_reg(
 GDN_STEP_REG(16)
 GDN_STEP_REG(32)
 
-// `out[h·d + i] = rmsnorm_d(o[h, ·])[i] · γ[i] · sigmoid(z[h·d + i])` — the
+// The output gate of the gated RMS norm: `sigmoid(z)` (Qwen4-exp) or
+// `silu(z)` (Qwen3.5, `output_gate_type: swish`). One body per kernel,
+// instantiated per gate; the gate is the block's (`GdnGate`).
+template <bool SILU>
+METAL_FUNC float gdn_out_gate(float z) {
+  const float sg = 1.0f / (1.0f + metal::exp(-z));
+  return SILU ? z * sg : sg;
+}
+
+// `out[h·d + i] = rmsnorm_d(o[h, ·])[i] · γ[i] · gate(z[h·d + i])` — the
 // gated RMS norm over each value head, scaled by the output gate. One
 // threadgroup per head, `d` threads.
-kernel void gdn_gated_norm_f32(
-    const device float* o [[buffer(0)]],
-    const device float* gamma [[buffer(1)]],
-    const device float* z [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& d [[buffer(4)]],
-    constant float& eps [[buffer(5)]],
-    uint h [[threadgroup_position_in_grid]],
-    uint i [[thread_position_in_threadgroup]],
-    uint width [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[32];
+template <bool SILU>
+METAL_FUNC void gdn_gated_norm_body(
+    const device float* o,
+    const device float* gamma,
+    const device float* z,
+    device float* out,
+    uint d,
+    float eps,
+    uint h,
+    uint i,
+    uint width,
+    uint simd_lane,
+    uint simd_id,
+    threadgroup float* partial) {
   const size_t idx = (size_t)h * d + i;
   const float x = (i < d) ? o[idx] : 0.0f;
   float ss = simd_sum(x * x);
@@ -322,10 +332,29 @@ kernel void gdn_gated_norm_f32(
   for (uint sidx = 0; sidx < n_simd; sidx++) total += partial[sidx];
   if (i < d) {
     const float scale = 1.0f / metal::sqrt(total / (float)d + eps);
-    const float sg = 1.0f / (1.0f + metal::exp(-z[idx]));
-    out[idx] = x * scale * gamma[i] * sg;
+    out[idx] = x * scale * gamma[i] * gdn_out_gate<SILU>(z[idx]);
   }
 }
+
+#define GDN_GATED_NORM(NAME, SILU)                                                  \
+  kernel void NAME(                                                                 \
+      const device float* o [[buffer(0)]],                                          \
+      const device float* gamma [[buffer(1)]],                                      \
+      const device float* z [[buffer(2)]],                                          \
+      device float* out [[buffer(3)]],                                              \
+      constant uint& d [[buffer(4)]],                                               \
+      constant float& eps [[buffer(5)]],                                            \
+      uint h [[threadgroup_position_in_grid]],                                      \
+      uint i [[thread_position_in_threadgroup]],                                    \
+      uint width [[threads_per_threadgroup]],                                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                                 \
+      uint simd_id [[simdgroup_index_in_threadgroup]]) {                            \
+    threadgroup float partial[32];                                                  \
+    gdn_gated_norm_body<SILU>(o, gamma, z, out, d, eps, h, i, width, simd_lane,     \
+                              simd_id, partial);                                    \
+  }
+GDN_GATED_NORM(gdn_gated_norm_f32, false)
+GDN_GATED_NORM(gdn_gated_norm_silu_f32, true)
 
 // ---- Chunked prefill ------------------------------------------------------------
 
@@ -484,25 +513,26 @@ kernel void gdn_chunk_scale_f32(
 }
 
 // The chunks' outputs `o [h_v, padded, d]` (head-first) → the gated RMS norm
-// per (position, head) × γ × sigmoid(z) → `[seq, h_v·d]`. One threadgroup
+// per (position, head) × γ × gate(z) → `[seq, h_v·d]`. One threadgroup
 // per (head, position), `d` threads.
-kernel void gdn_chunk_epilogue_f32(
-    const device float* o [[buffer(0)]],
-    const device float* gamma [[buffer(1)]],
-    const device float* z [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& padded [[buffer(4)]],
-    constant uint& d [[buffer(5)]],
-    constant uint& h_v [[buffer(6)]],
-    constant float& eps [[buffer(7)]],
-    uint2 gid [[threadgroup_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]],
-    uint2 tptg [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+template <bool SILU>
+METAL_FUNC void gdn_chunk_epilogue_body(
+    const device float* o,
+    const device float* gamma,
+    const device float* z,
+    device float* out,
+    uint padded,
+    uint d,
+    uint h_v,
+    float eps,
+    uint2 gid,
+    uint2 tid,
+    uint2 tptg,
+    uint simd_lane,
+    uint simd_id,
+    threadgroup float* partial) {
   const uint i = tid.x;
   const uint width = tptg.x;
-  threadgroup float partial[32];
   const uint h = gid.x;
   const uint p = gid.y;
   const float x = (i < d) ? o[((size_t)h * padded + p) * d + i] : 0.0f;
@@ -515,10 +545,31 @@ kernel void gdn_chunk_epilogue_f32(
   if (i < d) {
     const float scale = 1.0f / metal::sqrt(total / (float)d + eps);
     const size_t oi = ((size_t)p * h_v + h) * d + i;
-    const float sg = 1.0f / (1.0f + metal::exp(-z[oi]));
-    out[oi] = x * scale * gamma[i] * sg;
+    out[oi] = x * scale * gamma[i] * gdn_out_gate<SILU>(z[oi]);
   }
 }
+
+#define GDN_CHUNK_EPILOGUE(NAME, SILU)                                              \
+  kernel void NAME(                                                                 \
+      const device float* o [[buffer(0)]],                                          \
+      const device float* gamma [[buffer(1)]],                                      \
+      const device float* z [[buffer(2)]],                                          \
+      device float* out [[buffer(3)]],                                              \
+      constant uint& padded [[buffer(4)]],                                          \
+      constant uint& d [[buffer(5)]],                                               \
+      constant uint& h_v [[buffer(6)]],                                             \
+      constant float& eps [[buffer(7)]],                                            \
+      uint2 gid [[threadgroup_position_in_grid]],                                   \
+      uint2 tid [[thread_position_in_threadgroup]],                                 \
+      uint2 tptg [[threads_per_threadgroup]],                                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                                 \
+      uint simd_id [[simdgroup_index_in_threadgroup]]) {                            \
+    threadgroup float partial[32];                                                  \
+    gdn_chunk_epilogue_body<SILU>(o, gamma, z, out, padded, d, h_v, eps, gid, tid,  \
+                                  tptg, simd_lane, simd_id, partial);               \
+  }
+GDN_CHUNK_EPILOGUE(gdn_chunk_epilogue_f32, false)
+GDN_CHUNK_EPILOGUE(gdn_chunk_epilogue_silu_f32, true)
 
 // ---- Decode over the rows of one state pool, and over the positions of one row ----
 
@@ -791,20 +842,21 @@ GDN_STEP_ROWS_SEQ(32, _r32)
 
 // `gdn_gated_norm_f32` over `B` rows: `o [B, h_v, d]`, `z [B, h_v·d]` →
 // `[B, h_v·d]`. Grid: h_v × B threadgroups.
-kernel void gdn_gated_norm_rows_f32(
-    const device float* o [[buffer(0)]],
-    const device float* gamma [[buffer(1)]],
-    const device float* z [[buffer(2)]],
-    device float* out [[buffer(3)]],
-    constant uint& d [[buffer(4)]],
-    constant uint& h_v [[buffer(5)]],
-    constant float& eps [[buffer(6)]],
-    uint2 gid [[threadgroup_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]],
-    uint2 tptg [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[32];
+template <bool SILU>
+METAL_FUNC void gdn_gated_norm_rows_body(
+    const device float* o,
+    const device float* gamma,
+    const device float* z,
+    device float* out,
+    uint d,
+    uint h_v,
+    float eps,
+    uint2 gid,
+    uint2 tid,
+    uint2 tptg,
+    uint simd_lane,
+    uint simd_id,
+    threadgroup float* partial) {
   const uint h = gid.x;
   const uint b = gid.y;
   const uint i = tid.x;
@@ -819,10 +871,30 @@ kernel void gdn_gated_norm_rows_f32(
   for (uint sidx = 0; sidx < n_simd; sidx++) total += partial[sidx];
   if (i < d) {
     const float scale = 1.0f / metal::sqrt(total / (float)d + eps);
-    const float sg = 1.0f / (1.0f + metal::exp(-z[idx]));
-    out[idx] = x * scale * gamma[i] * sg;
+    out[idx] = x * scale * gamma[i] * gdn_out_gate<SILU>(z[idx]);
   }
 }
+
+#define GDN_GATED_NORM_ROWS(NAME, SILU)                                             \
+  kernel void NAME(                                                                 \
+      const device float* o [[buffer(0)]],                                          \
+      const device float* gamma [[buffer(1)]],                                      \
+      const device float* z [[buffer(2)]],                                          \
+      device float* out [[buffer(3)]],                                              \
+      constant uint& d [[buffer(4)]],                                               \
+      constant uint& h_v [[buffer(5)]],                                             \
+      constant float& eps [[buffer(6)]],                                            \
+      uint2 gid [[threadgroup_position_in_grid]],                                   \
+      uint2 tid [[thread_position_in_threadgroup]],                                 \
+      uint2 tptg [[threads_per_threadgroup]],                                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                                 \
+      uint simd_id [[simdgroup_index_in_threadgroup]]) {                            \
+    threadgroup float partial[32];                                                  \
+    gdn_gated_norm_rows_body<SILU>(o, gamma, z, out, d, h_v, eps, gid, tid, tptg,   \
+                                   simd_lane, simd_id, partial);                    \
+  }
+GDN_GATED_NORM_ROWS(gdn_gated_norm_rows_f32, false)
+GDN_GATED_NORM_ROWS(gdn_gated_norm_rows_silu_f32, true)
 
 // ---- The chunk scan: the inter-chunk recurrence as one launch --------------------
 //

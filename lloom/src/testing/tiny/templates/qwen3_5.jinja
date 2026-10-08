@@ -1,0 +1,93 @@
+{#- The tiny Qwen3.5 models' chat template: lloom's own, not a
+    checkpoint's. It renders the turn tokens of Qwen3.6's template in the
+    same order on every path the engine drives on this family: a system
+    turn, user and assistant turns, thinking kept on the last reply (and
+    everywhere with preserve_thinking), tool calls and results as the
+    checkpoint's template carries them, the generation prompt with an open
+    <think> block unless thinking is off. The prose is its own. -#}
+
+{%- macro text(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content -%}
+        {%- for part in content -%}
+            {%- if part.type == "text" -%}
+                {{- part.text -}}
+            {%- else -%}
+                {{- raise_exception("tiny qwen3_5 template: no content part of type " ~ part.type) -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- set system = "" -%}
+{%- set has_system = messages and messages[0].role == "system" -%}
+{%- if has_system -%}
+    {%- set system = text(messages[0].content) | trim -%}
+{%- endif -%}
+{%- if tools -%}
+    {{- "<|im_start|>system\n" ~ "Callable tools, one JSON object each:\n" ~ (tools | tojson) -}}
+    {{- "\n\nTo call one, answer <tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>\n</function>\n</tool_call> and stop there; several calls are several <tool_call>...</tool_call> blocks." -}}
+    {{- ("\n\n" ~ system if system else "") ~ "<|im_end|>\n" -}}
+{%- elif has_system -%}
+    {{- "<|im_start|>system\n" ~ system ~ "<|im_end|>\n" -}}
+{%- endif -%}
+
+{%- set chat = namespace(last_user=-1) -%}
+{%- for turn in messages -%}
+    {%- if turn.role == "user" -%}
+        {%- set chat.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if chat.last_user < 0 -%}
+    {{- raise_exception("tiny qwen3_5 template: the conversation has no user message") -}}
+{%- endif -%}
+
+{%- for turn in messages -%}
+    {%- set body = text(turn.content) | trim -%}
+    {%- if turn.role == "system" -%}
+        {%- if not loop.first -%}
+            {{- raise_exception("tiny qwen3_5 template: a system message must come first") -}}
+        {%- endif -%}
+    {%- elif turn.role == "user" -%}
+        {{- "<|im_start|>user\n" ~ body ~ "<|im_end|>\n" -}}
+    {%- elif turn.role == "assistant" -%}
+        {{- "<|im_start|>assistant\n" -}}
+        {%- set reasoning = turn.reasoning_content if turn.reasoning_content is string else "" -%}
+        {%- if "</think>" in body -%}
+            {%- set reasoning = body.split("</think>")[0].split("<think>")[-1] | trim -%}
+            {%- set body = body.split("</think>")[-1] | trim -%}
+        {%- endif -%}
+        {%- if (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > chat.last_user -%}
+            {{- "<think>\n" ~ reasoning | trim ~ "\n</think>\n\n" -}}
+        {%- endif -%}
+        {{- body -}}
+        {%- for call in turn.tool_calls or [] -%}
+            {%- set fn = call.function or call -%}
+            {{- ("\n\n" if body and loop.first else ("\n" if not loop.first else "")) ~ "<tool_call>\n<function=" ~ fn.name ~ ">\n" -}}
+            {%- if fn.arguments is string -%}
+                {{- fn.arguments ~ "\n" -}}
+            {%- else -%}
+                {%- for name, value in (fn.arguments or {}) | items -%}
+                    {{- "<parameter=" ~ name ~ ">\n" ~ (value if value is string else value | tojson) ~ "\n</parameter>\n" -}}
+                {%- endfor -%}
+            {%- endif -%}
+            {{- "</function>\n</tool_call>" -}}
+        {%- endfor -%}
+        {{- "<|im_end|>\n" -}}
+    {%- elif turn.role == "tool" -%}
+        {%- if loop.first or loop.previtem.role != "tool" -%}
+            {{- "<|im_start|>user" -}}
+        {%- endif -%}
+        {{- "\n<tool_response>\n" ~ body ~ "\n</tool_response>" -}}
+        {%- if loop.last or loop.nextitem.role != "tool" -%}
+            {{- "<|im_end|>\n" -}}
+        {%- endif -%}
+    {%- else -%}
+        {{- raise_exception("tiny qwen3_5 template: no role " ~ turn.role) -}}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- "<|im_start|>assistant\n" ~ ("<think>\n\n</think>\n\n" if enable_thinking is defined and enable_thinking is false else "<think>\n") -}}
+{%- endif -%}

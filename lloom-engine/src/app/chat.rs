@@ -432,6 +432,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         }
         let mut params =
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        params.logits_digest = options.decode.logits_digest;
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
             params.thinking =
@@ -485,7 +486,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -499,6 +500,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.commits,
             st.overrun,
             tokens_sha256(&decoded.tokens),
+            decoded.logits_sha256.as_deref().unwrap_or("-"),
             tokens_sha256(&ids),
             eos_gate_name(st.eos_gate),
             host_fill_name(st.host_feed.as_ref()),

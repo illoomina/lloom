@@ -10620,6 +10620,64 @@ impl<P: Profile> Model<P> {
         cache.resolve(tok, accepted.len())?;
         Ok(accepted)
     }
+
+    /// [`Self::verify_tokens`] where the target's token at each window
+    /// position is **sampled** with `sampler` rather than read as the
+    /// position's argmax (#943 §2).
+    ///
+    /// The acceptance rule is the same one
+    /// ([`accept_prefix`]): the run accepts while the target's token equals
+    /// the draft's and keeps the target's at the first disagreement, so the
+    /// emitted sequence is a draw from the target's own distribution and the
+    /// drafter moves only the acceptance rate. At `t = 0` the sampler's
+    /// `ArgMax` arm makes this the greedy verify, which is why the greedy
+    /// path stays [`Self::verify_tokens`] rather than routing through here:
+    /// that one fuses the argmax and the proposals into a single mapped
+    /// readback, and a sampled draw cannot (each row needs its own noise
+    /// before its own reduction).
+    ///
+    /// The window's rows are keyed to absolute positions `index_pos ..
+    /// index_pos + k`, so a row the verify rejects consumes nothing the next
+    /// position's noise depends on and a sampled speculative run reproduces a
+    /// sampled non-speculative one at one seed
+    /// ([`crate::generation::LogitsProcessor::window_draw`]).
+    pub fn verify_tokens_sampled(
+        &self,
+        last: u32,
+        proposed: &Tensor,
+        index_pos: usize,
+        cache: &mut State<P>,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<Vec<u32>> {
+        let k = proposed.dims1()?;
+        if k == 0 {
+            lloom_tensor::bail!("lfm2 verify_tokens_sampled: no proposed tokens")
+        }
+        if proposed.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "lfm2 verify_tokens_sampled: proposals must be U32 ids, got {:?}",
+                proposed.dtype()
+            )
+        }
+        let tok = cache.advance(k + 1)?;
+        let anchor = cache.anchor_tensor(last)?;
+        let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
+        // One pass over the weights for k + 1 positions, as the greedy verify.
+        let logits = self.forward_all(&input, index_pos, cache)?;
+        // One drawn token per position, each with its own position's noise.
+        // Row `i` is the input at `index_pos + i` predicting the token AT
+        // `index_pos + i + 1`, and the key is the drawn token's own position
+        // — the same key the K=1 loop uses for the token it feeds at
+        // `seq.pos` (`Session::decode`), so the two paths draw alike.
+        let drawn = sampler.window_draw(&logits, index_pos as u64 + 1)?;
+        // The proposals come back beside them, as the greedy path's one
+        // readback does; the compare is the same host function.
+        let proposed_host = proposed.stage_read()?.to_vec1::<u32>()?;
+        let accepted = accept_prefix(&drawn, &proposed_host, eos_ids);
+        cache.resolve(tok, accepted.len())?;
+        Ok(accepted)
+    }
 }
 
 /// The decode step's IR (`optimizer::walk`): the token's embedding gather,
@@ -11116,6 +11174,47 @@ impl<P: Profile> crate::nn::Probes<crate::nn::LayerTaps<5>> for Model<P> {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        Ok((vec![accepted], probe))
+    }
+
+    fn verify_and_probe_sampled(
+        &self,
+        drafts: &[crate::nn::Draft],
+        anchors: &[crate::nn::Anchor],
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
+            lloom_tensor::bail!(
+                "lfm2 verify_and_probe_sampled: the LFM2 cache is single-sequence (B=1); \
+                 got {} drafts and {} anchors",
+                drafts.len(),
+                anchors.len()
+            )
+        }
+        let anchor = anchors[0];
+        let ids = match &drafts[0].tokens {
+            crate::nn::DraftTokens::Host(ids) => {
+                if ids.is_empty() {
+                    lloom_tensor::bail!("lfm2 verify_and_probe_sampled: no proposed tokens")
+                }
+                Tensor::new(ids.as_slice(), &cache.device)?
+            }
+            crate::nn::DraftTokens::Device(ids) => ids.clone(),
+        };
+        let accepted =
+            self.verify_tokens_sampled(anchor.last, &ids, anchor.pos, cache, eos_ids, sampler)?;
+        // The probe, trimmed to the accepted rows, as the greedy verify's.
+        let taps = cache.take_taps();
+        let n_acc = accepted.len();
+        let probe = taps
+            .iter()
+            .map(|t| {
+                let seq = t.dim(1)?;
+                t.narrow(1, 0, n_acc.min(seq))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok((vec![accepted], probe))
     }
 

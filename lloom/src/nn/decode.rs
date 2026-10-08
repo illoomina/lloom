@@ -2088,6 +2088,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             } else {
                 None
             };
+            // The draw is for the token at `seq.pos`, and its noise is keyed
+            // to that position rather than to how many draws preceded it
+            // (`LogitsProcessor::at_position`): a sampled speculative run
+            // draws the same positions a window at a time and must land on
+            // the same tokens at one seed (#943 §2). Only the gumbel-max
+            // arms read the key; argmax and the host-sort arms are unmoved.
+            sampler.at_position(Some(self.seq.pos as u64));
             let mut feed = readback.sample_and_feed(sampler, &logits)?;
             // The step behind these logits settled, now that its pass is done
             // and before its token goes anywhere: a redone step's logits are
@@ -2099,6 +2106,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         sampler.rewind(m);
                     }
                     logits = redone.squeeze(0)?;
+                    sampler.at_position(Some(self.seq.pos as u64));
                     feed = readback.sample_and_feed(sampler, &logits)?;
                     stats.redraws += 1;
                 }
@@ -2294,6 +2302,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                             sampler.rewind(m);
                         }
                         self.seq.pos -= 1;
+                        sampler.at_position(Some(self.seq.pos as u64));
                         let again = readback.sample_and_feed(sampler, &redone.squeeze(0)?)?;
                         if let Some(f) = &host_feed {
                             f.link().note_fed();
@@ -2570,6 +2579,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the arm's own accounting: every returned id was fed before its
         // successor's forward, so the cache holds the prompt, the returned ids
         // and — on an arm that learns EOS late — the positions past them.
+        // Back to the running stream for whatever else this sampler serves.
+        sampler.at_position(None);
         let fed = self.seq.pos - pos_before - prompt.len();
         if fed < produced {
             lloom_tensor::bail!(
@@ -2953,7 +2964,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         _rewind: crate::profile::RewindProof<M::Profile>,
         spec: &mut S,
         readback: &mut R,
-        _sampler: &mut LogitsProcessor,
+        sampler: &mut LogitsProcessor,
         prompt: &[u32],
         opts: &DecodeOptions,
         eos_ids: &[u32],
@@ -2964,6 +2975,32 @@ impl<'m, M: CausalLM> Session<'m, M> {
         M: Probes<S::Probe> + crate::profile::Shaped,
         R: ReadbackStrategy,
     {
+        // The verify samples the target's token per window position with
+        // this sampler at `t > 0` (`Probes::verify_and_probe_sampled`, #943
+        // §2) and reads the argmax at `t = 0`, as it always has. What it
+        // cannot draw position-keyed is refused here, by name, before any
+        // state is touched: the host-sort arms draw through one running
+        // multinomial, and processors keep a per-token history a rejected
+        // row would corrupt.
+        let sampled = !matches!(sampler.sampling(), Sampling::ArgMax);
+        if sampled {
+            match sampler.sampling() {
+                Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
+                other => lloom_tensor::bail!(
+                    "Session::decode_speculative: {other:?} draws through a host sort on one \
+                     running rng, which a verify window cannot key by position; the \
+                     speculative body serves argmax and the gumbel-max arms (plain \
+                     temperature, --gumbel)"
+                ),
+            }
+            if sampler.processors().is_some() {
+                lloom_tensor::bail!(
+                    "Session::decode_speculative: logits processors keep a per-token history, \
+                     and a verify window draws rows it may reject; not served under a sampled \
+                     verify"
+                );
+            }
+        }
         if spec.max_draft() == 0 {
             lloom_tensor::bail!(
                 "Session::decode_speculative: the proposer has max_draft 0 (the K=1 identity); \
@@ -3013,10 +3050,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
         stats.prefill_units = prefill_units;
 
-        let mut anchor_tok = logits
-            .squeeze(0)?
-            .argmax(lloom_tensor::D::Minus1)?
-            .to_scalar::<u32>()?;
+        // The prefill's token: the argmax, or at `t > 0` the draw for the
+        // token at `seq.pos`, keyed exactly as the K=1 loop keys its first.
+        let mut anchor_tok = if sampled {
+            let drawn = sampler.window_draw(&logits, self.seq.pos as u64)?;
+            drawn[0]
+        } else {
+            logits
+                .squeeze(0)?
+                .argmax(lloom_tensor::D::Minus1)?
+                .to_scalar::<u32>()?
+        };
 
         // The last unit's probe, with the prefill's own argmax as the accepted
         // tail (the block anchor) — the same state the first round would see
@@ -3107,6 +3151,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 probe,
                 Some((&device, PassShape::Verify { k: k as usize })),
                 room,
+                sampled.then_some(&mut *sampler),
             )?;
             let accepted = accepted.into_iter().next().ok_or_else(|| {
                 lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")

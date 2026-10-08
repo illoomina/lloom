@@ -1,0 +1,10 @@
+# gitleaks configuration: the default rules, plus one narrow allowance.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "SHA-256 digests of generated token streams in the recorded decode traces under lloom/tests/fixtures/"
+regexTarget = "match"
+regexes = ['''tokens_sha256=[0-9a-f]{64}''']
+paths = ['''^lloom/tests/fixtures/[^/]+\.txt$''']
+condition = "AND"

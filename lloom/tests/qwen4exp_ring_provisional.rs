@@ -110,7 +110,10 @@ fn watched<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static
 }
 
 fn ring(dev: &Device) -> Result<Ring> {
-    Ok(Ring::new(&[NO_EOS], dev, 64, EosRead::Poll(PollMechanism::default()))?.with_poll_budget(20_000))
+    Ok(
+        Ring::new(&[NO_EOS], dev, 64, EosRead::Poll(PollMechanism::default()))?
+            .with_poll_budget(20_000),
+    )
 }
 
 fn ring_options() -> Result<DecodeOptions> {
@@ -126,9 +129,10 @@ fn session_decode<M: CausalLM, R: lloom::generation::ReadbackStrategy>(
     rb: &mut R,
     opts: &DecodeOptions,
     sampling: Sampling,
+    seed: u64,
 ) -> Result<DecodeOut> {
     let mut session = Session::new(model, cache);
-    let mut sampler = LogitsProcessor::from_sampling(7, sampling);
+    let mut sampler = LogitsProcessor::from_sampling(seed, sampling);
     session.decode(
         &mut IdentityProposer,
         rb,
@@ -145,75 +149,131 @@ fn session_decode<M: CausalLM, R: lloom::generation::ReadbackStrategy>(
 /// ring's temperature draw is the device's gumbel-max, the blocking arm's
 /// the host's): a resident model declines provisional steps, so its ring
 /// run takes nothing back.
-fn check(tag: &'static str, ple: bool, sampling: Sampling) -> Result<()> {
+/// Whether a step gets redone is the streamed tier's: a step computed on an
+/// expert the pool did not hold. A sampled stream's tokens, and so its
+/// routing, follow the seed, so the sampled arm sweeps `seeds` until one
+/// run redoes a step; the identity is asserted on every run either way.
+fn check(tag: &'static str, ple: bool, sampling: Sampling, seeds: &[u64]) -> Result<()> {
+    let mut last = None;
+    for &seed in seeds {
+        match check_seed(tag, ple, sampling.clone(), seed)? {
+            Redid::Yes => return Ok(()),
+            Redid::No => last = Some(seed),
+        }
+    }
+    panic!(
+        "{tag}: no step was redone behind the next forward on any of {} seeds (last {:?}) — the \
+         identity says nothing about the take-back",
+        seeds.len(),
+        last
+    )
+}
+
+enum Redid {
+    Yes,
+    No,
+}
+
+fn check_seed(tag: &'static str, ple: bool, sampling: Sampling, seed: u64) -> Result<Redid> {
     let path = table_path(tag);
     let want = {
         let path = path.clone();
         let sampling = sampling.clone();
-        watched(&format!("{tag}: resident"), move || -> Result<Option<Vec<u32>>> {
-            let Ok(dev) = Device::new_metal(0) else {
-                return Ok(None);
-            };
-            if lloom::testing::fixture::Backend::current().at_scale() {
-                return Ok(None);
-            }
-            let Some(fx) = Fixture::<Qwen4ExpTiny>::new(&format!("{tag}_resident"), Config::tiny())? else {
-                return Ok(None);
-            };
-            let cfg = fx.config(|_| {});
-            if ple {
-                write_table(&cfg, 80, &path)?;
-            }
-            let mut model = fx.resident::<CrownExact>(&cfg, &dev, &LoadOptions::default())?;
-            if ple {
-                attach_ple(&mut model, &cfg, &path, &dev)?;
-            }
-            let out = if sampling == Sampling::ArgMax {
-                let mut rb = Blocking::new(&[NO_EOS], &dev)?;
-                let opts = DecodeOptions::new(STEPS);
-                session_decode(&model, model.new_cache(&cfg, &dev)?, &mut rb, &opts, sampling)?
-            } else {
-                let mut rb = ring(&dev)?;
-                let opts = ring_options()?;
-                let out =
-                    session_decode(&model, model.new_cache(&cfg, &dev)?, &mut rb, &opts, sampling)?;
-                assert!(!out.stats.provisional, "a resident model took provisional steps");
-                out
-            };
-            Ok(Some(out.ids))
-        })?
+        watched(
+            &format!("{tag}: resident"),
+            move || -> Result<Option<Vec<u32>>> {
+                let Ok(dev) = Device::new_metal(0) else {
+                    return Ok(None);
+                };
+                if lloom::testing::fixture::Backend::current().at_scale() {
+                    return Ok(None);
+                }
+                let Some(fx) =
+                    Fixture::<Qwen4ExpTiny>::new(&format!("{tag}_resident"), Config::tiny())?
+                else {
+                    return Ok(None);
+                };
+                let cfg = fx.config(|_| {});
+                if ple {
+                    write_table(&cfg, 80, &path)?;
+                }
+                let mut model = fx.resident::<CrownExact>(&cfg, &dev, &LoadOptions::default())?;
+                if ple {
+                    attach_ple(&mut model, &cfg, &path, &dev)?;
+                }
+                let out = if sampling == Sampling::ArgMax {
+                    let mut rb = Blocking::new(&[NO_EOS], &dev)?;
+                    let opts = DecodeOptions::new(STEPS);
+                    session_decode(
+                        &model,
+                        model.new_cache(&cfg, &dev)?,
+                        &mut rb,
+                        &opts,
+                        sampling,
+                        seed,
+                    )?
+                } else {
+                    let mut rb = ring(&dev)?;
+                    let opts = ring_options()?;
+                    let out = session_decode(
+                        &model,
+                        model.new_cache(&cfg, &dev)?,
+                        &mut rb,
+                        &opts,
+                        sampling,
+                        seed,
+                    )?;
+                    assert!(
+                        !out.stats.provisional,
+                        "a resident model took provisional steps"
+                    );
+                    out
+                };
+                Ok(Some(out.ids))
+            },
+        )?
     };
     let Some(want) = want else {
-        return Ok(());
+        return Ok(Redid::Yes);
     };
     let got = {
         let path = path.clone();
         let sampling = sampling.clone();
-        watched(&format!("{tag}: streamed ring"), move || -> Result<(DecodeOut, u64)> {
-            let dev = Device::new_metal(0)?;
-            let fx = Fixture::<Qwen4ExpTiny>::new(&format!("{tag}_ring"), Config::tiny())?
-                .expect("the tiny fixture built above");
-            let cfg = fx.config(|_| {});
-            let mut model = fx.streamed::<CrownExact>(&cfg, &dev, &LoadOptions::default(), &stream(6))?;
-            if ple {
-                attach_ple(&mut model, &cfg, &path, &dev)?;
-            }
-            let mut rb = ring(&dev)?;
-            let opts = ring_options()?;
-            let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
-            let mut sampler = LogitsProcessor::from_sampling(7, sampling);
-            let out = session.decode(
-                &mut IdentityProposer,
-                &mut rb,
-                &mut sampler,
-                &PROMPT,
-                &opts,
-                &mut |_| Ok(()),
-            )?;
-            assert!(!model.step_settle_trailing(), "{tag}: a provisional step left unsettled");
-            assert!(!session.cache_mut().window_held(), "{tag}: a window left held");
-            Ok((out, session.cache_mut().provisional_redos))
-        })?
+        watched(
+            &format!("{tag}: streamed ring"),
+            move || -> Result<(DecodeOut, u64)> {
+                let dev = Device::new_metal(0)?;
+                let fx = Fixture::<Qwen4ExpTiny>::new(&format!("{tag}_ring"), Config::tiny())?
+                    .expect("the tiny fixture built above");
+                let cfg = fx.config(|_| {});
+                let mut model =
+                    fx.streamed::<CrownExact>(&cfg, &dev, &LoadOptions::default(), &stream(6))?;
+                if ple {
+                    attach_ple(&mut model, &cfg, &path, &dev)?;
+                }
+                let mut rb = ring(&dev)?;
+                let opts = ring_options()?;
+                let mut session = Session::new(&model, model.new_cache(&cfg, &dev)?);
+                let mut sampler = LogitsProcessor::from_sampling(seed, sampling);
+                let out = session.decode(
+                    &mut IdentityProposer,
+                    &mut rb,
+                    &mut sampler,
+                    &PROMPT,
+                    &opts,
+                    &mut |_| Ok(()),
+                )?;
+                assert!(
+                    !model.step_settle_trailing(),
+                    "{tag}: a provisional step left unsettled"
+                );
+                assert!(
+                    !session.cache_mut().window_held(),
+                    "{tag}: a window left held"
+                );
+                Ok((out, session.cache_mut().provisional_redos))
+            },
+        )?
     };
     std::fs::remove_file(&path).ok();
     let (out, redos) = got;
@@ -226,39 +286,57 @@ fn check(tag: &'static str, ple: bool, sampling: Sampling) -> Result<()> {
         rc.ring_retracted,
         out.stats.host_feed.as_ref().map(|f| (f.forwards, f.fills)),
     );
-    assert_eq!(out.ids, want, "{tag}: the ring's provisional stream differs from the resident one");
-    assert!(out.stats.provisional, "{tag}: the ring run's steps were not provisional");
-    assert!(
-        out.stats.redraws > 0,
-        "{tag}: no step was redone behind the next forward — the identity says nothing about \
-         the take-back"
+    assert_eq!(
+        out.ids, want,
+        "{tag} seed {seed}: the ring's provisional stream differs from the resident one"
     );
-    assert_eq!(rc.ring_retracted, out.stats.redraws, "{tag}: a redraw without a take-back");
+    assert!(
+        out.stats.provisional,
+        "{tag}: the ring run's steps were not provisional"
+    );
+    assert_eq!(
+        rc.ring_retracted, out.stats.redraws,
+        "{tag}: a redraw without a take-back"
+    );
     assert_eq!(
         rc.ring_publishes,
         out.ids.len() as u64 + rc.ring_eos_publishes + rc.ring_discarded + rc.ring_retracted,
         "{tag}: the ring's publishes do not reconcile"
     );
     if ple {
-        assert!(out.stats.host_feed.is_some(), "{tag}: the ring run took no host fill");
+        assert!(
+            out.stats.host_feed.is_some(),
+            "{tag}: the ring run took no host fill"
+        );
     }
-    Ok(())
+    Ok(if out.stats.redraws > 0 {
+        Redid::Yes
+    } else {
+        Redid::No
+    })
 }
 
 #[test]
 fn a_ring_step_redone_behind_the_next_forward_is_the_resident_stream_metal() -> Result<()> {
-    check("nople", false, Sampling::ArgMax)
+    check("nople", false, Sampling::ArgMax, &[7])
 }
 
 #[test]
 fn the_host_fill_takes_its_token_back_with_the_draw_metal() -> Result<()> {
-    check("ple", true, Sampling::ArgMax)
+    check("ple", true, Sampling::ArgMax, &[7])
 }
 
-/// A temperature draw on the ring is the device's gumbel-max over noise from
-/// the sampler's rng: a draw made again must start from the rng the taken-
-/// back draw started from, or every later token moves.
+/// A temperature draw on the ring is the device's gumbel-max over noise keyed
+/// to the drawn token's position (`LogitsProcessor::at_position`): a draw
+/// made again is the same position's draw, so a taken-back draw moves no
+/// later token. The seed the fixture happens to redo a step under follows
+/// the noise, which is why several are tried.
 #[test]
 fn a_draw_made_again_on_the_ring_puts_the_sampler_back_first_metal() -> Result<()> {
-    check("temp", false, Sampling::All { temperature: 1.0 })
+    check(
+        "temp",
+        false,
+        Sampling::All { temperature: 1.0 },
+        &[7, 8, 9, 10, 11, 12, 13, 14],
+    )
 }

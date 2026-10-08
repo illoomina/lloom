@@ -122,21 +122,19 @@ fn every_axis_has_a_default_that_is_one_of_its_variants() {
     }
 }
 
-/// Regenerate/check the manifest `registry_mirror.rs`'s third leg reads.
+/// Regenerate/check the committed manifest of the collected `AXES` names.
 ///
-/// The manifest is the bridge across the candle boundary: `lloom-runs` cannot
-/// depend on this crate, so the collected `AXES` names are written to a
-/// committed file and reconciled against `REGISTRY` there. This test keeps the
-/// committed file in sync with the slice — a drift is a test failure, not a
-/// silent hole.
+/// The manifest is the bridge to tooling that cannot depend on this crate: it
+/// reads the committed file instead of the slice. This crate is the file's
+/// authority, and this test keeps the committed file in sync with the slice —
+/// a drift is a test failure, not a silent hole.
 ///
 /// `LLOOM_WRITE_AXES_MANIFEST=1` writes the file; the default asserts it matches
 /// so CI catches a stale manifest.
 #[test]
 fn axes_manifest_is_in_sync() {
     let manifest = lloom::axes::manifest();
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../design/.bench/axes-manifest.txt");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/axes-manifest.txt");
 
     if std::env::var_os("LLOOM_WRITE_AXES_MANIFEST").is_some() {
         std::fs::write(&path, &manifest)

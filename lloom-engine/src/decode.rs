@@ -948,9 +948,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
     /// block per round and the target verifies it
     /// ([`Session::decode_speculative`], `design/docs/speculation.md`
-    /// §10.2t). Greedy by construction — the verify accepts the target's
-    /// argmax — so a temperature on `params` is refused rather than served
-    /// as argmax under a sampled label. The fragment hook's `false` ends the
+    /// §10.2t). At `t > 0` the verify samples the target's token per window
+    /// position with the request's sampler, position-keyed, so the run is
+    /// byte-identical to the non-speculative one at the same seed (#943 §2);
+    /// the host-sort arms (top-k, top-p) are refused by name rather than
+    /// served as argmax under a sampled label. The fragment hook's `false` ends the
     /// run after the round in flight (`DecodeOptions::stop`), reported as
     /// [`Stop::Cancelled`]; a fully cached prompt cannot be resumed by this
     /// body (its verify holds no per-position logits) and is refused, which
@@ -989,13 +991,18 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             );
         }
         let mut sampler = params.sampler();
-        if sampler.sampling() != &Sampling::ArgMax {
-            lloom_tensor::bail!(
-                "DecodeSession::decode_speculative: the speculative body decodes greedily (the \
-                 verify accepts the target's argmax); a temperature ({:?}) is refused rather \
-                 than served as argmax",
-                sampler.sampling()
-            );
+        // The verify samples the target's token per window position at
+        // `t > 0` (`Session::decode_speculative`, #943 §2) on the arms whose
+        // draw can be keyed by position — argmax and the gumbel-max arms
+        // (plain temperature, `--gumbel`). The host-sort arms (top-k, top-p)
+        // are refused by name rather than served as argmax under their label.
+        match sampler.sampling() {
+            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
+            other => lloom_tensor::bail!(
+                "DecodeSession::decode_speculative: {other:?} draws through a host sort on one \
+                 running rng, which a verify window cannot key by position; the speculative \
+                 body serves argmax, plain temperature and --gumbel"
+            ),
         }
         let prepared = self.session.prepare(prompt_ids)?;
         if prepared.suffix.is_empty() {

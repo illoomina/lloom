@@ -692,6 +692,84 @@ fn added_id(tok: &TinyTokenizer, content: &str) -> u32 {
         .unwrap_or_else(|| panic!("{content} is not an added token"))
 }
 
+/// The decision scoring on `lloom serve`: `logprobs` with `options` scores
+/// every option's first token under one forward on the tiny Qwen3.5 (the
+/// decision models' family) — the chosen option carries the highest
+/// log-probability, every option's logprob is that token's in the full
+/// distribution (the top-k block agrees where it lists it), an option
+/// encoding to several tokens reports the count, two options sharing a
+/// first token are flagged, and the shapes a decision cannot take are 400s.
+#[test]
+fn serve_scores_decision_options_from_one_forward() {
+    let dir = scratch("decide-qwen3_5");
+    let model = write::<Qwen3_5Tiny>(&dir);
+    let tok = dir.join("tokenizer.json");
+    let server = Server::start(&model, &["--cpu", "--tokenizer", tok.to_str().unwrap()]);
+    let req = |options: Value, top: u64| {
+        json!({
+            "max_tokens": 1,
+            "logprobs": true,
+            "top_logprobs": top,
+            "options": options,
+        })
+    };
+    let (status, body) = server.chat(req(json!(["A", "B", "yes!", "no"]), 64));
+    assert_eq!(status, 200, "{body}");
+    let d = &body["choices"][0]["decision"];
+    let opts = d["options"].as_array().unwrap();
+    assert_eq!(opts.len(), 4, "{d}");
+    let lps: Vec<f64> = opts
+        .iter()
+        .map(|o| o["logprob"].as_f64().unwrap())
+        .collect();
+    let choice = d["choice"].as_u64().unwrap() as usize;
+    let best = lps.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert_eq!(lps[choice], best, "{d}");
+    assert_eq!(d["text"], opts[choice]["text"]);
+    assert!(lps.iter().all(|lp| lp.is_finite() && *lp <= 0.0), "{d}");
+    assert_eq!(
+        opts[2]["tokens"], 4,
+        "`yes!` is four byte tokens on the tiny tokenizer: {d}"
+    );
+    assert_eq!(opts[0]["tokens"], 1);
+    assert_eq!(d["ambiguous"], json!([]));
+    // The top-k block and the decision agree on a token both list.
+    let top = body["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
+        .as_array()
+        .unwrap();
+    for o in opts {
+        if let Some(t) = top.iter().find(|t| t["token"] == o["token"]) {
+            assert_eq!(t["logprob"], o["logprob"], "{o} vs {t}");
+        }
+    }
+    // Two options with one first token are flagged.
+    let (status, body) = server.chat(req(json!(["yes", "yes!"]), 1));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["decision"]["ambiguous"], json!([0, 1]));
+    // The shapes a decision cannot take.
+    for (options, why) in [
+        (json!(["A"]), "at least two"),
+        (json!(["A", ""]), "non-empty"),
+        (json!("A"), "array"),
+    ] {
+        let (status, body) = server.chat(req(options, 1));
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains(why),
+            "{body}"
+        );
+    }
+    // Without options the block is absent and the reply is as before.
+    let (status, body) = server.chat(json!({ "max_tokens": 1, "logprobs": true }));
+    assert_eq!(status, 200, "{body}");
+    assert!(body["choices"][0]["decision"].is_null());
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A `lloom serve` chat request's generated ids and `timings`.
 fn served_ids(server: &Server, fields: Value) -> (Vec<u32>, Value) {
     let (status, body) = server.chat(fields);

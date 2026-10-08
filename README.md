@@ -161,11 +161,19 @@ acceptance rate and **never** the output.
 
 ---
 
-## Branches and history
+## Branches, history and pull requests
 
-`main` is the stable line; work lands on `dev` first. Both are published from
-the project's development repository, where the engine lives beside its design
-notes and measurements. **`#NNN` references in commit messages refer to that
+- **`dev`** is where work lands. **Open pull requests against `dev`.**
+- **`main`** is the default branch and the stable line. It moves only by a
+  merge from `dev`; nothing is committed to it directly.
+
+GitHub proposes `main` as a new pull request's base, so pick `dev` when you
+open one (`gh pr create --base dev`). A pull request opened against `main` is
+retargeted to `dev` before review.
+
+`dev` is published from the project's development repository, where the engine
+lives beside its design notes and measurements, and a merged pull request is
+merged back there. **`#NNN` references in commit messages refer to that
 private tracker, not to this repository's issues.**
 
 The history is candle's (upstream `huggingface/candle`), then the fork's own

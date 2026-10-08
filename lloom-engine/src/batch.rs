@@ -1301,10 +1301,14 @@ mod tests {
     fn a_cancel_retires_the_row_and_a_closed_job_waits_for_an_idle_engine() {
         let (handle, thread) = start(2, 0, BatchMode::Continuous);
         let cancel = Arc::new(AtomicBool::new(false));
-        // Row 1's chain never reaches EOS: it runs to its cap.
+        // Row 1's chain never reaches EOS: it runs to its cap. The cap is
+        // far past what the toy steps between the fifth token's receipt and
+        // the cancel below; at 200 an optimised build on a fast CPU ran the
+        // chain out before the flag landed and the row finished uncancelled.
+        let cap = 1_000_000;
         let rx = handle.submit(BatchRequest {
             prompt_ids: vec![0],
-            params: params(200),
+            params: params(cap),
             cancel: Arc::clone(&cancel),
         });
         let mut got = Vec::new();
@@ -1318,7 +1322,7 @@ mod tests {
         let (streamed, done) = collect(&rx);
         assert!(done.cancelled);
         assert!(!done.eos);
-        assert!(done.tokens.len() < 200);
+        assert!(done.tokens.len() < cap);
         assert_eq!(done.tokens.len(), got.len() + streamed.len());
         assert_eq!(&done.tokens[..5], &chain(0, 5).0);
         // The closed job runs with the pool whole.

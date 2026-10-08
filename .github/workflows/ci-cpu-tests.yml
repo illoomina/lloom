@@ -1,28 +1,42 @@
-# CPU tests, no `metal` feature: the tests a GitHub-hosted runner can run.
+# CPU tests, no `metal` feature: the tests a GitHub-hosted runner can run,
+# inside the project's container image (`Dockerfile`, stage `test`), so a red
+# run here reproduces on any host with Docker, amd64 or arm64:
+#
+#     .github/ci/in-container.sh -- cpu-tests.sh lloom 290 token_ring_fuzz
 #
 #   runs here     lloom-tensor: the CPU tensor library's unit + integration
 #                 tests (matmul, conv, quantized k-quants, grad, indexing, ...)
 #                 and its doctests. lloom: the model / generation / driver
 #                 tests that carry a CPU arm, the `token_ring_fuzz` proptest and
 #                 the LFM2 conv-slot model proptest, and its doctests.
-#                 lloom-engine: its unit tests. Every crate's examples are
-#                 built (`cargo test` builds them).
+#                 lloom-engine: its unit tests, and with `serve` the request
+#                 seam and option-spelling tests. Every crate's examples are
+#                 built by the doctest step.
 #
 #   cannot run    everything `#![cfg(feature = "metal")]`: the kernel parity,
 #   here          determinism and mutation suites, the Metal buffer-pool, arena,
 #                 blit-ordering, RNG and concurrency tests, and the in-crate
 #                 Metal fuzzers. They need a Metal device and run on Apple
-#                 silicon (`cargo test --features metal`). This job is the CPU
-#                 half only.
+#                 silicon (`cargo nextest run --features metal`). This job is
+#                 the CPU half only.
+#
+# The runner: `cargo nextest run`, one process per test (cpu-tests.sh), under
+# the `ci` profile (`opt-level = 2`, `debug = "line-tables-only"`, debug
+# assertions and overflow checks on); each crate's integration tests are one
+# binary (`tests/main.rs`).
 #
 # Non-vacuity, in two halves:
 #   * cpu-tests.sh refuses a run whose passed-test total is under a floor, and
-#     requires the named CPU fuzzer binary to have run >= 1 test -- a Metal-gated
-#     binary legitimately reports `running 0 tests` here, so the total alone
-#     cannot see the CPU fuzzer silently gated off.
+#     requires the named CPU fuzzer module to have run >= 1 test -- a
+#     Metal-gated module legitimately contributes no test here, so the total
+#     alone cannot see the CPU fuzzer silently gated off.
 #   * cpu-test-positive-control.sh breaks TokenRing's EOS decision in place and
 #     requires the token-ring tests to go red, then restores (SHA-256-verified)
 #     and requires green.
+#
+# These are the development repository's gates, ported: the same image, the
+# same scripts, paths at this repository's root. `#NNN` in comments refers to
+# that repository's tracker.
 
 name: CI / CPU tests (no metal)
 
@@ -33,82 +47,140 @@ on:
     branches: [main, dev]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   cpu-tests:
-    name: cargo test, no metal feature, non-vacuous
+    name: nextest, no metal feature, ci profile, in the container, non-vacuous
     runs-on: ubuntu-latest
-    # A run still going at this point is a hung test or a runaway proptest.
-    timeout-minutes: 40
-    # The three crates' debug test binaries link the whole engine statically,
-    # and lloom alone builds 129 of them. With full debug info the runner's
-    # disk fills while they link (the linker dies on SIGBUS); line tables keep
-    # file:line in a backtrace at a fraction of the size.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    # The budget's hard bound. A cold run (every `ci`-profile build from
+    # nothing, the positive control's three builds, the cache save) measured
+    # 38 minutes plus the save (#939); a warm one is the gates alone.
+    # A run still going past this is a hung test or a runaway proptest, not a
+    # slow one, and it must not consume the month.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      # The image's preinstalled SDKs this job never uses, removed for disk
-      # headroom; the free space is printed either side so an exhausted disk
-      # is named in the log rather than read off a linker crash.
+      # A fresh runner has 13G free; the warm `ci`-profile target is 14G and
+      # the image a few more, so the image's unused SDKs go first (13G -> 34G
+      # free; #939's run 37811117639).
       - name: Free runner disk
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
           df -h /
 
-      # .cargo/config.toml pins `target-cpu=native` for the development
-      # machine; the runner builds with its own defaults.
-      - name: Remove cargo config
-        run: rm -f .cargo/config.toml
+      - name: The runner's CPU
+        run: grep -m1 'model name' /proc/cpuinfo; grep -m1 flags /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx2|fma|f16c|avx512f)$' | tr '\n' ' '; echo; nproc
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: Swatinem/rust-cache@v2
+      # The image: built from the Dockerfile with the layer cache in the
+      # Actions cache, loaded into the runner's docker, used by every step
+      # through in-container.sh. The same build command works on any host.
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: test
+          tags: lloom-ci:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # One step per crate so a failure names the crate. cpu-tests.sh runs
-      # `--no-fail-fast`, so every test binary runs even when one is red, and
-      # the failing set must equal the step's --known-red list exactly: a
-      # listed test that passes fails the gate too, so a fixed test cannot stay
-      # silently listed. Each floor is about 2/3 of the passed count measured
-      # when it was set, so a whole test binary vanishing trips it while
-      # ordinary churn does not.
+      # The cargo registry and the target directory, mounted into the
+      # container from these paths and cached between runs.
+      # Restored here and saved at the end whatever the job's verdict
+      # (`actions/cache` alone saves only on success, so a red run left the
+      # next one cold, #939). The save reuses the key computed here:
+      # `hashFiles` evaluated after the build read a different Cargo.lock
+      # hash than before it, and the next run's exact key never matched.
+      - name: Restore cargo registry and target
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-cpu-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            ci-cpu-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-
+            ci-cpu-tests-${{ runner.os }}-
+
+      - name: Disk and time, before
+        run: df -h /; du -sh target 2>/dev/null || true; date -u +%s > /tmp/t0
+
+      # One step per crate so a failure names the crate. The floor is ~2/3 of
+      # the passed count measured when it was set (no metal, ci profile):
+      # lloom-tensor 284 + the 1 known red; lloom 581; lloom-engine 34 (+ the
+      # serve tests).
+      #
+      # lloom-tensor's known red is the last of the three #750 names (a
+      # parser whose refusals only exist with `metal`, `tuning.rs`). Each is
+      # removed here in the PR that makes it pass -- the gate fails on a listed
+      # test that passes, so a fixed test cannot stay silently listed.
       - name: lloom-tensor tests (no metal)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
         run: >-
-          bash .github/ci/cpu-tests.sh
-          --known-red src/lib.rs::tuning::tests::the_parsers_refuse_what_the_sites_refused
+          .github/ci/in-container.sh -- cpu-tests.sh
+          --known-red lloom-tensor::tuning::tests::the_parsers_refuse_what_the_sites_refused
           lloom-tensor 176
 
-      - name: lloom-engine tests (no metal)
-        run: bash .github/ci/cpu-tests.sh lloom-engine 11
+      # `serve` is on so #938's option-spelling tests run (lloom-engine's
+      # request seam is behind it).
+      - name: lloom-engine tests (no metal, serve)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cpu-tests.sh --features serve lloom-engine 11
 
-      # PROPTEST_CASES raises the proptests' case counts; token_ring_fuzz is
-      # the named binary that must have run >= 1 test.
+      # The proptests honour PROPTEST_CASES (token_ring_fuzz.rs reads it for
+      # its 128-default; the lfm2 slot model takes proptest's own default).
+      # token_ring_fuzz is the named module that must have run >= 1 test.
       #
-      # The three known reds hold numeric references taken on Apple silicon
-      # that x86_64 Linux does not reproduce: a pinned CPU logits fingerprint,
-      # a chunked prefill's error bounded at twice an in-range control, and a
-      # checkpoint restore required bit-identical to a fresh prefill (it
-      # differs by one rounding). The CPU arithmetic differs by platform; what
-      # these tests should pin off Apple silicon is undecided.
+      # One platform red (#939):
+      # the chunk test's bound is a ratio of two errors whose reference is the
+      # CPU's f16 matmul, which accumulates in f16 on aarch64 and in f32 on
+      # x86. It stays a known red until #939's accumulation PR decides the
+      # reference's accumulator; the gate fails if it passes.
       - name: lloom tests (no metal, PROPTEST_CASES raised)
         env:
           PROPTEST_CASES: "4096"
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
         run: >-
-          bash .github/ci/cpu-tests.sh
-          --known-red tests/lfm2_qkv_layout.rs::every_arm_computes_the_same_logits
-          --known-red tests/qwen4exp_chunk_past_dense.rs::a_prompt_past_the_dense_range_prefills_in_chunks_cpu
-          --known-red tests/turn_checkpoint.rs::a_rewound_sequence_does_not_restore_from_a_stale_checkpoint
+          .github/ci/in-container.sh -- cpu-tests.sh
+          --known-red lloom::main::qwen4exp_chunk_past_dense::a_prompt_past_the_dense_range_prefills_in_chunks_cpu
           lloom 290 token_ring_fuzz
+
+      # The CPU numerics probe's lines, for the cross-platform table.
+      # Diagnostic, never a gate.
+      - name: CPU numerics probe (diagnostic)
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: >-
+          .github/ci/in-container.sh -- cargo nextest run -p lloom --cargo-profile ci --no-capture
+          -E 'test(cpu_numerics_probe::the_cpu_probes_reproduce_within_a_process)' 2>&1 | grep -E 'PROBE|PASS|FAIL' | cut -c1-400
 
       # Shows the gate can FAIL: a broken TokenRing must go red here.
       - name: positive control (mutated TokenRing must fail)
-        run: bash .github/ci/cpu-test-positive-control.sh
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh -- cpu-test-positive-control.sh
 
-      - name: Disk left
+      - name: Disk and time, after
         if: always()
-        run: df -h /
+        run: df -h /; du -sh target; echo "elapsed $(( $(date -u +%s) - $(cat /tmp/t0) )) s"; ls target/ci/deps | grep -cE '^[a-z0-9_]+-[0-9a-f]{16}$' || true
+
+      - name: Save cargo registry and target
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

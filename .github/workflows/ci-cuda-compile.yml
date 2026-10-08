@@ -1,14 +1,19 @@
 # CUDA compile-check: the backend that cannot be executed on a hosted runner.
 #
-# The CUDA backend is COMPILED here, never executed: the job runs inside a CUDA
-# `-devel` container so nvcc is present (candle-kernels' build script compiles
-# the .cu kernels to PTX); no GPU is required and no kernel is launched. It
-# checks lloom-tensor's library AND its test targets (`--lib --tests`): the
-# `cfg(feature = "cuda")` test code is compiled by no other job.
+# `cargo check -p lloom-tensor --features cuda --lib --tests` in the project's
+# container image (`Dockerfile`, stage `cuda`: NVIDIA's CUDA devel image plus
+# the pinned toolchain). The CUDA backend is COMPILED here, never executed: no
+# GPU is required and no kernel is launched. The `cfg(feature = "cuda")` test
+# code is compiled by no other job.
 #
 # The gate is not "it compiled": cuda-positive-control.sh also shows the
 # compile-check FAILING on a deliberately broken CUDA kernel and passing once
-# restored. Its baseline arm is the compile-check itself.
+# restored. Local reproduction:
+#
+#     .github/ci/in-container.sh --stage cuda -- cuda-positive-control.sh
+#
+# These are the development repository's gates, ported: the same image, the
+# same scripts, paths at this repository's root.
 
 name: CI / CUDA (compile-check)
 
@@ -19,37 +24,61 @@ on:
     branches: [main, dev]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   cuda-compile-check:
-    name: cargo check --features cuda --lib --tests + positive control
+    name: cargo check --features cuda --lib --tests + positive control, in the container
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # A CUDA toolkit (nvcc + headers); no GPU and no CUDA driver are used.
-    container:
-      image: nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
-    env:
-      # candle-kernels needs a target compute capability to build PTX. Any
-      # valid cap compiles; the kernels are never launched.
-      CUDA_COMPUTE_CAP: "86"
+    timeout-minutes: 40
     steps:
-      - name: Install build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            curl ca-certificates build-essential pkg-config libssl-dev git
-
       - uses: actions/checkout@v4
 
-      - name: Remove cargo config (not needed in the container)
-        run: rm -f .cargo/config.toml
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          df -h /
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Build the cuda image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: cuda
+          tags: lloom-ci:cuda
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Restored here and saved at the end whatever the job's verdict
+      # (`actions/cache` alone saves only on success, so a red run left the
+      # next one cold, #939). The save reuses the key computed here:
+      # `hashFiles` evaluated after the build read a different Cargo.lock
+      # hash than before it, and the next run's exact key never matched.
+      - name: Restore cargo registry and target
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ci-cuda-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            ci-cuda-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Dockerfile') }}-
+            ci-cuda-${{ runner.os }}-
 
       - name: CUDA compile-check with positive control
-        run: bash .github/ci/cuda-positive-control.sh
+        env:
+          LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
+          LLOOM_CI_TARGET: ${{ github.workspace }}/target
+        run: .github/ci/in-container.sh --stage cuda -- cuda-positive-control.sh
+
+      - name: Save cargo registry and target
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -7,14 +7,22 @@
 //!
 //! The weights are the tiny LFM2's (`lloom::testing::tiny`, keyed by
 //! seed, name and index), so a difference between two arms is the arms'. The
-//! arms agreeing is a shape; the absolute references beside it are the CPU
-//! logits' pinned fingerprint and, on Metal, the CPU backend within a
-//! tolerance (CONTRIBUTING §3.1b) — a defect every arm shares moves both.
+//! arms agreeing is a shape; the absolute reference beside it is, on Metal,
+//! the CPU backend within a tolerance (CONTRIBUTING §3.1b), so a defect every
+//! Metal arm shares moves it.
+//!
+//! There is no absolute fingerprint of the CPU logits: they are not one value
+//! across machines. The CPU matmul is the `gemm` crate's, which fuses `a·b+c`
+//! on NEON and x86-FMA and not on SSE, and picks its kernel by the product's
+//! shape and the CPU; `expf` is the platform's libm; the reductions are
+//! NEON, AVX2 or scalar by target feature. Four CPUs gave four fingerprints
+//! of this model at one commit, every arm agreeing on each
+//! (`design/measurements/issue-939.md` §2.1). The CPU half of the test is the
+//! arms' agreement, bit for bit, on whatever CPU runs it.
 
 use lloom::models::lfm2::{AttnImpl, Config, KvAppend, LayerType, Model, QkvLayout, State};
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::profile::CrownExact;
-use lloom::testing::tiny::init::splitmix64;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -89,21 +97,6 @@ fn cpu_reference(cfg: &Config, dtype: DType) -> Result<Vec<Vec<f32>>> {
         .map(|s| s.into_iter().map(f32::from_bits).collect())
         .collect())
 }
-
-/// Every logit bit of every step, folded: a pinned value is an absolute
-/// reference that moves when any bit does.
-fn fingerprint(steps: &[Vec<u32>]) -> u64 {
-    steps
-        .iter()
-        .flatten()
-        .fold(0x761, |h, b| splitmix64(h ^ *b as u64))
-}
-
-/// The CPU `Contiguous` arm's fingerprint at f32 under the default law and
-/// seed. It moves with the weights' law, the tiny template's geometry and
-/// the CPU backend's arithmetic — each a reason to re-pin, named in the
-/// commit that does.
-const CPU_FINGERPRINT: u64 = 0x3723_fa1a_3016_59de;
 
 /// A 5-token prefill (strided views, real copies on `Contiguous`), then two
 /// decode steps (contiguous views); the logits of every step as f32 bits.
@@ -189,17 +182,6 @@ fn arms_agree_on(dev: &Device, attn_impl: AttnImpl, dtype: DType) -> Result<()> 
 #[test]
 fn every_arm_computes_the_same_logits() -> Result<()> {
     arms_agree_on(&Device::Cpu, AttnImpl::Generic, DType::F32)?;
-    let cpu = run(
-        &tiny_config(QkvLayout::Contiguous, AttnImpl::Generic),
-        &Device::Cpu,
-        DType::F32,
-    )?;
-    assert_eq!(
-        fingerprint(&cpu),
-        CPU_FINGERPRINT,
-        "the CPU logits moved: {:#x}",
-        fingerprint(&cpu)
-    );
     #[cfg(feature = "metal")]
     {
         let dev = Device::new_metal(0)?;

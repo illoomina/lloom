@@ -1,0 +1,109 @@
+//! One integration-test binary for the crate (lloom #939): every
+//! `tests/*.rs` file is a module here, so the suite links the engine once
+//! instead of once per file, and a new test file is one `mod` line. The
+//! files keep their names and their `#![cfg(feature = ...)]` gates. Each
+//! test still runs in its own process under `cargo nextest run` (the gate's
+//! runner); under plain `cargo test` the tests share a process, and a test
+//! that installs process-global state fails by name when another test did
+//! (`lloom_tensor::isolation`).
+//!
+//! Its own binary, because a test binary carries at most one
+//! `#[global_allocator]`: `metal_pool_alloc_free.rs`.
+//!
+//! `every_test_file_is_a_module` below reads this directory and this file,
+//! so a file that is not a module here fails the suite instead of silently
+//! not running.
+mod bilinear_tests;
+mod conv_tests;
+mod custom_op_tests;
+mod depthwise_conv;
+mod display_tests;
+mod fp_kind_codes;
+mod gate_contract_pinned;
+mod gate_contract_unpinned;
+mod gemm_row_batch_invariance;
+mod gemv_mixed;
+mod gemv_mixed_tiny_shapes;
+mod gguf_tests;
+mod grad_tests;
+mod heap_transients;
+mod host_fed_ring;
+mod indexing_tests;
+mod iq3xxs_gguf_read;
+mod iq_metal;
+mod layout_tests;
+mod matmul_tests;
+mod metal_arena_lifetime_fuzz;
+mod metal_arena_teardown_tests;
+mod metal_arg_sort_tests;
+mod metal_blit_ordering_tests;
+mod metal_buffer_pool_tests;
+mod metal_concurrent_tests;
+mod metal_dispatch_census_scope;
+mod metal_dispatch_trace_scope;
+mod metal_emulated_arms;
+mod metal_encoder_counters;
+mod metal_encoder_counters_limit;
+mod metal_indexing_tests;
+mod metal_rand_uniform_iid_tests;
+mod metal_retire_order_tests;
+mod metal_rng_seed_tests;
+mod metal_shared_device_threads;
+mod metal_strided_reduce_repeat_tests;
+mod mmap_advice_installed;
+mod moe_pair_order;
+mod moe_routed_metal;
+mod moe_routed_union;
+mod options_derive;
+mod pool_tests;
+mod pread_targets;
+mod pth_tests;
+mod q2_0_metal;
+mod qmatmul_dequant_once;
+mod qmatmul_f16w_mm;
+mod qmatmul_id_mm;
+mod qmatmul_id_mm_arm;
+mod qmatmul_id_mm_k_block;
+mod qmatmul_rows_arm;
+mod qmatmul_rows_default;
+mod qmatmul_rows_timing;
+mod qmatmul_rows_under_fast;
+mod qmm_f16w_tiny_shapes;
+mod qmm_narrow_weights;
+mod quant_mv_store;
+mod quant_parity_matrix;
+mod quant_parity_matrix_rows;
+mod quantized_tests;
+mod serialization_tests;
+mod slice_set_strided_tests;
+mod staged_readback_plans;
+mod tensor_tests;
+mod typed_tests;
+mod words_publish_order;
+
+/// Every `tests/*.rs` beside this file is declared above (or is one of the
+/// files that owns its binary), read from the directory at test time.
+#[test]
+fn every_test_file_is_a_module() {
+    let own: &[&str] = &["metal_pool_alloc_free"];
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let me = include_str!("main.rs");
+    let mut missing = Vec::new();
+    let mut files = 0;
+    for entry in std::fs::read_dir(dir).expect("tests/ is readable") {
+        let name = entry.expect("an entry").file_name().into_string().expect("utf-8");
+        let Some(stem) = name.strip_suffix(".rs") else { continue };
+        if stem == "main" || own.contains(&stem) {
+            continue;
+        }
+        files += 1;
+        if !me.lines().any(|l| l == format!("mod {stem};")) {
+            missing.push(stem.to_string());
+        }
+    }
+    assert!(files > 0, "no test files beside main.rs");
+    assert!(
+        missing.is_empty(),
+        "test files that are not modules of tests/main.rs (add `mod <name>;`): {missing:?}"
+    );
+}

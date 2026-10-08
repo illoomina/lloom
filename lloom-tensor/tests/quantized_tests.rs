@@ -491,9 +491,9 @@ fn quantize_q5_1(device: &Device) -> Result<()> {
 
 fn get_test_vector2(bound: f32, size: usize, device: &Device) -> Result<Tensor> {
     assert!(
-        size.is_multiple_of(crate::quantized::k_quants::QK_K),
+        size.is_multiple_of(self::quantized::k_quants::QK_K),
         "size must be a multiple of {}",
-        crate::quantized::k_quants::QK_K
+        self::quantized::k_quants::QK_K
     );
 
     let src = (0..size)
@@ -1187,7 +1187,7 @@ fn ggml_matmul_error_test_<T: GgmlType>(a: &[f32], b: &[f32], err_m: f32) -> Res
     }
 
     let mut dst = vec![0.0f32; 1];
-    crate::k_quants::matmul((1, length, 1), b, &a_quant, &mut dst)?;
+    self::k_quants::matmul((1, length, 1), b, &a_quant, &mut dst)?;
     let result_matmul = dst[0];
 
     if (result_matmul - result).abs() / length as f32 > 1e-6 {

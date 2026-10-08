@@ -213,9 +213,16 @@ fn the_env_alias_opts_the_process_in_and_warns_once() -> Result<()> {
     let native = bf16_is_native(&dev)?;
     let run = |alias: Option<&str>| {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        // The child's harness name carries this file's module path when the
+        // file is a module of `tests/main.rs` (and nothing when it is its
+        // own binary): `module_path!()` less the crate name.
+        let child = match module_path!().split_once("::") {
+            Some((_, rel)) => format!("{rel}::child_bf16_under_the_env_alias"),
+            None => "child_bf16_under_the_env_alias".to_string(),
+        };
         cmd.args([
             "--exact",
-            "child_bf16_under_the_env_alias",
+            child.as_str(),
             "--ignored",
             "--nocapture",
             "--test-threads=1",

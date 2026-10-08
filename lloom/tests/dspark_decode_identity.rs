@@ -2070,8 +2070,10 @@ fn decode_speculative_refuses_what_it_cannot_sample_by_name() -> Result<()> {
             .to_string();
         assert!(err.contains("host sort"), "{sampling:?}: {err}");
     }
-    let mut procs = lloom::generation::Processors::default();
-    procs.repetition_penalty = 1.2;
+    let procs = lloom::generation::Processors {
+        repetition_penalty: 1.2,
+        ..Default::default()
+    };
     let mut p = LogitsProcessor::from_sampling(1, Sampling::GumbelSoftmax { temperature: 0.8 })
         .with_processors(procs);
     let err = run(&mut p).unwrap_err().to_string();

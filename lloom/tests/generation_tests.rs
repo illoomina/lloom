@@ -508,8 +508,10 @@ fn window_draw_refuses_the_arms_it_cannot_key() -> Result<()> {
         );
     }
     // Processors have per-token history a rejected row would corrupt.
-    let mut procs = lloom::generation::Processors::default();
-    procs.repetition_penalty = 1.1;
+    let procs = lloom::generation::Processors {
+        repetition_penalty: 1.1,
+        ..Default::default()
+    };
     let mut p = LogitsProcessor::from_sampling(7, lloom::generation::Sampling::ArgMax)
         .with_processors(procs);
     let err = p.window_draw(&window, 0).unwrap_err().to_string();

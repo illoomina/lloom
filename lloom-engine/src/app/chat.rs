@@ -433,6 +433,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let mut params =
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         params.logits_digest = options.decode.logits_digest;
+        if !args.raw {
+            params.turn_tail = thinking::turn_tail(&*engine, &messages, &kwargs, add_bos, &ids);
+        }
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
             params.thinking =

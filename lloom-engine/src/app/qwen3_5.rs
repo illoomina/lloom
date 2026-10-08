@@ -72,6 +72,8 @@ pub trait Qwen3_5Model:
     fn embed_table(&self) -> &QMatMul;
     fn lm_head(&self) -> &QMatMul;
     fn capacity(&self) -> StateCapacity;
+    /// The bytes one turn checkpoint of a state takes (`Decoder::checkpoint_frame_bytes`).
+    fn checkpoint_frame_bytes(&self) -> usize;
     /// Retain `h_nextn` on every forward of `cache` (the drafter's seeding
     /// reads the prefill's rows).
     fn arm_nextn(cache: &mut Self::Cache);
@@ -88,6 +90,9 @@ impl<P: Profile, L: Layer + 'static> Qwen3_5Model
     }
     fn capacity(&self) -> StateCapacity {
         Decoder::capacity(self)
+    }
+    fn checkpoint_frame_bytes(&self) -> usize {
+        Decoder::checkpoint_frame_bytes(self)
     }
     fn arm_nextn(cache: &mut Self::Cache) {
         cache.set_want_nextn(true);
@@ -250,6 +255,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         mtp: opts.mtp,
         // The verify window of `k + 1` positions as one pass over the rings.
         window: if opts.mtp { opts.mtp_k.max(1) + 1 } else { 0 },
+        checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
     };
     let t = Instant::now();
     let mut warnings = Vec::new();
@@ -355,6 +361,17 @@ where
         if mtp.is_some() {
             M::arm_nextn(&mut cache);
         }
+        // The turn checkpoints (`sequence-reuse-design.md` §2.3b): the ring
+        // a request re-rendering the previous turn restores from, sized
+        // from the recurrent layers' state and admitted beside the weights.
+        let (slots, frame) = (model.capacity().checkpoints, model.checkpoint_frame_bytes());
+        eprintln!(
+            "[checkpoint ring: {slots} × {:.1} MiB ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
+            frame as f64 / (1024.0 * 1024.0),
+            (slots * frame) as f64 / (1024.0 * 1024.0)
+        );
+        tier["turn_checkpoints"] =
+            json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
         let mut engine = Engine {
             model: Arc::new(model),
             mtp,

@@ -1170,6 +1170,7 @@ impl SamplingConfig {
             logits_digest: false,
             prefill_tile,
             thinking: None,
+            turn_tail: 0,
         }
     }
 }

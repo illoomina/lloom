@@ -60,9 +60,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A fresh runner has 13G free; the warm `ci`-profile target is 14G and
-      # the image a few more, so the image's unused SDKs go first (13G -> 34G
-      # free; #939's run 37811117639).
+      # A fresh runner has 13-14G free and a run uses about as much: 34G free
+      # after this step fell to 20G by the end of a cold run of this job, and a
+      # warm `ci`-profile target alone reached 14G (#939). So the image's
+      # unused SDKs go first.
       - name: Free runner disk
         run: |
           df -h /

@@ -110,6 +110,17 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Where the passes that follow should leave a turn checkpoint: the
+    /// absolute position `pos` a later request is expected to return to
+    /// (a chat re-render diverges a few tokens before the previous
+    /// prompt's end, `design/docs/sequence-reuse-design.md` §2.3a), so
+    /// that [`CacheRewind::restore`] can stand there. A cache that keeps
+    /// checkpoints takes one at `pos` when a pass covers it; the default
+    /// keeps none and ignores the hint.
+    fn checkpoint_at(&self, _cache: &mut Self::Cache, _pos: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Arm a host fill for the decode steps that follow on `cache`, for a
     /// loop whose tokens stay on the device: each single-position forward
     /// then waits on the GPU for rows a producer thread fills from the token

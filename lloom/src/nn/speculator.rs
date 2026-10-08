@@ -1151,7 +1151,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             });
         }
         // Everything cached: the last token must be re-fed for its prediction.
-        let keep = if lcp == full.len() { lcp - 1 } else { lcp };
+        let mut keep = if lcp == full.len() { lcp - 1 } else { lcp };
         let drop = cached - keep;
         let action = if drop == 0 {
             ReuseAction::Extend
@@ -1161,15 +1161,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
             ReuseAction::Rewound(drop)
-        } else if self.seq.cache.can_restore(keep) {
+        } else if let Some(at) = self.seq.cache.restore_point(keep) {
             // Past the horizon but within a turn checkpoint's reach: the
-            // chat re-render that drops the previous generation prompt's
-            // last token and the whole reply diverges exactly here.
-            self.seq.cache.restore(keep)?;
+            // chat re-render drops the previous generation prompt's tail and
+            // the whole reply, and diverges at or just after a checkpoint.
+            self.seq.cache.restore(at)?;
+            keep = at;
             self.seq.pos = keep;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
-            ReuseAction::Rewound(drop)
+            ReuseAction::Rewound(cached - keep)
         } else {
             self.reset();
             ReuseAction::Fresh
@@ -1238,7 +1239,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        self.speculative_round_keyed(spec, active, anchors, p_min, eos_ids, probe, None, usize::MAX)
+        self.speculative_round_keyed(
+            spec,
+            active,
+            anchors,
+            p_min,
+            eos_ids,
+            probe,
+            None,
+            usize::MAX,
+        )
     }
 
     /// [`Self::speculative_round`] with the VERIFY phase bracketed as a

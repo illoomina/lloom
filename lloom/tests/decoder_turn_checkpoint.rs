@@ -457,8 +457,29 @@ where
     L: Layer<State = LayerState>,
     M::Cache: CacheReset,
 {
+    re_render_at(model, cfg, dev, tail, hinted.then_some(tail))
+}
+
+/// [`re_render_case`] with the checkpoint hinted `hint` positions before
+/// prompt 1's end (the generation prompt's start) and the re-render
+/// diverging `tail` before it: `prepare` restores to the latest checkpoint
+/// at or before the divergence (`CacheRewind::restore_point`).
+fn re_render_at<M, L>(
+    model: &M,
+    cfg: &Config,
+    dev: &Device,
+    tail: usize,
+    hint: Option<usize>,
+) -> Result<()>
+where
+    M: CausalLM<Config = Config, Cache = DecoderState<L>>,
+    L: Layer<State = LayerState>,
+    M::Cache: CacheReset,
+{
     let prompt1 = tokens(24, cfg.vocab_size, 3);
-    let keep = prompt1.len() - tail;
+    let div = prompt1.len() - tail;
+    let hinted = hint.is_some();
+    let keep = prompt1.len() - hint.unwrap_or(tail);
     let mut session = Session::new(model, model.new_cache(cfg, dev)?);
     if hinted {
         model.checkpoint_at(session.cache_mut(), keep)?;
@@ -466,7 +487,7 @@ where
     let reply = greedy_decode(&mut session, &prompt1, 8, dev)?;
     assert_eq!(reply.len(), 8);
     let before = session.tokens().len();
-    let mut full2 = prompt1[..keep].to_vec();
+    let mut full2 = prompt1[..div].to_vec();
     full2.extend_from_slice(&[11, 12, 13, 14, 2, 21, 22, 23, 24, 25, 26]);
     let prepared = session.prepare(&full2)?;
     if !hinted {
@@ -505,6 +526,9 @@ fn a_chat_re_render_restores_through_prepare() -> Result<()> {
         re_render_case(&model, &cfg, &dev, tail, true)?;
     }
     re_render_case(&model, &cfg, &dev, 2, false)?;
+    // The checkpoint at the generation prompt's start (5 back), the
+    // re-render keeping 3 of its tokens (diverging 2 back).
+    re_render_at(&model, &cfg, &dev, 2, Some(5))?;
     let (model, cfg) = dense::<RewindableExact>(&dev, 2)?;
     re_render_case(&model, &cfg, &dev, 2, true)?;
     let (model, cfg) = moe::<CrownExact>(&dev)?;

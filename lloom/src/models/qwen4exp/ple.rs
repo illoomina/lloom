@@ -148,6 +148,27 @@ impl<P: Profile> PleLayer<P> {
         conv_state: &mut RecurrentState,
         l: usize,
     ) -> Result<Tensor> {
+        Ok(self.forward_at(hidden, emb, conv_state, l, None)?.0)
+    }
+
+    /// The conv history channel's width, `n·d`.
+    pub fn hc_dim(&self) -> usize {
+        self.n * self.d
+    }
+
+    /// [`Self::forward`], and with `at = Some(rows)` the conv history the
+    /// chunk's first `rows` positions leave (`[n·d, history_len]`): a turn
+    /// checkpoint inside the pass (`sequence-reuse-design.md` §2.3b). The
+    /// history is a slice of the same padded input the pass convolves, so
+    /// it is what a pass of `rows` positions writes.
+    pub fn forward_at(
+        &self,
+        hidden: &Tensor,
+        emb: &Tensor,
+        conv_state: &mut RecurrentState,
+        l: usize,
+        at: Option<usize>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, hc_dim) = hidden.dims3()?;
         let (n, d) = (self.n, self.d);
         if b != 1 || hc_dim != n * d || emb.dim(0)? != seq {
@@ -186,9 +207,9 @@ impl<P: Profile> PleLayer<P> {
             .reshape((1, seq, n * d))?;
 
         let normed = grouped_rms_norm(&gated, &self.unit_d, &self.norm_conv, n, d, self.eps)?;
-        let conv = self.dilated_conv(&normed, conv_state, l)?; // [1, seq, n*d]
+        let (conv, hist_at) = self.dilated_conv(&normed, conv_state, l, at)?; // [1, seq, n*d]
         let conv = ops::silu(&conv)?;
-        gated + conv
+        Ok(((gated + conv)?, hist_at))
     }
 
     /// Depthwise causal conv, dilated by `ngram_size`, over `x [1, seq, hc_dim]`
@@ -199,7 +220,8 @@ impl<P: Profile> PleLayer<P> {
         x: &Tensor,
         conv_state: &mut RecurrentState,
         l: usize,
-    ) -> Result<Tensor> {
+        at: Option<usize>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (_, seq, ch) = x.dims3()?;
         let hist = self.history_len();
         let dt = x.dtype();
@@ -221,10 +243,15 @@ impl<P: Profile> PleLayer<P> {
             });
         }
         let out = acc.expect("k >= 1");
+        let hist_at = match at {
+            Some(r) if r <= seq => Some(padded.narrow(1, r, hist)?.contiguous()?),
+            Some(r) => lloom_tensor::bail!("ple: a checkpoint {r} rows into a {seq}-row chunk"),
+            None => None,
+        };
         // New history: the last `hist` columns of the padded input.
         let new_hist = padded.narrow(1, seq, hist)?.contiguous()?;
         conv_state.write(l, new_hist)?;
-        out.t()?.reshape((1, seq, ch))
+        Ok((out.t()?.reshape((1, seq, ch))?, hist_at))
     }
 }
 
@@ -507,7 +534,7 @@ mod tests {
         }
         let x = Tensor::from_vec(xv, (1, seq, ch), &dev).unwrap();
         let mut st = RecurrentState::new(1);
-        let y = layer.dilated_conv(&x, &mut st, 0).unwrap();
+        let y = layer.dilated_conv(&x, &mut st, 0, None).unwrap().0;
         let yv = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         // t = 11, channel 0: 1·x[2] + 2·x[5] + 3·x[8] + 4·x[11] = 2 + 10 + 24 + 44 = 80.
         assert_eq!(yv[11 * ch], 80.0);
@@ -519,7 +546,7 @@ mod tests {
         let mut st2 = RecurrentState::new(1);
         for t in 0..seq {
             let xt = x.narrow(1, t, 1).unwrap();
-            let yt = layer.dilated_conv(&xt, &mut st2, 0).unwrap();
+            let yt = layer.dilated_conv(&xt, &mut st2, 0, None).unwrap().0;
             let v = yt.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             assert_eq!(v, yv[t * ch..(t + 1) * ch].to_vec(), "position {t}");
         }

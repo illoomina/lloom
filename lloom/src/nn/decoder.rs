@@ -20,11 +20,10 @@
 use crate::nn::blocks::{Ffn, Mixer, Norm};
 use crate::nn::model::{CacheReset, CacheRewind, CausalLM, Model};
 use crate::nn::ops::KvPrecision;
-use crate::nn::ring::Ring;
 use crate::nn::row_log::RowLog;
 use crate::nn::speculator::{accept_prefix, Anchor, Draft, DraftTokens, NextnHidden, Probes};
+use crate::nn::turn_checkpoint::CheckpointRing;
 use crate::nn::var_builder::VarBuilder;
-use crate::nn::zeros as zs;
 use crate::optimizer::{NodeId, Shape, Visit, Walker};
 use crate::profile::Profile;
 use lloom_tensor::quantized::QMatMul;
@@ -562,23 +561,10 @@ pub struct DecoderState<L: Layer> {
     nextn: RowLog,
     want_nextn: bool,
     nextn_drops: u64,
-    /// The turn checkpoints (`sequence-reuse-design.md` §2.3b): `ckpt_slots`
-    /// frames of one ring, each every layer's [`Layer::checkpoint_elems`]
-    /// f32s laid end to end (`ckpt_layout`: offset and count per layer), the
-    /// KV layers' lengths in the marks. The ring is allocated at a
-    /// sequence's first checkpoint and kept; a slot is reused oldest first.
-    ckpt_slots: usize,
-    ckpt_layout: Vec<(usize, usize)>,
-    ckpt_ring: Option<Ring>,
-    checkpoints: Vec<TurnCheckpoint>,
-    ckpt_next: usize,
-    /// Where the passes that follow should leave their checkpoint
-    /// ([`Self::checkpoint_at`]).
-    ckpt_want: Option<usize>,
-    /// Until a caller hints, every multi-token pass checkpoints its end; a
-    /// hinted state is driven by its hints alone (a tiled prefill's other
-    /// tiles take none), until a reset.
-    ckpt_auto: bool,
+    /// The turn checkpoints (`sequence-reuse-design.md` §2.3b): the ring
+    /// of every layer's [`Layer::checkpoint_elems`] f32s, the KV layers'
+    /// lengths in the marks (`nn::turn_checkpoint`).
+    ckpt: CheckpointRing,
 }
 
 #[derive(Debug)]
@@ -586,15 +572,6 @@ struct DecoderWindow {
     pos: usize,
     marks: Vec<WindowMark>,
     retained: usize,
-}
-
-/// A turn checkpoint: the position it stands at and, per layer, the mark a
-/// restore needs beside the ring frame (a KV cache's lengths).
-#[derive(Debug, Clone)]
-struct TurnCheckpoint {
-    pos: usize,
-    valid: bool,
-    marks: Vec<WindowMark>,
 }
 
 impl<L: Layer> DecoderState<L> {
@@ -606,150 +583,66 @@ impl<L: Layer> DecoderState<L> {
             nextn: RowLog::default(),
             want_nextn: false,
             nextn_drops: 0,
-            ckpt_slots: 0,
-            ckpt_layout: Vec::new(),
-            ckpt_ring: None,
-            checkpoints: Vec::new(),
-            ckpt_next: 0,
-            ckpt_want: None,
-            ckpt_auto: true,
+            ckpt: CheckpointRing::none(),
         }
     }
 
     /// Keep `slots` turn checkpoints, each `elems[l]` f32s for layer `l`.
     pub fn with_checkpoints(mut self, elems: &[usize], slots: usize) -> Self {
-        let mut off = 0;
-        self.ckpt_layout = elems
-            .iter()
-            .map(|&n| {
-                let o = off;
-                off += n;
-                (o, n)
-            })
-            .collect();
-        self.ckpt_slots = slots;
+        self.ckpt = CheckpointRing::new(elems, slots);
         self
-    }
-
-    fn ckpt_elems(&self) -> usize {
-        self.ckpt_layout.iter().map(|(_, n)| n).sum()
     }
 
     /// The checkpoint ring's bytes (allocated at the first checkpoint).
     pub fn checkpoint_bytes(&self) -> usize {
-        self.ckpt_slots * self.ckpt_elems() * DType::F32.size_in_bytes()
+        self.ckpt.bytes()
     }
 
     pub fn checkpoint_slots(&self) -> usize {
-        self.ckpt_slots
+        self.ckpt.slots()
     }
 
     /// The positions the valid checkpoints stand at.
     pub fn checkpoint_positions(&self) -> Vec<usize> {
-        self.checkpoints
-            .iter()
-            .filter(|c| c.valid)
-            .map(|c| c.pos)
-            .collect()
+        self.ckpt.positions()
     }
 
     /// Have the passes that follow leave their checkpoint at `pos` (one a
     /// pass covers takes it there instead of at its end). Ignored without
     /// checkpoint slots.
     pub fn checkpoint_at(&mut self, pos: usize) {
-        if self.ckpt_slots > 0 {
-            self.ckpt_want = Some(pos);
-            self.ckpt_auto = false;
-        }
+        self.ckpt.hint(pos);
     }
 
     pub fn checkpoint_hint(&self) -> Option<usize> {
-        self.ckpt_want
-    }
-
-    /// Frame `slot`'s view for layer `l`, `[elems]` f32; `None` for a layer
-    /// whose checkpoint is its mark alone.
-    fn frame_view(&self, slot: usize, l: usize) -> Result<Option<Tensor>> {
-        let (off, n) = self.ckpt_layout[l];
-        if n == 0 {
-            return Ok(None);
-        }
-        let ring = self
-            .ckpt_ring
-            .as_ref()
-            .ok_or_else(|| lloom_tensor::Error::msg("decoder state: no checkpoint ring"))?;
-        Ok(Some(ring.frame(slot)?.narrow(0, off, n)?))
-    }
-
-    /// The slot the next checkpoint, at `pos`, goes in: the oldest, its
-    /// frame rewritten; the ring allocated at the first (one request, outside
-    /// every plan, kept for the sequence).
-    fn open_checkpoint(&mut self, pos: usize, dev: &Device) -> Result<usize> {
-        let elems = self.ckpt_elems();
-        if elems > 0 && self.ckpt_ring.is_none() {
-            self.ckpt_ring = Some(Ring::allocate(
-                self.ckpt_slots,
-                elems,
-                DType::F32,
-                dev,
-                zs::NN_DECODER_CHECKPOINTS,
-                "decoder-turn-checkpoints",
-            )?);
-        }
-        let slot = self.ckpt_next % self.ckpt_slots;
-        let c = TurnCheckpoint {
-            pos,
-            valid: false,
-            marks: Vec::new(),
-        };
-        if slot < self.checkpoints.len() {
-            self.checkpoints[slot] = c;
-        } else {
-            self.checkpoints.push(c);
-        }
-        self.ckpt_next = (slot + 1) % self.ckpt_slots;
-        Ok(slot)
-    }
-
-    fn close_checkpoint(&mut self, slot: usize, marks: Vec<WindowMark>) {
-        let c = &mut self.checkpoints[slot];
-        c.marks = marks;
-        c.valid = true;
-        if self.ckpt_want == Some(c.pos) {
-            self.ckpt_want = None;
-        }
-    }
-
-    /// Checkpoints past `pos` describe positions the state no longer holds.
-    fn forget_checkpoints_past(&mut self, pos: usize) {
-        for c in &mut self.checkpoints {
-            if c.pos > pos {
-                c.valid = false;
-            }
-        }
-    }
-
-    fn checkpoint_index(&self, pos: usize) -> Option<usize> {
-        self.checkpoints
-            .iter()
-            .position(|c| c.valid && c.pos == pos)
+        self.ckpt.hinted()
     }
 
     /// Whether [`Self::restore`] can put the state back at exactly `pos`: a
     /// checkpoint stands there and no window is open.
     pub fn can_restore(&self, pos: usize) -> bool {
-        self.window.is_none() && pos <= self.pos && self.checkpoint_index(pos).is_some()
+        self.window.is_none() && pos <= self.pos && self.ckpt.index(pos).is_some()
+    }
+
+    /// The latest checkpoint at or before `pos` (`CacheRewind::restore_point`).
+    pub fn restore_point(&self, pos: usize) -> Option<usize> {
+        if self.window.is_some() {
+            return None;
+        }
+        self.ckpt
+            .latest_at_or_before(pos.min(self.pos))
+            .map(|(_, p)| p)
     }
 
     /// Put every layer back where the checkpoint at `pos` was taken — a KV
     /// cache to its length, a recurrent state to the frame's copy — and the
     /// position with them; what the discarded positions retained goes.
     pub fn restore(&mut self, pos: usize) -> Result<()> {
-        let Some(idx) = self.checkpoint_index(pos).filter(|_| self.can_restore(pos)) else {
+        let Some(idx) = self.ckpt.index(pos).filter(|_| self.can_restore(pos)) else {
             lloom_tensor::bail!(
                 "decoder state: no turn checkpoint stands at {pos} (position {}, checkpoints at {:?}{})",
                 self.pos,
-                self.checkpoint_positions(),
+                self.ckpt.positions(),
                 if self.window.is_some() {
                     ", a window is open"
                 } else {
@@ -757,7 +650,7 @@ impl<L: Layer> DecoderState<L> {
                 }
             )
         };
-        let marks = self.checkpoints[idx].marks.clone();
+        let marks = self.ckpt.marks(idx).to_vec();
         if marks.len() != self.layers.len() {
             lloom_tensor::bail!(
                 "decoder state: a checkpoint of {} layers for {} layers",
@@ -766,14 +659,14 @@ impl<L: Layer> DecoderState<L> {
             )
         }
         let frames = (0..self.layers.len())
-            .map(|l| self.frame_view(idx, l))
+            .map(|l| self.ckpt.frame(idx, l))
             .collect::<Result<Vec<_>>>()?;
         for ((s, frame), mark) in self.layers.iter_mut().zip(&frames).zip(&marks) {
             L::restore_checkpoint(s, frame.as_ref(), *mark)?;
         }
         self.pos = pos;
         self.nextn.clear();
-        self.forget_checkpoints_past(pos);
+        self.ckpt.forget_past(pos);
         Ok(())
     }
 
@@ -806,7 +699,7 @@ impl<L: Layer> DecoderState<L> {
             L::rewind_window(s, *m)?;
         }
         self.pos = w.pos;
-        self.forget_checkpoints_past(self.pos);
+        self.ckpt.forget_past(self.pos);
         self.nextn.keep_first(w.retained)
     }
 
@@ -869,7 +762,7 @@ impl<L: Layer> DecoderState<L> {
             L::accept_window(s, a, at)?;
         }
         self.pos = w.pos + a;
-        self.forget_checkpoints_past(self.pos);
+        self.ckpt.forget_past(self.pos);
         self.nextn.keep_first(w.retained + a)
     }
 
@@ -889,7 +782,7 @@ impl<L: Layer> DecoderState<L> {
             L::truncate_state(s, tokens)?;
         }
         self.pos = tokens;
-        self.forget_checkpoints_past(tokens);
+        self.ckpt.forget_past(tokens);
         self.nextn.clear();
         Ok(())
     }
@@ -937,11 +830,7 @@ impl<L: Layer> CacheReset for DecoderState<L> {
         self.nextn.clear();
         // The ring stays (the next sequence writes over it); its contents
         // describe nothing now.
-        for c in &mut self.checkpoints {
-            c.valid = false;
-        }
-        self.ckpt_want = None;
-        self.ckpt_auto = true;
+        self.ckpt.forget_all();
     }
 }
 
@@ -963,6 +852,9 @@ impl<L: Layer> CacheRewind for DecoderState<L> {
     }
     fn can_restore(&self, pos: usize) -> bool {
         DecoderState::can_restore(self, pos)
+    }
+    fn restore_point(&self, pos: usize) -> Option<usize> {
+        DecoderState::restore_point(self, pos)
     }
     fn restore(&mut self, pos: usize) -> Result<()> {
         DecoderState::restore(self, pos)
@@ -1098,39 +990,23 @@ where
                 embeds.shape()
             )
         }
-        // A hint at a position already passed is stale; one a checkpoint
-        // already stands at is met.
-        if let Some(w) = state.ckpt_want {
-            if w < state.pos || state.checkpoint_index(w).is_some() {
-                state.ckpt_want = None;
-            }
-        }
-        let ckpt_on = state.ckpt_slots > 0 && state.window.is_none();
+        state.ckpt.drop_stale_hint(state.pos);
+        let windowed = state.window.is_some();
         let mut last = None;
         let mut start = 0;
         while start < seq {
             let len = (seq - start).min(self.chunk);
             let at = state.pos;
-            // The checkpoint this chunk leaves: at the hinted position when
-            // the chunk covers it, else at the end of a multi-token pass
-            // with no hint pending.
-            let rows = if !ckpt_on {
-                None
-            } else if let Some(w) = state.ckpt_want.filter(|&w| w >= at && w <= at + len) {
-                Some(w - at)
-            } else if state.ckpt_auto && state.ckpt_want.is_none() && start + len == seq && seq >= 2
-            {
-                Some(len)
-            } else {
-                None
-            };
+            let rows = state
+                .ckpt
+                .rows_for(at, len, start + len == seq, seq, windowed);
             let mut h = embeds.narrow(1, start, len)?;
             match rows {
                 Some(rows) => {
-                    let slot = state.open_checkpoint(at + rows, embeds.device())?;
+                    let slot = state.ckpt.open(at + rows, embeds.device())?;
                     let mut marks = Vec::with_capacity(self.layers.len());
                     for (l, layer) in self.layers.iter().enumerate() {
-                        let frame = state.frame_view(slot, l)?;
+                        let frame = state.ckpt.frame(slot, l)?;
                         let (out, mark) = layer.execute_checkpointing(
                             &h,
                             &mut state.layers[l],
@@ -1140,7 +1016,7 @@ where
                         h = out;
                         marks.push(mark);
                     }
-                    state.close_checkpoint(slot, marks);
+                    state.ckpt.close(slot, marks);
                 }
                 None => {
                     for (l, layer) in self.layers.iter().enumerate() {

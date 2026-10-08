@@ -330,6 +330,15 @@ pub trait CacheRewind {
         false
     }
 
+    /// The position a request diverging at `pos` is put back at from a
+    /// turn checkpoint: the latest one at or before `pos`, so a checkpoint
+    /// placed at the start of the generation prompt serves a re-render that
+    /// keeps a few of its tokens. The default is `pos` itself when
+    /// [`Self::can_restore`] takes it.
+    fn restore_point(&self, pos: usize) -> Option<usize> {
+        self.can_restore(pos).then_some(pos)
+    }
+
     /// Take the cache back to `pos` from a turn checkpoint: the KV to that
     /// length, the recurrent state as a pass ending at `pos` leaves it.
     /// Refused where [`Self::can_restore`] is false, before any mutation.

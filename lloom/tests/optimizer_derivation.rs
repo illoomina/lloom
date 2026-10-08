@@ -66,9 +66,8 @@ fn census_of(cfg: &Config) -> (u64, Vec<(String, u64)>) {
 /// `== kernels per decode token (step 1) ==` block in the IR's families
 /// (`optimizer::kernel_family`), and its `dispatches per decode token`.
 fn traced_census() -> (u64, Vec<(String, u64)>) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "../../design/measurements/issue-732-raw/remarks/lfm2-trace-arena-shuffle-branch.txt",
-    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/lfm2-trace-arena-shuffle-branch.txt");
     let text = std::fs::read_to_string(&path).expect("the committed trace");
     let mut lines = text.lines();
     lines

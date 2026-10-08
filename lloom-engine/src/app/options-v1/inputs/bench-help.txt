@@ -1,0 +1,509 @@
+The benchmark cells (the pipette sidecar's) in-process, both families
+
+Usage: lloom bench [OPTIONS]
+
+Options:
+      --model <MODEL>
+          The model: an LFM2 checkpoint directory (config.json, tokenizer.json, *.safetensors, chat_template.jinja) or a Qwen4-exp GGUF (the first shard, `-00001-of-0000N`; its siblings are found beside it, or a directory holding them). Defaults to LFM2_MODEL_DIR, then the LFM2.5-2.6B snapshot in the HF cache
+      --model-name <MODEL_NAME>
+          The `model` id reported by `/v1/models` and accepted by requests. Defaults to the checkpoint's Hub id when it is a HF-cache snapshot
+      --no-warmup
+          Skip the pipeline warmup at load (the first prompt then compiles the prefill pipelines inside its own TTFT)
+      --cpu
+          Force the CPU device
+      --tokenizer <TOKENIZER>
+          Qwen4-exp: tokenizer.json (with chat_template.jinja beside it). Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot
+      --experts <EXPERTS>
+          Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand, the tier that fits this machine; `expert-streaming.md` §20) or `resident` (every expert in memory) [default: stream]
+      --loader <LOADER>
+          Qwen4-exp, `--experts stream`: the loader primitive, `pread` (read + compute-encoder copy) or `io` (`MTLIOCommandQueue`) [default: pread]
+      --ple-cache-rows <PLE_CACHE_ROWS>
+          Qwen4-exp: rows of the N-gram PLE hot-row cache (0 = read the memory map every gather) [default: 0]
+      --no-ple
+          Qwen4-exp: load without the N-gram PLE (a measurement arm; the digests belong to the PLE-on model)
+      --moe-act <MOE_ACT>
+          Qwen4-exp: the routed experts' activation dtype — `auto` (`f16` under the `fast` contract, `f32` under `deterministic`), `f32` (the byte-identical routed arm) or `f16` [default: auto]
+      --hotlist <HOTLIST>
+          Qwen4-exp `--experts stream`: the expert hotlist file — read at load to warm every layer's pool before the first request (§20.3 R2; a missing file warms nothing), written at shutdown with the usage since load merged in
+      --prefetch [<BOOL>]
+          Qwen4-exp `--experts stream`: the expert prefetcher (the streamed tier's reads off the encoding thread, ahead of the layer; §20.4) [default: true] [possible values: true, false]
+      --io-hints [<BOOL>]
+          Qwen4-exp `--experts stream --loader io`: the in-flight residency hints into free slots (measured not to pay on a pool smaller than the tile; off) [default: false] [possible values: true, false]
+      --prefill-mode <chunk|replay>
+          Qwen4-exp: how a prompt is prefilled — `chunk` (the chunked DeltaNet / QSA passes) or `replay` (the decode recurrence replayed per token; a reference arm) [default: chunk]
+      --pin <PIN>
+          Qwen4-exp `--experts stream --hotlist`: pin this many experts per layer from the hotlist (never evicted); 0 = none [default: 0]
+      --flash-k <K>
+          LFM2, under `--attn flash`: pages per FlashDecoding chunk (`k` of `chunk_size = k × page_size`; 1, the shipped value, is a 256-key chunk per partial threadgroup). A probe of the partial kernel's geometry at long context; `k > 1` needs the pool's pages chunk-contiguous, which a fresh single-sequence pool is and a recycled one is not (§10.3d)
+      --config <PATH>
+          A JSON file of option groups (`{"decode": {...}}`) — what `lloom config` prints, read back. Applied over the defaults and the env aliases
+      --decode-config <JSON>
+          The decode group as JSON (`'{"readback": "ring-hostdrain", "in_flight": 2}'`)
+      --tuning-config <JSON>
+          The tuning group as JSON (`'{"qmv": {"q6k_nr0": 4}, "metal": {"cut_policy": "node-aligned"}}'`)
+      --model-config <JSON>
+          The model group as JSON (`'{"cache": "crown", "axes": {"attn": "flash", "kv-append": "paged"}}'`)
+      --speculative-config <JSON>
+          The speculative group as JSON (`'{"method": "mtp", "k": 2, "drafter": "…gguf"}'`)
+      --executor-config <JSON>
+          The executor group as JSON (`'{"replay": true, "replay_barriers": "always"}'`)
+      --memory-config <JSON>
+          The memory group as JSON (`'{"memory_fraction": 0.75, "kv_capacity": 4096, "slots": "200"}'`)
+      --generation-config <JSON>
+          The sampling group as JSON (`'{"temperature": 0.7, "top_p": 0.9, "max_tokens": 256}'`; vLLM's name)
+      --speculate <METHOD>
+          The speculative body by name (`speculative.method`): `none`, `dspark`, `mtp`, `dflash` (Qwen4-exp's block drafter), or `auto` — the family's own drafter when one is at hand. `--dspark` and `--mtp` override it
+      --dspark
+          LFM2: the speculative body (`speculative.method = dspark`): a DSpark drafter proposes a block per round, the target verifies it in one pass. Loads the newest LFM2.5-2.6B-DSpark snapshot in the HF cache, or `--draft-dir`
+      --draft-dir <DIR>
+          The block drafter's checkpoint directory (`speculative.drafter`): LFM2's DSpark under `--dspark`, Qwen4-exp's DFlash under `--speculate dflash`
+      --dspark-k <DSPARK_K>
+          Under `--dspark` (LFM2) or `--speculate dflash` (Qwen4-exp): propose this many positions per round (default: LFM2 the block, 9; Qwen4-exp 3 of its 7), clamped to the block (`speculative.k`)
+      --mtp <GGUF>
+          Qwen4-exp: the GGUF carrying the MTP head (`blk.{n_layers}.*` + `nextn.*`, the sidecar `qwen4exp-mtp-quantize write` produces); `speculative.method = mtp`, `speculative.drafter`
+      --mtp-k <MTP_K>
+          Qwen4-exp `--mtp`: tokens the drafter proposes per round (`speculative.k`)
+      --set <KEY=VALUE>
+          One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`)
+      --readback <SPELLING>
+          The token mechanisms; `--readback <spelling>` is the shorthand. (a shorthand for the group's keys)
+      --kind <READBACKKIND>
+          The strategy: `auto` (the ring where the sampler admits it), `blocking`, `ring`. [arms: auto, blocking, ring]
+      --eos <EOSKIND>
+          How a ring learns EOS. [arms: blocking, poll, host-drain, gpu-batched, gpu-batched-nonblocking]
+      --poll <POLLMECHANISM>
+          The poll mechanism under `eos = poll` (`wfe` on aarch64 by default). [arms: spin, spin-hint, wfe, sleep, sleep:<µs>]
+      --lookahead <USIZE>
+          Forward passes the host enqueues before it has learned the previous step's EOS (ring arms): 0 or 1. [arms: 0, 1]
+      --commit-budget <COMMITBUDGET>
+          How often the loop commits and prunes the in-flight queue: `per-token` or `steps:<N>`. [arms: per-token, steps:<N>]
+      --adaptive-commit [<BOOL>]
+          The adaptive commit (lloom #735): a buffer closes when the GPU starts the previous one, no cadence; needs a ring arm and lookahead 1, drains through the reader [possible values: true, false]
+      --run-ahead <USIZE>
+          Under the adaptive commit: the most steps one buffer holds before it closes regardless (0 = 8)
+      --eos-gate [<BOOL>]
+          The EOS gate: the kernels queued past an EOS return at once, so the cache ends at the EOS. Rides the adaptive commit; off where the adaptive commit does not run, or under the ICB replay executor [possible values: true, false]
+      --fused-publish [<BOOL>]
+          Under the adaptive commit: publish with the fused argmax·eos·stamp kernel (off = the six-launch chain, the A/B arm) [possible values: true, false]
+      --stream-reader [<BOOL>]
+          Stream tokens off a ring-reader thread per token instead of the loop's commit-cadence drain (ring arms; implied by the adaptive commit) [possible values: true, false]
+      --wake-cadence <USIZE>
+          Commits between live completion-marker writes on the deferred-marker arms (`host-drain`, `gpu-batched*`)
+      --in-flight <USIZE>
+          How many forwards the host may run ahead of the GPU (the pacer's bound); 0 = the depth warmup measured. [env: LLOOM_IN_FLIGHT]
+      --phase-sync [<BOOL>]
+          Diagnostic, perturbs what it measures: drain the GPU per phase of a speculative round [possible values: true, false]
+      --prefill-tile <USIZE>
+          The TILE: the most prompt tokens one prefill forward takes (llama.cpp's `n_ubatch`); 0 = the whole prompt in one forward
+      --prefill-ubatch <USIZE>
+          The spark: how many prompt tokens the FIRST forward takes, the remainder in one more (0 = one-shot)
+      --prefill-chunk <USIZE>
+          The CHUNK under `--batch N`: the most prompt tokens fed per batched step as extra ragged rows (0 = a whole prompt at its arrival)
+      --spark <STRING>
+          An aligned-bucket schedule for the prefill forwards: `N` or `progressive:START,STOP`, optionally `/tile:BULK`. [arms: 1, 16, 32, 64, progressive:START,STOP, …/tile:BULK]
+      --pass-widths <PASSWIDTHS>
+          How a batched step's prompt pieces are sized: `lru` or `ladder` (DESIGN §9.2aa I4). [arms: lru, ladder]
+      --prefill-in-flight <USIZE>
+          The pacer's in-flight bound during prefill (0 = decode's depth). [env: LLOOM_PREFILL_IN_FLIGHT]
+      --profile <STRING>
+          The determinism contract: `fast` (the default: the same distribution; licenses the arms whose bits depend on scheduling or batch composition) or `deterministic` (same inputs + seed → same bits; every gate pins it). [arms: deterministic, fast] [env: LLOOM_PROFILE]
+      --gemm-skinny-max <USIZE>
+          The `m` (rows) up to which the skinny 16-row GEMM tile is taken; above it the 64-row tile (§13.5o/p). [env: LLOOM_364_SKINNY_MAX]
+      --gemm-tile <STRING>
+          Pin the GEMM tile (an A/B arm): `32x32 | 32x16 | 16x32 | 16x16 | 64x32 | 64x64`; none = the derived tile. [arms: none, 32x32, 32x16, 16x32, 16x16, 64x32, 64x64] [env: LLOOM_383_TILE]
+      --gemv-bm <USIZE>
+          Pin the decode GEMV's `bm` (an A/B arm): 4 or 8; none = the derived tile. [arms: none, 4, 8] [env: LLOOM_492_GEMV_BM]
+      --force-gemm <STRING>
+          Force the GEMM route where the GEMV would be taken (an A/B arm): `m | n | both`; none = the rule. [arms: none, m, n, both] [env: LLOOM_386_FORCE_GEMM]
+      --qmv-iq2xs-nsg <USIZE>
+          Simdgroups a threadgroup on the IQ2_XS routed core (a function constant; 1..16). [env: LLOOM_QMV_IQ2XS_NSG]
+      --qmv-iq4nl-nsg <USIZE>
+          Simdgroups a threadgroup on the IQ4_NL core (a function constant; 1..16). [env: LLOOM_QMV_IQ4NL_NSG]
+      --qmv-iq2s-nsg <USIZE>
+          Simdgroups a threadgroup on the IQ2_S core, its 8 KB grid staged per threadgroup (P31 (4); 1..16). [env: LLOOM_QMV_IQ2S_NSG]
+      --qmv-q4k-nr0 <USIZE>
+          Rows a simdgroup on the Q4_K core: set, two simdgroups of that many rows (ggml master's 2 × 2); none = the incumbent one simdgroup of four (P31 (5)). [arms: none, 1, 2, 3, 4] [env: LLOOM_QMV_Q4K_NR0]
+      --qmv-q5k-nr0 <USIZE>
+          Rows a simdgroup on the Q5_K core: 1 (ggml master's) or 2; none = the incumbent 2 (P31 (5)). [arms: none, 1, 2, 4] [env: LLOOM_QMV_Q5K_NR0]
+      --qmv-q6k-nr0 <USIZE>
+          Rows a simdgroup on the Q6_K core (a function constant; 1..4; 2 = ggml master's). [env: LLOOM_QMV_Q6K_NR0]
+      --qmv-rows [<BOOL>]
+          The small-batch quantized gemv (NR1 rows per weight read) instead of per-row launches — measured no faster here; not bit-identical. [env: LLOOM_QMV_ROWS] [possible values: true, false]
+      --qmv-mm-from <USIZE>
+          Rows from which a quantized stem takes the mm kernel instead of the row gemvs (none = 9: up to 8 rows on the gemv). [env: LLOOM_QMV_MM_FROM]
+      --qmv-id-union [<BOOL>]
+          The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic; a function constant). [env: LLOOM_QMV_ID_UNION] [possible values: true, false]
+      --qmm-dequant-from <USIZE>
+          Rows from which a quantized stem's GEMM dequantises the weight to f16 once and runs the f16 arm (0 = never). [env: LLOOM_QMM_DEQUANT_FROM]
+      --qmm-dequant-gemm <STRING>
+          The GEMM over the dequantised scratch: `qmm` (the quantized GEMM's f16 arm) or `steel`. [arms: qmm, steel] [env: LLOOM_QMM_DEQUANT_GEMM]
+      --qmm-f16-mm [<BOOL>]
+          `QMatMul::TensorF16` takes the f16-weight GEMM past the mixed gemv's rows (off = the classical cast-matmul-cast route). [env: LLOOM_QMM_F16_MM] [possible values: true, false]
+      --dequantize-all [<BOOL>]
+          Dequantise every quantized matmul to f32 (a reference arm). [env: CANDLE_DEQUANTIZE_ALL] [possible values: true, false]
+      --dequantize-all-f16 [<BOOL>]
+          Dequantise every quantized matmul to f16 (a reference arm). [env: CANDLE_DEQUANTIZE_ALL_F16] [possible values: true, false]
+      --moe-mm-from <USIZE>
+          Pairs (rows × experts) from which the routed matmul takes the grouped GEMM instead of the matvec planes (0 = never). [env: LLOOM_MOE_MM_FROM]
+      --moe-mm-bn <USIZE>
+          Pin the routed GEMM's row block: 16 or 32 (0 = the rule: 16 when the experts see few rows each). [arms: 0, 16, 32] [env: LLOOM_MOE_MM_BN]
+      --moe-pair [<BOOL>]
+          Gate and up of a routed layer in one launch on the matmul-vec arm (`kernel_mul_mv_id2`; a GEMM tile always takes two); off = two launches, the A/B arm. [env: LLOOM_MOE_PAIR] [possible values: true, false]
+      --moe-pair-order <STRING>
+          Where the pair's half sits in its launch's grid: `expert` (an expert's gate and up adjacent, the default), `half` (the slowest axis, read by a division: the previous default), `half-cmp` (the same, read by a compare), `tile` (a row tile's gate and up adjacent), or `split` (the pair's kernel once a half, a discriminator). Same bits on every arm. [arms: expert, half, half-cmp, tile, split] [env: LLOOM_MOE_PAIR_ORDER]
+      --gdn-split <USIZE>
+          The most `dk` slices a head's threads take in `gdn_step` (1..32; more slices, longer cross-slice reduction). [env: LLOOM_GDN_SPLIT]
+      --gdn-step-reg [<BOOL>]
+          The step's register form (the default): each thread's slice of `S` held in registers, the slab read once, not twice; `false` = the loop form, the A/B arm (`docs/models/qwen3.8-flash-next.md`). [env: LLOOM_GDN_STEP_REG] [possible values: true, false]
+      --completion-wait <STRING>
+          How the host waits for a command buffer: `synchronize | shared-event | shared-event-sleep[:µs] | shared-event-wait[:ms] | shared-event-listener[:ms]`. [arms: synchronize, shared-event, shared-event-sleep[:µs], shared-event-wait[:ms], shared-event-listener[:ms]] [env: CANDLE_METAL_COMPLETION_WAIT]
+      --compute-per-buffer <USIZE>
+          Dispatches per command buffer on the blocking loop and the prefill (the cut period). [env: CANDLE_METAL_COMPUTE_PER_BUFFER]
+      --pipelined-compute-per-buffer <USIZE>
+          Dispatches per command buffer on the pipelined loop (lookahead ≥ 1). [env: CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER]
+      --cut-policy <STRING>
+          Where a command buffer is cut: `counter` (every period), `node-aligned` (at a layer boundary once the period passed), `nodes:<k>` (a layer partition). [arms: counter, node-aligned, nodes:<k>] [env: CANDLE_METAL_CUT_POLICY]
+      --nodes-per-cb <USIZE>
+          The layer partition's run length (`nodes:<k>` by another name; 0 = off). Takes precedence over `cut_policy` when set, as the variable did. [env: CANDLE_METAL_NODES_PER_CB]
+      --hazard-key <STRING>
+          The hazard tracker's key: `range` (byte ranges; the arena's) or `pointer` (buffer identity); none = the default for the arm. [arms: none, range, pointer] [env: CANDLE_METAL_HAZARD_KEY]
+      --cb-unretained [<BOOL>]
+          Command buffers with unretained references (the liveness discipline is ours; fuzzed by `cb_liveness`). [env: LLOOM_CB_UNRETAINED] [possible values: true, false]
+      --to-cpu-blit [<BOOL>]
+          Read a tensor back through a blit into a staging buffer rather than in place (an A/B arm). [env: CANDLE_METAL_TO_CPU_BLIT] [possible values: true, false]
+      --copy2d-no-blit [<BOOL>]
+          Route every contiguous `copy2d` through the compute copy kernel instead of the blit encoder (an A/B arm). [env: LLOOM_COPY2D_NO_BLIT] [possible values: true, false]
+      --wire-weights [<BOOL>]
+          `mlock` the quantized weight uploads (the slot pools' fix applied to the dense weights; #749 P29). [env: LLOOM_WIRE_WEIGHTS] [possible values: true, false]
+      --heap-chunk-mb <USIZE>
+          The placement heap's chunk size in MiB (≥ 16). [env: LLOOM_HEAP_CHUNK_MB]
+      --transient-heaps [<BOOL>]
+          Serve pool misses from heap chunks instead of a buffer each (an A/B arm; #749 P26). [env: LLOOM_TRANSIENT_HEAPS] [possible values: true, false]
+      --io-lanes <USIZE>
+          IO command buffers a point-of-use batch of the `io` loader is split across (≥ 1). [env: LLOOM_IO_LANES]
+      --metal-cflags <STRING>
+          Extra Metal compiler flags for the kernel library (an A/B arm; none = the default arm). [env: LLOOM_434_METAL_CFLAGS]
+      --merged-unit [<BOOL>]
+          Compile the kernel sources as one translation unit (an A/B arm). [env: LLOOM_477_MERGED_UNIT] [possible values: true, false]
+      --icb-quarantine-off [<BOOL>]
+          Lift the ICB replay quarantine on the `_swiglu_` kernels (the #732 reproducer's switch). [env: LLOOM_ICB_QUARANTINE_OFF] [possible values: true, false]
+      --icb-residency <STRING>
+          The ICB run's residency declaration: `per-run` (the buffers a run binds) or `plan-wide` (every buffer the plan binds, at every run). [arms: per-run, plan-wide] [env: LLOOM_688_RESIDENCY]
+      --allow-emulated <STRING>
+          Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a). [arms: none, bf16] [env: LLOOM_METAL_ALLOW_EMULATED]
+      --pool-reuse-oversize-bound <F64>
+          Reuse a free buffer up to this many times the request's size (none = exact-class reuse only). [arms: none, <factor ≥ 1.0>] [env: LLOOM_47_REUSE_OVERSIZE_BOUND]
+      --pool-eviction-order <STRING>
+          Which free buffer eviction takes first: `age` (oldest, what ships) or `size` (largest). [arms: age, size] [env: LLOOM_47_EVICTION_ORDER]
+      --pool-no-reuse [<BOOL>]
+          Never reuse a freed buffer (the corruption-class diagnostic; §2.3.8b). [env: LLOOM_POOL_NO_REUSE] [possible values: true, false]
+      --pool-no-admission-drain [<BOOL>]
+          The admission's second rung off: a pass that does not fit after the free lists are trimmed is NOT waited out for the pending lists (`MetalDevice::admit_bytes`, `memory.md` §9.5t) — the refusal stands on the first figure, or the tenants' pledge alone. The rung costs nothing while the budget suffices (it runs on the refusal path alone) and is counted in the ledger's `drains`; this is the arm without it, for the maintainer's numbers (#892). [env: LLOOM_POOL_NO_ADMISSION_DRAIN] [possible values: true, false]
+      --pool-quarantine <U64>
+          Completed command buffers a released buffer must outlive before reuse (0 ships; the #748 A/B). [env: LLOOM_POOL_QUARANTINE]
+      --pool-retain-evicted [<BOOL>]
+          Keep evicted buffers in the residency set (the pre-#206 arm). [env: CANDLE_METAL_RETAIN_EVICTED] [possible values: true, false]
+      --unpooled-uploads [<BOOL>]
+          Every host upload takes the unpooled `newBufferWithBytes` path (an A/B instrument). [env: LLOOM_UNPOOLED_UPLOADS] [possible values: true, false]
+      --stream-pooled-staging [<BOOL>]
+          Stage streamed weight loads through the Shared buffer pool instead of an unpooled buffer per load (the #748 A/B). [env: LLOOM_STREAM_POOLED_STAGING] [possible values: true, false]
+      --buffer-alignment <USIZE>
+          The pool's buffer alignment in bytes (a power of two ≥ 16; §9.2r). [env: LLOOM_586_BUFFER_ALIGNMENT]
+      --gpu-profile [<BOOL>]
+          The GPU profiler: per-command-buffer GPU intervals and per-label census (`PROFILE` lines). [env: CANDLE_METAL_PROFILE] [possible values: true, false]
+      --profile-counters [<BOOL>]
+          Under `profile`: time every compute encoder with stage-boundary counter samples. [env: CANDLE_METAL_PROFILE_COUNTERS] [possible values: true, false]
+      --profile-encoder-per-dispatch [<BOOL>]
+          Under `profile`: end the compute encoder after every dispatch, so each counter-sampled encoder is one kernel (an arm: a seam per dispatch). [env: CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH] [possible values: true, false]
+      --trace [<BOOL>]
+          The dispatch trace recorder (kernel, grid, threadgroup, barrier, encoder per dispatch). [env: CANDLE_METAL_TRACE] [possible values: true, false]
+      --pool-trace [<BOOL>]
+          Trace every buffer-pool allocation (who missed, at what size). [env: LLOOM_POOL_TRACE] [possible values: true, false]
+      --served-request-trace [<BOOL>]
+          Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa). [env: LLOOM_SERVED_REQUEST_TRACE] [possible values: true, false]
+      --readback-trace [<BOOL>]
+          Attribute every host readback (`to_cpu`'s fast and blit paths, a staged read's stage, a host-read slot's read) to the model call site that made it (a backtrace per readback, #814 part 5). [env: LLOOM_READBACK_TRACE] [possible values: true, false]
+      --upload-shadow [<BOOL>]
+          Shadow every host upload and check it back (the #748 corruption instrument). [env: LLOOM_UPLOAD_SHADOW] [possible values: true, false]
+      --late-bind [<BOOL>]
+          Count binds of a pooled buffer after its release (`late_bind.rs`, §15.1m). [env: LLOOM_LATE_BIND] [possible values: true, false]
+      --num-threads <USIZE>
+          Threads the CPU backend uses (0 = the machine's). [env: CANDLE_NUM_THREADS]
+      --mmap-advice <STRING>
+          The `madvise` for a memory-mapped safetensors file: `willneed | sequential`; none = no advice. [arms: none, willneed, sequential] [env: CANDLE_MMAP_ADVICE]
+      --grad-do-not-detach [<BOOL>]
+          Keep the autograd graph's detached nodes (a debugging arm). [env: CANDLE_GRAD_DO_NOT_DETACH] [possible values: true, false]
+      --skip-conv-c-fusion [<BOOL>]
+          Run the decode conv's composed path instead of the fused kernel (the A/B for the digest gate). [env: LLOOM_SKIP_CONV_C_FUSION] [possible values: true, false]
+      --rows-arm <STRING>
+          The pool rows' kernels: `batched` (the batch in one dispatch per kernel) or `per-row` (the per-row loop, the A/B arm). [arms: batched, per-row] [env: LLOOM_148_ROWS_ARM]
+      --flash-partial-bn <USIZE>
+          The FlashDecoding partial kernel's block width: 8 or 32 (the kernels differ only in this geometry). [arms: 8, 32] [env: LLOOM_FLASH_PARTIAL_BN]
+      --sdpa-two-pass-k <USIZE>
+          Keys from which a one-query attention takes the 2-pass vector kernel instead of the single-pass one, at every head dim; 0 = the measured threshold per head dim and dtype (`nn::ops::sdpa_vector_two_pass_from`, the arm). Moves digests at the lengths it moves. [env: LLOOM_SDPA_TWO_PASS_K]
+      --lfm2-norm-gemv [<BOOL>]
+          The decode step's RMSNorms computed inside the projections that consume them (`nn::ops::gemv_norm`: one dispatch where the pair is two; moves digests). An arm, off by default. [env: LLOOM_LFM2_NORM_GEMV] [possible values: true, false]
+      --lfm2-fusion-budget <STRING>
+          The weakest numerical class `--fusion derived` may land in: `rounding` (the epilogues) or `reorder` (also the norm inside its consumers' GEMVs, whose sum of squares takes another tree). An arm. [arms: rounding, reorder] [env: LLOOM_LFM2_FUSION_BUDGET]
+      --lfm2-ablate <STRING>
+          Skip these decode-step dispatches — `norm` (the layers' two RMSNorms) — to price what removing them would buy: a timing bound, the output is WRONG. An instrument. [env: LLOOM_LFM2_ABLATE]
+      --share-trace [<BOOL>]
+          Print every prefix share (pages, snapshots) — an instrument. [env: LLOOM_148_SHARE_TRACE] [possible values: true, false]
+      --verify-poll-trace [<BOOL>]
+          Print every verify poll's spins and fallback — an instrument. [env: LLOOM_VERIFY_POLL_TRACE] [possible values: true, false]
+      --poison-zeros <STRING>
+          Fill these zero sites with a sentinel instead of zeros (`nn/zeros.rs`): `all`, or site names separated by commas — an instrument. [env: LLOOM_POISON_ZEROS]
+      --poison-value <STRING>
+          The poison's sentinel: `nan` (any read that reaches arithmetic shows) or `finite` (a read whose value matters shows). [arms: nan, finite] [env: LLOOM_POISON_VALUE]
+      --dspark-ctx <STRING>
+          Where the drafter keeps its context KV: `auto` (paged per sequence on Metal, contiguous on the CPU), `contiguous` (cat-grown) or `paged[:<page_size>][:shared]`. [arms: auto, contiguous, paged[:page][:shared]] [env: LLOOM_DSPARK_CTX_KV]
+      --dspark-eager-attn [<BOOL>]
+          The drafter's eager attention arm (the parity gate's A/B). [env: LLOOM_DSPARK_EAGER_ATTN] [possible values: true, false]
+      --pread-direct [<BOOL>]
+          `pread` straight into the slot's Shared buffer (no staging copy) — measured slower under pressure, opt-in. [env: LLOOM_PREAD_DIRECT] [possible values: true, false]
+      --prefetch-threads <USIZE>
+          Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight). [env: LLOOM_PREFETCH_THREADS]
+      --prefetch-qos <STRING>
+          The prefetcher's reader threads' QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`). [env: LLOOM_PREFETCH_QOS]
+      --prefetch-split <USIZE>
+          Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another). [env: LLOOM_PREFETCH_SPLIT]
+      --prefetch-lead <USIZE>
+          Layers of lead the prefill's prefetcher runs ahead of the layer being computed (≥ 1). [env: QWEN4EXP_PREFETCH_LEAD]
+      --expert-plan <STRING>
+          Where the routed experts are planned: `device` (the settle once a token) or `host` (a readback per layer, the A/B arm). [arms: device, host] [env: QWEN4EXP_PLAN]
+      --decode-hint [<BOOL>]
+          At decode under the host plan, layer l+2's router names the experts to prefetch (recall 0.56, P27). [env: QWEN4EXP_DECODE_HINT] [possible values: true, false]
+      --hint-recall [<BOOL>]
+          Score the residual-speculation hint against the real routing — an instrument (extra router runs and readbacks). [env: QWEN4EXP_HINT_RECALL] [possible values: true, false]
+      --spare-slots <USIZE>
+          Slots each streamed layer keeps free: a miss lands in one, an eviction is quarantined until its readers complete (0 = land in the victim's slot in place; the protocol a load beside the pass needs, off while none runs: each spare slot is one expert less cached). [env: QWEN4EXP_SPARE_SLOTS]
+      --settle-batch [<BOOL>]
+          A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm). [env: QWEN4EXP_SETTLE_BATCH] [possible values: true, false]
+      --spike0 <STRING>
+          Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none). [arms: off, wait] [env: QWEN4EXP_SPIKE0]
+      --trace-settle [<BOOL>]
+          Print every settle's ids, flags and misses — an instrument. [env: QWEN4EXP_TRACE_SETTLE] [possible values: true, false]
+      --expert-fetch <STRING>
+          The fetch inside the token: `inside` = while the pool misses, a device-planned decode step waits on the device at each layer for the misses its router chose, read beside the pass, instead of replaying the token or taking the host plan (`off` = the settle and replay). [arms: off, inside] [env: QWEN4EXP_FETCH]
+      --fetch-poll-us <USIZE>
+          Microseconds the fetch worker sleeps between looks at a layer's routing (it never spins). [env: QWEN4EXP_FETCH_POLL_US]
+      --fetch-exit <USIZE>
+          Fetching steps in a row that load nothing before the waits stop (the pool holds the stream again). [env: QWEN4EXP_FETCH_EXIT]
+      --fetch-settle <STRING>
+          When a fetching step settles (`QWEN4EXP_FETCH=inside`) on a driver that does not settle its steps itself (`provisional`): `behind` = after the next step is encoded, waiting for that step's own pass only, so the host encodes step t+1 while the GPU runs step t (the step's misses were loaded inside it, so its settle is bookkeeping; a pass that still computed on a missing expert — past the worker's fail-safe — is an error, not a redo, its token handed out); `now` = at the step's own end, the host waiting for the GPU every step (the previous behaviour). [arms: behind, now] [env: QWEN4EXP_FETCH_SETTLE]
+      --provisional <STRING>
+          Provisional steps (`CausalLM::provisional`): a decode driver that can take its draw back (the blocking arm) settles each device-planned step itself, after its readback — the pass complete, so the settle waits for nothing — and redraws from the redone step when it computed on a missing expert; the model's step then returns without waiting for its pass. `off` = the step settles at its own end (the host waiting for the GPU every step, then again for the draw). [arms: on, off] [env: QWEN4EXP_PROVISIONAL]
+      --fetch-qos <STRING>
+          The fetch worker's QoS: a class (`user-interactive`, …) or `inherit`. [env: QWEN4EXP_FETCH_QOS]
+      --qwen-fusion <STRING>
+          Who decides the bracket epilogues a decode step takes: `manual` (every one the forward can fuse, the incumbent) or `derived` (the optimizer's plan over the model's walk, once at load; issue #732). [arms: manual, derived] [env: QWEN4EXP_FUSION]
+      --hc-mix [<BOOL>]
+          The fused HyperConnection prologue pair instead of the composed chain (measured +3.6 % slower in situ, P29 (4); the arm the next bracket kernel is measured against). [env: QWEN4EXP_HC_MIX] [possible values: true, false]
+      --fused-off [<BOOL>]
+          Every fused op declines and the composed path runs (the A/B for the fused kernels). [env: QWEN4EXP_FUSED_OFF] [possible values: true, false]
+      --qwen-f16-fuse [<BOOL>]
+          The f16 routed step's SwiGLU as one launch and its combine reading the f16 routed output; off = `silu` + multiply and a cast to f32, two launches more a layer (the A/B arm). [env: QWEN4EXP_F16_FUSE] [possible values: true, false]
+      --qwen-shared-store [<BOOL>]
+          The shared expert's SwiGLU on its quantized projections' stores: the SiLU on the gate's, the product multiplied into the gate's buffer on the up's — one launch less a layer (`silu_mul`); off = the two products and `silu_mul` (the A/B arm). An arm, off by default: measured 1.1 % slower a token (`optimizer-design.md` §10k). [env: QWEN4EXP_SHARED_STORE] [possible values: true, false]
+      --qwen-mtp-experts <STRING>
+          Where the MTP head's routed experts live when the target's are streamed: `streamed` (the head layer takes the target's per-layer slot count and misses as the pool does; the default) or `resident` (every expert of the head layer loaded at load and claimed beside the slot pool — 2.67 GB for the Q8 sidecar, 12 of 314 slots at 0.65 — so no observe pass is flagged and every draft comes from the fold). An arm: on the prose prompt it reads 129 rounds / 30 accepted against streamed's 123 / 36, tokens identical. [arms: resident, streamed] [env: QWEN4EXP_MTP_EXPERTS]
+      --qwen-f16-fold [<BOOL>]
+          The f16 routed step's activation cast folded into the gate|up launch (an f32 activation rounded to half as it loads); off = the `cast_f32_f16` launch in front of it (the A/B arm). Same bits either way. [env: QWEN4EXP_F16_FOLD] [possible values: true, false]
+      --chunk-scan [<BOOL>]
+          The DeltaNet prefill's chunk scan as one launch (off = the per-chunk launches). [env: QWEN4EXP_CHUNK_SCAN] [possible values: true, false]
+      --delta-reduce [<BOOL>]
+          The delta rule as a broadcast product + reduce instead of batched matmuls (a recorded non-deterministic arm; never shipping). [env: QWEN4EXP_DELTA_REDUCE] [possible values: true, false]
+      --state-write <STRING>
+          How a recurrent state is written: `in-place` or `copy` (an allocation per layer per token; a debugging arm). [arms: in-place, copy] [env: QWEN4EXP_STATE_WRITE]
+      --qwen-prefill-chunk <USIZE>
+          The prefill CHUNK the paired tiles are cut into (0 = the model's default). [env: QWEN4EXP_PREFILL_CHUNK]
+      --prefill-pair [<BOOL>]
+          The paired prefill: two chunks in one forward, the second's loads under the first's compute. [env: QWEN4EXP_PREFILL_PAIR] [possible values: true, false]
+      --prefill-tiles <USIZE>
+          Pipelined prefill tiles in flight (≥ 2; the reserve and admission follow). [env: QWEN4EXP_PREFILL_TILES]
+      --spec-ahead <USIZE>
+          Speculate the next layer's routing ahead: 0 (off) or 1. [arms: 0, 1] [env: QWEN4EXP_SPEC_AHEAD]
+      --mem-check <STRING>
+          What a pass the memory budget cannot take does: `off`, `report` or `refuse`. [arms: off, report, refuse] [env: QWEN4EXP_MEM]
+      --score-no-matmul [<BOOL>]
+          The QSA block score as a broadcast product + reduce instead of the matmul (an A/B instrument). [env: QWEN4EXP_SCORE_NO_MATMUL] [possible values: true, false]
+      --sparse-masked [<BOOL>]
+          A prefill chunk's queries past the QSA dense range attend through one masked dense attention over every cell instead of the paged kernel over each query's cells (an A/B arm). [env: QWEN4EXP_SPARSE_MASKED] [possible values: true, false]
+      --check-sel [<BOOL>]
+          Read the QSA selection back and check it every position — an instrument (a host sync per full layer per token). [env: QWEN4EXP_CHECK_SEL] [possible values: true, false]
+      --watch-nan [<BOOL>]
+          Check every layer's outputs for non-finite values and stop at the first — an instrument. [env: QWEN4EXP_WATCH_NAN] [possible values: true, false]
+      --qwen-trace [<BOOL>]
+          The sub-block activation trace — an instrument (a readback per sub-block). [env: QWEN4EXP_TRACE] [possible values: true, false]
+      --trace-load [<BOOL>]
+          Print each stacked stem's kinds at load — an instrument. [env: QWEN4EXP_TRACE_LOAD] [possible values: true, false]
+      --mtp-probe [<BOOL>]
+          The MTP prompt-row ablation probe — an instrument. [env: QWEN4EXP_MTP_PROBE] [possible values: true, false]
+      --mtp-trace [<BOOL>]
+          Print every MTP verify round's window, argmax and accepted prefix — an instrument. [env: QWEN4EXP_MTP_TRACE] [possible values: true, false]
+      --mtp-draft-loads <STRING>
+          Whether a host-planned MTP verify window loads the DRAFT rows' missing experts beside row 0's: `auto` (while the real row's loads per host-planned window average 2 or more — the pool is missing the stream — off again under 1), `on` (always), `off` (never: a draft row's miss flags the row and loads nothing). [arms: auto, on, off] [env: QWEN4EXP_MTP_DRAFT_LOADS]
+      --mtp-observe-plan <STRING>
+          Where the MTP head's own streamed experts are planned in the drafter's observe: `device` (no readback at its layer; its record settled after the draft's argmax) or `host` (a readback per round, the A/B arm). [arms: device, host] [env: QWEN4EXP_MTP_OBSERVE_PLAN]
+      --qwen-hc-norm-gemv [<BOOL>]
+          Each HyperConnection bracket's grouped RMSNorm computed inside its consumers at a one-row step — the `down` and `inject` mixed GEMVs (the norm in their prologue, `down` also writing the stream scales) and the collapse (reading them) — so `hc_norm_f32` is not launched (`docs/tuning.md` §13.5u). An arm, off by default. [env: QWEN4EXP_HC_NORM_GEMV] [possible values: true, false]
+      --qwen-ablate <STRING>
+          Skip a decode step's work by name, comma-separated (`hcnorm`: each HC bracket's grouped RMSNorm, its input passed through) — an instrument pricing a fusion's bound; the output is wrong. [env: QWEN4EXP_ABLATE]
+      --mtp-verify-key <STRING>
+          How a verify window's planned pass is keyed: `kind` (one key per window length, the incumbent) or `variant` (also by the sequence the window runs: the rows that complete an indexer block, the device or host plan, the drafts' loads, the dense range — so each is served its own plan instead of evicting another's). [arms: kind, variant] [env: QWEN4EXP_MTP_VERIFY_KEY]
+      --qsa-window <STRING>
+          The QSA layers of a verify window: `rows` (each position's prep, append, indexer and attention launched one after another, the incumbent) or `batched` (the window's positions in one launch per kernel, each row's arithmetic unchanged). [arms: rows, batched] [env: QWEN4EXP_QSA_WINDOW]
+      --mtp-fold [<BOOL>]
+          Run the MTP head on every verify window row inside the verify's pass (draft-for-every-prefix) and take the accepted row's draft after the accept, in place of the observe's own submission and readback. [env: QWEN4EXP_MTP_FOLD] [possible values: true, false]
+      --ring-slack-bytes <USIZE>
+          Consumer-slack bytes of the token ring's history (0 = the tight geometry, the A/B baseline). [env: LLOOM_RING_SLACK_BYTES]
+      --hot-thread <STRING>
+          The decode thread's QoS: `interactive` (claim `USER_INTERACTIVE`), `default`, or `off`. [arms: interactive, default, off] [env: LLOOM_HOT_THREAD]
+      --host-feed-qos <STRING>
+          The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`). [env: LLOOM_HOST_FEED_QOS]
+      --host-feed-poll <STRING>
+          How the host fill producer waits between tokens: `on-demand[:<µs>]` (`WFE` while a forward waits on an unfilled value, else a µs sleep: measured fastest), `event[:<µs>]` (park, woken by the ring's publish event or a forward's demand; slower where the pool misses), or one arm throughout: `sleep[:<µs>]`, `wfe`, `spin-hint`, `spin`. [env: LLOOM_HOST_FEED_POLL]
+      --host-feed-trace [<BOOL>]
+          Time every host fill (encoded, observed, signalled) and the producer's loop, and print a `HOSTFEED` line a run — an instrument. [env: LLOOM_HOST_FEED_TRACE] [possible values: true, false]
+      --ring-eos-park [<BOOL>]
+          The fixed cadence's EOS wait parks on the ring's publish event instead of polling the stamp (off: the poll; parking measured 8 % slower a token on LFM2's `ring-fixed`, the event landing ~1 ms after the stamp). [env: LLOOM_RING_EOS_PARK] [possible values: true, false]
+      --verify-park [<BOOL>]
+          DSpark's verify completion parks on an event behind the round's stamp instead of polling it (off = the poll, the A/B arm). [env: LLOOM_VERIFY_PARK] [possible values: true, false]
+      --cache <PRESET>
+          The cache preset the axes are applied over (`auto | crown | rewindable | rewindable-notap | pool | pool-spec`)
+      --attn <Config.attn_impl>
+          Axis `AttnImpl` (arms: Generic, Sdpa, FlashDecoding)
+      --flash-scratch-sizing <Config.flash_scratch_sizing>
+          Axis `ScratchSizing` (arms: Grow, Reserve, Bucket)
+      --kv-append <Config.kv_append>
+          Axis `KvAppend` (arms: Cat, InPlace, Paged)
+      --kv-quant <Config.kv_quant>
+          Axis `KvQuant` (arms: Off, Int8, Int4)
+      --conv-state <Config.conv_state>
+          Axis `ConvState` (arms: Shuffle, SlidingRing, RotatingRing)
+      --gemv-silu [<BOOL>]
+          Axis `GemvSilu`: `--gemv-silu` / `--gemv-silu=false`; absent keeps the preset's arm [possible values: true, false]
+      --gemv-residual [<BOOL>]
+          Axis `GemvResidual`: `--gemv-residual` / `--gemv-residual=false`; absent keeps the preset's arm [possible values: true, false]
+      --gemv-gate <Config.gemv_gate>
+          Axis `GemvGate` (arms: off, mul, swiglu)
+      --conv-fused [<BOOL>]
+          Axis `ConvFused`: `--conv-fused` / `--conv-fused=false`; absent keeps the preset's arm [possible values: true, false]
+      --conv-prefill-ctx [<BOOL>]
+          Axis `ConvPrefillCtx`: `--conv-prefill-ctx` / `--conv-prefill-ctx=false`; absent keeps the preset's arm [possible values: true, false]
+      --fusion <Config.fusion>
+          Axis `Fusion` (arms: Manual, Derived)
+      --qkv-layout <Config.qkv_layout>
+          Axis `QkvLayout` (arms: Contiguous, Strided, Fused)
+      --silu-impl <Config.silu_impl>
+          Axis `SiluImpl` (arms: Exact, Recip, Literal, Coarse4, Coarse1, HardSwish, Relu)
+      --sampling-defaults <STRING>
+          Where an unset field's value comes from: `greedy` (argmax; every recorded digest) or `checkpoint` (its `generation_config.json`). [arms: greedy, checkpoint]
+  -t, --temperature <F64>
+          The temperature; 0 (or none under `greedy`) is argmax
+      --top-p <F64>
+          Nucleus sampling's p (top-p); needs a temperature
+      --top-k <USIZE>
+          Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs
+      --gumbel [<BOOL>]
+          Device gumbel-max sampling at the temperature (rides the ring) [possible values: true, false]
+      --seed <U64>
+          The seed; none draws a fresh one per run (repeats explore), a value reproduces
+  -n, --max-tokens <USIZE>
+          New tokens per run at most (a request's own `max_tokens` overrides)
+      --ignore-eos [<BOOL>]
+          Never stop on EOS: exactly `max_tokens` tokens (the EOS mechanism runs and never fires) [possible values: true, false]
+      --stop <VEC<STRING>>
+          Stop strings, comma-separated (a request's own `stop` overrides)
+      --repetition-penalty <F64>
+          Repetition penalty over prompt and output tokens (> 0; 1 is off): a positive logit divided by it, a negative one multiplied
+      --presence-penalty <F64>
+          Presence penalty (OpenAI, [-2, 2]; 0 is off): subtracted once from every token the output holds
+      --frequency-penalty <F64>
+          Frequency penalty (OpenAI, [-2, 2]; 0 is off): subtracted per occurrence in the output
+      --min-p <F64>
+          Min-p ([0, 1]; 0 is off): drops tokens below min_p times the top token's probability; sampled arms only
+      --logit-bias <STD::COLLECTIONS::BTREEMAP<U32,F64>>
+          Logit bias, `token_id:bias,…` (each bias in [-100, 100]), added before the penalties
+      --thinking-budget <USIZE>
+          Tokens the model may generate inside the thinking block its prompt opens (vLLM's `thinking_token_budget`); then the template's end marker is fed and the answer follows. Refused where the template writes no block
+      --thinking-budget-message <STRING>
+          Text fed before the end marker when the thinking budget is spent, so the cut reads naturally (default: the marker alone)
+      --prompt-budget <USIZE>
+          The most tokens a prompt may take (vLLM's `truncate_prompt_tokens`); a longer one is refused or truncated per `prompt_budget_mode`
+      --prompt-budget-mode <STRING>
+          Over the prompt budget: `refuse` (the default: a clean error, the prompt is never silently shortened) or `truncate` (drop the oldest whole messages, the system message kept; a raw prompt keeps BOS and its last tokens). [arms: refuse, truncate]
+      --spec-method <STRING>
+          `none`, `dspark` (LFM2), `mtp` (Qwen4-exp), `dflash` (Qwen4-exp), or `auto`: the family's own drafter when one is at hand (DSpark when `drafter` names one or the HF cache holds one; on Qwen4-exp MTP when `drafter` names the sidecar or `~/.cache/lloom/qwen4exp-mtp-q8.gguf` exists, else DFlash when `drafter` names its directory or the HF cache holds the PixelML drafter, at `--batch 1`), else none. [arms: none, dspark, mtp, dflash, auto]
+      --spec-k <USIZE>
+          Tokens the drafter proposes per round (none = the drafter's own: DSpark's block of 9, DFlash 3 of its block of 7, MTP 1)
+      --drafter <STD::PATH::PATHBUF>
+          The drafter's weights: a DSpark checkpoint directory (none = the newest LFM2.5-2.6B-DSpark snapshot in the HF cache), a DFlash checkpoint directory (none = the newest PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash snapshot), or the MTP sidecar GGUF (required)
+      --arena [<BOOL>]
+          The activation arena (§9.2), recorded from the first decode steps (one skipped, two recorded); not under a speculative body [possible values: true, false]
+      --arena-layout <STRING>
+          The layout of the arena and of the pass-plan cache's plans: `packed` (values with disjoint liveness share a slot) or `non-aliasing` (the reference layout, every value its own slot). [arms: packed, non-aliasing]
+      --packed [<BOOL>]
+          Every decode dispatch through its `_packed` entry point with the constants pool (implied by `replay`) [possible values: true, false]
+      --replay [<BOOL>]
+          The ICB replay executor (#146/#169): the stable packed subset of a step recorded into an indirect command buffer and replayed; implies `packed` and the arena [possible values: true, false]
+      --replay-barriers <STRING>
+          Under `replay`: whether candle's own barrier still fires at a replayed position — `always` or `skip-replayed` (§11.3r). [arms: always, skip-replayed]
+      --replay-barrier-scope <STRING>
+          Under `replay`: how far back an ICB command's barrier scan looks — `run-start` or `since-barrier`. [arms: run-start, since-barrier]
+      --pass-plans [<BOOL>]
+          The pass-keyed plan cache (§9.2aa): every forward pass served from one arena base by a plan cached per pass shape. On by default; `--pass-plans false` runs every pass on the buffer pool. `arena` or `replay` select the single-key arena instead [possible values: true, false]
+      --memory-fraction <F64>
+          The fraction of Metal's `recommendedMaxWorkingSetSize` this process may claim (§9.5d); 0 turns LFM2's admission off
+      --kv-capacity <USIZE>
+          KV positions per request (prompt + generation); a request past it is refused
+      --kv-bucket <USIZE>
+          LFM2: positions the KV slab grows by when a pass would overrun it (a measurement knob; the stream is the same)
+      --kv-grow-fraction <F64>
+          LFM2: the fraction of the working set a KV grow may take the allocation to (§9.5c); none = the admission's
+      --free-budget-mb <USIZE>
+          The buffer pool's free-list budget in MiB (256 ships; 1024 under a speculative body); none = the default
+      --kv-reserve-tokens <USIZE>
+          Qwen4-exp `--slots auto`: KV tokens the slot budget reserves for (none = `kv_capacity`)
+      --slots <STRING>
+          Qwen4-exp `--experts stream`: streamed experts per layer per projection — a count, or `auto` (from the working set at `memory_fraction`). [arms: auto, <count>]
+      --cells <CELLS>
+          The cells, comma-separated: `prefill:P`, `decode:P:D`, `e2e:P:D`, `memory:P:D` (P prompt tokens, D decode tokens) [default: prefill:512,decode:512:100,e2e:8:64,memory:512:100]
+      --runs <RUNS>
+          Runs per cell (the first is the cold one) [default: 2]
+      --batch <BATCH>
+          The batch width the engine is loaded for; the cells take `batch` up to it [default: 1]
+      --rows <ROWS>
+          How the rows of `--batch N` hold their state (`auto | pool | pool-per-row | private`) [default: auto]
+      --reuse-prefix
+          Reuse the cached prefix across cells
+      --mem-sample
+          Sample the memory gauges around every cell (a gauge run)
+      --share-prefix
+          Share a prompt prefix between rows (the pool arms)
+      --prompt-seed-file <PROMPT_SEED_FILE>
+          A file whose text is tiled into the cells' prompts
+      --mode <cells|reuse|concurrent>
+          `cells` (the cells above), or a multi-sequence mode on LFM2: `reuse` (a two-turn conversation through prefix reuse against a fresh prefill; are the turn-2 streams identical, and turn 2's TTFT on each) or `concurrent` (`--sequences` conversations on one model — the time-sliced interleave, `--batched`, or the pipelined speculative driver under `--dspark` — each stream checked against its solo run) [default: cells]
+      --sequences <SEQUENCES>
+          `--mode concurrent`: how many sequences. The prompts are a varied set of eight from the workloads corpus, cycled past eight [default: 2]
+      --batched
+          `--mode concurrent`: drive the sequences through the batched-forward driver — one `m = B` forward per step for every live sequence — against each prompt run solo on the selected readback arm
+      --no-independence-check
+          `--mode concurrent --batched`: skip the neighbour-independence arm (the rows re-run as two separately batched halves)
+      --skip-solo
+          `--mode concurrent --batched`: skip the solo arm; the identity columns then read `false`
+      --fail-on-gate [<BOOL>]
+          `--mode concurrent --batched`: exit non-zero when the rows gate reads `gate=fail` (off: report it and exit 0). [env: LLOOM_FAIL_ON_GATE] [possible values: true, false]
+      --chunk <CHUNK>
+          `--mode concurrent`: tokens per visit on the time-sliced interleave [default: 16]
+      --stagger <STAGGER>
+          `--mode concurrent`: sequence `i` arrives at round (interleave) or step (`--batched`) `i × N`; 0 admits every sequence at once [default: 0]
+      --long-prompt-tokens <LONG_PROMPT_TOKENS>
+          `--mode concurrent`: give the last sequence a synthetic prompt of exactly this many body tokens, so a long prompt arrives beside the short ones; 0 keeps the corpus prompt [default: 0]
+      --first <FIRST>
+          `--mode concurrent`: which arm runs first — `solo`, or `pipelined` (`--dspark`) / `batched` (`--batched`) — so a rotation can alternate the order [default: solo]
+      --timeline <PATH>
+          `--mode concurrent --dspark`: write every round of both arms as CSV (`arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted`)
+  -h, --help
+          Print help

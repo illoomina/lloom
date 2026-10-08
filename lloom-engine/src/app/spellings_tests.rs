@@ -371,3 +371,92 @@ fn every_flag_the_help_printed_before_the_tree_still_parses() {
     );
     eprintln!("[{checked} flags of the three subcommands' old help parse]");
 }
+
+/// The resolved options of `argv` on `sub`, with no env.
+fn resolved(sub: &str, argv: &[&str]) -> Result<EngineOptions, String> {
+    let mut full = vec!["lloom", sub];
+    full.extend_from_slice(argv);
+    let cli = parse(full).map_err(|e| e.to_string())?;
+    let (common, front) = front_of(&cli);
+    let none = |_: &str| None;
+    resolve_layers(common, &*front, &none, false)
+        .map(|(o, _)| o)
+        .map_err(|e| e.to_string())
+}
+
+/// Every flag of a bool key takes the bool grammar the key and the env take
+/// (`option_grammar`): the true and false spellings in any case, and the
+/// rest refused. The flag is where clap's own bool parser would take
+/// only `true|false`.
+#[test]
+fn every_bool_flag_takes_the_bool_grammar() {
+    use lloom_tensor::options::{FALSE_SPELLINGS, TRUE_SPELLINGS};
+    const NOT_BOOLS: &[&str] = &["", "2", "tru", "yess", "enable", "none"];
+    let idx = index();
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+    let mut flags_checked = 0usize;
+    for key in idx.keys.values().filter(|k| k.compound.is_none()) {
+        for leaf in &key.targets {
+            let m = leaf.meta;
+            if !(m.is_bool || m.ty == "bool" || m.ty == "Option<bool>") {
+                continue;
+            }
+            let mut flags: Vec<&str> = vec![m.flag];
+            flags.extend(m.aliases.iter().copied());
+            if !m.cli.is_empty() {
+                flags.push(m.cli);
+            }
+            for flag in flags.into_iter().filter(|f| !f.is_empty()) {
+                let flag = format!("--{flag}");
+                let Some(sub) = SUBCOMMANDS.into_iter().find(|s| known(s, &flag)) else {
+                    continue;
+                };
+                flags_checked += 1;
+                let value = |v: &str| -> Result<Option<bool>, String> {
+                    let o = resolved(sub, &[&format!("{flag}={v}")])?;
+                    let stored = serde_json::to_value(&o).unwrap();
+                    let at = leaf
+                        .storage
+                        .split('.')
+                        .try_fold(&stored, |v, seg| v.get(seg))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    Ok(match at {
+                        Value::Bool(b) => Some(b),
+                        Value::String(s) => lloom_tensor::options::parse_bool(&s).ok(),
+                        _ => None,
+                    })
+                };
+                for (spellings, want) in [(TRUE_SPELLINGS, true), (FALSE_SPELLINGS, false)] {
+                    for s in spellings {
+                        for form in [s.to_string(), s.to_ascii_uppercase()] {
+                            checked += 1;
+                            match value(&form) {
+                                Ok(Some(b)) if b == want => {}
+                                other => failures.push(format!(
+                                    "{} {sub} {flag}={form}: {other:?}, want {want}",
+                                    key.path
+                                )),
+                            }
+                        }
+                    }
+                }
+                for s in NOT_BOOLS {
+                    checked += 1;
+                    if let Ok(v) = value(s) {
+                        failures.push(format!("{} {sub} {flag}={s}: accepted ({v:?})", key.path));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[{checked} bool flag spellings over {flags_checked} flags]");
+    assert!(flags_checked > 80, "{flags_checked} flags");
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

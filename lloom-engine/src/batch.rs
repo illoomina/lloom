@@ -1214,28 +1214,59 @@ mod tests {
         }
     }
 
+    /// Hold the scheduler thread in a closed job until the returned sender
+    /// fires (or is dropped). Returns once the job is running: no row is
+    /// admitted while a closed job is queued or running, so every request
+    /// submitted meanwhile is waiting when the gate opens.
+    fn hold(handle: &BatchHandle<Chain, ()>) -> Sender<()> {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        assert!(handle.run_closed(Box::new(move |_| {
+            let _ = held_tx.send(());
+            let _ = release_rx.recv();
+        })));
+        held_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the gate job runs");
+        release_tx
+    }
+
     /// Requests submitted from several threads at once, more than the batch
     /// width, each stream its own chain; the pool serves them in turn and
     /// every sequence comes back.
+    ///
+    /// The scheduler is held until all four are queued. Without the gate, a
+    /// row of this toy model can finish before the next thread submits, and
+    /// whether any row ever decodes beside another is the threads' timing.
     #[test]
     fn concurrent_requests_each_decode_their_own_chain() {
         let (handle, thread) = start(2, 2, BatchMode::Continuous);
         let prompts: Vec<Vec<u32>> = vec![vec![3, 1], vec![0], vec![9, 9, 9, 5], vec![7, 7, 2]];
+        let gate = hold(&handle);
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
         let results: Vec<(Vec<u32>, BatchDone)> = std::thread::scope(|scope| {
             let hs: Vec<_> = prompts
                 .iter()
                 .map(|p| {
                     let h = handle.clone();
+                    let queued = queued_tx.clone();
                     scope.spawn(move || {
                         let rx = h.submit(BatchRequest {
                             prompt_ids: p.clone(),
                             params: params(12),
                             cancel: Arc::new(AtomicBool::new(false)),
                         });
+                        queued.send(()).unwrap();
                         collect(&rx)
                     })
                 })
                 .collect();
+            for _ in &prompts {
+                queued_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("every request is queued");
+            }
+            gate.send(()).unwrap();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         for (p, (streamed, done)) in prompts.iter().zip(&results) {
@@ -1250,8 +1281,9 @@ mod tests {
                 "a reset sequence prefills the whole prompt"
             );
         }
-        // Non-vacuity: at width 2 with four rows, at least one row joined a
-        // batch that already had a live row.
+        // Non-vacuity: at width 2 with four rows queued, at least one row
+        // joined a batch that already had a live row, whatever order the
+        // four were queued in.
         assert!(
             results.iter().any(|(_, d)| d.joined_beside >= 1),
             "no row ever shared a step: {:?}",
@@ -1301,10 +1333,14 @@ mod tests {
     fn a_cancel_retires_the_row_and_a_closed_job_waits_for_an_idle_engine() {
         let (handle, thread) = start(2, 0, BatchMode::Continuous);
         let cancel = Arc::new(AtomicBool::new(false));
-        // Row 1's chain never reaches EOS: it runs to its cap.
+        // Row 1's chain never reaches EOS: it runs to its cap. The cap is
+        // far past what the toy steps between the fifth token's receipt and
+        // the cancel below; at 200 an optimised build on a fast CPU ran the
+        // chain out before the flag landed and the row finished uncancelled.
+        let cap = 1_000_000;
         let rx = handle.submit(BatchRequest {
             prompt_ids: vec![0],
-            params: params(200),
+            params: params(cap),
             cancel: Arc::clone(&cancel),
         });
         let mut got = Vec::new();
@@ -1318,7 +1354,7 @@ mod tests {
         let (streamed, done) = collect(&rx);
         assert!(done.cancelled);
         assert!(!done.eos);
-        assert!(done.tokens.len() < 200);
+        assert!(done.tokens.len() < cap);
         assert_eq!(done.tokens.len(), got.len() + streamed.len());
         assert_eq!(&done.tokens[..5], &chain(0, 5).0);
         // The closed job runs with the pool whole.

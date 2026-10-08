@@ -570,7 +570,7 @@ fn the_mtp_block_loads_from_a_sidecar_gguf() -> Result<()> {
     };
     // Without the sidecar the stripped file carries no block.
     let err = Qwen3_5::<RewindableExact>::from_gguf_shards_with_mtp(
-        &[main_path.clone()],
+        std::slice::from_ref(&main_path),
         None,
         &dev,
         &opts,

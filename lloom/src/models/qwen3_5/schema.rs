@@ -165,7 +165,7 @@ mod tests {
     /// The real checkpoints' geometry reproduces their headers' tensor
     /// counts: unsloth's Qwen3.8-27B-UD-Q4_K_M keeps the MTP block, 866
     /// tensors = 3 + 48 × 14 + 16 × 11 + a 65th full-attention layer's 11
-    /// + its 4 `nextn.*` (read 2026-10-08); unsloth's Qwen3.6-27B-Q4_K_M
+    /// and its 4 `nextn.*` (read 2026-10-08); unsloth's Qwen3.6-27B-Q4_K_M
     /// strips it, 851 (`nextn_predict_layers` absent from its header, so
     /// `n_nextn_layers` 0); the 35B-A3B's MoE layers carry 8 FFN tensors
     /// each, 733 stripped.

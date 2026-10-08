@@ -619,7 +619,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             for (i, text) in options.iter().enumerate() {
                 let ids = engine.encode(text, false)?;
                 let Some(&first) = ids.first() else {
-                    return Err(bad(&format!("options[{i}] encodes to no token")));
+                    return Err(bad(format!("options[{i}] encodes to no token")));
                 };
                 let (rank, lp) = all
                     .iter()

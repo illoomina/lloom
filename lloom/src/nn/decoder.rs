@@ -693,6 +693,7 @@ where
     /// Assemble a decoder. The process is held to the regime `P` names
     /// (`profile::hold`): a family at `Exact` never computes under an
     /// inherited `fast`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         family: &'static str,
         cfg: C,

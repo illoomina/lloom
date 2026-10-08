@@ -247,10 +247,7 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
                     .unwrap_or_else(|| panic!("no {name} on {accept}"))
             };
             let (rounds, tokens) = (field("rounds"), field("tokens"));
-            assert!(
-                rounds >= 1 && rounds <= 12,
-                "{dev:?} k={k}: {rounds} rounds"
-            );
+            assert!((1..=12).contains(&rounds), "{dev:?} k={k}: {rounds} rounds");
             // The first token is the prefill's, before round 0.
             assert!(
                 tokens + 1 >= 12,

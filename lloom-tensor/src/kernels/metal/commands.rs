@@ -4,7 +4,7 @@ use crate::kernels::metal::{
     contention::{Access, Censused, Side, SubmissionContention},
     executor::ExecutorSlot,
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    DispatchGate, Fence, GpuClock, PrevCeOutputs, ResidencySet,
+    DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
 use block2::RcBlock;
@@ -199,28 +199,58 @@ type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sy
 /// Whether the queue hands out command buffers that do NOT retain the
 /// resources encoded into them (`commandBufferWithUnretainedReferences`).
 ///
-/// Opt-in through `LLOOM_CB_UNRETAINED=1`, read once. The default retaining
-/// command buffer takes a strong reference to every buffer, pipeline and
-/// encoder argument it sees and releases them on completion -- objc retain
-/// traffic per encode that the hot path pays for nothing, because everything a
-/// decode step encodes is already held for the generation: pool buffers are
-/// parked in `pending` until their epoch completes (`BufferPool::drain_completed`),
-/// arena buffers live for the arena, pipelines for the process, and residency
-/// is the residency set's. That is the claim the unretained form rests on, and
-/// it is a claim about OUR liveness discipline rather than Metal's, which is why
-/// it is fuzzed rather than assumed: `lloom-fuzz`'s `cb_liveness` harness runs
-/// both kinds over a pool with a device-visible poison on free
-/// (`BufferPool::set_free_poison`) and reads every copy back.
+/// Opt-in through `LLOOM_CB_UNRETAINED=1` (`--cb-unretained`), read once. A
+/// retaining command buffer takes a strong reference to every buffer, fence and
+/// pipeline it sees and releases them on completion: objc retain traffic per
+/// encode that buys nothing when the host already holds each of them until the
+/// command buffer has run. The unretained form rests on that claim, and the
+/// claim is ours to keep, object class by object class:
+///
+/// - pool buffers are parked until their epoch completes (`BufferPool`);
+/// - arena and region bases, weights and slot pools live for their owner, and
+///   a base being replaced goes to the [`InFlightHold`];
+/// - a buffer outside every pool (an unpooled upload, a persistent allocation)
+///   goes to the hold when its last handle drops;
+/// - an encoder's fence goes to the hold when its last handle drops, since
+///   encoders in later command buffers may still wait on it;
+/// - pipelines live for the process.
+///
+/// The hold releases each object once the epoch open at its drop has completed
+/// (`in_flight.rs`). A path whose objects it cannot hold refuses the kind by
+/// name. The validation layer checks the claim on a real run
+/// (`MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_VALIDATE_UNRETAINED_RESOURCES=5`), and
+/// `lloom-fuzz`'s `cb_liveness` drives every class through both kinds.
 pub fn cb_unretained() -> bool {
     static KIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *KIND.get_or_init(|| crate::tuning::tuning().metal.cb_unretained)
 }
 
-fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
-    let raw = if cb_unretained() {
-        command_queue.commandBufferWithUnretainedReferences()
-    } else {
-        command_queue.commandBuffer()
+/// Which command buffers a [`Commands`] creates: Metal's retaining default,
+/// or unretained with the host holding what they read ([`InFlightHold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandBufferKind {
+    Retaining,
+    Unretained,
+}
+
+impl CommandBufferKind {
+    /// The kind the process selected (`cb_unretained`).
+    pub fn selected() -> Self {
+        if cb_unretained() {
+            CommandBufferKind::Unretained
+        } else {
+            CommandBufferKind::Retaining
+        }
+    }
+}
+
+fn create_command_buffer(
+    command_queue: &CommandQueue,
+    kind: CommandBufferKind,
+) -> Result<CommandBuffer, MetalKernelError> {
+    let raw = match kind {
+        CommandBufferKind::Unretained => command_queue.commandBufferWithUnretainedReferences(),
+        CommandBufferKind::Retaining => command_queue.commandBuffer(),
     };
     raw.map(CommandBuffer::new)
         .ok_or(MetalKernelError::FailedToCreateResource(
@@ -485,6 +515,44 @@ pub struct Commands {
     /// complete; the two counters simply count different things — commits
     /// against waits, ~13.5:1 under `CutPolicy::Counter(50)`.
     completion_already_complete: AtomicU64,
+    /// Retaining or unretained command buffers, fixed at construction.
+    kind: CommandBufferKind,
+    /// What the unretained kind's command buffers cannot hold for themselves;
+    /// `None` on the retaining kind, where Metal holds it.
+    hold: Option<Arc<InFlightHold>>,
+    /// The first command buffer that ended in error, latched by its completion
+    /// handler so every later commit and wait reports it.
+    failure: Arc<CommandBufferFailure>,
+}
+
+/// A command buffer of this queue ended in error.
+///
+/// Raised on Metal's completion thread and read on the host. Once raised it
+/// stays raised: the failed buffer's writes never happened, so nothing
+/// computed after it can be trusted, whichever wait the host next makes.
+#[derive(Default)]
+struct CommandBufferFailure {
+    failed: AtomicBool,
+    message: std::sync::OnceLock<String>,
+}
+
+impl CommandBufferFailure {
+    fn record(&self, message: String) {
+        let _ = self.message.set(message);
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn check(&self) -> Result<(), MetalKernelError> {
+        if !self.failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let msg = self
+            .message
+            .get()
+            .map(String::as_str)
+            .unwrap_or("unknown error");
+        Err(MetalKernelError::CommandBufferError(msg.to_string()))
+    }
 }
 
 /// The host's fence bookkeeping beside `prev_ce_outputs`.
@@ -569,8 +637,9 @@ impl Commands {
             command_queue.addResidencySet(raw);
         }
 
+        let kind = CommandBufferKind::selected();
         let device = Device::new(command_queue.device());
-        let cb = create_command_buffer(&command_queue)?;
+        let cb = create_command_buffer(&command_queue, kind)?;
 
         // `DESIGN.md` §11.5o. Absent -- every run that does not opt in --
         // leaves `Synchronize`, which is the path that ran before this field
@@ -591,6 +660,7 @@ impl Commands {
             cut_policy,
             completion_wait,
             residency_set,
+            kind,
         )
     }
 
@@ -612,11 +682,28 @@ impl Commands {
         residency_set: Arc<ResidencySet>,
         completion_wait: CompletionWait,
     ) -> Result<Self, MetalKernelError> {
+        Self::new_with(
+            command_queue,
+            residency_set,
+            completion_wait,
+            CommandBufferKind::selected(),
+        )
+    }
+
+    /// As [`Self::new_with_completion_wait`], with the command-buffer kind
+    /// supplied too: the kind is a `OnceLock` in production, and a test or a
+    /// fuzzer exercises both in one process.
+    pub fn new_with(
+        command_queue: CommandQueue,
+        residency_set: Arc<ResidencySet>,
+        completion_wait: CompletionWait,
+        kind: CommandBufferKind,
+    ) -> Result<Self, MetalKernelError> {
         if let Some(raw) = residency_set.raw() {
             command_queue.addResidencySet(raw);
         }
         let device = Device::new(command_queue.device());
-        let cb = create_command_buffer(&command_queue)?;
+        let cb = create_command_buffer(&command_queue, kind)?;
         Self::with_parts(
             command_queue,
             device,
@@ -625,9 +712,11 @@ impl Commands {
             CutPolicy::DispatchCounter,
             completion_wait,
             residency_set,
+            kind,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_parts(
         command_queue: CommandQueue,
         device: Device,
@@ -636,6 +725,7 @@ impl Commands {
         cut_policy: CutPolicy,
         completion_wait: CompletionWait,
         residency_set: Arc<ResidencySet>,
+        kind: CommandBufferKind,
     ) -> Result<Self, MetalKernelError> {
         // The listener is allocated with the event and only for the arm that
         // needs one (#583). Its lifetime is then the engine's, which is the
@@ -650,6 +740,9 @@ impl Commands {
 
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
+        let clock = Arc::new(GpuClock::new());
+        let hold = (kind == CommandBufferKind::Unretained)
+            .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
         Ok(Self {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
@@ -663,7 +756,7 @@ impl Commands {
             prev_ce_outputs: Arc::new(Censused::new(parking_lot::RwLock::new(HashMap::new()))),
             live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
             residency_set,
-            clock: Arc::new(GpuClock::new()),
+            clock,
             census: Arc::default(),
             trace: Arc::default(),
             on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -674,7 +767,21 @@ impl Commands {
             completion_signals: AtomicU64::new(0),
             completion_fires: AtomicU64::new(0),
             completion_already_complete: AtomicU64::new(0),
+            kind,
+            hold,
+            failure: Arc::default(),
         })
+    }
+
+    /// The command-buffer kind this queue creates.
+    pub fn kind(&self) -> CommandBufferKind {
+        self.kind
+    }
+
+    /// The hold for objects an unretained command buffer may still name after
+    /// their last host handle; `None` on the retaining kind.
+    pub fn in_flight_hold(&self) -> Option<&Arc<InFlightHold>> {
+        self.hold.as_ref()
     }
 
     /// The completion-wait arm in force (`DESIGN.md` §11.5o).
@@ -944,7 +1051,20 @@ impl Commands {
         }
 
         if state_guard.current_encoder.is_none() {
-            let fence = Arc::new(Fence::new(&self.device));
+            let executor = self.executor();
+            if self.hold.is_some() && !executor.is_classical() {
+                // An executor's indirect command buffers and the buffers
+                // their ranges keep resident are its own, replaced as it
+                // records; nothing holds them for a command buffer that does
+                // not retain them.
+                return Err(MetalKernelError::ArmRefused(
+                    "unretained command buffers (--cb-unretained) with an executor \
+                     installed: its indirect command buffers are not held until \
+                     the command buffers naming them complete"
+                        .to_string(),
+                ));
+            }
+            let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
             // No blanket wait here. HazardTrackingModeUntracked means Metal does
             // not flush GPU caches at encoder boundaries, so ordering is ours to
             // enforce -- but the encoder already records every buffer it binds,
@@ -953,11 +1073,7 @@ impl Commands {
             // after work it never touches.
             let mut enc = state_guard
                 .current
-                .compute_command_encoder_with_executor(
-                    &fence,
-                    &self.prev_ce_outputs,
-                    &self.executor(),
-                )
+                .compute_command_encoder_with_executor(&fence, &self.prev_ce_outputs, &executor)
                 .with_clock(Arc::clone(&self.clock));
             if crate::kernels::metal::profile::enabled() {
                 enc = enc.with_census(Arc::clone(&self.census));
@@ -1038,7 +1154,7 @@ impl Commands {
             self.end_encoding(enc);
         }
 
-        let fence = Arc::new(Fence::new(&self.device));
+        let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
         let encoder = state_guard
             .current
             .blit_command_encoder(&fence, &self.prev_ce_outputs);
@@ -1087,13 +1203,10 @@ impl Commands {
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait[..to_wait.len().saturating_sub(1)] {
             if cb.status() == MTLCommandBufferStatus::Error {
-                let msg = cb
-                    .error()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown error".to_string());
-                return Err(MetalKernelError::CommandBufferError(msg));
+                self.failure.record(cb_error_message(cb.as_ref()));
             }
         }
+        self.failure.check()?;
 
         // Drop only what has completed. The state lock was released before the
         // wait, so another thread sharing this queue may have ended sessions
@@ -1146,9 +1259,7 @@ impl Commands {
                 .fetch_add(outcome.already_complete, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
             let mut state = self.state.lock(Side::Host);
-            state
-                .in_flight
-                .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+            self.prune_in_flight(&mut state, Some(&cb))?;
         }
         Ok(())
     }
@@ -1209,6 +1320,11 @@ impl Commands {
         marker.cb.status() == MTLCommandBufferStatus::Completed
     }
 
+    /// Whether the marker's buffer ended in error.
+    pub fn marker_failed(&self, marker: &CommandMarker) -> bool {
+        marker.cb.status() == MTLCommandBufferStatus::Error
+    }
+
     /// Wait for the marker's buffer only; commits made after it keep running.
     ///
     /// Same completion seam and counters as [`Self::flush_and_wait_current`];
@@ -1227,10 +1343,7 @@ impl Commands {
         self.completion_already_complete
             .fetch_add(outcome.already_complete, Ordering::Relaxed);
         let mut state = self.state.lock(Side::Host);
-        state
-            .in_flight
-            .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
-        Ok(())
+        self.prune_in_flight(&mut state, Some(&marker.cb))
     }
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
@@ -1278,14 +1391,7 @@ impl Commands {
         // is observed, and a dropped error would present later as wrong output
         // rather than as a failure (§3.5 -- a missing dependency is silent
         // corruption, not an error).
-        for cb in state.in_flight.iter() {
-            if cb.status() == MTLCommandBufferStatus::Error {
-                return Err(Self::cb_error(cb));
-            }
-        }
-        state
-            .in_flight
-            .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+        self.prune_in_flight(&mut state, None)?;
         if let Some(t) = timed {
             crate::kernels::metal::profile::record_prune(t.elapsed());
         }
@@ -1333,6 +1439,10 @@ impl Commands {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
+        // A failed command buffer's writes never happened; nothing encoded
+        // after it is committed as though they had. The encoder is closed
+        // first either way: Metal refuses to release an open one.
+        self.failure.check()?;
         let t_end_enc = timed.map(|t| t.elapsed());
 
         // Publish any allocations a pool MISS staged with `ResidencySet::add`
@@ -1381,7 +1491,11 @@ impl Commands {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 let clock = Arc::clone(&self.clock);
                 let subs: Vec<_> = self.on_complete.lock().clone();
-                state.current.on_completion(move || {
+                let failure = Arc::clone(&self.failure);
+                state.current.on_completion_of(move |cb| {
+                    if cb.status() == MTLCommandBufferStatus::Error {
+                        failure.record(cb_error_message(cb));
+                    }
                     // Order matters: the clock must show the epoch finished
                     // before subscribers look, or they find nothing drainable
                     // and the buffers wait for an unrelated later completion.
@@ -1408,8 +1522,11 @@ impl Commands {
         if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, t_committed) {
             crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
         }
+        if let Some(hold) = &self.hold {
+            hold.release_completed();
+        }
         let created = timed.map(|_| std::time::Instant::now());
-        let new_cb = create_command_buffer(&self.command_queue)?;
+        let new_cb = create_command_buffer(&self.command_queue, self.kind)?;
         if let Some(t) = created {
             crate::kernels::metal::profile::record_create_cb(t.elapsed());
         }
@@ -1512,11 +1629,59 @@ impl Commands {
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
-        let msg = cb
-            .error()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string());
-        MetalKernelError::CommandBufferError(msg)
+        MetalKernelError::CommandBufferError(cb_error_message(cb.as_ref()))
+    }
+
+    /// Drop the in-flight buffers that completed, and report one that failed.
+    ///
+    /// Every wait prunes through here, so a failure in ANY buffer the host has
+    /// committed surfaces at the next wait, not only a failure in the buffer
+    /// that wait happened to name: the queue keeps executing after a failed
+    /// buffer, so the buffer waited on can complete cleanly over results the
+    /// failed one never wrote. The latch catches the paths that never wait.
+    fn prune_in_flight(
+        &self,
+        state: &mut EntryState,
+        waited: Option<&CommandBuffer>,
+    ) -> Result<(), MetalKernelError> {
+        // Every buffer committed before the one just waited on has run (the
+        // queue executes in order), but its final status is published by its
+        // own completion, which can lag the later buffer's: settle those, or a
+        // failure ahead of the waited buffer reads as still running.
+        let ahead = waited.and_then(|w| {
+            state
+                .in_flight
+                .iter()
+                .position(|c| std::ptr::eq(c.as_ref(), w.as_ref()))
+        });
+        for c in &state.in_flight[..ahead.unwrap_or(0)] {
+            if !matches!(
+                c.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            ) {
+                c.wait_until_completed();
+            }
+        }
+        let mut failed = None;
+        state.in_flight.retain(|c| match c.status() {
+            MTLCommandBufferStatus::Completed => false,
+            MTLCommandBufferStatus::Error => {
+                if failed.is_none() {
+                    failed = Some(cb_error_message(c.as_ref()));
+                }
+                false
+            }
+            _ => true,
+        });
+        if let Some(msg) = failed {
+            self.failure.record(msg);
+        }
+        self.failure.check()
+    }
+
+    /// The first command buffer of this queue that ended in error, if any.
+    pub fn check_failed(&self) -> Result<(), MetalKernelError> {
+        self.failure.check()
     }
 
     fn end_encoding(&self, encoder: ComputeCommandEncoder) {
@@ -1578,9 +1743,9 @@ impl Commands {
         encoder.raw.updateFence(encoder.fence.raw());
 
         if retires {
-            let fence = Arc::clone(&encoder.fence);
+            let completed = encoder.fence.completion_flag();
             let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                fence.mark_completed();
+                completed.store(true, Ordering::Release);
             });
             // SAFETY: Metal copies the block, so the `RcBlock` may drop at the
             // end of this scope; the buffer is the uncommitted current one,
@@ -1596,6 +1761,13 @@ impl Commands {
     }
 }
 
+/// The error a failed command buffer reports, as text.
+fn cb_error_message(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
+    cb.error()
+        .map(|e| e.localizedDescription().to_string())
+        .unwrap_or_else(|| "unknown error".to_string())
+}
+
 /// Drop one buffer's reference to `ptr`, forgetting the fence once none remain.
 fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
     if let Some(idx) = fences.iter().position(|f| f.ptr == ptr) {
@@ -1609,5 +1781,15 @@ fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
 impl Drop for Commands {
     fn drop(&mut self) {
         let _ = self.flush();
+        // What the hold keeps alive is still named by the buffers in flight;
+        // it may only go once they have run.
+        if self.hold.is_some() {
+            let last = self.state.lock(Side::Host).in_flight.last().cloned();
+            if let Some(cb) = last {
+                if cb.status() != MTLCommandBufferStatus::NotEnqueued {
+                    cb.wait_until_completed();
+                }
+            }
+        }
     }
 }

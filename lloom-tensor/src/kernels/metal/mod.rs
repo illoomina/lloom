@@ -83,6 +83,11 @@ pub mod ledger;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
+pub mod in_flight;
+/// Unretained command buffers executed: what the queue's hold takes and when it
+/// lets go.
+#[cfg(test)]
+mod in_flight_gpu_tests;
 #[cfg(test)]
 mod icb_executor_tests;
 #[cfg(test)]
@@ -152,6 +157,7 @@ pub use backing::{
     Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
 };
 pub use heap::*;
+pub use in_flight::{Held, HoldCounts, InFlightHold};
 pub use kv_pages::*;
 pub use library::*;
 pub use residency_set::*;

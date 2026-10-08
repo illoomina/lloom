@@ -335,16 +335,48 @@ fn parse_gemv_bm(v: &str) -> Result<Option<usize>, String> {
 fn parse_force_gemm(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "force gemm", &["m", "n", "both"]))
 }
+/// Without the Metal backend its parsers are not compiled; a value of one of
+/// its keys is still held to the arms the field declares (`variants`:
+/// `name`, `name:<param>`, `name[:<param>]`, the parameter a count), so a
+/// misspelling is refused on every build. The domain checks are the backend's.
+#[cfg(not(feature = "metal"))]
+fn declared_arm(v: &str, field: &str) -> Result<String, String> {
+    let variants = crate::options::meta_at(MetalTuning::META, field)
+        .map(|m| m.variants)
+        .unwrap_or(&[]);
+    let v = non_empty(v)?.to_ascii_lowercase();
+    let (name, param) = match v.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (v.as_str(), None),
+    };
+    let ok = variants.iter().any(|d| {
+        let base = d.split([':', '[']).next().unwrap_or(d);
+        base == name
+            && match param {
+                None => !d.contains(':') || d.contains("[:"),
+                Some(p) => d.contains(':') && parse_count::<u64>(p).is_ok(),
+            }
+    });
+    if ok {
+        Ok(v)
+    } else {
+        Err(format!("`{v}` is not one of {}", variants.join(", ")))
+    }
+}
 fn parse_cut_policy(v: &str) -> Result<String, String> {
     let v = non_empty(v)?.to_ascii_lowercase();
     #[cfg(feature = "metal")]
     crate::kernels::metal::commands::CutPolicy::from_env_str(&v)?;
+    #[cfg(not(feature = "metal"))]
+    declared_arm(&v, "cut_policy")?;
     Ok(v)
 }
 fn parse_completion_wait(v: &str) -> Result<String, String> {
     let v = non_empty(v)?.to_ascii_lowercase();
     #[cfg(feature = "metal")]
     crate::kernels::metal::completion::CompletionWait::from_str_arm(&v)?;
+    #[cfg(not(feature = "metal"))]
+    declared_arm(&v, "completion_wait")?;
     Ok(v)
 }
 /// `backend.metal.completion_wait` in the key's spelling; a bare
@@ -383,6 +415,10 @@ fn parse_allow_emulated(v: &str) -> Result<Option<String>, String> {
         let s = non_empty(s)?.to_ascii_lowercase();
         #[cfg(feature = "metal")]
         crate::kernels::metal::arms::parse_allow_emulated(&s)?;
+        #[cfg(not(feature = "metal"))]
+        for item in s.split(',') {
+            declared_arm(item.trim(), "allow_emulated")?;
+        }
         Ok(s)
     })
 }

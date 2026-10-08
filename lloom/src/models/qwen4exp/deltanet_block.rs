@@ -906,6 +906,30 @@ impl<P: Profile> GatedDeltaNet<P> {
 /// read and rewrite them are layer `l`'s recurrence. `In` is the bracket's
 /// output and the layer.
 #[cfg(not(target_arch = "wasm32"))]
+/// A layer's recurrent state as the Gated DeltaNet's block state: its
+/// index in the family's state (the pooled channels are addressed by
+/// layer), its `S` and its conv window.
+#[derive(Debug, Clone)]
+pub struct GdnState {
+    pub layer: usize,
+    pub s: RecurrentState,
+    pub conv: RecurrentState,
+}
+
+/// The Gated DeltaNet as a level-0 block (`nn::blocks::Mixer`): one
+/// position is a decode step, more are a chunk (the chunkwise recurrence,
+/// the state left where `seq` steps would leave it).
+impl<P: Profile> crate::nn::blocks::Mixer for GatedDeltaNet<P> {
+    type State = GdnState;
+    fn execute(&self, x: &Tensor, st: &mut GdnState) -> Result<Tensor> {
+        if x.dim(1)? == 1 {
+            self.decode(x, st.layer, &mut st.s, &mut st.conv)
+        } else {
+            self.prefill(x, st.layer, &mut st.s, &mut st.conv)
+        }
+    }
+}
+
 impl<P: Profile> crate::optimizer::Visit for GatedDeltaNet<P> {
     type In = (crate::optimizer::NodeId, usize);
     type Out = crate::optimizer::NodeId;

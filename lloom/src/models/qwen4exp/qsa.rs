@@ -745,12 +745,12 @@ impl KvPool {
                 .append(slot, need - seq_len)
                 .map_err(lloom_tensor::Error::wrap)?;
         }
-        let out: Vec<u32> = {
-            let pages = g.pages.seq(slot).expect("a leased slot").pages();
-            (start..need)
-                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
-                .collect()
-        };
+        let out: Vec<u32> = g
+            .pages
+            .seq(slot)
+            .expect("a leased slot")
+            .cells(ps, start..need)
+            .collect();
         g.layers[layer].lens[slot] = need;
         Ok(out)
     }
@@ -831,9 +831,11 @@ impl KvPool {
                 None => return Ok(None),
             };
             let ps = g.page_size;
-            let pages = g.pages.seq(slot).expect("a leased slot").pages();
-            let ids: Vec<u32> = (0..len)
-                .map(|t| pages[t / ps].0 * ps as u32 + (t % ps) as u32)
+            let ids: Vec<u32> = g
+                .pages
+                .seq(slot)
+                .expect("a leased slot")
+                .cells(ps, 0..len)
                 .collect();
             (pk, pv, ids)
         };
@@ -2993,6 +2995,20 @@ impl<P: Profile> QsaAttention<P> {
 /// ([`Indexer::visit_select`]); and the attention over keys that reach the
 /// 2-pass length is two launches.
 #[cfg(not(target_arch = "wasm32"))]
+/// The sparse attention as a level-0 block (`nn::blocks::Mixer`): one
+/// position is a decode step, more are a chunk (what `decode` computes
+/// position by position, up to fp32 reorder).
+impl<P: Profile> crate::nn::blocks::Mixer for QsaAttention<P> {
+    type State = KvCache;
+    fn execute(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
+        if x.dim(1)? == 1 {
+            self.decode(x, kv)
+        } else {
+            self.prefill(x, kv)
+        }
+    }
+}
+
 impl<P: Profile> crate::optimizer::Visit for QsaAttention<P> {
     type In = (crate::optimizer::NodeId, usize, KvPrecision);
     type Out = crate::optimizer::NodeId;

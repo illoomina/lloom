@@ -336,6 +336,30 @@ fn merged_fusion(axis: &str, value: &str) -> bool {
     axis == "fusion" && lloom::tuning::tuning().qwen4exp.fusion == value
 }
 
+/// The first of Qwen4-exp's own keys (`models.qwen4exp.*`) that `model`
+/// sets off its default, for a family that has no such arm to refuse by
+/// name (decode-driver-design.md Stage 7: a family refuses another's key).
+fn qwen4exp_key_set(model: &LoadConfig) -> Option<&'static str> {
+    let d = LoadConfig::default();
+    [
+        (model.ple != d.ple, "models.qwen4exp.ple.enabled"),
+        (
+            model.ple_cache_rows != d.ple_cache_rows,
+            "models.qwen4exp.ple.cache_rows",
+        ),
+        (
+            model.moe_act != d.moe_act,
+            "models.qwen4exp.moe.activation_dtype",
+        ),
+        (
+            model.prefill_mode != d.prefill_mode,
+            "models.qwen4exp.prefill_mode",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(set, key)| set.then_some(key))
+}
+
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
@@ -561,12 +585,12 @@ impl Family for Qwen3_5Family {
         if req.model.flash_k.is_some() {
             anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen3_5 has no such arm");
         }
+        if let Some(key) = qwen4exp_key_set(req.model) {
+            anyhow::bail!("`{key}` is Qwen4-exp's; qwen3_5 has no such arm");
+        }
         match req.model.experts.as_str() {
             "stream" | "resident" => {}
             other => anyhow::bail!("--experts {other}: stream | resident"),
-        }
-        if req.model.cpu() && lloom_tensor::tuning::contract().is_fast() {
-            // Nothing to refuse: the CPU runs either regime.
         }
         Ok(())
     }
@@ -1081,6 +1105,35 @@ mod tests {
 
     /// `--flash-k` is LFM2's FlashDecoding chunk: Qwen4-exp refuses it by
     /// name, LFM2 resolves it (the load refuses it off `--attn flash`).
+    /// Qwen4-exp's own keys are refused on qwen3_5 by name, and its
+    /// defaults pass (`LoadConfig::default` carries them for every family).
+    #[test]
+    fn qwen4exps_keys_are_refused_on_qwen3_5_by_name() {
+        for (argv, key) in [
+            (&["--moe-act", "f16"][..], "models.qwen4exp.moe.activation_dtype"),
+            (&["--no-ple"][..], "models.qwen4exp.ple.enabled"),
+            (&["--ple-cache-rows", "8"][..], "models.qwen4exp.ple.cache_rows"),
+            (&["--prefill-mode", "replay"][..], "models.qwen4exp.prefill_mode"),
+        ] {
+            let m = model_args(argv);
+            let err = Qwen3_5Family
+                .resolve(&Requested {
+                    model: &m,
+                    shape: shape(),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{argv:?}: {err}");
+        }
+        let m = model_args(&[]);
+        Qwen3_5Family
+            .resolve(&Requested {
+                model: &m,
+                shape: shape(),
+            })
+            .unwrap();
+    }
+
     #[test]
     fn flash_k_is_lfm2s() {
         let m = model_args(&["--flash-k", "2"]);

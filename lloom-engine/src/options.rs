@@ -1470,7 +1470,7 @@ pub struct LoadConfig {
         cli = "served-model-name"
     )]
     pub model_name: Option<String>,
-    /// Qwen4-exp: tokenizer.json, with chat_template.jinja beside it. Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
+    /// The GGUF families (Qwen4-exp, Qwen3.5): tokenizer.json, with chat_template.jinja beside it. Default: Qwen4-exp's is the HF cache's Qwen/Qwen3.8-Flash-Next snapshot; Qwen3.5's the base model's snapshot the quantizer recorded, else the GGUF's own vocabulary.
     #[opt(
         flag = "tokenizer",
         path = "model.tokenizer",
@@ -1484,7 +1484,7 @@ pub struct LoadConfig {
     /// The device: `auto` (the GPU this build has, else the CPU) or `cpu`.
     #[opt(flag = "device", parser = "parse_device", variants = ["auto", "cpu"], path = "backend.device", status = "stable", cli = "device", switches = ["cpu=cpu"])]
     pub device: String,
-    /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand) or `resident` (every expert in memory).
+    /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool per layer filled from the checkpoint on demand) or `resident` (every expert in memory). Qwen3.5's MoE loads resident whatever it says, with a load warning.
     #[opt(flag = "experts", parser = "parse_experts", variants = ["stream", "resident"], path = "weights.experts.placement", status = "stable", cli = "experts", facets = ["source"], flows = ["weights-in"])]
     pub experts: String,
     /// Qwen4-exp, streamed experts: the loader primitive, `pread` (a read and a compute-encoder copy) or `io` (`MTLIOCommandQueue`).

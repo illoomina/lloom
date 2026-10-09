@@ -70,6 +70,7 @@ pub mod error;
 mod indexer;
 pub mod isolation;
 pub mod layout;
+pub mod machine;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their
 /// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).
@@ -91,27 +92,26 @@ pub mod metal_backend;
 // Merged from candle-metal-kernels (RESTRUCTURING §7.1): the Metal kernel layer
 // is now a module of this crate rather than a separate leaf crate. Gated on the
 // `metal` feature exactly as its former crate dependency was.
-#[cfg(feature = "metal")]
-pub mod kernels;
 /// The GEMV's tile selection as plain arithmetic, for the dispatcher and for
 /// a reader with no device (the optimizer's legality facts).
 pub mod gemv_tile;
+#[cfg(feature = "metal")]
+pub mod kernels;
 /// The paged-KV page allocator (§10.3c–h): pure host bookkeeping — a free
 /// list, per-page refcounts, per-sequence page tables, a quarantine keyed
 /// on GPU epochs — shared by every model's page pool on every backend
 /// (LFM2's `BatchPool`, Qwen4-exp's `KvPool`; #749 P29 (8)). Re-exported at
 /// `kernels::metal::kv_pages`, its former home, for the Metal callers.
 pub mod kv_pages;
-pub mod retire;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod nditer;
 pub mod npy;
 pub mod op;
 pub mod options;
-pub mod tuning;
 pub mod pickle;
 pub mod quantized;
+pub mod retire;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
@@ -123,6 +123,7 @@ mod strided_index;
 mod tensor;
 mod tensor_cat;
 pub mod test_utils;
+pub mod tuning;
 pub mod typed;
 pub mod utils;
 mod variable;

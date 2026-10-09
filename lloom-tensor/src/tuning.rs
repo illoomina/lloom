@@ -273,6 +273,12 @@ fn parse_opt_nr0_4(v: &str) -> Result<Option<usize>, String> {
     }
     ranged(v, "rows a simdgroup", 1, 4).map(Some)
 }
+fn parse_opt_rows_max(v: &str) -> Result<Option<usize>, String> {
+    if v.is_empty() || v.eq_ignore_ascii_case("none") || v == "0" {
+        return Ok(None);
+    }
+    ranged(v, "rows a weight read", 1, 8).map(Some)
+}
 fn parse_gdn_split(v: &str) -> Result<usize, String> {
     ranged(v, "gdn split", 1, 32)
 }
@@ -586,7 +592,7 @@ pub struct QmvTuning {
         status = "advanced"
     )]
     pub q6k_nr0: usize,
-    /// The small-batch quantized gemv (NR1 rows per weight read) instead of per-row launches — measured no faster here; not bit-identical.
+    /// The row axis of the quantized matmul-vec under `fast`: 2 to 8 activation rows (a verify window, a small batch, the routed planes sharing a slot) read each weight block once; off = one weight read per row. `deterministic` never takes it (a row's bits then never depend on the row count).
     #[opt(
         flag = "qmv-rows",
         env = "LLOOM_QMV_ROWS",
@@ -595,6 +601,16 @@ pub struct QmvTuning {
         status = "arm"
     )]
     pub rows: bool,
+    /// The row axis's ceiling for every kind (1..8): none = each kind's measured ceiling (`QuantKind::rows_max`). An A/B arm, and how a test reaches every capacity of every kind.
+    #[opt(
+        flag = "qmv-rows-max",
+        env = "LLOOM_QMV_ROWS_MAX",
+        parser = "parse_opt_rows_max",
+        variants = ["none", "1", "2", "4", "8"],
+        path = "kernels.quant_matvec.rows_max",
+        status = "arm"
+    )]
+    pub rows_max: Option<usize>,
     /// Rows from which a quantized stem takes the mm kernel instead of the row gemvs (none = 9: up to 8 rows on the gemv).
     #[opt(
         flag = "qmv-mm-from",
@@ -603,7 +619,7 @@ pub struct QmvTuning {
         status = "advanced"
     )]
     pub mm_from: Option<usize>,
-    /// The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic; a function constant).
+    /// The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic, under either contract). Now the routed row axis at capacity 1 (`kernel_mul_mv_id{,2}_*_r1`); where `fast` and a ceiling put the launch on the axis, the axis wins.
     #[opt(
         flag = "qmv-id-union",
         env = "LLOOM_QMV_ID_UNION",
@@ -623,7 +639,8 @@ impl Default for QmvTuning {
             q4k_nr0: None,
             q5k_nr0: None,
             q6k_nr0: 2,
-            rows: false,
+            rows: true,
+            rows_max: None,
             mm_from: None,
             id_union: false,
         }

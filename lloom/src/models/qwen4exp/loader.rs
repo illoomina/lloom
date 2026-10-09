@@ -786,6 +786,9 @@ pub struct LoadOptions {
     /// §10.7); `None` is the checkpoint's f32. Set at load, so the slot plan
     /// reserves for the store the caches will hold.
     pub kv_precision: Option<crate::nn::ops::KvPrecision>,
+    /// The machine gate the load passes before its first tensor
+    /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
+    pub machine: Option<crate::nn::memory::MachineLoad>,
 }
 
 impl LoadOptions {
@@ -902,6 +905,66 @@ impl LoadPlan {
     }
 }
 
+/// The reservation a load made on the machine, held by the model it built.
+type Reservation = Option<Arc<lloom_tensor::machine::Holding>>;
+
+/// Admit the load on the machine (`memory.md` §9.10) when `opts` names a
+/// gate: its predicted peak is what `plan` holds on the device plus the
+/// session's claims beside it — the same claims the slot plan leaves room
+/// for (`session_claims`; the staging only on the streamed tier) and a
+/// drafter's bytes.
+fn admit_machine<Rd: Read + Seek>(
+    gg: &Gguf<'_, Rd>,
+    opts: &LoadOptions,
+    plan: &LoadPlan,
+    stream: Option<&StreamOptions>,
+) -> Result<Reservation> {
+    let Some(m) = &opts.machine else {
+        return Ok(None);
+    };
+    let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
+    if let Some(p) = opts.kv_precision {
+        cfg.kv_precision = p;
+    }
+    let claims = match stream {
+        Some(st) => session_claims(
+            &cfg,
+            m.rows,
+            m.kv_tokens,
+            m.prefill_tile,
+            &st.loader,
+            st.prefetch,
+        ),
+        None => session_claims(
+            &cfg,
+            m.rows,
+            m.kv_tokens,
+            m.prefill_tile,
+            &StreamLoader::Pread,
+            false,
+        )
+        .into_iter()
+        .filter(|c| c.name != "qwen4exp-staging")
+        .collect(),
+    };
+    let mut peak = lloom_tensor::machine::Peak::new()
+        .with("weights (resident tier)", plan.resident_bytes as u64)
+        .with(
+            match plan.slots {
+                Some(n) => format!("weights (experts, {n} slots)"),
+                None => "weights (experts, every one resident)".to_string(),
+            },
+            (plan.predicted() - plan.resident_bytes) as u64,
+        );
+    for c in &claims {
+        peak.push(c.name, c.bytes as u64);
+    }
+    if let Some(st) = stream {
+        peak.push("drafter", st.drafter_bytes as u64);
+    }
+    Ok(m.admit(&gg.device, peak)?.holding)
+}
+
 /// Refuse a load the budget cannot take, with the arithmetic (§9.5g).
 pub fn admit_load(plan: &LoadPlan) -> Result<()> {
     if plan.fits() {
@@ -950,15 +1013,19 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             }],
             device,
         )?;
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
-        build(&mut gg, device, opts, |gg, l| {
+        let plan = plan_load(&gg, device, opts.fraction(), None);
+        admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, None)?;
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
             ))
-        })
+        })?;
+        model.hold_reservation(reservation);
+        Ok(model)
     }
 
     /// Load from an open GGUF shard with every float matrix kept f32
@@ -1009,15 +1076,19 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
-        build(&mut gg, device, opts, |gg, l| {
+        let plan = plan_load(&gg, device, opts.fraction(), None);
+        admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, None)?;
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
             ))
-        })
+        })?;
+        model.hold_reservation(reservation);
+        Ok(model)
     }
 }
 
@@ -1157,6 +1228,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // `topk + 1` floor, which is then refused with the arithmetic).
         let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held);
         admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, Some(stream))?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -1269,6 +1341,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                 }
             }
         }
+        model.hold_reservation(reservation);
         Ok(model)
     }
 }

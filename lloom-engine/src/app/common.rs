@@ -167,6 +167,30 @@ pub fn profile_take() -> Option<ProfileReport> {
 
 pub use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
 
+/// The label a load's machine reservation is listed under: the family and
+/// the checkpoint, so `pid … qwen3_5 Qwen3.6-35B-A3B-UD-Q4_K_M` says which
+/// process holds what.
+pub fn machine_label(family: &str, checkpoint: &Path) -> String {
+    let name = checkpoint
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = match checkpoint.parent() {
+        // An HF-cache snapshot directory names nothing; its repo does.
+        Some(_) if name.len() == 40 && name.chars().all(|c| c.is_ascii_hexdigit()) => checkpoint
+            .ancestors()
+            .find_map(|a| {
+                a.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("models--"))
+                    .map(|n| n.replace("--", "/"))
+            })
+            .unwrap_or(name),
+        _ => name,
+    };
+    format!("lloom {family} {name}")
+}
+
 pub fn open_device() -> Result<Device> {
     #[cfg(feature = "metal")]
     {

@@ -1480,6 +1480,9 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// the streamed loader; dropped with the model.
     #[cfg(feature = "metal")]
     ledger_gauge: Option<std::sync::Arc<ExpertTenant>>,
+    /// What the load reserved on the machine (`lloom_tensor::machine`),
+    /// released when the model drops.
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1667,6 +1670,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             #[cfg(feature = "metal")]
             ledger_gauge: None,
+            reservation: None,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
@@ -2185,6 +2189,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         self.memory_fraction
     }
 
+    /// Keep the load's machine reservation for the model's life.
+    pub fn hold_reservation(
+        &mut self,
+        reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    ) {
+        self.reservation = reservation;
+    }
+
+    pub fn reservation(&self) -> Option<&std::sync::Arc<lloom_tensor::machine::Holding>> {
+        self.reservation.as_ref()
+    }
+
     /// What a pass the budget cannot take does (the env's arm by default).
     pub fn set_mem_check(&mut self, arm: MemCheck) {
         self.mem_check = arm;
@@ -2331,7 +2347,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             let (allocated, fits) = (a.committed, a.fits);
             debug_assert_eq!(
-                fits,
+                fits || a.machine.is_some(),
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
@@ -2351,6 +2367,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             );
             match self.mem_check {
                 MemCheck::Report => eprintln!("MEMCHECK {line}"),
+                MemCheck::Refuse if !fits && a.machine.is_some() => {
+                    cache.prepared = None;
+                    lloom_tensor::bail!(
+                        "qwen4exp pass refused {line}: {}",
+                        a.machine.as_deref().unwrap_or_default()
+                    )
+                }
                 MemCheck::Refuse if !fits => {
                     cache.prepared = None;
                     lloom_tensor::bail!(

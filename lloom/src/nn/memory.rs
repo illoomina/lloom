@@ -9,7 +9,8 @@
 //! does not name; `device_allocated` and `phys_footprint` are the two
 //! readings from outside it, and the ones that found the retention.
 
-use lloom_tensor::Device;
+use lloom_tensor::machine::{Admitted, Gate, Holding, Peak};
+use lloom_tensor::{Device, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -301,4 +302,66 @@ impl MemoryBudget {
         self.max_seq_len = seq_len;
         self
     }
+}
+
+/// What a family's loader admits on the machine before its first byte
+/// (`lloom_tensor::machine`, `memory.md` §9.10): the gate, the label the
+/// reservation is listed under, and the run's shape the loader cannot read
+/// from the checkpoint (the rows, the KV each row is sized for, the prefill
+/// tile).
+#[derive(Clone, Debug)]
+pub struct MachineLoad {
+    pub gate: Gate,
+    pub label: String,
+    pub rows: usize,
+    pub kv_tokens: usize,
+    /// The longest forward the run takes; 0 = the family's own chunk.
+    pub prefill_tile: usize,
+}
+
+impl MachineLoad {
+    /// Admit `peak` (with the pools' free-list bound added), print the two
+    /// load lines, and count the reservation on the device's ledger for the
+    /// growth check. Refused with the arithmetic before anything is
+    /// allocated.
+    pub fn admit(&self, device: &Device, peak: Peak) -> Result<Admitted> {
+        let peak = peak.with("pool free lists", pool_bound_bytes(device) as u64);
+        let t = std::time::Instant::now();
+        let admitted = self.gate.admit(&self.label, &peak)?;
+        eprintln!(
+            "[machine: peak {} for {}; gate {:.0} us]",
+            peak.describe(),
+            self.label,
+            t.elapsed().as_secs_f64() * 1e6
+        );
+        eprintln!("{}", admitted.line());
+        if let (Some(h), Some(v)) = (&admitted.holding, &admitted.verdict) {
+            if v.forced {
+                eprintln!("[machine: {}]", v.describe().replace('\n', "\n  "));
+            }
+            attach(device, h);
+        }
+        Ok(admitted)
+    }
+}
+
+/// Count `holding` on `device`'s ledger, so a pass past it is admitted on
+/// the machine (`MetalDevice::admit_bytes`). Nothing to do off Metal.
+pub fn attach(device: &Device, holding: &std::sync::Arc<Holding>) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.ledger().attach_machine(holding);
+    }
+    let _ = (device, holding);
+}
+
+/// The pools' free lists at their caps: bytes the process may keep that no
+/// tenant claims. 0 off Metal.
+pub fn pool_bound_bytes(device: &Device) -> usize {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return m.free_budgets();
+    }
+    let _ = device;
+    0
 }

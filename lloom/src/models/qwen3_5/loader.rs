@@ -50,6 +50,9 @@ pub struct LoadOptions {
     /// `Ring` profile runs as one pass over phase rings
     /// (`StateCapacity::window`); 0 runs a window as sequential steps.
     pub window: usize,
+    /// The machine gate the load passes before its first tensor
+    /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
+    pub machine: Option<crate::nn::memory::MachineLoad>,
 }
 
 impl Default for LoadOptions {
@@ -61,6 +64,7 @@ impl Default for LoadOptions {
             dense_f32: false,
             mtp: false,
             window: 0,
+            machine: None,
         }
     }
 }
@@ -206,6 +210,58 @@ fn admit<R: Read + Seek>(gg: &Gguf<'_, R>, fraction: f64) -> Result<()> {
     Ok(())
 }
 
+/// What a load holds at its peak before anything grows past its floors —
+/// the machine gate's figure (`memory.md` §9.10): the weights from the
+/// headers; the KV every full-attention layer allocates at its first append
+/// (`kv_capacity` positions, the MTP block's layer among them when loaded);
+/// every linear layer's recurrent state over `phases` buffers a channel; and
+/// the transient of one prefill chunk, at Qwen4-exp's per-position figure
+/// (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`: the same blocks).
+pub fn machine_peak(
+    cfg: &Config,
+    weights: usize,
+    opts: &LoadOptions,
+    prefill_tile: usize,
+    phases: usize,
+) -> lloom_tensor::machine::Peak {
+    use crate::models::qwen4exp::{PREFILL_CHUNK, PREFILL_TRANSIENT_BYTES_PER_TOKEN};
+    let full_stack = cfg
+        .layer_types
+        .iter()
+        .filter(|k| **k == LayerKind::Full)
+        .count();
+    let full = full_stack + usize::from(opts.mtp);
+    let linear = cfg.n_layers - full_stack;
+    let precision = opts.kv_precision.unwrap_or(cfg.kv_precision);
+    let per_token =
+        precision.bytes_per_token(cfg.n_kv_heads, cfg.head_dim, lloom_tensor::DType::F32);
+    let kv = full * opts.kv_capacity.max(1) * per_token;
+    let d = cfg.deltanet_dims();
+    let state = d.d_k * d.d_v * d.h_v + cfg.conv_channels() * cfg.ssm_conv_kernel;
+    let recurrent = linear * phases * state * std::mem::size_of::<f32>();
+    let tile = match prefill_tile {
+        0 => PREFILL_CHUNK,
+        t => t.min(PREFILL_CHUNK),
+    };
+    lloom_tensor::machine::Peak::new()
+        .with("weights", weights as u64)
+        .with(
+            format!(
+                "KV floor ({full} layers x {} positions)",
+                opts.kv_capacity.max(1)
+            ),
+            kv as u64,
+        )
+        .with(
+            format!("recurrent state ({linear} layers)"),
+            recurrent as u64,
+        )
+        .with(
+            format!("prefill transient ({tile}-position chunk)"),
+            (tile * PREFILL_TRANSIENT_BYTES_PER_TOKEN) as u64,
+        )
+}
+
 fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
     StateCapacity {
         kv_tokens: opts.kv_capacity.max(1),
@@ -335,7 +391,8 @@ fn open<R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
     want_moe: bool,
-) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>)> {
+    phases: usize,
+) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>, Holds)> {
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
     // A sidecar's MTP block (bartowski's `mtp-*.gguf`): the main header
     // says nothing of it, the table carries `blk.{n_layers}.nextn.*`.
@@ -372,6 +429,18 @@ fn open<R: Read + Seek>(
     let schema = super::schema::tensor_schema(&cfg, &Default::default());
     schema.validate(gg.table())?;
     admit(gg, opts.fraction())?;
+    let reservation = match &opts.machine {
+        Some(m) => {
+            let peak = machine_peak(&cfg, header_bytes(gg), opts, m.prefill_tile, phases);
+            m.admit(&gg.device, peak)?.holding
+        }
+        None => None,
+    };
+    let keep = if opts.mtp {
+        mtp_tenant(gg, cfg.n_layers)
+    } else {
+        None
+    };
     let embed = TokenEmbed::new(
         QMatMul::QTensor(gg.packed("token_embd.weight")?),
         cfg.hidden_size,
@@ -381,7 +450,71 @@ fn open<R: Read + Seek>(
         gg.qmat("output.weight")?,
         cfg.vocab_size,
     );
-    Ok((cfg, embed, head))
+    Ok((
+        cfg,
+        embed,
+        head,
+        Holds {
+            reservation,
+            keep: keep.into_iter().collect(),
+        },
+    ))
+}
+
+/// What a load registered that its model keeps for its life: the machine
+/// reservation and the ledger rows of what the model owns.
+struct Holds {
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    keep: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Register the MTP block's weights (`blk.{layer}.*`, from the main file or
+/// the sidecar) as a ledger row for the process's life: a capability the
+/// caller chose with `speculative.method = mtp`. The row is the returned
+/// handle's: the model keeps it.
+fn mtp_tenant<R: Read + Seek>(
+    gg: &Gguf<'_, R>,
+    layer: usize,
+) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = &gg.device {
+        use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+        let prefix = format!("blk.{layer}.");
+        let bytes: usize = gg
+            .shards
+            .iter()
+            .flat_map(|s| s.content.tensor_infos.iter())
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(_, ti)| {
+                ti.shape.elem_count() / ti.ggml_dtype.block_size() * ti.ggml_dtype.type_size()
+            })
+            .sum();
+        let g = Gauge::new(
+            "qwen3_5-mtp",
+            Claim {
+                floor: bytes,
+                want: bytes,
+                unit: bytes.max(1),
+                class: Class::Capability,
+            },
+            bytes,
+        );
+        let t: std::sync::Arc<dyn Tenant> = g.clone();
+        m.ledger().register(&t);
+        return Some(g);
+    }
+    let _ = (gg, layer);
+    None
+}
+
+/// Buffers a recurrent channel takes at profile `P`: the ring's phases when
+/// the state is pooled (`Ring` with a window), else the slab and its spare.
+fn state_phases<P: Profile>(opts: &LoadOptions) -> usize {
+    if <P::Rewind as crate::profile::Rewind>::REWINDABLE && opts.window > 0 {
+        opts.window + 1
+    } else {
+        2
+    }
 }
 
 /// The MTP block's attention layer, `blk.{n_layers}`: the full-attention
@@ -422,7 +555,7 @@ fn build_dense<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
 ) -> Result<(Qwen3_5<P>, Option<Qwen3_5MtpHead<P>>)> {
-    let (cfg, embed, head) = open(gg, opts, false)?;
+    let (cfg, embed, head, holds) = open(gg, opts, false, state_phases::<P>(opts))?;
     let mut layers: Vec<Qwen3_5Layer<P>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -455,17 +588,19 @@ fn build_dense<P: Profile, R: Read + Seek>(
     let cap = capacity(&cfg, opts);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
-    Ok((
-        Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?,
-        mtp,
-    ))
+    let mut model = Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?;
+    model.hold_reservation(holds.reservation);
+    for k in holds.keep {
+        model.keep_alive(k);
+    }
+    Ok((model, mtp))
 }
 
 fn build_moe<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
 ) -> Result<(Qwen3_5Moe<P>, Option<Qwen3_5MoeMtpHead<P>>)> {
-    let (cfg, embed, head) = open(gg, opts, true)?;
+    let (cfg, embed, head, holds) = open(gg, opts, true, state_phases::<P>(opts))?;
     let mut layers: Vec<Qwen3_5MoeLayer<P, Resident>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -498,10 +633,12 @@ fn build_moe<P: Profile, R: Read + Seek>(
     let cap = capacity(&cfg, opts);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
-    Ok((
-        Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?,
-        mtp,
-    ))
+    let mut model = Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?;
+    model.hold_reservation(holds.reservation);
+    for k in holds.keep {
+        model.keep_alive(k);
+    }
+    Ok((model, mtp))
 }
 
 /// The shards and, after them, an MTP sidecar GGUF (bartowski's

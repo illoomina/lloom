@@ -3,23 +3,24 @@
 //! it, never the thing a decision is made on (§6.3d: accounting is cheap,
 //! Metal calls are not).
 //!
-//! Two things live here. A [`Reservation`] is bytes a persistent allocation
-//! holds for its lifetime — the slot pools, the arena base, the pass-plan
-//! base, the heap chunks, every unpooled buffer — released when it drops, so
-//! the committed figure cannot drift from what exists. A [`Tenant`] is a
-//! holder that can say what it needs and wants (a [`Claim`]) and what it
-//! holds now; the registry lists them so a report, and later the arbiter
-//! (A5), sees every claim in one place.
+//! Three things live here. A [`Reservation`] is bytes an allocation holds for
+//! its lifetime — every byte through a backing (`backing.rs`), the slot
+//! pools, the arena and pass-plan bases, the heap chunks — released when it
+//! drops, so the committed figure cannot drift from what exists. A [`Tenant`]
+//! is a holder that can say what it needs and wants (a [`Claim`]) and what it
+//! holds now; [`arbitrate`] fits the claims into the quota and
+//! [`Ledger::yield_for`] asks the caches to give back. And the process's
+//! reservations on the machine (`machine.rs`): a pass admitted against the
+//! quota whose bytes would pass what the process reserved at load widens that
+//! reservation first ([`Ledger::admit_machine`]).
 //!
-//! **Accounting only, for now.** `reserve` never refuses and no claim is
-//! granted or shrunk here; the per-pass admission still reads the device
-//! (`Cache::admit_grow`, `prepare_pass_as`). Reservations as the admission
-//! mechanism are A4; the arbiter over the claims is A5. What this commit
-//! buys is the figure beside `currentAllocatedSize` that tells committed from
-//! elastic bytes (§1.1 #3) and the claims written down.
+//! `reserve` never refuses: admission is the pass's
+//! (`MetalDevice::admit_bytes`), never the allocation's.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+
+use crate::machine::Holding;
 
 /// What a tenant's memory is to the process (§2 principle 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -214,6 +215,9 @@ pub struct Ledger {
     drains: AtomicU32,
     next_id: AtomicU32,
     tenants: parking_lot::Mutex<Vec<(TenantId, Weak<dyn Tenant>)>>,
+    /// The process's reservations on the machine, held by the loads that
+    /// made them (`machine::Gate::admit`); a dropped load drops its row.
+    machine: parking_lot::Mutex<Vec<Weak<Holding>>>,
 }
 
 impl Default for Ledger {
@@ -226,6 +230,7 @@ impl Default for Ledger {
             drains: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
             tenants: parking_lot::Mutex::new(Vec::new()),
+            machine: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -338,7 +343,7 @@ impl Ledger {
     }
 
     /// Commit `bytes` for as long as the reservation lives. Never refuses
-    /// here: admission against the quota is the pass's (A4), not the
+    /// here: admission against the quota is the pass's, not the
     /// allocation's.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Reservation {
         self.committed.fetch_add(bytes, Ordering::AcqRel);
@@ -346,6 +351,44 @@ impl Ledger {
             ledger: Arc::clone(self),
             bytes,
         }
+    }
+
+    /// Count `holding` as this process's reservation on the machine for as
+    /// long as its owner keeps it.
+    pub fn attach_machine(&self, holding: &Arc<Holding>) {
+        let mut m = self.machine.lock();
+        m.retain(|w| w.strong_count() > 0);
+        m.push(Arc::downgrade(holding));
+    }
+
+    /// Bytes the process holds reserved on the machine; `None` when no load
+    /// reserved any (a harness, a test, the gate off).
+    pub fn machine_reserved(&self) -> Option<u64> {
+        let m = self.machine.lock();
+        let live: Vec<Arc<Holding>> = m.iter().filter_map(Weak::upgrade).collect();
+        (!live.is_empty()).then(|| live.iter().map(|h| h.reserved()).sum())
+    }
+
+    /// Admit `bytes` on the machine: inside what the process reserved,
+    /// nothing is read; past it, the first reservation is widened by the
+    /// excess through the machine gate's arithmetic (`Holding::grow_to`), or
+    /// the refusal's text is returned. No reservation, nothing to check.
+    pub fn admit_machine(&self, bytes: u64) -> std::result::Result<(), String> {
+        let live: Vec<Arc<Holding>> = {
+            let m = self.machine.lock();
+            m.iter().filter_map(Weak::upgrade).collect()
+        };
+        let Some(first) = live.first() else {
+            return Ok(());
+        };
+        let reserved: u64 = live.iter().map(|h| h.reserved()).sum();
+        if bytes <= reserved {
+            return Ok(());
+        }
+        first
+            .grow_to(first.reserved() + (bytes - reserved))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// List `tenant` until its owner drops it.
@@ -1010,5 +1053,69 @@ mod admit_tests {
         drop(raw);
         drop(held);
         assert_eq!(m.ledger().committed(), committed);
+    }
+
+    /// Past what the load reserved on the machine, a pass that fits the
+    /// quota widens the reservation through the machine gate, or is refused
+    /// with the gate's arithmetic; inside it nothing is asked. The
+    /// non-vacuity arm: with no reservation attached, the same pass fits.
+    #[test]
+    fn a_pass_past_the_machine_reservation_widens_it_or_is_refused() {
+        use crate::machine::{Gate, GateConfig, Peak};
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let gb = 1_000_000_000usize;
+        let budget = usize::MAX;
+        assert!(
+            m.admit_bytes(20 * gb, budget).fits,
+            "no reservation attached: the machine is not asked"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "lloom-ledger-machine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 10 GB available, nothing kept: the room is 10 GB less what this
+        // process has reserved and does not hold yet (its footprint is far
+        // under a gigabyte, so the arms below hold whatever it is).
+        let gate = Gate::new(GateConfig {
+            reserve: Some(0),
+            registry: Some(dir.clone()),
+            available: Some(10 * gb as u64),
+            total: Some(64 * gb as u64),
+            ..Default::default()
+        });
+        let held = gate
+            .admit("ledger test", &Peak::new().with("weights", gb as u64))
+            .unwrap()
+            .holding
+            .unwrap();
+        m.ledger().attach_machine(&held);
+        assert_eq!(m.ledger().machine_reserved(), Some(gb as u64));
+        let committed = m.ledger().committed();
+        // Inside the reservation: admitted, the reservation unmoved.
+        let a = m.admit_bytes(gb / 2 - committed.min(gb / 2), budget);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert_eq!(held.reserved(), gb as u64);
+        // Past it, with room: admitted, the reservation widened to the pass.
+        let a = m.admit_bytes(2 * gb, budget);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert_eq!(held.reserved(), (committed + 2 * gb) as u64);
+        // Past the room: refused with the gate's arithmetic, unmoved.
+        let a = m.admit_bytes(20 * gb, budget);
+        assert!(!a.fits, "{a:?}");
+        let why = a.machine.expect("the machine's refusal");
+        assert!(
+            why.contains("the machine cannot hold this now") && why.contains("of growth"),
+            "{why}"
+        );
+        assert_eq!(held.reserved(), (committed + 2 * gb) as u64);
+        drop(held);
+        assert_eq!(m.ledger().machine_reserved(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

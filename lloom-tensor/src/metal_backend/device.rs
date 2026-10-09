@@ -216,7 +216,7 @@ impl Drop for DeviceTeardown {
 /// (`profiles-and-memory-design.md` §4.2, §11), where the device figure
 /// also counted Metal's own objects and whatever another thread had just
 /// freed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassAdmission {
     pub committed: usize,
     pub reclaimed: usize,
@@ -229,6 +229,10 @@ pub struct PassAdmission {
     /// given back (`--pool-no-admission-drain` turns it off).
     pub drained: bool,
     pub fits: bool,
+    /// The machine gate's refusal (`machine.rs`), when the pass fit the
+    /// quota but the bytes past what the process reserved on the machine
+    /// did not fit the machine: the arithmetic, for the caller's message.
+    pub machine: Option<String>,
 }
 
 #[derive(Clone)]
@@ -796,6 +800,11 @@ impl MetalDevice {
         self.residency_set.reset_counters();
     }
 
+    /// The two pools' free-list caps summed: the most their free lists hold.
+    pub fn free_budgets(&self) -> usize {
+        self.buffers.free_budget() + self.private_buffers.free_budget()
+    }
+
     /// Sets the cap on bytes each pool retains in its free list, evicting
     /// immediately if the new cap is already exceeded.
     ///
@@ -908,7 +917,27 @@ impl MetalDevice {
     /// for. The caller decides on the figure returned; a reclaim is counted on
     /// the ledger. Not on the hot path: a decode step inside its slab asks
     /// nothing (§9.5e).
+    ///
+    /// Then the machine (`memory.md` §9.10): a pass that fits the quota and
+    /// would take the process past what it reserved at load widens the
+    /// reservation through the machine gate, or is refused with its
+    /// arithmetic (`PassAdmission::machine`). Inside the reservation that is
+    /// one comparison.
     pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
+        let mut a = self.admit_quota(need, budget);
+        if a.fits {
+            if let Err(why) = self
+                .ledger
+                .admit_machine(a.committed.saturating_add(need) as u64)
+            {
+                a.fits = false;
+                a.machine = Some(why);
+            }
+        }
+        a
+    }
+
+    fn admit_quota(&self, need: usize, budget: usize) -> PassAdmission {
         let committed = self.ledger.committed();
         if committed.saturating_add(need) <= budget {
             return PassAdmission {
@@ -917,6 +946,7 @@ impl MetalDevice {
                 pledged: 0,
                 drained: false,
                 fits: true,
+                machine: None,
             };
         }
         let mut reclaimed = self.trim_unused_buffers();
@@ -953,6 +983,7 @@ impl MetalDevice {
             pledged,
             drained,
             fits: committed.saturating_add(need) <= budget,
+            machine: None,
         }
     }
 
@@ -2359,6 +2390,13 @@ impl MetalDevice {
                 let working_set = self.device.recommended_max_working_set_size();
                 let budget = (working_set as f64 * pp.admit_fraction) as usize;
                 let a = self.admit_bytes(grow, budget);
+                if let Some(why) = &a.machine {
+                    return Err(MetalError::Message(format!(
+                        "pass plan base grow refused for {:?}: {why}",
+                        closes.kind
+                    ))
+                    .into());
+                }
                 if !a.fits {
                     let gb = |b: usize| b as f64 / 1e9;
                     return Err(MetalError::Message(format!(

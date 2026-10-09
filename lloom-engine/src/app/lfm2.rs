@@ -834,6 +834,13 @@ impl<P: Lfm2Shape> Engine<P> {
             None if opts.prefill_tile > 0 => opts.prefill_tile.max(opts.prefill_chunk),
             None => opts.kv_capacity,
         };
+        // A prefill of several forwards keeps the pacer's depth of them in
+        // flight, each holding its activations until its command buffer
+        // completes; the prefill's own bound, else decode's, else the floor.
+        let in_flight = [opts.decode.prefill.in_flight, opts.decode.in_flight]
+            .into_iter()
+            .find(|&d| d > 0)
+            .unwrap_or(lloom::nn::decode::IN_FLIGHT_FLOOR);
         let mut peak = machine_peak::<P>(
             &config,
             dtype,
@@ -841,6 +848,7 @@ impl<P: Lfm2Shape> Engine<P> {
             opts.batch,
             kv_floor,
             longest,
+            in_flight,
             config.memory_budget.and_then(|b| b.activation_rows),
         );
         if let Some(dir) = &dspark_dir {
@@ -2603,13 +2611,12 @@ fn pipeline_cache_sizes(device: &Device) -> (usize, usize) {
     (0, 0)
 }
 
-/// The safetensors shards for a checkpoint: the sharded index if present,
-/// else the single `model.safetensors`.
 /// What an LFM2 load holds at its peak before its KV grows past
 /// `kv_floor` positions (`memory.md` §9.10): the weights it will hold, each
 /// row's state floor (`lfm2::state_floor_bytes`), and — on Metal — the
-/// activation and scratch classes of its longest forward and the RoPE
-/// tables, from the arithmetic the KV cache is admitted on (§9.5d).
+/// activation class of its longest forward once per forward the pacer keeps
+/// in flight (`in_flight`), the scratch class and the RoPE tables, from the
+/// arithmetic the KV cache is admitted on (§9.5d).
 #[allow(unused_variables)]
 fn machine_peak<P: Profile>(
     config: &Config,
@@ -2618,6 +2625,7 @@ fn machine_peak<P: Profile>(
     batch: usize,
     kv_floor: usize,
     longest_forward: usize,
+    in_flight: usize,
     activation_rows: Option<usize>,
 ) -> lloom_tensor::machine::Peak {
     let rows = batch.max(1);
@@ -2637,9 +2645,10 @@ fn machine_peak<P: Profile>(
         b.max_seq_len = longest_forward;
         b.activation_rows = activation_rows;
         let f = State::<P>::admission_budget(config, &b, kv_floor).footprint();
+        let in_flight = in_flight.max(1);
         peak.push(
-            format!("activations ({longest_forward}-position forward)"),
-            f.activations as u64,
+            format!("activations ({longest_forward}-position forward x {in_flight} in flight)"),
+            (f.activations * in_flight) as u64,
         );
         peak.push("scratch", f.scratch as u64);
         peak.push("RoPE tables", State::<P>::rope_table_bytes(config) as u64);
@@ -2678,6 +2687,8 @@ fn checkpoint_elems(files: &[PathBuf]) -> Result<usize> {
     Ok(n)
 }
 
+/// The safetensors shards for a checkpoint: the sharded index if present,
+/// else the single `model.safetensors`.
 pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let index = dir.join("model.safetensors.index.json");
     if !index.is_file() {

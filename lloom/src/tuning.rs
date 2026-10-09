@@ -740,7 +740,7 @@ pub struct RingTuning {
     #[opt(flag = "ring-slack-bytes", env = "LLOOM_RING_SLACK_BYTES", path = "decode.ring.slack_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
     pub slack_bytes: usize,
     /// The decode thread's QoS: `user-interactive` (claim it for the run), `default` (hold the class a spawned thread has, a measurement arm) or `off` (leave the thread as found). The older spellings `interactive`, `demote`, `0` and `none` are the same arms.
-    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"], path = "decode.thread_qos", status = "advanced", facets = ["qos"], flows = ["token-out", "commands-out"], forms = ["user-interactive", "default", "off"], from_v1 = "lloom_tensor::options::v1::hot_thread_from", to_v1 = "lloom_tensor::options::v1::hot_thread_to", schema = "ThreadQos")]
+    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off", "demote", "0", "none"], path = "decode.thread_qos", status = "advanced", facets = ["qos"], flows = ["token-out", "commands-out"], forms = ["user-interactive", "default", "off"], from_v1 = "lloom_tensor::options::v1::hot_thread_from", to_v1 = "lloom_tensor::options::v1::hot_thread_to", schema = "ThreadQos")]
     pub hot_thread: String,
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
     #[opt(flag = "host-feed-qos",

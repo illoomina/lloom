@@ -42,7 +42,7 @@ mod tests {
     use super::*;
     use crate::option_tree::{index, Key, Leaf};
     use lloom_tensor::options::{canonical_env, KnobMeta, FALSE_SPELLINGS, TRUE_SPELLINGS};
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     /// A key's value type, read off its declaration.
     #[derive(Debug, Clone, PartialEq)]
@@ -498,5 +498,163 @@ mod tests {
             }
         }
         assert!(n >= 25, "{n} rows");
+    }
+
+    /// A JSON Schema validator for the keywords the option schema's value
+    /// nodes use; any other keyword fails the test rather than passing
+    /// silently.
+    fn schema_valid(node: &Value, v: &Value, defs: &Value) -> bool {
+        let Some(obj) = node.as_object() else {
+            return node.as_bool().unwrap_or(false);
+        };
+        obj.iter().all(|(k, rule)| match k.as_str() {
+            "description" | "default" | "examples" | "title" => true,
+            k if k.starts_with("x-lloom") => true,
+            "$ref" => {
+                let name = rule.as_str().unwrap().trim_start_matches("#/$defs/");
+                schema_valid(&defs[name], v, defs)
+            }
+            "allOf" => rule
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| schema_valid(r, v, defs)),
+            "anyOf" => rule
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| schema_valid(r, v, defs)),
+            "not" => !schema_valid(rule, v, defs),
+            "enum" => rule.as_array().unwrap().iter().any(|e| e == v),
+            "const" => rule == v,
+            "type" => match rule.as_str().unwrap() {
+                "string" => v.is_string(),
+                "boolean" => v.is_boolean(),
+                "null" => v.is_null(),
+                "number" => v.is_number(),
+                "integer" => v.as_f64().is_some_and(|f| f.fract() == 0.0),
+                "object" => v.is_object(),
+                "array" => v.is_array(),
+                other => panic!("type {other}"),
+            },
+            "pattern" => v.as_str().is_none_or(|s| {
+                regex::Regex::new(rule.as_str().unwrap())
+                    .expect("the pattern compiles")
+                    .is_match(s)
+            }),
+            "minimum" => v.as_f64().is_none_or(|f| f >= rule.as_f64().unwrap()),
+            other => panic!("the validator does not know `{other}`"),
+        })
+    }
+
+    /// The schema node of a key, through the groups (a group that also takes
+    /// a shorthand string is the `anyOf` member with properties).
+    fn schema_node<'a>(schema: &'a Value, path: &str) -> &'a Value {
+        let mut node = schema;
+        for seg in path.split('.') {
+            let group = node
+                .get("properties")
+                .map(|_| node)
+                .or_else(|| {
+                    node["anyOf"]
+                        .as_array()
+                        .and_then(|a| a.iter().find(|g| g.get("properties").is_some()))
+                })
+                .unwrap_or_else(|| panic!("{path}: no group at {seg}"));
+            node = &group["properties"][seg];
+        }
+        node
+    }
+
+    /// The schema states the grammar (review 1): every value the loader
+    /// takes for a typed key — a bool spelling or JSON bool, an arm in any
+    /// case, a padded count, `none` on an optional key — validates against
+    /// the key's schema node, and every spelling the grammar refuses does
+    /// not.
+    #[test]
+    fn the_schema_takes_what_the_loader_takes_and_refuses_what_it_refuses() {
+        let schema = crate::option_schema::schema();
+        let defs = &schema["$defs"];
+        let idx = index();
+        let mut bad: Vec<String> = Vec::new();
+        let (mut taken, mut refused) = (0usize, 0usize);
+        for key in idx.keys.values().filter(|k| k.compound.is_none()) {
+            let Some(leaf) = key.targets.first() else {
+                continue;
+            };
+            let ty = ty_of(leaf.meta);
+            let node = schema_node(&schema, &key.path);
+            let via = Via::Json(key.path.clone());
+            let s = |x: &str| Value::String(x.to_string());
+            let (mut candidates, nots): (Vec<Value>, &[&str]) = match &ty {
+                Ty::Bool { .. } => {
+                    let mut c: Vec<Value> = vec![json!(true), json!(false), json!(0), json!(1)];
+                    for sp in TRUE_SPELLINGS.iter().chain(FALSE_SPELLINGS) {
+                        c.extend([s(sp), s(&sp.to_ascii_uppercase()), s(&format!(" {sp} "))]);
+                    }
+                    (c, NOT_BOOLS)
+                }
+                Ty::Enum { arms, .. } => (
+                    arms.iter()
+                        .flat_map(|a| [s(a), s(&a.to_ascii_uppercase()), s(&format!(" {a} "))])
+                        .collect(),
+                    &["", " ", "no-such-arm"],
+                ),
+                Ty::Count { .. } => (
+                    ["1", "2", "4", "8", "16", "32", "64", "256"]
+                        .iter()
+                        .flat_map(|n| {
+                            [s(n), s(&format!(" {n} ")), json!(n.parse::<u64>().unwrap())]
+                        })
+                        .collect(),
+                    &["", " ", "x", "-1", "1.5", "4x"],
+                ),
+                Ty::Number { .. } => (
+                    ["1", "0.5", "1.5", "2"]
+                        .iter()
+                        .flat_map(|n| {
+                            [s(n), s(&format!(" {n} ")), json!(n.parse::<f64>().unwrap())]
+                        })
+                        .collect(),
+                    &["", " ", "x", "nan", "inf", "1..5"],
+                ),
+                Ty::Text => continue,
+            };
+            candidates.extend([s("NONE"), s("none"), Value::Null]);
+            for c in &candidates {
+                if via.write_json(c.clone()).is_ok() {
+                    taken += 1;
+                    if !schema_valid(node, c, defs) {
+                        bad.push(format!(
+                            "{}: the loader takes {c}, the schema refuses it",
+                            key.path
+                        ));
+                    }
+                }
+            }
+            for n in nots {
+                let c = s(n);
+                refused += 1;
+                if via.write_json(c.clone()).is_ok() {
+                    bad.push(format!(
+                        "{}: the loader takes the non-spelling {c}",
+                        key.path
+                    ));
+                } else if schema_valid(node, &c, defs) {
+                    bad.push(format!(
+                        "{}: the schema takes {c}, the loader refuses it",
+                        key.path
+                    ));
+                }
+            }
+        }
+        eprintln!("[{taken} accepted values validate; {refused} refused spellings checked]");
+        assert!(taken > 5_000 && refused > 1_000, "{taken} / {refused}");
+        assert!(
+            bad.is_empty(),
+            "{} failures:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 }

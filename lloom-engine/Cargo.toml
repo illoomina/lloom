@@ -62,6 +62,8 @@ path = "tests/main.rs"
 
 [dev-dependencies]
 anyhow = { workspace = true }
+# The option schema's patterns, checked against the loader in a test.
+regex = "1"
 # Examples encode/decode; the library itself names no tokenizer library (the
 # seam takes a rendered prompt and a detokenize closure), so this is dev-only.
 tokenizers = { workspace = true, features = ["onig"] }

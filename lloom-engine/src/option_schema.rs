@@ -8,29 +8,128 @@ use crate::option_tree::{index, Key};
 use crate::options::EngineOptions;
 use serde_json::{json, Map, Value};
 
-const DURATION: &str = r"\d+(us|ms|s)";
+const DURATION: &str = r"\d+([uU][sS]|[mM][sS]|[sS])";
+
+/// `pattern` (an ECMA-262 regex of ASCII alternatives) matching in any ASCII
+/// case: each letter becomes its two-case class; escapes and classes are
+/// copied as they are.
+fn case_free(pattern: &str) -> String {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            '[' => {
+                in_class = true;
+                out.push(c);
+            }
+            ']' => {
+                in_class = false;
+                out.push(c);
+            }
+            c if c.is_ascii_alphabetic() && !in_class => {
+                out.push('[');
+                out.push(c.to_ascii_lowercase());
+                out.push(c.to_ascii_uppercase());
+                out.push(']');
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The value grammar (`lloom_tensor::options`) as patterns: a typed value
+/// may carry surrounding whitespace, an arm and a bool spelling any case.
+fn padded(body: &str) -> String {
+    format!(r"^\s*({})\s*$", case_free(body))
+}
+
+fn escape(arm: &str) -> String {
+    arm.chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                vec![c]
+            } else {
+                vec!['\\', c]
+            }
+        })
+        .collect()
+}
+
+/// The bool spellings, as a string pattern.
+fn bool_pattern() -> String {
+    let all: Vec<&str> = lloom_tensor::options::TRUE_SPELLINGS
+        .iter()
+        .chain(lloom_tensor::options::FALSE_SPELLINGS)
+        .copied()
+        .collect();
+    padded(&all.join("|"))
+}
+
+/// A count, a number and `none` as the strings the grammar reads.
+const COUNT: &str = r"^\s*\+?\d+\s*$";
+const NUMBER: &str = r"^\s*[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?\s*$";
+
+/// The arms a field declares (`variants`), parameterised ones included
+/// (`nodes:<k>`, `ring[:<K>]`, `<count>`), as a pattern; `None` for a list
+/// that is prose rather than arms.
+fn variants_pattern(variants: &[&str]) -> Option<String> {
+    let mut alts = Vec::new();
+    for v in variants {
+        if v.chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || "-_:<>[]µ.,".contains(c)))
+        {
+            return None;
+        }
+        if v.starts_with('<') {
+            alts.push(r"\+?\d+".to_string());
+            continue;
+        }
+        let cut = v.find([':', '[']).unwrap_or(v.len());
+        let (base, rest) = v.split_at(cut);
+        alts.push(match rest.chars().next() {
+            None => escape(base),
+            Some('[') => format!(r"{}(:[^\s]+)?", escape(base)),
+            Some(_) => format!(r"{}:[^\s]+", escape(base)),
+        });
+    }
+    Some(padded(&alts.join("|")))
+}
+
+fn arms(variants: &[&str]) -> Value {
+    let alt: Vec<String> = variants.iter().map(|v| escape(v)).collect();
+    json!({"anyOf": [
+        {"type": "string", "enum": variants},
+        {"type": "string", "pattern": padded(&alt.join("|"))}
+    ]})
+}
 
 /// The shared value types.
 pub fn defs() -> Value {
     json!({
         "Duration": {
             "type": "string",
-            "pattern": format!("^{DURATION}$"),
+            "pattern": format!(r"^\s*{DURATION}\s*$"),
             "description": "A time with its unit: `50us`, `1ms`, `2s`."
         },
         "Wait": {
             "type": "string",
-            "pattern": format!("^(block|spin|spin-hint|wfe|inherit|(sleep|event|event-sleep|event-listener|adaptive)(:{DURATION})?)$"),
+            "pattern": format!(r"^\s*({}(:{DURATION})?)\s*$", case_free(r"block|spin|spin\-hint|wfe|inherit|(sleep|event|event\-sleep|event\-listener|adaptive)")),
             "description": "How a thread learns that something happened: `block` (the API's blocking call), `spin`, `spin-hint` (spin with a CPU hint), `wfe` (wait-for-event), `sleep[:dur]` (poll, sleeping between looks), `event[:timeout]` (park on an event), `event-sleep[:dur]` / `event-listener[:timeout]` (event variants), `adaptive[:dur]` (wfe while a consumer waits, else sleep), `inherit` (the flow's own wait). Each site takes the forms it implements (`x-lloom-wait-forms`)."
         },
         "ThreadQos": {
-            "type": "string",
-            "enum": ["user-interactive", "user-initiated", "default", "utility", "background", "inherit", "off"],
+            "allOf": [arms(&["user-interactive", "user-initiated", "default", "utility", "background", "inherit", "off"])],
             "description": "A thread's scheduling class (macOS QoS): `inherit` = as spawned, `off` = claim nothing. Each site takes the classes it implements."
         },
         "Locality": {
-            "type": "string",
-            "enum": ["device", "host"],
+            "allOf": [arms(&["device", "host"])],
             "description": "Where a decision is made: on the GPU, or on the host after a readback."
         }
     })
@@ -71,13 +170,13 @@ fn value_schema(key: &Key, default: &Value) -> Value {
             let alt = m
                 .forms
                 .iter()
-                .map(|f| f.replace('-', "\\-"))
+                .map(|f| escape(f))
                 .collect::<Vec<_>>()
                 .join("|");
-            json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!("^({alt})(:{DURATION})?$")}]})
+            json!({"allOf": [{"$ref": "#/$defs/Wait"}, {"pattern": format!(r"^\s*({})(:{DURATION})?\s*$", case_free(&alt))}]})
         }
         "ThreadQos" if !m.forms.is_empty() => {
-            json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, {"enum": m.forms}]})
+            json!({"allOf": [{"$ref": "#/$defs/ThreadQos"}, arms(m.forms)]})
         }
         "" => {
             let mut b = if m.is_bool {
@@ -88,8 +187,11 @@ fn value_schema(key: &Key, default: &Value) -> Value {
             if b["type"] == "string" && !m.variants.is_empty() {
                 let vs: Vec<&str> = m.variants.to_vec();
                 if vs.iter().all(|v| literal(v)) {
-                    b["enum"] = json!(vs);
+                    b = arms(&vs);
                 } else {
+                    if let Some(p) = variants_pattern(&vs) {
+                        b["pattern"] = json!(p);
+                    }
                     b["examples"] = json!(m.variants);
                 }
             }
@@ -97,10 +199,28 @@ fn value_schema(key: &Key, default: &Value) -> Value {
         }
         other => json!({"$ref": format!("#/$defs/{other}")}),
     };
-    if optional || default.is_null() {
-        s = json!({"anyOf": [s, {"type": "null"}]});
+    // A key whose vocabulary moved to a shared type still takes the stored
+    // spellings it always took (`interactive`, `synchronize`).
+    if m.schema != "" && !m.variants.is_empty() {
+        if let Some(p) = variants_pattern(m.variants) {
+            s = json!({"anyOf": [s, {"type": "string", "pattern": p}]});
+        }
     }
-    s
+    // What the grammar also reads besides the JSON type: a bool's spellings
+    // (and 0/1), a count's or a number's digits as a string.
+    if m.is_bool || ty == "bool" {
+        s = json!({"anyOf": [s, {"type": "boolean"}, {"enum": [0, 1]}, {"type": "string", "pattern": bool_pattern()}]});
+    } else if base_type(ty)["type"] == "integer" {
+        s = json!({"anyOf": [s, {"type": "integer", "minimum": 0}, {"type": "string", "pattern": COUNT}]});
+    } else if base_type(ty)["type"] == "number" {
+        s = json!({"anyOf": [s, {"type": "number"}, {"type": "string", "pattern": NUMBER}]});
+    }
+    // `null` returns any key to its default; `none` unsets an optional one.
+    let mut alts = vec![s, json!({"type": "null"})];
+    if optional || default.is_null() {
+        alts.push(json!({"type": "string", "pattern": padded("none")}));
+    }
+    json!({"anyOf": alts})
 }
 
 fn annotate(key: &Key, default: &Value, s: &mut Map<String, Value>) {

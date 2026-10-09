@@ -1098,7 +1098,7 @@ impl<P: Profile> State<P> {
                 marks.len()
             )
         }
-        for l in 0..n {
+        for (l, &m) in marks.iter().enumerate() {
             match self.ckpt.frame(idx, l)? {
                 Some(frame) => {
                     let (Some(s_cur), Some(c_cur)) = (self.s_state.get(l), self.conv_state.get(l))
@@ -1132,7 +1132,6 @@ impl<P: Profile> State<P> {
                     self.conv_state.write(l, w)?;
                 }
                 None => {
-                    let m = marks[l];
                     if m.tokens > self.kv[l].len() {
                         lloom_tensor::bail!(
                             "qwen4exp cache: layer {l}'s KV of {} positions cannot be put back at {}",

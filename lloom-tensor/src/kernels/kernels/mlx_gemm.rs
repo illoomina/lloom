@@ -1502,6 +1502,36 @@ pub fn call_mlx_gemm_out(
         .bt())?;
     };
 
+    // #942: deterministic half output uses the existing one-row reduction
+    // at every row count. Rows occupy GEMV's batch axis, not a new core.
+    // The storage caller materializes a transposed activation first. Weight
+    // strides and both input offsets remain those of the caller's views.
+    if dtype == GemmDType::F16
+        && out_dtype == dtype
+        && !crate::tuning::contract().is_fast()
+        && !a_trans
+        && m > 1
+    {
+        let a_batch = if lhs_stride.len() > 2 {
+            lhs_stride[lhs_stride.len() - 3]
+        } else { m * k };
+        let b_batch = if rhs_stride.len() > 2 {
+            rhs_stride[rhs_stride.len() - 3]
+        } else { n * k };
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        for batch in 0..b {
+            let out = output.view(batch * m * n * 2, m * n * 2);
+            call_mlx_gemv(
+                device, encoder, kernels, dtype, (m, 1, n, k),
+                &[k, k, 1], lhs_offset + batch * a_batch * 2, lhs_buffer,
+                &[0, rhs_m2, rhs_m1], rhs_offset + batch * b_batch * 2,
+                rhs_buffer, &out,
+            )?;
+        }
+        return Ok(());
+    }
+
     // The routing decision this project has never audited (issue #386): no
     // threshold, no config axis, and `select_tile_config` is never consulted.
     // `takes_gemv_route` is `m == 1 || n == 1` unless `LLOOM_386_FORCE_GEMM`

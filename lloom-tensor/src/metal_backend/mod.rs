@@ -2264,6 +2264,23 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // GEMV consumes contiguous vectors. Preserve transposed/strided
+        // matmul support under the row-invariant contract using the existing
+        // pooled allocation and strided-copy path, before taking an encoder.
+        if self.dtype == DType::F16
+            && !crate::tuning::contract().is_fast()
+            && !lhs_l.is_contiguous()
+        {
+            let contiguous = self.device.new_buffer_builder()
+                .with_size_for(lhs_l.shape().elem_count(), self.dtype)
+                .with_label("deterministic matmul activation")
+                .build()?;
+            let mut lhs = Self::new(contiguous, self.device.clone(),
+                lhs_l.shape().elem_count(), self.dtype);
+            self.copy_strided_src(&mut lhs, 0, lhs_l)?;
+            return lhs.matmul(rhs, (b, m, n, k),
+                &Layout::contiguous(lhs_l.shape().clone()), rhs_l);
+        }
         let buffer = self
             .device
             .new_buffer_builder()

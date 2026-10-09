@@ -15,6 +15,7 @@
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
+mod f16_rows_identity;
 mod bilinear_tests;
 mod conv_tests;
 mod custom_op_tests;

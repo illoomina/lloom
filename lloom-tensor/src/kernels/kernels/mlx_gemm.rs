@@ -9,8 +9,8 @@ use crate::kernels::{
 };
 use objc2_metal::MTLSize;
 
-pub use crate::gemv_tile::{gemv_mixed_gnorm_serves, gemv_norm_serves, GEMV_GROUP_NORM_MAX_GROUPS};
 use crate::gemv_tile::{derive_gemv_tile, gemv_tile_dims};
+pub use crate::gemv_tile::{gemv_mixed_gnorm_serves, gemv_norm_serves, GEMV_GROUP_NORM_MAX_GROUPS};
 
 /// Trailing alignment of the packed block, so its length matches the `sizeof`
 /// the kernel sees. Taken from the Rust mirror rather than written as a
@@ -100,7 +100,6 @@ fn forced_tile() -> Option<TileConfig> {
         None => None,
     })
 }
-
 
 /// The largest `m` `select_tile_config` serves with the 16-row tile
 /// (`TILE_16_32_16_2_2`), inclusive. Measured cheapest of the three
@@ -1254,7 +1253,6 @@ pub struct GemvGroupNorm<'a> {
     pub scales: Option<(&'a Buffer, usize)>,
 }
 
-
 /// [`call_mlx_gemv_mixed`] with a grouped RMSNorm of `vec` computed inside it
 /// ([`GemvGroupNorm`]): `out = epilogue(scale · mat · norm(vec))`, one launch
 /// where the composed route is the norm's launch and the GEMV. Refused where
@@ -1502,6 +1500,15 @@ pub fn call_mlx_gemm_out(
         .bt())?;
     };
 
+    if dtype == GemmDType::F16
+        && out_dtype == dtype
+        && !crate::tuning::contract().is_fast()
+        && forced_gemm().is_some()
+    {
+        return Err(MetalKernelError::InvalidInput(
+            "--force-gemm conflicts with deterministic f16 row identity; use --determinism fast for the forcing experiment, or unset --force-gemm".into()));
+    }
+
     // #942: deterministic half output uses the existing one-row reduction
     // at every row count. Rows occupy GEMV's batch axis, not a new core.
     // The storage caller materializes a transposed activation first. Weight
@@ -1514,19 +1521,31 @@ pub fn call_mlx_gemm_out(
     {
         let a_batch = if lhs_stride.len() > 2 {
             lhs_stride[lhs_stride.len() - 3]
-        } else { m * k };
+        } else {
+            m * k
+        };
         let b_batch = if rhs_stride.len() > 2 {
             rhs_stride[rhs_stride.len() - 3]
-        } else { n * k };
+        } else {
+            n * k
+        };
         let encoder = ep.encoder();
         let encoder: &ComputeCommandEncoder = encoder.as_ref();
         for batch in 0..b {
             let out = output.view(batch * m * n * 2, m * n * 2);
             call_mlx_gemv(
-                device, encoder, kernels, dtype, (m, 1, n, k),
-                &[k, k, 1], lhs_offset + batch * a_batch * 2, lhs_buffer,
-                &[0, rhs_m2, rhs_m1], rhs_offset + batch * b_batch * 2,
-                rhs_buffer, &out,
+                device,
+                encoder,
+                kernels,
+                dtype,
+                (m, 1, n, k),
+                &[k, k, 1],
+                lhs_offset + batch * a_batch * 2,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset + batch * b_batch * 2,
+                rhs_buffer,
+                &out,
             )?;
         }
         return Ok(());

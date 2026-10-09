@@ -257,6 +257,12 @@ pub struct DecodeParams {
     /// K=1 body carries it on every readback arm; the speculative body and
     /// the batch scheduler refuse it.
     pub thinking: Option<ThinkingBudget>,
+    /// The generation prompt's length at the end of the prompt
+    /// (`thinking::checkpoint_tail`, the load-time constant): the prefill
+    /// leaves its turn checkpoint before it (`CausalLM::checkpoint_at`), so
+    /// the next request, whose render keeps everything before it, is a
+    /// restore there rather than a fresh prefill. 0: no hint.
+    pub turn_tail: usize,
 }
 
 impl DecodeParams {
@@ -338,6 +344,7 @@ impl Default for DecodeParams {
             logits_digest: false,
             prefill_tile: 0,
             thinking: None,
+            turn_tail: 0,
         }
     }
 }
@@ -689,6 +696,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
         let prepared = self.session.prepare(prompt_ids)?;
+        self.hint_checkpoint(&prepared, params.turn_tail)?;
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
@@ -922,6 +930,21 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
+    /// Where the prefill of `prepared.suffix` should leave its turn
+    /// checkpoint: `tail` tokens before the prompt's end, the position the
+    /// next turn's render returns to (`DecodeParams::turn_tail`). A suffix
+    /// no longer than the tail ends where it starts, and the hint is the
+    /// current position (the state as it stands).
+    fn hint_checkpoint(&mut self, prepared: &lloom::nn::Prepared, tail: usize) -> Result<()> {
+        if tail == 0 {
+            return Ok(());
+        }
+        let end = self.session.pos() + prepared.suffix.len();
+        let at = end.saturating_sub(tail).max(self.session.pos());
+        let model = self.session.model();
+        model.checkpoint_at(self.session.cache_mut(), at)
+    }
+
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
     /// block per round and the target verifies it
     /// ([`Session::decode_speculative`], `design/docs/speculation.md`
@@ -989,6 +1012,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 prepared.action
             );
         }
+        self.hint_checkpoint(&prepared, params.turn_tail)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;

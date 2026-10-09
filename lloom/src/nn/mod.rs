@@ -63,6 +63,7 @@ pub mod short_conv;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
+pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
 pub mod weight_groups;

@@ -252,6 +252,32 @@ pub fn shift_step_reference(
     Ok((folded, new_win))
 }
 
+/// The window after the first `rows` positions of a chunk `x [seq,
+/// channels]` against the carried window — what [`shift_prefill_reference`]
+/// over `x[..rows]` leaves, without the fold: the newest `k` inputs,
+/// oldest first, `[channels, k]`.
+pub fn window_after(
+    x: &Tensor,
+    window: Option<&Tensor>,
+    channels: usize,
+    k: usize,
+    rows: usize,
+) -> Result<Tensor> {
+    let dev = x.device();
+    let dt = x.dtype();
+    let seq = x.dim(0)?;
+    if rows == 0 || rows > seq {
+        lloom_tensor::bail!("window_after: {rows} rows of a {seq}-position chunk")
+    }
+    let x_t = x.narrow(0, 0, rows)?.t()?.contiguous()?;
+    let history = match window {
+        Some(w) => w.to_dtype(dt)?.narrow(1, 1, k - 1)?,
+        None => Tensor::zeros((channels, k - 1), dt, dev)?,
+    };
+    let padded = Tensor::cat(&[&history, &x_t], 1)?;
+    padded.narrow(1, rows - 1, k)?.contiguous()
+}
+
 /// [`shift_step_reference`] over a chunk `x [seq, channels]` against the
 /// carried window: `(out [seq, channels], the window after the chunk)`,
 /// position by position what the steps give.

@@ -50,6 +50,13 @@ pub struct LoadOptions {
     /// `Ring` profile runs as one pass over phase rings
     /// (`StateCapacity::window`); 0 runs a window as sequential steps.
     pub window: usize,
+    /// Turn checkpoints a state keeps (`StateCapacity::checkpoints`): the
+    /// recurrent layers' `S` and conv windows at the last `checkpoints`
+    /// multi-token passes, so a request re-rendering the previous turn
+    /// restores there instead of prefilling the conversation again
+    /// (`sequence-reuse-design.md` §2.3b). Admitted beside the weights:
+    /// as many as the budget fits, at most this.
+    pub checkpoints: usize,
 }
 
 impl Default for LoadOptions {
@@ -61,6 +68,7 @@ impl Default for LoadOptions {
             dense_f32: false,
             mtp: false,
             window: 0,
+            checkpoints: 2,
         }
     }
 }
@@ -173,6 +181,25 @@ impl Config {
     }
 }
 
+/// The turn checkpoints admitted beside the weights: `want`, or as many
+/// frames of `frame_bytes` as the budget leaves after the weights (0 when
+/// none fits; the engine says so). Unchecked where the budget is (Metal
+/// only; `fraction` 0 turns it off).
+fn admit_checkpoints<R: Read + Seek>(
+    gg: &Gguf<'_, R>,
+    fraction: f64,
+    frame_bytes: usize,
+    want: usize,
+) -> usize {
+    let ws = working_set_of(&gg.device);
+    if ws == 0 || fraction <= 0.0 || frame_bytes == 0 {
+        return want;
+    }
+    let budget = (ws as f64 * fraction) as usize;
+    let free = budget.saturating_sub(header_bytes(gg));
+    want.min(free / frame_bytes)
+}
+
 /// The bytes a checkpoint's tensors hold, from the headers.
 fn header_bytes<R: Read + Seek>(gg: &Gguf<'_, R>) -> usize {
     gg.shards
@@ -211,7 +238,26 @@ fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
         kv_tokens: opts.kv_capacity.max(1),
         kv_precision: opts.kv_precision.unwrap_or(cfg.kv_precision),
         window: opts.window,
+        checkpoints: opts.checkpoints,
     }
+}
+
+/// [`capacity`] with the turn checkpoints the budget admits beside the
+/// weights, from the built layers' frame size.
+fn capacity_admitted<R: Read + Seek, L: crate::nn::decoder::Layer>(
+    gg: &Gguf<'_, R>,
+    cfg: &Config,
+    opts: &LoadOptions,
+    layers: &[L],
+) -> StateCapacity {
+    let mut cap = capacity(cfg, opts);
+    let frame = layers
+        .iter()
+        .map(|l| l.checkpoint_elems(&cap))
+        .sum::<usize>()
+        * lloom_tensor::DType::F32.size_in_bytes();
+    cap.checkpoints = admit_checkpoints(gg, opts.fraction(), frame, cap.checkpoints);
+    cap
 }
 
 /// The mixer of layer `l`: the Gated DeltaNet or the gated attention, with
@@ -452,7 +498,7 @@ fn build_dense<P: Profile, R: Read + Seek>(
     } else {
         None
     };
-    let cap = capacity(&cfg, opts);
+    let cap = capacity_admitted(gg, &cfg, opts, &layers);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
     Ok((
@@ -495,7 +541,7 @@ fn build_moe<P: Profile, R: Read + Seek>(
     } else {
         None
     };
-    let cap = capacity(&cfg, opts);
+    let cap = capacity_admitted(gg, &cfg, opts, &layers);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
     Ok((

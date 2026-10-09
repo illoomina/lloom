@@ -436,6 +436,12 @@ fn parse_hazard_key(v: &str) -> Result<Option<String>, String> {
 /// `none` is the arm that advises nothing, kept as `"none"` rather than
 /// cleared: unset takes the default, an advised arm.
 fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
+    if v.trim().is_empty() {
+        return Err(
+            "mmap advice: the empty value is refused; `none` is the arm that advises nothing"
+                .into(),
+        );
+    }
     one_of(
         v,
         "mmap advice",

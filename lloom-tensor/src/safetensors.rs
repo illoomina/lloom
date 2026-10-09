@@ -488,12 +488,12 @@ impl MmapAdvice {
     /// passing measurement for the path it was supposed to change, which is
     /// the vacuous-arm failure this project has already paid for once.
     ///
-    /// Unset and empty are deliberately *not* the same as `none`. Unset means
-    /// "no opinion", so it takes `Self::default()` and moves with it; the
-    /// empty string is what a shell supplies for `CANDLE_MMAP_ADVICE=`, which
-    /// reads as an explicit request to disable and so stays pinned to `None`.
-    /// Collapsing the two would make the default unreachable-by-omission the
-    /// moment it changed.
+    /// Unset is deliberately *not* the same as `none`. Unset means "no
+    /// opinion", so it takes `Self::default()` and moves with it; `none` is
+    /// the explicit request to advise nothing. Collapsing the two would make
+    /// the default unreachable-by-omission the moment it changed. The empty
+    /// value is neither: it is refused, naming `none` (the option tree's
+    /// grammar, `decode-driver-design.md` Stage 7).
     pub fn from_env() -> Result<Self> {
         Self::from_knob(crate::tuning::tuning().cpu.mmap_advice.as_deref())
     }
@@ -876,9 +876,10 @@ mod tests {
             resolve(Some("wilneed")).is_err(),
             "a misspelled arm fell back to the default instead of failing"
         );
+        let empty = resolve(Some("")).unwrap_err().to_string();
         assert!(
-            resolve(Some("")).is_err(),
-            "the empty value selected an arm instead of failing"
+            empty.contains("`none`"),
+            "the empty value's refusal names the arm that advises nothing: {empty}"
         );
         assert!(
             MmapAdvice::from_knob(Some("wilneed")).is_err(),

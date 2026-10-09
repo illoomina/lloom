@@ -745,15 +745,27 @@ impl ModelConfig {
             return Ok(());
         }
         let key = key.strip_prefix("axes.").unwrap_or(key);
-        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        if lloom_tensor::options::is_none(value) {
             self.axes.remove(key);
             return Ok(());
         }
         // Validate on a scratch config so a bad value is refused here, with
-        // the axis's own message, rather than at load.
+        // the axis's own message, rather than at load; keep the spelling the
+        // axis parses (a bool as `true`/`false`, an arm in lower case).
+        let value = lloom_tensor::options::non_empty(value).map_err(|e| format!("--{key}: {e}"))?;
+        let is_bool = lloom::models::lfm2::Config::AXES_META
+            .iter()
+            .any(|a| a.key == key && a.is_bool);
+        let value = if is_bool {
+            lloom_tensor::options::parse_bool(value)
+                .map_err(|e| format!("--{key}: {e}"))?
+                .to_string()
+        } else {
+            value.to_ascii_lowercase()
+        };
         let mut probe = lloom::models::lfm2::Config::default();
-        probe.set_axis(key, value)?;
-        self.axes.insert(key.to_string(), value.to_string());
+        probe.set_axis(key, &value)?;
+        self.axes.insert(key.to_string(), value);
         Ok(())
     }
 
@@ -892,14 +904,14 @@ fn parse_logit_bias(v: &str) -> Result<std::collections::BTreeMap<u32, f64>, Str
     Ok(out)
 }
 fn parse_prompt_budget_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "refuse" => Ok("refuse".into()),
         "truncate" => Ok("truncate".into()),
         other => Err(format!("`{other}` is not `refuse` or `truncate`")),
     }
 }
 fn parse_defaults(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "greedy" => Ok("greedy".into()),
         "checkpoint" => Ok("checkpoint".into()),
         other => Err(format!("`{other}` is not `greedy` or `checkpoint`")),
@@ -1177,7 +1189,7 @@ impl SamplingConfig {
 // ---- speculation ----------------------------------------------------------------
 
 pub(crate) fn parse_method(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "none" | "off" => Ok("none".into()),
         "dspark" => Ok("dspark".into()),
         "mtp" => Ok("mtp".into()),
@@ -1245,7 +1257,7 @@ impl Default for SpeculativeConfig {
 // ---- the executor ---------------------------------------------------------------
 
 fn parse_arena_layout(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "packed" => Ok("packed".into()),
         "non-aliasing" | "nonaliasing" | "reference" => Ok("non-aliasing".into()),
         other => Err(format!(
@@ -1254,7 +1266,7 @@ fn parse_arena_layout(v: &str) -> Result<String, String> {
     }
 }
 fn parse_replay_barriers(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "always" => Ok("always".into()),
         "skip-replayed" => Ok("skip-replayed".into()),
         other => Err(format!(
@@ -1263,7 +1275,7 @@ fn parse_replay_barriers(v: &str) -> Result<String, String> {
     }
 }
 fn parse_barrier_scope(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "run-start" => Ok("run-start".into()),
         "since-barrier" => Ok("since-barrier".into()),
         other => Err(format!(
@@ -1400,7 +1412,7 @@ pub struct MemoryConfig {
     )]
     pub kv_reserve_tokens: Option<usize>,
     /// Qwen4-exp `--experts stream`: streamed experts per layer per projection — a count, or `auto` (from the working set at `memory_fraction`).
-    #[opt(flag = "slots", variants = ["auto", "<count>"], path = "weights.experts.slots", status = "stable", cli = "slots", facets = ["buffer"], flows = ["weights-in"])]
+    #[opt(flag = "slots", parser = "parse_slots", variants = ["auto", "<count>"], path = "weights.experts.slots", status = "stable", cli = "slots", facets = ["buffer"], flows = ["weights-in"])]
     pub slots: String,
 }
 
@@ -1420,8 +1432,21 @@ impl Default for MemoryConfig {
 
 // ---- what to load, and the front-ends' own keys -----------------------------------
 
+/// `auto` or a count of slots.
+fn parse_slots(v: &str) -> Result<String, String> {
+    if v.trim().eq_ignore_ascii_case("auto") {
+        return Ok("auto".into());
+    }
+    lloom_tensor::options::parse_count::<usize>(v)
+        .map(|n| n.to_string())
+        .map_err(|e| format!("{e}, or `auto`"))
+}
+fn parse_rows(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["auto", "pool", "pool-per-row", "private"])
+        .map(str::to_string)
+}
 fn parse_device(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok("auto".into()),
         "cpu" => Ok("cpu".into()),
         other => Err(format!(
@@ -1430,25 +1455,25 @@ fn parse_device(v: &str) -> Result<String, String> {
     }
 }
 fn parse_experts(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("stream" | "resident") => Ok(s.into()),
         other => Err(format!("`{other}` is not `stream` or `resident`")),
     }
 }
 fn parse_loader(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("pread" | "io") => Ok(s.into()),
         other => Err(format!("`{other}` is not `pread` or `io`")),
     }
 }
 fn parse_moe_act(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("auto" | "f32" | "f16") => Ok(s.into()),
         other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
     }
 }
 fn parse_prefill_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("chunk" | "replay") => Ok(s.into()),
         other => Err(format!("`{other}` is not `chunk` or `replay`")),
     }
@@ -1572,7 +1597,7 @@ pub struct SchedulerConfig {
     #[opt(flag = "batch", path = "scheduler.max_sequences", status = "stable", cli = "batch", aliases = ["max-num-seqs"])]
     pub max_sequences: usize,
     /// How the rows of a batch hold their state: `auto` (`pool` at a batch), `pool` (one shared paged pool, the batch in one dispatch per kernel), `pool-per-row` (the same pool, the per-row loop) or `private` (a cache per row).
-    #[opt(flag = "rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
+    #[opt(flag = "rows", parser = "parse_rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
     pub rows: String,
 }
 
@@ -1703,7 +1728,7 @@ impl Default for ServerConfig {
 }
 
 fn parse_bench_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("cells" | "reuse" | "concurrent") => Ok(s.into()),
         other => Err(format!("`{other}` is not `cells`, `reuse` or `concurrent`")),
     }

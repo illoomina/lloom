@@ -559,7 +559,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 let main = if f.attr.is_bool {
                     quote! {
                         #[doc = #doc]
-                        #[arg(id = #id, long = #long, #short #alias_attr num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL", hide = #hidden, #heading overrides_with = #id)]
+                        #[arg(id = #id, long = #long, #short #alias_attr num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = #krate::options::parse_bool, value_name = "BOOL", hide = #hidden, #heading overrides_with = #id)]
                         pub #ident: Option<bool>,
                     }
                 } else {
@@ -665,7 +665,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         if f.attr.is_bool {
             let assign = if f.optional_bool() {
                 quote! {
-                    self.#ident = if value.is_empty() || value.eq_ignore_ascii_case("none") {
+                    self.#ident = if #krate::options::is_none(value) {
                         ::std::option::Option::None
                     } else {
                         ::std::option::Option::Some(#krate::options::parse_bool(value).map_err(|e| format!("{}: {}", #key, e))?)
@@ -990,30 +990,66 @@ fn nested_args_ty(ty: &Type) -> TokenStream {
     quote!(#p)
 }
 
-/// The expression parsing `value: &str` into the field's type.
+/// The expression parsing `value: &str` into the field's type, through the
+/// value grammar (`lloom_tensor::options`): a bool, a count and a number
+/// parse there; any other type through its `FromStr`, which owns its own
+/// arms. An optional typed value is unset by `none` and refuses the empty
+/// value; an optional text (a path, a name) is unset by `none` or the empty
+/// value, which is no text.
 fn parse_expr(f: &Field, krate: &TokenStream) -> TokenStream {
     if let Some(parser) = &f.attr.parser {
         let parse_fn: TokenStream = parser.parse().unwrap_or_else(|_| quote!(parse));
         return quote!(#parse_fn(value));
     }
+    let typed = |ty: &Type| -> Option<TokenStream> {
+        match type_name(ty).as_str() {
+            "bool" => Some(quote!(#krate::options::parse_bool(value))),
+            "usize" | "u64" | "u32" | "u16" | "u8" => {
+                Some(quote!(#krate::options::parse_count::<#ty>(value)))
+            }
+            "f64" => Some(quote!(#krate::options::parse_number(value))),
+            _ => None,
+        }
+    };
     match &f.inner {
-        // `Option<T>`: `none` / `` clears; anything else parses as `T`.
-        Some(inner) => quote! {
-            (if value.is_empty() || value.eq_ignore_ascii_case("none") {
-                Ok(::std::option::Option::None)
-            } else {
-                <#inner as ::std::str::FromStr>::from_str(value)
-                    .map(::std::option::Option::Some)
-                    .map_err(|e| e.to_string())
-            })
+        Some(inner) => match typed(inner) {
+            Some(parse) => quote! {
+                (if #krate::options::is_none(value) {
+                    Ok(::std::option::Option::None)
+                } else {
+                    #parse.map(::std::option::Option::Some)
+                })
+            },
+            None => quote! {
+                (if value.trim().is_empty() || #krate::options::is_none(value) {
+                    Ok(::std::option::Option::None)
+                } else {
+                    <#inner as ::std::str::FromStr>::from_str(value)
+                        .map(::std::option::Option::Some)
+                        .map_err(|e| e.to_string())
+                })
+            },
         },
         None => {
             let ty = &f.ty;
-            if type_name(ty) == "bool" {
-                quote!(#krate::options::parse_bool(value))
-            } else {
-                quote!(<#ty as ::std::str::FromStr>::from_str(value).map_err(|e| e.to_string()))
-            }
+            let text = matches!(
+                type_name(ty).as_str(),
+                "String" | "PathBuf" | "std::path::PathBuf"
+            );
+            typed(ty).unwrap_or_else(|| {
+                if text {
+                    quote!(<#ty as ::std::str::FromStr>::from_str(value).map_err(|e| e.to_string()))
+                } else {
+                    // An enum's own `FromStr`: its arm in any case, the empty
+                    // value refused.
+                    quote! {
+                        #krate::options::non_empty(value).and_then(|v| {
+                            <#ty as ::std::str::FromStr>::from_str(&v.to_ascii_lowercase())
+                                .map_err(|e| e.to_string())
+                        })
+                    }
+                }
+            })
         }
     }
 }

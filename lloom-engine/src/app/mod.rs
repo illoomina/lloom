@@ -342,6 +342,9 @@ pub fn resolve_layers(
         }
         last = now;
     };
+    for note in crate::option_grammar::legacy_notes(env) {
+        eprintln!("{note}");
+    }
     o.from_env_with(env)
         .map_err(|e| anyhow::anyhow!("env: {e}"))?;
     mark("env", &o);

@@ -372,10 +372,10 @@ fn is_kv_read_family(name: &str) -> bool {
     name.starts_with("sdpa_vector_quant") || name.starts_with("dequantize_kv_")
 }
 
-/// `rest` without its row-axis capacity suffix (`_r2`, `_r4`, `_r8`), and
-/// whether it had one.
+/// `rest` without its row-axis capacity suffix (`_r2`, `_r4`, `_r8`, and the
+/// routed union's `_r1`), and whether it had one.
 fn rows_suffix(rest: &str) -> (&str, bool) {
-    for cap in lloom_tensor::kernels::MV_ROWS_CAPACITIES {
+    for cap in std::iter::once(1).chain(lloom_tensor::kernels::MV_ROWS_CAPACITIES) {
         if let Some(s) = rest.strip_suffix(&format!("_r{cap}")) {
             return (s, true);
         }
@@ -994,7 +994,29 @@ impl Matrix {
             .collect()
     }
 
+    /// The routed entries; on the row axis, its capacities and then the union
+    /// form (capacity 1: `qmv.rows` off, `qmv.id_union` on, for the pass).
     pub fn run_mv_id(&mut self, d: GgmlDType, act: Act, pair: bool, rows: bool) -> Result<()> {
+        self.run_mv_id_with(d, act, pair, rows, false)?;
+        if rows {
+            lloom_tensor::kernels::set_qmv_rows(false);
+            lloom_tensor::kernels::set_qmv_id_union(true);
+            let r = self.run_mv_id_with(d, act, pair, rows, true);
+            lloom_tensor::kernels::set_qmv_id_union(false);
+            lloom_tensor::kernels::set_qmv_rows(true);
+            r?;
+        }
+        Ok(())
+    }
+
+    fn run_mv_id_with(
+        &mut self,
+        d: GgmlDType,
+        act: Act,
+        pair: bool,
+        rows: bool,
+        union: bool,
+    ) -> Result<()> {
         let entry = match (pair, rows) {
             (true, false) => Entry::MulMvId2,
             (false, false) => Entry::MulMvId,
@@ -1007,7 +1029,9 @@ impl Matrix {
         // and the single on the batches a window gives them.
         let batches: &[usize] = if rows { &[2, 3, 5, 8] } else { &[1, 3] };
         let suffix = |batch: usize| {
-            if rows {
+            if union {
+                "_r1".to_string()
+            } else if rows {
                 let nr = lloom_tensor::kernels::mv_rows_capacity(d.into(), batch, true);
                 assert!(
                     nr > 1,

@@ -54,6 +54,7 @@ mod mmap_advice_installed;
 mod moe_pair_order;
 mod moe_routed_metal;
 mod moe_routed_rows;
+mod moe_routed_union;
 mod options_derive;
 mod pool_tests;
 mod pread_targets;

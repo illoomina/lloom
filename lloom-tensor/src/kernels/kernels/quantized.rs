@@ -635,6 +635,62 @@ pub fn qmv_id_rows_launches() -> u64 {
     ID_ROWS_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The most rows a routed launch takes the union form for: its threadgroup
+/// of a slot runs the slot's planes one after another, so over a prefill
+/// tile's rows it would serialise what the per-plane launch runs side by
+/// side.
+pub const MV_ID_UNION_MAX_ROWS: usize = 8;
+
+/// `qmv.id_union` (`LLOOM_QMV_ID_UNION`, read once; or [`set_qmv_id_union`]):
+/// a routed launch of 2 to [`MV_ID_UNION_MAX_ROWS`] rows the row axis does not
+/// take runs its union form, the routed row kernel at capacity 1 (`_r1`):
+/// each plane the per-plane launch's core call, so the same bits under either
+/// contract.
+fn id_union_on() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ID_UNION.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().qmv.id_union;
+            ID_UNION.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// 0 unread, 1 off, 2 on.
+static ID_UNION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Select the routed union for this process (a test runs both forms;
+/// `qmv.id_union` otherwise).
+pub fn set_qmv_id_union(on: bool) {
+    ID_UNION.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Routed launches in the union form since process start.
+static ID_UNION_LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`ID_UNION_LAUNCHES`] now.
+pub fn qmv_id_union_launches() -> u64 {
+    ID_UNION_LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The routed launch's kernel name: on the row axis at the capacity
+/// [`mv_rows_capacity`] gives, else the union form when it is on and the
+/// launch has 2 to [`MV_ID_UNION_MAX_ROWS`] rows, else the per-plane launch.
+fn routed_name(name: String, dtype: GgmlDType, batch: usize) -> String {
+    let nr1 = mv_rows_capacity(dtype, batch, true);
+    if nr1 > 1 {
+        return rows_name(name, nr1, true);
+    }
+    if (2..=MV_ID_UNION_MAX_ROWS).contains(&batch) && id_union_on() {
+        ID_UNION_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return format!("{name}_r1");
+    }
+    name
+}
+
 /// `name` at capacity `nr1`: the kernel on the row axis when `nr1 > 1`,
 /// counted.
 fn rows_name(name: String, nr1: usize, routed: bool) -> String {
@@ -973,11 +1029,10 @@ pub fn call_quantized_matmul_mv_id_t(
     let stem = mv_id_stem(dtype)?;
     // The row axis: the planes of a slot the window's rows share, `nr1` a
     // core call (`_r<nr1>`); the grid stays the plane grid.
-    let nr1 = mv_rows_capacity(dtype, batch, true);
-    let name = rows_name(
+    let name = routed_name(
         format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix()),
-        nr1,
-        true,
+        dtype,
+        batch,
     );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {
@@ -1549,11 +1604,10 @@ pub fn call_quantized_matmul_mv_id2_t(
         ));
     }
     let stem = mv_id_stem(dtype)?;
-    let nr1 = mv_rows_capacity(dtype, batch, true);
-    let name = rows_name(
+    let name = routed_name(
         format!("kernel_mul_mv_id2_{stem}_{}", triple.name_suffix()),
-        nr1,
-        true,
+        dtype,
+        batch,
     );
     let (act_size, store_size) = triple_leg_bytes(triple);
     if in_dim1 != 1 && in_dim1 != topk {

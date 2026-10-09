@@ -536,6 +536,15 @@ pub struct QmvTuning {
         status = "advanced"
     )]
     pub mm_from: Option<usize>,
+    /// The routed matvec of 2 to 8 rows (a verify window, a few rows) in its union form: the first plane naming a slot runs every plane naming it, so a slot the rows share is read once (each plane the incumbent's arithmetic, under either contract). Now the routed row axis at capacity 1 (`kernel_mul_mv_id{,2}_*_r1`); where `fast` and a ceiling put the launch on the axis, the axis wins.
+    #[opt(
+        flag = "qmv-id-union",
+        env = "LLOOM_QMV_ID_UNION",
+        bool,
+        path = "kernels.quant_matvec.routed_union",
+        status = "arm"
+    )]
+    pub id_union: bool,
 }
 
 impl Default for QmvTuning {
@@ -550,6 +559,7 @@ impl Default for QmvTuning {
             rows: true,
             rows_max: None,
             mm_from: None,
+            id_union: false,
         }
     }
 }

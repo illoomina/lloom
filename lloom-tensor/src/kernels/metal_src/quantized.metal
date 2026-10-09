@@ -9466,11 +9466,16 @@ LLOOM_B8_CORE(fp8_e4m3, block_fp8_e4m3)
 // lock). The host's table (`kernels::QuantKind`) names the same stems; the
 // parity matrix reads the compiled library, so a kind added here is a cell.
 // The row axis of one kind at one capacity: the plain matmul-vec at the f32
-// and f16 triples, the routed single and pair at every triple
-// (`kernel_mul_mv{,_id,_id2}_<stem>_<triple>_r<NR1>`).
-#define LLOOM_QUANT_KIND_ROWS(STEM, NR1) \
+// and f16 triples (`kernel_mul_mv_<stem>_<triple>_r<NR1>`), and the routed
+// single and pair at every triple (`kernel_mul_mv{_id,_id2}_..._r<NR1>`). The
+// routed kernels also exist at capacity 1: a slot's planes gathered into one
+// threadgroup, one core call each — the routed union
+// (`kernels.quant_matvec.routed_union`).
+#define LLOOM_QUANT_KIND_ROWS_PLAIN(STEM, NR1) \
 template [[host_name("kernel_mul_mv_" #STEM "_f32_r" #NR1)]]           kernel decltype(kernel_mul_mv_rows<float, float, NR1, kernel_mul_mv_##STEM##_impl<float, float, NR1>>)                    kernel_mul_mv_rows<float, float, NR1, kernel_mul_mv_##STEM##_impl<float, float, NR1>>; \
-template [[host_name("kernel_mul_mv_" #STEM "_f16_f16_r" #NR1)]]       kernel decltype(kernel_mul_mv_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>)                        kernel_mul_mv_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>; \
+template [[host_name("kernel_mul_mv_" #STEM "_f16_f16_r" #NR1)]]       kernel decltype(kernel_mul_mv_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>)                        kernel_mul_mv_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>;
+
+#define LLOOM_QUANT_KIND_ROWS_ROUTED(STEM, NR1) \
 template [[host_name("kernel_mul_mv_id_" #STEM "_f32_r" #NR1)]]        kernel decltype(kernel_mul_mv_id_rows<float, float, NR1, kernel_mul_mv_##STEM##_impl<float, float, NR1>>)                 kernel_mul_mv_id_rows<float, float, NR1, kernel_mul_mv_##STEM##_impl<float, float, NR1>>; \
 template [[host_name("kernel_mul_mv_id_" #STEM "_f16_f16_r" #NR1)]]    kernel decltype(kernel_mul_mv_id_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>)                     kernel_mul_mv_id_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>; \
 template [[host_name("kernel_mul_mv_id_" #STEM "_f32h_f16_r" #NR1)]]   kernel decltype(kernel_mul_mv_id_rows<f32_as_half, half, NR1, kernel_mul_mv_##STEM##_impl<f32_as_half, half, NR1>>)       kernel_mul_mv_id_rows<f32_as_half, half, NR1, kernel_mul_mv_##STEM##_impl<f32_as_half, half, NR1>>; \
@@ -9478,7 +9483,12 @@ template [[host_name("kernel_mul_mv_id2_" #STEM "_f32_r" #NR1)]]       kernel de
 template [[host_name("kernel_mul_mv_id2_" #STEM "_f16_f16_r" #NR1)]]   kernel decltype(kernel_mul_mv_id2_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>)                    kernel_mul_mv_id2_rows<half, half, NR1, kernel_mul_mv_##STEM##_impl<half, half, NR1>>; \
 template [[host_name("kernel_mul_mv_id2_" #STEM "_f32h_f16_r" #NR1)]]  kernel decltype(kernel_mul_mv_id2_rows<f32_as_half, half, NR1, kernel_mul_mv_##STEM##_impl<f32_as_half, half, NR1>>)      kernel_mul_mv_id2_rows<f32_as_half, half, NR1, kernel_mul_mv_##STEM##_impl<f32_as_half, half, NR1>>;
 
+#define LLOOM_QUANT_KIND_ROWS(STEM, NR1) \
+LLOOM_QUANT_KIND_ROWS_PLAIN(STEM, NR1) \
+LLOOM_QUANT_KIND_ROWS_ROUTED(STEM, NR1)
+
 #define LLOOM_QUANT_KIND(STEM, BLOCK, NL, DEQ) \
+LLOOM_QUANT_KIND_ROWS_ROUTED(STEM, 1) \
 LLOOM_QUANT_KIND_ROWS(STEM, 2) \
 LLOOM_QUANT_KIND_ROWS(STEM, 4) \
 LLOOM_QUANT_KIND_ROWS(STEM, 8) \

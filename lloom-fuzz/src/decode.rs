@@ -338,7 +338,7 @@ pub fn cb_liveness(bytes: &[u8]) -> Vec<crate::cb_liveness::Op> {
     let mut ops = Vec::new();
     // Every op reaches a real queue and `Settle` sleeps: capped like `commands`.
     while r.remaining() > 0 && ops.len() < 48 {
-        ops.push(match r.weighted(&[5, 6, 4, 2, 2, 2, 3, 1, 1]) {
+        ops.push(match r.weighted(&[5, 6, 4, 2, 2, 2, 3, 1, 1, 3, 3, 2]) {
             0 => Op::Alloc {
                 size: [256usize, 1024, 4096, 16384, 65536][r.below(5)],
             },
@@ -353,7 +353,16 @@ pub fn cb_liveness(bytes: &[u8]) -> Vec<crate::cb_liveness::Op> {
             5 => Op::FlushAndWait,
             6 => Op::Drain,
             7 => Op::Trim,
-            _ => Op::Settle,
+            8 => Op::Settle,
+            9 => Op::AllocUnpooled {
+                size: [256usize, 1024, 4096, 16384, 65536][r.below(5)],
+            },
+            10 => Op::CopyAgain {
+                index: r.u8() as usize,
+            },
+            _ => Op::ReplaceBase {
+                index: r.u8() as usize,
+            },
         });
     }
     ops

@@ -1523,6 +1523,17 @@ impl MetalDevice {
         self.commands.clock()
     }
 
+    /// The kind of command buffer this device's queue creates.
+    pub fn command_buffer_kind(&self) -> crate::kernels::metal::CommandBufferKind {
+        self.commands.kind()
+    }
+
+    /// What the unretained kind's hold has taken (`in_flight.rs`); `None` on
+    /// the retaining kind, which has no hold.
+    pub fn in_flight_hold_counts(&self) -> Option<crate::kernels::metal::HoldCounts> {
+        self.commands.in_flight_hold().map(|h| h.counts())
+    }
+
     /// The memory ledger: committed bytes beside `currentAllocatedSize`, the
     /// tenants' claims, the quota (`profiles-and-memory-design.md` §4.2).
     pub fn ledger(&self) -> &Arc<crate::kernels::metal::ledger::Ledger> {
@@ -1605,6 +1616,7 @@ impl MetalDevice {
             // it applies to the arena.
             if let Some(previous) = slot.as_ref() {
                 self.residency_set.remove(previous.base());
+                self.hold_in_flight(previous.base());
             }
             *slot = Some(region);
         }
@@ -1620,6 +1632,7 @@ impl MetalDevice {
         let mut slot = self.session_region.write();
         if let Some(region) = slot.as_ref() {
             self.residency_set.remove(region.base());
+            self.hold_in_flight(region.base());
         }
         *slot = None;
     }
@@ -1701,6 +1714,7 @@ impl MetalDevice {
             // leak would be per replacement rather than one-off.
             if let Some(previous) = slot.as_ref() {
                 self.residency_set.remove(previous.base());
+                self.hold_in_flight(previous.base());
             }
             *slot = Some(arena);
         }
@@ -1811,6 +1825,7 @@ impl MetalDevice {
         let mut slot = self.arena.write();
         if let Some(arena) = slot.as_ref() {
             self.residency_set.remove(arena.base());
+            self.hold_in_flight(arena.base());
         }
         *slot = None;
         *self.arena_reservation.lock() = None;
@@ -2425,6 +2440,7 @@ impl MetalDevice {
                 .map_err(MetalError::from)?;
             if let Some(previous) = pp.base.take() {
                 self.residency_set.remove(&previous);
+                self.hold_in_flight(&previous);
             }
             pp.base = Some(base.buffer);
             pp.base_reservation = base.reservation;
@@ -2447,6 +2463,14 @@ impl MetalDevice {
             }
         }
         Ok(())
+    }
+
+    /// Keep `base` alive until every command buffer encoded so far has run,
+    /// when this queue's command buffers do not retain what they read: an
+    /// arena or region base being replaced was bound by the step just encoded.
+    /// A no-op on the retaining kind.
+    fn hold_in_flight(&self, base: &Buffer) {
+        crate::kernels::metal::in_flight::hold_buffer(self.commands.in_flight_hold(), base);
     }
 
     /// Uninstall the arena slot without releasing any base: the pass cache
@@ -2759,7 +2783,9 @@ impl MetalDevice {
         // returns a handle with no pool behind it. Dropping it frees the buffer
         // outright rather than offering it for reuse.
         Ok(BufferHandle::new(
-            PooledBuffer::unpooled(a.buffer, size).with_reservation(a.reservation),
+            PooledBuffer::unpooled(a.buffer, size)
+                .with_reservation(a.reservation)
+                .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 
@@ -2826,7 +2852,8 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
-                .with_reservation(a.reservation),
+                .with_reservation(a.reservation)
+                .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 
@@ -2850,7 +2877,8 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
-                .with_reservation(a.reservation),
+                .with_reservation(a.reservation)
+                .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 
@@ -2862,7 +2890,8 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
-                .with_reservation(a.reservation),
+                .with_reservation(a.reservation)
+                .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 
@@ -2937,7 +2966,8 @@ impl MetalDevice {
         // all — neither these staging buffers nor a per-round `Tensor::new`.
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
-                .reserved(self.ledger.reserve(size)),
+                .reserved(self.ledger.reserve(size))
+                .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 

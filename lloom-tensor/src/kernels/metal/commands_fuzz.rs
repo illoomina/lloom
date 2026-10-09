@@ -607,17 +607,24 @@ mod proptests {
         );
 
         // `retain` appears in prose too, so count executable occurrences only: a
-        // line that is a comment cannot shrink a queue. (`.retain(` with the
-        // receiver on the previous line is how both sites are formatted.)
+        // line that is a comment cannot shrink a queue. The one retain is
+        // `prune_in_flight`'s, which drops completed buffers and reports a
+        // failed one; the three paths that shrink by retaining call it.
         let retains: Vec<(usize, &str)> = sites(".retain(")
             .into_iter()
             .filter(|(_, l)| !l.starts_with("//") && !l.starts_with("///"))
             .collect();
         assert_eq!(
             retains.len(),
+            1,
+            "expected exactly one retain on in_flight (prune_in_flight's), found {retains:#?}"
+        );
+        let prunes = sites("self.prune_in_flight(&mut state,");
+        assert_eq!(
+            prunes.len(),
             3,
             "expected exactly three retain-based shrink sites on in_flight \
-         (flush_and_wait_current's, flush_and_prune's and wait_marker's), found {retains:#?}. \
+         (flush_and_wait_current's, flush_and_prune's and wait_marker's), found {prunes:#?}. \
          Losing one is the unbounded-queue defect #493 repaired."
         );
 
@@ -625,7 +632,7 @@ mod proptests {
         // can check: one unconditional push against four conditional removals, of
         // which exactly one does not block.
         assert_eq!(
-            pushes.len() + takes.len() + retains.len(),
+            pushes.len() + takes.len() + prunes.len(),
             5,
             "the growth/shrink census moved; the fuzzer's model is written against it"
         );

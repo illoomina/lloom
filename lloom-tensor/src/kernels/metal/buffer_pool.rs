@@ -267,6 +267,12 @@ pub struct PooledBuffer {
     /// (`ledger.rs`). `None` for a pooled buffer: the pool's bytes are the
     /// occupancy snapshot's, elastic, not committed.
     reservation: Option<super::ledger::Reservation>,
+
+    /// Where an unpooled buffer goes when its last handle drops, under
+    /// unretained command buffers: a command buffer encoded before the drop
+    /// may still read it, and nothing else would keep it alive (`in_flight.rs`).
+    /// `None` for a pooled buffer, which the pool parks itself.
+    hold: Option<Arc<super::InFlightHold>>,
 }
 
 impl PooledBuffer {
@@ -282,6 +288,7 @@ impl PooledBuffer {
             pool: Weak::new(),
             residency: None,
             reservation: None,
+            hold: None,
         }
     }
 
@@ -298,7 +305,15 @@ impl PooledBuffer {
             pool: Weak::new(),
             residency: Some(residency),
             reservation: None,
+            hold: None,
         }
+    }
+
+    /// The same unpooled buffer, handed to `hold` rather than released when
+    /// its last handle drops. A no-op with no hold (the retaining kind).
+    pub fn held_in_flight(mut self, hold: Option<&Arc<super::InFlightHold>>) -> Self {
+        self.hold = hold.cloned();
+        self
     }
 
     /// The same buffer, its bytes committed on the ledger until it drops.
@@ -394,6 +409,9 @@ impl Drop for PooledBuffer {
                 set.remove_deferred(&buffer);
             }
             unsafe { super::poison::unpoison_buffer(&buffer) };
+            if let Some(hold) = &self.hold {
+                hold.hold(super::Held::Buffer(buffer));
+            }
         }
     }
 }
@@ -625,6 +643,7 @@ impl FreeNode {
             residency: None,
             reservation,
             pool,
+            hold: None,
         });
         let node = handle.node;
         std::mem::forget(handle);
@@ -2280,6 +2299,7 @@ impl BufferPool {
             pool: Arc::downgrade(&self.inner),
             residency: None,
             reservation,
+            hold: None,
         })
     }
 

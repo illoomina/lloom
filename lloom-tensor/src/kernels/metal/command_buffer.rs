@@ -182,6 +182,24 @@ impl CommandBuffer {
         unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
     }
 
+    /// As [`Self::on_completion`], handing `f` the completed buffer so it can
+    /// read the final status.
+    pub fn on_completion_of<F>(&self, f: F)
+    where
+        F: Fn(&ProtocolObject<dyn MTLCommandBuffer>) + Send + Sync + 'static,
+    {
+        use block2::RcBlock;
+        use std::ptr::NonNull;
+
+        let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal passes its handler the buffer that completed,
+            // valid for the duration of the call.
+            f(unsafe { cb.as_ref() })
+        });
+        // SAFETY: as `on_completion`.
+        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+    }
+
     /// Register a completion handler that records this buffer's GPU execution
     /// interval, when profiling is enabled.
     ///

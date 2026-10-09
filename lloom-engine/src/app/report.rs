@@ -912,6 +912,15 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
         m.ledger().snapshot().line(),
         m.device().current_allocated_size() as f64 / 1e9
     );
+    // The unretained arm's engagement: what the host held for command buffers
+    // that hold nothing themselves (`in_flight.rs`).
+    match m.in_flight_hold_counts() {
+        Some(h) => eprintln!(
+            "[command buffers: unretained held fences={} buffers={} pending={}]",
+            h.fences, h.buffers, h.pending
+        ),
+        None => eprintln!("[command buffers: retaining]"),
+    }
 }
 
 /// The dispatch recorder's view of the run (`CANDLE_METAL_PROFILE=1`): GPU

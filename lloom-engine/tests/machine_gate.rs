@@ -222,3 +222,34 @@ fn force_loads_what_the_machine_refuses_and_says_so() {
     std::fs::remove_dir_all(&registry).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `serve` is admitted at startup through the same load: refused with the
+/// arithmetic, it exits before binding the socket.
+#[test]
+fn serve_refuses_at_startup() {
+    let dir = scratch("serve");
+    let model = write::<Lfm2Tiny>(&dir);
+    let registry = scratch("serve-registry");
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["serve", "--model"])
+        .arg(&model)
+        .args(["--cpu", "--port", "0"])
+        .arg("--set")
+        .arg(format!("memory.machine.registry={}", registry.display()))
+        .args([
+            "--set",
+            "memory.machine.available_gb=3",
+            "--set",
+            "memory.machine.reserve_gb=4",
+        ])
+        .output()
+        .expect("lloom runs");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "serve started without room:\n{err}");
+    assert!(
+        err.contains("the machine cannot hold this now"),
+        "no refusal:\n{err}"
+    );
+    std::fs::remove_dir_all(&registry).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}

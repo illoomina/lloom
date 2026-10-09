@@ -1444,6 +1444,11 @@ impl From<&Config> for AttnGeometry {
 }
 
 impl<P: Profile> QsaAttention<P> {
+    /// `(n_kv_heads, head_dim)`: what a [`KvCache`]'s byte counts are taken at.
+    pub fn kv_geometry(&self) -> (usize, usize) {
+        (self.n_kv_heads, self.head_dim)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         wq: QMatMul,

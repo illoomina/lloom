@@ -927,6 +927,16 @@ impl<P: Profile> GatedDeltaNet<P> {
     /// positions runs through as one pass (`Self::decode_seq`) and accepts by
     /// phase (`RecurrentState::accept_window`) — the Qwen4-exp `spec_pools`
     /// shape, built per layer for a `Decoder` at the `Ring` profile.
+    /// Bytes one sequence's state takes over `phases` buffers per channel —
+    /// the `[d_k, d_v, h_v]` recurrence and the conv window, f32; two
+    /// unpooled (the slab and the spare a decode step writes into), the
+    /// ring's phases pooled.
+    pub fn state_bytes(&self, phases: usize) -> usize {
+        let s = self.dims.d_k * self.dims.d_v * self.dims.h_v;
+        let conv = self.conv_channels * self.conv.k();
+        phases * (s + conv) * std::mem::size_of::<f32>()
+    }
+
     pub fn pooled_state(&self, dev: &lloom_tensor::Device, phases: usize) -> Result<GdnState> {
         let f32 = lloom_tensor::DType::F32;
         let s = crate::nn::StatePool::with_phases(

@@ -1118,4 +1118,86 @@ mod admit_tests {
         assert_eq!(m.ledger().machine_reserved(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A pass past the reservation on a machine that cannot widen it gives
+    /// back what the process holds and does not need — buffers its earlier
+    /// passes released — and is admitted inside the reservation, unwidened,
+    /// rather than refused on bytes it would have reused.
+    #[test]
+    fn a_pass_the_machine_refuses_is_asked_again_after_the_reclaim() {
+        use crate::machine::{Gate, GateConfig, Peak};
+        let _knob = DRAIN_KNOB.lock();
+        crate::metal_backend::set_admission_drain(true);
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let mib = 1usize << 20;
+        let dir = std::env::temp_dir().join(format!(
+            "lloom-ledger-machine-again-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Reserved: what the process holds now, the pass's 32 MiB and 8 MiB
+        // of slack, on a machine with exactly that available and nothing kept. An injected
+        // reading does not fall as the process allocates, so the room to
+        // widen it stays the reservation itself: smaller than the earlier
+        // pass's buffers below, which the first figure counts.
+        let need = 32 * mib;
+        let committed = m.ledger().committed();
+        let reserved = committed + need + 8 * mib;
+        let released = (reserved + 32 * mib).next_multiple_of(4 * mib);
+        assert!(
+            released <= 256 * mib,
+            "a fresh device commits {committed} bytes: the released buffers would pass the free list's cap"
+        );
+        let gate = Gate::new(GateConfig {
+            reserve: Some(0),
+            registry: Some(dir.clone()),
+            available: Some(reserved as u64),
+            total: Some(reserved as u64),
+            ..Default::default()
+        });
+        let held = gate
+            .admit("ledger test", &Peak::new().with("weights", reserved as u64))
+            .unwrap()
+            .holding
+            .unwrap();
+        m.ledger().attach_machine(&held);
+        // An earlier pass's buffers, released: free once its epoch completes.
+        let bufs: Vec<_> = (0..released / (4 * mib))
+            .map(|_| m.allocate_buffer(4 * mib).unwrap())
+            .collect();
+        drop(bufs);
+        let clock = m.gpu_clock();
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        assert!(m.ledger().committed() >= committed + released);
+        let a = m.admit_bytes(need, usize::MAX);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert!(
+            a.reclaimed >= released,
+            "the released buffers went back: {a:?}"
+        );
+        assert!(a.committed + need <= reserved, "{a:?}");
+        assert_eq!(
+            held.reserved(),
+            reserved as u64,
+            "admitted inside it, unwidened"
+        );
+        // Past the reservation with nothing to give back: refused.
+        let a = m.admit_bytes(2 * reserved, usize::MAX);
+        assert!(!a.fits, "{a:?}");
+        assert!(
+            a.machine
+                .as_deref()
+                .is_some_and(|w| w.contains("the machine cannot hold this now")),
+            "{a:?}"
+        );
+        assert_eq!(held.reserved(), reserved as u64);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

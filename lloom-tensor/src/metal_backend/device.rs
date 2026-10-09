@@ -920,19 +920,44 @@ impl MetalDevice {
     ///
     /// Then the machine (`memory.md` §9.10): a pass that fits the quota and
     /// would take the process past what it reserved at load widens the
-    /// reservation through the machine gate, or is refused with its
-    /// arithmetic (`PassAdmission::machine`). Inside the reservation that is
-    /// one comparison.
+    /// reservation through the machine gate. When the machine cannot widen
+    /// it, the quota's rungs run against the reservation — the free lists,
+    /// then the pending lists after one wait — and the machine is asked
+    /// again: a prefill pass is admitted while its predecessors' buffers
+    /// still wait on their command buffers, bytes the next pass reuses once
+    /// those complete, so a refusal read on the first figure would refuse a
+    /// pass the reservation holds. Still past it, the pass is refused with
+    /// the gate's arithmetic (`PassAdmission::machine`). Inside the
+    /// reservation all of this is one comparison.
     pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
         let mut a = self.admit_quota(need, budget);
-        if a.fits {
-            if let Err(why) = self
-                .ledger
-                .admit_machine(a.committed.saturating_add(need) as u64)
-            {
-                a.fits = false;
-                a.machine = Some(why);
+        if !a.fits {
+            return a;
+        }
+        let ask = |committed: usize| {
+            self.ledger
+                .admit_machine(committed.saturating_add(need) as u64)
+        };
+        let mut asked = ask(a.committed);
+        if asked.is_err() {
+            let mut reclaimed = self.trim_unused_buffers();
+            a.committed = self.ledger.committed();
+            asked = ask(a.committed);
+            if asked.is_err() && !a.drained && admission_drain_on() {
+                a.drained = true;
+                self.ledger.note_drain();
+                if self.wait_until_completed().is_ok() {
+                    reclaimed += self.trim_unused_buffers();
+                    a.committed = self.ledger.committed();
+                    asked = ask(a.committed);
+                }
             }
+            a.reclaimed += reclaimed;
+            self.ledger.note_reclaim(reclaimed);
+        }
+        if let Err(why) = asked {
+            a.fits = false;
+            a.machine = Some(why);
         }
         a
     }

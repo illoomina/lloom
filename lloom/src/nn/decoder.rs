@@ -791,6 +791,10 @@ pub struct Decoder<P: Profile, C, E, L, H> {
     /// What else the load registered for the model's life (a ledger row of
     /// a block the model owns), dropped with it.
     keep: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// The bytes a multi-position pass allocates per position, from the
+    /// family's geometry (0: the family says nothing, and a pass's working
+    /// set is not admitted).
+    prefill_bytes_per_position: usize,
 }
 
 /// The chunk a prefill runs through the layers at once.
@@ -832,7 +836,14 @@ where
             device: device.clone(),
             reservation: None,
             keep: Vec::new(),
+            prefill_bytes_per_position: 0,
         })
+    }
+
+    /// The bytes a multi-position pass allocates per position: what
+    /// `prepare_pass` admits on the machine before a prefill pass runs.
+    pub fn set_prefill_bytes_per_position(&mut self, bytes: usize) {
+        self.prefill_bytes_per_position = bytes;
     }
 
     /// Keep the load's machine reservation for the model's life.
@@ -996,51 +1007,71 @@ where
         Ok(state)
     }
 
-    /// Admit what the pass allocates of the state before it runs — the KV
-    /// slabs widened, the recurrent states' first writes — against the
-    /// ledger's quota and the machine (`MetalDevice::admit_bytes`), refused
-    /// with the arithmetic before anything moves. A pass that grows nothing
-    /// reads nothing.
+    /// Admit what the pass allocates before it runs, refused with the
+    /// arithmetic before anything moves: the state's growth (the KV slabs
+    /// widened, the recurrent states' first writes) against the ledger's
+    /// quota and the machine; and a multi-position pass's working set
+    /// against the machine (`MetalDevice::admit_bytes`, `memory.md` §9.10)
+    /// — a pass inside the load's reservation asks nothing. A decode step
+    /// that grows nothing reads nothing.
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         let grow = self.grow_bytes(cache, seq_len);
-        if grow.total() == 0 {
+        let pass = if seq_len > 1 {
+            seq_len * self.prefill_bytes_per_position
+        } else {
+            0
+        };
+        if grow.total() == 0 && pass == 0 {
             return Ok(());
         }
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &self.device {
-            let quota = m.ledger().quota();
-            let budget = if quota == 0 { usize::MAX } else { quota };
-            let a = m.admit_bytes(grow.total(), budget);
-            if !a.fits {
-                let gb = |b: usize| b as f64 / 1e9;
-                if let Some(why) = &a.machine {
+            let gb = |b: usize| b as f64 / 1e9;
+            if grow.total() > 0 {
+                let quota = m.ledger().quota();
+                let budget = if quota == 0 { usize::MAX } else { quota };
+                let a = m.admit_bytes(grow.total(), budget);
+                if !a.fits {
+                    if let Some(why) = &a.machine {
+                        lloom_tensor::bail!(
+                            "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
+                             is refused before anything is written: {why}",
+                            self.family,
+                            cache.pos,
+                            gb(grow.total()),
+                            gb(grow.kv),
+                            gb(grow.recurrent)
+                        );
+                    }
                     lloom_tensor::bail!(
-                        "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
-                         is refused before anything is written: {why}",
+                        "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
+                         {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
+                         giving back {:.3} GB of free lists; the pass stops here, before anything is \
+                         written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
                         self.family,
                         cache.pos,
                         gb(grow.total()),
                         gb(grow.kv),
-                        gb(grow.recurrent)
+                        gb(grow.recurrent),
+                        gb(a.committed),
+                        gb(budget),
+                        gb(a.reclaimed),
                     );
                 }
-                lloom_tensor::bail!(
-                    "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
-                     {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
-                     giving back {:.3} GB of free lists; the pass stops here, before anything is \
-                     written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
-                    self.family,
-                    cache.pos,
-                    gb(grow.total()),
-                    gb(grow.kv),
-                    gb(grow.recurrent),
-                    gb(a.committed),
-                    gb(budget),
-                    gb(a.reclaimed),
-                );
+                if let Some(t) = &cache.ledger {
+                    t.note(self.held_bytes(cache) + grow);
+                }
             }
-            if let Some(t) = &cache.ledger {
-                t.note(self.held_bytes(cache) + grow);
+            if pass > 0 {
+                if let Some(why) = m.admit_bytes(pass, usize::MAX).machine {
+                    lloom_tensor::bail!(
+                        "{}: the {seq_len}-position pass at position {} ({:.2} GB of working set) \
+                         is refused before it runs: {why}",
+                        self.family,
+                        cache.pos,
+                        gb(pass)
+                    );
+                }
             }
         }
         Ok(())

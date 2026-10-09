@@ -489,6 +489,21 @@ impl Gate {
         })
     }
 
+    /// The machine's room now (`available − reserve − outstanding`), read
+    /// as [`Self::admit`] reads it and reserving nothing: what a caller
+    /// sizing a lever after a refusal solves against. `None` with the gate
+    /// off, the registry unreadable, or the host's memory unreadable.
+    pub fn room(&self) -> Option<i128> {
+        if self.cfg.off {
+            return None;
+        }
+        let registry = self.registry().ok()?;
+        let guard = registry.guard().ok()?;
+        let entries = registry.scan(&guard).ok()?;
+        let v = self.decide(0, None, &entries, None);
+        (v.injected || v.host.is_some()).then(|| v.room())
+    }
+
     fn registry(&self) -> io::Result<Registry> {
         let dir = match &self.cfg.registry {
             Some(d) => d.clone(),

@@ -1211,7 +1211,8 @@ pub fn in_flight_mem_cap(_device: &Device) -> usize {
 /// completion, which retires or errors and cannot wait for a value that is
 /// never published. That is the whole difference from a cap spun on the ring's
 /// generation counter: a counter a stale replay stops advancing is a livelock,
-/// a command buffer that never retires is a reported error. When the GPU is
+/// Metal can report a command-buffer error, but an indefinitely scheduled
+/// buffer can still block its native wait indefinitely. When the GPU is
 /// within the bound the marker is already complete and the wait is a status
 /// read.
 pub(crate) struct StepPacer {

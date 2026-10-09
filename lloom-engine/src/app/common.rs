@@ -214,10 +214,20 @@ pub fn profile_take() -> Option<ProfileReport> {
 pub use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
 
 pub fn open_device() -> Result<Device> {
+    #[cfg(not(feature = "metal"))]
+    if lloom_tensor::tuning::tuning().metal.command_api == "metal4" {
+        anyhow::bail!("--metal-api metal4 requires a build with the metal feature; select metal3/auto for normal device fallback");
+    }
     #[cfg(feature = "metal")]
     {
-        if let Ok(d) = Device::new_metal(0) {
-            return Ok(d);
+        match Device::new_metal(0) {
+            Ok(d) => return Ok(d),
+            Err(error) if lloom_tensor::tuning::tuning().metal.command_api == "metal4" => {
+                // An explicit native API request must not silently become a
+                // CPU run when capability or diagnostics reject that API.
+                return Err(error.into());
+            }
+            Err(_) => {}
         }
     }
     #[cfg(feature = "cuda")]

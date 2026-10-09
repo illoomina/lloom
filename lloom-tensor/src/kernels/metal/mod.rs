@@ -20,6 +20,8 @@ pub mod buffer_pool_fuzz;
 /// The unit is load-bearing -- 128 B per *struct instance*, never per element;
 /// the module docs carry the 64x blowup the second half prevents.
 pub mod cache_pad;
+mod metal4;
+mod raw_encoder;
 pub mod command_buffer;
 pub mod commands;
 /// A stateful model-based fuzzer over `Commands`' submission surface, holding

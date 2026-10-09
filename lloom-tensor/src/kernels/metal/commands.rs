@@ -7,11 +7,9 @@ use crate::kernels::metal::{
     DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
-use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::{HashMap, HashSet};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -387,6 +385,7 @@ pub struct Commands {
     /// Its own line -- see `state` above.
     compute_count: CachePadded<AtomicUsize>,
     command_queue: CommandQueue,
+    modern_queue: Option<Arc<super::metal4::Queue>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: AtomicUsize,
@@ -738,6 +737,35 @@ impl Commands {
             None
         };
 
+        let requested_api = crate::tuning::tuning().metal.command_api.as_str();
+        let supported = super::arms::for_device(&device).has(super::arms::Feature::Metal4);
+        let counters = super::profile::counters_enabled();
+        if requested_api == "metal4" && counters {
+            return Err(MetalKernelError::InvalidInput(
+                "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
+        }
+        let supported = supported && !counters;
+        if requested_api == "auto" && counters {
+            eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
+        }
+
+        let modern_queue = match requested_api {
+            "metal4" if !supported => {
+                return Err(MetalKernelError::InvalidInput(
+                    "Metal 4 is unavailable or disabled on this device; select metal3 or auto"
+                        .into(),
+                ))
+            }
+            "metal4" | "auto" if supported => Some(super::metal4::Queue::new(device.clone())?),
+            _ => None,
+        };
+        let cb = if let Some(queue) = &modern_queue {
+            eprintln!("[metal] command_api=metal4 reusable_native_buffers=true");
+            CommandBuffer::from_metal4(queue.acquire()?)
+        } else {
+            cb
+        };
+
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
         let clock = Arc::new(GpuClock::new());
@@ -747,6 +775,7 @@ impl Commands {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             command_queue,
+            modern_queue,
             compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
             pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
             cut_policy,
@@ -1120,7 +1149,14 @@ impl Commands {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
-        state.current.signal_event(event, value);
+        if self.modern_queue.is_some() {
+            // Queue the signal as part of this commit, before acquiring a
+            // replacement slot can apply backpressure.
+            state.current.signal_event(event, value);
+            self.commit_swap_locked(&mut state, 0)?;
+        } else {
+            state.current.signal_event(event, value);
+        }
         Ok(())
     }
 
@@ -1135,6 +1171,9 @@ impl Commands {
         let mut state = self.state.lock(Side::Host);
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
+        }
+        if self.modern_queue.is_some() {
+            self.commit_swap_locked(&mut state, 0)?;
         }
         state.current.wait_for_event(event, value);
         Ok(())
@@ -1203,7 +1242,7 @@ impl Commands {
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait[..to_wait.len().saturating_sub(1)] {
             if cb.status() == MTLCommandBufferStatus::Error {
-                self.failure.record(cb_error_message(cb.as_ref()));
+                self.failure.record(cb_error_message(cb));
             }
         }
         self.failure.check()?;
@@ -1492,9 +1531,9 @@ impl Commands {
                 let clock = Arc::clone(&self.clock);
                 let subs: Vec<_> = self.on_complete.lock().clone();
                 let failure = Arc::clone(&self.failure);
-                state.current.on_completion_of(move |cb| {
-                    if cb.status() == MTLCommandBufferStatus::Error {
-                        failure.record(cb_error_message(cb));
+                state.current.on_completion_of(move |error| {
+                    if let Some(error) = error {
+                        failure.record(error);
                     }
                     // Order matters: the clock must show the epoch finished
                     // before subscribers look, or they find nothing drainable
@@ -1526,7 +1565,10 @@ impl Commands {
             hold.release_completed();
         }
         let created = timed.map(|_| std::time::Instant::now());
-        let new_cb = create_command_buffer(&self.command_queue, self.kind)?;
+        let new_cb = match &self.modern_queue {
+            Some(queue) => CommandBuffer::from_metal4(queue.acquire()?),
+            None => create_command_buffer(&self.command_queue, self.kind)?,
+        };
         if let Some(t) = created {
             crate::kernels::metal::profile::record_create_cb(t.elapsed());
         }
@@ -1629,7 +1671,7 @@ impl Commands {
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
-        MetalKernelError::CommandBufferError(cb_error_message(cb.as_ref()))
+        MetalKernelError::CommandBufferError(cb_error_message(cb))
     }
 
     /// Drop the in-flight buffers that completed, and report one that failed.
@@ -1652,7 +1694,7 @@ impl Commands {
             state
                 .in_flight
                 .iter()
-                .position(|c| std::ptr::eq(c.as_ref(), w.as_ref()))
+                .position(|c| c.identity() == w.identity())
         });
         for c in &state.in_flight[..ahead.unwrap_or(0)] {
             if !matches!(
@@ -1667,7 +1709,7 @@ impl Commands {
             MTLCommandBufferStatus::Completed => false,
             MTLCommandBufferStatus::Error => {
                 if failed.is_none() {
-                    failed = Some(cb_error_message(c.as_ref()));
+                    failed = Some(cb_error_message(c));
                 }
                 false
             }
@@ -1679,15 +1721,19 @@ impl Commands {
         self.failure.check()
     }
 
+    /// Device setup attaches the existing memory ledger before any encoding.
+    pub(crate) fn attach_command_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
+        if let Some(queue) = &self.modern_queue {
+            queue.attach_ledger(ledger);
+        }
+    }
+
     /// The first command buffer of this queue that ended in error, if any.
     pub fn check_failed(&self) -> Result<(), MetalKernelError> {
         self.failure.check()
     }
 
     fn end_encoding(&self, encoder: ComputeCommandEncoder) {
-        use objc2_metal::MTLCommandEncoder as _;
-        use objc2_metal::MTLComputeCommandEncoder as _;
-
         // The encoder is consumed here, so its output set is moved out rather
         // than cloned: a `HashSet` cloned per encoder close is 14 clones a
         // token (`CONTRIBUTING.md` §3.3a), and the capacity dies with the
@@ -1744,17 +1790,9 @@ impl Commands {
 
         if retires {
             let completed = encoder.fence.completion_flag();
-            let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            encoder.command_buffer.on_completion(move || {
                 completed.store(true, Ordering::Release);
             });
-            // SAFETY: Metal copies the block, so the `RcBlock` may drop at the
-            // end of this scope; the buffer is the uncommitted current one,
-            // which is when Metal accepts a handler.
-            unsafe {
-                encoder
-                    .command_buffer
-                    .addCompletedHandler(RcBlock::as_ptr(&block))
-            };
         }
 
         encoder.raw.endEncoding();
@@ -1762,9 +1800,9 @@ impl Commands {
 }
 
 /// The error a failed command buffer reports, as text.
-fn cb_error_message(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
+fn cb_error_message(cb: &CommandBuffer) -> String {
     cb.error()
-        .map(|e| e.localizedDescription().to_string())
+        .map(|e| e.into_owned())
         .unwrap_or_else(|| "unknown error".to_string())
 }
 

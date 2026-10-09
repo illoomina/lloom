@@ -117,7 +117,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLSharedEvent, MTLSharedEventListener};
+use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 
 use super::cache_pad::CachePadded;
 use super::{CommandBuffer, Device};
@@ -505,8 +505,7 @@ impl CompletionWait {
         // SAFETY-adjacent note rather than an `unsafe` block: the objc2 binding
         // for `encodeSignalEvent:value:` is safe, and its one documented
         // precondition -- no open encoder -- is the caller's, discharged above.
-        cb.as_ref()
-            .encodeSignalEvent_value(ProtocolObject::from_ref(event.raw()), value);
+        cb.signal_event(event.raw(), value);
         Some(value)
     }
 
@@ -844,8 +843,25 @@ pub struct NotifyState {
     ///
     /// The engagement proof for the listener arm, and it is a **count** rather
     /// than a flag so that a wait can tell *its own* block fired rather than
-    /// inheriting a previous one's.
+    /// inheriting a previous one's. Completion still requires `seen >= target`;
+    /// this count alone cannot identify which target fired.
     fired: u64,
+}
+
+impl NotifyState {
+    fn waiting_for(&self, target: u64) -> bool {
+        self.seen < target
+    }
+
+    fn completed_notifications(&self, target: u64, before: u64) -> u64 {
+        // A late callback for an earlier target is engagement, not completion
+        // of this wait. Returning zero preserves the caller's blocking fallback.
+        if self.waiting_for(target) {
+            0
+        } else {
+            self.fired.saturating_sub(before)
+        }
+    }
 }
 
 // SAFETY: `MTLSharedEvent` is documented as usable across threads and processes
@@ -1039,14 +1055,10 @@ impl SharedEvent {
         // returns the timeout as a plain result, so the poison arm std needed
         // here is gone; a timeout still falls through to the count below,
         // which reads 0 and sends the caller to the blocking wait.
-        let _timed_out = cv.wait_while_for(
-            &mut guard,
-            |st| st.seen < value && st.fired == before,
-            deadline,
-        );
+        let _timed_out = cv.wait_while_for(&mut guard, |st| st.waiting_for(value), deadline);
         // The count this wait observed, and 0 when nothing arrived. Reported
         // rather than a bool for the reason in the doc comment above.
-        guard.fired.saturating_sub(before)
+        guard.completed_notifications(value, before)
     }
 }
 
@@ -1061,6 +1073,19 @@ impl std::fmt::Debug for SharedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_listener_callback_cannot_complete_a_newer_target() {
+        let mut state = NotifyState { seen: 7, fired: 2 };
+        assert!(state.waiting_for(8));
+        assert_eq!(state.completed_notifications(8, 1), 0);
+        // Timeout after an old callback still requests the native fallback.
+        state.seen = 8;
+        state.fired = 3;
+        assert!(!state.waiting_for(8));
+        assert_eq!(state.completed_notifications(8, 1), 2);
+        assert_eq!(state.completed_notifications(9, 1), 0);
+    }
 
     #[test]
     fn parses_every_arm() {

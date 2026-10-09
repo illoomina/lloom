@@ -3097,6 +3097,7 @@ impl BackendDevice for MetalDevice {
         let buffers = BufferPool::with_clock(commands.clock());
         let private_buffers = BufferPool::with_clock(commands.clock());
         let ledger = crate::kernels::metal::ledger::Ledger::new();
+        commands.attach_command_ledger(Arc::clone(&ledger));
         // The backings (`profiles-and-memory-design.md` §4.1, L0). A pool
         // miss takes from placement heap chunks when `transient_heaps_on()`,
         // else from one `MTLBuffer` per miss with its residency committed at

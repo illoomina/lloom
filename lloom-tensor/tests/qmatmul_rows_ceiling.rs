@@ -1,5 +1,5 @@
 //! The row axis under `fast` with the kind table's measured ceilings
-//! (`QuantKind::rows_max`, `rows_max_routed`; `docs/tuning.md` §13.5v): a
+//! (`QuantKind::rows_max`, `rows_max_routed`; `docs/tuning.md` §13.5w): a
 //! kind takes the axis exactly where its ceiling says, the capacity the one
 //! the dispatch names, and nowhere else. Absolute references, not a shape:
 //! Q2_K at 8 rows runs `_r8`, Q8_0 at 2 rows `_r2` and at 5 rows `_r2` in

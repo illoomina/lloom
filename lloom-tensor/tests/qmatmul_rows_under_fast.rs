@@ -1,7 +1,7 @@
 //! The `fast` contract takes the row axis: an `m`-row quantized matmul-vec
 //! (2..=8 rows) runs the core at the capacity the dispatch names (`_r2`,
 //! `_r4`, `_r8`), every row's sum the one-row core's in the one-row core's
-//! order (`docs/tuning.md` §13.5v). Each row is held to 1e-5 of the one-row
+//! order (`docs/tuning.md` §13.5w). Each row is held to 1e-5 of the one-row
 //! launch and the bit agreement is printed, not asserted: the row loop may
 //! move the compiler's contraction and nothing else.
 //!

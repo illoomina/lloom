@@ -79,7 +79,7 @@ pub struct QuantKind {
     pub iq_shared: bool,
     /// The row axis's ceiling: the most activation rows one weight read
     /// serves under `fast` on the plain matmul-vec, measured per kind at the
-    /// stems' shapes (`docs/tuning.md` §13.5v); 1 where the axis reads slower
+    /// stems' shapes (`docs/tuning.md` §13.5w); 1 where the axis reads slower
     /// than a launch row per row, and for the dense template.
     pub rows_max: usize,
     /// The same for the routed matmul-vec (a slot's planes in one
@@ -539,7 +539,7 @@ fn mv_id2_constants(dtype: GgmlDType, grid: PairGrid) -> ConstantValues {
 pub const MV_ROWS_CAPACITIES: [usize; 3] = [2, 4, 8];
 
 /// Rows a matmul-vec launch of `m` activation rows takes per weight read
-/// (`docs/tuning.md` §13.5v): under `fast` with the axis on, the capacity at
+/// (`docs/tuning.md` §13.5w): under `fast` with the axis on, the capacity at
 /// or above `min(m, the kind's ceiling)`; 1 — the launch whose every row is
 /// the one-row core's bits — under `deterministic`, with the axis off
 /// (`qmv.rows`), at one row, or for a kind without a row axis. A routed

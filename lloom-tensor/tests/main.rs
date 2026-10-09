@@ -7,8 +7,10 @@
 //! that installs process-global state fails by name when another test did
 //! (`lloom_tensor::isolation`).
 //!
-//! Its own binary, because a test binary carries at most one
-//! `#[global_allocator]`: `metal_pool_alloc_free.rs`.
+//! Their own binaries: `metal_pool_alloc_free.rs`, because a test binary
+//! carries at most one `#[global_allocator]`; `metal_cb_failure_tests.rs`,
+//! because it makes the GPU fail command buffers on purpose and a fault must
+//! not share a process with tests it could disturb.
 //!
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
@@ -87,7 +89,7 @@ mod words_publish_order;
 /// files that owns its binary), read from the directory at test time.
 #[test]
 fn every_test_file_is_a_module() {
-    let own: &[&str] = &["metal_pool_alloc_free"];
+    let own: &[&str] = &["metal_pool_alloc_free", "metal_cb_failure_tests"];
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
     let me = include_str!("main.rs");
     let mut missing = Vec::new();

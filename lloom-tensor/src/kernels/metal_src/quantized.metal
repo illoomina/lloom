@@ -2451,7 +2451,7 @@ constant bool NR0_Q6K_SET = is_function_constant_defined(NR0_Q6K_FC);
 
 // ---- The row axis -----------------------------------------------------------
 // The activation rows a matmul-vec threadgroup computes against one read of
-// its weight rows (`docs/tuning.md` §13.5v): row `r` reads the activation at
+// its weight rows (`docs/tuning.md` §13.5w): row `r` reads the activation at
 // `src1 + y[r]` and stores at `dst + d[r]`, element offsets; rows at and
 // past `n` are not computed. `NR1` is the capacity, a template parameter of
 // every core, and a core at `NR1 = 1` is the one-row matmul-vec, form for

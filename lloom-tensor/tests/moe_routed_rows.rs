@@ -1,5 +1,5 @@
 //! The routed matmul-vec on the row axis (`kernel_mul_mv_id{,2}_<stem>_<triple>_r<N>`,
-//! `docs/tuning.md` §13.5v): over two or more rows under `fast`, the
+//! `docs/tuning.md` §13.5w): over two or more rows under `fast`, the
 //! threadgroup of the first plane naming a slot computes every plane naming
 //! it, `N` at a time through one core call, so a slot the rows share is read
 //! once. Every plane — the single launch, the f16 store and the gate|up pair

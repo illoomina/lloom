@@ -2,7 +2,7 @@
 //! `LLOOM_QMV_ID_UNION`): over two to eight rows, the threadgroup of the
 //! first plane naming a slot runs every plane naming it, so a slot the rows
 //! share is read once. It is the routed row axis at capacity 1
-//! (`kernel_mul_mv_id{,2}_<stem>_<triple>_r1`, `docs/tuning.md` §13.5v), and
+//! (`kernel_mul_mv_id{,2}_<stem>_<triple>_r1`, `docs/tuning.md` §13.5w), and
 //! under `deterministic` (pinned here: the union is the one routed form the
 //! contract admits) every plane must be the per-plane launch's, bit for bit —
 //! the single launch, the f16 store and the gate|up pair — and

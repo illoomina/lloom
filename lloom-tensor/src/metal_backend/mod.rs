@@ -2881,10 +2881,12 @@ impl MetalStorage {
     /// write would run past the extent; the caller then takes the `slice_set`
     /// upload fallback. `false` is a signal, not a panic.
     ///
-    /// SAFETY: the caller guarantees `src` is valid for `src.len()` elements and
-    /// that no GPU work is concurrently reading `[index, index+len)` of this
-    /// buffer (the same discipline the mapped read relies on: writes happen while
-    /// the slot is not in flight).
+    /// # Safety
+    ///
+    /// `T` must match this storage's element type. The source must not overlap
+    /// the destination, and no other host or GPU access may overlap the written
+    /// range during this copy. The caller must complete earlier accesses and
+    /// order later GPU work after the write; mapped aliases share this duty.
     pub(crate) unsafe fn write_host_slice<T: Copy>(&self, index: usize, src: &[T]) -> bool {
         if index.saturating_add(src.len()) > self.count {
             return false;
@@ -2895,8 +2897,8 @@ impl MetalStorage {
         }
         // SAFETY: `dst` is non-null; `index + src.len() <= self.count`, so the
         // destination range is within the buffer's extent; `src` is valid for
-        // `src.len()` per the caller's contract; the ranges do not overlap (src is
-        // host memory, dst is the mapped buffer).
+        // `src.len()` through its slice; the ranges do not overlap and accesses
+        // are synchronized by the caller's safety contract.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), (dst as *mut T).add(index), src.len());
         }

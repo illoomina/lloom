@@ -40,8 +40,17 @@ pub struct HostMemory {
 impl HostMemory {
     /// Pages the kernel can hand out without paging anything out: free,
     /// inactive, purgeable and speculative.
+    /// Saturates for reporting; admission rejects an overflowing sum.
     pub fn available(&self) -> u64 {
-        self.free + self.inactive + self.purgeable + self.speculative
+        self.checked_available().unwrap_or(u64::MAX)
+    }
+
+    // Admission uses this checked form, never the display ceiling above.
+    fn checked_available(&self) -> Option<u64> {
+        self.free
+            .checked_add(self.inactive)?
+            .checked_add(self.purgeable)?
+            .checked_add(self.speculative)
     }
 
     /// The host's reading; `None` where it cannot be read.
@@ -99,13 +108,16 @@ fn read_host() -> Option<HostMemory> {
         stats
     };
     // SAFETY: sysconf has no preconditions.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    if page == 0 {
+        return None;
+    }
     Some(HostMemory {
         total,
-        free: stats.free_count as u64 * page,
-        inactive: stats.inactive_count as u64 * page,
-        purgeable: stats.purgeable_count as u64 * page,
-        speculative: stats.speculative_count as u64 * page,
+        free: (stats.free_count as u64).checked_mul(page)?,
+        inactive: (stats.inactive_count as u64).checked_mul(page)?,
+        purgeable: (stats.purgeable_count as u64).checked_mul(page)?,
+        speculative: (stats.speculative_count as u64).checked_mul(page)?,
     })
 }
 
@@ -118,7 +130,7 @@ fn read_host() -> Option<HostMemory> {
         text.lines()
             .find_map(|l| l.strip_prefix(name))
             .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-            .map(|kb| kb * 1024)
+            .and_then(|kb| kb.checked_mul(1024))
     };
     Some(HostMemory {
         total: field("MemTotal:")?,
@@ -160,7 +172,7 @@ fn footprint_impl(pid: u32) -> Option<u64> {
     text.lines()
         .find_map(|l| l.strip_prefix("VmRSS:"))
         .and_then(|r| r.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        .map(|kb| kb * 1024)
+        .and_then(|kb| kb.checked_mul(1024))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -202,8 +214,16 @@ impl Peak {
         &self.rows
     }
 
+    /// The total, with a reporting ceiling of `u64::MAX`. Admission checks
+    /// the exact sum and refuses overflow, including under `--force`.
     pub fn total(&self) -> u64 {
-        self.rows.iter().map(|(_, b)| b).sum()
+        self.checked_total().unwrap_or(u64::MAX)
+    }
+
+    fn checked_total(&self) -> Option<u64> {
+        self.rows
+            .iter()
+            .try_fold(0u64, |sum, (_, b)| sum.checked_add(*b))
     }
 
     /// `24.31 GB = weights 22.13 + KV floor 0.69 + …`.
@@ -213,7 +233,10 @@ impl Peak {
             .iter()
             .map(|(n, b)| format!("{n} {:.2}", gb(*b)))
             .collect();
-        format!("{:.2} GB = {}", gb(self.total()), terms.join(" + "))
+        match self.checked_total() {
+            Some(total) => format!("{:.2} GB = {}", gb(total), terms.join(" + ")),
+            None => format!("overflow (exceeds u64 bytes) = {}", terms.join(" + ")),
+        }
     }
 }
 
@@ -280,24 +303,37 @@ impl Outstanding {
 }
 
 impl Verdict {
-    fn outstanding(&self) -> u64 {
-        self.others.iter().map(Outstanding::bytes).sum::<u64>() + self.mine.bytes()
+    fn other_bytes(&self) -> i128 {
+        self.others
+            .iter()
+            .fold(0i128, |sum, o| sum.saturating_add(o.bytes() as i128))
+    }
+
+    fn outstanding(&self) -> i128 {
+        self.other_bytes().saturating_add(self.mine.bytes() as i128)
     }
 
     /// `available − reserve − outstanding`, signed.
     pub fn room(&self) -> i128 {
-        self.available as i128 - self.reserve as i128 - self.outstanding() as i128
+        (self.available as i128 - self.reserve as i128).saturating_sub(self.outstanding())
     }
 
     /// One line for a load's report.
     pub fn line(&self) -> String {
+        if self.host.is_none() && !self.injected {
+            return format!(
+                "[machine: need={:.2} GB available=UNKNOWN room=UNKNOWN {}; host observation failed twice]",
+                gb(self.need),
+                if self.forced { "FORCED (safety unchecked)" } else { "REFUSED" },
+            );
+        }
         format!(
             "[machine: need={:.2} GB available={:.2} GB{} reserve={:.2} GB other_lloom={:.2} GB in {} process(es) room={:.2} GB {}]",
             gb(self.need),
             gb(self.available),
             if self.injected { " (injected)" } else { "" },
             gb(self.reserve),
-            gb(self.others.iter().map(Outstanding::bytes).sum()),
+            self.other_bytes() as f64 / 1e9,
             self.others.len(),
             self.room() as f64 / 1e9,
             match (self.fits, self.forced) {
@@ -310,11 +346,18 @@ impl Verdict {
 
     /// The arithmetic, for a refusal (or a forced admission).
     pub fn describe(&self) -> String {
-        let mut s = format!(
-            "the machine cannot hold this now: it needs {:.2} GB and the room is {:.2} GB\n",
-            gb(self.need),
-            self.room() as f64 / 1e9
-        );
+        let unknown = self.host.is_none() && !self.injected;
+        let mut s = if unknown {
+            "the host's available memory could not be read after two attempts; \
+             admission cannot establish room\n"
+                .to_string()
+        } else {
+            format!(
+                "the machine cannot hold this now: it needs {:.2} GB and the room is {:.2} GB\n",
+                gb(self.need),
+                self.room() as f64 / 1e9
+            )
+        };
         if let Some(p) = &self.peak {
             s.push_str(&format!("  needed     {}\n", p.describe()));
         } else {
@@ -330,10 +373,7 @@ impl Verdict {
                 gb(self.available),
                 h.describe()
             )),
-            (None, false) => s.push_str(&format!(
-                "  available  {:.2} GB (the host's memory could not be read)\n",
-                gb(self.available)
-            )),
+            (None, false) => s.push_str("  available  UNKNOWN (not a zero-byte measurement)\n"),
         }
         if self.reserve_is_default {
             s.push_str(&format!(
@@ -347,10 +387,9 @@ impl Verdict {
                 gb(self.reserve)
             ));
         }
-        let others: u64 = self.others.iter().map(Outstanding::bytes).sum();
         s.push_str(&format!(
             "  other lloom processes {:.2} GB reserved and not yet held{}\n",
-            gb(others),
+            self.other_bytes() as f64 / 1e9,
             match &self.registry {
                 Some(d) => format!(" (registry {})", d.display()),
                 None => String::new(),
@@ -382,14 +421,22 @@ impl Verdict {
                 gb(self.mine.footprint.unwrap_or(0))
             ));
         }
-        s.push_str(&format!(
-            "  room       {:.2} GB = available - reserve - reserved and not yet held\n",
-            self.room() as f64 / 1e9
-        ));
+        if unknown {
+            s.push_str("  room       UNKNOWN; retry on a host with a supported memory reader, \
+                        or explicitly use --force (safety unchecked) or memory.machine.gate=false\n");
+        } else {
+            s.push_str(&format!(
+                "  room       {:.2} GB = available - reserve - reserved and not yet held\n",
+                self.room() as f64 / 1e9
+            ));
+        }
         if self.forced {
             s.push_str(
                 "  FORCED: admitted anyway (memory.machine.force); the reservation is recorded",
             );
+            if unknown {
+                s.push_str("; safety could not be checked");
+            }
         } else {
             s.push_str(
                 "  Nothing was allocated. Free memory, stop another lloom process, ask for less \
@@ -447,9 +494,25 @@ impl Gate {
     /// peak if it fits (or if forced). Refused with the arithmetic, before
     /// anything is allocated.
     pub fn admit(&self, label: &str, peak: &Peak) -> crate::Result<Admitted> {
+        self.admit_with(label, peak, HostMemory::read)
+    }
+
+    fn admit_with(
+        &self,
+        label: &str,
+        peak: &Peak,
+        read_host: impl FnMut() -> Option<HostMemory>,
+    ) -> crate::Result<Admitted> {
         if self.cfg.off {
             return Ok(Admitted::off());
         }
+        let total = peak.checked_total().ok_or_else(|| {
+            crate::Error::Msg(format!(
+                "machine peak arithmetic overflow: {}; reduce the requested sizes; \
+                 --force cannot represent an overflowing reservation",
+                peak.describe()
+            ))
+        })?;
         let registry = match self.registry() {
             Ok(r) => Some(r),
             Err(e) if self.cfg.force => {
@@ -462,7 +525,7 @@ impl Gate {
             ),
         };
         let Some(registry) = registry else {
-            let v = self.decide(peak.total(), Some(peak.clone()), &[], None);
+            let v = self.decide_with(total, Some(peak.clone()), &[], None, read_host)?;
             return Ok(Admitted {
                 holding: None,
                 verdict: Some(v),
@@ -470,17 +533,18 @@ impl Gate {
         };
         let guard = registry.guard().map_err(crate::Error::wrap)?;
         let entries = registry.scan(&guard).map_err(crate::Error::wrap)?;
-        let v = self.decide(
-            peak.total(),
+        let v = self.decide_with(
+            total,
             Some(peak.clone()),
             &entries,
             Some(registry.dir().to_path_buf()),
-        );
+            read_host,
+        )?;
         if !v.fits && !v.forced {
             crate::bail!("{}", v.describe());
         }
         let holding = registry
-            .create(&guard, label, peak.total(), self.cfg.clone())
+            .create(&guard, label, total, self.cfg.clone())
             .map_err(crate::Error::wrap)?;
         drop(guard);
         Ok(Admitted {
@@ -500,7 +564,7 @@ impl Gate {
         let registry = self.registry().ok()?;
         let guard = registry.guard().ok()?;
         let entries = registry.scan(&guard).ok()?;
-        let v = self.decide(0, None, &entries, None);
+        let v = self.decide(0, None, &entries, None).ok()?;
         (v.injected || v.host.is_some()).then(|| v.room())
     }
 
@@ -525,23 +589,38 @@ impl Gate {
         peak: Option<Peak>,
         entries: &[Entry],
         registry: Option<PathBuf>,
-    ) -> Verdict {
+    ) -> crate::Result<Verdict> {
+        self.decide_with(need, peak, entries, registry, HostMemory::read)
+    }
+
+    fn decide_with(
+        &self,
+        need: u64,
+        peak: Option<Peak>,
+        entries: &[Entry],
+        registry: Option<PathBuf>,
+        mut read_host: impl FnMut() -> Option<HostMemory>,
+    ) -> crate::Result<Verdict> {
+        // At most two observations, no sleep under registry.lock. Fully
+        // injected budgets do not consult the host at all.
+        let observation = if self.cfg.available.is_none() || self.cfg.total.is_none() {
+            read_host().or_else(&mut read_host)
+        } else {
+            None
+        };
         let host = if self.cfg.available.is_some() {
             None
         } else {
-            HostMemory::read()
+            observation
         };
-        let available = self
-            .cfg
-            .available
-            .or(host.map(|h| h.available()))
-            .unwrap_or(0);
-        let total = self
-            .cfg
-            .total
-            .or(host.map(|h| h.total))
-            .or_else(|| HostMemory::read().map(|h| h.total))
-            .unwrap_or(0);
+        let available = match (self.cfg.available, host) {
+            (Some(bytes), _) => bytes,
+            (None, Some(h)) => h.checked_available().ok_or_else(|| {
+                crate::Error::Msg("machine host available-byte arithmetic overflow".into())
+            })?,
+            (None, None) => 0,
+        };
+        let total = self.cfg.total.or(observation.map(|h| h.total)).unwrap_or(0);
         let reserve = self.cfg.reserve.unwrap_or_else(|| default_reserve(total));
         let me = std::process::id();
         let mut others: Vec<Outstanding> = Vec::new();
@@ -552,13 +631,13 @@ impl Gate {
         };
         for e in entries {
             if e.pid == me {
-                mine.reserved += e.reserved;
+                mine.reserved = checked_reserved(mine.reserved, e)?;
                 mine.labels.push(e.label.clone());
                 continue;
             }
             match others.iter_mut().find(|o| o.pid == e.pid) {
                 Some(o) => {
-                    o.reserved += e.reserved;
+                    o.reserved = checked_reserved(o.reserved, e)?;
                     o.labels.push(e.label.clone());
                 }
                 None => others.push(Outstanding {
@@ -584,13 +663,23 @@ impl Gate {
             forced: false,
             registry,
         };
-        // The machine's memory unreadable and nothing injected: there is no
-        // figure to refuse on, so the gate admits and the line says 0.
+        // Unknown is not a fit. An explicit force still records a
+        // representable reservation, but reports that safety is unchecked.
         let unreadable = v.host.is_none() && !v.injected;
-        v.fits = unreadable || v.room() >= need as i128;
+        v.fits = !unreadable && v.room() >= need as i128;
         v.forced = !v.fits && self.cfg.force;
-        v
+        Ok(v)
     }
+}
+
+fn checked_reserved(previous: u64, entry: &Entry) -> crate::Result<u64> {
+    previous.checked_add(entry.reserved).ok_or_else(|| {
+        crate::Error::Msg(format!(
+            "machine registry reservation arithmetic overflow for pid {}; \
+             its owner must reduce or release reservations before admission",
+            entry.pid
+        ))
+    })
 }
 
 /// One reservation in the registry.
@@ -625,13 +714,15 @@ impl Entry {
     }
 }
 
-/// The machine-wide registry of lloom processes' reservations: a directory
+/// The shared registry of participating lloom processes' reservations: a directory
 /// under the user's cache with one file per reservation, each locked
 /// (`flock`) by its owner for as long as it lives. A file whose lock can be
 /// taken belongs to a process that is gone — the kernel drops a dead
 /// process's locks, so this is exact where a pid test is not (pids are
 /// reused) — and is reaped. Every read and write of the directory happens
 /// under `registry.lock`.
+/// Only processes using this directory participate; the default is per user,
+/// not a machine-wide allocation ceiling.
 #[derive(Clone, Debug)]
 pub struct Registry {
     dir: PathBuf,
@@ -686,21 +777,39 @@ impl Registry {
             if path.extension().and_then(|e| e.to_str()) != Some(&ENTRY_SUFFIX[1..]) {
                 continue;
             }
-            let mut f = match OpenOptions::new().read(true).write(true).open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            if lock(&f, false).is_ok() {
-                // Its owner is gone: the kernel released the lock with it.
-                let _ = fs::remove_file(&path);
-                continue;
-            }
-            let mut text = String::new();
-            if f.read_to_string(&mut text).is_ok() {
-                if let Some(e) = Entry::decode(&text) {
-                    out.push(e);
+            let open = || OpenOptions::new().read(true).write(true).open(&path);
+            let mut f = open()
+                .or_else(|_| open())
+                .map_err(|e| registry_entry_error(&path, e.kind(), &format!("cannot open: {e}")))?;
+            match lock(&f, false) {
+                Ok(()) => {
+                    // Its owner is gone: the kernel released the lock with it.
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    return Err(registry_entry_error(
+                        &path,
+                        e.kind(),
+                        &format!("cannot establish owner liveness: {e}"),
+                    ));
                 }
             }
+            // All cooperating writers hold registry.lock. Reread once to
+            // recover a transient read failure; persistent uncertainty is
+            // not evidence of zero reserved bytes, nor permission to reap.
+            out.push(
+                read_live_entry(&mut f)
+                    .or_else(|_| read_live_entry(&mut f))
+                    .map_err(|e| {
+                        registry_entry_error(
+                            &path,
+                            e.kind(),
+                            &format!("cannot read live reservation: {e}"),
+                        )
+                    })?,
+            );
         }
         out.sort_by_key(|e| (e.since, e.pid));
         Ok(out)
@@ -762,6 +871,69 @@ impl Registry {
     }
 }
 
+fn read_live_entry(file: &mut File) -> io::Result<Entry> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Entry::decode(&text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid pid/reserved/since fields",
+        )
+    })
+}
+
+fn write_entry(file: &mut File, entry: &Entry) -> io::Result<()> {
+    let text = entry.encode();
+    // A partial prefix cannot contain `since` until the complete reserved
+    // field has been written. Never overwrite digits in a valid old record:
+    // a torn decimal overwrite can parse as a smaller reservation.
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(text.as_bytes())?;
+    file.flush()
+}
+
+// Keep the inode (and its lifetime flock) unchanged. All readers hold the
+// registry lock; a failed update restores the previous record before that
+// lock is released. If restoration also fails, a complete required prefix
+// records either the old or the larger reservation; an incomplete one is
+// refused by scans until the owner repairs it or exits.
+fn replace_entry(
+    file: &mut File,
+    previous: &Entry,
+    next: &Entry,
+    mut write: impl FnMut(&mut File, &Entry) -> io::Result<()>,
+) -> io::Result<()> {
+    match write(file, next) {
+        Ok(()) => Ok(()),
+        Err(update) => match write(file, previous) {
+            Ok(()) => Err(io::Error::new(
+                update.kind(),
+                format!("reservation update failed ({update}); previous reservation restored"),
+            )),
+            Err(restore) => Err(io::Error::new(
+                restore.kind(),
+                format!(
+                    "reservation update failed ({update}) and restoration failed ({restore}); \
+                     registry contents are uncertain; release this holding before retrying"
+                ),
+            )),
+        },
+    }
+}
+
+fn registry_entry_error(path: &Path, kind: io::ErrorKind, detail: &str) -> io::Error {
+    io::Error::new(
+        kind,
+        format!(
+            "machine registry entry {}: {detail}; retry after its owner repairs or releases \
+             the reservation (do not delete a live entry); admission cannot establish room",
+            path.display()
+        ),
+    )
+}
+
 /// `flock` on `file`, exclusive; `wait` blocks, else fails at once when
 /// another holds it.
 fn lock(file: &File, wait: bool) -> io::Result<()> {
@@ -769,12 +941,16 @@ fn lock(file: &File, wait: bool) -> io::Result<()> {
     {
         use std::os::fd::AsRawFd;
         let op = libc::LOCK_EX | if wait { 0 } else { libc::LOCK_NB };
-        // SAFETY: the descriptor is open for the call's duration.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            // SAFETY: the descriptor is open for the call's duration.
+            if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
         }
-        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -818,30 +994,43 @@ impl Holding {
     /// arithmetic, the reservation unchanged. A target at or under the
     /// reservation is admitted with nothing read.
     pub fn grow_to(&self, target: u64) -> crate::Result<Option<Verdict>> {
+        self.grow_with(target, || {})
+    }
+
+    // The callback lets the concurrency test pause after the fast-path
+    // snapshot, without relying on scheduling or sleeps. Production calls
+    // monomorphize the empty callback away.
+    fn grow_with(&self, target: u64, before_lock: impl FnOnce()) -> crate::Result<Option<Verdict>> {
+        let current = self.reserved();
+        if target <= current {
+            return Ok(None);
+        }
+        before_lock();
+        let guard = self.registry.guard().map_err(crate::Error::wrap)?;
+        // Another grower may have widened this holding while we waited.
+        // Both the delta and the no-growth decision belong under the lock
+        // that serializes the registry update, not to the fast-path read.
         let current = self.reserved();
         if target <= current {
             return Ok(None);
         }
         let need = target - current;
-        let guard = self.registry.guard().map_err(crate::Error::wrap)?;
         let entries = self.registry.scan(&guard).map_err(crate::Error::wrap)?;
         let v = self.gate.decide(
             need,
             None,
             &entries,
             Some(self.registry.dir().to_path_buf()),
-        );
+        )?;
         if !v.fits && !v.forced {
             crate::bail!("{}", v.describe());
         }
         let mut entry = self.entry.lock();
-        entry.reserved = target;
+        let mut next = entry.clone();
+        next.reserved = target;
         let mut f = self.file.lock();
-        f.set_len(0).map_err(crate::Error::wrap)?;
-        f.seek(SeekFrom::Start(0)).map_err(crate::Error::wrap)?;
-        f.write_all(entry.encode().as_bytes())
-            .map_err(crate::Error::wrap)?;
-        f.flush().map_err(crate::Error::wrap)?;
+        replace_entry(&mut f, &entry, &next, write_entry).map_err(crate::Error::wrap)?;
+        *entry = next;
         self.reserved.store(target, Ordering::Release);
         drop(guard);
         Ok(Some(v))
@@ -900,6 +1089,160 @@ mod tests {
         assert_eq!(p.total(), 3_500_000_000);
         assert_eq!(p.rows().len(), 2, "a zero row is kept out of the report");
         assert_eq!(p.describe(), "3.50 GB = weights 3.00 + KV floor 0.50");
+    }
+
+    #[test]
+    fn an_overflowing_peak_is_refused_before_registration_even_when_forced() {
+        let dir = tmp_registry("peak-overflow");
+        let peak = Peak::new().with("weights", u64::MAX).with("scratch", 1);
+        assert_eq!(peak.total(), u64::MAX);
+        assert!(peak.describe().contains("overflow"));
+        for force in [false, true] {
+            let mut cfg = gate(&dir, u64::MAX, 0).config().clone();
+            cfg.force = force;
+            let error = Gate::new(cfg)
+                .admit("overflow", &peak)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("machine peak arithmetic overflow"),
+                "{error}"
+            );
+            assert!(Registry::open(&dir).unwrap().entries().unwrap().is_empty());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflowing_reservations_for_one_pid_are_not_a_smaller_reservation() {
+        let dir = tmp_registry("pid-overflow");
+        for pid in [std::process::id(), u32::MAX] {
+            let entry = Entry {
+                pid,
+                label: "numeric only".into(),
+                reserved: u64::MAX,
+                since: 0,
+            };
+            let mut second = entry.clone();
+            second.reserved = 1;
+            let error = gate(&dir, u64::MAX, 0)
+                .decide(1, None, &[entry, second], None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reservation arithmetic overflow"), "{error}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn outstanding_across_pids_uses_wide_arithmetic_in_decisions_and_reports() {
+        let dir = tmp_registry("wide-outstanding");
+        let entries: Vec<_> = [u32::MAX, u32::MAX - 1]
+            .into_iter()
+            .map(|pid| Entry {
+                pid,
+                label: "numeric only".into(),
+                reserved: u64::MAX,
+                since: 0,
+            })
+            .collect();
+        let verdict = gate(&dir, u64::MAX, 0)
+            .decide(1, None, &entries, None)
+            .unwrap();
+        assert!(!verdict.fits);
+        assert_eq!(verdict.room(), -(u64::MAX as i128));
+        assert!(verdict.line().contains("REFUSED"));
+        assert!(verdict.describe().contains("cannot hold"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overflowing_host_terms_are_not_an_available_byte_count() {
+        let host = HostMemory {
+            free: u64::MAX,
+            inactive: 1,
+            ..Default::default()
+        };
+        assert_eq!(host.checked_available(), None);
+        assert_eq!(host.available(), u64::MAX, "reporting ceiling only");
+    }
+
+    #[test]
+    fn a_failed_host_read_is_retried_once_before_refusing() {
+        let dir = tmp_registry("host-retry");
+        let mut cfg = gate(&dir, 10_000, 0).config().clone();
+        cfg.available = None;
+        let mut reads = 0;
+        let admitted = Gate::new(cfg)
+            .admit_with("retry", &Peak::new().with("bytes", 100), || {
+                reads += 1;
+                (reads == 2).then_some(HostMemory {
+                    total: 20_000,
+                    free: 10_000,
+                    ..Default::default()
+                })
+            })
+            .unwrap();
+        assert_eq!(reads, 2);
+        assert!(admitted.verdict.as_ref().unwrap().fits);
+        assert_eq!(admitted.holding.as_ref().unwrap().reserved(), 100);
+        drop(admitted);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_host_refuses_unless_explicitly_forced_and_never_reports_a_fit() {
+        let dir = tmp_registry("host-unknown");
+        for force in [false, true] {
+            let mut cfg = gate(&dir, 10_000, 0).config().clone();
+            cfg.available = None;
+            cfg.force = force;
+            let mut reads = 0;
+            let result =
+                Gate::new(cfg).admit_with("unknown", &Peak::new().with("bytes", 100), || {
+                    reads += 1;
+                    None
+                });
+            assert_eq!(reads, 2);
+            if force {
+                let admitted = result.unwrap();
+                let verdict = admitted.verdict.as_ref().unwrap();
+                assert!(!verdict.fits && verdict.forced);
+                assert!(verdict.line().contains("available=UNKNOWN room=UNKNOWN"));
+                assert!(verdict.line().contains("safety unchecked"));
+                assert!(verdict.describe().contains("safety could not be checked"));
+                assert_eq!(
+                    Registry::open(&dir).unwrap().entries().unwrap()[0].reserved,
+                    100
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("could not be read after two attempts"),
+                    "{error}"
+                );
+                assert!(error.contains("available  UNKNOWN"), "{error}");
+                assert!(error.contains("--force"), "{error}");
+                assert!(Registry::open(&dir).unwrap().entries().unwrap().is_empty());
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_off_and_fully_injected_budgets_do_not_probe_the_host() {
+        let dir = tmp_registry("no-host-probe");
+        for off in [false, true] {
+            let mut cfg = gate(&dir, 10_000, 0).config().clone();
+            cfg.off = off;
+            let admitted = Gate::new(cfg)
+                .admit_with("injected", &Peak::new().with("bytes", 100), || {
+                    panic!("an injected or disabled gate must not observe the host")
+                })
+                .unwrap();
+            assert_eq!(admitted.holding.is_none(), off);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// The machine's room, and nothing else, decides: a load that fits is
@@ -962,14 +1305,16 @@ mod tests {
         let dir = tmp_registry("race");
         let g = gate(&dir, 30 * GIB, 4 * GIB);
         let peak = Peak::new().with("weights", 20 * GIB);
+        let decided = std::sync::Barrier::new(2);
         let results: Vec<bool> = std::thread::scope(|s| {
             let hs: Vec<_> = (0..2)
                 .map(|i| {
                     let (g, peak) = (g.clone(), peak.clone());
+                    let decided = &decided;
                     s.spawn(move || {
                         let r = g.admit(&format!("racer {i}"), &peak);
                         // Hold it until both have decided.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        decided.wait();
                         r.is_ok()
                     })
                 })
@@ -1008,6 +1353,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_live_corrupt_reservation_refuses_then_recovers_without_reaping() {
+        let dir = tmp_registry("corrupt-live");
+        let reg = Registry::open(&dir).unwrap();
+        let h = reg.reserve_unchecked("live", 100).unwrap();
+        let original = fs::read(h.path()).unwrap();
+        {
+            let _guard = reg.guard().unwrap();
+            fs::write(h.path(), "pid=broken\nreserved=100\nsince=0\n").unwrap();
+        }
+        for force in [false, true] {
+            let mut cfg = gate(&dir, 10_000, 0).config().clone();
+            cfg.force = force;
+            let error = Gate::new(cfg)
+                .admit("next", &Peak::new().with("numeric bytes only", 1))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot read live reservation"), "{error}");
+            assert!(h.path().exists(), "a live owner must never be reaped");
+        }
+        {
+            let _guard = reg.guard().unwrap();
+            fs::write(h.path(), original).unwrap();
+        }
+        assert_eq!(reg.entries().unwrap()[0].reserved, 100);
+        assert!(gate(&dir, 10_000, 0)
+            .admit("recovered", &Peak::new().with("numeric bytes only", 1))
+            .is_ok());
+        drop(h);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unopenable_registry_entry_is_not_silently_ignored() {
+        let dir = tmp_registry("unopenable");
+        let path = dir.join("unreadable.res");
+        fs::create_dir(&path).unwrap();
+        let error = gate(&dir, 10_000, 0)
+            .admit("next", &Peak::new().with("numeric bytes only", 1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot open"), "{error}");
+        assert!(path.is_dir(), "uncertainty must not remove an entry");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_registry_write_restores_the_previous_record_under_the_lock() {
+        let dir = tmp_registry("write-recovery");
+        let reg = Registry::open(&dir).unwrap();
+        let h = reg.reserve_unchecked("live", 100).unwrap();
+        {
+            let _guard = reg.guard().unwrap();
+            let previous = h.entry.lock().clone();
+            let mut next = previous.clone();
+            next.reserved = 200;
+            let mut calls = 0;
+            let error = replace_entry(&mut h.file.lock(), &previous, &next, |f, e| {
+                calls += 1;
+                if calls == 1 {
+                    f.set_len(0)?;
+                    return Err(io::Error::other("injected partial write"));
+                }
+                write_entry(f, e)
+            })
+            .unwrap_err();
+            assert_eq!(calls, 2, "the failed write must attempt recovery");
+            assert!(error.to_string().contains("previous reservation restored"));
+            assert_eq!(read_live_entry(&mut h.file.lock()).unwrap(), previous);
+        }
+        assert_eq!(reg.entries().unwrap()[0].reserved, 100);
+        assert_eq!(h.reserved(), 100);
+        drop(h);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_torn_record_never_decodes_a_partial_reserved_number() {
+        // Decimal length changes are important: overwriting 900 with 1000
+        // without truncating first could leave a valid but unsafe 100.
+        for reserved in [900, 1000] {
+            let record = Entry {
+                pid: 123,
+                label: "live".into(),
+                reserved,
+                since: 12345,
+            };
+            let text = record.encode();
+            for cut in 0..=text.len() {
+                if let Some(decoded) = Entry::decode(&text[..cut]) {
+                    assert_eq!(decoded.reserved, reserved, "cut={cut}");
+                }
+            }
+        }
+    }
+
     /// Growth past the reservation passes the same arithmetic: admitted
     /// while there is room and recorded for the others to see, refused once
     /// there is none, the reservation left as it was.
@@ -1032,6 +1473,45 @@ mod tests {
         assert!(e.contains("6.44 GB of growth"), "{e}");
         assert_eq!(h.reserved(), 12 * GIB);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_waiting_grower_rechecks_both_the_target_and_the_delta() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        for target in [200, 400] {
+            let dir = tmp_registry("stale-growth");
+            let admitted = gate(&dir, 10_000, 0)
+                .admit("grower", &Peak::new().with("numeric bytes only", 100))
+                .unwrap();
+            let h = admitted.holding.unwrap();
+            let (paused_tx, paused_rx) = channel();
+            let (resume_tx, resume_rx) = channel();
+            let result = std::thread::scope(|s| {
+                let holding = &h;
+                let worker = s.spawn(move || {
+                    holding.grow_with(target, || {
+                        paused_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    })
+                });
+                paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(h.grow_to(300).unwrap().unwrap().need, 200);
+                resume_tx.send(()).unwrap();
+                worker.join().unwrap().unwrap()
+            });
+            assert_eq!(result.map(|v| v.need), (target > 300).then_some(100));
+            let expected = target.max(300);
+            assert_eq!(h.reserved(), expected, "growth never shrinks the holding");
+            assert_eq!(
+                Registry::open(&dir).unwrap().entries().unwrap()[0].reserved,
+                expected,
+                "the durable reservation agrees with the atomic value"
+            );
+            drop(h);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

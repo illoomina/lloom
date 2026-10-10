@@ -4,11 +4,13 @@
 //! adapters must not round-trip request objects through an unordered map.
 
 mod json;
+mod omni;
 mod question;
 mod readout;
 mod temperature;
 
 pub use json::OrderedJson;
+pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
 pub use question::{Answer, Question};
 pub use readout::{CausalReadout, PreparedQuestion};
 

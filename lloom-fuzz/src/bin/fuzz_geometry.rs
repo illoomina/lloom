@@ -21,6 +21,9 @@ struct Args {
     /// `qwen4exp`, `lfm2`, `qwen3_5` or `qwen3_5_moe`.
     #[arg(long, default_value = "qwen4exp")]
     family: String,
+    /// Numerical contract; recorded in the manifest because it selects routes.
+    #[arg(long, default_value = "deterministic", value_parser = ["fast", "deterministic"])]
+    contract: String,
     /// The value law of the weights (`hash[:gain]`, `uniform[:half]`,
     /// `ramp-sin`, `ramp-mod17`).
     #[arg(long, default_value = "hash:1")]
@@ -78,6 +81,10 @@ fn main() -> anyhow::Result<()> {
     // The census and the tuning are read once, on first use.
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
     let args = Args::parse();
+    geometry::FAST_CONTRACT.store(
+        args.contract == "fast",
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut t = lloom::tuning::Tuning::default();
     t.from_env().map_err(anyhow::Error::msg)?;
     t.qwen4exp.hc_mix = args.hc_mix;
@@ -310,6 +317,12 @@ fn manifest<F: TinyFamily>(
             .chain(ls.iter().map(|l| format!("census|{l}")))
             .collect();
         if !matches!(o, Outcome::Agree { .. }) {
+            eprintln!(
+                "MANIFEST_NON_AGREE input={} geometry={} outcome={o:?} steps={:?}",
+                f.display(),
+                g.describe::<F>(),
+                geometry::last_steps()
+            );
             for p in points {
                 elsewhere.entry(p).or_insert(o.class());
             }
@@ -339,6 +352,7 @@ fn manifest<F: TinyFamily>(
         .unwrap_or_default();
     let json = serde_json::json!({
         "family": F::NAME,
+        "contract": args.contract,
         "commit": commit,
         "law": args.law,
         "weight_seed": args.weight_seed,

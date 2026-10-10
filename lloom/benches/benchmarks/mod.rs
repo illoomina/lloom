@@ -2,7 +2,7 @@ pub(crate) mod conv;
 pub(crate) mod norm;
 pub(crate) mod softmax;
 
-use candle::{Device, Result};
+use lloom_tensor::{Device, Result};
 
 pub(crate) trait BenchDevice {
     fn sync(&self) -> Result<()>;
@@ -17,7 +17,7 @@ impl BenchDevice for Device {
             Device::Cuda(device) => {
                 #[cfg(feature = "cuda")]
                 {
-                    use candle::backend::BackendDevice;
+                    use lloom_tensor::backend::BackendDevice;
                     return Ok(device.synchronize()?);
                 }
                 #[cfg(not(feature = "cuda"))]

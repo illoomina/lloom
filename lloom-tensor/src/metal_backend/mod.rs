@@ -15,7 +15,6 @@ use crate::kernels::{
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
 };
-use objc2_foundation::NSRange;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
@@ -2684,7 +2683,7 @@ impl MetalStorage {
             .with_size(bytes)
             .with_label("staged_read_dst")
             .build()?;
-        {
+        if count != 0 {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("staged_read");
             blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem);
@@ -2877,8 +2876,8 @@ impl MetalStorage {
     /// and `memcpy`s; it reaches nothing that waits on or orders against the GPU,
     /// so the caller owns the ordering (as the ring's slot writes already do).
     ///
-    /// Returns `false` if the buffer is not CPU-mapped (`contents()` null — a
-    /// `StorageModePrivate` allocation past the 16384 B window, §15.2 #12a) or the
+    /// Returns `false` if the buffer is not CPU-mapped (Private by default;
+    /// the experimental policy is described in §15.2 #12a) or the
     /// write would run past the extent; the caller then takes the `slice_set`
     /// upload fallback. `false` is a signal, not a panic.
     ///
@@ -2906,6 +2905,12 @@ impl MetalStorage {
 
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
+        if size == 0 {
+            // Preserve the completion/error boundary without issuing Metal's
+            // forbidden zero-byte blit (or allocating a staging buffer).
+            self.device.flush_and_wait_current()?;
+            return Ok(Vec::new());
+        }
 
         // Fast path: read the source directly, no destination and no blit.
         //
@@ -2916,22 +2921,14 @@ impl MetalStorage {
         // can read; when the source is already CPU-readable there is nothing
         // for it to do.
         //
-        // **The test is `contents()`, and what it decides is not the storage
-        // mode -- it is whether Metal happened to MAP this allocation.**
-        // Measured on M1 Max / macOS 26.6.2 (`measurements/issue-336-raw/`):
-        // a `StorageModePrivate` buffer is CPU-mapped below **16384 bytes** and
-        // never at or above it, exactly. So `buffer.rs`'s "null for a
-        // Private-storage allocation" is wrong for small allocations and right
-        // for large ones, and neither a mode test nor a size test is the honest
-        // predicate: the pool rounds, so the same 4-byte `to_scalar` lands in a
-        // 12288 B buffer on one arm and a 731136 B one on another, and only the
-        // first is readable.
-        //
-        // Asking the pointer asks the only question whose answer is
-        // load-bearing, and it fails **closed**: an unmapped buffer takes the
-        // blit, which is the pre-existing path. That is why this is safe to
-        // ship even though which arm a given readback takes is a property of
-        // the allocator rather than of this function.
+        // Shared storage is CPU-readable by contract. Private storage takes
+        // the documented staging path by default; its small owned-buffer
+        // mapping probe is retained only behind `private_cpu_mapping`.
+        // That experimental pointer is implementation-dependent and forbidden
+        // by Metal API Validation, even when the runtime returns non-null.
+        // Private heap sub-buffers are never probed (their offset can masquerade
+        // as a mapping). The cached policy skips the pointless first wait when
+        // a source is known to require staging.
         //
         // What is NOT skipped is the wait. The GPU still has to finish writing
         // the value before the CPU may read it, so `flush_and_wait_current`
@@ -2962,7 +2959,7 @@ impl MetalStorage {
         // ordering is the fix — the wait must come first, because the pointer is
         // only meaningful once the GPU has finished — which is the same
         // §6.7 L4 shape as the pool's own two clocks, in a readback.
-        if !crate::metal_backend::to_cpu_force_blit() {
+        if !crate::metal_backend::to_cpu_force_blit() && self.buffer.may_be_cpu_mapped() {
             // Wait first: `contents()` is only worth asking after the GPU has
             // finished writing, and asking before means the answer can change
             // before it is used.
@@ -3578,7 +3575,9 @@ impl BackendDevice for MetalDevice {
         unsafe {
             std::ptr::copy_nonoverlapping([hi, lo].as_ptr(), contents as *mut u32, 2);
         }
-        seed_buffer.did_modify_range(NSRange::new(0, 8));
+        // The seed allocation is Shared, not Managed: didModifyRange is
+        // forbidden for Shared storage. The next submitted dispatch observes
+        // the host write without a Managed-storage notification.
 
         Ok(())
     }
@@ -3667,6 +3666,7 @@ mod issue_336_split {
             unreachable!()
         };
         let n = 256usize;
+        let readbacks_before = super::readback_counts();
 
         let mut t_fast = Vec::new();
         let mut t_blit = Vec::new();
@@ -3686,11 +3686,12 @@ mod issue_336_split {
             // `--sample-in-buffer` leaves it.
             mdev.wait_until_completed().unwrap();
 
-            // FAST: direct read + a wait that has nothing to do.
+            // Resolved policy: Shared staging by default, experimental mapping
+            // only when explicitly enabled. Counters below prove engagement.
             let s = Instant::now();
             let v: Vec<u32> = ms.to_cpu().unwrap();
             t_fast.push(s.elapsed().as_secs_f64() * 1e3);
-            std::hint::black_box(v);
+            std::hint::black_box(&v);
 
             // BLIT, decomposed.
             let size = ms.count * ms.dtype.size_in_bytes();
@@ -3716,7 +3717,7 @@ mod issue_336_split {
             ms.device.flush_and_wait_current().unwrap();
             let w = s3.elapsed().as_secs_f64() * 1e3;
             let v2: Vec<u32> = super::read_to_vec(&dst, ms.count);
-            std::hint::black_box(v2);
+            assert_eq!(v, v2, "resolved readback versus explicit Shared blit");
 
             if i >= 32 {
                 // warmup
@@ -3735,9 +3736,13 @@ mod issue_336_split {
         let (f, b) = (med(&mut t_fast.split_off(32)), med(&mut t_blit));
         let (al, en, wa) = (med(&mut t_alloc), med(&mut t_encode), med(&mut t_wait));
         println!("ISSUE336-SPLIT n={} (queue pre-drained)", t_wait.len());
-        println!("ISSUE336-SPLIT fast_total_ms={f:.4}");
+        println!(
+            "ISSUE336-SPLIT resolved_total_ms={f:.4} mapping_opt_in={} readbacks={:?}",
+            crate::tuning::tuning().metal.private_cpu_mapping,
+            super::readback_counts().since(&readbacks_before)
+        );
         println!("ISSUE336-SPLIT blit_total_ms={b:.4}  alloc={al:.4} encode={en:.4} wait={wa:.4}");
-        println!("ISSUE336-SPLIT blit_minus_fast_ms={:.4}", b - f);
+        println!("ISSUE336-SPLIT blit_minus_resolved_ms={:.4}", b - f);
     }
 }
 
@@ -3861,19 +3866,12 @@ mod issue_336_to_cpu {
         assert_eq!(seen.len(), 32, "fixture did not vary");
     }
 
-    /// **Which allocations are CPU-mapped, pinned as a fact about the machine.**
-    ///
-    /// This is what decides how often the fast path fires, and it is a property
-    /// of *(device, OS)* rather than of candle (`CONTRIBUTING.md` §2.7). A
-    /// Private allocation is mapped below 16 KiB and unmapped at or above it,
-    /// so the same 4-byte `to_scalar` is readable or not depending on what size
-    /// the pool rounded its buffer to.
-    ///
-    /// If this changes, the fast path's *hit rate* changes and nothing else --
-    /// `to_cpu` still returns the right bytes either way, because the null test
-    /// fails closed onto the blit.
+    /// Default policy denies Private CPU access at every size and keeps the
+    /// Shared control mapped. With the explicit experimental opt-in, retain
+    /// the historical machine-specific 16 KiB threshold probe. That probe is
+    /// not an API guarantee and must not run under Metal API Validation.
     #[test]
-    fn private_allocations_are_mapped_below_16k_and_not_above() {
+    fn private_mapping_policy_and_opt_in_threshold() {
         let Some(dev) = metal() else { return };
         let Device::Metal(m) = &dev else {
             unreachable!()
@@ -3899,6 +3897,23 @@ mod issue_336_to_cpu {
         // `to_cpu` and `read_to_vec`, landing on the check for it.
         let mapped_ptr = std::hint::black_box(mapped.contents());
         let unmapped_ptr = std::hint::black_box(unmapped.contents());
+
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                mapped_ptr.is_null(),
+                "Private mapping must be opt-in at small sizes"
+            );
+            assert!(
+                unmapped_ptr.is_null(),
+                "Private mapping must be opt-in at large sizes"
+            );
+            let shared = m.allocate_buffer(1 << 20).unwrap();
+            assert!(
+                !std::hint::black_box(shared.contents()).is_null(),
+                "Shared control must remain mapped"
+            );
+            return;
+        }
 
         assert!(
             !mapped_ptr.is_null(),
@@ -3948,6 +3963,40 @@ mod issue_336_to_cpu {
             "a 128 B Private heap sub-buffer at offset {offset} was reported \
              CPU-mapped; its contents() is {raw_ptr:?}, which is not a mapping"
         );
+        heaps.release(&placed);
+        heaps.release(&first);
+    }
+
+    /// The documented path and the opt-in both reject Private heap pointers.
+    /// Unlike the opt-in machine probe above, this never calls the forbidden
+    /// raw Private `contents()` getter, so API Validation can check the guard.
+    #[test]
+    fn private_heap_buffers_never_expose_a_cpu_pointer() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let heaps = crate::kernels::metal::HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            1 << 20,
+            None,
+        );
+        let first = heaps.alloc(128).unwrap();
+        let placed = heaps.alloc(128).unwrap();
+        use objc2_metal::MTLResource as _;
+        assert!(
+            placed.as_ref().heapOffset() > 0,
+            "nonzero placement control"
+        );
+        for buffer in [&first, &placed] {
+            assert!(!buffer.may_be_cpu_mapped());
+            assert!(std::hint::black_box(buffer.contents()).is_null());
+        }
+        let shared = m.allocate_buffer(128).unwrap();
+        assert!(shared.may_be_cpu_mapped());
+        assert!(!std::hint::black_box(shared.contents()).is_null());
         heaps.release(&placed);
         heaps.release(&first);
     }
@@ -4359,6 +4408,18 @@ mod issue_481_arena_mapping {
             "the control arm allocated {small_len} B, which is not below the \
              16384 B threshold it exists to sit under"
         );
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                small_null && big_null,
+                "Private arenas must not expose CPU pointers by default"
+            );
+            let shared = m.allocate_buffer(small_len).unwrap();
+            assert!(
+                !std::hint::black_box(shared.contents()).is_null(),
+                "Shared control must be mapped"
+            );
+            return;
+        }
         assert!(
             !small_null,
             "a {small_len} B arena is ALSO unmapped, so this probe cannot \
@@ -4385,7 +4446,7 @@ mod issue_481_arena_mapping {
     /// arm that says *why* the arena is unmapped -- it is size, not something
     /// particular to `install_arena`.
     #[test]
-    fn the_arena_mapping_transition_is_the_16384_b_threshold() {
+    fn arena_mapping_policy_and_opt_in_threshold() {
         let Some(dev) = metal() else { return };
         let Device::Metal(m) = &dev else {
             unreachable!()
@@ -4404,6 +4465,20 @@ mod issue_481_arena_mapping {
             println!("ISSUE481 sweep asked={asked} allocated={len} null={is_null}");
         }
 
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                rows.iter().all(|r| r.2),
+                "Private arena mapping is opt-in: {rows:?}"
+            );
+            for (_, len, _) in &rows {
+                let shared = m.allocate_buffer(*len).unwrap();
+                assert!(
+                    !std::hint::black_box(shared.contents()).is_null(),
+                    "Shared control at {len} bytes must be mapped"
+                );
+            }
+            return;
+        }
         // Both answers must appear, or the sweep is measuring its own fixture.
         assert!(
             rows.iter().any(|r| !r.2),

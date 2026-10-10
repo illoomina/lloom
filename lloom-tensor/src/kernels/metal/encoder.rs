@@ -1558,6 +1558,11 @@ impl BlitCommandEncoder {
         dst_offset: usize,
         size: usize,
     ) {
+        // Empty tensor copies are no-ops, not legal zero-byte Metal blits.
+        // No byte is read or written, so there is no hazard to register.
+        if size == 0 {
+            return;
+        }
         let src_ptr = src_buffer.raw_ptr() as usize;
         let dst_ptr = dst_buffer.raw_ptr() as usize;
         // A blit reads and writes buffers exactly as a dispatch binds them, so

@@ -124,6 +124,32 @@ pub fn routed_act(
     })
 }
 
+/// `auto` is a preference, not permission to dispatch a missing kernel.
+/// Check every routed stack, including MTP and shards beyond the first.
+#[cfg(feature = "metal")]
+fn routed_half_supported<'a>(
+    tensors: impl IntoIterator<Item = (&'a str, lloom_tensor::quantized::GgmlDType)>,
+) -> bool {
+    let mut found = false;
+    for (name, dtype) in tensors {
+        if name.starts_with("blk.")
+            && [
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            found = true;
+            if !lloom_tensor::kernels::GgmlDType::from(dtype).has_gemv_triple() {
+                return false;
+            }
+        }
+    }
+    found
+}
+
 /// The HF cache directory of the DFlash drafter trained for this target.
 pub const DFLASH_SNAPSHOT: &str = "models--PixelML--Qwen3.8-Flash-Next-NVFP4-DFlash";
 
@@ -467,6 +493,31 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                 anyhow::bail!("--mtp {}: no such file", p.display());
             }
             shards.push(p.clone());
+        }
+        #[cfg(feature = "metal")]
+        if opts.moe_act == "auto"
+            && device.is_metal()
+            && routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? == DType::F16
+        {
+            // Header-only inspection at load, never on the decode hot path.
+            let headers = shards
+                .iter()
+                .map(|path| {
+                    let mut file = std::fs::File::open(path)?;
+                    lloom_tensor::quantized::gguf_file::Content::read(&mut file)
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !routed_half_supported(headers.iter().flat_map(|h| {
+                h.tensor_infos
+                    .iter()
+                    .map(|(name, ti)| (name.as_str(), ti.ggml_dtype))
+            })) {
+                opts.moe_act = "f32".into();
+                eprintln!(
+                    "[moe-act auto: f32; checkpoint has no complete native f16 routed kernel set]"
+                );
+            }
         }
         let moe_act = match routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? {
             DType::F16 => Some(DType::F16),
@@ -1589,6 +1640,29 @@ mod tests {
         }
         assert!(super::routed_act("bf16", Fast).is_err());
         assert!(lloom_tensor::tuning::Contract::FAST_ARMS.contains(&"moe-act-f16"));
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn moe_auto_checks_every_routed_stack_not_dense_stems() {
+        use lloom_tensor::quantized::GgmlDType::{F32, Q4_0, Q8_0};
+        assert!(super::routed_half_supported([
+            ("blk.0.ffn_gate_exps.weight", Q4_0),
+            ("blk.0.ffn_up_exps.weight", Q4_0),
+            ("blk.0.ffn_down_exps.weight", Q8_0),
+            ("blk.0.attn_norm.weight", F32),
+        ]));
+        for missing in [
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ] {
+            let name = format!("blk.99.{missing}");
+            assert!(!super::routed_half_supported([
+                ("blk.0.ffn_gate_exps.weight", Q4_0),
+                (name.as_str(), F32),
+            ]));
+        }
+        assert!(!super::routed_half_supported(std::iter::empty()));
     }
     use crate::{ReadbackArm, RingArm};
     use lloom::generation::EosRead;

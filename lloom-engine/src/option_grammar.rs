@@ -337,6 +337,30 @@ mod tests {
                 for via in vias(key, leaf) {
                     let mut took_one = false;
                     for sample in &samples {
+                        // Metadata describes all targets; WFE is executable only
+                        // on aarch64. Every front-end must preserve that refusal.
+                        if !cfg!(target_arch = "aarch64")
+                            && sample == "wfe"
+                            && matches!(
+                                key.path.as_str(),
+                                "decode.host_feed.wait" | "decode.readback.wait"
+                            )
+                        {
+                            for form in [
+                                sample.clone(),
+                                sample.to_ascii_uppercase(),
+                                format!(" {sample} "),
+                            ] {
+                                checked += 1;
+                                if via.write(&form).is_ok() {
+                                    bad.push(format!(
+                                        "{} via {via:?}: architecture-unavailable `{form}` accepted",
+                                        key.path
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
                         let Ok(plain) = via.write(sample) else {
                             if matches!(ty, Ty::Enum { .. }) {
                                 bad.push(format!(

@@ -274,7 +274,8 @@ fn parse_opt_nr0_4(v: &str) -> Result<Option<usize>, String> {
     ranged(v, "rows a simdgroup", 1, 4).map(Some)
 }
 fn parse_opt_rows_max(v: &str) -> Result<Option<usize>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v == "0" {
+    let v = non_empty(v)?;
+    if is_none(v) || v == "0" {
         return Ok(None);
     }
     ranged(v, "rows a weight read", 1, 8).map(Some)
@@ -372,10 +373,7 @@ fn declared_arm(v: &str, field: &str) -> Result<String, String> {
 }
 fn parse_cut_policy(v: &str) -> Result<String, String> {
     let v = non_empty(v)?.to_ascii_lowercase();
-    #[cfg(feature = "metal")]
-    crate::kernels::metal::commands::CutPolicy::from_env_str(&v)?;
-    #[cfg(not(feature = "metal"))]
-    declared_arm(&v, "cut_policy")?;
+    crate::command_policy::CutPolicy::from_env_str(&v)?;
     Ok(v)
 }
 fn parse_command_api(v: &str) -> Result<String, String> {
@@ -821,6 +819,9 @@ pub struct MetalTuning {
     /// Read a tensor back through a blit into a staging buffer rather than in place (an A/B arm).
     #[opt(flag = "to-cpu-blit", env = "CANDLE_METAL_TO_CPU_BLIT", bool, path = "backend.metal.readback_blit", status = "arm", facets = ["transport"], flows = ["token-out"])]
     pub to_cpu_blit: bool,
+    /// Opt into implementation-dependent CPU mapping of non-heap Private buffers. Off by default: Private readback stages through Shared storage. Incompatible with Metal API Validation; never permits heap mappings.
+    #[opt(flag = "private-cpu-mapping", env = "LLOOM_PRIVATE_CPU_MAPPING", bool, path = "backend.metal.private_cpu_mapping", status = "arm", facets = ["transport"], flows = ["token-out", "prompt-in"])]
+    pub private_cpu_mapping: bool,
     /// Route every contiguous `copy2d` through the compute copy kernel instead of the blit encoder (an A/B arm).
     #[opt(
         flag = "copy2d-no-blit",
@@ -949,6 +950,7 @@ impl Default for MetalTuning {
             hazard_key: None,
             cb_unretained: false,
             to_cpu_blit: false,
+            private_cpu_mapping: false,
             copy2d_no_blit: false,
             wire_weights: false,
             heap_chunk_mb: 512,

@@ -762,9 +762,10 @@ pub struct RoundTiming {
     /// drafter's state is owned (issue #894).
     pub pool_allocations: u64,
     pub residency_adds: u64,
-    /// Of `pool_allocations`, those made while a buffer of the same size
-    /// was released and not yet complete (`PoolCounters::pending_twin_allocations`):
-    /// the pool's deferred-release window, not a size the round lacked.
+    /// Of `pool_allocations`, misses with an eligible released buffer still
+    /// pending (`PoolCounters::pending_twin_allocations`), including larger
+    /// buckets permitted by the reuse policy. An observed deferred-reuse
+    /// opportunity, not proof that an allocation could have been avoided.
     pub pool_allocations_pending_twin: u64,
 }
 

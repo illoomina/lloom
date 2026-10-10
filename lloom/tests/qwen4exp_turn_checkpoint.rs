@@ -1,8 +1,8 @@
 //! The turn checkpoint on Qwen4-exp's own state (`sequence-reuse-design.md`
 //! §2.3b): the same ring and the same side recurrence as the generic
 //! decoder's (`decoder_turn_checkpoint.rs`), hosted by `qwen4exp::State`
-//! inside `prefill_mix`. A restore equals a fresh prefill of the kept
-//! prefix bit for bit (`S`, the conv window, the KV rows), the hint lands
+//! inside `prefill_mix`. Save/overwrite/restore preserves the saved state
+//! bit for bit; prefix causality uses an identical pass shape. The hint lands
 //! inside a pass and inside a pipelined pass's second tile, and the chat
 //! re-render is `Rewound(reply + tail)` through `Session::prepare` with
 //! the fresh session's stream. The tiny resident model, CPU and Metal.
@@ -31,7 +31,8 @@ fn tokens(n: usize, vocab: usize, seed: u32) -> Vec<u32> {
         .collect()
 }
 
-fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+fn tensor_diff(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
+    assert_eq!(a.dims(), b.dims(), "shapes differ");
     let a = a
         .flatten_all()?
         .to_dtype(lloom_tensor::DType::F32)?
@@ -41,15 +42,44 @@ fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
         .to_dtype(lloom_tensor::DType::F32)?
         .to_vec1::<f32>()?;
     assert_eq!(a.len(), b.len(), "shapes differ");
-    Ok(a.iter()
-        .zip(b.iter())
+    assert!(
+        a.iter().chain(&b).all(|x| x.is_finite()),
+        "non-finite state"
+    );
+    let diff = a
+        .iter()
+        .zip(&b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0f32, f32::max))
+        .fold(0f32, f32::max);
+    let scale = b.iter().map(|x| x.abs()).fold(0f32, f32::max);
+    Ok((diff, scale))
+}
+
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+    Ok(tensor_diff(a, b)?.0)
+}
+
+fn relative_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+    let (diff, scale) = tensor_diff(a, b)?;
+    Ok(if diff == 0.0 { 0.0 } else { diff / scale })
+}
+
+// CPU pass splits change matmul dispatch. This parity bound does not assert
+// split-invariant bits; Metal cross-shape differences remain diagnostic.
+const PREFIX_REL: f32 = 1e-5;
+
+fn state_diff<P: Profile>(a: &State<P>, b: &State<P>) -> Result<(f32, f32)> {
+    state_diff_by(a, b, max_abs_diff)
 }
 
 /// Every layer of `a` against `b`: the recurrent channels' largest
 /// difference and the KV rows' (the lengths must agree).
-fn state_diff<P: Profile>(a: &State<P>, b: &State<P>) -> Result<(f32, f32)> {
+fn state_diff_by<P: Profile>(
+    a: &State<P>,
+    b: &State<P>,
+    diff: fn(&Tensor, &Tensor) -> Result<f32>,
+) -> Result<(f32, f32)> {
+    assert_eq!(a.kv.len(), b.kv.len(), "layer count");
     assert_eq!(a.pos, b.pos, "position");
     assert_eq!(
         a.ngram.window(None),
@@ -63,28 +93,43 @@ fn state_diff<P: Profile>(a: &State<P>, b: &State<P>) -> Result<(f32, f32)> {
             ("conv", a.conv_state.get(l), b.conv_state.get(l)),
         ] {
             match (s, t) {
-                (Some(s), Some(t)) => rec = rec.max(max_abs_diff(s, t)?),
+                (Some(s), Some(t)) => rec = rec.max(diff(s, t)?),
                 (None, None) => {}
                 _ => panic!("layer {l}: {what} written on one side only"),
             }
         }
         match (a.ple_conv.get(l), b.ple_conv.get(l)) {
-            (Some(s), Some(t)) => rec = rec.max(max_abs_diff(s, t)?),
+            (Some(s), Some(t)) => rec = rec.max(diff(s, t)?),
             (None, None) => {}
             _ => panic!("layer {l}: the PLE history written on one side only"),
         }
-        assert_eq!(a.kv[l].len(), b.kv[l].len(), "layer {l}: KV length");
-        let n = a.kv[l].len();
-        let [pk, pv, _, _] = a.kv[l].state_views()?;
-        let [qk, qv, _, _] = b.kv[l].state_views()?;
-        for (s, t) in [(pk, qk), (pv, qv)] {
-            let (Some(s), Some(t)) = (s, t) else { continue };
-            if s.rank() == 3 && t.rank() == 3 && s.dim(1)? >= n && t.dim(1)? >= n {
-                kv = kv.max(max_abs_diff(&s.narrow(1, 0, n)?, &t.narrow(1, 0, n)?)?);
+        assert_eq!(
+            a.kv[l].lens(),
+            b.kv[l].lens(),
+            "layer {l}: KV/indexer lengths"
+        );
+        for (part, (s, t)) in a.kv[l]
+            .state_views()?
+            .into_iter()
+            .zip(b.kv[l].state_views()?)
+            .enumerate()
+        {
+            match (s, t) {
+                (Some(s), Some(t)) => kv = kv.max(diff(&s, &t)?),
+                (None, None) => {}
+                _ => panic!("layer {l}: KV/indexer part {part} written on one side only"),
             }
         }
     }
     Ok((rec, kv))
+}
+
+#[test]
+#[should_panic(expected = "non-finite state")]
+fn state_comparison_rejects_nan() {
+    let a = Tensor::from_vec(vec![f32::NAN], 1, &Device::Cpu).unwrap();
+    let b = Tensor::from_vec(vec![0f32], 1, &Device::Cpu).unwrap();
+    let _ = max_abs_diff(&a, &b);
 }
 
 fn prefill(
@@ -114,20 +159,33 @@ fn logits(
     model.forward(&input, pos, st)
 }
 
-/// Whether a fresh prefill of `keep` rows runs through the same kernel
-/// arms as the `n`-row pass (`decoder_turn_checkpoint.rs`'s rule): one row
-/// is the decode step on every backend; on Metal the family's attention
-/// prefill over `keep` rows takes another tile class than over `n`
-/// (measured on the tiny model: 68–70 rows agree with a 70-row pass, 61 do
-/// not — recurrent 7e-7, KV 3e-5). The restored state is the pass's own
-/// either way; the reference is a different computation. Asserted where
-/// they agree, printed elsewhere.
-fn same_arms(dev: &Device, n: usize, keep: usize) -> bool {
-    if dev.is_metal() {
-        n - keep <= 2
-    } else {
-        keep >= 2
-    }
+/// An independent reference never restored from a checkpoint: the same prefix
+/// pass stopped at its end. The subject runs a later pass before restoring, so
+/// a missing copy cannot pass as a no-op restore.
+fn exact_restore_case(
+    model: &Qwen4Exp<CrownExact, Resident>,
+    cfg: &Config,
+    dev: &Device,
+    keep: usize,
+) -> Result<()> {
+    let prompt = tokens(keep + 7, cfg.vocab_size, 3);
+    let fresh = prefill(model, cfg, dev, &prompt[..keep], None)?;
+    let mut st = prefill(model, cfg, dev, &prompt[..keep], Some(keep))?;
+    logits(model, &mut st, keep, &prompt[keep..], dev)?;
+    assert_eq!(st.pos, prompt.len());
+    assert!(st.checkpoint_positions().contains(&keep));
+    CacheRewind::restore(&mut st, keep)?;
+    assert_eq!(
+        state_diff(&st, &fresh)?,
+        (0.0, 0.0),
+        "exact restore at {keep}"
+    );
+    let a = logits(model, &mut st, keep, &prompt[keep..], dev)?;
+    let mut fresh = fresh;
+    let b = logits(model, &mut fresh, keep, &prompt[keep..], dev)?;
+    assert_eq!(max_abs_diff(&a, &b)?, 0.0, "exact continuation at {keep}");
+    eprintln!("Q4E-CKPT exact save/overwrite/restore keep={keep}: state=0 continuation=0");
+    Ok(())
 }
 
 fn restore_case(
@@ -139,6 +197,7 @@ fn restore_case(
 ) -> Result<()> {
     let prompt = tokens(n + 8, cfg.vocab_size, 3);
     let keep = n - tail;
+    exact_restore_case(model, cfg, dev, keep)?;
     let mut st = prefill(model, cfg, dev, &prompt[..n], Some(keep))?;
     assert_eq!(st.pos, n);
     assert_eq!(
@@ -153,11 +212,29 @@ fn restore_case(
     CacheRewind::restore(&mut st, keep)?;
     assert_eq!(st.pos, keep);
     let fresh = prefill(model, cfg, dev, &prompt[..keep], None)?;
+    // Keep the pass shape identical while changing only tokens after the
+    // checkpoint. A causal checkpoint cannot include any of that suffix.
+    if tail > 0 {
+        let mut changed = prompt[..n].to_vec();
+        for t in &mut changed[keep..] {
+            *t = (*t + 1) % cfg.vocab_size as u32;
+        }
+        assert_ne!(&changed[keep..], &prompt[keep..n]);
+        let mut causal = prefill(model, cfg, dev, &changed, Some(keep))?;
+        CacheRewind::restore(&mut causal, keep)?;
+        assert_eq!(
+            state_diff(&st, &causal)?,
+            (0.0, 0.0),
+            "checkpoint must not depend on the discarded suffix at {keep} of {n}"
+        );
+    }
     let (rec, kv) = state_diff(&st, &fresh)?;
     eprintln!(
         "Q4E-CKPT n={n} tail={tail} keep={keep} restore-vs-fresh: recurrent {rec:e} kv {kv:e}"
     );
-    let exact = same_arms(dev, n, keep);
+    // Preserve the existing exact Metal fixtures, without claiming that all
+    // shorter passes use the same arithmetic. Exact restore is tested above.
+    let exact = n == keep || (dev.is_metal() && tail <= 2);
     if exact {
         assert_eq!(
             rec, 0.0,
@@ -168,12 +245,26 @@ fn restore_case(
             "n={n} tail={tail}: the KV rows kept are the fresh prefill's"
         );
     }
+    let (rec_rel, kv_rel) = state_diff_by(&st, &fresh, relative_diff)?;
+    eprintln!("Q4E-CKPT n={n} tail={tail} relative: recurrent {rec_rel:e} kv {kv_rel:e}");
+    if dev.is_cpu() {
+        assert!(
+            rec_rel <= PREFIX_REL && kv_rel <= PREFIX_REL,
+            "prefix state: recurrent {rec_rel:e}, KV {kv_rel:e}, bound {PREFIX_REL:e}"
+        );
+    }
     let mut fresh = fresh;
     let cont = &prompt[keep..n + 6];
     let a = logits(model, &mut st, keep, cont, dev)?;
     let b = logits(model, &mut fresh, keep, cont, dev)?;
     let d = max_abs_diff(&a, &b)?;
     eprintln!("Q4E-CKPT n={n} tail={tail} continuation: {d:e}");
+    if dev.is_cpu() {
+        assert!(
+            relative_diff(&a, &b)? <= PREFIX_REL,
+            "fresh-prefix continuation"
+        );
+    }
     if exact {
         assert_eq!(
             d, 0.0,
@@ -292,10 +383,16 @@ fn cases(dev: &Device) -> Result<()> {
         eprintln!(
             "Q4E-CKPT pipelined tiles, hint at 30 of [16, 16, 8]: recurrent {rec:e} kv {kv:e}"
         );
-        // The fresh prefill of 30 chunks as [16, 14] (a different partition
-        // of the DeltaNet recurrence than [16, 16]'s first 30 rows: §2.3b);
-        // the KV rows do not depend on it.
-        assert_eq!(kv, 0.0);
+        // [16, 14] and [16, 16]'s prefix have different pass shapes.
+        let (rec_rel, kv_rel) = state_diff_by(&st, &fresh, relative_diff)?;
+        if dev.is_cpu() {
+            assert!(
+                rec_rel <= PREFIX_REL && kv_rel <= PREFIX_REL,
+                "pipelined prefix: recurrent {rec_rel:e}, KV {kv_rel:e}"
+            );
+        } else {
+            assert_eq!(kv, 0.0, "the existing Metal pipelined KV fixture");
+        }
         // The same partition, bit for bit: a pass of [16, 16] cut to 30 is
         // the hinted pass itself.
         let mut same = prefill(&model, &cfg, dev, &prompt[..32], Some(30))?;

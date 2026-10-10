@@ -116,6 +116,42 @@ fn decode<R: ExpertResidency>(model: &Qwen4Exp<CrownExact, R>, dev: &Device) -> 
         .ids)
 }
 
+/// Bracket decode after the public prefill seam. Cold multi-row routing reads
+/// ids through documented Shared staging; it is not a steady decode readback.
+/// The reference above remains the single-call driver, so this seam must leave
+/// the token stream unchanged too.
+fn decode_after_prefill<R: ExpertResidency>(
+    model: &Qwen4Exp<CrownExact, R>,
+    dev: &Device,
+) -> Result<(Vec<u32>, lloom_tensor::metal_backend::ReadbackCounts)> {
+    let mut session = Session::new(model, model.new_cache(&tiny(), dev)?);
+    let mut rb = Blocking::new(&[u32::MAX], dev)?;
+    let opts = DecodeOptions::new(STEPS);
+    let before = lloom_tensor::metal_backend::readback_counts();
+    session.prefill(&mut rb, &PROMPT, &opts)?;
+    dev.synchronize()?;
+    let decode_start = lloom_tensor::metal_backend::readback_counts();
+    eprintln!(
+        "[streamed prefill] readbacks {:?}",
+        decode_start.since(&before)
+    );
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        &[],
+        &opts,
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(
+        out.stats.prefill_units, 0,
+        "the decode window must resume, not prefill"
+    );
+    let reads = lloom_tensor::metal_backend::readback_counts().since(&decode_start);
+    Ok((out.ids, reads))
+}
+
 /// The driver's decode keys with a plan: `(variant, covered, total)`.
 fn decode_plans(m: &MetalDevice) -> Vec<(u32, usize, usize)> {
     let (keys, _) = m.pass_plan_report().expect("the cache is on");
@@ -210,9 +246,7 @@ fn a_warm_streamed_decode_is_served_and_asks_the_pools_for_nothing() -> Result<(
     lloom_tensor::metal_backend::set_served_request_trace(true);
     let _ = lloom_tensor::metal_backend::served_pass_request_sites();
     let before = m.served_pass_pool_requests();
-    let reads = lloom_tensor::metal_backend::readback_counts();
-    let got = decode(&model, &dev)?;
-    let reads = lloom_tensor::metal_backend::readback_counts().since(&reads);
+    let (got, reads) = decode_after_prefill(&model, &dev)?;
     let after = m.served_pass_pool_requests();
     let sites = lloom_tensor::metal_backend::served_pass_request_sites();
     lloom_tensor::metal_backend::set_served_request_trace(false);

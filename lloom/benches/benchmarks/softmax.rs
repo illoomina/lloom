@@ -1,8 +1,8 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use candle::{DType, Device, Tensor};
-use candle_nn::ops::softmax_last_dim;
 use criterion::Throughput;
 use criterion::{criterion_group, Criterion};
+use lloom::nn::ops::softmax_last_dim;
+use lloom_tensor::{DType, Device, Tensor};
 use std::hint::black_box;
 use std::time::Instant;
 

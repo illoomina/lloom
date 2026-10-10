@@ -16,3 +16,6 @@ pub use temperature::Temperature;
 
 #[cfg(test)]
 mod contract_tests;
+
+#[cfg(test)]
+mod session_tests;

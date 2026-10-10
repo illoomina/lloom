@@ -1029,6 +1029,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
         &self.seq
     }
 
+    /// The held logits of the last consumed position, not every prompt position.
+    /// Available after successful prefill or a settled resumable decode; absent
+    /// after reset, invalidating prepare, or failed nonempty prefill. Empty
+    /// prefill preserves them. The borrow cannot outlive a mutable session call;
+    /// a cloned Tensor may alias reusable hold storage and is NOT a snapshot.
+    /// Read or copy selected values before the next session operation. Device
+    /// work may still be pending: use the tensor's ordinary staged readback.
+    pub fn last_logits(&self) -> Option<&Tensor> {
+        self.seq.last_logits.as_ref()
+    }
+
     /// Positions currently in the cache.
     pub fn pos(&self) -> usize {
         self.seq.pos

@@ -21,6 +21,7 @@
 pub mod batch;
 pub mod couplings;
 pub mod decode;
+pub mod decision;
 pub mod option_schema;
 pub mod option_tree;
 pub mod options;

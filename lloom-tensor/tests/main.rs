@@ -15,6 +15,9 @@
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
+#[cfg(not(feature = "metal"))]
+use lloom_tensor::retire;
+
 mod f16_rows_identity;
 mod bilinear_tests;
 mod conv_tests;
@@ -34,6 +37,7 @@ mod host_fed_ring;
 mod indexing_tests;
 mod iq3xxs_gguf_read;
 mod iq_metal;
+mod kv_pages_cpu;
 mod layout_tests;
 mod matmul_tests;
 mod metal_arena_lifetime_fuzz;

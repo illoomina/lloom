@@ -24,6 +24,7 @@ autotests = false
 lloom = { workspace = true }
 lloom-tensor = { workspace = true }
 thiserror = { workspace = true }
+parking_lot = { workspace = true }
 
 # The `lloom-serve` binary only (feature `serve`): the library stays free of a
 # tokenizer, an HTTP stack and a template engine. A consumer that links the

@@ -4,9 +4,10 @@
 use super::Device;
 use crate::kernels::MetalKernelError;
 use block2::RcBlock;
+use crossbeam_queue::ArrayQueue;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::*;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::{
     collections::HashSet,
     ptr::NonNull,
@@ -27,16 +28,66 @@ pub(crate) struct Feedback {
     pub end: f64,
 }
 
-struct Pool {
-    available: Vec<Slot>,
-    allocated: usize,
+/// A notification sequence, not a mutex shared with the completion thread.
+/// The waiter snapshots BEFORE checking its predicate. Registration plus the
+/// sequence check under parking_lot's queue lock closes check -> park; sequential
+/// consistency prevents the waker missing registration while validation misses
+/// the new sequence. No parking/wake call when nobody needs to block.
+#[derive(Default)]
+struct Wake {
+    epoch: AtomicUsize,
+    waiters: AtomicUsize,
+}
+impl Wake {
+    fn snapshot(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+    fn notify(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            // SAFETY: this object's own stable address is its parking key.
+            // Every parked caller holds the enclosing Queue/Submission alive.
+            unsafe {
+                parking_lot_core::unpark_all(
+                    self as *const Self as usize,
+                    parking_lot_core::DEFAULT_UNPARK_TOKEN,
+                );
+            }
+        }
+    }
+    fn wait(&self, seen: usize) {
+        self.park(seen, None);
+    }
+    fn park(
+        &self,
+        seen: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> parking_lot_core::ParkResult {
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: same owned key as notify; validation only reads an atomic,
+        // cannot panic or reenter parking_lot. The caller keeps self alive.
+        let result = unsafe {
+            parking_lot_core::park(
+                self as *const Self as usize,
+                || self.snapshot() == seen,
+                || {},
+                |_, _| {},
+                parking_lot_core::DEFAULT_PARK_TOKEN,
+                deadline,
+            )
+        };
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
 }
 
 pub(crate) struct Queue {
     pub raw: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     device: Device,
-    pool: Mutex<Pool>,
-    ready: Condvar,
+    available: ArrayQueue<Slot>,
+    allocated: AtomicUsize,
+    ready: Wake,
+    acquire_parks: AtomicUsize,
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
@@ -53,11 +104,10 @@ impl Queue {
         Ok(Arc::new(Self {
             raw,
             device,
-            pool: Mutex::new(Pool {
-                available: Vec::with_capacity(SLOTS),
-                allocated: 0,
-            }),
-            ready: Condvar::new(),
+            available: ArrayQueue::new(SLOTS),
+            allocated: AtomicUsize::new(0),
+            ready: Wake::default(),
+            acquire_parks: AtomicUsize::new(0),
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
@@ -72,31 +122,34 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
-        let mut pool = self.pool.lock();
         let mut slot = loop {
-            if let Some(slot) = pool.available.pop() {
+            let seen = self.ready.snapshot();
+            if let Some(slot) = self.available.pop() {
                 self.reused.fetch_add(1, Ordering::Relaxed);
                 break slot;
             }
-            if pool.allocated < SLOTS {
-                pool.allocated += 1;
-                drop(pool);
+            if self
+                .allocated
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < SLOTS).then_some(n + 1)
+                })
+                .is_ok()
+            {
                 match Slot::new(self) {
                     Ok(slot) => {
                         self.created.fetch_add(1, Ordering::Relaxed);
-                        pool = self.pool.lock();
                         break slot;
                     }
                     Err(e) => {
-                        self.pool.lock().allocated -= 1;
-                        self.ready.notify_one();
+                        self.allocated.fetch_sub(1, Ordering::AcqRel);
+                        self.ready.notify();
                         return Err(e);
                     }
                 }
             }
-            self.ready.wait(&mut pool);
+            self.acquire_parks.fetch_add(1, Ordering::Relaxed);
+            self.ready.wait(seen);
         };
-        drop(pool);
         // Only completed submissions return slots; abandoned uncommitted ones
         // are destroyed instead. No reset races outstanding GPU commands.
         slot.reset();
@@ -111,11 +164,9 @@ impl Queue {
                 slot: Some(slot),
                 callbacks: Vec::new(),
                 signals: Vec::new(),
-                error: None,
-                gpu_start: 0.0,
-                gpu_end: 0.0,
             }),
-            done: Condvar::new(),
+            feedback: OnceLock::new(),
+            done: Wake::default(),
         }))
     }
 }
@@ -123,9 +174,10 @@ impl Queue {
 impl Drop for Queue {
     fn drop(&mut self) {
         eprintln!(
-            "[metal4] native_buffers_created={} native_buffers_reused={}",
+            "[metal4] native_buffers_created={} native_buffers_reused={} acquire_parks={}",
             self.created.load(Ordering::Relaxed),
-            self.reused.load(Ordering::Relaxed)
+            self.reused.load(Ordering::Relaxed),
+            self.acquire_parks.load(Ordering::Relaxed)
         );
     }
 }
@@ -235,9 +287,6 @@ struct State {
     slot: Option<Slot>,
     callbacks: Vec<Callback>,
     signals: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
-    error: Option<String>,
-    gpu_start: f64,
-    gpu_end: f64,
 }
 
 pub(crate) struct Submission {
@@ -246,7 +295,8 @@ pub(crate) struct Submission {
     pub queue: Arc<Queue>,
     status: AtomicUsize,
     state: Mutex<State>,
-    done: Condvar,
+    feedback: OnceLock<Feedback>,
+    done: Wake,
 }
 unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
@@ -287,13 +337,13 @@ impl Submission {
         }
     }
     pub fn gpu_start_time(&self) -> f64 {
-        self.state.lock().gpu_start
+        self.feedback.get().map_or(0.0, |f| f.start)
     }
     pub fn gpu_end_time(&self) -> f64 {
-        self.state.lock().gpu_end
+        self.feedback.get().map_or(0.0, |f| f.end)
     }
     pub fn error(&self) -> Option<String> {
-        self.state.lock().error.clone()
+        self.feedback.get().and_then(|f| f.error.clone())
     }
     pub fn device(&self) -> &Device {
         &self.queue.device
@@ -312,8 +362,9 @@ impl Submission {
         }
     }
     pub fn on_completion(&self, f: impl Fn(&Feedback) + Send + Sync + 'static) {
+        let mut state = self.state.lock();
         assert!(self.status().0 < MTLCommandBufferStatus::Committed.0);
-        self.state.lock().callbacks.push(Box::new(f));
+        state.callbacks.push(Box::new(f));
     }
     pub fn signal(&self, event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
         let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }.unwrap();
@@ -324,10 +375,15 @@ impl Submission {
         if self.status().0 >= MTLCommandBufferStatus::Committed.0 {
             return;
         }
-        let slot = state.slot.as_ref().expect("uncommitted slot");
+        let slot = state.slot.take().expect("uncommitted slot");
         slot.residency.commit();
         slot.cb.endCommandBuffer();
         let options = MTL4CommitOptions::new();
+        let mut cb = NonNull::from(slot.cb.as_ref());
+        // Completion owns this payload exclusively. Its mutex is only needed
+        // because Metal's block is Fn, not FnOnce; the encoding thread never
+        // acquires it. In particular feedback never locks recording state.
+        let retired = Mutex::new(Some((slot, std::mem::take(&mut state.callbacks))));
         let this = Arc::clone(self);
         let block = RcBlock::new(
             move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
@@ -339,14 +395,14 @@ impl Submission {
                     start: feedback.GPUStartTime(),
                     end: feedback.GPUEndTime(),
                 };
-                this.finish(info);
+                let (slot, callbacks) = retired.lock().take().expect("completion once");
+                this.finish(info, slot, callbacks);
             },
         );
-        let mut cb = NonNull::from(slot.cb.as_ref());
         self.status
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         // SAFETY: the array has one live command buffer; Metal retains the
-        // feedback block. `state` retains the slot until feedback arrives.
+        // feedback block. the feedback payload retains the slot until feedback arrives.
         unsafe {
             options.addFeedbackHandler(RcBlock::as_ptr(&block));
             self.queue.raw.signalEvent_value(
@@ -363,45 +419,37 @@ impl Submission {
                 .signalEvent_value(ProtocolObject::from_ref(&*event), value);
         }
     }
-    fn finish(&self, feedback: Feedback) {
-        let (slot, callbacks) = {
-            let mut state = self.state.lock();
-            state.error.clone_from(&feedback.error);
-            state.gpu_start = feedback.start;
-            state.gpu_end = feedback.end;
-            (
-                state.slot.take().expect("completion once"),
-                std::mem::take(&mut state.callbacks),
-            )
-        };
-        // Match native Metal 3 completion callbacks: a callback observes
-        // Completed/Error and may wait on this submission without deadlocking.
-        // GPU writes and error/timing data are already final. Pool-clock
-        // callbacks may lag this publication (as on Metal 3), which only
-        // delays reuse; the native slot stays held until all callbacks return.
+    fn finish(&self, feedback: Feedback, slot: Slot, callbacks: Vec<Callback>) {
+        let failed = feedback.error.is_some();
+        assert!(self.feedback.set(feedback).is_ok(), "completion once");
         self.status.store(
-            if feedback.error.is_some() {
+            if failed {
                 MTLCommandBufferStatus::Error.0
             } else {
                 MTLCommandBufferStatus::Completed.0
             },
             Ordering::Release,
         );
-        // Pair notification with the wait mutex to avoid a lost wakeup.
-        {
-            let _state = self.state.lock();
-            self.done.notify_all();
-        }
+        self.done.notify();
+        // Preserve callback-before-slot-reuse semantics, including error latches
+        // and epoch retirement. Old markers read the immutable feedback above.
+        let feedback = self.feedback.get().expect("published above");
         for callback in callbacks {
-            callback(&feedback);
+            callback(feedback);
         }
-        self.queue.pool.lock().available.push(slot);
-        self.queue.ready.notify_one();
+        assert!(
+            self.queue.available.push(slot).is_ok(),
+            "one return per native slot"
+        );
+        self.queue.ready.notify();
     }
     pub fn wait(&self) {
-        let mut state = self.state.lock();
-        while self.status().0 < MTLCommandBufferStatus::Completed.0 {
-            self.done.wait(&mut state);
+        loop {
+            let seen = self.done.snapshot();
+            if self.status().0 >= MTLCommandBufferStatus::Completed.0 {
+                return;
+            }
+            self.done.wait(seen);
         }
     }
 }
@@ -409,8 +457,8 @@ impl Drop for Submission {
     fn drop(&mut self) {
         if self.state.get_mut().slot.take().is_some() {
             // An abandoned, never submitted recording is not reset/reused.
-            self.queue.pool.lock().allocated -= 1;
-            self.queue.ready.notify_one();
+            self.queue.allocated.fetch_sub(1, Ordering::AcqRel);
+            self.queue.ready.notify();
         }
     }
 }
@@ -522,6 +570,74 @@ mod tests {
     use super::*;
     use objc2_foundation::NSString;
     #[test]
+    fn completion_wake_covers_notify_before_and_during_registration() {
+        use std::time::{Duration, Instant};
+        let wake = Arc::new(Wake::default());
+        let seen = wake.snapshot();
+        wake.notify();
+        assert_eq!(
+            wake.park(seen, Some(Instant::now() + Duration::from_secs(1))),
+            parking_lot_core::ParkResult::Invalid,
+            "notification before registration was lost"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let worker_wake = wake.clone();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                let seen = worker_wake.snapshot();
+                tx.send(()).unwrap();
+                let result = worker_wake.park(seen, Some(Instant::now() + Duration::from_secs(1)));
+                assert_ne!(
+                    result,
+                    parking_lot_core::ParkResult::TimedOut,
+                    "lost completion wake"
+                );
+            }
+        });
+        for _ in 0..1000 {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            wake.notify();
+        }
+        worker.join().unwrap();
+        assert_eq!(wake.waiters.load(Ordering::SeqCst), 0);
+        println!("MTL4_WAKE transitions=1001 lost_wakes=0 waiters=0");
+    }
+
+    #[test]
+    fn completion_does_not_take_the_recording_lock() {
+        let _pool = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let event = device.as_ref().newSharedEvent().unwrap();
+        queue
+            .raw
+            .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        let submission = queue.acquire().unwrap();
+        let encoder = submission.encoder();
+        encoder.raw.endEncoding();
+        submission.commit();
+        let recording = submission.state.lock();
+        event.setSignaledValue(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while submission.status().0 < MTLCommandBufferStatus::Completed.0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let completed_without_lock = submission.status() == MTLCommandBufferStatus::Completed;
+        drop(recording); // release even on mutation failure; never strand feedback
+        submission.wait();
+        assert!(
+            completed_without_lock,
+            "completion waited for the encoding-side mutex"
+        );
+        println!("MTL4_COMPLETION recording_lock_held=true completion_progress=true");
+    }
+
+    #[test]
     fn native_reuse_preserves_old_submission_markers_and_constant_bytes() {
         let _pool = crate::AutoreleaseScope::new();
         let device = Device::system_default().expect("Metal device");
@@ -603,6 +719,143 @@ mod tests {
         println!("MTL4_RUST_REUSE submissions=100 created={} reused={} old_markers=100 words_checked=6400",
             queue.created.load(Ordering::Relaxed), queue.reused.load(Ordering::Relaxed));
     }
+    /// Exercise the completion-prefix premise with real pending earlier work.
+    /// Report GPU overlap separately: queue signals can serialize this workload,
+    /// so a lack of inversion is not evidence about an untested no-signal path.
+    #[test]
+    fn later_feedback_observes_the_earlier_submission_retired() {
+        let _scope = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let library = device.as_ref().newLibraryWithSource_options_error(&NSString::from_str(
+            "#include <metal_stdlib>\nusing namespace metal; kernel void step(device float* x [[buffer(0)]]) { x[0] = sin(x[0]) + 0.01f; }"), None).unwrap();
+        let function = library
+            .newFunctionWithName(&NSString::from_str("step"))
+            .unwrap();
+        let pipeline = device
+            .as_ref()
+            .newComputePipelineStateWithFunction_error(&function)
+            .unwrap();
+        let mut pending_at_later_commit = 0;
+        let mut gpu_inversions = 0;
+        for _ in 0..8 {
+            let heavy = queue.acquire().unwrap();
+            let tiny = queue.acquire().unwrap();
+            for (submission, count) in [(&heavy, 4000), (&tiny, 1)] {
+                let buffer = device
+                    .as_ref()
+                    .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+                    .unwrap();
+                unsafe {
+                    *buffer.contents().as_ptr().cast::<f32>() = 0.;
+                }
+                let encoder = submission.encoder();
+                encoder.pipeline(&pipeline);
+                encoder.buffer(0, Some(&buffer), 0);
+                for _ in 0..count {
+                    encoder.raw.dispatchThreads_threadsPerThreadgroup(
+                        MTLSize {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    encoder
+                        .raw
+                        .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                            MTLStages::Dispatch,
+                            MTLStages::Dispatch,
+                            MTL4VisibilityOptions::Device,
+                        );
+                }
+                encoder.raw.endEncoding();
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let earlier = heavy.clone();
+            tiny.on_completion(move |_| {
+                tx.send(earlier.status()).unwrap();
+            });
+            heavy.commit();
+            pending_at_later_commit +=
+                usize::from(heavy.status() != MTLCommandBufferStatus::Completed);
+            tiny.commit();
+            tiny.wait();
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+                MTLCommandBufferStatus::Completed,
+                "later feedback preceded earlier retirement"
+            );
+            heavy.wait();
+            gpu_inversions += usize::from(tiny.gpu_end_time() < heavy.gpu_end_time());
+        }
+        assert!(
+            pending_at_later_commit > 0,
+            "earlier work was already retired: vacuous test"
+        );
+        println!("MTL4_RETIRE_PREFIX trials=8 earlier_pending_at_later_commit={} gpu_end_inversions={} later_feedback_saw_earlier_completed=8",
+            pending_at_later_commit, gpu_inversions);
+    }
+
+    #[test]
+    fn full_native_pool_parks_and_feedback_releases_the_waiter() {
+        let _scope = crate::AutoreleaseScope::new();
+        let device = Device::system_default().expect("Metal device");
+        if !device.as_ref().supportsFamily(MTLGPUFamily::Metal4) {
+            return;
+        }
+        let queue = Queue::new(device.clone()).unwrap();
+        let event = device.as_ref().newSharedEvent().unwrap();
+        queue
+            .raw
+            .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        let mut submissions = Vec::new();
+        for _ in 0..SLOTS {
+            let submission = queue.acquire().unwrap();
+            submission.encoder().raw.endEncoding();
+            submission.commit();
+            submissions.push(submission);
+        }
+        assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
+        let worker_queue = queue.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _scope = crate::AutoreleaseScope::new();
+            let slot = worker_queue.acquire().unwrap();
+            tx.send(slot).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while queue.acquire_parks.load(Ordering::Relaxed) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let parked = queue.acquire_parks.load(Ordering::Relaxed) > 0;
+        let blocked = matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+        // Unblock even on a failing assertion: never strand queued GPU work.
+        event.setSignaledValue(1);
+        let slot = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        for submission in submissions {
+            submission.wait();
+        }
+        assert!(
+            parked && blocked,
+            "the ninth acquisition must encounter the full pool"
+        );
+        assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
+        drop(slot);
+        println!("MTL4_FULL_POOL slots={} ninth_acquire_blocked=true feedback_unblocked=true acquire_parks={}",
+            SLOTS, queue.acquire_parks.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn native_pool_backpressure_and_upload_page_rollover() {
         let _pool = crate::AutoreleaseScope::new();

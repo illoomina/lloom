@@ -389,19 +389,15 @@ pub struct Decoded {
 /// what every request did before #677.
 /// The token rings a serving process keeps across requests, one per EOS set.
 ///
-/// A [`Ring`] is a wrapping history of `RING_HISTORY_SLOTS` plus the consumer
-/// slack (32 MiB by default, ~2 050 zero-filled segments): building one is
-/// ~35 ms of `Tensor::zeros` and a `synchronize` (issue #702, §11.5y's TTFT
-/// finding), and its capacity is its live window, not the generation, so one
-/// ring serves every run — mapped, which is also the fast drain (a history
-/// sized past `RING_HISTORY_SLOTS` is not CPU-mapped and snapshots on every
-/// drain). What a ring cannot change after construction is its EOS set
-/// (uploaded once, read by the `eos_index` kernel), so the pool is keyed on
-/// it; a serving binary holds two — the checkpoint's EOS ids and the
-/// never-EOS set its throughput cells use.
+/// This pool calls `Ring::new` with `RING_HISTORY_SLOTS` (4,092 dense slots,
+/// 16,368 bytes), not `Ring::with_geometry` with its configurable consumer
+/// slack. Capacity bounds the live window, not the generation: the same mapped
+/// ring wraps across long runs. Larger segmented rings can remain mapped too;
+/// mapping is a per-segment property, not a total-capacity threshold.
 ///
-/// Built on first use, or ahead of it by [`RingPool::prepare`] at load, so no
-/// request pays the construction inside its own latency.
+/// A ring's EOS set and read mechanism are fixed at construction, so the pool
+/// keys both. Built on first use, or ahead of it by [`RingPool::prepare`] at
+/// load, it is reused across requests rather than zero-filled per request.
 #[derive(Default)]
 pub struct RingPool {
     rings: Vec<(Vec<u32>, EosRead, Ring)>,
@@ -841,13 +837,21 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                                 .load(std::sync::atomic::Ordering::Acquire)
                                             {
                                                 buf.clear();
-                                                if let Ok(n) = reader.read_new(&mut buf) {
-                                                    if n > 0 && !hook(&buf)? {
+                                                let n =
+                                                    reader.read_new(&mut buf).map_err(|lap| {
                                                         stop_flag.store(
                                                             true,
                                                             std::sync::atomic::Ordering::Release,
                                                         );
-                                                    }
+                                                        lloom_tensor::Error::msg(format!(
+                                                            "ring reader final drain: {lap}"
+                                                        ))
+                                                    })?;
+                                                if n > 0 && !hook(&buf)? {
+                                                    stop_flag.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
                                                 }
                                                 return Ok(());
                                             }
@@ -864,6 +868,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                             }
                                         }
                                         Err(lap) => {
+                                            stop_flag
+                                                .store(true, std::sync::atomic::Ordering::Release);
                                             lloom_tensor::bail!("ring reader: {lap}");
                                         }
                                     }

@@ -963,6 +963,13 @@ impl Commands {
     /// subscribers added later would miss the command buffers already in
     /// flight, and a buffer parked against one of those epochs would never be
     /// swept in.
+    ///
+    /// Runs on Metal's completion thread. Per CONTRIBUTING §3.3a, a callback
+    /// must not acquire a lock the encoding thread takes or submit work that
+    /// waits for that thread. In particular, native-slot backpressure can hold
+    /// the Commands state lock while feedback is responsible for returning a
+    /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
+    /// on the host, as the buffer pools do.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         self.on_complete.lock().push(Arc::new(f));
     }

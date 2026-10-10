@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use lloom_tensor::{test_utils, Device, Tensor};
 use lloom::nn::{LayerNorm, Module};
+use lloom_tensor::{test_utils, Device, Tensor};
 
 #[test]
 fn layer_norm() -> Result<()> {

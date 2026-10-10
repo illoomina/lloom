@@ -1685,7 +1685,10 @@ fn quant_f16_arm_matches_f32_arm_q6k() -> Result<()> {
 #[test]
 fn m5_native_int_arm_is_declared_but_unimplemented() {
     use lloom_tensor::kernels::GemvTriple;
-    assert!(!GemvTriple::I8I32I8.is_implemented(), "M5 int arm is declared but unimplemented");
+    assert!(
+        !GemvTriple::I8I32I8.is_implemented(),
+        "M5 int arm is declared but unimplemented"
+    );
     assert!(GemvTriple::F32F32F32.is_implemented());
     assert!(GemvTriple::F16F32F16.is_implemented());
 }

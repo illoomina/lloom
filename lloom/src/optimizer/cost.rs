@@ -248,7 +248,12 @@ pub fn unfuse_in(graph: &Graph, fragment: &str, catalogue: &[super::fragments::F
             .map(|f| f.class())
             .unwrap_or(super::numeric::NumericClass::BitExact)
     };
-    let semantics_of = |name: &str| catalogue.iter().find(|f| f.name == name).map(|f| f.semantics);
+    let semantics_of = |name: &str| {
+        catalogue
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.semantics)
+    };
     for id in order(graph) {
         let n = graph.node(id);
         let inputs: Vec<NodeId> = n
@@ -270,7 +275,15 @@ pub fn unfuse_in(graph: &Graph, fragment: &str, catalogue: &[super::fragments::F
                     if n.name.is_empty() {
                         out.gemv_on(n.core, w, norm)
                     } else {
-                        out.fused_on(n.core, &n.name, class_of(&n.name), w, norm, operand, n.scalar)
+                        out.fused_on(
+                            n.core,
+                            &n.name,
+                            class_of(&n.name),
+                            w,
+                            norm,
+                            operand,
+                            n.scalar,
+                        )
                     }
                 } else {
                     // The epilogue back to its pair; a prologue stays on the
@@ -353,11 +366,7 @@ pub fn marginals_in(
     fragments
         .iter()
         .map(|&f| {
-            let sites = derived
-                .nodes()
-                .iter()
-                .filter(|n| n.carries(f))
-                .count();
+            let sites = derived.nodes().iter().filter(|n| n.carries(f)).count();
             if sites == 0 {
                 return Marginal {
                     fragment: f.to_string(),
@@ -371,9 +380,7 @@ pub fn marginals_in(
             let between = full
                 .barriers
                 .iter()
-                .find(|b| {
-                    derived.node(b.after).carries(f)
-                })
+                .find(|b| derived.node(b.after).carries(f))
                 .map(|b| {
                     (
                         family(derived.node(b.before)).unwrap_or_default(),

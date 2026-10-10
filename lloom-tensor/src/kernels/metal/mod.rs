@@ -5,12 +5,13 @@
 /// rather than acquire them from a `metal::*`.
 pub mod admission;
 pub mod arena;
-/// The native-arm registry (§15.2a). Not in the glob re-export below:
-/// `Feature` and `Features` are general names, and `cpu::arms` has its own.
-pub mod arms;
 pub mod arena_cursor;
 #[cfg(test)]
 mod arena_gpu_tests;
+/// The native-arm registry (§15.2a). Not in the glob re-export below:
+/// `Feature` and `Features` are general names, and `cpu::arms` has its own.
+pub mod arms;
+pub mod backing;
 pub mod buffer;
 pub mod buffer_pool;
 /// A stateful model-based fuzzer over the pool's public surface (#494).
@@ -39,6 +40,12 @@ pub mod completion;
 /// needs no GPU.
 #[cfg(test)]
 mod completion_gpu_tests;
+/// Component digests: one fingerprint per mechanism per variant (#105).
+#[cfg(test)]
+mod component_digest_tests;
+pub mod compute_pipeline;
+#[cfg(test)]
+mod constants_pool_tests;
 /// Contended acquisitions of the submission locks, counted per lock (§6.4d).
 ///
 /// Not in the glob re-export: `Side` and `Access` are general names.
@@ -47,12 +54,6 @@ pub mod contention;
 /// to take, and only that (§6.4d).
 #[cfg(test)]
 mod contention_gpu_tests;
-/// Component digests: one fingerprint per mechanism per variant (#105).
-#[cfg(test)]
-mod component_digest_tests;
-pub mod compute_pipeline;
-#[cfg(test)]
-mod constants_pool_tests;
 /// Where the command buffer is cut: the partition arithmetic (#420 stage 3).
 ///
 /// Pure functions, no device -- `scratch_tests.rs`'s split between the
@@ -77,22 +78,23 @@ mod flash_decoding_tests;
 /// unconditionally and compiles to nothing when the feature is off --
 /// `run_telemetry`'s shape, for its reasons.
 pub mod hazard_audit;
-pub mod backing;
-pub mod heap;
-pub mod ledger;
 #[cfg(test)]
 mod hazard_audit_tests;
+pub mod heap;
 pub mod icb;
+#[cfg(test)]
+mod icb_executor_tests;
+#[cfg(test)]
+mod icb_tests;
 pub mod in_flight;
 /// Unretained command buffers executed: what the queue's hold takes and when it
 /// lets go.
 #[cfg(test)]
 mod in_flight_gpu_tests;
-#[cfg(test)]
-mod icb_executor_tests;
-#[cfg(test)]
-mod icb_tests;
 pub mod io_queue;
+pub mod ledger;
+mod metal4;
+mod raw_encoder;
 /// The paged KV pool: allocation, free list, refcounts and the page table
 /// (`DESIGN.md` §10.3c–§10.3g, issue #148). Pure functions of a configuration
 /// and an allocation history — no device, no buffer, no dispatch — which is the
@@ -101,6 +103,7 @@ pub use crate::kv_pages;
 pub use crate::retire::{self, Completed, Epoch, Retire, Tick};
 #[cfg(test)]
 mod kv_pages_tests;
+pub mod late_bind;
 pub mod library;
 /// ASan shadow-memory poisoning for allocator invariants (issue #475). Every
 /// entry point is inert without the `asan-poison` feature, so the module is
@@ -138,11 +141,13 @@ pub mod session_region;
 mod session_region_tests;
 pub mod staging;
 pub mod trace;
-pub mod late_bind;
 pub mod upload_shadow;
 
 pub use arena::*;
 pub use arena_cursor::*;
+pub use backing::{
+    Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
+};
 pub use buffer::*;
 pub use buffer_pool::*;
 pub use command_buffer::*;
@@ -153,9 +158,6 @@ pub use encoder::*;
 pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
-pub use backing::{
-    Allocation, Backing, BackingStats, Backings, Commit, DeviceBuffer, Fallback, Heap, Mapped,
-};
 pub use heap::*;
 pub use in_flight::{Held, HoldCounts, InFlightHold};
 pub use kv_pages::*;

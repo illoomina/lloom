@@ -14,8 +14,8 @@ use lloom::models::metavoice::{adapters, gpt, tokenizers, transformer};
 use lloom::models::quantized_metavoice::transformer as qtransformer;
 
 use candle::{DType, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
 use hf_hub::api::sync::Api;
+use lloom::nn::VarBuilder;
 use rand::{distr::Distribution, SeedableRng};
 
 pub const ENCODEC_NTOKENS: u32 = 1024;
@@ -148,8 +148,7 @@ fn main() -> Result<()> {
             Some(w) => std::path::PathBuf::from(w),
             None => repo.get("first_stage_q4k.gguf")?,
         };
-        let vb =
-            lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         let first_stage_model = qtransformer::Model::new(&first_stage_config, vb)?;
         Transformer::Quantized(first_stage_model)
     } else {

@@ -296,10 +296,7 @@ mod tests {
         }
         assert_eq!(
             c.hits,
-            vec![
-                (1, HookKind::LayerOutput),
-                (3, HookKind::LayerOutput)
-            ]
+            vec![(1, HookKind::LayerOutput), (3, HookKind::LayerOutput)]
         );
     }
 }

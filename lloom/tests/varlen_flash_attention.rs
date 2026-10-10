@@ -5,9 +5,9 @@
 //!
 //! Ported from <https://github.com/huggingface/candle/pull/3250>.
 
-use lloom_tensor::Result;
 use lloom::nn::attention::flash_attn_varlen_cpu;
 use lloom::nn::varlen_attention::flash_attn_varlen_unfused;
+use lloom_tensor::Result;
 
 #[cfg(test)]
 mod tests {

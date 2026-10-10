@@ -53,6 +53,7 @@ pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
+mod command_policy;
 pub mod conv;
 mod convert;
 pub mod cpu;

@@ -152,7 +152,9 @@ fn mixed_gemv_with_a_grouped_norm_matches_the_reference() -> Result<()> {
         let group = k / groups;
         let w = weight(n_out, k, 1.3, &gpu)?;
         let x = input(1, k, 0.4, &gpu)?;
-        let gamma: Vec<f32> = (0..k).map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin()).collect();
+        let gamma: Vec<f32> = (0..k)
+            .map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin())
+            .collect();
         let g = Tensor::from_vec(gamma.clone(), k, &gpu)?;
         let wv: Vec<f32> = w.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
         let xv: Vec<f32> = x.flatten_all()?.to_vec1()?;
@@ -187,7 +189,10 @@ fn mixed_gemv_with_a_grouped_norm_matches_the_reference() -> Result<()> {
             .to_vec1()?;
         assert_eq!(got.len(), n_out + if scales { groups } else { 0 });
         // `f64::max` drops a NaN, so a non-finite output would read as no error.
-        assert!(got.iter().all(|v| v.is_finite()), "gemv_mixed_gnorm [{n_out}, {k}]: a non-finite output");
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "gemv_mixed_gnorm [{n_out}, {k}]: a non-finite output"
+        );
         let mag = want.iter().fold(0f64, |m, v| m.max(v.abs()));
         let err = got[..n_out]
             .iter()
@@ -199,20 +204,36 @@ fn mixed_gemv_with_a_grouped_norm_matches_the_reference() -> Result<()> {
         if scales {
             for gi in 0..groups {
                 let e = (got[n_out + gi] as f64 - want_s[gi]).abs() / want_s[gi];
-                assert!(e < 1e-5, "scale {gi}: {} against {}", got[n_out + gi], want_s[gi]);
+                assert!(
+                    e < 1e-5,
+                    "scale {gi}: {} against {}",
+                    got[n_out + gi],
+                    want_s[gi]
+                );
             }
         }
     }
     use lloom_tensor::kernels::gemv_mixed_gnorm_serves as serves;
     assert!(serves(320, 10240, 4) && serves(4, 10240, 4));
-    assert!(!serves(10240, 320, 4), "the up projection takes the bm8 tile");
+    assert!(
+        !serves(10240, 320, 4),
+        "the up projection takes the bm8 tile"
+    );
     assert!(!serves(320, 10240, 3), "10240 does not split into 3");
     assert!(!serves(320, 10240, 9), "more groups than the scratch holds");
     let qm = QMatMul::TensorF16(weight(10240, 320, 0.2, &gpu)?);
     let g = Tensor::ones(320, DType::F32, &gpu)?;
     assert!(
-        qm.gemv_mixed_gnorm(&input(1, 320, 0.1, &gpu)?, &g, eps, 4, MixedEpilogue::None, 1.0, false)
-            .is_none(),
+        qm.gemv_mixed_gnorm(
+            &input(1, 320, 0.1, &gpu)?,
+            &g,
+            eps,
+            4,
+            MixedEpilogue::None,
+            1.0,
+            false
+        )
+        .is_none(),
         "declined where the tile is not instantiated"
     );
     Ok(())

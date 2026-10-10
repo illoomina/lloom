@@ -7,8 +7,8 @@ use crate::kernels::metal::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLResourceUsage, MTLSize,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLComputeCommandEncoder,
+    MTLResourceUsage, MTLSize,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -569,9 +569,9 @@ impl EncoderState {
 
 #[derive(Clone)]
 pub struct ComputeCommandEncoder {
-    pub(crate) raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    pub(crate) raw: super::raw_encoder::Compute,
     /// Retained so we can register completion handlers on this CB.
-    pub(crate) command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    pub(crate) command_buffer: super::CommandBuffer,
     /// Per-encoder-session fence. Updated at end_encoding.
     pub(crate) fence: Arc<Fence>,
     /// Hazard tracking state. Arc shared between the canonical encoder in EntryState
@@ -662,6 +662,22 @@ impl ComputeCommandEncoder {
     pub fn with_executor(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
+        executor: Arc<ExecutorSlot>,
+    ) -> ComputeCommandEncoder {
+        Self::with_backend(
+            super::raw_encoder::Compute::Metal3(raw),
+            super::CommandBuffer::new(command_buffer),
+            fence,
+            prev_ce_outputs,
+            executor,
+        )
+    }
+
+    pub(crate) fn with_backend(
+        raw: super::raw_encoder::Compute,
+        command_buffer: super::CommandBuffer,
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
         executor: Arc<ExecutorSlot>,
@@ -1233,7 +1249,7 @@ impl ComputeCommandEncoder {
             return false;
         }
         let index = self.capture_buffer_index(usize::MAX);
-        let device = crate::kernels::metal::Device::new(self.command_buffer.device());
+        let device = self.command_buffer.device();
         let Ok(buffer) =
             device.new_buffer_with_data(bytes, len_bytes, crate::kernels::RESOURCE_OPTIONS)
         else {
@@ -1370,13 +1386,11 @@ impl ComputeCommandEncoder {
     }
 
     pub fn end_encoding(&self) {
-        use objc2_metal::MTLCommandEncoder as _;
         self.raw.updateFence(self.fence.raw());
         self.raw.endEncoding();
     }
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
-        use MTLComputeCommandEncoder as _;
         trace::record_pipeline(
             self.trace.as_deref(),
             pipeline.name().unwrap_or("<unnamed>"),
@@ -1416,7 +1430,7 @@ impl ComputeCommandEncoder {
 }
 
 pub struct BlitCommandEncoder {
-    pub(crate) raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
+    pub(crate) raw: super::raw_encoder::Blit,
     /// Per-encoder fence, updated at end_encoding.
     fence: Arc<Fence>,
     /// Shared global cross-encoder output map.
@@ -1434,6 +1448,17 @@ impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
 impl BlitCommandEncoder {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
+        fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
+    ) -> BlitCommandEncoder {
+        Self::with_backend(
+            super::raw_encoder::Blit::Metal3(raw),
+            fence,
+            prev_ce_outputs,
+        )
+    }
+    pub(crate) fn with_backend(
+        raw: super::raw_encoder::Blit,
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
     ) -> BlitCommandEncoder {
@@ -1456,8 +1481,6 @@ impl BlitCommandEncoder {
     }
 
     pub fn end_encoding(&self) {
-        use objc2_metal::MTLCommandEncoder as _;
-
         // Signal this blit encoder's fence after all blit commands complete
         self.update_fence(&self.fence);
         self.raw.endEncoding();
@@ -1473,7 +1496,6 @@ impl BlitCommandEncoder {
     }
 
     pub fn set_label(&self, label: &str) {
-        use objc2_metal::MTLCommandEncoder as _;
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 
@@ -1492,8 +1514,6 @@ impl BlitCommandEncoder {
     /// two buffers that often share a writer, so the dedup avoids emitting the
     /// same wait twice on the common path.
     fn wait_for_last_writers(&self, ptrs: &[usize]) {
-        use objc2_metal::MTLBlitCommandEncoder as _;
-
         let fences: Vec<Arc<Fence>> = {
             // A read of the ordering map (blit-after-blit); see `PrevCeOutputs`.
             let map = self.prev_ce_outputs.read(Side::Host);
@@ -1538,6 +1558,11 @@ impl BlitCommandEncoder {
         dst_offset: usize,
         size: usize,
     ) {
+        // Empty tensor copies are no-ops, not legal zero-byte Metal blits.
+        // No byte is read or written, so there is no hazard to register.
+        if size == 0 {
+            return;
+        }
         let src_ptr = src_buffer.raw_ptr() as usize;
         let dst_ptr = dst_buffer.raw_ptr() as usize;
         // A blit reads and writes buffers exactly as a dispatch binds them, so

@@ -1567,21 +1567,16 @@ impl Axes {
         }
     }
 
-    /// The math mode this build will compile its kernels under.
-    ///
-    /// Read from the same environment variable `candle-metal-kernels`'
-    /// `kernel.rs:203` reads, so the recorded value is the one that decides
-    /// codegen rather than a flag we happen to pass. Note the off arm is
-    /// `Relaxed`, **not** `Safe` — `MTLMathMode` has three values and neither
-    /// arm available today is the strict one (§2.3.5, §2.3.9).
+    /// The math mode this build will compile its kernels under: the
+    /// switch the kernel compiler reads (`backend.metal.compiler.fast_math`),
+    /// so the recorded value is the one that decides codegen. Note the off
+    /// arm is `Relaxed`, **not** `Safe` — `MTLMathMode` has three values and
+    /// neither arm available today is the strict one (§2.3.5, §2.3.9).
     fn math_mode_name() -> &'static str {
-        match std::env::var("CANDLE_METAL_ENABLE_FAST_MATH").as_deref() {
-            Ok("0") | Ok("false") | Ok("no") => "Relaxed+Precise",
-            // Metal's own default is `Fast`, so an unset variable is the fast
-            // arm rather than an unknown one: candle's `get_env_bool(.., true)`
-            // declines to depart from Metal, and the `else` branch is the
-            // departure (§2.3.9).
-            _ => "Fast",
+        if candle::tuning::tuning().metal.fast_math {
+            "Fast"
+        } else {
+            "Relaxed+Precise"
         }
     }
 

@@ -3,13 +3,28 @@ use super::{
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
+use objc2_metal::{MTL4CommandQueue, MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandBuffer {
-    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Metal3(Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal4(Arc<super::metal4::Submission>),
+}
+
+impl std::fmt::Debug for CommandBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandBuffer")
+            .field("metal4", &self.is_metal4())
+            .field("status", &self.status())
+            .finish()
+    }
 }
 
 unsafe impl Send for CommandBuffer {}
@@ -17,7 +32,36 @@ unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
     pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
-        Self { raw }
+        Self {
+            backend: Backend::Metal3(raw),
+        }
+    }
+
+    pub(crate) fn from_metal4(submission: Arc<super::metal4::Submission>) -> Self {
+        Self {
+            backend: Backend::Metal4(submission),
+        }
+    }
+    fn raw(&self) -> &Retained<ProtocolObject<dyn MTLCommandBuffer>> {
+        match &self.backend {
+            Backend::Metal3(raw) => raw,
+            Backend::Metal4(_) => unreachable!("Metal 3-only helper"),
+        }
+    }
+    pub(crate) fn is_metal4(&self) -> bool {
+        matches!(self.backend, Backend::Metal4(_))
+    }
+    pub(crate) fn identity(&self) -> usize {
+        match &self.backend {
+            Backend::Metal3(raw) => Retained::as_ptr(raw) as usize,
+            Backend::Metal4(s) => Arc::as_ptr(s) as usize,
+        }
+    }
+    pub(crate) fn device(&self) -> Device {
+        match &self.backend {
+            Backend::Metal3(raw) => Device::new(raw.device()),
+            Backend::Metal4(s) => s.device().clone(),
+        }
     }
 
     /// Create a compute command encoder with the provided per-encoder fence and global output map.
@@ -41,16 +85,25 @@ impl CommandBuffer {
         prev_ce_outputs: &PrevCeOutputs,
         executor: &Arc<ExecutorSlot>,
     ) -> ComputeCommandEncoder {
-        let raw = match crate::kernels::metal::profile::sample_encoder(&self.raw) {
+        if let Backend::Metal4(s) = &self.backend {
+            return ComputeCommandEncoder::with_backend(
+                super::raw_encoder::Compute::Metal4(s.encoder()),
+                self.clone(),
+                Arc::clone(fence),
+                Arc::clone(prev_ce_outputs),
+                Arc::clone(executor),
+            );
+        }
+        let raw = match crate::kernels::metal::profile::sample_encoder(self.raw()) {
             Some((samples, index)) => self.sampled_encoder(&samples, index),
             None => self
-                .as_ref()
+                .raw()
                 .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent),
         };
         raw.map(|raw| {
-            ComputeCommandEncoder::with_executor(
-                raw,
-                self.raw.clone(),
+            ComputeCommandEncoder::with_backend(
+                super::raw_encoder::Compute::Metal3(raw),
+                self.clone(),
                 Arc::clone(fence),
                 Arc::clone(prev_ce_outputs),
                 Arc::clone(executor),
@@ -77,31 +130,19 @@ impl CommandBuffer {
             a.setStartOfEncoderSampleIndex(index);
             a.setEndOfEncoderSampleIndex(index + 1);
         }
-        self.as_ref().computeCommandEncoderWithDescriptor(&d)
+        self.raw().computeCommandEncoderWithDescriptor(&d)
     }
 
     /// Create a compute command encoder with freshly allocated fence and a standalone output map.
     /// Used by tests and `EncoderProvider` implementations that don't share a global fence map.
     pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
-        let device = Device::new(self.raw.device());
-        let fence = Arc::new(Fence::new(&device));
-        let raw = match crate::kernels::metal::profile::sample_encoder(&self.raw) {
-            Some((samples, index)) => self.sampled_encoder(&samples, index),
-            None => self
-                .as_ref()
-                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent),
-        };
-        raw.map(|raw| {
-            ComputeCommandEncoder::new(
-                raw,
-                self.raw.clone(),
-                fence,
-                Arc::new(crate::kernels::metal::contention::Censused::new(
-                    parking_lot::RwLock::new(std::collections::HashMap::new()),
-                )),
-            )
-        })
-        .unwrap()
+        let fence = Arc::new(Fence::new(&self.device()));
+        self.compute_command_encoder(
+            &fence,
+            &Arc::new(crate::kernels::metal::contention::Censused::new(
+                parking_lot::RwLock::new(std::collections::HashMap::new()),
+            )),
+        )
     }
 
     pub fn blit_command_encoder(
@@ -109,40 +150,77 @@ impl CommandBuffer {
         fence: &Arc<Fence>,
         prev_ce_outputs: &PrevCeOutputs,
     ) -> BlitCommandEncoder {
-        self.as_ref()
+        if let Backend::Metal4(s) = &self.backend {
+            return BlitCommandEncoder::with_backend(
+                super::raw_encoder::Blit::Metal4(s.encoder()),
+                Arc::clone(fence),
+                Arc::clone(prev_ce_outputs),
+            );
+        }
+        self.raw()
             .blitCommandEncoder()
             .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)))
             .unwrap()
     }
 
     pub fn commit(&self) {
-        self.raw.commit()
+        match &self.backend {
+            Backend::Metal3(raw) => raw.commit(),
+            Backend::Metal4(s) => s.commit(),
+        }
     }
 
     pub fn enqueue(&self) {
-        self.raw.enqueue()
+        match &self.backend {
+            Backend::Metal3(raw) => raw.enqueue(),
+            Backend::Metal4(s) => s.enqueue(),
+        }
     }
 
     pub fn set_label(&self, label: &str) {
-        self.as_ref().setLabel(Some(&NSString::from_str(label)))
+        match &self.backend {
+            Backend::Metal3(raw) => raw.setLabel(Some(&NSString::from_str(label))),
+            Backend::Metal4(s) => s.set_label(label),
+        }
     }
 
     pub fn status(&self) -> MTLCommandBufferStatus {
-        self.raw.status()
+        match &self.backend {
+            Backend::Metal3(raw) => raw.status(),
+            Backend::Metal4(s) => s.status(),
+        }
     }
 
     pub fn error(&self) -> Option<Cow<'_, str>> {
-        unsafe {
-            self.raw.error().map(|error| {
-                let description = error.localizedDescription();
-                let c_str = core::ffi::CStr::from_ptr(description.UTF8String());
-                c_str.to_string_lossy()
-            })
+        match &self.backend {
+            Backend::Metal3(raw) => raw
+                .error()
+                .map(|e| Cow::Owned(e.localizedDescription().to_string())),
+            Backend::Metal4(s) => s.error().map(Cow::Owned),
+        }
+    }
+
+    /// GPU start timestamp, valid after completion, in the native uptime clock.
+    pub fn gpu_start_time(&self) -> f64 {
+        match &self.backend {
+            Backend::Metal3(raw) => raw.GPUStartTime(),
+            Backend::Metal4(s) => s.gpu_start_time(),
+        }
+    }
+
+    /// GPU end timestamp, valid after completion, in the native uptime clock.
+    pub fn gpu_end_time(&self) -> f64 {
+        match &self.backend {
+            Backend::Metal3(raw) => raw.GPUEndTime(),
+            Backend::Metal4(s) => s.gpu_end_time(),
         }
     }
 
     pub fn wait_until_completed(&self) {
-        self.raw.waitUntilCompleted();
+        match &self.backend {
+            Backend::Metal3(raw) => raw.waitUntilCompleted(),
+            Backend::Metal4(s) => s.wait(),
+        }
     }
 
     /// Encode a signal of `event` to `value` once every command encoded so far
@@ -153,7 +231,11 @@ impl CommandBuffer {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) {
-        self.raw
+        if let Backend::Metal4(s) = &self.backend {
+            s.signal(event, value);
+            return;
+        }
+        self.raw()
             .encodeSignalEvent_value(ProtocolObject::from_ref(event), value);
     }
 
@@ -164,7 +246,13 @@ impl CommandBuffer {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) {
-        self.raw
+        if let Backend::Metal4(s) = &self.backend {
+            s.queue
+                .raw
+                .waitForEvent_value(ProtocolObject::from_ref(event), value);
+            return;
+        }
+        self.raw()
             .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);
     }
 
@@ -173,31 +261,44 @@ impl CommandBuffer {
     /// Must be called before `commit`: Metal rejects handlers added to a buffer
     /// that has already been committed.
     pub fn on_completion<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        if let Backend::Metal4(s) = &self.backend {
+            s.on_completion(move |_| f());
+            return;
+        }
         use block2::RcBlock;
         use std::ptr::NonNull;
 
         let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| f());
         // SAFETY: `addCompletedHandler` copies the block, and `RcBlock` keeps it
         // alive until Metal releases it. The block captures only owned state.
-        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
     }
 
-    /// As [`Self::on_completion`], handing `f` the completed buffer so it can
-    /// read the final status.
+    /// As [`Self::on_completion`], handing `f` the final error, if any,
+    /// independently of the native command API.
     pub fn on_completion_of<F>(&self, f: F)
     where
-        F: Fn(&ProtocolObject<dyn MTLCommandBuffer>) + Send + Sync + 'static,
+        F: Fn(Option<String>) + Send + Sync + 'static,
     {
+        if let Backend::Metal4(s) = &self.backend {
+            s.on_completion(move |feedback| f(feedback.error.clone()));
+            return;
+        }
         use block2::RcBlock;
         use std::ptr::NonNull;
 
         let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal passes its handler the buffer that completed,
             // valid for the duration of the call.
-            f(unsafe { cb.as_ref() })
+            let cb = unsafe { cb.as_ref() };
+            f((cb.status() == MTLCommandBufferStatus::Error).then(|| {
+                cb.error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown error".into())
+            }))
         });
         // SAFETY: as `on_completion`.
-        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
+        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
     }
 
     /// Register a completion handler that records this buffer's GPU execution
@@ -222,6 +323,12 @@ impl CommandBuffer {
         // microseconds early (issue #702: the bias is toward "seam").
         let committed = profile::now_s();
         let step = profile::current_step();
+        if let Backend::Metal4(s) = &self.backend {
+            s.on_completion(move |feedback| {
+                profile::record_command_buffer(feedback.start, feedback.end, committed, step);
+            });
+            return;
+        }
         let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal hands the completed command buffer to its own
             // completion handler, so the pointer is valid and non-null for the
@@ -233,12 +340,6 @@ impl CommandBuffer {
             profile::record_command_buffer(start, end, committed, step);
             profile::resolve_encoder_samples(key, start, end);
         });
-        unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
-    }
-}
-
-impl AsRef<ProtocolObject<dyn MTLCommandBuffer>> for CommandBuffer {
-    fn as_ref(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
-        &self.raw
+        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
     }
 }

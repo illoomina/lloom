@@ -7,9 +7,9 @@ use lloom::models::bert::{BertModel, Config, HiddenAct, DTYPE};
 
 use anyhow::{Error as E, Result};
 use candle::Tensor;
-use lloom::nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]

@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use anyhow::bail;
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use lloom::nn::ops::softmax;
-use lloom::nn::VarBuilder;
+use clap::{ArgGroup, Parser, ValueEnum};
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use lloom::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};
 use lloom::models::debertav2::{DebertaV2SeqClassificationModel, Id2Label};
 use lloom::models::debertav2::{NERItem, TextClassificationItem};
-use clap::{ArgGroup, Parser, ValueEnum};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::ops::softmax;
+use lloom::nn::VarBuilder;
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 
 enum TaskType {
@@ -150,11 +150,7 @@ impl Args {
         tokenizer.with_padding(Some(PaddingParams::default()));
 
         let vb = if self.use_pth {
-            VarBuilder::from_pth(
-                &weights_filename,
-                lloom::models::debertav2::DTYPE,
-                &device,
-            )?
+            VarBuilder::from_pth(&weights_filename, lloom::models::debertav2::DTYPE, &device)?
         } else {
             unsafe {
                 VarBuilder::from_mmaped_safetensors(

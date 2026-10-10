@@ -350,7 +350,12 @@ fn classify(
 /// GEMV whose simdgroup walks K), the grouped norm (`hc_norm` into the mixed
 /// GEMV, any tile). A prologue that only imports the reduction removes no
 /// dispatch and is not this seam's.
-fn load_prologue<'c>(graph: &Graph, p: NodeId, c: NodeId, catalogue: &'c [Fragment]) -> Option<&'c Fragment> {
+fn load_prologue<'c>(
+    graph: &Graph,
+    p: NodeId,
+    c: NodeId,
+    catalogue: &'c [Fragment],
+) -> Option<&'c Fragment> {
     let (pn, cn) = (graph.node(p), graph.node(c));
     let semantics = match (&pn.op, pn.name.as_str()) {
         (Op::RmsNorm, _) if graph.gemv_walks_k(c) => Semantics::RmsNorm,
@@ -384,16 +389,13 @@ fn store_fragment(
     } else {
         OperandKind::None
     };
-    match catalogue
-        .iter()
-        .find(|f| {
-            f.side == Side::Store
-                && f.core == pn.core
-                && f.semantics == sem
-                && (f.operand == operand
-                    || (operand == OperandKind::RowIndexed && f.operand == OperandKind::Into))
-        })
-    {
+    match catalogue.iter().find(|f| {
+        f.side == Side::Store
+            && f.core == pn.core
+            && f.semantics == sem
+            && (f.operand == operand
+                || (operand == OperandKind::RowIndexed && f.operand == OperandKind::Into))
+    }) {
         Some(f) => Why::Refused {
             fragment: f.name.to_string(),
             reason: refused

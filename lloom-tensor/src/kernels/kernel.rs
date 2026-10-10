@@ -450,17 +450,10 @@ pub fn metal_compile_flags() -> Option<&'static str> {
 /// wants it — loudly, at load, rather than as a silent fallback to the
 /// baseline. That is the same two-level shape §12.2i's residual epilogue takes,
 /// and it is why this returns a bool rather than silently degrading.
-/// # Why this does not use `get_env_bool`
 ///
-/// That helper maps every unrecognised value to `false`
-/// (`utils.rs`: `"true"|"t"|"yes"|"y"|"1"` and `_ => false`), so
-/// `LLOOM_477_MERGED_UNIT=on` — a spelling a batch script will produce —
-/// **silently runs the baseline** while the script believes it ran the arm.
-/// That is #69's vacuous-run shape (§2.4) and is precisely what
-/// `LLOOM_434_METAL_CFLAGS` panics on an empty value to avoid. An A/B arm owes
-/// a loud failure on a value it does not understand; a general-purpose feature
-/// toggle does not, which is why the helper is right for its callers and wrong
-/// for this one.
+/// The switch takes the option tree's bool grammar, so a spelling it does not
+/// know is refused at the first read rather than running the baseline while
+/// the caller believes it ran the arm: an A/B arm owes a loud failure.
 pub fn merged_translation_unit() -> bool {
     crate::tuning::tuning().metal.merged_unit
 }

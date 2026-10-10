@@ -733,9 +733,10 @@ fn a_steady_state_round_allocates_nothing_on_the_paged_context() -> Result<()> {
             eos,
             &mut |_: &[u32]| Ok(()),
         )?;
-        // Allocations with a pending twin are the pool's deferred-release
-        // window — a size the round owns, released and not yet complete when
-        // asked for again — not a size the round lacked; they are subtracted.
+        // Subtract misses with an eligible pending reuse candidate, including
+        // oversized buckets. Keep the raw allocation counters in production:
+        // this gate isolates repeat-shape demand, not physical allocation-free
+        // execution while the host can outrun completion.
         Ok(out
             .stats
             .rounds

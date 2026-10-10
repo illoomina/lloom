@@ -72,6 +72,8 @@ pub trait Qwen3_5Model:
     fn embed_table(&self) -> &QMatMul;
     fn lm_head(&self) -> &QMatMul;
     fn capacity(&self) -> StateCapacity;
+    /// The bytes one turn checkpoint of a state takes (`Decoder::checkpoint_frame_bytes`).
+    fn checkpoint_frame_bytes(&self) -> usize;
     /// Retain `h_nextn` on every forward of `cache` (the drafter's seeding
     /// reads the prefill's rows).
     fn arm_nextn(cache: &mut Self::Cache);
@@ -88,6 +90,9 @@ impl<P: Profile, L: Layer + 'static> Qwen3_5Model
     }
     fn capacity(&self) -> StateCapacity {
         Decoder::capacity(self)
+    }
+    fn checkpoint_frame_bytes(&self) -> usize {
+        Decoder::checkpoint_frame_bytes(self)
     }
     fn arm_nextn(cache: &mut Self::Cache) {
         cache.set_want_nextn(true);
@@ -266,6 +271,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
             kv_tokens: opts.kv_capacity,
             prefill_tile: opts.prefill_tile,
         }),
+        checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
     };
     let t = Instant::now();
     let mut warnings = Vec::new();
@@ -371,6 +377,17 @@ where
         if mtp.is_some() {
             M::arm_nextn(&mut cache);
         }
+        // The turn checkpoints (`sequence-reuse-design.md` §2.3b): the ring
+        // a request re-rendering the previous turn restores from, sized
+        // from the recurrent layers' state and admitted beside the weights.
+        let (slots, frame) = (model.capacity().checkpoints, model.checkpoint_frame_bytes());
+        eprintln!(
+            "[checkpoint ring: {slots} × {:.1} MiB ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
+            frame as f64 / (1024.0 * 1024.0),
+            (slots * frame) as f64 / (1024.0 * 1024.0)
+        );
+        tier["turn_checkpoints"] =
+            json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
         let mut engine = Engine {
             model: Arc::new(model),
             mtp,
@@ -386,6 +403,7 @@ where
                 eos_ids,
                 seed_tokens,
                 think: Default::default(),
+                gen_prompts: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -417,6 +435,7 @@ where
             );
         }
         let _ = &mut engine;
+        engine.text.prime();
         Ok(Box::new(engine))
     }
 
@@ -585,6 +604,14 @@ where
     }
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         self.text.think_tags().cloned()
+    }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.text
+            .generation_prompt(kwarg, want)
+            .map(<[u32]>::to_vec)
+    }
+    fn template_renders(&self) -> u64 {
+        self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.mtp.is_some() {

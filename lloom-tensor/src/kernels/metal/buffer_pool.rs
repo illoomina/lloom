@@ -778,11 +778,11 @@ pub struct PoolCounters {
     /// found a later use, which is the steady state a fixed-shape workload
     /// reaches.
     pub evicted: u64,
-    /// Of `allocations`, those made while a buffer of the SAME size sat in
-    /// the pending list — released, its last reader's epoch not yet complete
-    /// (§6.3b's deferred release). The host ran ahead of the GPU; the size
-    /// was owned. The rest of `allocations` are sizes the pool had never
-    /// seen or had evicted.
+    /// Of `allocations`, misses with a released buffer pending that could
+    /// serve the request under the pool's size/oversize policy. Captured at
+    /// lookup, not after the driver allocation. This includes oversized
+    /// candidates; it is an observation of deferred reuse, not a claim that
+    /// the allocation was avoidable or that concurrent demand was unchanged.
     pub pending_twin_allocations: u64,
 
     /// Bytes callers actually asked for, summed over every served `acquire`.
@@ -1356,6 +1356,14 @@ pub trait BufferEvictionObserver: Send + Sync {
     /// looking at allocations that still exist. It runs on the hot path: no
     /// driver round-trip per call.
     fn on_evict(&self, buffers: &[Buffer]);
+}
+
+/// Attribution for one failed pool lookup, consumed when its allocation is
+/// adopted. Private fields prevent callers inventing a deferred-reuse result.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AllocationMiss {
+    requested: usize,
+    pending_reuse: bool,
 }
 
 pub struct PoolInner {
@@ -2121,28 +2129,42 @@ impl BufferPool {
     /// `None` means the caller should allocate; it does **not** mean the pool
     /// holds nothing of that size, only that nothing of that size is free.
     pub fn acquire(&self, size: usize) -> Option<BufferHandle> {
-        let (found, evicted) = {
+        self.acquire_for_allocation(size).ok()
+    }
+
+    /// The same lookup, retaining the miss's pending-reuse observation across
+    /// the driver allocation. Completion or another host can drain the pending
+    /// list before adoption; attribution belongs to the miss, not that later
+    /// state. Scan only on a miss; the warm hit keeps its existing lock path.
+    pub(crate) fn acquire_for_allocation(
+        &self,
+        size: usize,
+    ) -> Result<BufferHandle, AllocationMiss> {
+        let (found, miss, evicted) = {
             let mut state = self.inner.state.lock(Side::Host);
-            // A completion handler only advances the clock; what it made
-            // reusable enters the free list here, under the lock this call
-            // takes anyway (`DESIGN.md` §6.4e).
             let evicted = self.inner.drain_locked(&mut state);
-            // `pool_no_reuse`, an A/B instrument: every request misses, so no
-            // allocation is ever handed to a second tenant (the §2.3.8b "pool
-            // reuse disabled" arm, 0/30 there). Released buffers still park
-            // and drain into the free lists, where eviction bounds them.
-            let found = if pool_no_reuse() {
+            let reuse_disabled = pool_no_reuse();
+            let found = if reuse_disabled {
                 None
             } else {
                 state.take(size)
             };
-            (found, evicted)
+            let pending_reuse = found.is_none()
+                && !reuse_disabled
+                && state.pending.iter().any(|n| {
+                    n.size() >= size && bucket_admissible(size, n.size(), state.oversize_bound)
+                });
+            (
+                found,
+                AllocationMiss {
+                    requested: size,
+                    pending_reuse,
+                },
+                evicted,
+            )
         };
-        // Outside the lock, before `evicted` drops (`DESIGN.md` §6.3c).
         self.inner.notify_evicted(&evicted);
-        let (node, _) = found?;
-        // The node its last tenant's handles shared: no allocation.
-        Some(node.into_handle())
+        found.map(|(node, _)| node.into_handle()).ok_or(miss)
     }
 
     /// Whether allocating `size` fresh bytes would take this pool past
@@ -2251,6 +2273,16 @@ impl BufferPool {
         size: usize,
         reservation: Option<super::ledger::Reservation>,
     ) -> BufferHandle {
+        self.adopt_reserved_at_miss(buffer, size, reservation, None)
+    }
+
+    fn adopt_reserved_at_miss(
+        &self,
+        buffer: Buffer,
+        size: usize,
+        reservation: Option<super::ledger::Reservation>,
+        miss: Option<AllocationMiss>,
+    ) -> BufferHandle {
         debug_assert!(
             !buffer.is_view(),
             "BufferPool::adopt was given a VIEW ({} bytes at offset {} of a \
@@ -2270,17 +2302,26 @@ impl BufferPool {
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
             state.live_bytes += size;
-            // A miss already pays `newBufferWithLength`; the scan over the
-            // pending list says whether it was the deferred-release window.
-            let pending_same = state.pending.iter().filter(|n| n.size() == size).count();
-            if pending_same > 0 {
+            // Production captured eligibility at lookup, before Metal could
+            // finish and another host could drain the pending candidates.
+            // Direct adoption (probes/fuzzers) has no lookup observation.
+            let pending_reuse = miss.map_or_else(
+                || {
+                    state.pending.iter().any(|n| {
+                        n.size() >= size && bucket_admissible(size, n.size(), state.oversize_bound)
+                    })
+                },
+                |m| m.pending_reuse,
+            );
+            if pending_reuse {
                 state.counters.pending_twin_allocations += 1;
             }
             if trace_on() {
+                let pending_same = state.pending.iter().filter(|n| n.size() == size).count();
                 let free_same = state.free.get(&size).map_or(0, |b| b.nodes.len());
                 let head = state.pending.head_epoch();
                 Some(format!(
-                    "free_same={free_same} pending_same={pending_same} pending={} head_epoch={head:?} \
+                    "free_same={free_same} pending_same={pending_same} pending_reuse_at_miss={pending_reuse} pending={} head_epoch={head:?} \
                      completed={} current={}",
                     state.pending.held(),
                     self.inner.clock.completed_count(),
@@ -2330,6 +2371,25 @@ impl BufferPool {
         requested: usize,
         allocated: usize,
     ) -> BufferHandle {
+        self.adopt_requesting_at_miss(allocation, requested, allocated, None)
+    }
+
+    pub(crate) fn adopt_after_miss(
+        &self,
+        allocation: impl Into<super::backing::Allocation>,
+        allocated: usize,
+        miss: AllocationMiss,
+    ) -> BufferHandle {
+        self.adopt_requesting_at_miss(allocation, miss.requested, allocated, Some(miss))
+    }
+
+    fn adopt_requesting_at_miss(
+        &self,
+        allocation: impl Into<super::backing::Allocation>,
+        requested: usize,
+        allocated: usize,
+        miss: Option<AllocationMiss>,
+    ) -> BufferHandle {
         debug_assert!(
             allocated >= requested,
             "adopt_requesting({requested} -> {allocated}) shrank the request; \
@@ -2338,7 +2398,8 @@ impl BufferPool {
              and the overhang would underflow (DESIGN.md §9.2)."
         );
         let allocation = allocation.into();
-        let handle = self.adopt_reserved(allocation.buffer, allocated, allocation.reservation);
+        let handle =
+            self.adopt_reserved_at_miss(allocation.buffer, allocated, allocation.reservation, miss);
         {
             let mut state = self.inner.state.lock(Side::Host);
             state.counters.requested_bytes += requested as u64;
@@ -2514,6 +2575,49 @@ mod tests {
         let epoch = clock.commit_epoch();
         clock.mark_completed(epoch);
         pool.drain_completed();
+    }
+
+    #[test]
+    fn pending_reuse_attribution_uses_lookup_policy_and_survives_completion() {
+        let dev = device();
+        for (pending_bytes, requested, bound, want) in [
+            (1024, 1024, None, true),
+            (4096, 1024, None, true),
+            (4096, 1024, Some(2.0), false),
+            (512, 1024, None, false),
+            (4096, 2048, Some(2.0), true),
+        ] {
+            for complete_before_adopt in [false, true] {
+                let (pool, clock) = pool_with_clock();
+                pool.set_reuse_oversize_bound(bound);
+                let old = dev
+                    .new_buffer(pending_bytes, crate::kernels::RESOURCE_OPTIONS)
+                    .unwrap();
+                drop(pool.adopt(old, pending_bytes));
+                let miss = pool
+                    .acquire_for_allocation(requested)
+                    .expect_err("epoch is pending");
+                assert_eq!(
+                    miss.pending_reuse, want,
+                    "{pending_bytes}/{requested} {bound:?}"
+                );
+                if complete_before_adopt {
+                    gpu_completes(&pool, &clock);
+                    assert_eq!(pool.occupancy().pending_buffers, 0);
+                }
+                let before = pool.counters().pending_twin_allocations;
+                let raw = dev
+                    .new_buffer(requested, crate::kernels::RESOURCE_OPTIONS)
+                    .unwrap();
+                let held = pool.adopt_after_miss(raw, requested, miss);
+                assert_eq!(
+                    pool.counters().pending_twin_allocations - before,
+                    u64::from(want)
+                );
+                drop(held);
+                gpu_completes(&pool, &clock);
+            }
+        }
     }
 
     /// Allocates through the pool the way `MetalDevice` does: try to reuse,

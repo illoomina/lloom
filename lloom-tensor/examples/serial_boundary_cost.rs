@@ -28,7 +28,7 @@ use lloom_tensor::kernels::metal::{Buffer, CommandBuffer, ComputeCommandEncoder,
 use lloom_tensor::kernels::{
     call_unary_contiguous, unary, BufferOffset, Kernels, RESOURCE_OPTIONS,
 };
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
+use objc2_metal::MTLCommandQueue;
 
 #[derive(Parser, Debug)]
 #[command(about = "GPU cost of a serial (barrier-ordered) boundary between dispatches")]
@@ -99,8 +99,7 @@ fn main() -> Result<()> {
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
-        let raw = cb.as_ref();
-        Ok((raw.GPUEndTime() - raw.GPUStartTime()) * 1e6)
+        Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6)
     };
 
     println!("SERIAL elems n dependent_us independent_us c_us_per_boundary");

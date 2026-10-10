@@ -20,8 +20,9 @@
 //! critical path — nothing the device runs waits on it — so it runs at the
 //! class `std` spawns it with (`default`), and its wait is a sleep.
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How often a consumer takes the accumulated text.
@@ -43,9 +44,8 @@ impl DeltaBuffer {
     /// or into `spill` when a consumer holds the buffer this instant.
     pub fn push(&self, spill: &mut String, frag: &str) {
         let mut g = match self.buf.try_lock() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => {
+            Some(g) => g,
+            None => {
                 spill.push_str(frag);
                 return;
             }
@@ -65,10 +65,7 @@ impl DeltaBuffer {
         if spill.is_empty() {
             return;
         }
-        self.buf
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_str(spill);
+        self.buf.lock().push_str(spill);
         spill.clear();
         self.dirty.store(true, Ordering::Release);
     }
@@ -80,7 +77,7 @@ impl DeltaBuffer {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return false;
         }
-        std::mem::swap(&mut *self.buf.lock().unwrap_or_else(|e| e.into_inner()), out);
+        std::mem::swap(&mut *self.buf.lock(), out);
         !out.is_empty()
     }
 }
@@ -192,7 +189,7 @@ mod tests {
     fn a_busy_buffer_spills_and_the_spill_is_carried_over() {
         let b = DeltaBuffer::new();
         let mut spill = String::new();
-        let held = b.buf.lock().unwrap();
+        let held = b.buf.lock();
         b.push(&mut spill, "ab");
         b.push(&mut spill, "c");
         assert_eq!(spill, "abc", "the producer never waits on a held buffer");

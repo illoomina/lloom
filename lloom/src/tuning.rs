@@ -10,14 +10,100 @@
 //! changes.
 
 use lloom_macros::Options;
+use lloom_tensor::options::{before, non_empty, parse_arm, parse_count, BeforeRow};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 static TUNING: OnceLock<Tuning> = OnceLock::new();
 
+/// The legacy env names of this group whose values meant something else
+/// before they joined the option tree (`lloom_tensor::options::legacy_notes`).
+pub const LEGACY_BEFORE: &[BeforeRow] = &[
+    ("LLOOM_WG_SYNC", "wg.sync", before::presence),
+    (
+        "LLOOM_WG_CUT_AFTER_ENSURE",
+        "wg.cut_after_ensure",
+        before::presence,
+    ),
+    ("LLOOM_WG_NO_LOADER", "wg.no_loader", before::presence),
+    ("LLOOM_WG_TRACE", "wg.trace", before::presence),
+    // The field took the bool spellings and the batch scheduler checked for
+    // presence beside it, so a false spelling left the scheduler's trace on.
+    ("LLOOM_148_SHARE_TRACE", "lfm2.share_trace", |v| {
+        before::derive_bool(v).map(|_| "true".into())
+    }),
+    (
+        "QWEN4EXP_MASK",
+        "stream.per_plane_mask",
+        before::exactly_one,
+    ),
+    (
+        "QWEN4EXP_READY_FIRST",
+        "stream.ready_first",
+        before::exactly_one,
+    ),
+    ("QWEN4EXP_REPLAY", "stream.replay", |v| {
+        Some(
+            if v == "device" {
+                "\"device\""
+            } else {
+                "\"host\""
+            }
+            .into(),
+        )
+    }),
+    ("QWEN4EXP_PREDICT", "stream.predict", |v| {
+        Some(
+            if v == "hotlist" {
+                "\"hotlist\""
+            } else {
+                "\"off\""
+            }
+            .into(),
+        )
+    }),
+    (
+        "LLOOM_148_POOL_PAGES",
+        "lfm2.pool_pages",
+        before::strict_count,
+    ),
+    (
+        "LLOOM_148_POOL_CHURN",
+        "lfm2.pool_churn",
+        before::strict_count,
+    ),
+    (
+        "LLOOM_WG_SLOW_LOADER_MS",
+        "wg.slow_loader_ms",
+        before::count_or_unset,
+    ),
+    // An empty path opened nothing.
+    ("LLOOM_LFM2_LOGITS_DUMP", "lfm2.logits_dump", |v| {
+        if v.is_empty() {
+            Some("null".into())
+        } else {
+            before::path_verbatim(v)
+        }
+    }),
+];
+
+/// [`LEGACY_BEFORE`]'s lines for the values `env` sets.
+pub fn legacy_notes(env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    lloom_tensor::options::legacy_notes(LEGACY_BEFORE, Tuning::META, env, &|alone| {
+        let mut t = Tuning::default();
+        t.from_env_with(alone)?;
+        serde_json::to_value(&t).map_err(|e| e.to_string())
+    })
+}
+
 /// The group in force for this process (see the module docs).
 pub fn tuning() -> &'static Tuning {
     TUNING.get_or_init(|| {
+        for note in legacy_notes(&|name: &str| {
+            std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+        }) {
+            eprintln!("{note}");
+        }
         let mut t = Tuning::default();
         if let Err(e) = t.from_env() {
             panic!("tuning: {e}");
@@ -34,18 +120,12 @@ pub fn install(t: Tuning) -> Result<(), Tuning> {
 }
 
 fn one_of(v: &str, what: &str, arms: &[&str]) -> Result<String, String> {
-    let s = v.trim().to_ascii_lowercase();
-    if arms.contains(&s.as_str()) {
-        Ok(s)
-    } else {
-        Err(format!("{what}: `{v}` is not one of {}", arms.join(", ")))
-    }
+    parse_arm(v, arms)
+        .map(str::to_string)
+        .map_err(|e| format!("{what}: {e}"))
 }
 fn parse_at_least_one(v: &str) -> Result<usize, String> {
-    let n: usize = v
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{v}` is not an integer"))?;
+    let n: usize = parse_count(v)?;
     if n == 0 {
         return Err("must be >= 1".into());
     }
@@ -59,27 +139,24 @@ fn parse_at_least_two(v: &str) -> Result<usize, String> {
     Ok(n)
 }
 fn parse_spec_ahead(v: &str) -> Result<usize, String> {
-    match v.trim() {
-        "0" => Ok(0),
-        "1" => Ok(1),
+    match parse_count::<usize>(v).map_err(|e| format!("spec ahead: {e}"))? {
+        n @ (0 | 1) => Ok(n),
         other => Err(format!("spec ahead: `{other}` is not 0 or 1")),
     }
 }
 fn parse_flash_bn(v: &str) -> Result<usize, String> {
-    match v.trim() {
-        "8" => Ok(8),
-        "32" => Ok(32),
+    match parse_count::<usize>(v).map_err(|e| format!("flash partial bn: {e}"))? {
+        n @ (8 | 32) => Ok(n),
         other => Err(format!("flash partial bn: `{other}` is not 8 or 32")),
     }
 }
 fn parse_ctx_kv(v: &str) -> Result<String, String> {
-    if v.trim()
-        .eq_ignore_ascii_case(crate::models::lfm2_dspark::CtxKv::AUTO)
-    {
-        return Ok(crate::models::lfm2_dspark::CtxKv::AUTO.to_string());
+    let v = non_empty(v)?.to_ascii_lowercase();
+    if v == crate::models::lfm2_dspark::CtxKv::AUTO {
+        return Ok(v);
     }
-    crate::models::lfm2_dspark::CtxKv::parse(v)
-        .map(|_| v.trim().to_string())
+    crate::models::lfm2_dspark::CtxKv::parse(&v)
+        .map(|_| v.clone())
         .map_err(|e| e.to_string())
 }
 fn parse_hot_thread(v: &str) -> Result<String, String> {
@@ -96,10 +173,7 @@ fn parse_mem_check(v: &str) -> Result<String, String> {
     one_of(v, "mem check", &["off", "report", "refuse"])
 }
 fn parse_draft_loads(v: &str) -> Result<String, String> {
-    match v {
-        "auto" | "on" | "off" => Ok(v.to_string()),
-        _ => Err(format!("{v:?}: expected auto, on or off")),
-    }
+    one_of(v, "MTP draft loads", &["auto", "on", "off"])
 }
 
 fn parse_fusion_budget(v: &str) -> Result<String, String> {
@@ -108,7 +182,12 @@ fn parse_fusion_budget(v: &str) -> Result<String, String> {
 fn parse_mtp_experts(v: &str) -> Result<String, String> {
     one_of(v, "MTP experts", &["resident", "streamed"])
 }
+/// `none` is the family's own policy, as for the key it shares with LFM2's
+/// axis (`kernels.fusion.policy`, unset by default): `manual`.
 fn parse_fusion(v: &str) -> Result<String, String> {
+    if lloom_tensor::options::is_none(v) {
+        return Ok("manual".into());
+    }
     one_of(v, "fusion", &["manual", "derived"])
 }
 fn parse_verify_key(v: &str) -> Result<String, String> {
@@ -661,7 +740,7 @@ pub struct RingTuning {
     #[opt(flag = "ring-slack-bytes", env = "LLOOM_RING_SLACK_BYTES", path = "decode.ring.slack_bytes", status = "advanced", facets = ["buffer"], flows = ["token-out"])]
     pub slack_bytes: usize,
     /// The decode thread's QoS: `user-interactive` (claim it for the run), `default` (hold the class a spawned thread has, a measurement arm) or `off` (leave the thread as found). The older spellings `interactive`, `demote`, `0` and `none` are the same arms.
-    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off"], path = "decode.thread_qos", status = "advanced", facets = ["qos"], flows = ["token-out", "commands-out"], forms = ["user-interactive", "default", "off"], from_v1 = "lloom_tensor::options::v1::hot_thread_from", to_v1 = "lloom_tensor::options::v1::hot_thread_to", schema = "ThreadQos")]
+    #[opt(flag = "hot-thread", env = "LLOOM_HOT_THREAD", parser = "parse_hot_thread", variants = ["interactive", "default", "off", "demote", "0", "none"], path = "decode.thread_qos", status = "advanced", facets = ["qos"], flows = ["token-out", "commands-out"], forms = ["user-interactive", "default", "off"], from_v1 = "lloom_tensor::options::v1::hot_thread_from", to_v1 = "lloom_tensor::options::v1::hot_thread_to", schema = "ThreadQos")]
     pub hot_thread: String,
     /// The host fill producer's QoS: a class (`user-interactive`, `user-initiated`, `default`, `utility`) or `inherit` (as spawned: `default`).
     #[opt(flag = "host-feed-qos",
@@ -685,10 +764,11 @@ pub struct RingTuning {
 }
 
 fn parse_spawned_qos(v: &str) -> Result<String, String> {
-    crate::generation::hot_thread::parse_spawned_arm(v)
+    crate::generation::hot_thread::parse_spawned_arm(&non_empty(v)?.to_ascii_lowercase())
 }
 fn parse_poll(v: &str) -> Result<String, String> {
-    v.trim()
+    non_empty(v)?
+        .to_ascii_lowercase()
         .parse::<crate::nn::decode::FeedWait>()
         .map(|w| w.to_string())
 }

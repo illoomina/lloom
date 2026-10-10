@@ -10,8 +10,8 @@ use clap::Parser;
 use lloom::models::qwen2::{Config, Model};
 
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use tokenizers::{
     utils::padding::{PaddingDirection, PaddingParams, PaddingStrategy},
     Tokenizer,

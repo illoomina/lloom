@@ -18,23 +18,24 @@
 //! `verify_step`'s sibling — the plain per-token path — and its first production
 //! caller (`RESTRUCTURING_DESIGN.md` §1.9, §10.1 wave F).
 
+#[cfg(feature = "serve")]
+pub mod app;
 pub mod batch;
 pub mod couplings;
 pub mod decode;
+pub mod option_grammar;
 pub mod option_schema;
 pub mod option_tree;
 pub mod options;
-#[cfg(feature = "serve")]
-pub mod app;
 pub mod seam;
 pub mod sink;
 pub mod slots;
 pub mod stream;
 
 pub use batch::{
-    spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent, BatchHandle,
-    BatchMode, BatchRequest, ClosedJob, CountersHook, Driver, Idle, MakeDriver, RowSpec,
-    StaticBody, drive_closed_rows,
+    drive_closed_rows, spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent,
+    BatchHandle, BatchMode, BatchRequest, ClosedJob, CountersHook, Driver, Idle, MakeDriver,
+    RowSpec, StaticBody,
 };
 pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingArm, RingPool, Stop,

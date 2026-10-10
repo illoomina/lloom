@@ -25,7 +25,11 @@ fn a_norm_executes_its_own_forward_and_visits_an_rms_node() -> Result<()> {
     let xn = walker.input("x", Shape::of(&[1, 1, 4]), DType::F32);
     let out = norm.visit(&mut walker, xn);
     let g = walker.finish();
-    assert_eq!(g.node(out).inputs.len(), 2, "an rms_norm node reads the weight and x");
+    assert_eq!(
+        g.node(out).inputs.len(),
+        2,
+        "an rms_norm node reads the weight and x"
+    );
     Ok(())
 }
 

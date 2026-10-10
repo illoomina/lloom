@@ -1,12 +1,10 @@
 use candle::Device;
 use candle::Module;
-use lloom::nn::VarBuilder;
-use lloom::models::segformer::{
-    Config, ImageClassificationModel, SemanticSegmentationModel,
-};
 use clap::{Args, Parser, Subcommand};
 use imageproc::image::Rgb;
 use imageproc::integral_image::ArrayData;
+use lloom::models::segformer::{Config, ImageClassificationModel, SemanticSegmentationModel};
+use lloom::nn::VarBuilder;
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -251,7 +251,8 @@ impl QuantKvSlab {
     ) -> Result<()> {
         let dtype = self.scale_dtype.unwrap_or(dtype);
         if self.k_codes.is_some() || self.v_codes.is_some() {
-            if (b_sz, n_heads, head_dim, dtype) != (self.b_sz, self.n_heads, self.head_dim, self.dtype)
+            if (b_sz, n_heads, head_dim, dtype)
+                != (self.b_sz, self.n_heads, self.head_dim, self.dtype)
             {
                 lloom_tensor::bail!(
                     "QuantKvSlab: an append of {b_sz}×{n_heads}×{head_dim} {dtype:?} into planes of \
@@ -447,7 +448,18 @@ impl QuantKvSlab {
         let [kc, ks, kb, vc, vs, vb] = self.planes_or_bail()?;
         let (b, h, d) = (self.b_sz, self.n_heads, self.head_dim);
         let read = |c: &Tensor, s: &Tensor, bi: &Tensor| -> Result<Tensor> {
-            ops::dequantize_kv(c, s, bi, b, h, self.len, d, self.capacity, dtype, self.quant)
+            ops::dequantize_kv(
+                c,
+                s,
+                bi,
+                b,
+                h,
+                self.len,
+                d,
+                self.capacity,
+                dtype,
+                self.quant,
+            )
         };
         Ok((read(kc, ks, kb)?, read(vc, vs, vb)?))
     }

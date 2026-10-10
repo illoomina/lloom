@@ -1202,7 +1202,12 @@ impl QTensor {
     /// [`Self::indexed_moe_forward_with`] computes for it on the same arm.
     /// The arm is `batch`'s ([`MoeArm::for_rows`]);
     /// [`Self::indexed_moe_forward_pair_with`] takes it from the caller.
-    pub fn indexed_moe_forward_pair(&self, up: &QTensor, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn indexed_moe_forward_pair(
+        &self,
+        up: &QTensor,
+        x: &Tensor,
+        ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         self.indexed_moe_forward_pair_with(up, x, ids, MoeArm::for_rows(x.dim(0)?))
     }
 
@@ -1527,10 +1532,18 @@ impl QMatMul {
     }
 
     /// [`QTensor::indexed_moe_forward_pair`] on two quantized weights.
-    pub fn indexed_moe_forward_pair(&self, up: &QMatMul, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn indexed_moe_forward_pair(
+        &self,
+        up: &QMatMul,
+        x: &Tensor,
+        ids: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         match (self, up) {
             (Self::QTensor(g), Self::QTensor(u)) => g.indexed_moe_forward_pair(u, x, ids),
-            _ => Ok((self.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?)),
+            _ => Ok((
+                self.indexed_moe_forward(x, ids)?,
+                up.indexed_moe_forward(x, ids)?,
+            )),
         }
     }
 
@@ -1741,8 +1754,10 @@ impl QMatMul {
             let Ok((_, k)) = q.shape().dims2() else {
                 return false;
             };
-            matches!(kind.kind().mul_mv, crate::kernels::kernels::quantized::MulMv::Quant(_))
-                && matches!(q.storage, QStorage::Metal(_))
+            matches!(
+                kind.kind().mul_mv,
+                crate::kernels::kernels::quantized::MulMv::Quant(_)
+            ) && matches!(q.storage, QStorage::Metal(_))
                 && xs.device().is_metal()
                 && xs.dtype() == DType::F32
                 && xs.is_contiguous()
@@ -2061,7 +2076,13 @@ impl crate::CustomOp1 for MvSilu {
             crate::bail!("the quantized matvec store block needs a Metal weight")
         };
         let out = w
-            .fwd_mv_store(&self.0.shape, storage, layout, crate::kernels::MvStore::Silu, None)?
+            .fwd_mv_store(
+                &self.0.shape,
+                storage,
+                layout,
+                crate::kernels::MvStore::Silu,
+                None,
+            )?
             .expect("a fresh store returns its storage");
         let n = self.0.shape.dims2()?.0;
         let mut dims = layout.shape().dims().to_vec();

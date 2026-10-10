@@ -37,7 +37,8 @@ pub use diff::{diff, listing, IrDiff};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
 pub use ir::{
-    census_of_labels, kernel_family, Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape,
+    census_of_labels, kernel_family, Census, Core, DepthProfile, Dim, Graph, Node, NodeId, Op,
+    Shape,
 };
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
@@ -184,7 +185,12 @@ pub struct Derivation {
 /// Whether the block `name` could apply in `graph`: a product block whose
 /// core runs a product here; a prologue whose producer feeds such a product
 /// at a tile it admits; a kernel fragment whose pair occurs.
-fn applies(graph: &Graph, name: &str, catalogue: &[Fragment], kernels: &[fragments::KernelFragment]) -> bool {
+fn applies(
+    graph: &Graph,
+    name: &str,
+    catalogue: &[Fragment],
+    kernels: &[fragments::KernelFragment],
+) -> bool {
     use crate::nn::fusion::{Semantics, TileNeed};
     let nodes = graph.nodes();
     let products = |core: Core| {
@@ -211,9 +217,9 @@ fn applies(graph: &Graph, name: &str, catalogue: &[Fragment], kernels: &[fragmen
         return match k.form {
             fragments::KernelForm::SiluMul => nodes.iter().any(|n| {
                 n.op == Op::Mul
-                    && n.inputs.iter().any(|&i| {
-                        nodes[i].op == Op::Silu && k.dtypes.contains(&nodes[i].dtype)
-                    })
+                    && n.inputs
+                        .iter()
+                        .any(|&i| nodes[i].op == Op::Silu && k.dtypes.contains(&nodes[i].dtype))
             }),
             fragments::KernelForm::LoadCast { into, operand } => nodes.iter().any(|n| {
                 n.op == Op::Opaque
@@ -831,7 +837,10 @@ mod tests {
             ..Default::default()
         };
         let d = derive(&g, &policy).unwrap();
-        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("norm_swiglu"));
+        assert_eq!(
+            d.plan.sites.get("w3").map(String::as_str),
+            Some("norm_swiglu")
+        );
         assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
         assert_eq!(d.plan.sites.len(), 2, "{:?}", d.plan.sites);
         assert_eq!(d.plan.dispatches_before(), 7);
@@ -842,16 +851,21 @@ mod tests {
         // The fused node: `w3`, the norm's input, the gate weight, the norm
         // weight last.
         let n = d.graph.nodes().iter().find(|n| n.op == Op::Fused).unwrap();
-        let names: Vec<&str> = n.inputs.iter().map(|&i| d.graph.node(i).name.as_str()).collect();
+        let names: Vec<&str> = n
+            .inputs
+            .iter()
+            .map(|&i| d.graph.node(i).name.as_str())
+            .collect();
         assert_eq!(names, ["w3", "h", "w1", "ffn_norm"]);
         assert_eq!(n.prologue.as_deref(), Some("norm"));
 
         let d = derive(&g, &Policy::default()).unwrap();
         assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("swiglu"));
         assert_eq!(d.plan.after.get("rmsnorm"), Some(&1));
-        assert!(d
-            .refused
-            .contains(&("norm".to_string(), "class reorder exceeds the budget rounding".to_string())));
+        assert!(d.refused.contains(&(
+            "norm".to_string(),
+            "class reorder exceeds the budget rounding".to_string()
+        )));
     }
 
     /// A norm one of whose products cannot take it (a tile whose simdgroups
@@ -879,8 +893,16 @@ mod tests {
         assert!(d.plan.sites.is_empty(), "{:?}", d.plan.sites);
         assert_eq!(d.plan.dispatches_after(), 3);
         assert_eq!(d.plan.after.get("rmsnorm"), Some(&1));
-        let why = d.refused.iter().find(|(n, _)| n == "norm").map(|(_, w)| w.as_str());
-        assert!(why.is_some_and(|w| w.starts_with("at 1 sites:")), "{:?}", d.refused);
+        let why = d
+            .refused
+            .iter()
+            .find(|(n, _)| n == "norm")
+            .map(|(_, w)| w.as_str());
+        assert!(
+            why.is_some_and(|w| w.starts_with("at 1 sites:")),
+            "{:?}",
+            d.refused
+        );
     }
 
     /// The kernel fragments: the SwiGLU of two quantized products (no block
@@ -899,7 +921,12 @@ mod tests {
         let y = g.opaque("mul_mv_id", &[h], Shape::of(&[1, 4, 64]), DType::F16);
         let y32 = g.opaque("cast", &[y], Shape::of(&[1, 4, 64]), DType::F32);
         let route = g.input("route", Shape::of(&[1, 4]), DType::F32);
-        let out = g.opaque("moe_combine", &[y32, route], Shape::of(&[1, 64]), DType::F32);
+        let out = g.opaque(
+            "moe_combine",
+            &[y32, route],
+            Shape::of(&[1, 64]),
+            DType::F32,
+        );
         g.mark_root(out);
         // Admitted, the store blocks take the SwiGLU on packed products —
         // the SiLU on the gate's store, the product into the gate's buffer —
@@ -911,8 +938,14 @@ mod tests {
             ..Default::default()
         };
         let d = derive(&g, &admit).unwrap();
-        assert_eq!(d.plan.sites.get("wg").map(String::as_str), Some("quant_silu"));
-        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        assert_eq!(
+            d.plan.sites.get("wg").map(String::as_str),
+            Some("quant_silu")
+        );
+        assert_eq!(
+            d.plan.sites.get("wu").map(String::as_str),
+            Some("quant_mul")
+        );
         assert!(!d.plan.kernels.contains_key("silu_mul_f32"));
         let d = derive(&g, &Policy::default()).unwrap();
         assert!(d
@@ -923,12 +956,27 @@ mod tests {
         assert_eq!(d.plan.kernels.get("combine_cast"), Some(&1));
         assert_eq!(d.plan.after.get("silu_mul"), Some(&1));
         for gone in ["silu", "bmul", "cast"] {
-            assert!(!d.plan.after.contains_key(gone), "{gone}: {:?}", d.plan.after);
+            assert!(
+                !d.plan.after.contains_key(gone),
+                "{gone}: {:?}",
+                d.plan.after
+            );
         }
         // The combine reads the f16 store itself.
-        let c = d.graph.nodes().iter().find(|n| n.name == "moe_combine").unwrap();
+        let c = d
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| n.name == "moe_combine")
+            .unwrap();
         assert_eq!(d.graph.node(c.inputs[0]).name, "mul_mv_id");
-        assert!(d.plan.to_string().contains(" combine_cast=1 silu_mul_f32=1"), "{}", d.plan);
+        assert!(
+            d.plan
+                .to_string()
+                .contains(" combine_cast=1 silu_mul_f32=1"),
+            "{}",
+            d.plan
+        );
         // Excluded by name, both pairs stay.
         let policy = Policy {
             excluded: vec![
@@ -970,7 +1018,10 @@ mod tests {
             derive(&g, &admit).unwrap()
         };
         let d = swiglu(false, DType::U8);
-        assert_eq!(d.plan.sites.get("wu").map(String::as_str), Some("quant_mul"));
+        assert_eq!(
+            d.plan.sites.get("wu").map(String::as_str),
+            Some("quant_mul")
+        );
         let d = swiglu(true, DType::U8);
         assert_eq!(d.plan.sites.get("wu"), None, "{:?}", d.plan.sites);
         let d = swiglu(false, DType::F32);

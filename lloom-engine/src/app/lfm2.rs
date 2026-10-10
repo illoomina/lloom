@@ -937,6 +937,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 eos_ids,
                 seed_tokens,
                 think: Default::default(),
+                gen_prompts: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -987,6 +988,7 @@ impl<P: Lfm2Shape> Engine<P> {
             sched: None,
             sched_thread: Mutex::new(None),
         };
+        engine.text.prime();
 
         if opts.warmup {
             let ((libs, pipes), measured) =
@@ -2819,6 +2821,14 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         self.text.think_tags().cloned()
+    }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.text
+            .generation_prompt(kwarg, want)
+            .map(<[u32]>::to_vec)
+    }
+    fn template_renders(&self) -> u64 {
+        self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {

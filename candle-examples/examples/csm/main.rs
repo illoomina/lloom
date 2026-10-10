@@ -10,8 +10,8 @@ use clap::Parser;
 use lloom::models::csm::{Config, Model};
 
 use candle::{DType, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -188,11 +188,7 @@ fn main() -> Result<()> {
     println!("loaded the model in {:?}", start.elapsed());
 
     let voices = candle::safetensors::load(args.voices, &device)?;
-    let mut lp = lloom::generation::LogitsProcessor::new(
-        args.seed,
-        Some(args.temperature),
-        None,
-    );
+    let mut lp = lloom::generation::LogitsProcessor::new(args.seed, Some(args.temperature), None);
     let tokens = voices
         .get("tokens")
         .expect("no tokens in prompt")

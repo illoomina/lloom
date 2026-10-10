@@ -7,11 +7,9 @@ use crate::kernels::metal::{
     DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
-use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::{HashMap, HashSet};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -23,174 +21,7 @@ pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 // `crate::tuning` beside the knobs that override them, one definition each.
 use crate::tuning::DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER;
 
-/// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
-///
-/// # Why there are two
-///
-/// The shipping cut is a **global dispatch counter**: `count >=
-/// compute_per_buffer`, with `count` running from process start. §13.5i
-/// measured what that produces — every seam at a multiple of 50 *counted from
-/// process start*, so the flash arm's land at 51/101/152 rather than
-/// 50/100/150, and of a token's seams 6 fall inside attention layers and 7
-/// inside conv, none at a position the graph would have chosen. The placement
-/// is a **counter's residue**, not a decision.
-///
-/// §13.5j then measured the cost of the cut itself and found it is **~7.2–7.4
-/// µs per encoder session and not a function of the barrier count** — but
-/// barriers and sessions are *collinear* along `COMPUTE_PER_BUFFER` (R² 0.983
-/// and 0.985), because one cut produces both. **No setting of that knob can
-/// separate the two terms.**
-///
-/// A node-index partition is the arm that can, and that is the only reason
-/// this enum exists: it moves *where* the seams land while holding *how many*
-/// there are, so the session term and the barrier term stop moving together.
-///
-/// # What a "node" is here, and why it is the layer
-///
-/// llama.cpp partitions a materialised graph — `n_nodes_per_cb = (n_nodes +
-/// n_cb - 1) / n_cb`, shipping `n_cb` of 1 or 2 (#419). Candle is eager and has
-/// no graph object to index, so the node index has to come from the only party
-/// that knows the graph position: the model. LFM2's decoder is a loop over 30
-/// layers, so **node := layer** and the partition is over the layer sequence.
-///
-/// That is what makes the count held rather than approximately held: cutting a
-/// 30-layer sequence into `n_cb` contiguous runs yields **exactly `n_cb`
-/// sessions per forward pass, by construction**, independent of how many
-/// dispatches a layer happens to contain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CutPolicy {
-    /// Cut every `compute_per_buffer` dispatches, counted from process start.
-    /// The default and the shipping path; §13.5j's arm and every recorded
-    /// digest belong to it.
-    DispatchCounter,
-    /// Cut at the first node boundary once `compute_per_buffer` dispatches
-    /// have accumulated, and unconditionally at four periods.
-    ///
-    /// The counter's period as a *lower bound* on a session's length and the
-    /// graph's own boundaries as the places a seam may fall: the count stays
-    /// the counter's to within a node, the placement is the graph's, and a
-    /// stream that marks no nodes (a model that never calls
-    /// `mark_graph_node`) is still cut by the hard bound rather than growing
-    /// one command buffer for its whole pass. `CANDLE_METAL_CUT_POLICY=
-    /// node-aligned`.
-    NodeAligned,
-    /// Cut on a layer-index partition: `n_cb` contiguous runs of the layer
-    /// sequence, so every seam lands on a layer boundary and the session count
-    /// is `n_cb` by construction.
-    ///
-    /// `nodes_per_cb` is the run length in layers, derived from `n_cb` the same
-    /// way llama.cpp derives it — `ceil(n_layers / n_cb)` — and computed by the
-    /// caller, since only the model knows `n_layers`.
-    NodeIndex { nodes_per_cb: usize },
-}
-
-impl CutPolicy {
-    /// Whether reaching graph node `index` should arm a cut.
-    ///
-    /// A free function of the policy and the index so the partition arithmetic
-    /// is testable **without a device** — `Commands` needs a live
-    /// `MTLCommandQueue` and this needs none, which is `scratch_tests.rs`'s
-    /// split between the arithmetic and what executes it.
-    ///
-    /// **Node 0 never cuts.** `n_cb` contiguous runs have `n_cb - 1` interior
-    /// boundaries, and a cut at the first node would add a seam the partition
-    /// does not name — the forward pass already opens against whatever encoder
-    /// the previous token's `flush_and_wait_current` left. Cutting there would
-    /// make the session count `n_cb + 1` and break the held-count property the
-    /// arm exists to have.
-    ///
-    /// `since_cut` is how many dispatches the open session holds when the node
-    /// is reached; only `NodeAligned` reads it, against `compute_per_buffer`.
-    #[inline]
-    pub fn cuts_at_node(&self, index: usize, since_cut: usize, compute_per_buffer: usize) -> bool {
-        match self {
-            // A dispatch counter has no notion of graph position, which is
-            // §13.5i's whole finding. It cannot answer this question and does
-            // not try.
-            CutPolicy::DispatchCounter => false,
-            CutPolicy::NodeIndex { nodes_per_cb } => {
-                index > 0 && index.is_multiple_of(*nodes_per_cb)
-            }
-            CutPolicy::NodeAligned => index > 0 && since_cut >= compute_per_buffer,
-        }
-    }
-
-    /// The dispatch count at which `NodeAligned` cuts whether or not a node
-    /// boundary has arrived, as a multiple of the period.
-    pub const NODE_ALIGNED_HARD_BOUND: usize = 4;
-
-    /// Whether a session `since_cut` dispatches long must be cut at this
-    /// dispatch, node or no node.
-    #[inline]
-    pub fn cuts_at_dispatch(&self, since_cut: usize, compute_per_buffer: usize) -> bool {
-        match self {
-            CutPolicy::DispatchCounter => since_cut >= compute_per_buffer,
-            CutPolicy::NodeIndex { .. } => false,
-            CutPolicy::NodeAligned => {
-                since_cut >= compute_per_buffer.saturating_mul(Self::NODE_ALIGNED_HARD_BOUND)
-            }
-        }
-    }
-
-    /// The arm as a `RESULT`-line token, with the period the counter arms
-    /// use: `Counter(50)`, `Node(3)`, `NodeAligned(50)`.
-    pub fn render(policy: CutPolicy, compute_per_buffer: usize) -> String {
-        match policy {
-            CutPolicy::DispatchCounter => format!("Counter({compute_per_buffer})"),
-            CutPolicy::NodeIndex { nodes_per_cb } => format!("Node({nodes_per_cb})"),
-            CutPolicy::NodeAligned => format!("NodeAligned({compute_per_buffer})"),
-        }
-    }
-
-    /// Parse the environment's spelling: `counter`, `node-aligned`, or
-    /// `nodes:<k>`.
-    pub fn from_env_str(s: &str) -> Result<CutPolicy, String> {
-        match s {
-            "counter" => Ok(CutPolicy::DispatchCounter),
-            "node-aligned" => Ok(CutPolicy::NodeAligned),
-            other => match other.strip_prefix("nodes:") {
-                Some(k) => {
-                    let n: usize = k
-                        .parse()
-                        .map_err(|_| format!("nodes:<k> needs a positive integer, got {k:?}"))?;
-                    if n == 0 {
-                        return Err("nodes:0 would cut at every node and then some".to_string());
-                    }
-                    Ok(CutPolicy::NodeIndex { nodes_per_cb: n })
-                }
-                None => Err(format!(
-                    "CANDLE_METAL_CUT_POLICY must be `counter`, `node-aligned` or `nodes:<k>`, \
-                     got {other:?}"
-                )),
-            },
-        }
-    }
-
-    /// How many sessions a forward pass over `n_nodes` nodes will cut into.
-    ///
-    /// The held-count property, as arithmetic rather than as a claim: a
-    /// partition of `n_nodes` into runs of `nodes_per_cb` has
-    /// `ceil(n_nodes / nodes_per_cb)` runs, and each run is one session. Used
-    /// by the tests and by anything choosing a `nodes_per_cb` to match a
-    /// counter arm's count.
-    pub fn sessions_for(
-        &self,
-        n_nodes: usize,
-        compute_per_buffer: usize,
-        n_dispatches: usize,
-    ) -> usize {
-        match self {
-            // The counter's count is a function of the dispatch total, which is
-            // why it cannot be held while placement moves (§13.5j).
-            CutPolicy::DispatchCounter => n_dispatches.div_ceil(compute_per_buffer.max(1)),
-            CutPolicy::NodeIndex { nodes_per_cb } => n_nodes.div_ceil((*nodes_per_cb).max(1)),
-            // At most the counter's count, at least one; the exact figure
-            // depends on where the nodes fall against the period and is
-            // read from the run rather than predicted here.
-            CutPolicy::NodeAligned => n_dispatches.div_ceil(compute_per_buffer.max(1)).max(1),
-        }
-    }
-}
+pub use crate::command_policy::CutPolicy;
 
 /// Callbacks run after each command buffer completes. See
 /// [`Commands::on_command_buffer_complete`].
@@ -387,6 +218,7 @@ pub struct Commands {
     /// Its own line -- see `state` above.
     compute_count: CachePadded<AtomicUsize>,
     command_queue: CommandQueue,
+    modern_queue: Option<Arc<super::metal4::Queue>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: AtomicUsize,
@@ -738,6 +570,35 @@ impl Commands {
             None
         };
 
+        let requested_api = crate::tuning::tuning().metal.command_api.as_str();
+        let supported = super::arms::for_device(&device).has(super::arms::Feature::Metal4);
+        let counters = super::profile::counters_enabled();
+        if requested_api == "metal4" && counters {
+            return Err(MetalKernelError::InvalidInput(
+                "Metal 4 encoder counter sampling is not implemented; select --metal-api metal3 (or auto) to retain counter profiling".into()));
+        }
+        let supported = supported && !counters;
+        if requested_api == "auto" && counters {
+            eprintln!("[metal] command_api=metal3 auto_fallback=encoder-counter-profiling");
+        }
+
+        let modern_queue = match requested_api {
+            "metal4" if !supported => {
+                return Err(MetalKernelError::InvalidInput(
+                    "Metal 4 is unavailable or disabled on this device; select metal3 or auto"
+                        .into(),
+                ))
+            }
+            "metal4" | "auto" if supported => Some(super::metal4::Queue::new(device.clone())?),
+            _ => None,
+        };
+        let cb = if let Some(queue) = &modern_queue {
+            eprintln!("[metal] command_api=metal4 reusable_native_buffers=true");
+            CommandBuffer::from_metal4(queue.acquire()?)
+        } else {
+            cb
+        };
+
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
         let clock = Arc::new(GpuClock::new());
@@ -747,6 +608,7 @@ impl Commands {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             command_queue,
+            modern_queue,
             compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
             pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
             cut_policy,
@@ -934,6 +796,13 @@ impl Commands {
     /// subscribers added later would miss the command buffers already in
     /// flight, and a buffer parked against one of those epochs would never be
     /// swept in.
+    ///
+    /// Runs on Metal's completion thread. Per CONTRIBUTING §3.3a, a callback
+    /// must not acquire a lock the encoding thread takes or submit work that
+    /// waits for that thread. In particular, native-slot backpressure can hold
+    /// the Commands state lock while feedback is responsible for returning a
+    /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
+    /// on the host, as the buffer pools do.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         self.on_complete.lock().push(Arc::new(f));
     }
@@ -1120,7 +989,14 @@ impl Commands {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
-        state.current.signal_event(event, value);
+        if self.modern_queue.is_some() {
+            // Queue the signal as part of this commit, before acquiring a
+            // replacement slot can apply backpressure.
+            state.current.signal_event(event, value);
+            self.commit_swap_locked(&mut state, 0)?;
+        } else {
+            state.current.signal_event(event, value);
+        }
         Ok(())
     }
 
@@ -1135,6 +1011,9 @@ impl Commands {
         let mut state = self.state.lock(Side::Host);
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
+        }
+        if self.modern_queue.is_some() {
+            self.commit_swap_locked(&mut state, 0)?;
         }
         state.current.wait_for_event(event, value);
         Ok(())
@@ -1203,7 +1082,7 @@ impl Commands {
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait[..to_wait.len().saturating_sub(1)] {
             if cb.status() == MTLCommandBufferStatus::Error {
-                self.failure.record(cb_error_message(cb.as_ref()));
+                self.failure.record(cb_error_message(cb));
             }
         }
         self.failure.check()?;
@@ -1492,9 +1371,9 @@ impl Commands {
                 let clock = Arc::clone(&self.clock);
                 let subs: Vec<_> = self.on_complete.lock().clone();
                 let failure = Arc::clone(&self.failure);
-                state.current.on_completion_of(move |cb| {
-                    if cb.status() == MTLCommandBufferStatus::Error {
-                        failure.record(cb_error_message(cb));
+                state.current.on_completion_of(move |error| {
+                    if let Some(error) = error {
+                        failure.record(error);
                     }
                     // Order matters: the clock must show the epoch finished
                     // before subscribers look, or they find nothing drainable
@@ -1526,7 +1405,10 @@ impl Commands {
             hold.release_completed();
         }
         let created = timed.map(|_| std::time::Instant::now());
-        let new_cb = create_command_buffer(&self.command_queue, self.kind)?;
+        let new_cb = match &self.modern_queue {
+            Some(queue) => CommandBuffer::from_metal4(queue.acquire()?),
+            None => create_command_buffer(&self.command_queue, self.kind)?,
+        };
         if let Some(t) = created {
             crate::kernels::metal::profile::record_create_cb(t.elapsed());
         }
@@ -1629,7 +1511,7 @@ impl Commands {
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
-        MetalKernelError::CommandBufferError(cb_error_message(cb.as_ref()))
+        MetalKernelError::CommandBufferError(cb_error_message(cb))
     }
 
     /// Drop the in-flight buffers that completed, and report one that failed.
@@ -1652,7 +1534,7 @@ impl Commands {
             state
                 .in_flight
                 .iter()
-                .position(|c| std::ptr::eq(c.as_ref(), w.as_ref()))
+                .position(|c| c.identity() == w.identity())
         });
         for c in &state.in_flight[..ahead.unwrap_or(0)] {
             if !matches!(
@@ -1667,7 +1549,7 @@ impl Commands {
             MTLCommandBufferStatus::Completed => false,
             MTLCommandBufferStatus::Error => {
                 if failed.is_none() {
-                    failed = Some(cb_error_message(c.as_ref()));
+                    failed = Some(cb_error_message(c));
                 }
                 false
             }
@@ -1679,15 +1561,19 @@ impl Commands {
         self.failure.check()
     }
 
+    /// Device setup attaches the existing memory ledger before any encoding.
+    pub(crate) fn attach_command_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
+        if let Some(queue) = &self.modern_queue {
+            queue.attach_ledger(ledger);
+        }
+    }
+
     /// The first command buffer of this queue that ended in error, if any.
     pub fn check_failed(&self) -> Result<(), MetalKernelError> {
         self.failure.check()
     }
 
     fn end_encoding(&self, encoder: ComputeCommandEncoder) {
-        use objc2_metal::MTLCommandEncoder as _;
-        use objc2_metal::MTLComputeCommandEncoder as _;
-
         // The encoder is consumed here, so its output set is moved out rather
         // than cloned: a `HashSet` cloned per encoder close is 14 clones a
         // token (`CONTRIBUTING.md` §3.3a), and the capacity dies with the
@@ -1744,17 +1630,9 @@ impl Commands {
 
         if retires {
             let completed = encoder.fence.completion_flag();
-            let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            encoder.command_buffer.on_completion(move || {
                 completed.store(true, Ordering::Release);
             });
-            // SAFETY: Metal copies the block, so the `RcBlock` may drop at the
-            // end of this scope; the buffer is the uncommitted current one,
-            // which is when Metal accepts a handler.
-            unsafe {
-                encoder
-                    .command_buffer
-                    .addCompletedHandler(RcBlock::as_ptr(&block))
-            };
         }
 
         encoder.raw.endEncoding();
@@ -1762,9 +1640,9 @@ impl Commands {
 }
 
 /// The error a failed command buffer reports, as text.
-fn cb_error_message(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
+fn cb_error_message(cb: &CommandBuffer) -> String {
     cb.error()
-        .map(|e| e.localizedDescription().to_string())
+        .map(|e| e.into_owned())
         .unwrap_or_else(|| "unknown error".to_string())
 }
 

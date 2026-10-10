@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
 use candle::Tensor;
-use lloom::nn::VarBuilder;
-use lloom::models::bert::{self, BertForMaskedLM, Config};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::models::bert::{self, BertForMaskedLM, Config};
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]

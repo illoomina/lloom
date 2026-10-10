@@ -31,9 +31,55 @@ pub struct Text {
     pub seed_tokens: Vec<u32>,
     /// The template's reasoning tags, read on first use ([`Self::think_tags`]).
     pub think: std::sync::OnceLock<Option<ThinkTags>>,
+    /// The generation prompt's ids per `enable_thinking` argument × the
+    /// engine's thinking switch (each unset, on, off), read at load
+    /// ([`Self::prime`], [`Self::generation_prompt`]).
+    pub gen_prompts: std::sync::OnceLock<[[Option<Vec<u32>>; 3]; 3]>,
 }
 
 impl Text {
+    /// Read what the template's load-time analysis gives — the reasoning
+    /// tags and the generation prompts — so no request renders a probe.
+    pub fn prime(&self) {
+        let _ = self.think_tags();
+        let _ = self.generation_prompt(None, None);
+    }
+
+    /// The ids a prompt ends with when rendered with the template argument
+    /// `enable_thinking` = `kwarg` and passed through the engine's thinking
+    /// switch `want` (`thinking::apply`, which closes a block the template
+    /// left open): the template's generation prompt, with the end marker
+    /// the engine appends. `None` without a template, or where the renders
+    /// do not nest.
+    pub fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<&[u32]> {
+        let modes = [None, Some(true), Some(false)];
+        let all = self
+            .gen_prompts
+            .get_or_init(|| modes.map(|k| modes.map(|w| self.read_generation_prompt(k, w))));
+        let at = |m: Option<bool>| match m {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        all[at(kwarg)][at(want)].as_deref()
+    }
+
+    fn read_generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        let template = self.template.as_ref()?;
+        let mut kwargs = serde_json::Map::new();
+        if let Some(k) = kwarg {
+            kwargs.insert(super::template::ENABLE_THINKING.into(), Value::Bool(k));
+        }
+        let (mut with, without) = template.generation_prompt(&self.bos_token, &kwargs, |s| {
+            self.tokenizer
+                .encode(s, false)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| anyhow::anyhow!("encoding a probe render: {e}"))
+        })?;
+        super::thinking::apply(want, self.think_tags(), &mut with).ok()?;
+        Some(with[without.len()..].to_vec())
+    }
+
     /// The family's reasoning tags ([`Template::think_tags`]): markers are
     /// the tokenizer's added tokens. `None` without a template, or when it
     /// writes no thinking block.
@@ -192,10 +238,20 @@ pub fn machine_label(family: &str, checkpoint: &Path) -> String {
 }
 
 pub fn open_device() -> Result<Device> {
+    #[cfg(not(feature = "metal"))]
+    if lloom_tensor::tuning::tuning().metal.command_api == "metal4" {
+        anyhow::bail!("--metal-api metal4 requires a build with the metal feature; select metal3/auto for normal device fallback");
+    }
     #[cfg(feature = "metal")]
     {
-        if let Ok(d) = Device::new_metal(0) {
-            return Ok(d);
+        match Device::new_metal(0) {
+            Ok(d) => return Ok(d),
+            Err(error) if lloom_tensor::tuning::tuning().metal.command_api == "metal4" => {
+                // An explicit native API request must not silently become a
+                // CPU run when capability or diagnostics reject that API.
+                return Err(error.into());
+            }
+            Err(_) => {}
         }
     }
     #[cfg(feature = "cuda")]

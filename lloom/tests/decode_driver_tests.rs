@@ -2904,14 +2904,22 @@ fn a_draw_taken_back_on_the_ring_is_read_as_the_one_drawn_again() -> Result<()> 
     device.synchronize()?;
     seen.clear();
     reader.read_all_new(&mut seen).expect("no lap");
-    assert_eq!(seen, vec![9], "the reader read the slot under the new stamp");
+    assert_eq!(
+        seen,
+        vec![9],
+        "the reader read the slot under the new stamp"
+    );
     rb.sample_and_feed(&mut sampler, &logits(11)?)?;
     assert!(!rb.eos_of_last()?);
     device.synchronize()?;
     seen.clear();
     reader.read_all_new(&mut seen).expect("no lap");
     assert_eq!(seen, vec![11]);
-    assert_eq!(rb.drain_all()?, vec![3, 9, 11], "the history kept the taken-back token");
+    assert_eq!(
+        rb.drain_all()?,
+        vec![3, 9, 11],
+        "the history kept the taken-back token"
+    );
     let c = rb.counters();
     assert_eq!(c.ring_retracted, 1);
     assert_eq!(c.ring_publishes, 4);

@@ -18,12 +18,12 @@
 #[cfg(not(feature = "metal"))]
 use lloom_tensor::retire;
 
-mod f16_rows_identity;
 mod bilinear_tests;
 mod conv_tests;
 mod custom_op_tests;
 mod depthwise_conv;
 mod display_tests;
+mod f16_rows_identity;
 mod fp_kind_codes;
 mod gate_contract_pinned;
 mod gate_contract_unpinned;
@@ -100,8 +100,14 @@ fn every_test_file_is_a_module() {
     let mut missing = Vec::new();
     let mut files = 0;
     for entry in std::fs::read_dir(dir).expect("tests/ is readable") {
-        let name = entry.expect("an entry").file_name().into_string().expect("utf-8");
-        let Some(stem) = name.strip_suffix(".rs") else { continue };
+        let name = entry
+            .expect("an entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8");
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
         if stem == "main" || own.contains(&stem) {
             continue;
         }

@@ -1993,7 +1993,6 @@ impl BufferPool {
         )
     }
 
-
     /// Write `byte` over every buffer the moment it becomes free (#706), or
     /// stop. Fuzz builds only -- see `PoolInner::free_poison`.
     #[cfg(feature = "fuzzing")]
@@ -2268,11 +2267,7 @@ impl BufferPool {
             state.live_bytes += size;
             // A miss already pays `newBufferWithLength`; the scan over the
             // pending list says whether it was the deferred-release window.
-            let pending_same = state
-                .pending
-                .iter()
-                .filter(|n| n.size() == size)
-                .count();
+            let pending_same = state.pending.iter().filter(|n| n.size() == size).count();
             if pending_same > 0 {
                 state.counters.pending_twin_allocations += 1;
             }
@@ -4658,14 +4653,19 @@ mod contention_tests {
         drop(alloc(&pool, &dev, 4096));
 
         // Released in the open epoch, which has not completed: parked.
-        assert!(pool.acquire(4096).is_none(), "reused before the GPU finished");
+        assert!(
+            pool.acquire(4096).is_none(),
+            "reused before the GPU finished"
+        );
         let c = pool.counters();
         assert_eq!((c.hits, c.drained), (0, 0));
         assert_eq!(pool.occupancy().pending_buffers, 1);
 
         let e = clock.commit_epoch();
         clock.mark_completed(e);
-        let b = pool.acquire(4096).expect("a completed release must be reused");
+        let b = pool
+            .acquire(4096)
+            .expect("a completed release must be reused");
         let c = pool.counters();
         assert_eq!((c.hits, c.drained), (1, 1), "{c:?}");
         assert_eq!(pool.occupancy().pending_buffers, 0);
@@ -4767,7 +4767,10 @@ mod contention_tests {
         drop(held);
         let e = clock.commit_epoch();
         clock.mark_completed(e);
-        assert!(told.calls.lock().is_empty(), "nothing evicts before a drain");
+        assert!(
+            told.calls.lock().is_empty(),
+            "nothing evicts before a drain"
+        );
 
         // A size none of them answers: the drain frees 12672 B against a
         // 4096 B budget, and oldest-first eviction takes all three.

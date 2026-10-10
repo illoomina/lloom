@@ -1350,41 +1350,13 @@ mod metal_sdpa_tests {
         let v = f.v_pool.to_device(&metal)?;
         let q9 = randn(&mut rng, (1, LFM2_Q_HEADS, 9, LFM2_HEAD_DIM), &cpu)?.to_device(&metal)?;
         let q1 = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?.to_device(&metal)?;
-        let ok = lloom::nn::ops::sdpa_paged(
-            &q9,
-            &k,
-            &v,
-            false,
-            scale as f32,
-            32,
-            &f.table,
-            2,
-            41,
-        );
+        let ok = lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &f.table, 2, 41);
         assert!(ok.is_ok(), "the control must dispatch: {:?}", ok.err());
-        let decode = lloom::nn::ops::sdpa_paged(
-            &q1,
-            &k,
-            &v,
-            false,
-            scale as f32,
-            32,
-            &f.table,
-            2,
-            41,
-        );
+        let decode =
+            lloom::nn::ops::sdpa_paged(&q1, &k, &v, false, scale as f32, 32, &f.table, 2, 41);
         assert!(decode.is_err(), "q_seq == 1 must be refused");
-        let bad_page = lloom::nn::ops::sdpa_paged(
-            &q9,
-            &k,
-            &v,
-            false,
-            scale as f32,
-            48,
-            &f.table,
-            2,
-            41,
-        );
+        let bad_page =
+            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 48, &f.table, 2, 41);
         assert!(
             bad_page.is_err(),
             "page_size 48 is not a multiple of the key block"
@@ -1392,8 +1364,7 @@ mod metal_sdpa_tests {
         let past =
             lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &[0, 99], 2, 41);
         assert!(past.is_err(), "a page past the pool must be refused");
-        let short =
-            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &[0], 1, 41);
+        let short = lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &[0], 1, 41);
         assert!(
             short.is_err(),
             "a table shorter than the live pages must be refused"

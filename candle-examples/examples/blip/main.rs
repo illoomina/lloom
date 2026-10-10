@@ -9,9 +9,9 @@ use clap::Parser;
 
 use candle::{DType, Device, Result, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
 use lloom::models::blip;
 use lloom::models::quantized_blip;
+use lloom::nn::VarBuilder;
 
 use tokenizers::Tokenizer;
 
@@ -101,8 +101,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     let tokenizer = Tokenizer::from_file(tokenizer).map_err(E::msg)?;
     let mut tokenizer = TokenOutputStream::new(tokenizer);
-    let mut logits_processor =
-        lloom::generation::LogitsProcessor::new(1337, None, None);
+    let mut logits_processor = lloom::generation::LogitsProcessor::new(1337, None, None);
 
     let config = blip::Config::image_captioning_large();
 

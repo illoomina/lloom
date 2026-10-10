@@ -39,7 +39,10 @@ fn header_parses_and_iq_q2_0_tensors_dequant() {
     eprintln!("dtype histogram: {hist:?}");
     // The types this issue added must be present in the real file.
     for want in ["Q2_0", "IQ3XXS", "IQ4NL", "IQ2XS"] {
-        assert!(hist.contains_key(want), "expected {want} tensors in the checkpoint");
+        assert!(
+            hist.contains_key(want),
+            "expected {want} tensors in the checkpoint"
+        );
     }
 
     // CPU-dequant one Q2_0 expert-down tensor and one IQ tensor: exercises the
@@ -56,7 +59,11 @@ fn header_parses_and_iq_q2_0_tensors_dequant() {
         // Sanity: dequantized weights are finite and not all zero.
         assert!(v.iter().all(|x| x.is_finite()), "{name}: non-finite weight");
         assert!(v.iter().any(|&x| x != 0.0), "{name}: all-zero dequant");
-        eprintln!("{name}: {} elems, first {:?}", v.len(), &v[..4.min(v.len())]);
+        eprintln!(
+            "{name}: {} elems, first {:?}",
+            v.len(),
+            &v[..4.min(v.len())]
+        );
     }
 }
 
@@ -65,13 +72,19 @@ fn header_parses_and_iq_q2_0_tensors_dequant() {
 #[test]
 #[ignore = "needs the 44 GB IQ3_XXS checkpoint present"]
 fn dump_loader_facing_shapes() {
-    let Some(path) = checkpoint_path() else { return };
+    let Some(path) = checkpoint_path() else {
+        return;
+    };
     let mut f = std::fs::File::open(&path).expect("open gguf");
     let content = gguf_file::Content::read(&mut f).expect("parse gguf header");
     let mut names: Vec<&String> = content.tensor_infos.keys().collect();
     names.sort();
     for name in names {
-        if !name.starts_with("blk.") || name.starts_with("blk.0.") || name.starts_with("blk.3.") || name.starts_with("blk.1.ple") {
+        if !name.starts_with("blk.")
+            || name.starts_with("blk.0.")
+            || name.starts_with("blk.3.")
+            || name.starts_with("blk.1.ple")
+        {
             let ti = &content.tensor_infos[name];
             eprintln!("{name}: {:?} {:?}", ti.ggml_dtype, ti.shape.dims());
         }
@@ -92,16 +105,34 @@ fn dump_loader_facing_shapes() {
 #[test]
 #[ignore = "needs the 44 GB IQ3_XXS checkpoint present"]
 fn dump_ssm_scalars() {
-    let Some(path) = checkpoint_path() else { return };
+    let Some(path) = checkpoint_path() else {
+        return;
+    };
     let mut f = std::fs::File::open(&path).expect("open gguf");
     let content = gguf_file::Content::read(&mut f).expect("parse gguf header");
     let dev = lloom_tensor::Device::Cpu;
-    for name in ["blk.0.ssm_a", "blk.0.ssm_dt.bias", "blk.0.ssm_norm.weight", "blk.0.hc_attn_norm.weight", "blk.0.ffn_gate_inp_shexp.weight"] {
+    for name in [
+        "blk.0.ssm_a",
+        "blk.0.ssm_dt.bias",
+        "blk.0.ssm_norm.weight",
+        "blk.0.hc_attn_norm.weight",
+        "blk.0.ffn_gate_inp_shexp.weight",
+    ] {
         let qt = content.tensor(&mut f, name, &dev).expect("load");
-        let v = qt.dequantize(&dev).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let v = qt
+            .dequantize(&dev)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
         let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        eprintln!("{name}: n={} min={mn} max={mx} first={:?}", v.len(), &v[..6.min(v.len())]);
+        eprintln!(
+            "{name}: n={} min={mn} max={mx} first={:?}",
+            v.len(),
+            &v[..6.min(v.len())]
+        );
     }
 }
 
@@ -114,7 +145,9 @@ fn dump_ssm_scalars() {
 fn scan_for_nonfinite_weights() {
     use lloom_tensor::quantized::GgmlDType;
     use std::io::{Read, Seek, SeekFrom};
-    let Some(path) = checkpoint_path() else { return };
+    let Some(path) = checkpoint_path() else {
+        return;
+    };
     let mut f = std::fs::File::open(&path).expect("open gguf");
     let content = gguf_file::Content::read(&mut f).expect("parse gguf header");
     let mut names: Vec<&String> = content.tensor_infos.keys().collect();
@@ -128,24 +161,31 @@ fn scan_for_nonfinite_weights() {
         let size = n_elems / dt.block_size() * dt.type_size();
         buf.clear();
         buf.resize(size, 0);
-        f.seek(SeekFrom::Start(content.tensor_data_offset + ti.offset)).unwrap();
+        f.seek(SeekFrom::Start(content.tensor_data_offset + ti.offset))
+            .unwrap();
         f.read_exact(&mut buf).unwrap();
         let mut nonfinite = 0usize;
         let mut zero_scale = 0usize;
         match dt {
             GgmlDType::F32 => {
                 for c in buf.chunks_exact(4) {
-                    if !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite() { nonfinite += 1; }
+                    if !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite() {
+                        nonfinite += 1;
+                    }
                 }
             }
             GgmlDType::F16 => {
                 for c in buf.chunks_exact(2) {
-                    if !half::f16::from_le_bytes([c[0], c[1]]).to_f32().is_finite() { nonfinite += 1; }
+                    if !half::f16::from_le_bytes([c[0], c[1]]).to_f32().is_finite() {
+                        nonfinite += 1;
+                    }
                 }
             }
             GgmlDType::BF16 => {
                 for c in buf.chunks_exact(2) {
-                    if !half::bf16::from_le_bytes([c[0], c[1]]).to_f32().is_finite() { nonfinite += 1; }
+                    if !half::bf16::from_le_bytes([c[0], c[1]]).to_f32().is_finite() {
+                        nonfinite += 1;
+                    }
                 }
             }
             _ => {
@@ -161,8 +201,12 @@ fn scan_for_nonfinite_weights() {
                 };
                 for b in buf.chunks_exact(ts) {
                     let d = half::f16::from_le_bytes([b[d_off], b[d_off + 1]]).to_f32();
-                    if !d.is_finite() { nonfinite += 1; }
-                    if d == 0.0 { zero_scale += 1; }
+                    if !d.is_finite() {
+                        nonfinite += 1;
+                    }
+                    if d == 0.0 {
+                        zero_scale += 1;
+                    }
                 }
             }
         }
@@ -171,5 +215,8 @@ fn scan_for_nonfinite_weights() {
             eprintln!("BAD {name}: {dt:?} nonfinite={nonfinite} zero_scale={zero_scale} of {} blocks/elems", buf.len() / dt.type_size().max(1));
         }
     }
-    eprintln!("SCAN tensors={} with_nonfinite={bad}", content.tensor_infos.len());
+    eprintln!(
+        "SCAN tensors={} with_nonfinite={bad}",
+        content.tensor_infos.len()
+    );
 }

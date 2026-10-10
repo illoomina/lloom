@@ -136,7 +136,10 @@ pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
         eos_ids: &[u32],
         max_tokens: usize,
     ) -> Result<RowId>;
-    fn step(&mut self, on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>) -> Result<StepReport>;
+    fn step(
+        &mut self,
+        on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+    ) -> Result<StepReport>;
     fn cancel(&mut self, id: RowId) -> bool;
     fn take_finished(&mut self) -> Vec<(RowId, R, DecodeOut)>;
     fn drain_rows(&mut self) -> Vec<R>;
@@ -164,7 +167,10 @@ impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M,
     ) -> Result<RowId> {
         BatchDecoder::admit_with_eos(self, session, prompt, sampling, seed, eos_ids, max_tokens)
     }
-    fn step(&mut self, on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>) -> Result<StepReport> {
+    fn step(
+        &mut self,
+        on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>,
+    ) -> Result<StepReport> {
         BatchDecoder::step(self, on_tokens)
     }
     fn cancel(&mut self, id: RowId) -> bool {
@@ -494,7 +500,11 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
         let s = self.slot_of(id)?;
         let session: &Session<'m, M> = Borrow::borrow(&s.session);
         let fed = s.lane.prompt_off.min(s.prompt.len());
-        Some((session.seq.tokens(), &session.seq.cache, fed == s.prompt.len()))
+        Some((
+            session.seq.tokens(),
+            &session.seq.cache,
+            fed == s.prompt.len(),
+        ))
     }
 
     /// The token log row `id`'s cache will hold once its prompt is in: what

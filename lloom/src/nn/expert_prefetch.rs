@@ -1156,7 +1156,11 @@ fn stage_whole(w: &Shared, req: &Req) {
             let bytes = staged.bytes() as u64;
             let mut g = w.state.lock();
             if g.generation.get(&req.key).copied().unwrap_or(0) == req.generation {
-                let filed = if req.now { &mut g.done_now } else { &mut g.done };
+                let filed = if req.now {
+                    &mut g.done_now
+                } else {
+                    &mut g.done
+                };
                 filed.entry(req.key).or_default().push(staged);
                 drop(g);
                 w.counters.staged.fetch_add(1, Ordering::Relaxed);
@@ -1285,7 +1289,11 @@ mod tests {
             direct_pending: HashMap::from([(7, 1)]),
             assembling: HashMap::new(),
             next_asm: 0,
-            reqs: VecDeque::from([req(3, false, &file), req(3, true, &file), req(4, false, &file)]),
+            reqs: VecDeque::from([
+                req(3, false, &file),
+                req(3, true, &file),
+                req(4, false, &file),
+            ]),
             done: HashMap::new(),
             done_now: HashMap::new(),
             generation: HashMap::new(),

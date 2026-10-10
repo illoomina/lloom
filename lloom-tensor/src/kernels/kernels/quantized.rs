@@ -811,7 +811,12 @@ pub fn call_quantized_matmul_mv_t(
 
     let iq_shared = needs_iq_shared(dtype);
 
-    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let pipeline = kernels.load_pipeline_with_constants(
+        device,
+        Source::Quantized,
+        name.clone(),
+        mv_constants(dtype),
+    )?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

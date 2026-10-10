@@ -818,11 +818,14 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
         .iter()
         .filter(|(key, ..)| matches!(key.kind, PassKind::Verify { k: w } if w as usize == k + 1))
         .count();
-    assert_eq!(full, 1, "the full rounds share one K+1 window key: {kinds:?}");
+    assert_eq!(
+        full, 1,
+        "the full rounds share one K+1 window key: {kinds:?}"
+    );
     assert!(
-        verify
-            .iter()
-            .all(|(key, ..)| matches!(key.kind, PassKind::Verify { k: w } if (w as usize) <= k + 1)),
+        verify.iter().all(
+            |(key, ..)| matches!(key.kind, PassKind::Verify { k: w } if (w as usize) <= k + 1)
+        ),
         "only the budget's tail rounds take a narrower window, none a wider one: {kinds:?}"
     );
     assert_eq!(c.evicted, 0, "a verify drifted under its own plan: {c:?}");

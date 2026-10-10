@@ -6,8 +6,8 @@
 //! This implementation supports the LFM2ForCausalLM architecture from HuggingFace transformers.
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
-use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::kv_quant::QuantKvSlab;
+use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
@@ -4936,10 +4936,8 @@ impl<P: Profile> State<P> {
             b.prefill_geometry.conv_layers,
             b.prefill_geometry.attention_layers,
         );
-        b.conv_state_bytes = conv_layers
-            * config.hidden_size
-            * config.conv_state.width(config.conv_l_cache)
-            * 2;
+        b.conv_state_bytes =
+            conv_layers * config.hidden_size * config.conv_state.width(config.conv_l_cache) * 2;
         b.kv_bytes_per_token =
             2 * config.num_key_value_heads * config.head_dim() * 2 * attention_layers;
         b
@@ -6465,12 +6463,7 @@ impl<P: Profile> Attention<P> {
         match first {
             Some(f) => {
                 matches!(dtype, DType::F16 | DType::F32)
-                    && f.shared()
-                        .expect("checked")
-                        .pool
-                        .inner
-                        .lock()
-                        .batched_arms
+                    && f.shared().expect("checked").pool.inner.lock().batched_arms
             }
             None => false,
         }
@@ -7364,8 +7357,7 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         // At a position whose keys reach the 2-pass length, the vector
         // kernel is two launches: the partials, then their merge.
         let two_pass = self.route.decode == DecodeAttn::SdpaVector
-            && w
-                .position()
+            && w.position()
                 .is_some_and(|p| crate::nn::ops::sdpa_vector_two_pass(p + 1, hd, dt));
         let y = if two_pass {
             let partial = w.opaque("sdpa_vector_2pass_1", &[qr, k_all, v_all], out.clone(), dt);
@@ -7997,14 +7989,7 @@ impl<P: Profile> ShortConv<P> {
             }
         }
         match first {
-            Some(f) => {
-                f.shared()
-                    .expect("checked")
-                    .pool
-                    .inner
-                    .lock()
-                    .batched_arms
-            }
+            Some(f) => f.shared().expect("checked").pool.inner.lock().batched_arms,
             None => false,
         }
     }
@@ -8677,7 +8662,8 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
                         let tail = w.view("narrow", state, Shape::of(&[1, h, lc - 1]));
                         let gathered =
                             w.opaque("copy_strided", &[tail], Shape::of(&[1, h, lc - 1]), dt);
-                        let shifted = w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
+                        let shifted =
+                            w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
                         let next = w.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dt);
                         ring.extend([tail, gathered, shifted, next]);
                         next
@@ -9382,7 +9368,8 @@ fn derive_fusion<P: Profile>(
             )
         }
     };
-    let uniform = |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
+    let uniform =
+        |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
@@ -9432,9 +9419,8 @@ fn derive_fusion<P: Profile>(
                 && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
-        let known_prologue = !pro
-            || *site == lm_head
-            || norm_kinds.iter().any(|k| site.ends_with(k));
+        let known_prologue =
+            !pro || *site == lm_head || norm_kinds.iter().any(|k| site.ends_with(k));
         if !(known_epilogue && known_prologue) {
             lloom_tensor::bail!(
                 "lfm2 fusion=derived: the plan fuses `{b}` onto `{site}`, a site no flag \
@@ -9861,7 +9847,12 @@ impl<P: Profile> Model<P> {
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
         if seq_len == 1
-            && norm_gemv_applies(self.norm_gemv_head, &hidden_states, &self.embedding_norm, &self.lm_head)
+            && norm_gemv_applies(
+                self.norm_gemv_head,
+                &hidden_states,
+                &self.embedding_norm,
+                &self.lm_head,
+            )
         {
             let last = hidden_states.squeeze(1)?;
             let logits = norm_gemv(&last, &self.embedding_norm, &self.lm_head, false)?;

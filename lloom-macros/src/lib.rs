@@ -550,7 +550,11 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
             }
         }
     });
-    let flag_list = axes.iter().map(|(_, _, a)| a.flag.clone()).collect::<Vec<_>>().join(", ");
+    let flag_list = axes
+        .iter()
+        .map(|(_, _, a)| a.flag.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
     let line_parts = axes.iter().map(|(ident, _ty, attr)| {
         let name = &attr.name;
         quote! { parts.push(format!("{}={:?}", #name, self.#ident)); }

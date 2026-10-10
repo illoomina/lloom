@@ -501,12 +501,14 @@ mod tests {
         for f in crate::optimizer::catalogue() {
             let t = ExclusionSet::fragment_transform(f.name);
             match (f.core, f.side) {
-                (crate::optimizer::Core::Gemv, crate::optimizer::fragments::Side::Store) => assert!(
-                    matches!(set.lookup(&t, &f.model), Lookup::Validated(v) if v.verdict == Verdict::Admit),
-                    "{t} under {}: {:?}",
-                    f.model,
-                    set.get(&t)
-                ),
+                (crate::optimizer::Core::Gemv, crate::optimizer::fragments::Side::Store) => {
+                    assert!(
+                        matches!(set.lookup(&t, &f.model), Lookup::Validated(v) if v.verdict == Verdict::Admit),
+                        "{t} under {}: {:?}",
+                        f.model,
+                        set.get(&t)
+                    )
+                }
                 _ => assert!(
                     matches!(set.lookup(&t, &f.model), Lookup::Unvalidated),
                     "{t} under {}: {:?}",

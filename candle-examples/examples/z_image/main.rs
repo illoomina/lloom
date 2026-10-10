@@ -34,14 +34,14 @@
 
 use anyhow::{Error as E, Result};
 use candle::{DType, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
+use clap::Parser;
+use hf_hub::api::sync::Api;
 use lloom::models::z_image::{
     calculate_shift, get_noise, postprocess_image, AutoEncoderKL, Config,
     FlowMatchEulerDiscreteScheduler, SchedulerConfig, TextEncoderConfig, VaeConfig,
     ZImageTextEncoder, ZImageTransformer2DModel,
 };
-use clap::Parser;
-use hf_hub::api::sync::Api;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 /// Z-Image scheduler constants

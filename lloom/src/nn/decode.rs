@@ -1235,12 +1235,18 @@ struct PacerQueue<M> {
 #[cfg(any(feature = "metal", test))]
 impl<M> PacerQueue<M> {
     fn new(capacity: usize) -> Self {
-        Self { entries: std::collections::VecDeque::with_capacity(capacity), queued_steps: 0 }
+        Self {
+            entries: std::collections::VecDeque::with_capacity(capacity),
+            queued_steps: 0,
+        }
     }
 
     fn push(&mut self, marker: M, steps: usize) {
         debug_assert!(steps > 0);
-        debug_assert!(self.entries.len() < self.entries.capacity(), "pacer setup must reserve its bound");
+        debug_assert!(
+            self.entries.len() < self.entries.capacity(),
+            "pacer setup must reserve its bound"
+        );
         self.entries.push_back((marker, steps));
         self.queued_steps += steps;
     }
@@ -1269,8 +1275,18 @@ impl StepPacer {
 
     /// Reserve the largest bound this run can use before encoding starts.
     fn for_decode(opts: &DecodeOptions) -> Self {
-        let capacity = opts.pacer_depth().max(opts.prefill_pacer_depth)
-            .max(if opts.adaptive_commit { 2 * if opts.run_ahead == 0 { 8 } else { opts.run_ahead } } else { 0 });
+        let capacity =
+            opts.pacer_depth()
+                .max(opts.prefill_pacer_depth)
+                .max(if opts.adaptive_commit {
+                    2 * if opts.run_ahead == 0 {
+                        8
+                    } else {
+                        opts.run_ahead
+                    }
+                } else {
+                    0
+                });
         let mut pacer = Self::new(capacity);
         pacer.set_depth(opts.pacer_depth());
         pacer
@@ -4068,16 +4084,25 @@ mod pacer_queue_tests {
         // Fixed prefill, then adaptive multi-step commits in the same queue.
         for step in 0..10000 {
             if step < 100 {
-                while q.entries.len() >= 2 { q.retire(|_| Ok(false))?; }
+                while q.entries.len() >= 2 {
+                    q.retire(|_| Ok(false))?;
+                }
                 q.push(step, 1);
             } else {
-                while q.queued_steps >= 8 { q.retire(|_| Ok(true))?; }
+                while q.queued_steps >= 8 {
+                    q.retire(|_| Ok(true))?;
+                }
                 q.push(step, step % 4 + 1);
             }
-            assert_eq!(q.queued_steps, q.entries.iter().map(|(_, n)| n).sum::<usize>());
+            assert_eq!(
+                q.queued_steps,
+                q.entries.iter().map(|(_, n)| n).sum::<usize>()
+            );
             assert_eq!(q.entries.capacity(), capacity);
         }
-        while !q.entries.is_empty() { q.retire(|_| Ok(false))?; }
+        while !q.entries.is_empty() {
+            q.retire(|_| Ok(false))?;
+        }
         assert_eq!(q.queued_steps, 0);
         Ok(())
     }
@@ -4094,8 +4119,12 @@ mod pacer_queue_tests {
 
     #[test]
     fn pacer_reserves_prefill_and_adaptive_bounds_before_decode() {
-        let opts = DecodeOptions { prefill_pacer_depth: 24, adaptive_commit: true,
-            run_ahead: 16, ..DecodeOptions::new(32) };
+        let opts = DecodeOptions {
+            prefill_pacer_depth: 24,
+            adaptive_commit: true,
+            run_ahead: 16,
+            ..DecodeOptions::new(32)
+        };
         let p = StepPacer::for_decode(&opts);
         assert_eq!(p.depth, opts.pacer_depth().max(IN_FLIGHT_FLOOR));
         #[cfg(feature = "metal")]

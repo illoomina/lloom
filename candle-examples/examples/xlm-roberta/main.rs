@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use lloom::nn::ops::softmax;
-use lloom::nn::VarBuilder;
+use clap::{Parser, ValueEnum};
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use lloom::models::xlm_roberta::{
     Config, XLMRobertaForMaskedLM, XLMRobertaForSequenceClassification,
 };
-use clap::{Parser, ValueEnum};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::ops::softmax;
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Debug, Clone, ValueEnum)]

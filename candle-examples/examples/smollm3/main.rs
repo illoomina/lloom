@@ -12,9 +12,9 @@ use candle::{DType, Device, Tensor};
 use candle_examples::chat_template::{ChatTemplate, ChatTemplateOptions, Message};
 use candle_examples::token_output_stream::TokenOutputStream;
 
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 // Import both model implementations

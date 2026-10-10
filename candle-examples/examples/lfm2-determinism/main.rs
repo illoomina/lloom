@@ -1148,8 +1148,10 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
             // accumulate for the lifetime of the standalone harness thread.
             let _pool = candle::AutoreleaseScope::new();
             let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
-            model.forward(&input, kv_len, &mut cache)
-                .context("prefill forward pass")?.squeeze(0)?
+            model
+                .forward(&input, kv_len, &mut cache)
+                .context("prefill forward pass")?
+                .squeeze(0)?
         };
         kv_len += turn_ids.len();
         turns_run = turn + 1;

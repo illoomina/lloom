@@ -444,7 +444,9 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
 
     let mut items: Vec<Field> = Vec::new();
     for f in fields {
-        let Some(ident) = f.ident.clone() else { continue };
+        let Some(ident) = f.ident.clone() else {
+            continue;
+        };
         let mut attr = OptAttr::default();
         let mut tagged = false;
         for a in &f.attrs {
@@ -790,11 +792,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
     // ---- 5. META ----------------------------------------------------------
     let meta_items = items.iter().filter(|f| !f.attr.skip).map(|f| {
         let key = f.ident.to_string();
-        let flag = f
-            .attr
-            .flag
-            .clone()
-            .unwrap_or_else(|| key.replace('_', "-"));
+        let flag = f.attr.flag.clone().unwrap_or_else(|| key.replace('_', "-"));
         let internal = &f.doc;
         let doc = user_doc(&f.doc);
         let env = match &f.attr.env {
@@ -846,7 +844,11 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         } else {
             quote!(::std::option::Option::None)
         };
-        let flag = if f.attr.nested && !compound { String::new() } else { flag };
+        let flag = if f.attr.nested && !compound {
+            String::new()
+        } else {
+            flag
+        };
         let is_bool = f.attr.is_bool;
         quote! {
             #krate::options::KnobMeta {

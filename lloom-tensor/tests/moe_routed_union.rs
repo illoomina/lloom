@@ -35,7 +35,11 @@ fn device() -> Result<Device> {
 /// The kernels a closure ran whose names carry the union's suffix.
 fn union_kernels(dev: &Device, f: impl FnOnce() -> Result<()>) -> Result<u64> {
     dev.synchronize()?;
-    let window = dev.as_metal_device()?.dispatch_census().open().expect("a window");
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("a window");
     f()?;
     dev.synchronize()?;
     Ok(window

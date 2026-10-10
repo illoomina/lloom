@@ -135,8 +135,7 @@ pub static TO_CPU_STAGED_READBACK: std::sync::atomic::AtomicU64 =
 /// Of `TO_CPU_STAGED_READBACK`, the reads that waited on their blit's
 /// command buffer: a host sync. A deferred stage reads after a drain some
 /// other readback already waited for, and is not one.
-pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Reads of a host-read slot ([`HostSlot::read`]): the producing kernel
 /// wrote a Shared, persistent buffer the host reads in place, so there is no
@@ -2271,15 +2270,25 @@ impl BackendStorage for MetalStorage {
             && !crate::tuning::contract().is_fast()
             && !lhs_l.is_contiguous()
         {
-            let contiguous = self.device.new_buffer_builder()
+            let contiguous = self
+                .device
+                .new_buffer_builder()
                 .with_size_for(lhs_l.shape().elem_count(), self.dtype)
                 .with_label("deterministic matmul activation")
                 .build()?;
-            let mut lhs = Self::new(contiguous, self.device.clone(),
-                lhs_l.shape().elem_count(), self.dtype);
+            let mut lhs = Self::new(
+                contiguous,
+                self.device.clone(),
+                lhs_l.shape().elem_count(),
+                self.dtype,
+            );
             self.copy_strided_src(&mut lhs, 0, lhs_l)?;
-            return lhs.matmul(rhs, (b, m, n, k),
-                &Layout::contiguous(lhs_l.shape().clone()), rhs_l);
+            return lhs.matmul(
+                rhs,
+                (b, m, n, k),
+                &Layout::contiguous(lhs_l.shape().clone()),
+                rhs_l,
+            );
         }
         let buffer = self
             .device

@@ -78,7 +78,10 @@ mod tests {
             .join();
         let err = second.expect_err("a second test is refused");
         let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
-        assert!(msg.contains("first::test") && msg.contains("second::test"), "{msg}");
+        assert!(
+            msg.contains("first::test") && msg.contains("second::test"),
+            "{msg}"
+        );
         let unnamed = std::thread::spawn(|| claim("tuning")).join();
         assert!(unnamed.is_ok(), "an unnamed thread claims nothing");
     }

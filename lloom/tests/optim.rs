@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use lloom_tensor::test_utils::{to_vec0_round, to_vec2_round};
 
 use anyhow::Result;
-use lloom_tensor::{DType, Device, Tensor, Var};
 use lloom::nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, SGD};
+use lloom_tensor::{DType, Device, Tensor, Var};
 
 #[test]
 fn sgd_optim() -> Result<()> {

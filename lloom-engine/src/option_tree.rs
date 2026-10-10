@@ -655,11 +655,13 @@ mod tests {
             let b = s.as_bytes();
             s.contains('§')
                 || s.contains("DESIGN")
-                || (0..b.len()).any(|i| b[i] == b'#' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
-                || s.split(|c: char| c.is_whitespace() || "(),;`".contains(c)).any(|w| {
-                    let w = w.trim_end_matches(['.', ':']);
-                    [".rs", ".md", ".metal"].iter().any(|e| w.ends_with(e))
-                })
+                || (0..b.len())
+                    .any(|i| b[i] == b'#' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+                || s.split(|c: char| c.is_whitespace() || "(),;`".contains(c))
+                    .any(|w| {
+                        let w = w.trim_end_matches(['.', ':']);
+                        [".rs", ".md", ".metal"].iter().any(|e| w.ends_with(e))
+                    })
         };
         let bad: Vec<String> = index()
             .keys
@@ -674,7 +676,10 @@ mod tests {
             .values()
             .filter(|k| is_ref(k.meta().internal))
             .count();
-        assert!(internal > 20, "the notes are kept: {internal} keys' internal notes cite one");
+        assert!(
+            internal > 20,
+            "the notes are kept: {internal} keys' internal notes cite one"
+        );
     }
 
     #[test]

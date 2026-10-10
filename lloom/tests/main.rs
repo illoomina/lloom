@@ -156,8 +156,14 @@ fn every_test_file_is_a_module() {
     let mut missing = Vec::new();
     let mut files = 0;
     for entry in std::fs::read_dir(dir).expect("tests/ is readable") {
-        let name = entry.expect("an entry").file_name().into_string().expect("utf-8");
-        let Some(stem) = name.strip_suffix(".rs") else { continue };
+        let name = entry
+            .expect("an entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8");
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
         if stem == "main" || own.contains(&stem) {
             continue;
         }

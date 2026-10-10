@@ -393,6 +393,54 @@ pub(crate) struct Attention {
 }
 
 impl Attention {
+    /// Compose the same attention block from already loaded projections.
+    /// Packed-QKV checkpoints split their weights once at load, not per pass.
+    /// This does not select a new attention backend or change `forward`.
+    pub(crate) fn from_projections(
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        out_proj: Linear,
+        num_heads: usize,
+    ) -> Result<Self> {
+        let (embed_dim, input_dim) = q_proj.weight().dims2()?;
+        if embed_dim == 0 || input_dim != embed_dim || num_heads == 0 {
+            lloom_tensor::bail!(
+                "attention components require square nonempty projections and positive heads"
+            )
+        }
+        if embed_dim % num_heads != 0 {
+            lloom_tensor::bail!("attention width {embed_dim} is not divisible by {num_heads} heads")
+        }
+        for (name, projection) in [
+            ("query", &q_proj),
+            ("key", &k_proj),
+            ("value", &v_proj),
+            ("output", &out_proj),
+        ] {
+            if projection.weight().dims2()? != (embed_dim, embed_dim) {
+                lloom_tensor::bail!(
+                    "attention {name} projection must be {embed_dim} by {embed_dim}"
+                )
+            }
+            if let Some(bias) = projection.bias() {
+                if bias.dims1()? != embed_dim {
+                    lloom_tensor::bail!("attention {name} bias must have {embed_dim} elements")
+                }
+            }
+        }
+        let head_dim = embed_dim / num_heads;
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            num_heads,
+            head_dim,
+            scale: (head_dim as f64).powf(-0.5),
+        })
+    }
+
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let embed_dim = cfg.hidden_size();
         let q_proj = linear(embed_dim, embed_dim, vb.pp("q_proj"))?;
@@ -448,6 +496,19 @@ pub(crate) struct Mlp {
 }
 
 impl Mlp {
+    /// Compose existing feed-forward execution with another checkpoint spelling.
+    pub(crate) fn from_parts(
+        fc1: Linear,
+        fc2: Linear,
+        activation_fn: crate::nn::Activation,
+    ) -> Self {
+        Self {
+            fc1,
+            fc2,
+            activation_fn,
+        }
+    }
+
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let intermediate_size = cfg.intermediate_size();
@@ -479,6 +540,21 @@ pub(crate) struct EncoderLayer {
 }
 
 impl EncoderLayer {
+    /// Assemble pre-norm residual blocks without changing their execution order.
+    pub(crate) fn from_parts(
+        self_attn: Attention,
+        layer_norm1: LayerNorm,
+        mlp: Mlp,
+        layer_norm2: LayerNorm,
+    ) -> Self {
+        Self {
+            self_attn,
+            layer_norm1,
+            mlp,
+            layer_norm2,
+        }
+    }
+
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let layer_norm_eps = cfg.layer_norm_eps();
@@ -512,6 +588,11 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
+    /// A loader may assemble the same stack from differently named components.
+    pub(crate) fn from_layers(layers: Vec<EncoderLayer>) -> Self {
+        Self { layers }
+    }
+
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let mut layers = vec![];
         let vb = vb.pp("layers");
@@ -806,5 +887,191 @@ impl Model {
             .broadcast_add(&self.logit_bias)?;
         let logits_per_image = logits_per_text.t()?;
         Ok((logits_per_text, logits_per_image))
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+    use lloom_tensor::{DType, Device};
+    use std::collections::HashMap;
+
+    fn config() -> VisionConfig {
+        VisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_channels: 3,
+            image_size: 2,
+            patch_size: 1,
+            hidden_act: crate::nn::Activation::Relu,
+            layer_norm_eps: 1e-5,
+        }
+    }
+
+    fn weights(cfg: &VisionConfig) -> Result<HashMap<String, Tensor>> {
+        let mut tensors = HashMap::new();
+        for l in 0..cfg.num_hidden_layers {
+            for (name, rows, cols) in [
+                ("self_attn.q_proj", 4, 4),
+                ("self_attn.k_proj", 4, 4),
+                ("self_attn.v_proj", 4, 4),
+                ("self_attn.out_proj", 4, 4),
+                ("mlp.fc1", 8, 4),
+                ("mlp.fc2", 4, 8),
+            ] {
+                let values: Vec<f32> = (0..rows * cols)
+                    .map(|i| ((i + 3 * l) % 11) as f32 / 32. - 0.125)
+                    .collect();
+                tensors.insert(
+                    format!("layers.{l}.{name}.weight"),
+                    Tensor::from_vec(values, (rows, cols), &Device::Cpu)?,
+                );
+                tensors.insert(
+                    format!("layers.{l}.{name}.bias"),
+                    Tensor::from_vec(
+                        (0..rows).map(|i| i as f32 / 64.).collect::<Vec<_>>(),
+                        rows,
+                        &Device::Cpu,
+                    )?,
+                );
+            }
+            for name in ["layer_norm1", "layer_norm2"] {
+                tensors.insert(
+                    format!("layers.{l}.{name}.weight"),
+                    Tensor::from_slice(&[0.75f32, 1., 1.25, 1.5], 4, &Device::Cpu)?,
+                );
+                tensors.insert(
+                    format!("layers.{l}.{name}.bias"),
+                    Tensor::from_slice(&[-0.125f32, 0., 0.125, 0.25], 4, &Device::Cpu)?,
+                );
+            }
+        }
+        Ok(tensors)
+    }
+
+    #[test]
+    fn component_stack_matches_existing_loader_with_and_without_additive_mask() -> Result<()> {
+        let cfg = config();
+        let vb = VarBuilder::from_tensors(weights(&cfg)?, DType::F32, &Device::Cpu);
+        let original = Encoder::new(&cfg, vb.clone())?;
+        let mut layers = Vec::new();
+        for l in 0..cfg.num_hidden_layers {
+            let v = vb.pp("layers").pp(l);
+            let a = v.pp("self_attn");
+            let attention = Attention::from_projections(
+                linear(4, 4, a.pp("q_proj"))?,
+                linear(4, 4, a.pp("k_proj"))?,
+                linear(4, 4, a.pp("v_proj"))?,
+                linear(4, 4, a.pp("out_proj"))?,
+                2,
+            )?;
+            let mlp = Mlp::from_parts(
+                linear(4, 8, v.pp("mlp.fc1"))?,
+                linear(8, 4, v.pp("mlp.fc2"))?,
+                cfg.hidden_act,
+            );
+            layers.push(EncoderLayer::from_parts(
+                attention,
+                layer_norm(4, cfg.layer_norm_eps, v.pp("layer_norm1"))?,
+                mlp,
+                layer_norm(4, cfg.layer_norm_eps, v.pp("layer_norm2"))?,
+            ));
+        }
+        let composed = Encoder::from_layers(layers);
+        let x = Tensor::from_vec(
+            (0..24)
+                .map(|i| (i % 13) as f32 / 8. - 0.75)
+                .collect::<Vec<_>>(),
+            (2, 3, 4),
+            &Device::Cpu,
+        )?;
+        let mask = Tensor::from_slice(
+            &[0f32, -2., -1e4, -1e4, 0.5, 0., 0., -1e4, -0.5],
+            (1, 1, 3, 3),
+            &Device::Cpu,
+        )?;
+        for mask in [None, Some(&mask)] {
+            let expected = original
+                .forward(&x, mask)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = composed
+                .forward(&x, mask)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(expected.iter().all(|x| x.is_finite()));
+            assert_eq!(
+                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn projection_constructor_rejects_bad_geometry_before_forward() -> Result<()> {
+        let make = |rows, cols, bias: Option<usize>| -> Result<Linear> {
+            Ok(Linear::new(
+                Tensor::zeros((rows, cols), DType::F32, &Device::Cpu)?,
+                bias.map(|n| Tensor::zeros(n, DType::F32, &Device::Cpu))
+                    .transpose()?,
+            ))
+        };
+        let valid = make(4, 4, Some(4))?;
+        for heads in [0, 3, 5] {
+            assert!(Attention::from_projections(
+                valid.clone(),
+                valid.clone(),
+                valid.clone(),
+                valid.clone(),
+                heads
+            )
+            .is_err());
+        }
+        for bad in [make(0, 0, None)?, make(4, 3, None)?, make(4, 4, Some(3))?] {
+            assert!(Attention::from_projections(
+                bad.clone(),
+                valid.clone(),
+                valid.clone(),
+                valid.clone(),
+                2
+            )
+            .is_err());
+            assert!(Attention::from_projections(
+                valid.clone(),
+                bad.clone(),
+                valid.clone(),
+                valid.clone(),
+                2
+            )
+            .is_err());
+            assert!(Attention::from_projections(
+                valid.clone(),
+                valid.clone(),
+                bad.clone(),
+                valid.clone(),
+                2
+            )
+            .is_err());
+            assert!(Attention::from_projections(
+                valid.clone(),
+                valid.clone(),
+                valid.clone(),
+                bad,
+                2
+            )
+            .is_err());
+        }
+        assert!(Attention::from_projections(
+            make(4, 4, None)?,
+            valid.clone(),
+            valid.clone(),
+            valid,
+            2
+        )
+        .is_ok());
+        Ok(())
     }
 }

@@ -72,6 +72,7 @@ mod indexer;
 pub mod isolation;
 pub mod layout;
 pub mod machine;
+mod memory_accounting;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their
 /// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).

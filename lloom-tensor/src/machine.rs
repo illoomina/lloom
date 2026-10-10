@@ -1430,6 +1430,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_update_and_restore_leave_a_live_uncertain_entry_refused() {
+        let dir = tmp_registry("double-write-failure");
+        let reg = Registry::open(&dir).unwrap();
+        let h = reg.reserve_unchecked("live", 100).unwrap();
+        {
+            let _guard = reg.guard().unwrap();
+            let previous = h.entry.lock().clone();
+            let mut next = previous.clone();
+            next.reserved = 200;
+            let mut calls = 0;
+            let error = replace_entry(&mut h.file.lock(), &previous, &next, |f, _| {
+                calls += 1;
+                f.set_len(0)?;
+                Err(io::Error::other("injected write and restore failure"))
+            })
+            .unwrap_err();
+            assert_eq!(calls, 2);
+            assert!(error.to_string().contains("restoration failed"), "{error}");
+            assert!(error.to_string().contains("release this holding"), "{error}");
+        }
+        assert_eq!(h.reserved(), 100, "uncommitted growth stays unpublished");
+        let error = reg.entries().unwrap_err().to_string();
+        assert!(error.contains("admission cannot establish room"), "{error}");
+        assert!(h.path().exists(), "never delete the live uncertain entry");
+        drop(h);
+        assert!(reg.entries().unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_torn_record_never_decodes_a_partial_reserved_number() {
         // Decimal length changes are important: overwriting 900 with 1000
         // without truncating first could leave a valid but unsafe 100.
@@ -1538,3 +1568,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "machine_process_tests.rs"]
+mod process_tests;

@@ -381,6 +381,22 @@ impl Module for MultiheadAttentionPoolingHead {
     }
 }
 
+/// Existing SigLIP default: preserve operation order and dtype.
+fn dense_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    attention_mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let weights = (q.matmul(&k.t()?)? * scale)?;
+    let weights = match attention_mask {
+        None => weights,
+        Some(mask) => weights.broadcast_add(mask)?,
+    };
+    crate::nn::ops::softmax_last_dim(&weights)?.matmul(v)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Attention {
     q_proj: Linear,
@@ -461,6 +477,23 @@ impl Attention {
     }
 
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_attention(xs, attention_mask, &mut dense_attention)
+    }
+
+    /// Reuse projections with caller-owned, monomorphized attention dispatch.
+    /// The callback receives contiguous [B,H,L,D] Q/K/V, the unchanged mask
+    /// and scale, and returns [B,H,L,D] on the same device and in the same dtype.
+    /// Compact-mask policies may live in the callback rather than allocating
+    /// a full L-by-L mask before this call. This seam itself sets no budget.
+    pub(crate) fn forward_with_attention<F>(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
         let (batch_size, q_len, _) = xs.dims3()?;
         let query_states = xs.apply(&self.q_proj)?;
         let key_states = xs.apply(&self.k_proj)?;
@@ -471,15 +504,22 @@ impl Attention {
         let key_states = key_states.reshape(shape)?.transpose(1, 2)?.contiguous()?;
         let value_states = value_states.reshape(shape)?.transpose(1, 2)?.contiguous()?;
 
-        let attn_weights = (query_states.matmul(&key_states.t()?)? * self.scale)?;
-        let attn_weights = match attention_mask {
-            None => attn_weights,
-            Some(mask) => attn_weights.broadcast_add(mask)?,
-        };
-        // The original implementation upcasts to f32 but crate::nn::ops::softmax should handle this properly.
-        let attn_weights = crate::nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_outputs = attn_weights
-            .matmul(&value_states)?
+        let attended = attend(
+            &query_states,
+            &key_states,
+            &value_states,
+            attention_mask,
+            self.scale,
+        )?;
+        if attended.dims() != [batch_size, self.num_heads, q_len, self.head_dim]
+            || attended.dtype() != query_states.dtype()
+            || !attended.device().same_device(query_states.device())
+        {
+            lloom_tensor::bail!(
+                "attention callback must preserve [B,H,L,D] shape, dtype and device"
+            )
+        }
+        let attn_outputs = attended
             .transpose(1, 2)?
             .reshape((batch_size, q_len, ()))?
             .apply(&self.out_proj)?;
@@ -571,9 +611,23 @@ impl EncoderLayer {
     }
 
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_attention(xs, attention_mask, &mut dense_attention)
+    }
+
+    pub(crate) fn forward_with_attention<F>(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
         let residual = xs;
         let xs = xs.apply(&self.layer_norm1)?;
-        let xs = self.self_attn.forward(&xs, attention_mask)?;
+        let xs = self
+            .self_attn
+            .forward_with_attention(&xs, attention_mask, attend)?;
         let xs = (residual + xs)?;
         let residual = &xs;
         let xs = xs.apply(&self.layer_norm2)?.apply(&self.mlp)?;
@@ -604,9 +658,21 @@ impl Encoder {
     }
 
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_attention(xs, attention_mask, &mut dense_attention)
+    }
+
+    pub(crate) fn forward_with_attention<F>(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
         let mut xs = xs.clone();
         for layer in self.layers.iter() {
-            xs = layer.forward(&xs, attention_mask)?
+            xs = layer.forward_with_attention(&xs, attention_mask, attend)?
         }
         Ok(xs)
     }
@@ -992,7 +1058,24 @@ mod component_tests {
             (1, 1, 3, 3),
             &Device::Cpu,
         )?;
-        for mask in [None, Some(&mask)] {
+        // Captured from the original production forward before callback factoring.
+        // The raw pre-factor log records source hash and exact machine/command.
+        // Portable tolerance avoids asserting cross-architecture reduction bits.
+        let golden_bits: [[u32; 24]; 2] = [
+            [
+                3206781994, 3203708153, 3201896840, 1018045364, 3188617388, 1018474628, 1033615838,
+                1057321246, 1052297129, 1057334660, 1058240316, 1065531535, 1062202343, 3206063862,
+                3205099284, 3196998335, 3196307605, 3189721012, 3161067640, 1053239214, 1048080086,
+                1051745319, 1056485244, 1063490520,
+            ],
+            [
+                3206781995, 3203708154, 3201896840, 1018045352, 3188617388, 1018474636, 1033615836,
+                1057321246, 1052297129, 1057334660, 1058240316, 1065531535, 1062208295, 3207627715,
+                3203783499, 3197448061, 3196532651, 3184704685, 3175653896, 1053484064, 1048436732,
+                1050127430, 1057267118, 1063364322,
+            ],
+        ];
+        for (case, mask) in [None, Some(&mask)].into_iter().enumerate() {
             let expected = original
                 .forward(&x, mask)?
                 .flatten_all()?
@@ -1002,6 +1085,36 @@ mod component_tests {
                 .flatten_all()?
                 .to_vec1::<f32>()?;
             assert!(expected.iter().all(|x| x.is_finite()));
+            for (&value, &bits) in expected.iter().zip(&golden_bits[case]) {
+                assert!((value - f32::from_bits(bits)).abs() <= 1e-6);
+            }
+            let mut calls = 0;
+            let via_callback = composed
+                .forward_with_attention(&x, mask, &mut |q, k, v, seen_mask, scale| {
+                    calls += 1;
+                    assert_eq!(q.dims(), [2, 2, 3, 2]);
+                    assert_eq!(q.dims(), k.dims());
+                    assert_eq!(q.dims(), v.dims());
+                    assert!(q.is_contiguous() && k.is_contiguous() && v.is_contiguous());
+                    assert_eq!(scale.to_bits(), (2f64).powf(-0.5).to_bits());
+                    assert_eq!(
+                        seen_mask.map(|m| m as *const Tensor),
+                        mask.map(|m| m as *const Tensor)
+                    );
+                    dense_attention(q, k, v, seen_mask, scale)
+                })?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(calls, 2);
+            assert_eq!(
+                via_callback.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+            println!(
+                "SIGLIP_GOLDEN_MASK={}; BITS={:?}",
+                mask.is_some(),
+                expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
             assert_eq!(
                 actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                 expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
@@ -1072,6 +1185,57 @@ mod component_tests {
             2
         )
         .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn callback_output_contract_rejects_shape_and_dtype_and_propagates_errors() -> Result<()> {
+        let cfg = config();
+        let vb = VarBuilder::from_tensors(weights(&cfg)?, DType::F32, &Device::Cpu);
+        let attention = Attention::new(&cfg, vb.pp("layers.0.self_attn"))?;
+        let x = Tensor::zeros((2, 3, 4), DType::F32, &Device::Cpu)?;
+        let original = attention
+            .forward(&x, None)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let alternate = attention
+            .forward_with_attention(&x, None, &mut dense_attention)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(original, alternate);
+        for dtype in [DType::F64, DType::U32] {
+            let error = attention
+                .forward_with_attention(&x, None, &mut |q, _, _, _, _| {
+                    Tensor::zeros(q.shape(), dtype, &Device::Cpu)
+                })
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("attention callback must preserve"));
+        }
+        let error = attention
+            .forward_with_attention(&x, None, &mut |_, _, _, _, _| {
+                Tensor::zeros((2, 3, 2, 2), DType::F32, &Device::Cpu)
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("attention callback must preserve"));
+        let error = attention
+            .forward_with_attention(&x, None, &mut |_, _, _, _, _| {
+                lloom_tensor::bail!("caller scratch admission refused")
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("caller scratch admission refused"));
+        let layer = EncoderLayer::new(&cfg, vb.pp("layers.0"))?;
+        let old = layer.forward(&x, None)?.flatten_all()?.to_vec1::<f32>()?;
+        let new = layer
+            .forward_with_attention(&x, None, &mut dense_attention)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(old, new);
         Ok(())
     }
 }

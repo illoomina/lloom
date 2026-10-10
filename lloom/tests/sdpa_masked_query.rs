@@ -268,4 +268,51 @@ mod metal {
         }
         Ok(())
     }
+
+    #[test]
+    fn full_mask_nonunit_key_stride_matches_its_copy() -> Result<()> {
+        deterministic_contract();
+        let dev = Device::new_metal(0)?;
+        for dtype in [DType::F16, DType::F32] {
+            for queries in [1, 2] {
+                let f = Fixture::new(queries, 33);
+                let interleaved: Vec<_> = f.mask.iter().flat_map(|&x| [x, 0.]).collect();
+                let backing =
+                    Tensor::from_vec(interleaved, (BATCH, HEADS, queries, f.keys, 2), &dev)?
+                        .to_dtype(dtype)?;
+                let view = backing.narrow(4, 0, 1)?.squeeze(4)?;
+                assert_eq!(view.layout().start_offset(), 0);
+                assert_eq!(view.stride()[3], 2);
+                check_mask_view(&f, dtype, &dev, &view)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_mask_broadcast_key_stride_matches_its_copy() -> Result<()> {
+        deterministic_contract();
+        let dev = Device::new_metal(0)?;
+        for dtype in [DType::F16, DType::F32] {
+            for queries in [1, 2] {
+                let mut f = Fixture::new(queries, 33);
+                f.mask.fill(0.5);
+                // Every wrong stride-one read stays within allocated storage
+                // but sees sentinel -inf, not the broadcast logical value.
+                let mut padded = vec![f32::NEG_INFINITY; BATCH * HEADS * queries * (f.keys + 4)];
+                for row in padded.chunks_exact_mut(f.keys + 4) {
+                    row[0] = 0.5;
+                }
+                let backing = Tensor::from_vec(padded, (BATCH, HEADS, queries, f.keys + 4), &dev)?
+                    .to_dtype(dtype)?;
+                let view = backing
+                    .narrow(3, 0, 1)?
+                    .broadcast_as((BATCH, HEADS, queries, f.keys))?;
+                assert_eq!(view.layout().start_offset(), 0);
+                assert_eq!(view.stride()[3], 0);
+                check_mask_view(&f, dtype, &dev, &view)?;
+            }
+        }
+        Ok(())
+    }
 }

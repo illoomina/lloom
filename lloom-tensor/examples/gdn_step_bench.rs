@@ -21,7 +21,7 @@ use anyhow::Result;
 use clap::Parser;
 use lloom_tensor::kernels::metal::{Buffer, CommandBuffer, Device};
 use lloom_tensor::kernels::{call_gdn_step, BufferOffset, Kernels, RESOURCE_OPTIONS};
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
+use objc2_metal::MTLCommandQueue;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -115,8 +115,7 @@ fn main() -> Result<()> {
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
-        let raw = cb.as_ref();
-        Ok((raw.GPUEndTime() - raw.GPUStartTime()) * 1e6 / a.n as f64)
+        Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6 / a.n as f64)
     };
 
     // Identity first: one independent step in each form from the same state,

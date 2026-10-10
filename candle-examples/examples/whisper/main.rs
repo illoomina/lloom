@@ -11,12 +11,12 @@ extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, IndexOp, Tensor};
+use clap::{Parser, ValueEnum};
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use lloom::nn::{
     ops::{log_softmax, softmax},
     VarBuilder,
 };
-use clap::{Parser, ValueEnum};
-use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::SeedableRng;
@@ -733,10 +733,7 @@ fn main() -> Result<()> {
     println!("loaded mel: {:?}", mel.dims());
 
     let mut model = if args.quantized {
-        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-            &weights_filename,
-            &device,
-        )?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&weights_filename, &device)?;
         Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?)
     } else {
         let vb =

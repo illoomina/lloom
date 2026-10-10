@@ -91,8 +91,14 @@ fn check(name: &str, sampling: Sampling) -> Result<()> {
         out.stats.provisional, out.stats.redraws, st.device_plans, st.settled_misses
     );
     assert_eq!(out.ids.len(), STEPS);
-    assert_eq!(out.ids, want.ids, "{name}: the provisional stream differs from the resident one");
-    assert!(out.stats.provisional, "{name}: the run's steps were not provisional");
+    assert_eq!(
+        out.ids, want.ids,
+        "{name}: the provisional stream differs from the resident one"
+    );
+    assert!(
+        out.stats.provisional,
+        "{name}: the run's steps were not provisional"
+    );
     assert!(
         out.stats.redraws > 0 && redos > 0,
         "{name}: no provisional step was redone — the identity says nothing about the redraw \
@@ -129,7 +135,10 @@ fn a_resident_model_declines_provisional_steps_metal() -> Result<()> {
     let cfg = fx.config(|_| {});
     let resident = fx.resident::<CrownExact>(&cfg, &dev, &LoadOptions::default())?;
     let (out, _) = run(&resident, &cfg, &dev, Sampling::ArgMax)?;
-    assert!(!out.stats.provisional, "a resident model took provisional steps");
+    assert!(
+        !out.stats.provisional,
+        "a resident model took provisional steps"
+    );
     assert_eq!(out.stats.redraws, 0);
     Ok(())
 }

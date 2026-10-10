@@ -5511,18 +5511,28 @@ mod tests {
         let a = Tensor::new(&[[1u32, 2, 3]], &dev).unwrap();
         let (_, rec_a) = tier.plan_device(&a).unwrap().expect("a device plan");
         let want_a = read(&rec_a);
-        assert_eq!(&want_a[6..9], &[0, 0, 0], "plan A misses nothing: {want_a:?}");
+        assert_eq!(
+            &want_a[6..9],
+            &[0, 0, 0],
+            "plan A misses nothing: {want_a:?}"
+        );
         let b = Tensor::new(&[[7u32, 8, 9]], &dev).unwrap();
         let (_, rec_b) = tier.plan_device(&b).unwrap().expect("a device plan");
         let got_b = read(&rec_b);
-        assert_ne!(want_a, got_b, "the two plans' records are the same: no test");
+        assert_ne!(
+            want_a, got_b,
+            "the two plans' records are the same: no test"
+        );
         assert_eq!(
             read(&rec_a),
             want_a,
             "plan A's record read after plan B ran is not plan A's"
         );
         assert!(!tier.settle_host(&want_a).unwrap());
-        assert!(tier.settle_host(&got_b).unwrap(), "plan B computed on missing experts");
+        assert!(
+            tier.settle_host(&got_b).unwrap(),
+            "plan B computed on missing experts"
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -5580,7 +5590,10 @@ mod tests {
         // The settle proper loads the two missing experts.
         let _ = tier.plan_device(&tok).unwrap().expect("a device plan");
         tier.settle_host(&record).unwrap();
-        assert!(tier.stats().bytes_loaded > before.bytes_loaded, "the control loaded nothing");
+        assert!(
+            tier.stats().bytes_loaded > before.bytes_loaded,
+            "the control loaded nothing"
+        );
         std::fs::remove_file(path).ok();
     }
 

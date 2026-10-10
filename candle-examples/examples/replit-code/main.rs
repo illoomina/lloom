@@ -11,9 +11,9 @@ use lloom::models::mpt::{Config, Model as M};
 use lloom::models::quantized_mpt::Model as Q;
 
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -239,8 +239,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let config = Config::replit_code_v1_5_3b();
     let model = if args.quantized {
-        let vb =
-            lloom::quantized_var_builder::VarBuilder::from_gguf(&filename, &device)?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&filename, &device)?;
         Model::Q(Q::new(&config, vb.pp("transformer"))?)
     } else {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[filename], DType::F32, &device)? };

@@ -128,7 +128,10 @@ fn the_derived_walk_is_the_traced_step() {
         ),
         (Some(&388), None, Some(&98), Some(&(98 + 96)), Some(&98))
     );
-    assert_eq!((src.get("silu_mul"), src.get("bmul").is_some()), (None, true));
+    assert_eq!(
+        (src.get("silu_mul"), src.get("bmul").is_some()),
+        (None, true)
+    );
     assert_eq!(source.dispatches(), 1579 + 3 * 97 + 96);
 }
 
@@ -179,13 +182,20 @@ fn the_derivation_reproduces_the_hand_wired_brackets() {
     // The refusals that apply here: the shared expert's store blocks, by
     // their switch; the grouped norm the brackets' products cannot take as
     // the catalogue stands.
-    let refused: Vec<(&str, &str)> = d.refused.iter().map(|(n, w)| (n.as_str(), w.as_str())).collect();
+    let refused: Vec<(&str, &str)> = d
+        .refused
+        .iter()
+        .map(|(n, w)| (n.as_str(), w.as_str()))
+        .collect();
     assert_eq!(
         refused,
         [
             ("quant_silu", "the switch qwen4exp.shared_store is off"),
             ("quant_mul", "the switch qwen4exp.shared_store is off"),
-            ("mixed_gnorm", lloom::optimizer::fragments::MIXED_GNORM_REFUSAL),
+            (
+                "mixed_gnorm",
+                lloom::optimizer::fragments::MIXED_GNORM_REFUSAL
+            ),
         ]
     );
     // The SwiGLUs as one launch each: the routed experts' and the shared
@@ -229,7 +239,11 @@ fn the_plan_is_set_on_the_brackets_it_decides() {
     assert!(line.contains("2 unvalidated"), "{line}");
     assert!(brackets(&m).iter().all(|&e| e == (true, true)));
     assert_eq!(brackets(&m).len(), 97);
-    assert!(m.switches_policy().unavailable.iter().any(|(f, _)| f == "quant_silu"));
+    assert!(m
+        .switches_policy()
+        .unavailable
+        .iter()
+        .any(|(f, _)| f == "quant_silu"));
     // The switch is the plan's to set either way: on, the derivation turns
     // it off; admitted, the blocks are placed and it turns it on.
     let store_on = |m: &Qwen4Exp<CrownExact, GhostExperts>| {
@@ -360,7 +374,10 @@ fn the_past_dense_walk_is_the_needle_step() {
     assert_eq!(needle.values().sum::<u64>(), 1992 - 147);
     let m = ghost_model_host_planned::<CrownExact>(&Device::Cpu).expect("ghost build");
     let pos = 4001;
-    assert_eq!(((pos + 1) % 4, pos + 1 > m.dense_limit().unwrap()), (2, true));
+    assert_eq!(
+        ((pos + 1) % 4, pos + 1 > m.dense_limit().unwrap()),
+        (2, true)
+    );
     let d = derive(&walk_at(&m, pos), &m.switches_policy()).expect("derive");
     assert_eq!(with_driver(d.graph).census(), needle);
 }

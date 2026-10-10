@@ -8,8 +8,8 @@ use lloom::models::jina_bert::{BertModel, Config, PositionEmbeddingType};
 
 use anyhow::Error as E;
 use candle::{DType, Module, Tensor};
-use lloom::nn::VarBuilder;
 use clap::Parser;
+use lloom::nn::VarBuilder;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

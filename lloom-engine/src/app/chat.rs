@@ -360,6 +360,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             continue;
         }
         turn += 1;
+        let renders_before = engine.template_renders();
         if pending.is_empty() {
             messages.push(json!({ "role": "user", "content": user }));
         } else {
@@ -433,6 +434,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let mut params =
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         params.logits_digest = options.decode.logits_digest;
+        if !args.raw {
+            params.turn_tail = thinking::checkpoint_tail(&*engine, &kwargs, want, &ids);
+        }
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
             params.thinking =
@@ -486,7 +490,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -523,6 +527,8 @@ pub fn run(args: ChatArgs) -> Result<()> {
             opt(decoded.thinking.map(|t| t.fired)),
             opt(sampling.prompt_budget),
             dropped.tokens,
+            params.turn_tail,
+            engine.template_renders() - renders_before,
         );
         if st.readback.poll_fallbacks > 0 {
             eprintln!(

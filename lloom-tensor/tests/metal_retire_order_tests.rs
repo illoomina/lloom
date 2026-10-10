@@ -18,7 +18,7 @@ use lloom_tensor::kernels::metal::{Buffer, CommandBuffer, ComputeCommandEncoder,
 use lloom_tensor::kernels::{
     call_unary_contiguous, unary, BufferOffset, Kernels, RESOURCE_OPTIONS,
 };
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -111,8 +111,8 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
             heavy_done_at_tiny_handler.load(Ordering::Acquire),
             "trial {trial}: the later buffer's handler ran before the earlier one completed"
         );
-        let heavy_end = heavy.as_ref().GPUEndTime();
-        let tiny_end = tiny.as_ref().GPUEndTime();
+        let heavy_end = heavy.gpu_end_time();
+        let tiny_end = tiny.gpu_end_time();
         gpu_inverted += u32::from(tiny_end < heavy_end);
     }
     eprintln!("RETIREORDER trials={trials} tiny_gpu_end_first={gpu_inverted}");

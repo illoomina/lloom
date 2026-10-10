@@ -8,10 +8,10 @@ mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use lloom::nn::{Module, VarBuilder};
-use lloom::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
+use lloom::nn::{Module, VarBuilder};
+use lloom::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 
 // Keypoints as reported by ChatGPT :)
 // Nose

@@ -62,9 +62,9 @@ pub use mlx_gemm::{
     GemvNormInline, GemvRmsNorm, MixedEpilogue, GEMV_GROUP_NORM_MAX_GROUPS, SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::{
-    call_hc_collapse, call_hc_collapse_scaled, call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm,
-    call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch,
-    call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
+    call_hc_collapse, call_hc_collapse_scaled, call_hc_combine, call_hc_mix_a, call_hc_mix_b,
+    call_hc_norm, call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep,
+    call_qsa_prep_batch, call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
 };
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
@@ -87,9 +87,8 @@ pub use params::{
 pub use quantized::{
     call_moe_rowmap, call_quantized_dequant_rows_f16, call_quantized_get_rows,
     call_quantized_matmul_mm_id_mapped, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id2_t,
-    call_quantized_matmul_mv_id_t,
-    call_quantized_matmul_mv_store, call_quantized_matmul_mv_t, mm_id_block_bound,
-    mv_store_instantiations, GemvFloat, GemvTriple, GgmlDType, MvStore,
+    call_quantized_matmul_mv_id_t, call_quantized_matmul_mv_store, call_quantized_matmul_mv_t,
+    mm_id_block_bound, mv_store_instantiations, GemvFloat, GemvTriple, GgmlDType, MvStore,
     PairGrid, MM_ID_BLOCK_ROWS,
 };
 pub use random::*;

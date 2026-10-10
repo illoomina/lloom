@@ -2235,3 +2235,16 @@ fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
     assert_ne!(id1, id2);
     Ok(())
 }
+
+#[test]
+fn cpu_mapped_write_and_words_publish_keep_their_fallbacks() -> Result<()> {
+    let t = Tensor::from_vec(vec![3u32, 5], 2, &Device::Cpu)?;
+    // SAFETY: local CPU storage, no concurrent access, separate source slice.
+    assert!(!unsafe { t.write_host_slice(0, &[7u32]) });
+    assert_eq!(t.to_vec1::<u32>()?, [3, 5]);
+    let stamp = Tensor::zeros(1, DType::U32, &Device::Cpu)?;
+    let err = Device::Cpu.words_publish(&t, 2, &t, &stamp, 1).unwrap_err();
+    assert!(err.to_string().contains("words_publish: Metal only"));
+    assert_eq!(stamp.to_vec1::<u32>()?, [0]);
+    Ok(())
+}

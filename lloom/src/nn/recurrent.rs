@@ -864,7 +864,10 @@ mod tests {
         rs.hold_window().unwrap();
         rs.write(0, t(2.0, &dev)).unwrap();
         assert_eq!(val(&rs), 2.0);
-        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+        assert_eq!(
+            rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0],
+            0.0
+        );
     }
 
     /// A write lands in neither base, in place or not.
@@ -880,7 +883,10 @@ mod tests {
         rs.write(0, t(5.0, &dev)).unwrap();
         rs.write(0, t(6.0, &dev)).unwrap();
         assert_eq!(val(&rs), 6.0);
-        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+        assert_eq!(
+            rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0],
+            0.0
+        );
         rs.rewind_to_window().unwrap();
         rs.unhold_window().unwrap();
         rs.rewind_to_window().unwrap();

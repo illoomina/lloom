@@ -128,7 +128,11 @@ mod tests {
         if let Some(rest) = tos.decode_rest().unwrap() {
             out.push_str(&rest);
         }
-        assert_eq!(out, tok.decode(&ids, true).unwrap(), "the pieces are the whole decode");
+        assert_eq!(
+            out,
+            tok.decode(&ids, true).unwrap(),
+            "the pieces are the whole decode"
+        );
         // Under the alphanumeric rule the punctuation runs above collapse into
         // their neighbours' writes; every token that decodes to a complete
         // character is now its own write.

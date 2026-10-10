@@ -2268,15 +2268,19 @@ impl Tensor {
     /// lands in a reused device staging buffer without a per-feed allocation.
     ///
     /// Returns `true` if it wrote through the mapped pointer. Returns `false` when
-    /// the tensor is not a contiguous rank-1 `Metal` buffer of the matching dtype,
+    /// the tensor is not a contiguous `Metal` buffer of the matching dtype,
     /// or the buffer is unmapped, or the range would overflow — the caller then
     /// takes the `slice_set`-from-`Tensor` upload fallback. Never panics; `false`
     /// is a signal.
     ///
-    /// SAFETY: the caller guarantees no GPU work is concurrently reading
-    /// `[index, index+src.len())` of this buffer — the same discipline the mapped
-    /// read relies on (writes happen while the slot is not in flight; the pacer /
-    /// commit ordering is the caller's to hold).
+    /// # Safety
+    ///
+    /// The source and destination ranges must not overlap. No other host or GPU
+    /// access may overlap `[index, index + src.len())` while the write occurs.
+    /// Writes happen while the slot is not in flight; the caller must establish
+    /// completion of earlier accesses and order later GPU work after this write.
+    /// Tensor clones and views share this obligation; the storage lock alone
+    /// does not synchronize access through mapped pointers or GPU commands.
     pub unsafe fn write_host_slice<S: crate::WithDType>(&self, index: usize, src: &[S]) -> bool {
         // Any contiguous shape: the write is into flat buffer memory, so `[1, N]`
         // (the input staging scratch) is as valid as `[N]` — same bytes, same
@@ -2305,7 +2309,10 @@ impl Tensor {
                 }
                 storage.write_host_slice::<S>(at, src)
             }
-            _ => false,
+            _ => {
+                let _ = (index, src);
+                false
+            }
         }
     }
 

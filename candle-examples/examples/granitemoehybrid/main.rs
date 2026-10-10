@@ -10,10 +10,10 @@ use anyhow::{bail, Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::granitemoehybrid as model;
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use model::{GraniteMoeHybrid, GraniteMoeHybridCache, GraniteMoeHybridConfig};
 
 use std::{io::Write, path::Path};

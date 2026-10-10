@@ -1,0 +1,19 @@
+# Metal-capable packages contain GPU tests without "metal" in their names.
+# Keep all tests; serialize their processes on macOS, not their internal threads.
+# This is runner-local exclusion. Each whole invocation still needs lloom-arb.
+[test-groups]
+metal-device = { max-threads = 1 }
+
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'package(=lloom-tensor) | package(=lloom) | package(=lloom-engine) | package(=candle-ug) | package(=candle-examples)'
+test-group = 'metal-device'
+
+# Explicit, coordinator-approved process-concurrency experiments only.
+# Existing concurrency within a single test remains enabled in every profile.
+[profile.gpu-stress]
+
+[[profile.gpu-stress.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = 'package(=lloom-tensor) | package(=lloom) | package(=lloom-engine) | package(=candle-ug) | package(=candle-examples)'
+test-group = '@global'

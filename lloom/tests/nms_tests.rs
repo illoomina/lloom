@@ -1,7 +1,5 @@
+use lloom::object_detection::{non_maximum_suppression, soft_non_maximum_suppression, Bbox};
 use lloom_tensor::Result;
-use lloom::object_detection::{
-    non_maximum_suppression, soft_non_maximum_suppression, Bbox,
-};
 
 #[test]
 fn nms_basic() -> Result<()> {

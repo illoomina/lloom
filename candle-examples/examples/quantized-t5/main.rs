@@ -10,9 +10,9 @@ use lloom::models::quantized_t5 as t5;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use lloom::generation::LogitsProcessor;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, api::sync::ApiRepo, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 #[derive(Clone, Debug, Copy, ValueEnum)]

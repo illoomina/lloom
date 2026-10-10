@@ -673,7 +673,10 @@ impl Device {
                     _ => crate::bail!("words_publish: every tensor must live on the Metal device"),
                 }
             }
-            _ => crate::bail!("words_publish: Metal only"),
+            _ => {
+                let _ = (src, n, out, step, generation);
+                crate::bail!("words_publish: Metal only")
+            }
         }
     }
 

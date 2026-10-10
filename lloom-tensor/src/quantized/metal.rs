@@ -374,7 +374,8 @@ impl QMetalStorage {
     fn qmv_rows_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
-            crate::tuning::tuning().qmv
+            crate::tuning::tuning()
+                .qmv
                 .mm_from
                 .map(|from| from.saturating_sub(1).max(1))
                 .unwrap_or(8)
@@ -488,8 +489,13 @@ impl QMetalStorage {
     ) -> Result<Option<MetalStorage>> {
         use crate::MetalError;
         let (n, k) = self_shape.dims2()?;
-        if !layout.is_contiguous() || layout.shape().elem_count() != k || storage.dtype() != DType::F32 {
-            crate::bail!("quantized matvec store block: one contiguous f32 row of {k}, got {layout:?}")
+        if !layout.is_contiguous()
+            || layout.shape().elem_count() != k
+            || storage.dtype() != DType::F32
+        {
+            crate::bail!(
+                "quantized matvec store block: one contiguous f32 row of {k}, got {layout:?}"
+            )
         }
         let device = storage.device().clone();
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
@@ -516,7 +522,12 @@ impl QMetalStorage {
                     store,
                 )
                 .map_err(MetalError::from)?;
-                Ok(Some(crate::MetalStorage::new(dst, device.clone(), n, DType::F32)))
+                Ok(Some(crate::MetalStorage::new(
+                    dst,
+                    device.clone(),
+                    n,
+                    DType::F32,
+                )))
             }
             Some((dst, dst_layout)) => {
                 if !dst_layout.is_contiguous()
@@ -959,7 +970,10 @@ impl QMetalStorage {
         let (triple, store_dtype) =
             self.routed_triple(input.dtype(), act, "indexed_moe_forward_pair")?;
         if ids.dtype() != DType::U32 {
-            crate::bail!("indexed_moe_forward_pair ids must be u32, got {:?}", ids.dtype())
+            crate::bail!(
+                "indexed_moe_forward_pair ids must be u32, got {:?}",
+                ids.dtype()
+            )
         }
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
         let (batch, in_dim1, k_in) = input_l.shape().dims3()?;

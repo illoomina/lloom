@@ -2652,9 +2652,9 @@ impl MetalDevice {
             }
         }
         self.note_pool_request(1);
-        let buffer = match self.private_buffers.acquire(size) {
-            Some(b) => b,
-            None => {
+        let buffer = match self.private_buffers.acquire_for_allocation(size) {
+            Ok(b) => b,
+            Err(miss) => {
                 let alloc = buf_size(size);
                 // `DESIGN.md` §9.5k's one branch, on the derived residual. It
                 // sits on the pool MISS, after `acquire` has declined, because
@@ -2676,7 +2676,7 @@ impl MetalDevice {
                 // above, which is the last point where the two are both in
                 // scope (#47).
                 self.private_buffers
-                    .adopt_requesting(new_buffer, size, alloc)
+                    .adopt_after_miss(new_buffer, alloc, miss)
             }
         };
         Ok(self.note_for_recording(buffer, size))
@@ -2961,12 +2961,12 @@ impl MetalDevice {
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<BufferHandle> {
         self.note_pool_request(0);
-        if let Some(b) = self.buffers.acquire(size) {
-            return Ok(b);
-        }
-        // Kept before `buf_size` shadows `size`, so the overhang has both terms
-        // (§9.2, #47).
-        let requested = size;
+        let miss = match self.buffers.acquire_for_allocation(size) {
+            Ok(b) => return Ok(b),
+            Err(miss) => miss,
+        };
+        // `miss` retains the requested size before rounding, so adoption can
+        // account for the overhang (§9.2, #47).
         let size = buf_size(size);
         // §9.5k's branch, on the pool miss and before the allocation -- see
         // `new_buffer` above. This is the pool the KV reserve is served from
@@ -2980,7 +2980,7 @@ impl MetalDevice {
             .transient_shared
             .alloc(size)
             .map_err(MetalError::from)?;
-        Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
+        Ok(self.buffers.adopt_after_miss(new_buffer, size, miss))
     }
 
     /// Create a metal GPU capture trace on [`path`].

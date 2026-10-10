@@ -52,7 +52,7 @@ use lloom_tensor::{Device, Result, Tensor};
 #[cfg(feature = "metal")]
 const EOS: &[u32] = &[124900];
 
-/// Counts every allocation the process makes, for #578's first defect.
+/// Counts allocations on the calling thread, for #578's first defect.
 ///
 /// **A global allocator is the only instrument that can see this.** The defect
 /// is that `poll_eos` reached `peek_vec1`, which materialises a `Vec` of the
@@ -63,27 +63,34 @@ const EOS: &[u32] = &[124900];
 /// again and the same shape as #535's M4. The repair is a different
 /// instrument, and this is it.
 ///
-/// This is process-global like the peek counters, which is why the assertion
-/// lives in **this** binary rather than beside its siblings -- see the module
-/// comment above: cargo runs integration tests on parallel threads within one
-/// binary, so a shared counter must be attributed by construction.
+/// The allocator counter is thread-local: sibling tests, Metal callbacks and
+/// the test harness can allocate concurrently with the polling window. A
+/// process-global counter cannot attribute those allocations to `poll_eos`.
+/// The positive control below exercises the same thread and counter.
 struct CountingAllocator;
 
-static ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_alloc() {
+    // Allocation during TLS teardown is outside the measured test window.
+    let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+}
 
 // SAFETY: this forwards every call to the system allocator unchanged and only
 // increments a counter, so it upholds `GlobalAlloc`'s contract exactly as
 // `System` does.
 unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_alloc();
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        note_alloc();
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
     }
 }
@@ -93,7 +100,7 @@ static ALLOC: CountingAllocator = CountingAllocator;
 
 #[cfg(feature = "metal")]
 fn allocs() -> u64 {
-    ALLOCS.load(std::sync::atomic::Ordering::Relaxed)
+    ALLOCS.with(|n| n.get())
 }
 
 #[cfg(feature = "metal")]
@@ -312,4 +319,38 @@ fn a_cpu_tensor_is_declined() -> Result<()> {
         "the CPU backend was served by a Metal-only peek"
     );
     Ok(())
+}
+
+/// Prove attribution while another thread allocates inside this one's window.
+#[cfg(feature = "metal")]
+#[test]
+fn allocation_counter_excludes_other_threads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let start = AtomicBool::new(false);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            while !start.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            let before = allocs();
+            for _ in 0..1000 {
+                std::hint::black_box(vec![7u8; 256]);
+            }
+            let own = allocs() - before;
+            done.store(true, Ordering::Release);
+            own
+        });
+        let before = allocs();
+        start.store(true, Ordering::Release);
+        while !done.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let counted = allocs() - before;
+        assert_eq!(counted, 0, "another thread contaminated the measurement");
+        assert!(
+            worker.join().unwrap() >= 1000,
+            "positive control did not allocate"
+        );
+    });
 }

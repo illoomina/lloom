@@ -4,8 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use lloom_tensor::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
 use lloom::nn::RNN;
+use lloom_tensor::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
 
 /* The following test can be verified against PyTorch using the following snippet.
 import torch

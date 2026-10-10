@@ -189,7 +189,9 @@ fn the_lfm2_step_remarks() {
         .sum();
     assert_eq!(norm_into_gemv, 8 * 3 + 22 + 1 + 30, "{r}");
     assert!(
-        !r.rows.iter().any(|x| x.producer == "rmsnorm" && x.why == Why::CrossThreadgroup(Side::Load)),
+        !r.rows
+            .iter()
+            .any(|x| x.producer == "rmsnorm" && x.why == Why::CrossThreadgroup(Side::Load)),
         "{r}"
     );
 

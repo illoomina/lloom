@@ -13,11 +13,11 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Device, Tensor};
-use lloom::generation::LogitsProcessor;
-use lloom::models::llama::LlamaEosToks;
 use cudarc::driver::safe::CudaDevice;
 use cudarc::nccl::safe::{Comm, Id};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::models::llama::LlamaEosToks;
 use std::io::Write;
 use std::rc::Rc;
 

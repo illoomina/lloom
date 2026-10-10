@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use lloom_tensor::{test_utils, DType, Device, Tensor};
 use lloom::nn::{batch_norm, BatchNorm, BatchNormConfig, VarBuilder, VarMap};
+use lloom_tensor::{test_utils, DType, Device, Tensor};
 
 /* The test below has been generated using the following PyTorch code:
 import torch

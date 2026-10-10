@@ -585,7 +585,8 @@ template <typename T, int D>
 // contiguously (`qwen4exp`'s pooled rows gate). `keys` / `values` are one
 // layer's pool `[n_kv_heads, tokens, D]` (`k_stride` = the head stride).
 template <typename T, int D>
-[[kernel]] void sdpa_vector_paged(
+// The fixed reduction requires 32 SIMD groups, including at register-heavy D=512.
+[[kernel, max_total_threads_per_threadgroup(1024)]] void sdpa_vector_paged(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],

@@ -9,13 +9,11 @@ use std::path::Path;
 use anyhow::{anyhow, Error as E, Result};
 use clap::Parser;
 
-use lloom::models::stella_en_v5::{
-    Config, EmbedDim as StellaEmbedDim, EmbeddingModel,
-};
+use lloom::models::stella_en_v5::{Config, EmbedDim as StellaEmbedDim, EmbeddingModel};
 
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo};
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
 struct Embedding {

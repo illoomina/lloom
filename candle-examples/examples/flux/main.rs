@@ -8,8 +8,8 @@ use lloom::models::{clip, flux, t5};
 
 use anyhow::{Error as E, Result};
 use candle::{IndexOp, Module, Tensor};
-use lloom::nn::VarBuilder;
 use clap::Parser;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -192,9 +192,8 @@ fn run(args: Args) -> Result<()> {
                             .get("flux1-schnell.gguf")?,
                         Model::Dev => todo!(),
                     };
-                    let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-                        model_file, &device,
-                    )?;
+                    let vb =
+                        lloom::quantized_var_builder::VarBuilder::from_gguf(model_file, &device)?;
 
                     let model = flux::quantized_model::Flux::new(&cfg, vb)?;
                     flux::sampling::denoise(

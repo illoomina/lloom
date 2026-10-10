@@ -50,6 +50,9 @@ pub const LFM2_KV_PAGES: &str = "lfm2.kv.pages";
 pub const NN_KV_SLAB: &str = "nn.kv_cache.slab";
 /// The dense weight-group tier's slots (`nn::weight_groups`, #892 A6a).
 pub const NN_WEIGHT_GROUPS: &str = "nn.weight_groups.slots";
+/// The generic decoder's turn-checkpoint ring (`nn::decoder`): every frame
+/// is written whole before a restore reads it.
+pub const NN_DECODER_CHECKPOINTS: &str = "nn.decoder.turn_checkpoints";
 
 /// Every site a poison list may name.
 pub const SITES: &[&str] = &[

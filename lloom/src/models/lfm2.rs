@@ -6,8 +6,8 @@
 //! This implementation supports the LFM2ForCausalLM architecture from HuggingFace transformers.
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
-use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::kv_quant::QuantKvSlab;
+use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
@@ -1751,6 +1751,11 @@ pub struct PagedKv {
     /// this pass writes, and the largest of them (checked against the pool by
     /// the scatter without a readback).
     slots: Option<Tensor>,
+    /// Host staging reused across passes; device uploads remain immutable while queued.
+    slot_staging: Vec<u32>,
+    /// One live count for every attention layer of a one-sequence decode pass.
+    /// Replaced, never overwritten: preceding GPU readers retain the old upload.
+    live_count: Option<Tensor>,
     max_slot: usize,
     /// Every sequence's chunk table, `table_stride` entries each.
     table: Vec<u32>,
@@ -1792,6 +1797,8 @@ impl PagedKv {
             len: 0,
             pass_len: 0,
             slots: None,
+            slot_staging: Vec::new(),
+            live_count: None,
             max_slot: 0,
             table: Vec::new(),
             table_stride: 0,
@@ -1939,7 +1946,9 @@ impl PagedKv {
         let pool = pool.pages_mut();
 
         let start = self.len;
-        let mut slots = Vec::with_capacity(n_seqs * seq_len);
+        self.slot_staging.clear();
+        let slots = &mut self.slot_staging;
+        slots.reserve(n_seqs * seq_len);
         for s in 0..n_seqs {
             pool.append(s, seq_len).map_err(|e| {
                 lloom_tensor::Error::msg(format!(
@@ -1955,6 +1964,11 @@ impl PagedKv {
         self.pass_len = seq_len;
         self.max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
         self.slots = Some(Tensor::new(slots.as_slice(), device)?);
+        self.live_count = if n_seqs == 1 && seq_len == 1 {
+            Some(Tensor::new(&[self.len as u32], device)?)
+        } else {
+            None
+        };
 
         // The chunk tables the reader is handed, one per sequence, all the
         // same length because the batch is lockstep.
@@ -1969,9 +1983,9 @@ impl PagedKv {
                     self.pages_per_chunk
                 )
             }
-            let t = pool.table_for(s, self.pages_per_chunk);
-            debug_assert_eq!(t.len(), n_chunks);
-            self.table.extend_from_slice(&t);
+            let before = self.table.len();
+            pool.extend_table_for(s, self.pages_per_chunk, &mut self.table);
+            debug_assert_eq!(self.table.len() - before, n_chunks);
         }
         self.sync_resident_table(n_seqs, device)?;
         Ok(())
@@ -2093,6 +2107,7 @@ impl PagedKv {
         self.len = 0;
         self.pass_len = 0;
         self.slots = None;
+        self.live_count = None;
         self.max_slot = 0;
         self.table.clear();
         self.table_stride = 0;
@@ -4921,10 +4936,8 @@ impl<P: Profile> State<P> {
             b.prefill_geometry.conv_layers,
             b.prefill_geometry.attention_layers,
         );
-        b.conv_state_bytes = conv_layers
-            * config.hidden_size
-            * config.conv_state.width(config.conv_l_cache)
-            * 2;
+        b.conv_state_bytes =
+            conv_layers * config.hidden_size * config.conv_state.width(config.conv_l_cache) * 2;
         b.kv_bytes_per_token =
             2 * config.num_key_value_heads * config.head_dim() * 2 * attention_layers;
         b
@@ -6450,12 +6463,7 @@ impl<P: Profile> Attention<P> {
         match first {
             Some(f) => {
                 matches!(dtype, DType::F16 | DType::F32)
-                    && f.shared()
-                        .expect("checked")
-                        .pool
-                        .inner
-                        .lock()
-                        .batched_arms
+                    && f.shared().expect("checked").pool.inner.lock().batched_arms
             }
             None => false,
         }
@@ -7138,21 +7146,40 @@ impl<P: Profile> Attention<P> {
                     )?
                 } else {
                     let paged = cache.paged().expect("checked above");
-                    crate::nn::ops::flash_decoding_paged_resident(
-                        &q,
-                        &k,
-                        &v,
-                        1f32 / (self.head_dim as f32).sqrt(),
-                        1.0,
-                        self.flash_page_size,
-                        self.flash_pages_per_chunk,
-                        self.flash_scratch_sizing,
-                        reserve_chunks,
-                        &paged.table,
-                        paged.table_stride,
-                        paged.len,
-                        paged.table_t.as_ref(),
-                    )?
+                    if let (Some(table), Some(count)) = (&paged.table_t, &paged.live_count) {
+                        crate::nn::ops::flash_decoding_paged_ragged_bound(
+                            &q,
+                            &k,
+                            &v,
+                            1f32 / (self.head_dim as f32).sqrt(),
+                            1.0,
+                            self.flash_page_size,
+                            self.flash_pages_per_chunk,
+                            self.flash_scratch_sizing,
+                            reserve_chunks,
+                            &paged.table,
+                            paged.table_stride,
+                            &[paged.len as u32],
+                            table,
+                            count,
+                        )?
+                    } else {
+                        crate::nn::ops::flash_decoding_paged_resident(
+                            &q,
+                            &k,
+                            &v,
+                            1f32 / (self.head_dim as f32).sqrt(),
+                            1.0,
+                            self.flash_page_size,
+                            self.flash_pages_per_chunk,
+                            self.flash_scratch_sizing,
+                            reserve_chunks,
+                            &paged.table,
+                            paged.table_stride,
+                            paged.len,
+                            paged.table_t.as_ref(),
+                        )?
+                    }
                 }
             }
         } else if self.flash_decoding_applies(&q, seq_len) {
@@ -7330,8 +7357,7 @@ impl<P: Profile> crate::optimizer::Visit for Attention<P> {
         // At a position whose keys reach the 2-pass length, the vector
         // kernel is two launches: the partials, then their merge.
         let two_pass = self.route.decode == DecodeAttn::SdpaVector
-            && w
-                .position()
+            && w.position()
                 .is_some_and(|p| crate::nn::ops::sdpa_vector_two_pass(p + 1, hd, dt));
         let y = if two_pass {
             let partial = w.opaque("sdpa_vector_2pass_1", &[qr, k_all, v_all], out.clone(), dt);
@@ -7963,14 +7989,7 @@ impl<P: Profile> ShortConv<P> {
             }
         }
         match first {
-            Some(f) => {
-                f.shared()
-                    .expect("checked")
-                    .pool
-                    .inner
-                    .lock()
-                    .batched_arms
-            }
+            Some(f) => f.shared().expect("checked").pool.inner.lock().batched_arms,
             None => false,
         }
     }
@@ -8643,7 +8662,8 @@ impl<P: Profile> crate::optimizer::Visit for ShortConv<P> {
                         let tail = w.view("narrow", state, Shape::of(&[1, h, lc - 1]));
                         let gathered =
                             w.opaque("copy_strided", &[tail], Shape::of(&[1, h, lc - 1]), dt);
-                        let shifted = w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
+                        let shifted =
+                            w.opaque("copy2d", &[gathered, state], Shape::of(&[1, h, lc]), dt);
                         let next = w.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dt);
                         ring.extend([tail, gathered, shifted, next]);
                         next
@@ -9348,7 +9368,8 @@ fn derive_fusion<P: Profile>(
             )
         }
     };
-    let uniform = |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
+    let uniform =
+        |kind: &str, fragment: &str| uniform_by(kind, fragment, &|s| block(s).1 == fragment);
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
@@ -9398,9 +9419,8 @@ fn derive_fusion<P: Profile>(
                 && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
-        let known_prologue = !pro
-            || *site == lm_head
-            || norm_kinds.iter().any(|k| site.ends_with(k));
+        let known_prologue =
+            !pro || *site == lm_head || norm_kinds.iter().any(|k| site.ends_with(k));
         if !(known_epilogue && known_prologue) {
             lloom_tensor::bail!(
                 "lfm2 fusion=derived: the plan fuses `{b}` onto `{site}`, a site no flag \
@@ -9827,7 +9847,12 @@ impl<P: Profile> Model<P> {
         #[cfg(feature = "metal")]
         cache.flush_ring_snapshots();
         if seq_len == 1
-            && norm_gemv_applies(self.norm_gemv_head, &hidden_states, &self.embedding_norm, &self.lm_head)
+            && norm_gemv_applies(
+                self.norm_gemv_head,
+                &hidden_states,
+                &self.embedding_norm,
+                &self.lm_head,
+            )
         {
             let last = hidden_states.squeeze(1)?;
             let logits = norm_gemv(&last, &self.embedding_norm, &self.lm_head, false)?;
@@ -11707,6 +11732,70 @@ mod tests {
     thread_local! {
         /// `Cache::conv_spare_for`'s calls on this thread.
         pub(super) static SPARES_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Per-pass metadata is immutable across queued readers, while host staging
+    /// keeps its capacity. Exercise page boundaries and a recycled sequence.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn paged_metadata_reuses_staging_without_overwriting_queued_counts() -> Result<()> {
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let device = Device::new_metal(0)?;
+        let Device::Metal(m) = &device else {
+            unreachable!()
+        };
+        let clock = m.gpu_clock();
+        let config = Config {
+            flash_page_size: 4,
+            flash_pages_per_chunk: 1,
+            ..Default::default()
+        };
+        let mut paged = PagedKv::new(&config, 64, 64, 1, clock.clone())?;
+        let mut reads = Vec::new();
+        let mut first_table = None;
+        for n in 1..=17usize {
+            paged.begin_pass(1, 1, &device)?;
+            let count = paged.live_count.as_ref().expect("one shared count");
+            // An actual queued GPU reader, not just the host's current field.
+            reads.push((n, count.affine(1., 0.)?));
+            if n == 1 {
+                first_table = paged.table_t.clone();
+            }
+            assert_eq!(
+                paged.table_t.as_ref().unwrap().id(),
+                first_table.as_ref().unwrap().id(),
+                "an append-only table must remain resident across page boundaries"
+            );
+            assert_eq!(paged.table.len(), n.div_ceil(4));
+            assert_eq!(paged.slot_staging.as_slice(), &[(n - 1) as u32]);
+        }
+        device.synchronize()?;
+        for (n, read) in reads {
+            assert_eq!(
+                read.to_vec1::<u32>()?,
+                vec![n as u32],
+                "old pass count was overwritten"
+            );
+        }
+        let slot_capacity = paged.slot_staging.capacity();
+        let table_capacity = paged.table.capacity();
+        paged.release_all();
+        // Release stamps the open epoch; close it before recycling this fixture.
+        device.synchronize()?;
+        paged.begin_pass(1, 1, &device)?;
+        assert_eq!(
+            paged.live_count.as_ref().unwrap().to_vec1::<u32>()?,
+            vec![1]
+        );
+        assert_eq!(paged.slot_staging.capacity(), slot_capacity);
+        assert_eq!(paged.table.capacity(), table_capacity);
+        assert_ne!(
+            paged.table_t.as_ref().unwrap().id(),
+            first_table.as_ref().unwrap().id(),
+            "a reset must not shorten/overwrite an old table still held by readers"
+        );
+        println!("PAGED_METADATA queued_counts=17 page_boundaries=4 resident_table_reused=true reset_isolated=true staging_capacity_stable=true");
+        Ok(())
     }
 
     /// The unfused `Shuffle` decode step takes no spare state: the spare is

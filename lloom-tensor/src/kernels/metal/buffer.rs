@@ -40,8 +40,8 @@ pub struct Buffer {
     /// carries its slot size so `length()` cannot report the whole arena.
     length: Option<usize>,
 
-    /// Whether `contents()` may be trusted at all: false for a Private buffer
-    /// placed in a heap, decided once at construction (see `new`).
+    /// Whether CPU access is permitted by storage mode and the selected
+    /// experimental mapping policy, fixed at construction (see `new`).
     cpu_visible: bool,
 }
 
@@ -50,14 +50,11 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
-        // A Private buffer placed in an `MTLHeap` answers `contents()` with
-        // null plus its heap offset: non-null, not a CPU mapping, and reading
-        // it faults (§6.3k). A Private buffer of its own answers truthfully: a
-        // mapping below 16384 B, null at or above (§15.2 #12a). So heap
-        // placement is what makes the answer untrustworthy, and only it is
-        // overridden.
-        let cpu_visible =
-            raw.storageMode() != objc2_metal::MTLStorageMode::Private || raw.heap().is_none();
+        // Private storage has no documented CPU mapping. The experimental
+        // opt-in retains the owned-buffer probe, never the heap-offset value
+        // (which can be non-null without being a CPU address).
+        let cpu_visible = raw.storageMode() != objc2_metal::MTLStorageMode::Private
+            || (crate::tuning::tuning().metal.private_cpu_mapping && raw.heap().is_none());
         super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
         Buffer {
             raw,
@@ -127,6 +124,12 @@ impl Buffer {
         self.length.is_some()
     }
 
+    /// Whether querying a CPU pointer is permitted by the selected policy.
+    /// An experimental Private probe can still return null.
+    pub fn may_be_cpu_mapped(&self) -> bool {
+        self.cpu_visible
+    }
+
     pub fn contents(&self) -> *mut u8 {
         self.data()
     }
@@ -139,12 +142,10 @@ impl Buffer {
     /// being a silent-corruption hazard: `read_to_vec` and every other CPU-side
     /// consumer takes this pointer without knowing whether it holds a view.
     ///
-    /// Null for a Private-storage allocation at or above 16384 B, which has no
-    /// CPU mapping -- unchanged by the offset, since `null + n` is still not
-    /// readable and callers already assert on it. Below that threshold a
-    /// Private allocation *is* mapped, which is `DESIGN.md` §15.2 #12a's
-    /// correction to the older "null for Private" reading. Null, too, for a
-    /// Private buffer placed in a heap, whatever `contents()` returns (`new`).
+    /// Null for Private storage by default, without invoking Metal's CPU
+    /// getter. With `private_cpu_mapping` enabled, non-heap Private buffers
+    /// retain the implementation-dependent mapping probe; heap placements
+    /// remain inaccessible. Shared storage retains the direct-access path.
     ///
     /// # This function's own null check folded away (#366, repaired #454)
     ///

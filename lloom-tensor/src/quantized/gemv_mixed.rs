@@ -167,7 +167,9 @@ impl crate::CustomOp1 for GemvMixed {
         let extra = match &self.gnorm {
             Some(g) if g.scales => {
                 if b != 1 {
-                    crate::bail!("gemv_mixed: the grouped norm's scales are a one-row form, got {b} rows")
+                    crate::bail!(
+                        "gemv_mixed: the grouped norm's scales are a one-row form, got {b} rows"
+                    )
                 }
                 g.groups
             }

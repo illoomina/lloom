@@ -112,7 +112,11 @@ fn gemm(out: &mut Vec<String>, dtype: DType, dev: &Device) -> Result<()> {
             } else {
                 format!("differs maxdiff {:e}", max_diff(row0, &alone_f32))
             };
-            let pairinv = if row0_bits == pair_bits { "equal" } else { "differs" };
+            let pairinv = if row0_bits == pair_bits {
+                "equal"
+            } else {
+                "differs"
+            };
             // Every row of the m-row pass against the same row computed in
             // a 2-row pass: the rows a tile's remainder handles are the ones
             // a row-0 comparison cannot see.
@@ -136,7 +140,11 @@ fn gemm(out: &mut Vec<String>, dtype: DType, dev: &Device) -> Result<()> {
             let tail8 = if m >= 8 {
                 let alone8 = bits(&x_all.narrow(0, m - 8, 8)?.matmul(&wt)?)?;
                 let tail: Vec<u32> = yf[(m - 8) * n..].iter().map(|v| v.to_bits()).collect();
-                if tail == alone8 { "equal" } else { "differs" }
+                if tail == alone8 {
+                    "equal"
+                } else {
+                    "differs"
+                }
             } else {
                 "-"
             };
@@ -165,7 +173,10 @@ fn elementwise(out: &mut Vec<String>, dev: &Device) -> Result<()> {
         "PROBE softmax_last_dim hash={:#018x}",
         hash(&lloom::nn::ops::softmax_last_dim(&v)?)?
     ));
-    out.push(format!("PROBE sum_last_dim hash={:#018x}", hash(&v.sum_keepdim(1)?)?));
+    out.push(format!(
+        "PROBE sum_last_dim hash={:#018x}",
+        hash(&v.sum_keepdim(1)?)?
+    ));
     let alpha = Tensor::from_vec(ramp(512, 31, 97), 512, dev)?;
     out.push(format!(
         "PROBE rms_norm hash={:#018x}",
@@ -253,7 +264,9 @@ fn lfm2_by_layer(out: &mut Vec<String>, dev: &Device) -> Result<()> {
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
         let logits = model.forward(&inp, 0, &mut cache)?;
-        let conv = cache.conv_state_for_test(0).expect("layer 0 is a conv layer");
+        let conv = cache
+            .conv_state_for_test(0)
+            .expect("layer 0 is a conv layer");
         out.push(format!(
             "PROBE lfm2_fingerprint layers={layers} prefill_logits={:#018x} conv0_state={:#018x}",
             hash(&logits)?,
@@ -262,7 +275,11 @@ fn lfm2_by_layer(out: &mut Vec<String>, dev: &Device) -> Result<()> {
         let mut steps = Vec::new();
         for (i, tok) in [7u32, 9u32].into_iter().enumerate() {
             let step = Tensor::new(&[tok], dev)?.reshape((1, 1))?;
-            steps.push(hash(&model.forward(&step, prompt.len() + i, &mut cache)?)?);
+            steps.push(hash(&model.forward(
+                &step,
+                prompt.len() + i,
+                &mut cache,
+            )?)?);
         }
         out.push(format!(
             "PROBE lfm2_fingerprint layers={layers} decode_logits={steps:#018x?}"
@@ -355,7 +372,14 @@ fn lfm2_row_count(out: &mut Vec<String>, dev: &Device) -> Result<()> {
         for (l, (a, b)) in states.iter().zip(&one_states).enumerate() {
             if let (Some(a), Some(b)) = (a, b) {
                 let d = max_diff(a, b);
-                conv.push(format!("L{l}:{}", if d == 0.0 { "equal".into() } else { format!("{d:e}") }));
+                conv.push(format!(
+                    "L{l}:{}",
+                    if d == 0.0 {
+                        "equal".into()
+                    } else {
+                        format!("{d:e}")
+                    }
+                ));
             }
         }
         out.push(format!(
@@ -397,7 +421,10 @@ fn the_cpu_probes_reproduce_within_a_process() -> Result<()> {
         first.iter().any(|l| l.contains("row0_vs_m1=")),
         "the row-count probes ran"
     );
-    assert_eq!(first, second, "a probe did not reproduce within the process");
+    assert_eq!(
+        first, second,
+        "a probe did not reproduce within the process"
+    );
     Ok(())
 }
 
@@ -442,7 +469,10 @@ fn long_run(out: &mut Vec<String>, dev: &Device) -> Result<Vec<f32>> {
             let next = row
                 .iter()
                 .enumerate()
-                .fold((0usize, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m })
+                .fold(
+                    (0usize, f32::MIN),
+                    |m, (i, &v)| if v > m.1 { (i, v) } else { m },
+                )
                 .0 as u32;
             hashes.push(fold(row.iter().map(|v| v.to_bits())));
             dump.extend_from_slice(&row);
@@ -475,10 +505,15 @@ fn the_long_run_reproduces_within_a_process() -> Result<()> {
     for line in &first {
         println!("{line}");
     }
-    assert_eq!(first, second, "the long run did not reproduce within the process");
+    assert_eq!(
+        first, second,
+        "the long run did not reproduce within the process"
+    );
     assert_eq!(dump.len(), 3 * 200 * 64, "600 positions of 64 logits");
     assert!(
-        dump.iter().map(|v| v.to_bits()).eq(dump2.iter().map(|v| v.to_bits())),
+        dump.iter()
+            .map(|v| v.to_bits())
+            .eq(dump2.iter().map(|v| v.to_bits())),
         "the dumped logits did not reproduce"
     );
     if let Ok(path) = std::env::var("LLOOM_PROBE_DUMP") {

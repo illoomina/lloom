@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::{DType, IndexOp, D};
-use lloom::nn::{ModuleT, VarBuilder};
-use lloom::models::vgg::{Models, Vgg};
 use clap::{Parser, ValueEnum};
+use lloom::models::vgg::{Models, Vgg};
+use lloom::nn::{ModuleT, VarBuilder};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Which {

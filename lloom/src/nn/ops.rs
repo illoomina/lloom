@@ -2205,7 +2205,8 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 
             let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
 
-            let (mask_type, mask_buffer, mask_strides) = if let Some(mask) = &self.mask {
+            let (mask_type, mask_buffer, mask_offset, mask_strides) = if let Some(mask) = &self.mask
+            {
                 let (mask_s, mask_l) = mask_s_l.as_ref().unwrap();
 
                 let mask_buffer = match &**mask_s {
@@ -2234,10 +2235,11 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 (
                     Some(mask_type),
                     Some(mask_buffer),
+                    mask_l.start_offset() * mask.dtype().size_in_bytes(),
                     Some(mask_l.stride().to_vec()),
                 )
             } else {
-                (None, None, None)
+                (None, None, 0, None)
             };
 
             // A pool is one row read by every sequence through its table: the
@@ -2297,7 +2299,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 _ => None,
             };
 
-            lloom_tensor::kernels::call_sdpa_full_with(
+            lloom_tensor::kernels::call_sdpa_full_with_mask_offset(
                 q.device().device(),
                 &encoder,
                 q.device().kernels(),
@@ -2314,6 +2316,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 &v_stride,
                 mask_type,
                 mask_buffer,
+                mask_offset,
                 mask_strides.as_deref(),
                 &output,
                 out_layout.stride(),

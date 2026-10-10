@@ -96,11 +96,11 @@ pub use random::*;
 pub use reduce::*;
 pub use reduce_names::ReduceKernel;
 pub use sdpa::{
-    call_dequantize_kv, call_quantize_kv, call_sdpa_full, call_sdpa_full_with, call_sdpa_vector,
-    call_sdpa_vector_2pass, call_sdpa_vector_paged, call_sdpa_vector_quant,
-    call_sdpa_vector_quant_sel, quantize_group_reference, sdpa_full_tile,
-    sdpa_vector_admits_its_widths, KvQuantBits, SdpaDType, SdpaPageTable, KV_QUANT_HEAD_DIMS,
-    SDPA_FULL_HEAD_DIMS, SDPA_VECTOR_HEAD_DIMS,
+    call_dequantize_kv, call_quantize_kv, call_sdpa_full, call_sdpa_full_with,
+    call_sdpa_full_with_mask_offset, call_sdpa_vector, call_sdpa_vector_2pass,
+    call_sdpa_vector_paged, call_sdpa_vector_quant, call_sdpa_vector_quant_sel,
+    quantize_group_reference, sdpa_full_tile, sdpa_vector_admits_its_widths, KvQuantBits,
+    SdpaDType, SdpaPageTable, KV_QUANT_HEAD_DIMS, SDPA_FULL_HEAD_DIMS, SDPA_VECTOR_HEAD_DIMS,
 };
 pub use sort::{call_arg_sort, call_mlx_arg_sort};
 pub use ternary::call_where_cond;

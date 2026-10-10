@@ -198,4 +198,74 @@ mod metal {
         assert!(got.iter().all(|v| v.is_finite()));
         Ok(())
     }
+
+    fn check_mask_view(f: &Fixture, dtype: DType, dev: &Device, mask_view: &Tensor) -> Result<()> {
+        let (q, k, v, materialized) = inputs(f, dtype, dev)?;
+        assert_eq!(values(mask_view)?, values(&materialized)?);
+        let got = values(&ops::sdpa(&q, &k, &v, Some(mask_view), false, 0.125, 1.)?)?;
+        assert_reference(&got, &f.reference(true), dtype, f.keys);
+        let copied = values(&ops::sdpa(
+            &q,
+            &k,
+            &v,
+            Some(&materialized),
+            false,
+            0.125,
+            1.,
+        )?)?;
+        assert_eq!(
+            got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            copied.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_mask_nonzero_start_offset_matches_its_copy() -> Result<()> {
+        deterministic_contract();
+        let dev = Device::new_metal(0)?;
+        for dtype in [DType::F16, DType::F32] {
+            for queries in [1, 2] {
+                let f = Fixture::new(queries, 33);
+                let (_, _, _, mask) = inputs(&f, dtype, &dev)?;
+                let zeros = Tensor::zeros(mask.shape(), dtype, &dev)?;
+                let backing = Tensor::cat(&[&zeros, &mask], 0)?;
+                let view = backing.narrow(0, BATCH, BATCH)?;
+                assert_ne!(view.layout().start_offset(), 0);
+                assert!(
+                    view.is_contiguous(),
+                    "offset is independent of noncontiguity"
+                );
+                check_mask_view(&f, dtype, &dev, &view)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_mask_outer_strides_match_its_copy_without_offset() -> Result<()> {
+        deterministic_contract();
+        let dev = Device::new_metal(0)?;
+        for dtype in [DType::F16, DType::F32] {
+            for queries in [1, 2] {
+                let f = Fixture::new(queries, 33);
+                let mut padded = Vec::new();
+                for row in f.mask.chunks_exact(f.keys) {
+                    padded.extend_from_slice(row);
+                    padded.extend_from_slice(&[0.; 4]);
+                }
+                let backing = Tensor::from_vec(padded, (BATCH, HEADS, queries, f.keys + 4), &dev)?
+                    .to_dtype(dtype)?;
+                let view = backing.narrow(3, 0, f.keys)?;
+                assert_eq!(view.layout().start_offset(), 0);
+                assert!(
+                    !view.is_contiguous(),
+                    "stride coverage must not collapse into offset coverage"
+                );
+                assert_eq!(view.stride()[3], 1);
+                check_mask_view(&f, dtype, &dev, &view)?;
+            }
+        }
+        Ok(())
+    }
 }

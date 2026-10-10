@@ -2027,6 +2027,19 @@ using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
 template <int val>
 using Int = integral_constant<int, val>;
 
+// MSL integral_constant does not implicitly convert in int * constant.
+// Preserve compile-time unit strides while accepting the mask's runtime stride.
+template <typename T>
+METAL_FUNC constexpr T attn_stride_value(T value) {
+  return value;
+}
+
+template <typename T, T value>
+METAL_FUNC constexpr T attn_stride_value(integral_constant<T, value>) {
+  return value;
+}
+
+
 ///////////////////////////////////////////////////////////////////////////////
 // Binary Operators on Integral constants
 ///////////////////////////////////////////////////////////////////////////////
@@ -2222,7 +2235,8 @@ struct BaseMMAFrag<T, 8, 8> {
       for (short j = 0; j < kElemCols; j++) {
         if ((off_x + i) < lim_x && (off_y + j) < lim_y) {
           dst[i * kElemCols + j] =
-              static_cast<T>(src[(off_x + i) * str_x + (off_y + j) * str_y]);
+              static_cast<T>(src[(off_x + i) * str_x +
+                                 (off_y + j) * attn_stride_value(str_y)]);
         } else {
           dst[i * kElemCols + j] = T(0);
         }

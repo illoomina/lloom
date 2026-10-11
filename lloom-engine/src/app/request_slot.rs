@@ -60,6 +60,18 @@ where
     pub fn needs_recovery(&self) -> bool {
         self.recover && self.needs_recovery
     }
+    /// Run a caller-owned fallible data fence only for marked decoding recovery.
+    /// This does not clear the marker or reset state: refusal/unwind keeps Held
+    /// custody, and only the later successful decoding reset clears recovery.
+    pub fn before_recovery<RunError>(
+        &self,
+        fence: impl FnOnce() -> std::result::Result<(), RunError>,
+    ) -> std::result::Result<(), RunError> {
+        if self.needs_recovery() {
+            fence()?;
+        }
+        Ok(())
+    }
     pub fn extra(&self) -> &E {
         match self.state.as_ref() {
             Some(LeaseState::Held(state)) => &state.extra,

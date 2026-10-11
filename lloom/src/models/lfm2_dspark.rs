@@ -3263,21 +3263,6 @@ impl<H: SharedHead> DSparkSpeculator<H> {
         })
     }
 
-    /// Fence prior readers of this proposer's retained mapped slots after a
-    /// failed request. The owned queue marker survives concurrent queue drains;
-    /// only Ok permits the caller to reset/reuse slots. This is a data/error
-    /// boundary, not arbitrary callback return or global teardown quiescence.
-    /// No fence is added to successful steady requests.
-    pub fn fence_failed_request(&self) -> Result<()> {
-        let device = self.head.device();
-        #[cfg(feature = "metal")]
-        if let Device::Metal(device) = device {
-            let marker = device.flush_marker()?;
-            return device.wait_marker(&marker);
-        }
-        device.synchronize()
-    }
-
     /// Discard context from an incomplete request before reusing this proposer.
     /// Retain shared weights, slot tensors, Vec capacity, tuning and cumulative
     /// diagnostics. Context clearing may release backing or touch a paged pool;

@@ -1364,15 +1364,22 @@ impl<P: Lfm2Shape> Engine<P> {
         Ok(engine)
     }
 
+    fn fence_failed_request(&self) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = &self.core.device {
+            let marker = device.flush_marker()?;
+            device.wait_marker_prefix_data(&marker)?;
+            return Ok(());
+        }
+        self.core.device.synchronize()?;
+        Ok(())
+    }
+
     fn checkout_single(&self) -> Result<RequestLease<'_, Model<P>, SingleExtra>> {
         let lease = RequestLease::<Model<P>, _>::checkout(&self.single, true)?;
-        if lease.needs_recovery() {
-            if let Some(spec) = &lease.extra().spec {
-                // Before any target/extra reset or mapped-slot overwrite. Err
-                // restores unchanged custody and the recovery marker via Drop.
-                spec.fence_failed_request()?;
-            }
-        }
+        // Retained target scratch also needs quiescence without speculation.
+        // Refusal restores Held custody and the marker before any reset.
+        lease.before_recovery(|| self.fence_failed_request())?;
         Ok(lease)
     }
 

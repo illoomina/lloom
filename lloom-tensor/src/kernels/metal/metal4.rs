@@ -852,6 +852,28 @@ impl Submission {
         crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
             .map_err(|_| MetalKernelError::CallbackWouldBlock)
     }
+    /// The retained front event belongs to this logical submission's captured
+    /// generation. It is queued under commit_order before every own segment;
+    /// Apple's MTL4 signalEvent contract completes all earlier queue GPU work.
+    /// Own terminal feedback cannot substitute for this receipt, including an
+    /// empty submission. No arbitrary callback join is required here.
+    pub(super) fn try_wait_prefix_front(&self) -> Result<(), MetalKernelError> {
+        self.queue.check_failure()?;
+        crate::prefix_data::wait_front(
+            || self.front_event.signaledValue() >= self.generation,
+            || {
+                self.queue.check_failure()?;
+                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)
+            },
+            || {
+                self.front_event
+                    .waitUntilSignaledValue_timeoutMS(self.generation, 50)
+            },
+        )?;
+        self.queue.check_failure()
+    }
+
     pub(super) fn try_wait_data_ready(&self) -> Result<(), MetalKernelError> {
         loop {
             let seen = self.done.snapshot();

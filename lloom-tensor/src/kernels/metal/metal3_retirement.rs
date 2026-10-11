@@ -451,6 +451,9 @@ pub(super) struct CallbackRejected {
     pub callback: Option<super::retirement::Callback>,
 }
 impl AssociatedBuffer {
+    pub(super) fn queue_identity(&self) -> usize {
+        self.core.identity()
+    }
     pub(super) fn command_lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
         self.marker.command_lifecycle()
     }

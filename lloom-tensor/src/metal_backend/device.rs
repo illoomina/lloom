@@ -1596,6 +1596,19 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Recovery-only registered-prefix data boundary. M4 joins prior native
+    /// queue work through its front receipt plus own data. M3 joins registered
+    /// ordered callbacks, not untracked raw submissions.
+    /// Error/refusal is not permission to reset mapped scratch or release
+    /// unknown native custody. Later commits remain outside this receipt.
+    pub fn wait_marker_prefix_data(&self, marker: &CommandMarker) -> Result<()> {
+        self.commands
+            .wait_marker_prefix_data(marker)
+            .map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(())
+    }
+
     /// Commit without waiting, prune finished command buffers, and return the
     /// number still in flight.
     ///

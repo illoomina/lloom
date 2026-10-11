@@ -764,6 +764,47 @@ impl CommandBuffer {
             Backend::Metal4(submission) => submission.try_wait_data_ready(),
         }
     }
+    pub(super) fn associated_queue_identity(&self) -> Option<usize> {
+        match &self.backend {
+            Backend::Metal3(_) => None,
+            Backend::Metal3Associated(buffer) => Some(buffer.queue_identity()),
+            Backend::Metal4(submission) => Some(Arc::as_ptr(&submission.queue) as usize),
+        }
+    }
+
+    /// Recovery-only registered associated prefix: known returned handoff,
+    /// earlier registered work, then own data/error. Untracked raw submissions
+    /// are not covered by M3's registered prefix. Unlike own-data inspection, native
+    /// terminal status never overrides ENTERED/unknown lifecycle admission.
+    /// M3 currently uses the stronger ordered logical prefix (including
+    /// arbitrary callbacks and its self-wait refusal), not an enqueue/FIFO
+    /// shortcut. M4 uses its front receipt without joining callbacks.
+    pub(super) fn try_wait_prefix_data_ready(
+        &self,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        crate::prefix_data::wait_prefix(
+            || self.check_wait_admission(),
+            || match &self.backend {
+                Backend::Metal3(_) => Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "standalone buffer has no associated prefix receipt",
+                )),
+                Backend::Metal3Associated(buffer) => buffer.try_wait(true),
+                Backend::Metal4(submission) => submission.try_wait_prefix_front(),
+            },
+            || {
+                self.try_wait_data_ready()?;
+                if self.status() == MTLCommandBufferStatus::Error {
+                    return Err(crate::kernels::MetalKernelError::CommandBufferError(
+                        self.error()
+                            .map(|error| error.into_owned())
+                            .unwrap_or_else(|| "unknown error".into()),
+                    ));
+                }
+                Ok(())
+            },
+        )
+    }
+
     fn check_wait_admission(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.check_lifecycle_failure()?;
         match &self.backend {

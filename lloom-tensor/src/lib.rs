@@ -155,6 +155,8 @@ mod ordered_metadata;
 pub mod pickle;
 #[cfg(any(feature = "metal", test))]
 mod planner_transaction;
+#[cfg(any(feature = "metal", test))]
+mod prefix_data;
 pub mod quantized;
 #[cfg(any(feature = "metal", test))]
 mod residency_ownership;

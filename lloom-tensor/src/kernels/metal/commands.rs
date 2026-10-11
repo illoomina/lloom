@@ -1513,6 +1513,38 @@ impl Commands {
         self.prune_in_flight(&mut state, Some(&marker.cb))
     }
 
+    /// Recovery boundary for a marker created by this associated queue.
+    /// Joins the registered associated prefix plus this marker's data/error
+    /// even if a concurrent drainer removed predecessors from in_flight. M3 does
+    /// not cover untracked raw submissions; M4 also awaits its native queue front.
+    /// M4 does not
+    /// join arbitrary callbacks; M3's current stronger ordered-logical fallback
+    /// can wait for them, and refuses callback self-wait rather than deadlocking.
+    /// No EntryState guard is held across either wait. This does not prove final
+    /// callback/physical teardown or absence of errors published after return.
+    pub fn wait_marker_prefix_data(&self, marker: &CommandMarker) -> Result<(), MetalKernelError> {
+        let identity = self
+            .core
+            .modern_queue
+            .as_ref()
+            .map(|queue| Arc::as_ptr(queue) as usize)
+            .or_else(|| {
+                self.core
+                    .legacy_completions
+                    .as_ref()
+                    .map(|core| core.identity())
+            });
+        if identity.is_none() || marker.cb.associated_queue_identity() != identity {
+            return Err(MetalKernelError::QueueUnavailable(
+                "marker belongs to another queue",
+            ));
+        }
+        marker.cb.try_wait_prefix_data_ready()?;
+        self.core.failure.check()?;
+        let mut state = self.lock_state()?;
+        self.prune_in_flight(&mut state, Some(&marker.cb))
+    }
+
     pub fn flush(&self) -> Result<(), MetalKernelError> {
         let mut state = self.lock_state()?;
         if state.current.submitted().is_some()

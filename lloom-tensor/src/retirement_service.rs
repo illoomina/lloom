@@ -47,6 +47,70 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
     fn fail(&self, reason: Failure);
 }
 
+/// Nonblocking progress for a last-owner teardown, distinct from terminal
+/// payload destruction. Registration precedes any owner becoming externally
+/// visible; final-owner Drop only publishes a request and notifies `Wake`.
+///
+/// # Safety
+/// `poll` never waits for GPU work, native slots, another inbox, or a producer
+/// lock. It returns after bounded progress; a pending dependency must notify the
+/// service Wake when its predicate can change. Native commit may run only after
+/// exclusive recording ownership is established, without acquiring a replacement.
+/// Every owner remains inside this registered inbox across native entry, error,
+/// and unwind. Unknown handoff or failed callbacks cannot become terminal by
+/// poisoning. An error is retained and observable, not a successful drain.
+///
+/// Arbitrary capture destruction must use separately rooted active anchors as in
+/// `CleanupInbox`; `poll` cannot move the last physical custody onto its stack.
+/// `can_unregister` requires all submit-capable owners and all pending/active/
+/// quarantined payloads to be gone. `fail` only publishes refusal and wakes.
+/// Logical callback progress never depends on this service running `poll`.
+pub(crate) unsafe trait LifecycleInbox: Send + Sync {
+    fn poll(&self) -> bool;
+    fn can_unregister(&self) -> bool;
+    fn fail(&self, reason: Failure);
+}
+
+#[derive(Clone)]
+enum Inbox {
+    Cleanup(Arc<dyn CleanupInbox>),
+    Lifecycle(Arc<dyn LifecycleInbox>),
+}
+impl Inbox {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Cleanup(a), Self::Cleanup(b)) => Arc::ptr_eq(a, b),
+            (Self::Lifecycle(a), Self::Lifecycle(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+    fn progress(&self) -> bool {
+        match self {
+            Self::Cleanup(entry) => {
+                if !entry.begin_retire() {
+                    return false;
+                }
+                entry.drop_captures();
+                entry.finish_retire();
+                true
+            }
+            Self::Lifecycle(entry) => entry.poll(),
+        }
+    }
+    fn can_unregister(&self) -> bool {
+        match self {
+            Self::Cleanup(entry) => entry.can_unregister(),
+            Self::Lifecycle(entry) => entry.can_unregister(),
+        }
+    }
+    fn fail(&self, reason: Failure) {
+        match self {
+            Self::Cleanup(entry) => entry.fail(reason),
+            Self::Lifecycle(entry) => entry.fail(reason),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServiceError {
     StartFailed,
@@ -56,7 +120,7 @@ pub(crate) enum ServiceError {
 pub(crate) struct HostRetirementService {
     // Only host registration and this host worker access the registry lock.
     // Native feedback publishes into its rooted inbox and calls wake.notify.
-    registry: Mutex<Vec<Arc<dyn CleanupInbox>>>,
+    registry: Mutex<Vec<Inbox>>,
     wake: Arc<Wake>,
     failure: FailureSignal,
     // An arbitrary destructor panic can itself carry owned values. Keep those
@@ -112,12 +176,23 @@ impl HostRetirementService {
     /// Queue/slab setup, not per-CB allocation. Caller retains its own handle on
     /// rejection. Registry publication completes before any native handoff.
     pub(crate) fn register(&self, inbox: &Arc<dyn CleanupInbox>) -> Result<(), ServiceError> {
+        self.register_inbox(Inbox::Cleanup(inbox.clone()))
+    }
+
+    pub(crate) fn register_lifecycle(
+        &self,
+        inbox: &Arc<dyn LifecycleInbox>,
+    ) -> Result<(), ServiceError> {
+        self.register_inbox(Inbox::Lifecycle(inbox.clone()))
+    }
+
+    fn register_inbox(&self, inbox: Inbox) -> Result<(), ServiceError> {
         let mut registry = self.registry.lock();
         if let Some(reason) = self.failure.get() {
             return Err(ServiceError::Failed(reason));
         }
-        if !registry.iter().any(|entry| Arc::ptr_eq(entry, inbox)) {
-            registry.push(inbox.clone());
+        if !registry.iter().any(|entry| entry.same(&inbox)) {
+            registry.push(inbox);
         }
         drop(registry);
         self.wake.notify();
@@ -158,17 +233,13 @@ impl HostRetirementService {
             };
             // Crucially outside the registry lock. Detaching one credit before
             // Drop permits that destructor to register/submit another record.
-            if entry.begin_retire() {
-                entry.drop_captures();
-                entry.finish_retire();
-                progressed = true;
-            }
+            progressed |= entry.progress();
             if entry.can_unregister() {
                 let mut registry = self.registry.lock();
                 // This worker is the only remover; registration only appends.
                 if registry
                     .get(index)
-                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                    .is_some_and(|current| current.same(&entry))
                 {
                     registry.swap_remove(index);
                 }
@@ -426,5 +497,121 @@ mod tests {
         drop(active.finish().unwrap());
         assert_eq!(&*events.lock(), &["capture", "anchor"]);
         assert!(active.is_empty());
+    }
+    struct LifecycleControl {
+        requested: std::sync::atomic::AtomicBool,
+        terminal: std::sync::atomic::AtomicBool,
+        phase: AtomicUsize,
+        anchor: Mutex<Option<Anchor>>,
+        failure: FailureSignal,
+        wake: Arc<Wake>,
+    }
+    impl LifecycleControl {
+        fn new(service: &Arc<HostRetirementService>, drops: Arc<AtomicUsize>) -> Arc<Self> {
+            let control = Arc::new(Self {
+                requested: std::sync::atomic::AtomicBool::new(false),
+                terminal: std::sync::atomic::AtomicBool::new(false),
+                phase: AtomicUsize::new(0),
+                anchor: Mutex::new(Some(Anchor(drops))),
+                failure: FailureSignal::default(),
+                wake: service.wake(),
+            });
+            service
+                .register_lifecycle(&(control.clone() as Arc<dyn LifecycleInbox>))
+                .unwrap();
+            control
+        }
+        fn request(&self) {
+            self.requested.store(true, Ordering::Release);
+            self.wake.notify();
+        }
+        fn complete(&self) {
+            self.terminal.store(true, Ordering::Release);
+            self.wake.notify();
+        }
+    }
+    // SAFETY: fake native completion is one atomic predicate. No native object,
+    // blocking wait, arbitrary capture, or owner transfer onto a callback stack.
+    // Anchor::drop only increments its independent test counter.
+    unsafe impl LifecycleInbox for LifecycleControl {
+        fn poll(&self) -> bool {
+            if self.failure.get().is_some() {
+                return false;
+            }
+            match self.phase.load(Ordering::Acquire) {
+                0 if self.requested.load(Ordering::Acquire) => {
+                    self.phase.store(1, Ordering::Release);
+                    true
+                }
+                1 if self.terminal.load(Ordering::Acquire) => {
+                    let anchor = self.anchor.lock().take();
+                    drop(anchor);
+                    self.phase.store(2, Ordering::Release);
+                    true
+                }
+                _ => false,
+            }
+        }
+        fn can_unregister(&self) -> bool {
+            self.phase.load(Ordering::Acquire) == 2
+        }
+        fn fail(&self, reason: Failure) {
+            self.failure.publish(reason, || self.wake.notify());
+        }
+    }
+
+    #[test]
+    fn pending_lifecycle_preserves_owner_without_blocking_terminal_cleanup() {
+        use crate::host_anchor::HostAnchorRegistry;
+        let service = HostRetirementService::manual();
+        let lifecycle_drops = Arc::new(AtomicUsize::new(0));
+        let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let control = LifecycleControl::new(&service, lifecycle_drops.clone());
+        let cleanup = HostAnchorRegistry::manual(
+            Arc::new(FailureSignal::default()),
+            service.clone(),
+            Arc::new(Wake::default()),
+        );
+        let permit = cleanup
+            .reserve((), Anchor(cleanup_drops.clone()), |_| Ok(()))
+            .unwrap_or_else(|_| panic!("fixture cleanup registration"));
+        assert!(!service.manual_pass());
+        control.request();
+        assert!(service.manual_pass());
+        assert_eq!(control.phase.load(Ordering::Acquire), 1);
+        drop(permit);
+        assert!(service.manual_pass());
+        assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle_drops.load(Ordering::SeqCst), 0);
+        assert!(!service.manual_pass());
+        control.complete();
+        assert!(service.manual_pass());
+        assert_eq!(lifecycle_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(control.phase.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn closing_lifecycle_retains_unknown_ownership_and_refuses_new_registration() {
+        let service = HostRetirementService::manual();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let control = LifecycleControl::new(&service, drops.clone());
+        control.request();
+        assert!(service.manual_pass());
+        service.close_admission();
+        assert_eq!(control.failure.get(), Some(Failure::Closing));
+        control.complete();
+        assert!(!service.manual_pass());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(!control.can_unregister());
+        assert_eq!(
+            service.register_lifecycle(&(control.clone() as Arc<dyn LifecycleInbox>)),
+            Err(ServiceError::Failed(Failure::Closing))
+        );
+        drop(control);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        // Fake fixture explicitly ends all host custody. Production's static
+        // service does not disappear on Closing or infer terminality from it.
+        drop(service);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

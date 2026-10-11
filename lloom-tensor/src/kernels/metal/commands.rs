@@ -1391,23 +1391,19 @@ impl Commands {
         Ok(())
     }
 
-    /// Commit the current buffer, swap in a fresh one, and return the value the
-    /// completion arm should wait for -- `None` on the incumbent path.
-    ///
-    /// The return is what makes the async arms possible without a second commit
-    /// site: the signal has to be encoded on *this* buffer, between closing its
-    /// encoder and committing it, and only this function is at that point.
-    fn commit_swap_locked(
+    /// Submit once and retain the original receipt on retry. Replacement is a
+    /// separate operation: draining already recorded work must not require
+    /// acquiring another native slot.
+    fn commit_current_locked(
         &self,
         state: &mut EntryState,
-        reset_to: usize,
-    ) -> Result<Option<u64>, MetalKernelError> {
-        let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
+        timed: Option<std::time::Instant>,
+    ) -> Result<CommitReceipt, MetalKernelError> {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc)?;
         }
         let t_end_enc = timed.map(|t| t.elapsed());
-        let receipt = *state
+        state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
                 self.failure.check()?;
@@ -1454,7 +1450,23 @@ impl Commands {
                     crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
                 }
                 Ok(CommitReceipt { epoch, signalled })
-            })?;
+            })
+            .copied()
+    }
+
+    /// Commit the current buffer, swap in a fresh one, and return the value the
+    /// completion arm should wait for -- `None` on the incumbent path.
+    ///
+    /// The return is what makes the async arms possible without a second commit
+    /// site: the signal has to be encoded on *this* buffer, between closing its
+    /// encoder and committing it, and only this function is at that point.
+    fn commit_swap_locked(
+        &self,
+        state: &mut EntryState,
+        reset_to: usize,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
+        let receipt = self.commit_current_locked(state, timed)?;
         if let Some(hold) = &self.hold {
             hold.release_completed();
         }

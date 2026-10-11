@@ -224,7 +224,9 @@ pub struct PassAdmission {
     /// arbiter's third rung, §4.2) when the pass did not fit after the
     /// reclaim: the owner of those tenants applies the pledge (an elastic
     /// expert tier parks slots) and asks again.
-    pub pledged: usize,
+    pub pledged: u128,
+    /// Bulk tenants whose concurrent grants prevented a bounded yield attempt.
+    pub yield_contended: usize,
     /// The second rung ran: the queue waited out once and the pending lists
     /// given back (`--pool-no-admission-drain` turns it off).
     pub drained: bool,
@@ -233,6 +235,32 @@ pub struct PassAdmission {
     /// quota but the bytes past what the process reserved on the machine
     /// did not fit the machine: the arithmetic, for the caller's message.
     pub machine: Option<String>,
+}
+
+impl PassAdmission {
+    pub fn yield_report(&self) -> crate::memory_arbitration::YieldReport {
+        crate::memory_arbitration::YieldReport {
+            pledged: self.pledged,
+            contended: self.yield_contended,
+        }
+    }
+
+    pub fn needs_yield_retry(&self) -> bool {
+        self.yield_report().needs_retry(self.fits)
+    }
+
+    pub fn merge_yield_report(
+        &mut self,
+        previous: crate::memory_arbitration::YieldReport,
+    ) -> crate::Result<()> {
+        let merged = self
+            .yield_report()
+            .checked_merge(previous)
+            .ok_or_else(|| crate::Error::Msg("yield report diagnostic total overflow".into()))?;
+        self.pledged = merged.pledged;
+        self.yield_contended = merged.contended;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -970,6 +998,7 @@ impl MetalDevice {
                 committed,
                 reclaimed: 0,
                 pledged: 0,
+                yield_contended: 0,
                 drained: false,
                 fits: true,
                 machine: None,
@@ -992,21 +1021,22 @@ impl MetalDevice {
                 committed = self.ledger.committed();
             }
         }
-        let mut pledged = 0;
+        let mut yielded = crate::memory_arbitration::YieldReport::default();
         if !fits_budget(committed, need, budget) {
             // The third rung (§4.2, caches yield): the tenants that can
             // shrink pledge units — the expert tier's slots — until the
             // shortfall is covered or none can give more. The pledge is
             // applied by the tenants' owner, which asks again.
             let short = reclaim_target(committed, need, budget);
-            pledged = self.ledger.yield_for(short);
+            yielded = self.ledger.yield_for_report(short);
             committed = self.ledger.committed();
         }
         self.ledger.note_reclaim(reclaimed);
         PassAdmission {
             committed,
             reclaimed,
-            pledged,
+            pledged: yielded.pledged,
+            yield_contended: yielded.contended,
             drained,
             fits: fits_budget(committed, need, budget),
             machine: None,

@@ -72,6 +72,46 @@ impl GroupTenant {
         })
     }
 
+    /// Exact atomic pledged delta with bounded retries. Contention leaves a
+    /// competing grant intact and is reported separately from no available yield.
+    pub fn yield_bulk(&self, bytes: usize) -> lloom_tensor::memory_arbitration::BulkYield {
+        self.yield_bulk_with(bytes, || {})
+    }
+
+    fn yield_bulk_with(
+        &self,
+        bytes: usize,
+        mut before_cas: impl FnMut(),
+    ) -> lloom_tensor::memory_arbitration::BulkYield {
+        use lloom_tensor::memory_arbitration::BulkYield;
+        if self.unit == 0 || bytes == 0 {
+            return BulkYield::Pledged { bytes: 0 };
+        }
+        let requested = bytes.div_ceil(self.unit);
+        let mut held = self.wanted.load(Ordering::Relaxed);
+        for _ in 0..4 {
+            let units = requested.min(held.saturating_sub(self.floor_units));
+            if units == 0 {
+                return BulkYield::Pledged { bytes: 0 };
+            }
+            let top = self.max_units.min(self.want_units).max(self.floor_units);
+            let target = (held - units).min(top);
+            before_cas();
+            match self
+                .wanted
+                .compare_exchange(held, target, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    return BulkYield::Pledged {
+                        bytes: (held - target) * self.unit,
+                    }
+                }
+                Err(now) => held = now,
+            }
+        }
+        BulkYield::Contended
+    }
+
     pub fn unit(&self) -> usize {
         self.unit
     }
@@ -107,6 +147,9 @@ impl lloom_tensor::kernels::metal::ledger::Tenant for GroupTenant {
     fn held(&self) -> usize {
         self.wanted_units() * self.unit
     }
+    fn yield_bulk(&self, bytes: usize) -> lloom_tensor::memory_arbitration::BulkYield {
+        GroupTenant::yield_bulk(self, bytes)
+    }
     /// Record the grant as units, between the floor and the most the owner
     /// can run; the bytes those units are, back to the arbiter. Nothing
     /// moves here.
@@ -121,6 +164,57 @@ impl lloom_tensor::kernels::metal::ledger::Tenant for GroupTenant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_bulk_yield_is_bounded_and_preserves_competing_grants() {
+        use lloom_tensor::memory_arbitration::BulkYield;
+        let tenant = GroupTenant::new("bulk", 100, 8, 3, 30, 10).unwrap();
+        assert_eq!(tenant.yield_bulk(150), BulkYield::Pledged { bytes: 200 });
+        assert_eq!(tenant.wanted_units(), 6);
+        assert_eq!(
+            tenant.yield_bulk(usize::MAX),
+            BulkYield::Pledged { bytes: 300 }
+        );
+        assert_eq!(tenant.yield_bulk(1), BulkYield::Pledged { bytes: 0 });
+        let zero = GroupTenant::new("zero", 0, usize::MAX, 0, usize::MAX, usize::MAX).unwrap();
+        assert_eq!(zero.yield_bulk(usize::MAX), BulkYield::Pledged { bytes: 0 });
+        let huge = GroupTenant::new("huge", 1, usize::MAX, 0, usize::MAX, usize::MAX).unwrap();
+        assert_eq!(
+            huge.yield_bulk(usize::MAX),
+            BulkYield::Pledged { bytes: usize::MAX }
+        );
+        let low_want = GroupTenant::new("low-want", 100, 8, 1, 3, 10).unwrap();
+        assert_eq!(low_want.yield_bulk(100), BulkYield::Pledged { bytes: 500 });
+        assert_eq!(low_want.wanted_units(), 3, "preserve resize's want clamp");
+        let tenant = GroupTenant::new("race", 100, 8, 3, 30, 10).unwrap();
+        let mut attempts = 0;
+        let result = tenant.yield_bulk_with(100, || {
+            attempts += 1;
+            tenant
+                .wanted
+                .store(if attempts % 2 == 1 { 9 } else { 8 }, Ordering::Relaxed);
+        });
+        assert_eq!(result, BulkYield::Contended);
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            tenant.wanted_units(),
+            8,
+            "no failed CAS overwrote the competing grant"
+        );
+        let mut first = true;
+        let result = tenant.yield_bulk_with(100, || {
+            if first {
+                tenant.wanted.store(10, Ordering::Relaxed);
+                first = false;
+            }
+        });
+        assert_eq!(result, BulkYield::Pledged { bytes: 100 });
+        assert_eq!(
+            tenant.wanted_units(),
+            9,
+            "successful CAS used the fresh grant, not stale eight"
+        );
+    }
 
     #[test]
     fn numeric_bounds_are_checked_after_normalization() {

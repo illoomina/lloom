@@ -2633,14 +2633,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.
             let mut a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-            if !a.fits && a.pledged > 0 {
+            if a.needs_yield_retry() {
                 // The tenants pledged a yield (the expert tier's slots):
                 // apply it — park the slots, their pages given back — and
                 // ask again on the figure after.
                 let parked = self.apply_expert_grant()?;
-                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                let (yielded, reclaimed) = (a.yield_report(), a.reclaimed);
                 a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-                a.pledged = pledged;
+                a.merge_yield_report(yielded)?;
                 a.reclaimed += reclaimed + parked;
             }
             let (allocated, fits) = (a.committed, a.fits);
@@ -2650,7 +2650,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
@@ -2662,6 +2662,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,
                 gb(working_set),
+                a.pledged,
+                a.yield_contended,
             );
             match self.mem_check {
                 MemCheck::Report => eprintln!("MEMCHECK {line}"),

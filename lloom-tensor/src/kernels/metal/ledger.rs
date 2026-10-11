@@ -23,7 +23,8 @@ use std::sync::{Arc, Weak};
 use crate::machine::Holding;
 
 pub use crate::memory_arbitration::{
-    arbitrate, Arbitration, Claim, Class, Grant, LedgerSnapshot, TenantId, TenantRow,
+    arbitrate, Arbitration, BulkYield, Claim, Class, Grant, LedgerSnapshot, TenantId, TenantRow,
+    YieldReport,
 };
 
 /// A holder of memory the ledger can ask about. Reads must be cheap: the
@@ -34,6 +35,11 @@ pub trait Tenant: Send + Sync {
     fn claim(&self) -> Claim;
     /// Bytes held now.
     fn held(&self) -> usize;
+    /// Opt in only when one atomic operation can report an exact pledged delta.
+    /// Default retains the legacy callback-per-unit behavior.
+    fn yield_bulk(&self, _bytes: usize) -> BulkYield {
+        BulkYield::Legacy
+    }
     /// Cold path: grow by refilling, shrink by evict + retire
     /// (`profiles-and-memory-design.md` §4.2). Returns what the tenant
     /// holds after. A fixed tenant (the default) holds what it holds.
@@ -187,21 +193,38 @@ impl Ledger {
         (a, resized)
     }
 
-    /// Ask the tenants that yield — `Scratch` first, then `Cache`, never a
-    /// `Capability` — to shrink by units until `bytes` are pledged or none
-    /// can give more. A pledge is what a tenant reports holding less after
-    /// `resize`; a tenant that frees at once (drops reservations) moves
-    /// `committed` here, one whose owner applies the grant later (the
-    /// expert tier reallocating its pools) moves it then. Returns the
-    /// bytes pledged.
+    /// Compatibility scalar: caps an unrepresentable pledge at usize::MAX and
+    /// omits contention. New admission callers must use `yield_for_report`.
     pub fn yield_for(&self, bytes: usize) -> usize {
-        let mut pledged = 0usize;
+        self.yield_for_report(bytes).pledged.min(usize::MAX as u128) as usize
+    }
+
+    /// Ask Scratch, then Cache (never Capability) to yield. Only opt-in tenants
+    /// use bulk; arbitrary third-party resize callbacks still run once per unit.
+    /// Pledge is not credit: committed changes only when physical owners release.
+    pub fn yield_for_report(&self, bytes: usize) -> YieldReport {
+        let mut report = YieldReport::default();
         let tenants = self.live_tenants();
         for class in [Class::Scratch, Class::Cache] {
             for (_, t) in tenants.iter().filter(|(_, t)| t.claim().class == class) {
+                if report.pledged >= bytes as u128 {
+                    return report;
+                }
+                let remaining = (bytes as u128 - report.pledged) as usize;
+                match t.yield_bulk(remaining) {
+                    BulkYield::Pledged { bytes } => {
+                        report.pledged += bytes as u128;
+                        continue;
+                    }
+                    BulkYield::Contended => {
+                        report.contended += 1;
+                        continue;
+                    }
+                    BulkYield::Legacy => {}
+                }
                 loop {
-                    if pledged >= bytes {
-                        return pledged;
+                    if report.pledged >= bytes as u128 {
+                        return report;
                     }
                     let claim = t.claim();
                     let held = t.held();
@@ -214,11 +237,11 @@ impl Ledger {
                     if after >= held {
                         break;
                     }
-                    pledged += held - after;
+                    report.pledged += (held - after) as u128;
                 }
             }
         }
-        pledged
+        report
     }
 
     /// A pass-level admission gave the free lists back: count it.
@@ -348,6 +371,126 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BulkOnly {
+        held: AtomicUsize,
+        contended: bool,
+        class: Class,
+    }
+    impl Tenant for BulkOnly {
+        fn name(&self) -> String {
+            "bulk-test".into()
+        }
+        fn claim(&self) -> Claim {
+            Claim {
+                floor: 0,
+                want: self.held(),
+                unit: 1,
+                class: self.class,
+            }
+        }
+        fn held(&self) -> usize {
+            self.held.load(Ordering::Relaxed)
+        }
+        fn yield_bulk(&self, _: usize) -> BulkYield {
+            if self.contended {
+                BulkYield::Contended
+            } else {
+                BulkYield::Pledged {
+                    bytes: self.held.swap(0, Ordering::Relaxed),
+                }
+            }
+        }
+        fn resize(&self, _: usize) -> usize {
+            panic!("bulk tenant must not use legacy resize")
+        }
+    }
+
+    #[test]
+    fn numeric_bulk_yield_reports_exact_overshoot_and_contention() {
+        let ledger = Ledger::new();
+        let tenants: Vec<Arc<dyn Tenant>> = vec![
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(1),
+                contended: true,
+                class: Class::Scratch,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(usize::MAX - 1),
+                contended: false,
+                class: Class::Cache,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(usize::MAX),
+                contended: false,
+                class: Class::Cache,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(1),
+                contended: true,
+                class: Class::Capability,
+            }),
+        ];
+        for t in &tenants {
+            ledger.register(t);
+        }
+        assert_eq!(
+            ledger.yield_for_report(usize::MAX),
+            YieldReport {
+                pledged: 2 * usize::MAX as u128 - 1,
+                contended: 1
+            }
+        );
+        assert_eq!(ledger.committed(), 0, "a pledge is not physical credit");
+        assert_eq!(tenants[3].held(), 1, "capability not visited");
+        assert_eq!(ledger.yield_for_report(0), YieldReport::default());
+    }
+
+    #[test]
+    fn numeric_legacy_yield_keeps_each_callback() {
+        struct Stateful {
+            held: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        impl Tenant for Stateful {
+            fn name(&self) -> String {
+                "legacy-stateful".into()
+            }
+            fn claim(&self) -> Claim {
+                Claim {
+                    floor: 2,
+                    want: 8,
+                    unit: 2,
+                    class: Class::Cache,
+                }
+            }
+            fn held(&self) -> usize {
+                self.held.load(Ordering::Relaxed)
+            }
+            fn resize(&self, grant: usize) -> usize {
+                assert_eq!(grant, self.held() - 2, "one-unit callback contract");
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.held.store(grant, Ordering::Relaxed);
+                grant
+            }
+        }
+        let ledger = Ledger::new();
+        let owner = Arc::new(Stateful {
+            held: AtomicUsize::new(8),
+            calls: AtomicUsize::new(0),
+        });
+        let tenant: Arc<dyn Tenant> = owner.clone();
+        ledger.register(&tenant);
+        assert_eq!(
+            ledger.yield_for_report(5),
+            YieldReport {
+                pledged: 6,
+                contended: 0
+            }
+        );
+        assert_eq!(owner.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(ledger.yield_for(1), 0);
+    }
 
     /// A tenant that yields: its `resize` drops a unit's reservation at
     /// once and reports the pledge; a fixed tenant (a `Gauge`) holds what

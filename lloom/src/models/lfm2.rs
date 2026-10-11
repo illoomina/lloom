@@ -4819,16 +4819,15 @@ impl<P: Profile> State<P> {
         // The free lists are given back before a refusal stands
         // (`MetalDevice::admit_bytes`); the arithmetic is `kv_grow_fits`'.
         let mut a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
-        if !a.fits && a.pledged > 0 {
+        if a.needs_yield_retry() {
             // The tenants pledged a yield (the layers' slots): apply it —
             // the tier resized to its grant — and ask again on the figure
             // after (the expert tier's shape, `prepare_pass_as`).
-            if self.apply_layer_grant()?.is_some() {
-                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
-                a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
-                a.pledged = pledged;
-                a.reclaimed += reclaimed;
-            }
+            self.apply_layer_grant()?;
+            let (yielded, reclaimed) = (a.yield_report(), a.reclaimed);
+            a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+            a.merge_yield_report(yielded)?;
+            a.reclaimed += reclaimed;
         }
         if a.fits {
             debug_assert!(kv_grow_fits(
@@ -4840,7 +4839,11 @@ impl<P: Profile> State<P> {
             return Ok(());
         }
         if let Some(why) = &a.machine {
-            lloom_tensor::bail!("lfm2 KV grow refused {what}: {why}");
+            lloom_tensor::bail!(
+                "lfm2 KV grow refused {what}: {why}; pledged={} yield_contended={}",
+                a.pledged,
+                a.yield_contended
+            );
         }
         let gb = |b: usize| b as f64 / 1e9;
         lloom_tensor::bail!(
@@ -4849,13 +4852,15 @@ impl<P: Profile> State<P> {
              {:.2} GB) after giving back {:.3} GB of free lists. The reply stops here, \
              before anything is written, rather than risk \
              the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
-             free memory, or bound the run.",
+             free memory, or bound the run. pledged={} yield_contended={} (at most one yield retry).",
             gb(grow),
             gb(a.committed),
             gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
             self.kv_grow_fraction,
             gb(working_set),
             gb(a.reclaimed),
+            a.pledged,
+            a.yield_contended,
         )
     }
 

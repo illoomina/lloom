@@ -27,6 +27,37 @@ impl Class {
     }
 }
 
+/// Optional bulk-yield protocol. Legacy preserves arbitrary per-unit resize
+/// callbacks; Contended is a retryable observation, never a zero-byte pledge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkYield {
+    Legacy,
+    Pledged { bytes: usize },
+    Contended,
+}
+
+/// Exact pledge diagnostics, not physical memory credit. Owners apply their
+/// grants and admission re-reads committed bytes before deciding whether to fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YieldReport {
+    pub pledged: u128,
+    pub contended: usize,
+}
+
+impl YieldReport {
+    pub fn needs_retry(self, fits: bool) -> bool {
+        !fits && (self.pledged > 0 || self.contended > 0)
+    }
+
+    /// Preserve both attempts' diagnostics without hiding impossible totals.
+    pub fn checked_merge(self, previous: Self) -> Option<Self> {
+        Some(Self {
+            pledged: self.pledged.checked_add(previous.pledged)?,
+            contended: self.contended.checked_add(previous.contended)?,
+        })
+    }
+}
+
 /// A tenant's claim on the quota, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Claim {
@@ -220,6 +251,44 @@ pub(crate) fn machine_target(committed: usize, need: usize) -> Result<u64, Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_yield_retry_and_merge_use_both_attempts() {
+        let empty = super::YieldReport::default();
+        let pledge = super::YieldReport {
+            pledged: 3,
+            contended: 0,
+        };
+        let contention = super::YieldReport {
+            pledged: 0,
+            contended: 2,
+        };
+        for report in [empty, pledge, contention] {
+            assert!(!report.needs_retry(true));
+        }
+        assert!(!empty.needs_retry(false));
+        assert!(pledge.needs_retry(false));
+        assert!(contention.needs_retry(false));
+        assert_eq!(
+            pledge.checked_merge(contention),
+            Some(super::YieldReport {
+                pledged: 3,
+                contended: 2
+            })
+        );
+        assert!(super::YieldReport {
+            pledged: u128::MAX,
+            contended: 0
+        }
+        .checked_merge(pledge)
+        .is_none());
+        assert!(super::YieldReport {
+            pledged: 0,
+            contended: usize::MAX
+        }
+        .checked_merge(contention)
+        .is_none());
+    }
+
     use super::*;
     fn row(id: u32, class: Class, floor: usize, want: usize, unit: usize) -> TenantRow {
         TenantRow {

@@ -27,6 +27,26 @@ impl Wake {
             }
         }
     }
+    #[cfg(test)]
+    pub(crate) fn test_is_parked(&self) -> bool {
+        let mut parked = false;
+        // SAFETY: the test retains this Wake at its stable parking address.
+        // This mirrors the existing registered-waiter control: observe a
+        // validated queue member without removing it or changing the epoch.
+        // The filter cannot panic or reenter the parking queue.
+        unsafe {
+            parking_lot_core::unpark_filter(
+                self as *const Self as usize,
+                |_| {
+                    parked = true;
+                    parking_lot_core::FilterOp::Skip
+                },
+                |_| parking_lot_core::DEFAULT_UNPARK_TOKEN,
+            );
+        }
+        parked
+    }
+
     pub(crate) fn wait(&self, seen: usize) {
         self.park(seen, None);
     }

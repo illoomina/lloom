@@ -15,7 +15,11 @@ use parking_lot::Mutex;
 use std::{
     any::Any,
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 /// Native adapter contract, in addition to Rust thread safety.
@@ -52,10 +56,21 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
     fn drop_captures(&self);
     fn finish_retire(&self);
     fn can_unregister(&self) -> bool;
+    /// Immutable opt-in for inboxes whose warm publishers use atomics only.
+    /// Such inboxes never call Wake from last-owner release. Their registered
+    /// root must remain eligible for polling until every possible delayed
+    /// publication has been consumed: dropping application producers alone is
+    /// not enough to permit can_unregister. This engine-only immutable query
+    /// must not panic or acquire a lock. Defaults preserve existing adapters.
+    fn requires_polling(&self) -> bool {
+        false
+    }
     /// Opt-in final metadata destruction on the service thread. Safety requires
     /// no Weak/raw-Arc acquisition path: every external clone must start from
     /// an already counted Arc. Service snapshots acquire under registry lock.
     /// Every foreign final release must drop its Arc BEFORE notifying Wake.
+    /// An immutable requires_polling opt-in may omit that notification; the
+    /// registered polling root then survives every foreign counted reference.
     /// Non-opt-in lifecycle adapters retain their existing unregister policy.
     fn worker_final_metadata_drop(&self) -> bool {
         false
@@ -156,6 +171,12 @@ impl Inbox {
             Self::Lifecycle(_) => true,
         }
     }
+    fn requires_polling(&self) -> bool {
+        match self {
+            Self::Cleanup(entry) => entry.requires_polling(),
+            Self::Lifecycle(_) => false,
+        }
+    }
     fn worker_final_metadata_drop(&self) -> bool {
         match self {
             Self::Cleanup(entry) => entry.worker_final_metadata_drop(),
@@ -201,6 +222,16 @@ pub(crate) struct HostRetirementService {
     registry: Mutex<Vec<Inbox>>,
     wake: Arc<Wake>,
     failure: FailureSignal,
+    // Cold registry edits publish this summary under the existing registry
+    // guard; warm inbox publishers never touch service locks or Wake. The
+    // service owns the policy, not allocation callers: 10 ms is an initial,
+    // unmeasured latency/idle-cost tradeoff, not an optimum or deadline promise.
+    polling: AtomicBool,
+    polling_interval: Duration,
+    #[cfg(test)]
+    test_stop: AtomicBool,
+    #[cfg(test)]
+    test_idle_parks: std::sync::atomic::AtomicUsize,
     // An arbitrary destructor panic can itself carry owned values. Keep those
     // under static host custody too; do not drop/retry them on worker unwind.
     panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
@@ -221,6 +252,12 @@ impl HostRetirementService {
                 registry: Mutex::new(Vec::new()),
                 wake: Arc::new(Wake::default()),
                 failure: FailureSignal::default(),
+                polling: AtomicBool::new(false),
+                polling_interval: Duration::from_millis(10),
+                #[cfg(test)]
+                test_stop: AtomicBool::new(false),
+                #[cfg(test)]
+                test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
                 panic_payloads: Mutex::new(Vec::new()),
                 active_metadata_charge: Mutex::new(None),
             });
@@ -242,6 +279,12 @@ impl HostRetirementService {
             registry: Mutex::new(Vec::new()),
             wake: Arc::new(Wake::default()),
             failure: FailureSignal::default(),
+            polling: AtomicBool::new(false),
+            polling_interval: Duration::from_millis(10),
+            #[cfg(test)]
+            test_stop: AtomicBool::new(false),
+            #[cfg(test)]
+            test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
             panic_payloads: Mutex::new(Vec::new()),
             active_metadata_charge: Mutex::new(None),
         })
@@ -284,7 +327,11 @@ impl HostRetirementService {
             return Err(ServiceError::Failed(reason));
         }
         if !registry.iter().any(|entry| entry.same(&inbox)) {
+            let requires_polling = inbox.requires_polling();
             registry.push(inbox);
+            if requires_polling {
+                self.polling.store(true, Ordering::Release);
+            }
         }
         drop(registry);
         self.wake.notify();
@@ -345,7 +392,16 @@ impl HostRetirementService {
                     .get(index)
                     .is_some_and(|current| current.same(&entry) && current.metadata_removable())
                 {
-                    Some(registry.swap_remove(index))
+                    // Query surviving roots BEFORE removal: no removed root
+                    // is exposed to an erroneous immutable predicate unwind.
+                    // Lifecycle/default-false inboxes never opt into polling.
+                    let polling = registry
+                        .iter()
+                        .enumerate()
+                        .any(|(candidate, inbox)| candidate != index && inbox.requires_polling());
+                    let removed = registry.swap_remove(index);
+                    self.polling.store(polling, Ordering::Release);
+                    Some(removed)
                 } else {
                     None
                 }
@@ -398,11 +454,39 @@ impl HostRetirementService {
             // Snapshot before examining inboxes, including RETURNED and final
             // reader notifications; the shared Wake closes check -> park.
             let seen = self.wake.snapshot();
+            // Test stop uses the same snapshot -> check -> park handshake.
+            #[cfg(test)]
+            if self.test_stop.load(Ordering::Acquire) {
+                return;
+            }
             #[cfg(feature = "metal")]
             let progressed = objc2::rc::autoreleasepool(|_| self.pass());
             #[cfg(not(feature = "metal"))]
             let progressed = self.pass();
-            if !progressed {
+            if !progressed && self.polling.load(Ordering::Acquire) {
+                // Existing notifications remain responsive: unlike sleep,
+                // timed park returns on a legacy Wake as well as timeout.
+                // Snapshot-before-pass + cold register's notify closes a
+                // registration racing this check, including false -> park.
+                // Productive passes keep the original immediate-drain policy.
+                // With no notifications, each retained polled root causes
+                // about 100 passes/s; every pass scans unrelated roots too.
+                // Cost and eventual latency require measurement separately.
+                let Some(deadline) = Instant::now().checked_add(self.polling_interval) else {
+                    // Never turn an unrepresentable deadline into indefinite
+                    // park or a retry spin. Close admission, preserve static
+                    // inbox custody, and stop this worker conservatively.
+                    self.failure
+                        .publish(Failure::WorkerFailed, || self.wake.notify());
+                    self.fail_inboxes(Failure::WorkerFailed);
+                    return;
+                };
+                #[cfg(test)]
+                self.test_idle_parks.fetch_add(1, Ordering::Release);
+                self.wake.park(seen, Some(deadline));
+            } else if !progressed {
+                #[cfg(test)]
+                self.test_idle_parks.fetch_add(1, Ordering::Release);
                 self.wake.wait(seen);
             }
         }));
@@ -991,5 +1075,216 @@ mod metadata_charge_tests {
         assert!(service.registry.lock().is_empty());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(domain.snapshot().committed, 0);
+    }
+}
+
+#[cfg(test)]
+mod polling_tests {
+    use super::*;
+    use crate::memory_admission::ModelDomain;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread::JoinHandle;
+
+    // Test-only teardown wakes an indefinite park too, including the mutation
+    // that removes polling eligibility. worker() is the production decision.
+    struct RunningWorker {
+        service: Arc<HostRetirementService>,
+        thread: Option<JoinHandle<()>>,
+    }
+    impl RunningWorker {
+        fn start(service: Arc<HostRetirementService>) -> Self {
+            let worker = service.clone();
+            let thread = std::thread::Builder::new()
+                .name("957-tagged-polling-control".into())
+                .spawn(move || worker.worker())
+                .unwrap();
+            Self {
+                service,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for RunningWorker {
+        fn drop(&mut self) {
+            self.service.test_stop.store(true, Ordering::Release);
+            self.service.wake.notify();
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    fn eventually(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now().checked_add(Duration::from_secs(2)).unwrap();
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "eventual progress watchdog expired"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct LegacyInbox;
+    // SAFETY: no producer, native work, callback, physical charge or payload.
+    unsafe impl CleanupInbox for LegacyInbox {
+        fn begin_retire(&self) -> bool {
+            false
+        }
+        fn drop_captures(&self) {}
+        fn finish_retire(&self) {}
+        fn can_unregister(&self) -> bool {
+            true
+        }
+        fn fail(&self, _: Failure) {}
+    }
+    #[test]
+    fn old_adapter_default_does_not_enroll_idle_polling() {
+        let service = HostRetirementService::manual();
+        let inbox: Arc<dyn CleanupInbox> = Arc::new(LegacyInbox);
+        assert!(!inbox.requires_polling());
+        service.register(&inbox).unwrap();
+        assert!(!service.polling.load(Ordering::Acquire));
+        assert!(!service.manual_pass());
+        assert!(service.registry.lock().is_empty());
+        assert!(!service.polling.load(Ordering::Acquire));
+    }
+
+    struct PollingInbox {
+        service: Arc<HostRetirementService>,
+        domain: ModelDomain,
+        charge: Mutex<Option<PhysicalCharge>>,
+        producer_alive: AtomicBool,
+        pending: AtomicUsize,
+        passes: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+        first_idle: AtomicUsize,
+        interrupted_drain: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+    }
+    // SAFETY: this bounded host fixture owns no native work or arbitrary
+    // callbacks. Three release-published scalar records retire once each.
+    // Unregistration requires producer gone and all three consumed; counted
+    // foreign Arcs forbid final metadata destruction until publisher Drop ends.
+    // No Weak/raw Arc acquisition exists. The immutable opt-in uses no lock.
+    // Only the one service worker takes the charge and destroys metadata.
+    unsafe impl CleanupInbox for PollingInbox {
+        fn begin_retire(&self) -> bool {
+            self.passes.fetch_add(1, Ordering::Release);
+            self.pending
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    pending.checked_sub(1)
+                })
+                .is_ok()
+        }
+        fn drop_captures(&self) {}
+        fn finish_retire(&self) {
+            let idle = self.service.test_idle_parks.load(Ordering::Acquire);
+            let first = self
+                .first_idle
+                .compare_exchange(usize::MAX, idle, Ordering::AcqRel, Ordering::Acquire)
+                .unwrap_or_else(|first| first);
+            if first != usize::MAX && first != idle {
+                self.interrupted_drain.store(true, Ordering::Release);
+            }
+            self.finished.fetch_add(1, Ordering::Release);
+        }
+        fn can_unregister(&self) -> bool {
+            !self.producer_alive.load(Ordering::Acquire)
+                && self.finished.load(Ordering::Acquire) == 3
+        }
+        fn requires_polling(&self) -> bool {
+            true
+        }
+        fn worker_final_metadata_drop(&self) -> bool {
+            true
+        }
+        fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
+            self.charge.lock().take()
+        }
+        fn fail(&self, _: Failure) {}
+    }
+    impl Drop for PollingInbox {
+        fn drop(&mut self) {
+            assert!(
+                self.service.registry.try_lock().is_some(),
+                "metadata destructor ran under registry guard"
+            );
+            assert_eq!(self.finished.load(Ordering::Acquire), 3);
+            assert_eq!(
+                self.domain.snapshot().committed,
+                8,
+                "metadata charge returned before actual destructor"
+            );
+            assert!(
+                self.service.active_metadata_charge.lock().is_some(),
+                "metadata charge lacked independent custody during destructor"
+            );
+            self.drops.fetch_add(1, Ordering::Release);
+        }
+    }
+    struct AtomicPublisher {
+        inbox: Arc<PollingInbox>,
+    }
+    impl Drop for AtomicPublisher {
+        fn drop(&mut self) {
+            // This publication and following counted Arc decrement use atomics;
+            // no wake, allocation, native Drop or final physical charge Drop.
+            self.inbox.pending.store(3, Ordering::Release);
+            self.inbox.producer_alive.store(false, Ordering::Release);
+        }
+    }
+    #[test]
+    fn atomics_only_final_publication_progresses_after_idle_without_owner() {
+        let service = HostRetirementService::manual();
+        let running = RunningWorker::start(service.clone());
+        // Start from the legacy indefinite park; cold registration must wake it.
+        eventually(|| service.wake.test_is_parked());
+        let domain = ModelDomain::isolated_numeric_fixture(32);
+        let pass = domain.reserve(8).unwrap();
+        let charge = pass.context().take(8).unwrap().commit(8).unwrap();
+        drop(pass);
+        let passes = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let interrupted_drain = Arc::new(AtomicBool::new(false));
+        let publisher = AtomicPublisher {
+            inbox: Arc::new(PollingInbox {
+                service: service.clone(),
+                domain: domain.clone(),
+                charge: Mutex::new(Some(charge)),
+                producer_alive: AtomicBool::new(true),
+                pending: AtomicUsize::new(0),
+                passes: passes.clone(),
+                finished: finished.clone(),
+                first_idle: AtomicUsize::new(usize::MAX),
+                interrupted_drain: interrupted_drain.clone(),
+                drops: drops.clone(),
+            }),
+        };
+        let inbox: Arc<dyn CleanupInbox> = publisher.inbox.clone();
+        service.register(&inbox).unwrap();
+        service.register(&inbox).unwrap();
+        assert_eq!(service.registry.lock().len(), 1, "duplicate cold root");
+        drop(inbox);
+        // Both cold notifications have returned. Queue observation (Skip,
+        // never unpark) proves validation accepted the final registration epoch,
+        // not merely waiter enrollment with an old seen value that returns
+        // Invalid. Otherwise the no-polling mutant can drain by that stale wake.
+        eventually(|| passes.load(Ordering::Acquire) > 0 && service.wake.test_is_parked());
+        let wake_before = service.wake.snapshot();
+        drop(publisher);
+        assert_eq!(
+            service.wake.snapshot(),
+            wake_before,
+            "warm publication notified Wake"
+        );
+        eventually(|| drops.load(Ordering::Acquire) == 1 && domain.snapshot().committed == 0);
+        assert_eq!(finished.load(Ordering::Acquire), 3);
+        assert!(
+            !interrupted_drain.load(Ordering::Acquire),
+            "productive drain parked between records"
+        );
+        assert!(service.registry.lock().is_empty());
+        assert!(!service.polling.load(Ordering::Acquire));
+        assert_eq!(service.failure.get(), None);
+        drop(running); // Stop+notify+join even after removal restores indefinite wait.
     }
 }

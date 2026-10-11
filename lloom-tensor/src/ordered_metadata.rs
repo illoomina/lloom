@@ -39,6 +39,13 @@ impl<P> OrderedMetadata<P> {
             command_lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
         }
     }
+    /// Atomic-only prerequisite for final host metadata disposal. Together
+    /// with the containing Slab's exclusive Arc census, EMPTY/TAKEN prove no
+    /// successor value remains and zero wrappers prove no release is pending.
+    pub(crate) fn quiescent(&self) -> bool {
+        matches!(self.successor_phase.load(Ordering::Acquire), EMPTY | TAKEN)
+            && self.wrapper_handles.load(Ordering::Acquire) == 0
+    }
     /// Caller owns a newly prepared mailbox generation, before returning its
     /// first Registration. Previous generation has no pins or initial pinners.
     /// Every linked predecessor stays pinned until its successor was taken.

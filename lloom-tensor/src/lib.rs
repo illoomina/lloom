@@ -49,10 +49,19 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+#[cfg(any(feature = "metal", test))]
+mod allocation_admission;
+mod allocation_alias;
+#[cfg(any(feature = "metal", test))]
+mod allocation_geometry;
+#[cfg(any(feature = "metal", test))]
+mod allocation_owner;
 pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
+#[doc(hidden)]
+pub mod checkout;
 mod command_lifecycle;
 mod command_policy;
 mod command_segments;
@@ -76,9 +85,23 @@ pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(any(feature = "metal", test))]
+mod heap_ranges;
 mod indexer;
 pub mod isolation;
 pub mod layout;
+pub mod machine;
+#[cfg(any(feature = "metal", test))]
+mod membership_groups;
+mod memory_accounting;
+mod memory_accounting_machine;
+pub mod memory_admission;
+pub mod memory_arbitration;
+// Compile the actual production ledger and its lifecycle tests without Metal.
+// The ledger itself depends only on numeric accounting and machine ownership.
+#[cfg(all(test, not(feature = "metal")))]
+#[path = "kernels/metal/ledger.rs"]
+mod memory_ledger_cpu_tests;
 #[cfg(any(feature = "metal", test))]
 mod native_reuse;
 pub use autorelease::AutoreleaseScope;
@@ -124,7 +147,11 @@ pub mod options;
 #[cfg(any(feature = "metal", test))]
 mod ordered_metadata;
 pub mod pickle;
+#[cfg(any(feature = "metal", test))]
+mod planner_transaction;
 pub mod quantized;
+#[cfg(any(feature = "metal", test))]
+mod residency_ownership;
 pub mod retire;
 #[cfg(any(feature = "metal", test))]
 mod retirement_mailbox;

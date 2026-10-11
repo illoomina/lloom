@@ -107,6 +107,7 @@ pub use crate::retire::{self, Completed, Epoch, Retire, Tick};
 mod kv_pages_tests;
 pub mod late_bind;
 pub mod library;
+pub(crate) mod membership;
 /// ASan shadow-memory poisoning for allocator invariants (issue #475). Every
 /// entry point is inert without the `asan-poison` feature, so the module is
 /// declared unconditionally and compiles to nothing when the feature is off --

@@ -70,9 +70,10 @@ impl HostSlot {
         if buffer.contents().is_null() {
             crate::bail!("HostSlot: a {bytes}-byte Shared allocation is not CPU-mapped")
         }
+        let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
             buffer: buffer.clone(),
-            device: device.clone(),
+            device,
             dtype,
             cap,
         })

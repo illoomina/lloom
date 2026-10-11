@@ -1732,12 +1732,12 @@ impl Inner {
             if buf.contents().is_null() {
                 return Ok(None);
             }
-            let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+            let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
                 buf.clone(),
                 m.clone(),
                 n,
                 lloom_tensor::DType::U32,
-            ));
+            )?);
             let t =
                 Tensor::from_storage(storage, (1, n), lloom_tensor::op::BackpropOp::none(), false);
             self.decode_io.slots = Some((buf, t));
@@ -1770,12 +1770,12 @@ impl LiveTable {
         if buf.contents().is_null() {
             lloom_tensor::bail!("the live residency table has no CPU mapping")
         }
-        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
             buf.clone(),
             device.clone(),
             n,
             lloom_tensor::DType::U32,
-        ));
+        )?);
         let tensor = Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
         let t = Self { tensor, buf, n };
         for e in 0..n {
@@ -2005,9 +2005,9 @@ impl Streamed {
     ) -> Result<Self> {
         #[cfg(feature = "metal")]
         let staging = match (device, &loader) {
-            (Device::Metal(d), LoaderArm::Pread) => Some(
-                lloom_tensor::kernels::metal::staging::StagingRing::shared(d),
-            ),
+            (Device::Metal(d), LoaderArm::Pread) => {
+                Some(lloom_tensor::kernels::metal::staging::StagingRing::try_shared(d)?)
+            }
             _ => None,
         };
         #[cfg(not(feature = "metal"))]
@@ -2432,7 +2432,7 @@ impl Streamed {
                             (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
                         })
                         .collect();
-                    p.take_needed(self.key, &needed)
+                    p.try_take_needed(self.key, &needed)?
                         .into_iter()
                         .map(|s| (s.expert, s))
                         .collect()
@@ -2696,7 +2696,7 @@ impl Streamed {
                         inner.sources[2].plane_source(),
                     ];
                     let t0 = std::time::Instant::now();
-                    let ticket = p.submit_now(self.key, &want, &planes);
+                    let ticket = p.try_submit_now(self.key, &want, &planes)?;
                     pending.now = Some((ticket, std::mem::take(&mut misses), t0.elapsed()));
                 }
             }
@@ -2947,7 +2947,7 @@ impl Streamed {
             return Ok(());
         }
         if let Some(p) = &self.prefetch {
-            p.request(self.key, &missing, &planes);
+            p.try_request(self.key, &missing, &planes)?;
             return Ok(());
         }
         if self.io_hints {
@@ -3375,13 +3375,13 @@ pub fn fetch_on() -> bool {
 /// Whether a value allocated now is read after the open pass closes: the
 /// open pass is a model's own (`MetalDevice::model_pass_open`), whose settle
 /// runs after it. False with no pass open, off Metal, or under a driver's.
-fn record_outlives_pass(t: &Tensor) -> bool {
+fn record_outlives_pass(t: &Tensor) -> Result<bool> {
     #[cfg(feature = "metal")]
     if let Ok(m) = t.device().as_metal_device() {
-        return m.model_pass_open();
+        return Ok(m.execution_device()?.model_pass_open());
     }
     let _ = t;
-    false
+    Ok(false)
 }
 
 /// An escape guard while the streamed tier allocates (Metal): the pool
@@ -3580,13 +3580,23 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 {
                     lloom_tensor::bail!("slot_map: the record slot must be a fresh u32 [3·n]")
                 }
-                os.buffer_handle().clone()
+                lloom_tensor::MetalStorage::new(
+                    os.buffer_handle().clone(),
+                    os.device().clone(),
+                    3 * n,
+                    s.dtype(),
+                )
             }
-            None => device
-                .new_buffer_builder()
-                .with_size_for(3 * n, lloom_tensor::DType::U32)
-                .with_label("moe_slot_map")
-                .build()?,
+            None => lloom_tensor::MetalStorage::new_allocated(
+                device
+                    .new_buffer_builder()
+                    .with_size_for(3 * n, lloom_tensor::DType::U32)
+                    .with_label("moe_slot_map")
+                    .build()?,
+                device.clone(),
+                3 * n,
+                s.dtype(),
+            )?,
         };
         lloom_tensor::kernels::call_moe_slot_map(
             device.metal_device(),
@@ -3602,13 +3612,10 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 buffer: ts.buffer(),
                 offset_in_bytes: tl.start_offset() * ts.dtype().size_in_bytes(),
             },
-            &output,
+            output.buffer(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), 3 * n, s.dtype()),
-            lloom_tensor::Shape::from(3 * n),
-        ))
+        Ok((output, lloom_tensor::Shape::from(3 * n)))
     }
 }
 
@@ -4350,7 +4357,7 @@ impl ExpertResidency for Streamed {
         // The record is read by the settle after the pass body: inside a
         // driver's pass, where a plan serves it, and after a model's own
         // pass has closed, where it must be declared (`DESIGN.md` §9.2aa).
-        let _escape = if record_outlives_pass(&ids) {
+        let _escape = if record_outlives_pass(&ids)? {
             escape_guard()
         } else {
             None

@@ -9,9 +9,8 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
     metal::{
-        heap_chunk_bytes, transient_heaps_on, Backing, Backings, Buffer, BufferHandle, BufferPool,
-        Commands, Commit, Device, DeviceBuffer, HeapChunks, MTLResourceOptions, Mapped,
-        ResidencySet,
+        Backing, Buffer, BufferHandle, Commands, Commit, Device, DeviceBuffer, HeapChunks,
+        MTLResourceOptions, Mapped, ResidencySet,
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
 };
@@ -22,7 +21,13 @@ use objc2_metal::MTLCommandQueue;
 use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
+mod allocation_namespace;
+mod allocation_scope;
+pub use allocation_scope::{
+    AllocationRequest, AllocationWorker, ExecutionScope, MetalAllocationDomain,
+};
 mod device;
+pub(crate) use device::retain_evicted_allocations;
 mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
@@ -30,9 +35,7 @@ pub use device::{
 };
 mod host_fed;
 mod host_slot;
-use device::{
-    ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
-};
+use device::{DeviceTeardown, PRIVATE_RESOURCE_OPTIONS};
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 pub use host_slot::HostSlot;
 
@@ -684,7 +687,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn powf(&self, layout: &Layout, pow: f64) -> Result<Self> {
@@ -740,7 +743,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
@@ -796,7 +799,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
@@ -882,7 +885,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
 
-            return Ok(Self::new(buffer, device, dst_el, dtype));
+            return Ok(Self::new_allocated(buffer, device, dst_el, dtype)?);
         }
 
         let (name, check_empty, return_index) = match (op, self.dtype) {
@@ -942,7 +945,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(buffer, device, dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device, dst_el, dtype)?)
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -1166,7 +1169,12 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
@@ -1352,7 +1360,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
         }
 
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1423,7 +1436,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device, el, dtype))
+        Ok(Self::new_allocated(buffer, device, el, dtype)?)
     }
 
     fn conv1d(
@@ -1466,12 +1479,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
         drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
+        let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
         let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
@@ -1505,7 +1513,7 @@ impl BackendStorage for MetalStorage {
             .with_size_for(el_count, res.dtype())
             .with_label("conv1d_out")
             .build()?;
-        let mut res_t = Self::new(buffer, self.device().clone(), el_count, res.dtype());
+        let mut res_t = Self::new_allocated(buffer, self.device().clone(), el_count, res.dtype())?;
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
@@ -1595,7 +1603,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?,
         }
 
-        Ok(Self::new(dst, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            dst,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn conv_transpose1d(
@@ -1701,7 +1714,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn conv2d(
@@ -1748,12 +1766,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
         drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
+        let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
         let h_out = params.out_h();
         let w_out = params.out_w();
         let b = params.b_size;
@@ -1843,7 +1856,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn avg_pool2d(
@@ -1883,7 +1901,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn max_pool2d(
@@ -1923,7 +1946,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
@@ -1966,7 +1994,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn upsample_bilinear2d(
@@ -2020,7 +2053,12 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -2079,7 +2117,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
 
     fn scatter_set(
@@ -2211,7 +2249,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
 
     fn index_add(
@@ -2276,12 +2314,12 @@ impl BackendStorage for MetalStorage {
                 .with_size_for(lhs_l.shape().elem_count(), self.dtype)
                 .with_label("deterministic matmul activation")
                 .build()?;
-            let mut lhs = Self::new(
+            let mut lhs = Self::new_allocated(
                 contiguous,
                 self.device.clone(),
                 lhs_l.shape().elem_count(),
                 self.dtype,
-            );
+            )?;
             self.copy_strided_src(&mut lhs, 0, lhs_l)?;
             return lhs.matmul(
                 rhs,
@@ -2323,12 +2361,12 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(
+        Ok(Self::new_allocated(
             buffer,
             self.device.clone(),
             b * m * n,
             self.dtype(),
-        ))
+        )?)
     }
 
     fn copy2d(
@@ -2524,6 +2562,18 @@ impl MetalStorage {
         }
     }
 
+    /// A newly allocated output inherits the active payer, not an input's
+    /// namespace. Existing-buffer aliases must use `new` to retain their origin.
+    pub fn new_allocated(
+        buffer: BufferHandle,
+        device: MetalDevice,
+        count: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let device = device.allocated_output_device(&buffer)?;
+        Ok(Self::new(buffer, device, count, dtype))
+    }
+
     /// The batched EOS-index reduction: over the first `n` `U32` token ids in this
     /// storage, return a `[1]` `U32` storage whose element is the FIRST index whose
     /// token is one of `eos_ids`' `n_eos` stop ids, or `n` if none. One dispatch
@@ -2564,7 +2614,7 @@ impl MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), 1, DType::U32))
+        Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -2658,7 +2708,12 @@ impl MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     /// Stage `count` elements starting at element `offset` for a later host
@@ -3100,82 +3155,16 @@ impl BackendDevice for MetalDevice {
         let commands =
             Commands::new(command_queue, Arc::clone(&residency_set)).map_err(MetalError::from)?;
 
-        // Both pools decide reuse against the GPU's progress through the command
-        // queue, not against CPU refcounts. `Commands` owns that clock and is
-        // the only thing that advances it.
-        let buffers = BufferPool::with_clock(commands.clock());
-        let private_buffers = BufferPool::with_clock(commands.clock());
         let ledger = crate::kernels::metal::ledger::Ledger::new();
         commands.attach_command_ledger(Arc::clone(&ledger));
-        // The backings (`profiles-and-memory-design.md` §4.1, L0). A pool
-        // miss takes from placement heap chunks when `transient_heaps_on()`,
-        // else from one `MTLBuffer` per miss with its residency committed at
-        // the next cut; a persistent allocation takes from a resident
-        // backing, wired when it is Shared.
-        let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
-            if transient_heaps_on() {
-                Arc::new(HeapChunks::new(
-                    &device,
-                    Arc::clone(&residency_set),
-                    options,
-                    heap_chunk_bytes(),
-                    Some(Arc::clone(&ledger)),
-                ))
-            } else {
-                Arc::new(DeviceBuffer::new(
-                    &device,
-                    Arc::clone(&residency_set),
-                    options,
-                    Commit::Deferred,
-                    Some(Arc::clone(&ledger)),
-                ))
-            }
-        };
-        let backings = Arc::new(Backings {
-            transient_shared: transient(RESOURCE_OPTIONS),
-            transient_private: transient(PRIVATE_RESOURCE_OPTIONS),
-            resident_shared: DeviceBuffer::new(
-                &device,
-                Arc::clone(&residency_set),
-                RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-            resident_private: DeviceBuffer::new(
-                &device,
-                Arc::clone(&residency_set),
-                PRIVATE_RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-            mapped_shared: Mapped::new(
-                &device,
-                Arc::clone(&residency_set),
-                RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-        });
-        // The pools do not subscribe to command-buffer completion. The handler
-        // advances the clock, and each pool drains what it made reusable at
-        // its next `acquire`, on the host: a handler that took the pool's lock
-        // could be descheduled holding it and stall the encoding thread
-        // (`DESIGN.md` §6.4e).
-
-        {
-            // Installed before any allocation, so no buffer is evicted without
-            // the residency set hearing about it. The pool bounds its free list
-            // by destroying buffers (§6.3b), which is the second place a
-            // buffer's existence ends and the one nothing was announcing
-            // (`DESIGN.md` §6.3c).
-            let observer = Arc::new(ResidencyEvictionObserver::new(
-                Arc::clone(&residency_set),
-                Arc::clone(&backings),
-            ));
-            buffers.set_eviction_observer(observer.clone());
-            private_buffers.set_eviction_observer(observer);
-        }
-
+        let allocation_namespace = allocation_namespace::AllocationNamespace::new(
+            &device,
+            commands.clock(),
+            &residency_set,
+            &ledger,
+            None,
+            None,
+        );
         let emulated = Arc::new(
             crate::kernels::metal::arms::EmulatedArms::for_device(&device)
                 .map_err(MetalError::from)?,
@@ -3191,38 +3180,39 @@ impl BackendDevice for MetalDevice {
         ));
 
         Ok(Self {
-            constants: Arc::new(ConstantsByValue::new()),
+            constants: allocation_namespace.constants.clone(),
             teardown,
             id: DeviceId::new(),
             device,
             commands,
-            buffers,
-            private_buffers,
-            backings,
+            buffers: allocation_namespace.buffers.clone(),
+            private_buffers: allocation_namespace.private_buffers.clone(),
+            backings: allocation_namespace.backings.clone(),
             kernels,
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
             residency_set,
             ledger,
-            arena_reservation: Arc::new(parking_lot::Mutex::new(None)),
+            arena_reservation: allocation_namespace.arena_reservation.clone(),
             // No arena until one is installed: the classical path is the
             // default, and the cost of the seam is one `Option` test per
             // allocation (`DESIGN.md` §9.2a, §11.1).
-            arena: Arc::new(parking_lot::RwLock::new(None)),
-            arena_recorder: Arc::new(parking_lot::Mutex::new(None)),
-            arena_auto: Arc::new(parking_lot::Mutex::new(None)),
-            arena_auto_report: Arc::new(parking_lot::Mutex::new(None)),
-            arena_rerecord: Arc::new(parking_lot::Mutex::new(None)),
-            arena_rerecordings: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            arena: allocation_namespace.arena.clone(),
+            arena_recorder: allocation_namespace.arena_recorder.clone(),
+            arena_auto: allocation_namespace.arena_auto.clone(),
+            arena_auto_report: allocation_namespace.arena_auto_report.clone(),
+            arena_rerecord: allocation_namespace.arena_rerecord.clone(),
+            arena_rerecordings: allocation_namespace.arena_rerecordings.clone(),
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
-            session_region: Arc::new(parking_lot::RwLock::new(None)),
-            pass_plans: Arc::new(parking_lot::Mutex::new(None)),
-            base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            served_pass_pool_requests: Arc::new(Default::default()),
-            next_pass_variant: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            session_region: allocation_namespace.session_region.clone(),
+            pass_plans: allocation_namespace.pass_plans.clone(),
+            base_mode: allocation_namespace.base_mode.clone(),
+            pass_state: allocation_namespace.pass_state.clone(),
+            served_pass_pool_requests: allocation_namespace.served_pass_pool_requests.clone(),
+            next_pass_variant: allocation_namespace.next_pass_variant.clone(),
             emulated,
+            allocation_namespace,
         })
     }
 
@@ -3251,12 +3241,12 @@ impl BackendDevice for MetalDevice {
             .with_size_for(shape.elem_count(), dtype)
             .with_label("alloc-uninit")
             .build()?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
@@ -3266,12 +3256,12 @@ impl BackendDevice for MetalDevice {
             .with_zeros(size)
             .with_label("zeros")
             .build()?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
@@ -3354,7 +3344,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(T::DTYPE, "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new(buffer?, self.clone(), count, T::DTYPE))
+        Ok(Self::Storage::new_allocated(
+            buffer?,
+            self.clone(),
+            count,
+            T::DTYPE,
+        )?)
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
@@ -3437,12 +3432,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             storage.dtype(),
-        ))
+        )?)
     }
 
     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<Self::Storage> {
@@ -3481,12 +3476,12 @@ impl BackendDevice for MetalDevice {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn rand_normal(
@@ -3521,12 +3516,12 @@ impl BackendDevice for MetalDevice {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
@@ -3599,18 +3594,20 @@ impl BackendDevice for MetalDevice {
     /// Declines — `Ok(false)` — until `enable_pass_plans` turns the cache
     /// on, so the brackets are inert on every arm that has not asked for it.
     fn begin_pass(&self, key: crate::backend::PassShapeKey) -> Result<bool> {
-        if !self.pass_plans_enabled() {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
             return Ok(false);
         }
-        MetalDevice::begin_pass(self, Self::key_of(key))?;
+        MetalDevice::begin_pass(&view, Self::key_of(key))?;
         Ok(true)
     }
 
     fn finish_pass(&self) -> Result<()> {
-        if !self.pass_plans_enabled() {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
             return Ok(());
         }
-        MetalDevice::finish_pass(self)
+        MetalDevice::finish_pass(&view)
     }
 }
 

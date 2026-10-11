@@ -53,6 +53,85 @@ impl Wake {
     }
 }
 
+/// Residency membership lock only: a successful acquisition notifies the
+/// independently owned service AFTER unlocking, including unwind/early return.
+/// The wake is installed once before a lifecycle entry becomes pollable. A
+/// guard acquired before installation reads the OnceLock at RELEASE, not birth.
+/// Busy acquisition does not notify itself. This bounds host lock acquisition,
+/// not the synchronous native residency commit performed while holding it.
+pub(crate) struct WakeMutex<T> {
+    value: parking_lot::Mutex<T>,
+    wake: std::sync::OnceLock<std::sync::Arc<Wake>>,
+}
+impl<T> WakeMutex<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self {
+            value: parking_lot::Mutex::new(value),
+            wake: std::sync::OnceLock::new(),
+        }
+    }
+    /// Same exact service is idempotent. Preserve a conflicting supplied owner
+    /// on rejection; never replace a wake used by an existing lifecycle poll.
+    pub(crate) fn install_wake(
+        &self,
+        wake: std::sync::Arc<Wake>,
+    ) -> Result<(), std::sync::Arc<Wake>> {
+        match self.wake.set(wake) {
+            Ok(()) => Ok(()),
+            Err(wake)
+                if std::sync::Arc::ptr_eq(self.wake.get().expect("installed wake"), &wake) =>
+            {
+                Ok(())
+            }
+            Err(wake) => Err(wake),
+        }
+    }
+    pub(crate) fn lock(&self) -> WakeGuard<'_, T> {
+        WakeGuard {
+            value: Some(self.value.lock()),
+            wake: &self.wake,
+        }
+    }
+    pub(crate) fn try_lock(&self) -> Option<WakeGuard<'_, T>> {
+        self.value.try_lock().map(|guard| WakeGuard {
+            value: Some(guard),
+            wake: &self.wake,
+        })
+    }
+}
+pub(crate) struct WakeGuard<'a, T> {
+    value: Option<parking_lot::MutexGuard<'a, T>>,
+    wake: &'a std::sync::OnceLock<std::sync::Arc<Wake>>,
+}
+impl<T> std::ops::Deref for WakeGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.value.as_deref().expect("live membership guard")
+    }
+}
+impl<T> std::ops::DerefMut for WakeGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.value.as_deref_mut().expect("live membership guard")
+    }
+}
+// Static-dispatch ordering seam shared by shipping Drop and scalar control.
+// The closure is not stored in the mutex/guard and adds no runtime test hook.
+fn unlock_then_notify<G>(guard: G, notify: impl FnOnce()) {
+    drop(guard);
+    notify();
+}
+impl<T> Drop for WakeGuard<'_, T> {
+    fn drop(&mut self) {
+        let wake = self.wake;
+        unlock_then_notify(self.value.take(), || {
+            // Resolve installation at release, AFTER lock custody has ended.
+            if let Some(wake) = wake.get() {
+                wake.notify();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -129,5 +208,100 @@ pub(crate) mod tests {
             "registered waiter lost notification"
         );
         assert_eq!(wake.waiters.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod residency_guard_tests {
+    use super::*;
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::Arc,
+    };
+
+    #[test]
+    fn residency_guard_busy_has_no_self_notification() {
+        let value = WakeMutex::new(7usize);
+        let wake = Arc::new(Wake::default());
+        assert!(value.install_wake(wake.clone()).is_ok());
+        let held = value.lock();
+        let seen = wake.snapshot();
+        assert!(value.try_lock().is_none());
+        assert_eq!(wake.snapshot(), seen, "Busy notified its own retry");
+        drop(held);
+        assert_eq!(wake.snapshot(), seen.wrapping_add(1));
+    }
+
+    #[test]
+    fn residency_guard_release_unlocks_before_single_notification() {
+        let value = WakeMutex::new(1usize);
+        let wake = Arc::new(Wake::default());
+        assert!(value.install_wake(wake.clone()).is_ok());
+        let seen = wake.snapshot();
+        let mut held = value.try_lock().unwrap();
+        *held = 9;
+        assert_eq!(wake.snapshot(), seen);
+        drop(held);
+        assert_eq!(wake.snapshot(), seen.wrapping_add(1));
+        assert_eq!(*value.value.try_lock().unwrap(), 9, "not unlocked");
+        // Actual Drop shares this static ordering helper. Check the mutex at
+        // NOTIFICATION instant, not merely after the complete Drop returned.
+        let held = value.value.lock();
+        let seen = wake.snapshot();
+        unlock_then_notify(held, || {
+            assert!(
+                value.value.try_lock().is_some(),
+                "notification preceded membership unlock"
+            );
+            wake.notify();
+        });
+        assert_eq!(wake.snapshot(), seen.wrapping_add(1));
+    }
+
+    #[test]
+    fn residency_guard_acquired_before_install_reads_wake_at_release() {
+        let value = WakeMutex::new(());
+        let wake = Arc::new(Wake::default());
+        let held = value.lock();
+        let seen = wake.snapshot();
+        assert!(value.install_wake(wake.clone()).is_ok());
+        assert_eq!(wake.snapshot(), seen);
+        drop(held);
+        assert_eq!(
+            wake.snapshot(),
+            seen.wrapping_add(1),
+            "captured absent wake"
+        );
+    }
+
+    #[test]
+    fn residency_guard_wake_is_same_owner_idempotent_and_foreign_preserved() {
+        let value = WakeMutex::new(());
+        let wake = Arc::new(Wake::default());
+        let foreign = Arc::new(Wake::default());
+        assert!(value.install_wake(wake.clone()).is_ok());
+        assert!(value.install_wake(wake.clone()).is_ok());
+        let rejected = value.install_wake(foreign.clone()).err().unwrap();
+        assert!(Arc::ptr_eq(&rejected, &foreign));
+        let seen = wake.snapshot();
+        let foreign_seen = foreign.snapshot();
+        drop(value.lock());
+        assert_eq!(wake.snapshot(), seen.wrapping_add(1));
+        assert_eq!(foreign.snapshot(), foreign_seen, "foreign wake installed");
+    }
+
+    #[test]
+    fn residency_guard_unwind_unlocks_and_notifies() {
+        let value = WakeMutex::new(());
+        let wake = Arc::new(Wake::default());
+        assert!(value.install_wake(wake.clone()).is_ok());
+        let seen = wake.snapshot();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _held = value.lock();
+            panic!("injected residency guard unwind");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(wake.snapshot(), seen.wrapping_add(1));
+        assert!(value.value.try_lock().is_some(), "unwind retained lock");
     }
 }

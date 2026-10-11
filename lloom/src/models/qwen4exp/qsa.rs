@@ -1444,6 +1444,11 @@ impl From<&Config> for AttnGeometry {
 }
 
 impl<P: Profile> QsaAttention<P> {
+    /// `(n_kv_heads, head_dim)`: what a [`KvCache`]'s byte counts are taken at.
+    pub fn kv_geometry(&self) -> (usize, usize) {
+        (self.n_kv_heads, self.head_dim)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         wq: QMatMul,
@@ -5354,7 +5359,7 @@ mod tests {
                         kv + ixb
                     })
                     .sum();
-                let want = tokens * super::super::loader::kv_bytes_per_token(&cfg);
+                let want = tokens * super::super::loader::kv_bytes_per_token(&cfg).unwrap();
                 let d = |a: u64, b: u64| a as f64 / 1e9 - b as f64 / 1e9;
                 println!(
                     "KVBYTES store={p:?} tokens={tokens} planes_bytes={planes} planes_gb={:.4} per_token={} device_delta_gb={:.4} pool_live_delta_gb={:.4} phys_delta_gb={:.4}",

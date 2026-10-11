@@ -659,6 +659,10 @@ pub struct State<P: Profile> {
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+    /// Retained admission-planner scratch, never an authoritative cached total.
+    /// Growth/State clone can allocate host metadata; steady collection reuses it.
+    #[cfg(feature = "metal")]
+    heap_credit: lloom_tensor::kernels::metal::backing::ReuseCredit,
     /// A driver owns the settles of this cache's device-planned decode steps
     /// (`CausalLM::provisional`): a step returns its logits unsettled, and
     /// the driver settles it once it has read them back
@@ -954,6 +958,8 @@ impl<P: Profile> State<P> {
             window_draft_loads: false,
             window_real_loads_ema: 0.0,
             prepared: None,
+            #[cfg(feature = "metal")]
+            heap_credit: Default::default(),
         }
     }
 
@@ -1572,6 +1578,7 @@ impl<P: Profile> State<P> {
 fn declared_copy(t: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if let Ok(m) = t.device().as_metal_device() {
+        let m = m.execution_device()?;
         if m.activations_may_be_reused() {
             let _declared = lloom_tensor::EscapeGuard::new();
             return crate::nn::recurrent::own_copy(t);
@@ -1722,6 +1729,25 @@ pub struct Ple<P: Profile> {
 /// quarantine and give the parked slots' pages back.
 pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
 
+fn expert_tenant(
+    bytes_per_slot: usize,
+    slots: usize,
+    n_experts: usize,
+    topk: usize,
+) -> Result<ExpertTenant> {
+    let floor = topk.checked_add(1).ok_or_else(|| {
+        lloom_tensor::Error::Msg("qwen4exp expert tenant: topk + 1 exceeds usize".into())
+    })?;
+    ExpertTenant::new(
+        "qwen4exp-experts",
+        bytes_per_slot,
+        slots,
+        floor,
+        n_experts,
+        slots,
+    )
+}
+
 #[derive(Debug)]
 pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
@@ -1763,6 +1789,9 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// the streamed loader; dropped with the model.
     #[cfg(feature = "metal")]
     ledger_gauge: Option<std::sync::Arc<ExpertTenant>>,
+    /// What the load reserved on the machine (`lloom_tensor::machine`),
+    /// released when the model drops.
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1951,6 +1980,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             #[cfg(feature = "metal")]
             ledger_gauge: None,
+            reservation: None,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
@@ -2232,6 +2262,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if !m.pass_plans_enabled() || m.pass_open() {
                 return Ok(false);
             }
@@ -2400,24 +2431,19 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         slots: usize,
         n_experts: usize,
         topk: usize,
-    ) {
+    ) -> Result<()> {
+        let tenant = expert_tenant(bytes_per_slot, slots, n_experts, topk)?;
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = device {
             use lloom_tensor::kernels::metal::ledger::Tenant;
-            let tenant = std::sync::Arc::new(ExpertTenant::new(
-                "qwen4exp-experts",
-                bytes_per_slot,
-                slots,
-                topk + 1,
-                n_experts,
-                slots,
-            ));
+            let tenant = std::sync::Arc::new(tenant);
             let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
             m.ledger().register(&dyn_tenant);
             self.ledger_gauge = Some(tenant);
         }
         #[cfg(not(feature = "metal"))]
-        let _ = (device, bytes_per_slot, slots, n_experts, topk);
+        let _ = (device, tenant);
+        Ok(())
     }
 
     /// Apply the expert tenant's grant to every layer's tier: shrink the
@@ -2467,6 +2493,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     pub fn memory_fraction(&self) -> f64 {
         self.memory_fraction
+    }
+
+    /// Keep the load's machine reservation for the model's life.
+    pub fn hold_reservation(
+        &mut self,
+        reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    ) {
+        self.reservation = reservation;
+    }
+
+    pub fn reservation(&self) -> Option<&std::sync::Arc<lloom_tensor::machine::Holding>> {
+        self.reservation.as_ref()
     }
 
     /// What a pass the budget cannot take does (the env's arm by default).
@@ -2564,6 +2602,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if seq > 1 {
             if let Ok(m) = self.device().as_metal_device() {
+                let m = m.execution_device()?;
                 if m.pass_plans_enabled() {
                     let opener = if own && !m.pass_open() {
                         PassOpener::Model
@@ -2596,31 +2635,37 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             // The transients come from the heap chunks first (§6.3k), whose
             // whole size the allocated figure already counts: what the chunks
             // have free is transient the pass will NOT allocate.
-            let (hs, hp) = m.heap_stats();
-            let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
-            let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
+            // Legacy planner cannot spend foreign admitted-domain or not-yet-
+            // published capacity. Admitted callers must pass their domain key.
+            let heap_free = m.heap_reusable_bytes(None, &mut cache.heap_credit)?;
+            let need = plan
+                .kv_grow
+                .checked_add(plan.transient.saturating_sub(heap_free))
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("pass demand exceeds usize after heap credit".into())
+                })?;
             // Read with the free lists given back first when the first
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.
             let mut a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-            if !a.fits && a.pledged > 0 {
+            if a.needs_yield_retry() {
                 // The tenants pledged a yield (the expert tier's slots):
                 // apply it — park the slots, their pages given back — and
                 // ask again on the figure after.
                 let parked = self.apply_expert_grant()?;
-                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                let (yielded, reclaimed) = (a.yield_report(), a.reclaimed);
                 a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-                a.pledged = pledged;
+                a.merge_yield_report(yielded)?;
                 a.reclaimed += reclaimed + parked;
             }
             let (allocated, fits) = (a.committed, a.fits);
             debug_assert_eq!(
-                fits,
+                fits || a.machine.is_some(),
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
@@ -2632,9 +2677,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,
                 gb(working_set),
+                a.pledged,
+                a.yield_contended,
             );
             match self.mem_check {
                 MemCheck::Report => eprintln!("MEMCHECK {line}"),
+                MemCheck::Refuse if !fits && a.machine.is_some() => {
+                    cache.prepared = None;
+                    lloom_tensor::bail!(
+                        "qwen4exp pass refused {line}: {}",
+                        a.machine.as_deref().unwrap_or_default()
+                    )
+                }
                 MemCheck::Refuse if !fits => {
                     cache.prepared = None;
                     lloom_tensor::bail!(
@@ -3271,12 +3325,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 if buf.contents().is_null() {
                     return Ok(None);
                 }
-                let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
-                    buf.clone(),
-                    m.clone(),
-                    n,
-                    lloom_tensor::DType::F32,
-                ));
+                let storage =
+                    lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
+                        buf.clone(),
+                        m.clone(),
+                        n,
+                        lloom_tensor::DType::F32,
+                    )?);
                 let t =
                     Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
                 *g = Some((buf, t, None));
@@ -3877,7 +3932,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             let bound = self.layers.len().max(1);
             let mut h = h.clone();
             for _ in 0..bound {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 cache.device_replays += 1;
@@ -3904,7 +3959,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             cache.replay_fallbacks += 1;
         }
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
@@ -4134,6 +4189,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn replay_input_owned(&self, h: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if let Ok(m) = h.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.activations_may_be_reused() {
                 let clock = m.gpu_clock();
                 let mut g = self.replay_h.lock();
@@ -4196,16 +4252,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The pass in progress replays: its recording holds the replay, which
     /// a pass that settles clean never runs, so it must not become its key's
     /// plan (`MetalDevice::pass_diverged`).
-    fn note_replay(&self) {
+    fn note_replay(&self) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
-            m.pass_diverged();
+            m.execution_device()?.pass_diverged();
         }
         // The tiers: the replay's resolves must not count the settled
         // token's experts into the hotlist again (#899's finding).
         for layer in &self.layers {
             layer.moe().experts().note_replay();
         }
+        Ok(())
     }
 
     /// Whether the fetch arm (`QWEN4EXP_FETCH=inside`) can run on this
@@ -4598,7 +4655,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let bound = self.layers.len().max(1);
         for attempt in 0..bound {
             if replay || attempt > 0 {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 if attempt > 0 {
@@ -4640,7 +4697,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             cache.settle_after_first += after_first;
         }
         cache.replay_fallbacks += 1;
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.open_window()?;
@@ -5044,6 +5101,8 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     /// driver holds (`State::in_ring` over `spec_pools`, `State::in_pools`
     /// over `state_pools`), so here it is refused by name.
     fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
+        // Validate the unit before state construction, not after its allocations.
+        let _slab_unit = super::loader::kv_slab_bytes(cfg)?;
         let mut cache = State::<P>::own(cfg)?;
         self.arm_turn_checkpoints(&mut cache);
         #[cfg(feature = "metal")]
@@ -5057,7 +5116,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
                 Claim {
                     floor: 0,
                     want: 0,
-                    unit: super::qsa::KV_SLAB_TOKENS * super::loader::kv_bytes_per_token(cfg),
+                    unit: _slab_unit,
                     class: Class::Capability,
                 },
                 0,
@@ -5072,6 +5131,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.pass_plans_enabled() {
                 let variant = if seq_len == 1 {
                     let planned = self.device_plan && plan_on_device() && !cache.window_open();
@@ -5370,7 +5430,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             return Ok(logits);
         }
         let t0 = std::time::Instant::now();
-        self.note_replay();
+        self.note_replay()?;
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
@@ -5763,7 +5823,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 .collect();
             R::settle_window(&parts, 0)?;
             let t1 = std::time::Instant::now();
-            self.note_replay();
+            self.note_replay()?;
             cache.accept_window(0)?;
             cache.redos += 1;
             cache.window_redos += 1;
@@ -6281,6 +6341,24 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_expert_tenant_checks_the_actual_registration_input() {
+        assert!(super::expert_tenant(1, 1, 1, usize::MAX).is_err());
+        assert!(super::expert_tenant(usize::MAX, 2, 2, 0).is_err());
+        assert!(super::expert_tenant(usize::MAX, 1, 2, 0).is_err());
+        let tenant = super::expert_tenant(100, 8, 30, 2).unwrap();
+        assert_eq!(
+            (
+                tenant.unit(),
+                tenant.wanted_units(),
+                tenant.floor_units(),
+                tenant.max_units()
+            ),
+            (100, 8, 3, 8)
+        );
+        assert!(super::expert_tenant(0, usize::MAX, usize::MAX, usize::MAX - 1).is_ok());
+    }
+
     /// The KV store reaches the caches built from the config, and the
     /// shapes it has no arm on are refused by name: a quantized store on a
     /// device without the kernels (CPU), and any non-default store on the

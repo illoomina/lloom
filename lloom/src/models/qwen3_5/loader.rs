@@ -50,6 +50,9 @@ pub struct LoadOptions {
     /// `Ring` profile runs as one pass over phase rings
     /// (`StateCapacity::window`); 0 runs a window as sequential steps.
     pub window: usize,
+    /// The machine gate the load passes before its first tensor
+    /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
+    pub machine: Option<crate::nn::memory::MachineLoad>,
     /// Turn checkpoints a state keeps (`StateCapacity::checkpoints`): the
     /// recurrent layers' `S` and conv windows at the last `checkpoints`
     /// multi-token passes, so a request re-rendering the previous turn
@@ -68,6 +71,7 @@ impl Default for LoadOptions {
             dense_f32: false,
             mtp: false,
             window: 0,
+            machine: None,
             checkpoints: 2,
         }
     }
@@ -233,6 +237,125 @@ fn admit<R: Read + Seek>(gg: &Gguf<'_, R>, fraction: f64) -> Result<()> {
     Ok(())
 }
 
+/// The share of a prefill pass's tensors live at once at its peak, as a
+/// fraction: the pool hands a buffer back only when the command buffer that
+/// last read it completes, so a pass holds nearly all it allocates
+/// (`memory.md` §9.10).
+pub const PREFILL_LIVE_SHARE: (usize, usize) = (91, 100);
+
+/// The bytes a prefill pass allocates per position, over every layer, from
+/// the blocks' own launches — the Gated DeltaNet's projections and chunked
+/// operands, the attention's fused path, the feed-forward (dense or routed,
+/// with its shared expert), the norms and residuals, at f32 with a 16-bit
+/// stem's output counted beside its f32 copy — times
+/// [`PREFILL_LIVE_SHARE`]. Linear in the positions: a pass's working set is
+/// its positions' rows through every layer (`memory.md` §9.10).
+pub fn prefill_bytes_per_position(cfg: &Config) -> usize {
+    const CHUNK: usize = crate::models::qwen4exp::deltanet::CHUNK_SIZE;
+    let h = cfg.hidden_size;
+    let d = cfg.deltanet_dims();
+    let (v, c, hv) = (d.d_v * d.h_v, cfg.conv_channels(), d.h_v);
+    // The projections and their 16-bit stems; the gate; the q/k/v pack;
+    // the decays; the scaled operands; the WY solve; the scan's output;
+    // the gated norm; the out-projection.
+    let gdn = (c + v + 2 * hv)
+        + (c + v) / 2
+        + 2 * hv
+        + 3 * v
+        + (2 * hv * CHUNK + hv)
+        + 5 * v
+        + 3 * hv * CHUNK
+        + 2 * v
+        + v
+        + v
+        + h;
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    // q|gate and k, v with their 16-bit copies; the prepared rows; the
+    // attention's output, its contiguous copy and the gated product; the
+    // out-projection.
+    let attn = 3 * nh * hd + 3 * nkv * hd + 2 * (nh + nkv) * hd + 3 * nh * hd + h;
+    let ffn = if cfg.is_moe() {
+        let (k, mff, sff) = (
+            cfg.n_experts_per_tok,
+            cfg.moe_intermediate_size,
+            cfg.shared_expert_intermediate_size,
+        );
+        cfg.n_experts + k * (3 * mff + h) + 4 * sff + 3 * h
+    } else {
+        4 * cfg.intermediate_size + h
+    };
+    let norms = 4 * h;
+    let elems: usize = cfg
+        .layer_types
+        .iter()
+        .map(|k| match k {
+            LayerKind::Full => attn,
+            LayerKind::Linear => gdn,
+        } + ffn
+            + norms)
+        .sum();
+    elems * std::mem::size_of::<f32>() * PREFILL_LIVE_SHARE.0 / PREFILL_LIVE_SHARE.1
+}
+
+/// What a load holds at its peak before anything grows past its floors —
+/// the machine gate's figure (`memory.md` §9.10): the weights from the
+/// headers; the KV every full-attention layer allocates at its first append
+/// (`kv_capacity` positions, the MTP block's layer among them when loaded);
+/// every linear layer's recurrent state over `phases` buffers a channel; one
+/// prefill pass's working set at the tile (the whole capacity when the
+/// prompt is one forward, `prefill_tile` 0); and, when pass plans serve the
+/// passes, the base a planned pass holds, another working set. A pass past
+/// these is admitted when it comes (`Decoder::prepare_pass`).
+pub fn machine_peak(
+    cfg: &Config,
+    weights: usize,
+    opts: &LoadOptions,
+    prefill_tile: usize,
+    phases: usize,
+    pass_plans: bool,
+) -> lloom_tensor::machine::Peak {
+    let full_stack = cfg
+        .layer_types
+        .iter()
+        .filter(|k| **k == LayerKind::Full)
+        .count();
+    let full = full_stack + usize::from(opts.mtp);
+    let linear = cfg.n_layers - full_stack;
+    let precision = opts.kv_precision.unwrap_or(cfg.kv_precision);
+    let per_token =
+        precision.bytes_per_token(cfg.n_kv_heads, cfg.head_dim, lloom_tensor::DType::F32);
+    let kv = full * opts.kv_capacity.max(1) * per_token;
+    let d = cfg.deltanet_dims();
+    let state = d.d_k * d.d_v * d.h_v + cfg.conv_channels() * cfg.ssm_conv_kernel;
+    let recurrent = linear * phases * state * std::mem::size_of::<f32>();
+    let positions = match prefill_tile {
+        0 => opts.kv_capacity.max(1),
+        t => t,
+    };
+    let pass = positions * prefill_bytes_per_position(cfg);
+    let mut peak = lloom_tensor::machine::Peak::new()
+        .with("weights", weights as u64)
+        .with(
+            format!(
+                "KV floor ({full} layers x {} positions)",
+                opts.kv_capacity.max(1)
+            ),
+            kv as u64,
+        )
+        .with(
+            format!("recurrent state ({linear} layers)"),
+            recurrent as u64,
+        )
+        .with(
+            format!("prefill working set ({positions}-position pass)"),
+            pass as u64,
+        );
+    if pass_plans {
+        peak.push("pass-plan base (one pass)", pass as u64);
+    }
+    peak
+}
+
 fn capacity(cfg: &Config, opts: &LoadOptions) -> StateCapacity {
     StateCapacity {
         kv_tokens: opts.kv_capacity.max(1),
@@ -381,7 +504,8 @@ fn open<R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
     want_moe: bool,
-) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>)> {
+    phases: usize,
+) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>, Holds)> {
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
     // A sidecar's MTP block (bartowski's `mtp-*.gguf`): the main header
     // says nothing of it, the table carries `blk.{n_layers}.nextn.*`.
@@ -418,6 +542,45 @@ fn open<R: Read + Seek>(
     let schema = super::schema::tensor_schema(&cfg, &Default::default());
     schema.validate(gg.table())?;
     admit(gg, opts.fraction())?;
+    let reservation = match &opts.machine {
+        Some(m) => {
+            let plans = pass_plans_on(&gg.device)?;
+            let peak = machine_peak(&cfg, header_bytes(gg), opts, m.prefill_tile, phases, plans);
+            let per_tile_position = prefill_bytes_per_position(&cfg) * (1 + usize::from(plans));
+            match m.admit(&gg.device, peak.clone()) {
+                Ok(a) => a.holding,
+                Err(e) => {
+                    // The tile is the lever a refusal can solve for: the
+                    // largest prefill tile whose passes fit the room.
+                    let pool = crate::nn::memory::pool_bound_bytes(&gg.device) as i128;
+                    let tile = match m.prefill_tile {
+                        0 => opts.kv_capacity.max(1),
+                        t => t,
+                    };
+                    let fixed = peak.total() as i128 + pool - (tile * per_tile_position) as i128;
+                    let fits = m
+                        .gate
+                        .room()
+                        .map(|room| (room - fixed) / per_tile_position as i128);
+                    match fits {
+                        Some(n) if n >= 1 && (n as usize) < tile => lloom_tensor::bail!(
+                            "{e}\n  A prefill tile of {n} positions fits the room: --prefill-tile {n} \
+                             ({:.1} MB a position of working set{}).",
+                            per_tile_position as f64 / 1e6,
+                            if plans { ", its pass-plan base included" } else { "" }
+                        ),
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+    let keep = if opts.mtp {
+        mtp_tenant(gg, cfg.n_layers)
+    } else {
+        None
+    };
     let embed = TokenEmbed::new(
         QMatMul::QTensor(gg.packed("token_embd.weight")?),
         cfg.hidden_size,
@@ -427,7 +590,82 @@ fn open<R: Read + Seek>(
         gg.qmat("output.weight")?,
         cfg.vocab_size,
     );
-    Ok((cfg, embed, head))
+    Ok((
+        cfg,
+        embed,
+        head,
+        Holds {
+            reservation,
+            keep: keep.into_iter().collect(),
+        },
+    ))
+}
+
+/// What a load registered that its model keeps for its life: the machine
+/// reservation and the ledger rows of what the model owns.
+struct Holds {
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    keep: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Register the MTP block's weights (`blk.{layer}.*`, from the main file or
+/// the sidecar) as a ledger row for the process's life: a capability the
+/// caller chose with `speculative.method = mtp`. The row is the returned
+/// handle's: the model keeps it.
+fn mtp_tenant<R: Read + Seek>(
+    gg: &Gguf<'_, R>,
+    layer: usize,
+) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = &gg.device {
+        use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+        let prefix = format!("blk.{layer}.");
+        let bytes: usize = gg
+            .shards
+            .iter()
+            .flat_map(|s| s.content.tensor_infos.iter())
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(_, ti)| {
+                ti.shape.elem_count() / ti.ggml_dtype.block_size() * ti.ggml_dtype.type_size()
+            })
+            .sum();
+        let g = Gauge::new(
+            "qwen3_5-mtp",
+            Claim {
+                floor: bytes,
+                want: bytes,
+                unit: bytes.max(1),
+                class: Class::Capability,
+            },
+            bytes,
+        );
+        let t: std::sync::Arc<dyn Tenant> = g.clone();
+        m.ledger().register(&t);
+        return Some(g);
+    }
+    let _ = (gg, layer);
+    None
+}
+
+/// Whether recorded pass plans serve the passes on `device` (each planned
+/// pass shape then holds a base the size of its working set).
+fn pass_plans_on(device: &Device) -> Result<bool> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return Ok(m.execution_device()?.pass_plans_enabled());
+    }
+    let _ = device;
+    Ok(false)
+}
+
+/// Buffers a recurrent channel takes at profile `P`: the ring's phases when
+/// the state is pooled (`Ring` with a window), else the slab and its spare.
+fn state_phases<P: Profile>(opts: &LoadOptions) -> usize {
+    if <P::Rewind as crate::profile::Rewind>::REWINDABLE && opts.window > 0 {
+        opts.window + 1
+    } else {
+        2
+    }
 }
 
 /// The MTP block's attention layer, `blk.{n_layers}`: the full-attention
@@ -468,7 +706,7 @@ fn build_dense<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
 ) -> Result<(Qwen3_5<P>, Option<Qwen3_5MtpHead<P>>)> {
-    let (cfg, embed, head) = open(gg, opts, false)?;
+    let (cfg, embed, head, holds) = open(gg, opts, false, state_phases::<P>(opts))?;
     let mut layers: Vec<Qwen3_5Layer<P>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -501,17 +739,21 @@ fn build_dense<P: Profile, R: Read + Seek>(
     let cap = capacity_admitted(gg, &cfg, opts, &layers);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
-    Ok((
-        Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?,
-        mtp,
-    ))
+    let per_position = prefill_bytes_per_position(&cfg);
+    let mut model = Decoder::new(ARCH_DENSE, cfg, embed, layers, head, cap, hidden, &device)?;
+    model.set_prefill_bytes_per_position(per_position);
+    model.hold_reservation(holds.reservation);
+    for k in holds.keep {
+        model.keep_alive(k);
+    }
+    Ok((model, mtp))
 }
 
 fn build_moe<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
 ) -> Result<(Qwen3_5Moe<P>, Option<Qwen3_5MoeMtpHead<P>>)> {
-    let (cfg, embed, head) = open(gg, opts, true)?;
+    let (cfg, embed, head, holds) = open(gg, opts, true, state_phases::<P>(opts))?;
     let mut layers: Vec<Qwen3_5MoeLayer<P, Resident>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -544,10 +786,14 @@ fn build_moe<P: Profile, R: Read + Seek>(
     let cap = capacity_admitted(gg, &cfg, opts, &layers);
     let hidden = cfg.hidden_size;
     let device = gg.device.clone();
-    Ok((
-        Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?,
-        mtp,
-    ))
+    let per_position = prefill_bytes_per_position(&cfg);
+    let mut model = Decoder::new(ARCH_MOE, cfg, embed, layers, head, cap, hidden, &device)?;
+    model.set_prefill_bytes_per_position(per_position);
+    model.hold_reservation(holds.reservation);
+    for k in holds.keep {
+        model.keep_alive(k);
+    }
+    Ok((model, mtp))
 }
 
 /// The shards and, after them, an MTP sidecar GGUF (bartowski's
@@ -734,4 +980,50 @@ fn no_mtp(opts: &LoadOptions) -> Result<()> {
         lloom_tensor::bail!("qwen3_5: `LoadOptions::mtp` wants a `*_with_mtp` constructor")
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-position figure at the two real geometries: the 27B's pass
+    /// tensors sum to 51.0 MB a position and the 35B-A3B's to 18.3, of which
+    /// the live share is what a pass holds at its peak (`memory.md` §9.10:
+    /// 46.4 MB a position over a 267-position pass on the 27B).
+    #[test]
+    fn the_prefill_working_set_comes_from_the_geometry() {
+        let mb = |b: usize| b as f64 / 1e6;
+        let dense = prefill_bytes_per_position(&Config::qwen3_6_27b());
+        let moe = prefill_bytes_per_position(&Config::qwen3_6_35b_a3b());
+        assert!((mb(dense) - 46.44).abs() < 0.05, "27B: {:.2} MB", mb(dense));
+        assert!((mb(moe) - 16.70).abs() < 0.05, "35B-A3B: {:.2} MB", mb(moe));
+        // Twice the positions, twice the bytes; a tiny geometry, a tiny figure.
+        assert!(prefill_bytes_per_position(&Config::tiny()) < 100_000);
+    }
+
+    /// The peak carries one pass at the tile and, with pass plans, its base;
+    /// one forward over the prompt (`prefill_tile` 0) is a pass of the whole
+    /// capacity.
+    #[test]
+    fn the_peak_carries_one_pass_and_the_plans_base() {
+        let cfg = Config::qwen3_6_27b();
+        let opts = LoadOptions::default();
+        let row = |p: &lloom_tensor::machine::Peak, name: &str| {
+            p.rows()
+                .iter()
+                .find(|(n, _)| n.starts_with(name))
+                .map(|(_, b)| *b as usize)
+        };
+        let per = prefill_bytes_per_position(&cfg);
+        let planned = machine_peak(&cfg, 1, &opts, 512, 2, true);
+        assert_eq!(row(&planned, "prefill working set"), Some(512 * per));
+        assert_eq!(row(&planned, "pass-plan base"), Some(512 * per));
+        let pooled = machine_peak(&cfg, 1, &opts, 512, 2, false);
+        assert_eq!(row(&pooled, "pass-plan base"), None);
+        let one_shot = machine_peak(&cfg, 1, &opts, 0, 2, false);
+        assert_eq!(
+            row(&one_shot, "prefill working set"),
+            Some(opts.kv_capacity * per)
+        );
+    }
 }

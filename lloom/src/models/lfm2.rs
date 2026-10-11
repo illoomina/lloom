@@ -3715,6 +3715,52 @@ impl<P: Profile> crate::nn::model::CacheShare for State<P> {
 /// reuses the oldest slot's buffers.
 pub const TURN_CHECKPOINTS: usize = 8;
 
+/// One token's KV across every attention layer at B=1, from the geometry
+/// (§5.6): `2 × attention layers × kv_heads × head_dim × dtype`, or the
+/// code bytes plus a scale and a bias per head vector on a quantized arm.
+pub fn kv_bytes_per_token(config: &Config, dtype: DType) -> usize {
+    let attention_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::FullAttention)
+        .count();
+    let head_dim = config.head_dim();
+    let per_vector = match config.kv_quant.code_bytes(head_dim) {
+        Some(codes) => codes + 2 * DType::F16.size_in_bytes(),
+        None => head_dim * dtype.size_in_bytes(),
+    };
+    2 * attention_layers * config.num_key_value_heads * per_vector
+}
+
+/// The bytes one sequence's state holds before its KV grows past
+/// `kv_floor` positions: the KV slab, the conv state at its width, and the
+/// turn-checkpoint ring (`TURN_CHECKPOINTS` frames of every conv layer's
+/// tail) — the floors the machine gate reserves (`memory.md` §9.10).
+pub fn state_floor_bytes(
+    config: &Config,
+    dtype: DType,
+    kv_floor: usize,
+) -> [(&'static str, usize); 3] {
+    let conv_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::Conv)
+        .count();
+    let elem = dtype.size_in_bytes();
+    let conv =
+        conv_layers * config.hidden_size * config.conv_state.width(config.conv_l_cache) * elem;
+    let ring = TURN_CHECKPOINTS
+        * conv_layers
+        * config.hidden_size
+        * (config.conv_l_cache + TURN_CHECKPOINT_SLACK)
+        * elem;
+    [
+        ("KV floor", kv_floor * kv_bytes_per_token(config, dtype)),
+        ("conv state", conv),
+        ("turn-checkpoint ring", ring),
+    ]
+}
+
 /// Positions before a checkpointed pass's end the checkpoint can still stand
 /// at: its tail keeps `l_cache + TURN_CHECKPOINT_SLACK` input columns, and a
 /// position `back` before the end needs the `l_cache` columns ending there.
@@ -3977,7 +4023,7 @@ impl<P: Profile> State<P> {
             )
         }
         let slab = DEFAULT_KV_BUCKET.min(kv_capacity);
-        let kv_bytes_per_token = Self::kv_bytes_per_token(config, dtype);
+        let kv_bytes_per_token = kv_bytes_per_token(config, dtype);
         let kv_grow_fraction = config
             .memory_budget
             .map(|b| b.fraction)
@@ -4756,23 +4802,6 @@ impl<P: Profile> State<P> {
         }
     }
 
-    /// One token's KV across every attention layer at B=1, from the geometry
-    /// (§5.6): `2 × attention layers × kv_heads × head_dim × dtype`, or the
-    /// code bytes plus a scale and a bias per head vector on a quantized arm.
-    fn kv_bytes_per_token(config: &Config, dtype: DType) -> usize {
-        let attention_layers = config
-            .layer_types
-            .iter()
-            .filter(|t| **t == LayerType::FullAttention)
-            .count();
-        let head_dim = config.head_dim();
-        let per_vector = match config.kv_quant.code_bytes(head_dim) {
-            Some(codes) => codes + 2 * DType::F16.size_in_bytes(),
-            None => head_dim * dtype.size_in_bytes(),
-        };
-        2 * attention_layers * config.num_key_value_heads * per_vector
-    }
-
     /// The memory half of `prepare_pass`'s refusal, against the device.
     ///
     /// `currentAllocatedSize` is the whole process's Metal allocation — the
@@ -4790,16 +4819,15 @@ impl<P: Profile> State<P> {
         // The free lists are given back before a refusal stands
         // (`MetalDevice::admit_bytes`); the arithmetic is `kv_grow_fits`'.
         let mut a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
-        if !a.fits && a.pledged > 0 {
+        if a.needs_yield_retry() {
             // The tenants pledged a yield (the layers' slots): apply it —
             // the tier resized to its grant — and ask again on the figure
             // after (the expert tier's shape, `prepare_pass_as`).
-            if self.apply_layer_grant()?.is_some() {
-                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
-                a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
-                a.pledged = pledged;
-                a.reclaimed += reclaimed;
-            }
+            self.apply_layer_grant()?;
+            let (yielded, reclaimed) = (a.yield_report(), a.reclaimed);
+            a = metal.admit_bytes(grow, kv_grow_budget(working_set, self.kv_grow_fraction));
+            a.merge_yield_report(yielded)?;
+            a.reclaimed += reclaimed;
         }
         if a.fits {
             debug_assert!(kv_grow_fits(
@@ -4810,6 +4838,13 @@ impl<P: Profile> State<P> {
             ));
             return Ok(());
         }
+        if let Some(why) = &a.machine {
+            lloom_tensor::bail!(
+                "lfm2 KV grow refused {what}: {why}; pledged={} yield_contended={}",
+                a.pledged,
+                a.yield_contended
+            );
+        }
         let gb = |b: usize| b as f64 / 1e9;
         lloom_tensor::bail!(
             "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the ledger already \
@@ -4817,13 +4852,15 @@ impl<P: Profile> State<P> {
              {:.2} GB) after giving back {:.3} GB of free lists. The reply stops here, \
              before anything is written, rather than risk \
              the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
-             free memory, or bound the run.",
+             free memory, or bound the run. pledged={} yield_contended={} (at most one yield retry).",
             gb(grow),
             gb(a.committed),
             gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
             self.kv_grow_fraction,
             gb(working_set),
             gb(a.reclaimed),
+            a.pledged,
+            a.yield_contended,
         )
     }
 
@@ -8970,7 +9007,7 @@ impl<P: Profile> DecoderLayer<P> {
         #[cfg(feature = "metal")]
         if moved {
             if let Device::Metal(m) = mlp.gate.weight().device() {
-                m.drop_pass_plans();
+                m.execution_device()?.drop_pass_plans();
             }
         }
         #[cfg(not(feature = "metal"))]

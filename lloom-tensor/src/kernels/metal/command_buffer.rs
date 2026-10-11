@@ -117,6 +117,9 @@ impl PreparedCommandCommit<'_> {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), crate::kernels::MetalKernelError> {
+        if let Backend::Metal4(submission) = &self.admission.buffer.backend {
+            return submission.signal_tail(event, value);
+        }
         self.admission.buffer.signal_event_unchecked(event, value)
     }
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
@@ -193,7 +196,7 @@ impl EncoderAdmission {
         notify_after_close: bool,
         close: impl FnOnce(EndingEncoder<'_>) -> Result<(), crate::kernels::MetalKernelError>,
     ) -> Result<(), crate::kernels::MetalKernelError> {
-        let _wake = notify_after_close.then(|| EncoderEndWake(&self.buffer));
+        let _wake = notify_after_close.then(|| EncoderEndWake::armed(&self.buffer));
         let ticket = self.ticket.as_mut().ok_or_else(|| {
             crate::kernels::MetalKernelError::QueueUnavailable("encoder already closed")
         })?;
@@ -221,10 +224,32 @@ impl Drop for EncoderAdmission {
 
 /// Declare before acquiring EncoderState so even unwind releases that lock
 /// before waking a host lifecycle poller.
-pub(super) struct EncoderEndWake<'a>(pub(super) &'a CommandBuffer);
+pub(super) struct EncoderEndWake<'a> {
+    buffer: &'a CommandBuffer,
+    changed: bool,
+}
+impl<'a> EncoderEndWake<'a> {
+    pub(super) fn pending(buffer: &'a CommandBuffer) -> Self {
+        Self {
+            buffer,
+            changed: false,
+        }
+    }
+    pub(super) fn armed(buffer: &'a CommandBuffer) -> Self {
+        Self {
+            buffer,
+            changed: true,
+        }
+    }
+    pub(super) fn arm(&mut self) {
+        self.changed = true;
+    }
+}
 impl Drop for EncoderEndWake<'_> {
     fn drop(&mut self) {
-        self.0.notify_lifecycle();
+        if self.changed {
+            self.buffer.notify_lifecycle();
+        }
     }
 }
 
@@ -677,6 +702,28 @@ impl CommandBuffer {
         self.wait_until_completed()
     }
 
+    /// Final teardown's nonblocking associated-queue readiness. A standalone
+    /// native status cannot prove that its arbitrary handlers have returned.
+    pub(super) fn poll_logical_completed(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        let ready = match &self.backend {
+            Backend::Metal3(_) => {
+                return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "standalone callback join has no nonblocking completion proof",
+                ))
+            }
+            Backend::Metal3Associated(buffer) => buffer.poll_logical_completed()?,
+            Backend::Metal4(submission) => submission.poll_logical_completed()?,
+        };
+        if ready && self.status() == MTLCommandBufferStatus::Error {
+            return Err(crate::kernels::MetalKernelError::CommandBufferError(
+                self.error()
+                    .map(|error| error.into_owned())
+                    .unwrap_or_else(|| "unknown error".into()),
+            ));
+        }
+        Ok(ready)
+    }
+
     /// Encode a signal of `event` to `value` once every command encoded so far
     /// has completed. Metal's precondition — no open encoder on the buffer —
     /// is enforced by boundary admission (`Commands` ends its encoder first).
@@ -710,11 +757,7 @@ impl CommandBuffer {
     ) -> Result<(), crate::kernels::MetalKernelError> {
         let _admission = self.edit_boundary()?;
         if let Backend::Metal4(s) = &self.backend {
-            s.queue.check_failure()?;
-            s.queue
-                .raw
-                .waitForEvent_value(ProtocolObject::from_ref(event), value);
-            return Ok(());
+            return s.wait_event(event, value);
         }
         self.raw()
             .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);

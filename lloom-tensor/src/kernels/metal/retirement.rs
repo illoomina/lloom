@@ -11,7 +11,7 @@ use crate::{
     retirement_registry::{OwnerRegistry, Registration, RegistryError},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLSharedEvent};
+use objc2_metal::MTLCommandBuffer;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ enum NativeBackend {
         slot: Option<metal4::Slot>,
         queue: Arc<metal4::Queue>,
         submission: Option<Arc<metal4::Submission>>,
-        signals: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+        signals: Vec<metal4::EventBoundary>,
     },
 }
 // SAFETY: Metal CB wrappers already permit cross-thread retention. The M4 slot
@@ -100,7 +100,7 @@ impl NativeOwners {
     pub fn metal4_abandoned(
         slot: metal4::Slot,
         queue: Arc<metal4::Queue>,
-        signals: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+        signals: Vec<metal4::EventBoundary>,
         physical: Option<Arc<dyn Send + Sync>>,
     ) -> Self {
         Self {
@@ -197,6 +197,14 @@ impl Metal4Completions {
         }
     }
 
+    /// An incomplete segmented recording can contain a later event wait whose
+    /// producer depended on failed GPU work. Wake/refuse promptly, but do not
+    /// manufacture missing feedback or release the aggregate native owners.
+    pub(super) fn segment_failed(&self) {
+        self.failure
+            .publish(Failure::AdapterFailed, || self.wake.notify());
+    }
+
     /// Entire Rust callback boundary. Physical owners never enter this stack.
     /// A malformed/already-retired record cannot accept a panic box; retaining
     /// that box for process lifetime is safer than dropping arbitrary captures
@@ -207,9 +215,22 @@ impl Metal4Completions {
         record: Record,
         read_feedback: impl FnOnce() -> metal4::Feedback,
     ) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.publish(sequence, record.clone(), read_feedback())
-        }));
+        self.native_feedback_if_ready(sequence, record, || Some(read_feedback()));
+    }
+
+    /// Segment feedback is metadata-only until the complete logical recording
+    /// is ready. The same unwind boundary retains panic payloads and poisons.
+    pub fn native_feedback_if_ready(
+        &self,
+        sequence: u64,
+        record: Record,
+        read_feedback: impl FnOnce() -> Option<metal4::Feedback>,
+    ) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match read_feedback() {
+                Some(feedback) => self.publish(sequence, record.clone(), feedback),
+                None => Ok(()),
+            }));
         match result {
             Ok(Ok(())) => {}
             Ok(Err(_error)) => self

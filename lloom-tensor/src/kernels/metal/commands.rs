@@ -253,6 +253,9 @@ pub struct Commands {
 }
 
 struct CommandsCore {
+    // Shared service Wake reserved for final teardown (inbox wiring pending).
+    // External encoder release publishes here after its wrapper fields drop.
+    retirement_wake: Arc<crate::completion_wake::Wake>,
     /// The encoder state, and `compute_count` beside it, are on **different
     /// cache lines** (issue #442).
     ///
@@ -687,8 +690,12 @@ impl Commands {
             live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
             failure: Arc::clone(&failure),
         });
+        let retirement_wake = crate::retirement_service::HostRetirementService::shared()
+            .map_err(|_| MetalKernelError::QueueUnavailable("host teardown service unavailable"))?
+            .wake();
         Ok(Self {
             core: Arc::new(CommandsCore {
+                retirement_wake,
                 state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(
                     cb,
                 )))),
@@ -1094,7 +1101,10 @@ impl Commands {
             // `prev_ce_outputs` + `wait_for_buffer` and by no barrier, and #144
             // found 11 real edges that survive on that alone (issue #185).
             crate::kernels::metal::hazard_audit::record_encoder_begin();
-            state_guard.current_encoder = Some(enc);
+            // This wrapper has never escaped; public guards borrow it under this
+            // EntryState guard, and any explicit clone is counted as external.
+            state_guard.current_encoder =
+                Some(enc.into_canonical(self.core.retirement_wake.clone()));
         }
 
         Ok(CommandsGuard { guard: state_guard })
@@ -1853,85 +1863,127 @@ impl EncoderFinalizer {
         &self,
         encoder: &ComputeCommandEncoder,
     ) -> Result<(), MetalKernelError> {
+        self.end_encoding_mode(encoder, false)
+    }
+
+    pub(super) fn try_end_encoding(
+        &self,
+        encoder: &ComputeCommandEncoder,
+    ) -> Result<bool, MetalKernelError> {
+        match self.end_encoding_mode(encoder, true) {
+            Ok(()) => Ok(true),
+            Err(MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            )) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn end_encoding_mode(
+        &self,
+        encoder: &ComputeCommandEncoder,
+        nonblocking: bool,
+    ) -> Result<(), MetalKernelError> {
         self.failure.check()?;
         let _unwind = CloseUnwind {
             failure: &self.failure,
             message: "compute close exited exceptionally; custody retained",
             buffer: Some(&encoder.command_buffer),
         };
-        encoder.end_encoding_with(|closing, s| {
-            let all_outputs = {
-                // Once per encoder close, off the per-bind path: the session's
-                // fence-probe counts into the profiler (lloom #732).
-                if crate::kernels::metal::profile::enabled() {
-                    crate::kernels::metal::profile::record_fence_stats(
-                        s.fence_probes,
-                        s.fence_hits,
-                        s.fence_waits,
-                    );
-                }
-                std::mem::take(&mut s.all_outputs)
-            };
-
-            let retires = !all_outputs.is_empty();
-            {
-                // Once per encoder close: drop what completed sessions wrote, then
-                // register this session's outputs so later encoders wait for it.
-                let mut prev_ce_outputs = self.prev_ce_outputs.write(Side::Host);
-                let mut book = self.live_fences.lock(Side::Host);
-                book.reap(&mut prev_ce_outputs);
-                let this_ptr = Arc::as_ptr(&encoder.fence) as usize;
-                let mut claimed = 0usize;
-                for output in all_outputs.iter() {
-                    if let Some(prev) = prev_ce_outputs.insert(*output, encoder.fence.clone()) {
-                        // Another fence owned this buffer; it loses one reference.
-                        release_fence(&mut book.live, Arc::as_ptr(&prev) as usize);
+        encoder.end_encoding_prepared(
+            nonblocking,
+            || {
+                let busy = || {
+                    MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    )
+                };
+                let outputs = if nonblocking {
+                    self.prev_ce_outputs.try_write().ok_or_else(busy)?
+                } else {
+                    self.prev_ce_outputs.write(Side::Host)
+                };
+                let book = if nonblocking {
+                    self.live_fences.try_lock().ok_or_else(busy)?
+                } else {
+                    self.live_fences.lock(Side::Host)
+                };
+                Ok((outputs, book))
+            },
+            |closing, s, (mut prev_ce_outputs, mut book)| {
+                let all_outputs = {
+                    // Once per encoder close, off the per-bind path: the session's
+                    // fence-probe counts into the profiler (lloom #732).
+                    if crate::kernels::metal::profile::enabled() {
+                        crate::kernels::metal::profile::record_fence_stats(
+                            s.fence_probes,
+                            s.fence_hits,
+                            s.fence_waits,
+                        );
                     }
-                    claimed += 1;
-                }
-                if claimed > 0 {
-                    match book.live.iter_mut().find(|f| f.ptr == this_ptr) {
-                        Some(live) => live.buffers += claimed,
-                        None => book.live.push(LiveFence {
-                            ptr: this_ptr,
+                    std::mem::take(&mut s.all_outputs)
+                };
+
+                let retires = !all_outputs.is_empty();
+                {
+                    // Once per encoder close: drop what completed sessions wrote, then
+                    // register this session's outputs so later encoders wait for it.
+                    book.reap(&mut prev_ce_outputs);
+                    let this_ptr = Arc::as_ptr(&encoder.fence) as usize;
+                    let mut claimed = 0usize;
+                    for output in all_outputs.iter() {
+                        if let Some(prev) = prev_ce_outputs.insert(*output, encoder.fence.clone()) {
+                            // Another fence owned this buffer; it loses one reference.
+                            release_fence(&mut book.live, Arc::as_ptr(&prev) as usize);
+                        }
+                        claimed += 1;
+                    }
+                    if claimed > 0 {
+                        match book.live.iter_mut().find(|f| f.ptr == this_ptr) {
+                            Some(live) => live.buffers += claimed,
+                            None => book.live.push(LiveFence {
+                                ptr: this_ptr,
+                                fence: encoder.fence.clone(),
+                                buffers: claimed,
+                            }),
+                        }
+                    }
+                    if retires {
+                        book.retiring.push(Retiring {
                             fence: encoder.fence.clone(),
-                            buffers: claimed,
-                        }),
+                            outputs: all_outputs,
+                        });
                     }
                 }
-                if retires {
-                    book.retiring.push(Retiring {
-                        fence: encoder.fence.clone(),
-                        outputs: all_outputs,
-                    });
+
+                drop(book);
+                drop(prev_ce_outputs);
+                encoder.raw.updateFence(encoder.fence.raw());
+
+                let registration = if retires {
+                    let completed = encoder.fence.completion_flag();
+                    closing
+                        .on_completion(move || {
+                            completed.store(true, Ordering::Release);
+                        })
+                        .map_err(MetalKernelError::from)
+                } else {
+                    Ok(())
+                };
+                // Close the native encoder even when registration refused. The error
+                // carries its rejected capture out through the caller's EntryState guard;
+                // it is not formatted/dropped under that guard.
+                encoder.raw.endEncoding();
+                if registration.is_err() {
+                    // Required fence retirement is missing. Preserve the closed encoder
+                    // in EntryState and the rejected callback in the returned error;
+                    // refuse future recording instead of retrying native endEncoding.
+                    self.failure
+                        .record("encoder fence completion registration refused".into());
                 }
-            }
-
-            encoder.raw.updateFence(encoder.fence.raw());
-
-            let registration = if retires {
-                let completed = encoder.fence.completion_flag();
-                closing
-                    .on_completion(move || {
-                        completed.store(true, Ordering::Release);
-                    })
-                    .map_err(MetalKernelError::from)
-            } else {
-                Ok(())
-            };
-            // Close the native encoder even when registration refused. The error
-            // carries its rejected capture out through the caller's EntryState guard;
-            // it is not formatted/dropped under that guard.
-            encoder.raw.endEncoding();
-            if registration.is_err() {
-                // Required fence retirement is missing. Preserve the closed encoder
-                // in EntryState and the rejected callback in the returned error;
-                // refuse future recording instead of retrying native endEncoding.
-                self.failure
-                    .record("encoder fence completion registration refused".into());
-            }
-            registration
-        })
+                registration
+            },
+        )
     }
 }
 

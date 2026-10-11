@@ -593,6 +593,22 @@ impl AssociatedBuffer {
         crate::completion_scope::before_park(self.core.identity())
             .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)
     }
+    /// Own returned handoff plus ordered callback completion; never parks and
+    /// never converts queue failure into native terminality.
+    pub(super) fn poll_logical_completed(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        use crate::command_lifecycle::LifecycleError;
+        self.core.check()?;
+        match self.command_lifecycle().check_wait_submission() {
+            Ok(()) => {}
+            Err(LifecycleError::NotSubmitted | LifecycleError::Busy) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        if !self.marker.callbacks_finished() {
+            return Ok(false);
+        }
+        self.core.check()?;
+        Ok(true)
+    }
     pub(super) fn try_wait(&self, logical: bool) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.try_wait(&self.marker, logical)
     }

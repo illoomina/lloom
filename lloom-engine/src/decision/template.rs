@@ -23,6 +23,25 @@ pub enum SystemOneMedia<'a> {
     Audio { marker: &'a str },
 }
 
+// One media classification/validation for full and certified-prefix rendering.
+fn media_parameters(media: SystemOneMedia<'_>) -> Result<(OmniMedia, usize, Option<&str>)> {
+    match media {
+        SystemOneMedia::Text => Ok((OmniMedia::Text, 0, None)),
+        SystemOneMedia::Images { count, marker } => {
+            if !(1..=8).contains(&count) || marker.is_empty() {
+                bail!("systemone images require 1..=8 items and a nonempty marker")
+            }
+            Ok((OmniMedia::Image, count, Some(marker)))
+        }
+        SystemOneMedia::Audio { marker } => {
+            if marker.is_empty() {
+                bail!("systemone audio requires a nonempty marker")
+            }
+            Ok((OmniMedia::Audio, 1, Some(marker)))
+        }
+    }
+}
+
 pub struct SystemOneTemplate {
     compiled: ChatTemplate,
     kind: SystemOneTemplateKind,
@@ -93,15 +112,37 @@ impl SystemOneTemplate {
     /// callers must additionally verify token nesting against EVERY full prompt.
     /// This certificate does not authorize unknown templates by heuristic.
     pub(super) fn causal_state_prefix(&self, state: &OrderedJson) -> Result<String> {
+        self.causal_state_prefix_with_media(state, SystemOneMedia::Text)
+    }
+
+    /// The SAME audited prefix with caller-supplied media markers. Expansion to
+    /// geometry-specific image placeholders is the encoder's responsibility;
+    /// full/prefix token nesting is checked by CausalRequest, not assumed here.
+    pub(super) fn causal_state_prefix_with_media(
+        &self,
+        state: &OrderedJson,
+        media: SystemOneMedia<'_>,
+    ) -> Result<String> {
         #[derive(Serialize)]
         struct Prefix<'a> {
-            state: &'a OrderedJson,
-            images: [(); 0],
+            state: Cow<'a, OrderedJson>,
+            images: Vec<&'a str>,
         }
         let prefix = self.causal_prefix.as_ref().ok_or_else(|| Error::Msg(
             "systemone template has no audited state-prefix certificate; ordinary rendering remains supported".into()))?;
+        let (_, n_media, marker) = media_parameters(media)?;
+        // Full rendering removes injected marker spellings from JSON string
+        // values. The state prefix applies that SAME transform before proving
+        // byte/token nesting; image markers themselves remain outside JSON.
+        let state = match marker {
+            Some(marker) => Cow::Owned(transform_json(state, false, Some(marker))),
+            None => Cow::Borrowed(state),
+        };
         prefix
-            .render_context(&Prefix { state, images: [] })
+            .render_context(&Prefix {
+                state,
+                images: marker.map_or_else(Vec::new, |marker| vec![marker; n_media]),
+            })
             .map_err(Error::wrap)
     }
 
@@ -133,21 +174,7 @@ impl SystemOneTemplate {
             }
             _ => (),
         }
-        let (media_kind, n_media, marker) = match media {
-            SystemOneMedia::Text => (OmniMedia::Text, 0, None),
-            SystemOneMedia::Images { count, marker } => {
-                if !(1..=8).contains(&count) || marker.is_empty() {
-                    bail!("systemone images require 1..=8 items and a nonempty marker")
-                }
-                (OmniMedia::Image, count, Some(marker))
-            }
-            SystemOneMedia::Audio { marker } => {
-                if marker.is_empty() {
-                    bail!("systemone audio requires a nonempty marker")
-                }
-                (OmniMedia::Audio, 1, Some(marker))
-            }
-        };
+        let (media_kind, n_media, marker) = media_parameters(media)?;
         let omni = self.kind == SystemOneTemplateKind::D1Omni;
         let text = |value: &str| transform_text(value, omni, marker);
         let raw = |value: &OrderedJson| transform_json(value, omni, marker);

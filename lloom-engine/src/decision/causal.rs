@@ -223,6 +223,30 @@ impl CausalRequest {
         state: &OrderedJson,
         questions: Vec<(String, Question<OrderedJson>, Temperature)>,
         max_prompt_tokens: usize,
+        encode_label: impl FnMut(&str) -> Result<Vec<u32>>,
+        encode_prompt: impl FnMut(&str) -> Result<Vec<u32>>,
+    ) -> Result<Self> {
+        Self::render_with_media(
+            template,
+            state,
+            questions,
+            max_prompt_tokens,
+            super::SystemOneMedia::Text,
+            encode_label,
+            encode_prompt,
+        )
+    }
+
+    /// Same certified renderer and branch request, with actual supplied media.
+    /// The prompt encoder may expand each placeholder using the loaded family's
+    /// image layout; it receives WHOLE prefix/full strings, never fragments.
+    /// Decoding/encoding tensors and their admission remain family obligations.
+    pub fn render_with_media(
+        template: &super::SystemOneTemplate,
+        state: &OrderedJson,
+        questions: Vec<(String, Question<OrderedJson>, Temperature)>,
+        max_prompt_tokens: usize,
+        media: super::SystemOneMedia<'_>,
         mut encode_label: impl FnMut(&str) -> Result<Vec<u32>>,
         mut encode_prompt: impl FnMut(&str) -> Result<Vec<u32>>,
     ) -> Result<Self> {
@@ -232,7 +256,10 @@ impl CausalRequest {
         // Source certificate first, then full byte/token nesting. Tokenizers
         // may merge across the split; refusing that case avoids partial state
         // replay. We do not concatenate separately encoded prompt fragments.
-        let state_text = template.causal_state_prefix(state)?;
+        let state_text = match media {
+            super::SystemOneMedia::Text => template.causal_state_prefix(state)?,
+            _ => template.causal_state_prefix_with_media(state, media)?,
+        };
         let state_prefix = encode_prompt(&state_text)?;
         let mut tasks = Vec::new();
         tasks
@@ -240,13 +267,7 @@ impl CausalRequest {
             .map_err(Error::wrap)?;
         for (id, question, temperature) in questions {
             let labels = super::CausalLabels::systemone(&question, &mut encode_label)?;
-            let rendered = template.render(
-                &id,
-                state,
-                &question,
-                labels.texts(),
-                super::SystemOneMedia::Text,
-            )?;
+            let rendered = template.render(&id, state, &question, labels.texts(), media)?;
             if !rendered.starts_with(&state_text) {
                 lloom_tensor::bail!(
                     "causal rendered state prefix differs from full template output"
@@ -543,3 +564,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "serve"))]
+mod media_render_tests;

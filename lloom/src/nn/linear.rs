@@ -19,6 +19,13 @@
 //! ```
 use lloom_tensor::{Result, Tensor};
 
+/// Metadata needed to compose dense and quantized projections without changing
+/// either projection's execution route or exposing quantized storage as a Tensor.
+pub(crate) trait Projection: super::Module {
+    fn dimensions(&self) -> Result<(usize, usize)>;
+    fn projection_bias(&self) -> Option<&Tensor>;
+}
+
 #[derive(Clone, Debug)]
 pub struct Linear {
     weight: Tensor,
@@ -110,5 +117,14 @@ pub fn linear_b(
         linear(in_dim, out_dim, vb)
     } else {
         linear_no_bias(in_dim, out_dim, vb)
+    }
+}
+
+impl Projection for Linear {
+    fn dimensions(&self) -> Result<(usize, usize)> {
+        self.weight.dims2()
+    }
+    fn projection_bias(&self) -> Option<&Tensor> {
+        self.bias()
     }
 }

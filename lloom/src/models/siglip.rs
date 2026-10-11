@@ -397,66 +397,113 @@ fn dense_attention(
     crate::nn::ops::softmax_last_dim(&weights)?.matmul(v)
 }
 
+use crate::nn::linear::Projection;
+
+/// QKV storage layout is a static axis independent of attention backend.
+pub(crate) trait QkvProjection {
+    fn width(&self) -> Result<usize>;
+    fn project(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)>;
+}
+
 #[derive(Debug, Clone)]
-pub(crate) struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
+pub(crate) struct SeparateQkv<P = Linear> {
+    q_proj: P,
+    k_proj: P,
+    v_proj: P,
+}
+
+fn check_projection<P: Projection>(p: &P, output: usize, input: usize) -> Result<()> {
+    if p.dimensions()? != (output, input) {
+        lloom_tensor::bail!("projection must be {output} by {input}")
+    }
+    if p.projection_bias().is_some_and(|b| b.dims() != [output]) {
+        lloom_tensor::bail!("projection bias must have {output} elements")
+    }
+    Ok(())
+}
+
+impl<P: Projection> QkvProjection for SeparateQkv<P> {
+    fn width(&self) -> Result<usize> {
+        let (width, input) = self.q_proj.dimensions()?;
+        if width == 0 || width != input {
+            lloom_tensor::bail!("attention requires square nonempty projections")
+        }
+        for p in [&self.q_proj, &self.k_proj, &self.v_proj] {
+            check_projection(p, width, width)?;
+        }
+        Ok(width)
+    }
+    fn project(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let q = xs.apply(&self.q_proj)?;
+        let k = xs.apply(&self.k_proj)?;
+        let v = xs.apply(&self.v_proj)?;
+        Ok((q, k, v))
+    }
+}
+
+/// Packed weights remain packed; only activation views split after projection.
+#[derive(Debug, Clone)]
+pub(crate) struct PackedQkv<P> {
+    projection: P,
+    width: usize,
+}
+impl<P: Projection> PackedQkv<P> {
+    pub(crate) fn new(projection: P) -> Result<Self> {
+        let (output, width) = projection.dimensions()?;
+        if width == 0 || width.checked_mul(3) != Some(output) {
+            lloom_tensor::bail!("packed QKV requires [3*width,width] nonempty weight")
+        }
+        check_projection(&projection, output, width)?;
+        Ok(Self { projection, width })
+    }
+}
+impl<P: Projection> QkvProjection for PackedQkv<P> {
+    fn width(&self) -> Result<usize> {
+        Ok(self.width)
+    }
+    fn project(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let projected = xs.apply(&self.projection)?;
+        let axis = projected
+            .rank()
+            .checked_sub(1)
+            .ok_or_else(|| lloom_tensor::Error::Msg("QKV output needs a feature axis".into()))?;
+        Ok((
+            projected.narrow(axis, 0, self.width)?,
+            projected.narrow(axis, self.width, self.width)?,
+            projected.narrow(axis, 2 * self.width, self.width)?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Attention<P = Linear, Q = SeparateQkv<P>> {
+    qkv: Q,
+    out_proj: P,
     num_heads: usize,
     head_dim: usize,
     scale: f64,
 }
 
-impl Attention {
-    /// Compose the same attention block from already loaded projections.
-    /// Packed-QKV checkpoints split their weights once at load, not per pass.
-    /// This does not select a new attention backend or change `forward`.
+impl<P: Projection> Attention<P, SeparateQkv<P>> {
     pub(crate) fn from_projections(
-        q_proj: Linear,
-        k_proj: Linear,
-        v_proj: Linear,
-        out_proj: Linear,
+        q_proj: P,
+        k_proj: P,
+        v_proj: P,
+        out_proj: P,
         num_heads: usize,
     ) -> Result<Self> {
-        let (embed_dim, input_dim) = q_proj.weight().dims2()?;
-        if embed_dim == 0 || input_dim != embed_dim || num_heads == 0 {
-            lloom_tensor::bail!(
-                "attention components require square nonempty projections and positive heads"
-            )
-        }
-        if embed_dim % num_heads != 0 {
-            lloom_tensor::bail!("attention width {embed_dim} is not divisible by {num_heads} heads")
-        }
-        for (name, projection) in [
-            ("query", &q_proj),
-            ("key", &k_proj),
-            ("value", &v_proj),
-            ("output", &out_proj),
-        ] {
-            if projection.weight().dims2()? != (embed_dim, embed_dim) {
-                lloom_tensor::bail!(
-                    "attention {name} projection must be {embed_dim} by {embed_dim}"
-                )
-            }
-            if let Some(bias) = projection.bias() {
-                if bias.dims1()? != embed_dim {
-                    lloom_tensor::bail!("attention {name} bias must have {embed_dim} elements")
-                }
-            }
-        }
-        let head_dim = embed_dim / num_heads;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+        Self::from_qkv(
+            SeparateQkv {
+                q_proj,
+                k_proj,
+                v_proj,
+            },
             out_proj,
             num_heads,
-            head_dim,
-            scale: (head_dim as f64).powf(-0.5),
-        })
+        )
     }
-
+}
+impl Attention {
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let embed_dim = cfg.hidden_size();
         let q_proj = linear(embed_dim, embed_dim, vb.pp("q_proj"))?;
@@ -466,16 +513,34 @@ impl Attention {
         let num_heads = cfg.num_attention_heads();
         let head_dim = embed_dim / num_heads;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv: SeparateQkv {
+                q_proj,
+                k_proj,
+                v_proj,
+            },
             out_proj,
             num_heads,
             head_dim,
             scale: (head_dim as f64).powf(-0.5),
         })
     }
-
+}
+impl<P: Projection, Q: QkvProjection> Attention<P, Q> {
+    pub(crate) fn from_qkv(qkv: Q, out_proj: P, num_heads: usize) -> Result<Self> {
+        let width = qkv.width()?;
+        if width == 0 || num_heads == 0 || width % num_heads != 0 {
+            lloom_tensor::bail!("attention width must be positive and divisible by positive heads")
+        }
+        check_projection(&out_proj, width, width)?;
+        let head_dim = width / num_heads;
+        Ok(Self {
+            qkv,
+            out_proj,
+            num_heads,
+            head_dim,
+            scale: (head_dim as f64).powf(-0.5),
+        })
+    }
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         self.forward_with_attention(xs, attention_mask, &mut dense_attention)
     }
@@ -495,9 +560,7 @@ impl Attention {
         F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
     {
         let (batch_size, q_len, _) = xs.dims3()?;
-        let query_states = xs.apply(&self.q_proj)?;
-        let key_states = xs.apply(&self.k_proj)?;
-        let value_states = xs.apply(&self.v_proj)?;
+        let (query_states, key_states, value_states) = self.qkv.project(xs)?;
 
         let shape = (batch_size, q_len, self.num_heads, self.head_dim);
         let query_states = query_states.reshape(shape)?.transpose(1, 2)?.contiguous()?;
@@ -529,26 +592,24 @@ impl Attention {
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L599
 #[derive(Debug, Clone)]
-pub(crate) struct Mlp {
-    fc1: Linear,
-    fc2: Linear,
+pub(crate) struct Mlp<P = Linear> {
+    fc1: P,
+    fc2: P,
     activation_fn: crate::nn::Activation,
 }
 
-impl Mlp {
+impl<P: Projection> Mlp<P> {
     /// Compose existing feed-forward execution with another checkpoint spelling.
-    pub(crate) fn from_parts(
-        fc1: Linear,
-        fc2: Linear,
-        activation_fn: crate::nn::Activation,
-    ) -> Self {
+    pub(crate) fn from_parts(fc1: P, fc2: P, activation_fn: crate::nn::Activation) -> Self {
         Self {
             fc1,
             fc2,
             activation_fn,
         }
     }
+}
 
+impl Mlp {
     pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let intermediate_size = cfg.intermediate_size();
@@ -562,7 +623,7 @@ impl Mlp {
     }
 }
 
-impl Module for Mlp {
+impl<P: Projection> Module for Mlp<P> {
     fn forward(&self, xs: &lloom_tensor::Tensor) -> Result<lloom_tensor::Tensor> {
         xs.apply(&self.fc1)?
             .apply(&self.activation_fn)?
@@ -572,19 +633,19 @@ impl Module for Mlp {
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L614
 #[derive(Debug, Clone)]
-pub(crate) struct EncoderLayer {
-    self_attn: Attention,
+pub(crate) struct EncoderLayer<P = Linear, Q = SeparateQkv<P>> {
+    self_attn: Attention<P, Q>,
     layer_norm1: LayerNorm,
-    mlp: Mlp,
+    mlp: Mlp<P>,
     layer_norm2: LayerNorm,
 }
 
-impl EncoderLayer {
+impl<P: Projection, Q: QkvProjection> EncoderLayer<P, Q> {
     /// Assemble pre-norm residual blocks without changing their execution order.
     pub(crate) fn from_parts(
-        self_attn: Attention,
+        self_attn: Attention<P, Q>,
         layer_norm1: LayerNorm,
-        mlp: Mlp,
+        mlp: Mlp<P>,
         layer_norm2: LayerNorm,
     ) -> Self {
         Self {
@@ -593,21 +654,6 @@ impl EncoderLayer {
             mlp,
             layer_norm2,
         }
-    }
-
-    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = cfg.hidden_size();
-        let layer_norm_eps = cfg.layer_norm_eps();
-        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
-        let layer_norm1 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm1"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
-        let layer_norm2 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm2"))?;
-        Ok(Self {
-            self_attn,
-            layer_norm1,
-            mlp,
-            layer_norm2,
-        })
     }
 
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
@@ -636,25 +682,32 @@ impl EncoderLayer {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct Encoder {
-    layers: Vec<EncoderLayer>,
+impl EncoderLayer {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = cfg.hidden_size();
+        let layer_norm_eps = cfg.layer_norm_eps();
+        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
+        let layer_norm1 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm1"))?;
+        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
+        let layer_norm2 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm2"))?;
+        Ok(Self {
+            self_attn,
+            layer_norm1,
+            mlp,
+            layer_norm2,
+        })
+    }
 }
 
-impl Encoder {
-    /// A loader may assemble the same stack from differently named components.
-    pub(crate) fn from_layers(layers: Vec<EncoderLayer>) -> Self {
-        Self { layers }
-    }
+#[derive(Debug, Clone)]
+pub(crate) struct Encoder<P = Linear, Q = SeparateQkv<P>> {
+    layers: Vec<EncoderLayer<P, Q>>,
+}
 
-    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
-        let mut layers = vec![];
-        let vb = vb.pp("layers");
-        for layer_idx in 0..cfg.num_hidden_layers() {
-            let layer = EncoderLayer::new(cfg, vb.pp(layer_idx))?;
-            layers.push(layer)
-        }
-        Ok(Self { layers })
+impl<P: Projection, Q: QkvProjection> Encoder<P, Q> {
+    /// A loader may assemble the same stack from differently named components.
+    pub(crate) fn from_layers(layers: Vec<EncoderLayer<P, Q>>) -> Self {
+        Self { layers }
     }
 
     pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
@@ -675,6 +728,18 @@ impl Encoder {
             xs = layer.forward_with_attention(&xs, attention_mask, attend)?
         }
         Ok(xs)
+    }
+}
+
+impl Encoder {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+        let mut layers = vec![];
+        let vb = vb.pp("layers");
+        for layer_idx in 0..cfg.num_hidden_layers() {
+            let layer = EncoderLayer::new(cfg, vb.pp(layer_idx))?;
+            layers.push(layer)
+        }
+        Ok(Self { layers })
     }
 }
 
@@ -1239,3 +1304,7 @@ mod component_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "siglip/projection_tests.rs"]
+mod projection_tests;

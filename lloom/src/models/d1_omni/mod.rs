@@ -5,3 +5,6 @@
 
 mod head;
 pub use head::{DecisionHead, DecisionHeadBatch};
+
+mod trunk;
+pub use trunk::{QuerySegment, TextConfig, Trunk, TrunkBatch};

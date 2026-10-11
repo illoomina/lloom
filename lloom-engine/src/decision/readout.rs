@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn score_is_expected_level_not_the_winning_index() {
-        let q = Question::Score {
+        let q: Question = Question::Score {
             instructions: "Rate.".into(),
             criteria: vec!["low".into(), "mid".into(), "high".into()],
         };

@@ -5,23 +5,23 @@ use serde_json::{json, Value};
 
 /// A named question's payload. Choice and score order is preserved verbatim.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Question {
+pub enum Question<Content = String> {
     Noul {
-        instructions: String,
+        instructions: Content,
         /// The optional descriptions for true and false, respectively.
-        criteria: Option<(Option<String>, Option<String>)>,
+        criteria: Option<(Option<Content>, Option<Content>)>,
     },
     Choice {
-        instructions: String,
-        criteria: Vec<(String, Option<String>)>,
+        instructions: Content,
+        criteria: Vec<(String, Option<Content>)>,
     },
     Score {
-        instructions: String,
-        criteria: Vec<String>,
+        instructions: Content,
+        criteria: Vec<Content>,
     },
 }
 
-impl Question {
+impl<Content> Question<Content> {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Choice { criteria, .. } => {
@@ -68,7 +68,10 @@ impl Question {
     /// llama.cpp `/v1/systemone` response confidence. Probabilities and selected
     /// answers are unchanged; the Python reference's max-probability confidence
     /// remains available through `answer` for explicit reference comparisons.
-    pub fn systemone_answer(&self, probabilities: &[f64]) -> Result<Answer> {
+    pub fn systemone_answer(&self, probabilities: &[f64]) -> Result<Answer<Content>>
+    where
+        Content: Clone,
+    {
         let mut answer = self.answer(probabilities)?;
         match &mut answer {
             Answer::Noul { .. } => {}
@@ -104,7 +107,10 @@ impl Question {
     }
 
     /// Build a response from probabilities in question order; noul is yes, no.
-    pub fn answer(&self, probabilities: &[f64]) -> Result<Answer> {
+    pub fn answer(&self, probabilities: &[f64]) -> Result<Answer<Content>>
+    where
+        Content: Clone,
+    {
         self.validate()?;
         if probabilities.len() != self.option_count()
             || probabilities
@@ -151,7 +157,7 @@ impl Question {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Answer {
+pub enum Answer<Content = String> {
     Noul {
         probability: f64,
     },
@@ -164,11 +170,11 @@ pub enum Answer {
         score: f64,
         confidence: f64,
         probabilities: Vec<f64>,
-        legend: Vec<String>,
+        legend: Vec<Content>,
     },
 }
 
-impl Answer {
+impl<Content: Serialize> Answer<Content> {
     /// Convenience value conversion. Object key order is not retained by the
     /// workspace's serde_json map; use Serialize or to_json_string on the wire.
     pub fn to_json(&self) -> Value {
@@ -232,7 +238,7 @@ impl<T: Serialize> Serialize for Levels<'_, T> {
     }
 }
 
-impl Serialize for Answer {
+impl<Content: Serialize> Serialize for Answer<Content> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         match self {
@@ -267,7 +273,7 @@ impl Serialize for Answer {
     }
 }
 
-impl Answer {
+impl<Content: Serialize> Answer<Content> {
     pub fn to_json_string(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
     }
@@ -278,7 +284,7 @@ mod tests {
     use super::Question;
     #[test]
     fn wire_answer_preserves_option_order() {
-        let q = Question::Choice {
+        let q: Question = Question::Choice {
             instructions: "Pick.".into(),
             criteria: vec![("zeta".into(), None), ("alpha".into(), None)],
         };
@@ -291,7 +297,7 @@ mod tests {
 
     #[test]
     fn systemone_confidence_matches_llama_formula_not_python_maximum() {
-        let q = Question::Choice {
+        let q: Question = Question::Choice {
             instructions: "Pick.".into(),
             criteria: vec![("z".into(), None), ("a".into(), None)],
         };
@@ -308,7 +314,7 @@ mod tests {
             0.0
         );
         assert_eq!(q.answer(&[0.5, 0.5]).unwrap().to_json()["confidence"], 0.5);
-        let q = Question::Score {
+        let q: Question = Question::Score {
             instructions: "Rate.".into(),
             criteria: vec!["low".into(), "mid".into(), "high".into()],
         };
@@ -323,7 +329,7 @@ mod tests {
     }
     #[test]
     fn systemone_singleton_choice_is_defined() {
-        let q = Question::Choice {
+        let q: Question = Question::Choice {
             instructions: "Pick.".into(),
             criteria: vec![("only".into(), None)],
         };
@@ -331,5 +337,50 @@ mod tests {
             q.systemone_answer(&[1.0]).unwrap().to_json()["confidence"],
             1.0
         );
+    }
+
+    #[test]
+    fn raw_json_payload_keeps_nested_score_legend_on_wire() {
+        use super::super::OrderedJson;
+        let levels = [r#"{"z":"雪\nline","a":[false,null]}"#, "17"]
+            .into_iter()
+            .map(|s| OrderedJson::from_slice(s.as_bytes()).unwrap())
+            .collect();
+        let q: Question<OrderedJson> = Question::Score {
+            instructions: OrderedJson::Bool(false),
+            criteria: levels,
+        };
+        q.validate().unwrap();
+        assert_eq!(q.option_count(), 2);
+        assert_eq!(q.temperature_key(), "score:2");
+        let answer = q.systemone_answer(&[0.25, 0.75]).unwrap();
+        assert_eq!(
+            answer.to_json_string().unwrap(),
+            r#"{"type":"score","score":0.75,"confidence":0.5,"probabilities":{"0":0.25,"1":0.75},"legend":{"0":{"z":"雪\nline","a":[false,null]},"1":17}}"#
+        );
+        let super::Answer::Score { legend, .. } = answer else {
+            panic!("score answer")
+        };
+        let Question::Score { criteria, .. } = q else {
+            panic!("score question")
+        };
+        assert_eq!(legend, criteria);
+    }
+
+    #[test]
+    fn cardinality_and_validation_do_not_require_payload_traits() {
+        struct Opaque;
+        let q = Question::Choice {
+            instructions: Opaque,
+            criteria: vec![("z".into(), Some(Opaque)), ("a".into(), None)],
+        };
+        q.validate().unwrap();
+        assert_eq!(q.option_count(), 2);
+        assert_eq!(q.temperature_key(), "choice:2");
+        let duplicate = Question::Choice {
+            instructions: Opaque,
+            criteria: vec![("z".into(), None), ("z".into(), None)],
+        };
+        assert!(duplicate.validate().is_err());
     }
 }

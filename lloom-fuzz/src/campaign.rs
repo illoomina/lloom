@@ -392,7 +392,7 @@ where
                 execute_recorded(record, &h, name, &bytes)
             };
             #[allow(deprecated)]
-            let mut executor = InProcessExecutor::with_timeout(
+            let executor = InProcessExecutor::with_timeout(
                 &mut exec_harness,
                 tuple_list!(edges_observer, shape_observer, time_observer),
                 &mut fuzzer,
@@ -400,28 +400,15 @@ where
                 &mut mgr,
                 timeout,
             )?;
-            // All executors install process-wide handlers at construction.
-            // Construct tracing before the outer recorder hook and before seeds,
-            // so later tracing cannot replace the recorder's signal handler.
+            // Comparison tracing shares the one in-process executor: separate
+            // typed panic hooks would cast the same global executor pointer.
             #[cfg(feature = "cmplog")]
-            let cmplog_observer = libafl_targets::CmpLogObserver::new("cmplog", true);
-            #[cfg(feature = "cmplog")]
-            let h2 = Rc::clone(&harness);
-            #[cfg(feature = "cmplog")]
-            let mut trace_harness = |input: &BytesInput| -> ExitKind {
-                let bytes = input.target_bytes();
-                execute_recorded(record, &h2, name, &bytes)
-            };
-            #[cfg(feature = "cmplog")]
-            #[allow(deprecated)]
-            let tracer = InProcessExecutor::with_timeout(
-                &mut trace_harness,
-                tuple_list!(cmplog_observer),
-                &mut fuzzer,
-                &mut state,
-                &mut mgr,
-                timeout,
-            )?;
+            let mut executor = libafl::executors::ShadowExecutor::new(
+                executor,
+                tuple_list!(libafl_targets::CmpLogObserver::new("cmplog", true)),
+            );
+            #[cfg(not(feature = "cmplog"))]
+            let mut executor = executor;
             // The recorder wraps the final executor-installed panic/signal hooks
             // before the first target invocation, including corpus seeding.
             Record::install_crash_dump();
@@ -458,9 +445,9 @@ where
             #[cfg(feature = "cmplog")]
             {
                 use libafl::mutators::token_mutations::I2SRandReplace;
-                use libafl::stages::TracingStage;
+                use libafl::stages::ShadowTracingStage;
 
-                let tracing = TracingStage::new(tracer);
+                let tracing = ShadowTracingStage::new();
                 let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
                     I2SRandReplace::new()
                 )));

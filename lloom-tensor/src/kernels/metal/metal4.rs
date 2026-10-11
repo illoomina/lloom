@@ -813,6 +813,15 @@ mod tests {
         }
         let queue = Queue::new(device.clone()).unwrap();
         let event = device.as_ref().newSharedEvent().unwrap();
+        struct UnblockOnDrop(Retained<ProtocolObject<dyn MTLSharedEvent>>);
+        impl Drop for UnblockOnDrop {
+            fn drop(&mut self) {
+                self.0.setSignaledValue(1);
+            }
+        }
+        // Acquisition and assertion failures must not strand the queue wait.
+        let _unblock = UnblockOnDrop(event.clone());
+
         queue
             .raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);

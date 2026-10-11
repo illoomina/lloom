@@ -1709,3 +1709,68 @@ impl Drop for Commands {
         }
     }
 }
+
+#[cfg(test)]
+mod failure_latch_tests {
+    use super::*;
+
+    fn message(latch: &CommandBufferFailure) -> String {
+        match latch.check() {
+            Err(MetalKernelError::CommandBufferError(message)) => message,
+            other => panic!("expected latched command failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_error_persists_across_checks_and_later_records() {
+        let latch = CommandBufferFailure::default();
+        assert!(latch.check().is_ok());
+        latch.record("first native failure".into());
+        for _ in 0..32 {
+            assert_eq!(message(&latch), "first native failure");
+            latch.record("later native failure".into());
+            assert_eq!(message(&latch), "first native failure");
+        }
+    }
+
+    #[test]
+    fn concurrent_publication_never_exposes_unknown_or_changes_the_first_message() {
+        for _ in 0..16 {
+            let latch = Arc::new(CommandBufferFailure::default());
+            let start = Arc::new(std::sync::Barrier::new(9));
+            let mut workers = Vec::new();
+            for id in 0..8 {
+                let latch = latch.clone();
+                let start = start.clone();
+                workers.push(std::thread::spawn(move || {
+                    start.wait();
+                    latch.record(format!("writer-{id}"));
+                }));
+            }
+            start.wait();
+            let mut first_seen = None;
+            for _ in 0..64 {
+                if latch.check().is_err() {
+                    let observed = message(&latch);
+                    assert!((0..8).any(|id| observed == format!("writer-{id}")));
+                    if let Some(first) = &first_seen {
+                        assert_eq!(&observed, first);
+                    }
+                    first_seen = Some(observed);
+                }
+                std::thread::yield_now();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            let final_message = message(&latch);
+            assert!((0..8).any(|id| final_message == format!("writer-{id}")));
+            if let Some(first) = first_seen {
+                assert_eq!(final_message, first);
+            }
+            for _ in 0..16 {
+                assert_eq!(message(&latch), final_message);
+            }
+        }
+    }
+}

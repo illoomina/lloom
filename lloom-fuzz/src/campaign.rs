@@ -447,7 +447,7 @@ where
                             &mut fuzzer,
                             &mut executor,
                             &mut mgr,
-                            &[dir.clone()],
+                            std::slice::from_ref(dir),
                         )?;
                     }
                     _ => {

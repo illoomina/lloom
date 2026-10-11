@@ -234,9 +234,7 @@ fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
     // The hook can interrupt a writer or another thread can be recording.
     // Never read racing bytes or block waiting for the interrupted thread.
     let snapshot = r.inputs.snapshot().ok()?;
-    if snapshot.inputs().next().is_none() {
-        return None;
-    }
+    snapshot.inputs().next()?;
     let seq = r
         .dumps
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))

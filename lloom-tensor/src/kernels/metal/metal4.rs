@@ -103,7 +103,7 @@ impl Queue {
 
     /// Acquisition and every submission wait use the same Wake. Poison closes
     /// admission without claiming native completion or releasing any payload.
-    fn check_failure(&self) -> Result<(), MetalKernelError> {
+    pub(super) fn check_failure(&self) -> Result<(), MetalKernelError> {
         if self.failure.get().is_some() {
             Err(MetalKernelError::QueueUnavailable(
                 "retirement queue failed",
@@ -349,7 +349,8 @@ impl Submission {
     pub(super) fn notify_lifecycle(&self) {
         self.retirement.notify_lifecycle();
     }
-    pub fn enqueue(&self) {
+    pub fn enqueue(&self) -> Result<(), MetalKernelError> {
+        let _state = self.recording_state()?;
         // Commands has one open recording and commits it in producer order.
         // MTL4 has no native enqueue; this is logical state, not a queue reservation.
         let _ = self.status.compare_exchange(
@@ -358,15 +359,17 @@ impl Submission {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        Ok(())
     }
-    pub fn set_label(&self, label: &str) {
-        self.state
-            .lock()
+    pub fn set_label(&self, label: &str) -> Result<(), MetalKernelError> {
+        let state = self.recording_state()?;
+        state
             .slot
             .as_ref()
-            .expect("recording")
+            .expect("checked recording")
             .cb
             .setLabel(Some(&objc2_foundation::NSString::from_str(label)));
+        Ok(())
     }
 
     pub fn status(&self) -> MTLCommandBufferStatus {
@@ -454,9 +457,22 @@ impl Submission {
         }
         Ok(state)
     }
-    pub fn signal(&self, event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
-        let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }.unwrap();
-        self.state.lock().signals.push((event, value));
+    pub fn signal(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self.recording_state()?;
+        state
+            .signals
+            .try_reserve(1)
+            .map_err(|_| MetalKernelError::QueueUnavailable("event signal storage exhausted"))?;
+        // SAFETY: caller supplies a live shared event; native retain is copied
+        // into recording custody before returning.
+        let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+            .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
+        state.signals.push((event, value));
+        Ok(())
     }
     /// Reserve ordering and native handler allocations before engine epoch and
     /// subscriber registration. Dropping this value consumes no sequence.
@@ -1365,7 +1381,7 @@ mod tests {
             submission
         };
         let first = record(&a, 1);
-        first.signal(&event, 1);
+        first.signal(&event, 1).unwrap();
         b.raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
         let second = record(&b, 2);

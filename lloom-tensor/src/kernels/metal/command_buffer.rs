@@ -116,8 +116,8 @@ impl PreparedCommandCommit<'_> {
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
-    ) {
-        self.admission.buffer.signal_event_unchecked(event, value);
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.admission.buffer.signal_event_unchecked(event, value)
     }
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.admission.enter_commit()?;
@@ -260,6 +260,16 @@ impl CommandBuffer {
         Ok(RecordingAdmission {
             buffer: self,
             ticket: self.lifecycle().begin_edit().map_err(lifecycle_error)?,
+            entered: false,
+            editing: true,
+            released: false,
+        })
+    }
+
+    fn edit_boundary(&self) -> Result<RecordingAdmission<'_>, crate::kernels::MetalKernelError> {
+        Ok(RecordingAdmission {
+            buffer: self,
+            ticket: self.lifecycle().begin_boundary().map_err(lifecycle_error)?,
             entered: false,
             editing: true,
             released: false,
@@ -511,22 +521,31 @@ impl CommandBuffer {
         self.prepare_commit()?.commit()
     }
 
-    pub fn enqueue(&self) {
+    pub fn enqueue(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        let _admission = self.edit_recording()?;
+        if self.status() != MTLCommandBufferStatus::NotEnqueued {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "command buffer already enqueued",
+            ));
+        }
         match &self.backend {
             Backend::Metal3(raw) => raw.enqueue(),
             Backend::Metal3Associated(buffer) => buffer.raw().enqueue(),
-            Backend::Metal4(s) => s.enqueue(),
+            Backend::Metal4(s) => s.enqueue()?,
         }
+        Ok(())
     }
 
-    pub fn set_label(&self, label: &str) {
+    pub fn set_label(&self, label: &str) -> Result<(), crate::kernels::MetalKernelError> {
+        let _admission = self.edit_recording()?;
         match &self.backend {
             Backend::Metal3(raw) => raw.setLabel(Some(&NSString::from_str(label))),
             Backend::Metal3Associated(buffer) => {
                 buffer.raw().setLabel(Some(&NSString::from_str(label)))
             }
-            Backend::Metal4(s) => s.set_label(label),
+            Backend::Metal4(s) => s.set_label(label)?,
         }
+        Ok(())
     }
 
     pub fn status(&self) -> MTLCommandBufferStatus {
@@ -624,25 +643,26 @@ impl CommandBuffer {
 
     /// Encode a signal of `event` to `value` once every command encoded so far
     /// has completed. Metal's precondition — no open encoder on the buffer —
-    /// is the caller's (`Commands` ends its encoder first).
+    /// is enforced by boundary admission (`Commands` ends its encoder first).
     pub fn signal_event(
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
-    ) {
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let _admission = self.edit_boundary()?;
         self.signal_event_unchecked(event, value)
     }
     fn signal_event_unchecked(
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
-    ) {
+    ) -> Result<(), crate::kernels::MetalKernelError> {
         if let Backend::Metal4(s) = &self.backend {
-            s.signal(event, value);
-            return;
+            return s.signal(event, value);
         }
         self.raw()
             .encodeSignalEvent_value(ProtocolObject::from_ref(event), value);
+        Ok(())
     }
 
     /// Encode a wait for `event` to reach `value` before any command encoded
@@ -651,15 +671,18 @@ impl CommandBuffer {
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
-    ) {
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let _admission = self.edit_boundary()?;
         if let Backend::Metal4(s) = &self.backend {
+            s.queue.check_failure()?;
             s.queue
                 .raw
                 .waitForEvent_value(ProtocolObject::from_ref(event), value);
-            return;
+            return Ok(());
         }
         self.raw()
             .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);
+        Ok(())
     }
 
     /// Register before commit; rejected captures remain owned by the returned

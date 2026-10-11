@@ -114,6 +114,11 @@ impl CommandLifecycle {
             active: true,
         })
     }
+    /// Event boundaries require no open native encoder. Callback registration
+    /// deliberately uses begin_edit instead, preserving its borrowed subphase.
+    pub(crate) fn begin_boundary(&self) -> Result<Ticket, LifecycleError> {
+        self.enter(EDITING)
+    }
     pub(crate) fn finish_edit(&self, ticket: &mut Ticket) -> Result<(), LifecycleError> {
         if ticket.word & MASK != ENCODING_EDIT {
             return self.transition(ticket, EDITING, RECORDING, true);
@@ -305,6 +310,27 @@ impl Drop for Ending<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_refusal_preserves_open_encoder_and_callback_registration() {
+        let gate = CommandLifecycle::new();
+        let mut encoder = gate.begin_encoder().unwrap();
+        assert!(matches!(gate.begin_boundary(), Err(LifecycleError::Busy)));
+        let mut registration = gate.begin_edit().unwrap();
+        gate.finish_edit(&mut registration).unwrap();
+        gate.begin_end_encoder(&mut encoder).unwrap();
+        gate.finish_end_encoder(&mut encoder).unwrap();
+        let mut boundary = gate.begin_boundary().unwrap();
+        assert!(matches!(gate.prepare(), Err(LifecycleError::Busy)));
+        gate.finish_edit(&mut boundary).unwrap();
+        let mut commit = gate.prepare().unwrap();
+        gate.entered_native(&mut commit).unwrap();
+        gate.handoff_returned(&mut commit).unwrap();
+        assert!(matches!(
+            gate.begin_boundary(),
+            Err(LifecycleError::Submitted)
+        ));
+    }
 
     #[test]
     fn prepared_excludes_edits_and_unused_reservation_can_retry() {

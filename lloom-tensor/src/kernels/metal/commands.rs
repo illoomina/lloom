@@ -1123,14 +1123,14 @@ impl Commands {
                 .current
                 .recording()
                 .expect("recording recovered above")
-                .signal_event(event, value);
+                .signal_event(event, value)?;
             self.commit_swap_locked(&mut state, 0)?;
         } else {
             state
                 .current
                 .recording()
                 .expect("recording recovered above")
-                .signal_event(event, value);
+                .signal_event(event, value)?;
         }
         Ok(())
     }
@@ -1156,7 +1156,7 @@ impl Commands {
             .current
             .recording()
             .expect("recording recovered above")
-            .wait_for_event(event, value);
+            .wait_for_event(event, value)?;
         Ok(())
     }
 
@@ -1792,7 +1792,7 @@ impl CommandsCore {
                 let t_residency = timed.map(|t| t.elapsed());
                 let signalled = self
                     .completion_wait
-                    .encode_prepared_signal(&prepared, self.completion_event.as_ref());
+                    .encode_prepared_signal(&prepared, self.completion_event.as_ref())?;
                 if signalled.is_some() {
                     self.completion_signals.fetch_add(1, Ordering::Relaxed);
                 }

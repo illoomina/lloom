@@ -21,6 +21,7 @@ pub mod batch_norm;
 pub mod batched;
 mod batched_spec;
 pub mod blocks;
+pub mod channel_affine;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
@@ -78,6 +79,7 @@ pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
 pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
 pub use batched_spec::SpecBatchDecoder;
+pub use channel_affine::ChannelAffine;
 pub use conv::{
     conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, conv_transpose1d, conv_transpose1d_no_bias,
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,

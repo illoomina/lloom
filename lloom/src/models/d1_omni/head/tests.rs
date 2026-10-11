@@ -62,6 +62,14 @@ fn weights() -> Result<HashMap<String, Tensor>> {
 }
 
 fn head() -> Result<DecisionHead> {
+    // The bounded contract runner supplies this explicit process policy.
+    // Do not initialize an otherwise unused barrier pool in ordinary suites.
+    if std::env::var("CANDLE_NUM_THREADS").as_deref() == Ok("1") {
+        let workers = lloom_tensor::utils::barrier_pool().n_workers();
+        eprintln!("BOUNDED_BARRIER_WORKERS={workers}");
+        assert_eq!(workers, 0);
+    }
+
     DecisionHead::load(
         WIDTH,
         1,
@@ -358,5 +366,131 @@ fn nonzero_transformer_matches_scalar_reference_and_distinguishes_padding_and_ca
         }
     }
     assert_eq!(output[1][1], -1e4);
+    Ok(())
+}
+
+/// A synthetic official-name GGUF, not a downloaded model. This composes the
+/// tested quantized projections with head marker/mask semantics; the expected
+/// scorer deliberately shares quantized arithmetic, not a checkpoint oracle.
+#[test]
+fn gguf_packed_head_reuses_shared_forward_with_official_names_and_markers() -> Result<()> {
+    use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::io::Cursor;
+    // nextest gives this test its own process. Plain cargo test must use its
+    // exact filter: fail rather than silently inherit a dequantizing policy.
+    let mut tuning = lloom_tensor::tuning::Tuning::default();
+    tuning.cpu.num_threads = 1;
+    tuning.qmm.dequantize_all = false;
+    tuning.qmm.dequantize_all_f16 = false;
+    lloom_tensor::tuning::install(tuning).expect("isolated GGUF head fixture tuning");
+    assert_eq!(lloom_tensor::utils::barrier_pool().n_workers(), 0);
+    eprintln!("BOUNDED_BARRIER_WORKERS=0");
+    let mappings = [
+        ("type_emb", "token_types"),
+        ("head.layers.0.self_attn.in_proj", "blk.7.attn_qkv"),
+        ("head.layers.0.self_attn.out_proj", "blk.7.attn_output"),
+        ("head.layers.0.norm1", "blk.7.attn_norm"),
+        ("head.layers.0.linear1", "blk.7.ffn_up"),
+        ("head.layers.0.linear2", "blk.7.ffn_down"),
+        ("head.layers.0.norm2", "blk.7.ffn_norm"),
+        ("scorer.0", "cls.norm"),
+        ("scorer.1", "cls"),
+        ("scorer.3", "cls.output"),
+    ];
+    let mut tensors = Vec::new();
+    let mut quantized_matrices = 0;
+    for (name, tensor) in weights()? {
+        let (base, suffix) = mappings
+            .iter()
+            .find_map(|(old, new)| {
+                let separator = if old.ends_with("in_proj") { "_" } else { "." };
+                name.strip_prefix(&format!("{old}{separator}"))
+                    .map(|suffix| (*new, suffix))
+            })
+            .expect("every synthetic weight has an audited GGUF name");
+        let dtype = if tensor.rank() == 2 && base != "token_types" {
+            quantized_matrices += 1;
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F32
+        };
+        tensors.push((
+            format!("{base}.{suffix}"),
+            QTensor::quantize(&tensor, dtype)?,
+        ));
+    }
+    assert_eq!(quantized_matrices, 6);
+    tensors.sort_by(|a, b| a.0.cmp(&b.0));
+    let entries: Vec<_> = tensors
+        .iter()
+        .map(|(name, tensor)| (name.as_str(), tensor))
+        .collect();
+    let mut bytes = Cursor::new(Vec::new());
+    gguf_file::write(&mut bytes, &[], &entries)?;
+    assert!(bytes.get_ref().len() < 128 * 1024);
+    let vb =
+        crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
+    assert_eq!(
+        vb.get((3 * WIDTH, WIDTH), "blk.7.attn_qkv.weight")?.dtype(),
+        GgmlDType::Q8_0
+    );
+    assert!(QuantizedDecisionHead::load(WIDTH, 1, 6, vb.clone()).is_err());
+    let head = QuantizedDecisionHead::load(WIDTH, 1, 7, vb.clone())?;
+    let markers: [&[usize]; 2] = [&[4, 0, 2], &[1, 0]];
+    let batch = head.prepare_batch(5, &[5, 2], &markers, &[0, 2])?;
+    let x = hidden()?;
+    let mut calls = 0;
+    let actual = head
+        .forward_with_attention(&x, &batch, &mut |q, k, v, mask, scale| {
+            calls += 1;
+            assert_eq!(scale, 0.125);
+            for (part, expected) in [q, k, v].into_iter().zip([0.125, 0.25, 0.375]) {
+                assert_eq!(part.dims(), [2, 1, 5, WIDTH]);
+                assert!(part
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .all(|&x| x == expected));
+            }
+            let mask = mask.expect("head supplies padding mask");
+            assert_eq!(mask.dims(), [2, 1, 1, 5]);
+            let mask = mask.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(&mask[..7], &[0.; 7]);
+            assert!(mask[7..].iter().all(|&x| x == f32::NEG_INFINITY));
+            Ok(v.clone())
+        })?
+        .to_vec2::<f32>()?;
+    assert_eq!(calls, 1);
+    // Residual attention and FFN projections are exactly zero in this fixture.
+    // Expected branch directly scores selected type-enriched tokens, bypassing
+    // the Transformer and batch gather/missing-marker implementation.
+    let types = vb
+        .get((3, WIDTH), "token_types.weight")?
+        .dequantize(&Device::Cpu)?;
+    let norm = crate::quantized_nn::layer_norm(WIDTH, 1e-5, vb.pp("cls.norm"))?;
+    let scorer = crate::quantized_nn::linear(WIDTH, WIDTH, vb.pp("cls"))?;
+    let output = crate::quantized_nn::linear(WIDTH, 1, vb.pp("cls.output"))?;
+    for (row, kind) in [0usize, 2].into_iter().enumerate() {
+        for (option, &position) in markers[row].iter().enumerate() {
+            let token = x.narrow(0, row, 1)?.narrow(1, position, 1)?;
+            let typed = token.broadcast_add(&types.narrow(0, kind, 1)?.unsqueeze(0)?)?;
+            let expected = typed
+                .apply(&norm)?
+                .apply(&scorer)?
+                .apply(&Activation::Gelu)?
+                .apply(&output)?
+                .flatten_all()?
+                .to_vec1::<f32>()?[0];
+            assert!(
+                (actual[row][option] - expected).abs() < 2e-5,
+                "row{row} option{option}: {} != {expected}",
+                actual[row][option]
+            );
+        }
+    }
+    assert_eq!(actual.len(), 2);
+    assert_eq!(actual[0].len(), 3);
+    assert_eq!(actual[1].len(), 3);
+    assert_eq!(actual[1][2], -1e4);
     Ok(())
 }

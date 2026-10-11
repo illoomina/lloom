@@ -3,8 +3,8 @@
 use super::relative::RelativeInputs;
 use crate::models::siglip::Mlp;
 use crate::nn::{
-    batch_norm, conv1d, conv2d, layer_norm, linear, linear_no_bias, Activation, BatchNorm, Conv1d,
-    Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
+    batch_norm, conv1d, conv2d, layer_norm, linear, linear_no_bias, Activation, BatchNorm,
+    ChannelAffine, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
 };
 use lloom_tensor::{DType, Device, Module, ModuleT, Result, Tensor};
 
@@ -276,11 +276,26 @@ impl RelativeProjection {
     }
 }
 
+// Normalization storage is a static format axis, not a second convolution loop.
+trait ChannelNormalization {
+    fn eval(&self, x: &Tensor) -> Result<Tensor>;
+}
+impl ChannelNormalization for BatchNorm {
+    fn eval(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_t(x, false)
+    }
+}
+impl ChannelNormalization for ChannelAffine {
+    fn eval(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
 #[derive(Debug)]
-struct ConvModule {
+struct ConvModule<N = BatchNorm> {
     input: Conv1d,
     depth: Conv1d,
-    norm: BatchNorm,
+    norm: N,
     output: Conv1d,
     pad: usize,
     width: usize,
@@ -307,6 +322,54 @@ impl ConvModule {
             width: d,
         })
     }
+}
+
+impl ConvModule<ChannelAffine> {
+    /// `vb` is rooted at official `a.blk.{i}`. Converter stores pointwise
+    /// weights as matrices and depthwise weights as [D,K], all F32; restore
+    /// only singleton convolution axes, never invent missing BN statistics.
+    fn load_gguf(cfg: &AudioConfig, vb: crate::quantized_var_builder::VarBuilder) -> Result<Self> {
+        cfg.validate(cfg.d_model, DType::F32)?;
+        let d = cfg.d_model;
+        let twice = product(&[2, d])?;
+        let k = cfg.conv_kernel_size;
+        let weight = |shape: &[usize], name: &str| -> Result<Tensor> {
+            vb.get(shape, name)?.dequantize(vb.device())
+        };
+        let input = Conv1d::new(
+            weight(&[twice, d], "conv_pw1.weight")?.unsqueeze(2)?,
+            Some(weight(&[twice], "conv_pw1.bias")?),
+            Default::default(),
+        );
+        let depth = Conv1d::new(
+            weight(&[d, k], "conv_dw.weight")?.unsqueeze(1)?,
+            Some(weight(&[d], "conv_dw.bias")?),
+            Conv1dConfig {
+                groups: d,
+                ..Default::default()
+            },
+        );
+        let norm = ChannelAffine::new(
+            weight(&[d], "conv_norm.weight")?,
+            weight(&[d], "conv_norm.bias")?,
+        )?;
+        let output = Conv1d::new(
+            weight(&[d, d], "conv_pw2.weight")?.unsqueeze(2)?,
+            Some(weight(&[d], "conv_pw2.bias")?),
+            Default::default(),
+        );
+        Ok(Self {
+            input,
+            depth,
+            norm,
+            output,
+            pad: (k - 1) / 2,
+            width: d,
+        })
+    }
+}
+
+impl<N: ChannelNormalization> ConvModule<N> {
     fn forward(&self, x: &Tensor, valid_mask: &Tensor, zero: &Tensor) -> Result<Tensor> {
         let x = self.input.forward(&x.transpose(1, 2)?)?;
         let left = x.narrow(1, 0, self.width)?;
@@ -317,7 +380,7 @@ impl ConvModule {
             .where_cond(&x, &zero.broadcast_as(x.shape())?)?
             .pad_with_zeros(2, self.pad, self.pad)?;
         let x = self.depth.forward(&x)?;
-        let x = self.norm.forward_t(&x, false)?.silu()?;
+        let x = self.norm.eval(&x)?.silu()?;
         self.output.forward(&x)?.transpose(1, 2)
     }
 }

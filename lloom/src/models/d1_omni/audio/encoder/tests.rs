@@ -4,6 +4,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 fn fixture() -> Result<(AudioEncoder, Value)> {
+    // The bounded contract runner supplies this explicit process policy.
+    // Do not initialize an otherwise unused barrier pool in ordinary suites.
+    if std::env::var("CANDLE_NUM_THREADS").as_deref() == Ok("1") {
+        let workers = lloom_tensor::utils::barrier_pool().n_workers();
+        eprintln!("BOUNDED_BARRIER_WORKERS={workers}");
+        assert_eq!(workers, 0);
+    }
+
     let data: Value = serde_json::from_str(include_str!("scalar_fixture.json")).unwrap();
     let cfg: AudioConfig = serde_json::from_value(data["config"].clone()).unwrap();
     let mut weights = HashMap::new();
@@ -203,5 +211,80 @@ fn learned_audio_rejects_malformed_metadata_and_callback() -> Result<()> {
             &Device::Cpu
         ))
         .is_err());
+    Ok(())
+}
+
+#[test]
+fn gguf_folded_channel_norm_composes_existing_convolution_loop() -> Result<()> {
+    use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::io::Cursor;
+    let (encoder, _) = fixture()?;
+    let old = &encoder.layers[0].conv;
+    let (gamma, beta) = old.norm.weight_and_bias().unwrap();
+    // Emulate the pinned converter once at fixture generation, not in load.
+    let a = gamma.div(&(old.norm.running_var() + old.norm.eps())?.sqrt()?)?;
+    let b = beta.sub(&old.norm.running_mean().mul(&a)?)?;
+    let tensors = [
+        ("conv_pw1.weight", old.input.weight().squeeze(2)?),
+        ("conv_pw1.bias", old.input.bias().unwrap().clone()),
+        ("conv_dw.weight", old.depth.weight().squeeze(1)?),
+        ("conv_dw.bias", old.depth.bias().unwrap().clone()),
+        ("conv_norm.weight", a),
+        ("conv_norm.bias", b),
+        ("conv_pw2.weight", old.output.weight().squeeze(2)?),
+        ("conv_pw2.bias", old.output.bias().unwrap().clone()),
+    ]
+    .into_iter()
+    .map(|(name, t)| {
+        Ok((
+            format!("a.blk.0.{name}"),
+            QTensor::quantize(&t, GgmlDType::F32)?,
+        ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    let entries: Vec<_> = tensors.iter().map(|(name, t)| (name.as_str(), t)).collect();
+    let mut bytes = Cursor::new(Vec::new());
+    gguf_file::write(&mut bytes, &[], &entries)?;
+    assert!(bytes.get_ref().len() < 4096);
+    let vb =
+        crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
+    assert!(!vb.contains_key("a.blk.0.conv_norm.running_mean"));
+    assert!(!vb.contains_key("a.blk.0.conv_norm.running_var"));
+    let folded = ConvModule::<ChannelAffine>::load_gguf(&encoder.cfg, vb.pp("a.blk.0"))?;
+    assert_eq!(folded.input.weight().dims(), [8, 4, 1]);
+    assert_eq!(folded.depth.weight().dims(), [4, 1, 3]);
+    assert_eq!(folded.output.weight().dims(), [4, 4, 1]);
+    let input = Tensor::new(
+        &[[
+            [0.2f32, -0.4, 0.6, -0.8],
+            [0.3, 0.5, -0.7, 0.9],
+            [-3., 2., -1., 4.],
+        ]],
+        &Device::Cpu,
+    )?;
+    let zero = Tensor::zeros((1, 1, 3), DType::F32, &Device::Cpu)?;
+    for valid in [2usize, 3] {
+        let mask = Tensor::from_vec(
+            (0..3).map(|i| u8::from(i < valid)).collect::<Vec<_>>(),
+            (1, 1, 3),
+            &Device::Cpu,
+        )?;
+        let expected = old
+            .forward(&input, &mask, &zero)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = folded
+            .forward(&input, &mask, &zero)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(expected.len(), 12);
+        assert_eq!(actual.len(), 12);
+        for (i, (a, b)) in actual.into_iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() < 2e-6,
+                "folded convolution valid{valid} index{i}: {a} != {b}"
+            );
+        }
+    }
     Ok(())
 }

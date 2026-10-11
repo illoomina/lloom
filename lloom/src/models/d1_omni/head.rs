@@ -1,7 +1,11 @@
-use crate::models::siglip::{Attention, Encoder, EncoderLayer, Mlp};
+use crate::models::siglip::{
+    Attention, Encoder, EncoderLayer, Mlp, PackedQkv, QkvProjection, SeparateQkv,
+};
+use crate::nn::linear::Projection;
 use crate::nn::{
     embedding, layer_norm, linear, Activation, Embedding, LayerNorm, Linear, VarBuilder,
 };
+use crate::quantized_nn::Linear as QuantizedLinear;
 use lloom_tensor::{DType, Module, Result, Tensor};
 
 /// Prepared, right-padded text rows and option markers for one head invocation.
@@ -20,15 +24,20 @@ pub struct DecisionHeadBatch {
 }
 
 /// Question-type embedding, pre-norm transformer stack and shared marker scorer.
-/// Loads the Python DecisionHead checkpoint namespace (pass its prefix in `vb`).
+/// Dense checkpoint facade; the private implementation also serves packed GGUF.
 #[derive(Debug, Clone)]
 pub struct DecisionHead {
+    inner: HeadInner<Linear, SeparateQkv<Linear>>,
+}
+
+#[derive(Debug, Clone)]
+struct HeadInner<P, Q> {
     width: usize,
     type_embedding: Embedding,
-    encoder: Encoder,
+    encoder: Encoder<P, Q>,
     scorer_norm: LayerNorm,
-    scorer_hidden: Linear,
-    scorer_output: Linear,
+    scorer_hidden: P,
+    scorer_output: P,
 }
 
 impl DecisionHead {
@@ -37,41 +46,8 @@ impl DecisionHead {
         layers: usize,
         dtype: DType,
     ) -> Result<(usize, usize, usize)> {
-        let heads = width / 64;
-        if heads == 0 || width % heads != 0 {
-            lloom_tensor::bail!("decision head width must be divisible by its width/64 heads")
-        }
-        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
-            lloom_tensor::bail!("decision head requires floating-point weights")
-        }
-        let packed = width
-            .checked_mul(3)
-            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
-        let intermediate = width
-            .checked_mul(4)
-            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
-        // Representability of actual weight arrays and layer metadata, not
-        // a weight-load/pass reservation or physical memory-fit claim.
-        let checked = |dims: &[usize]| -> Result<()> {
-            dims.iter()
-                .try_fold(1usize, |n, &d| n.checked_mul(d))
-                .filter(|&n| n <= isize::MAX as usize)
-                .ok_or_else(|| {
-                    lloom_tensor::Error::Msg("decision head shape/byte overflow".into())
-                })?;
-            Ok(())
-        };
-        let e = dtype.size_in_bytes();
-        checked(&[3, width, e])?;
-        checked(&[width, width, e])?; // scorer exists even with zero layers
-        checked(&[layers, std::mem::size_of::<EncoderLayer>()])?;
-        if layers != 0 {
-            checked(&[packed, width, e])?;
-            checked(&[intermediate, width, e])?;
-        }
-        Ok((heads, packed, intermediate))
+        HeadInner::<Linear, SeparateQkv<Linear>>::validate_config(width, layers, dtype)
     }
-
     pub fn load(width: usize, layers: usize, vb: VarBuilder) -> Result<Self> {
         let (heads, packed, intermediate) = Self::validate_config(width, layers, vb.dtype())?;
         let type_embedding = embedding(3, width, vb.pp("type_emb"))?;
@@ -106,13 +82,82 @@ impl DecisionHead {
             ));
         }
         Ok(Self {
-            width,
-            type_embedding,
-            encoder: Encoder::from_layers(stack),
-            scorer_norm: layer_norm(width, 1e-5, vb.pp("scorer.0"))?,
-            scorer_hidden: linear(width, width, vb.pp("scorer.1"))?,
-            scorer_output: linear(width, 1, vb.pp("scorer.3"))?,
+            inner: HeadInner {
+                width,
+                type_embedding,
+                encoder: Encoder::from_layers(stack),
+                scorer_norm: layer_norm(width, 1e-5, vb.pp("scorer.0"))?,
+                scorer_hidden: linear(width, width, vb.pp("scorer.1"))?,
+                scorer_output: linear(width, 1, vb.pp("scorer.3"))?,
+            },
         })
+    }
+
+    /// Validate right-padded rows and option markers before device indexing.
+    pub fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        markers: &[&[usize]],
+        qtypes: &[u32],
+    ) -> Result<DecisionHeadBatch> {
+        self.inner.prepare_batch(length, lengths, markers, qtypes)
+    }
+
+    /// Score [B,L,D] into F32 [B,options]. Callback applies the compact additive
+    /// key mask without causality; there is no hidden attention fallback.
+    pub fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &DecisionHeadBatch,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(hidden, batch, attend)
+    }
+}
+
+impl<P: Projection, Q: QkvProjection> HeadInner<P, Q> {
+    pub(crate) fn validate_config(
+        width: usize,
+        layers: usize,
+        dtype: DType,
+    ) -> Result<(usize, usize, usize)> {
+        let heads = width / 64;
+        if heads == 0 || width % heads != 0 {
+            lloom_tensor::bail!("decision head width must be divisible by its width/64 heads")
+        }
+        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
+            lloom_tensor::bail!("decision head requires floating-point weights")
+        }
+        let packed = width
+            .checked_mul(3)
+            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
+        let intermediate = width
+            .checked_mul(4)
+            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
+        // Representability of actual weight arrays and layer metadata, not
+        // a weight-load/pass reservation or physical memory-fit claim.
+        let checked = |dims: &[usize]| -> Result<()> {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .filter(|&n| n <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("decision head shape/byte overflow".into())
+                })?;
+            Ok(())
+        };
+        let e = dtype.size_in_bytes();
+        checked(&[3, width, e])?;
+        checked(&[width, width, e])?; // scorer exists even with zero layers
+        checked(&[layers, std::mem::size_of::<EncoderLayer<P, Q>>()])?;
+        if layers != 0 {
+            checked(&[packed, width, e])?;
+            checked(&[intermediate, width, e])?;
+        }
+        Ok((heads, packed, intermediate))
     }
 
     /// Validate host metadata before device indexing. Each row has at least one
@@ -221,6 +266,91 @@ impl DecisionHead {
         batch
             .marker_valid
             .where_cond(&logits, &batch.missing_logits)
+    }
+}
+
+/// Official GGUF head namespace, using packed QKV and quantized projections.
+/// The caller supplies an already-loaded weight view and owns load/pass admission;
+/// constructing this component does not load a second checkpoint or create quota.
+#[derive(Debug, Clone)]
+pub(crate) struct QuantizedDecisionHead {
+    inner: HeadInner<QuantizedLinear, PackedQkv<QuantizedLinear>>,
+}
+impl QuantizedDecisionHead {
+    pub(crate) fn load(
+        width: usize,
+        layers: usize,
+        trunk_layers: usize,
+        vb: crate::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        use crate::quantized_nn as qnn;
+        let (heads, packed, intermediate) =
+            HeadInner::<QuantizedLinear, PackedQkv<QuantizedLinear>>::validate_config(
+                width,
+                layers,
+                DType::F32,
+            )?;
+        trunk_layers
+            .checked_add(layers)
+            .ok_or_else(|| lloom_tensor::Error::Msg("GGUF head layer index overflow".into()))?;
+        let type_embedding = Embedding::new(
+            vb.get((3, width), "token_types.weight")?
+                .dequantize(vb.device())?,
+            width,
+        );
+        let mut stack = Vec::with_capacity(layers);
+        for i in 0..layers {
+            let layer = vb.pp(format!("blk.{}", trunk_layers + i));
+            let attention = Attention::from_qkv(
+                PackedQkv::new(qnn::linear(width, packed, layer.pp("attn_qkv"))?)?,
+                qnn::linear(width, width, layer.pp("attn_output"))?,
+                heads,
+            )?;
+            stack.push(EncoderLayer::from_parts(
+                attention,
+                qnn::layer_norm(width, 1e-5, layer.pp("attn_norm"))?,
+                Mlp::from_parts(
+                    qnn::linear(width, intermediate, layer.pp("ffn_up"))?,
+                    qnn::linear(intermediate, width, layer.pp("ffn_down"))?,
+                    Activation::Relu,
+                ),
+                qnn::layer_norm(width, 1e-5, layer.pp("ffn_norm"))?,
+            ));
+        }
+        Ok(Self {
+            inner: HeadInner {
+                width,
+                type_embedding,
+                encoder: Encoder::from_layers(stack),
+                scorer_norm: qnn::layer_norm(width, 1e-5, vb.pp("cls.norm"))?,
+                scorer_hidden: qnn::linear(width, width, vb.pp("cls"))?,
+                scorer_output: qnn::linear(width, 1, vb.pp("cls.output"))?,
+            },
+        })
+    }
+    /// Validate right-padded rows and option markers before device indexing.
+    pub fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        markers: &[&[usize]],
+        qtypes: &[u32],
+    ) -> Result<DecisionHeadBatch> {
+        self.inner.prepare_batch(length, lengths, markers, qtypes)
+    }
+
+    /// Score [B,L,D] into F32 [B,options]. Callback applies the compact additive
+    /// key mask without causality; there is no hidden attention fallback.
+    pub fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &DecisionHeadBatch,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(hidden, batch, attend)
     }
 }
 

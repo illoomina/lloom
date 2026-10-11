@@ -463,7 +463,7 @@ impl CommandBuffer {
     ) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.backend {
             Backend::Metal3Associated(buffer) => buffer.attach_physical_owner(owner),
-            Backend::Metal4(submission) => submission.queue.attach_physical_owner(owner),
+            Backend::Metal4(submission) => submission.attach_physical_owner(owner),
             Backend::Metal3(_) => Err(crate::kernels::err::CompletionRegistrationError::new(
                 crate::kernels::MetalKernelError::QueueUnavailable(
                     "standalone physical attachment refused",

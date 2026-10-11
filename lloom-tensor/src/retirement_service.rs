@@ -619,6 +619,12 @@ impl<T> PhysicalAnchor<T> {
     pub(crate) fn install(&self, owner: T) -> Result<(), T> {
         self.owner.set(owner)
     }
+    pub(crate) fn try_owner<E>(
+        &self,
+        clone: impl FnOnce(&T) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        self.owner.get().map(clone).transpose()
+    }
 }
 impl<T: Clone> PhysicalAnchor<T> {
     pub(crate) fn owner(&self) -> Option<T> {

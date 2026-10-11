@@ -783,6 +783,22 @@ impl MetalDevice {
         &self,
         domain: crate::memory_admission::ModelDomain,
     ) -> Result<Self> {
+        // Standalone cold route only. Loaded uses allocation_view_in to split
+        // its ALREADY promised term instead of reserving that term a second time.
+        let bytes = DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
+        let pass = domain.reserve(bytes).map_err(crate::Error::wrap)?;
+        self.allocation_view_in(domain, &pass.context())
+    }
+
+    pub(crate) fn allocation_view_in(
+        &self,
+        domain: crate::memory_admission::ModelDomain,
+        metadata: &crate::memory_admission::AllocationContext,
+    ) -> Result<Self> {
+        if metadata.domain_key() != domain.key() {
+            crate::bail!("namespace metadata and physical domain must name the supplied owner");
+        }
+        metadata.check_open().map_err(crate::Error::wrap)?;
         let namespace = super::allocation_namespace::AllocationNamespace::new(
             &self.device,
             self.commands.clock(),
@@ -817,6 +833,7 @@ impl MetalDevice {
             self.device.clone(),
             self.residency_set.clone(),
             self.ledger.clone(),
+            metadata,
         )
         .map_err(MetalError::from)?;
         view.allocation_namespace = namespace;
@@ -832,8 +849,12 @@ impl MetalDevice {
         &self,
     ) -> Result<super::device_retirement::NamespaceOwner> {
         let owner = match super::allocation_scope::active(self)? {
-            Some(scope) => scope.view.teardown.namespace_owner(),
-            None => self.teardown.namespace_owner(),
+            Some(scope) => scope
+                .view
+                .teardown
+                .namespace_owner()
+                .map_err(MetalError::from)?,
+            None => self.teardown.namespace_owner().map_err(MetalError::from)?,
         };
         Ok(owner)
     }

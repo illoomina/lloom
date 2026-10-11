@@ -124,9 +124,8 @@ impl CommandsGuard<'_> {
             .ok_or(MetalKernelError::QueueUnavailable(
                 "namespace attachment requires recording generation",
             ))?
-            .retain_namespace(owner.clone())?;
-        owner.remember(&mut self.guard.namespace);
-        Ok(())
+            .retain_namespace(owner.try_clone()?)?;
+        owner.remember(&mut self.guard.namespace)
     }
 
     pub fn set_label(&self, label: &str) {
@@ -177,9 +176,8 @@ impl BlitCommandsGuard<'_> {
             .ok_or(MetalKernelError::QueueUnavailable(
                 "namespace attachment requires recording generation",
             ))?
-            .retain_namespace(owner.clone())?;
-        owner.remember(&mut self._guard.namespace);
-        Ok(())
+            .retain_namespace(owner.try_clone()?)?;
+        owner.remember(&mut self._guard.namespace)
     }
 
     /// Explicit completion returns refusal; unfinished native custody remains in
@@ -812,7 +810,7 @@ impl Commands {
             .ok_or(MetalKernelError::QueueUnavailable(
                 "physical attachment requires pristine recording",
             ))?
-            .attach_physical_owner(owner.clone())?;
+            .attach_physical_owner(owner.try_clone()?)?;
         self.core.physical.install(owner).map_err(|owner| {
             crate::kernels::err::CompletionRegistrationError::new(
                 MetalKernelError::QueueUnavailable("physical owner already installed"),
@@ -1598,16 +1596,24 @@ impl Commands {
     fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
         match &self.core.modern_queue {
             Some(queue) => Ok(CommandBuffer::from_metal4(queue.acquire()?)),
-            None => super::metal3_retirement::AssociatedBuffer::new(
-                create_command_buffer(&self.core.command_queue, self.core.kind)?,
-                self.core
-                    .legacy_completions
-                    .as_ref()
-                    .expect("M3 core constructed")
-                    .clone(),
-                self.core.physical.owner(),
-            )
-            .map(CommandBuffer::from_metal3_associated),
+            None => {
+                // Counted owner refusal precedes raw CB creation. Never create
+                // an unregistered native resource and then drop it on EntryState
+                // merely because acquiring its metadata pin failed.
+                let physical = self.core.physical.try_owner(
+                    crate::metal_backend::device_retirement::NamespaceOwner::try_clone,
+                )?;
+                super::metal3_retirement::AssociatedBuffer::new(
+                    create_command_buffer(&self.core.command_queue, self.core.kind)?,
+                    self.core
+                        .legacy_completions
+                        .as_ref()
+                        .expect("M3 core constructed")
+                        .clone(),
+                    physical,
+                )
+                .map(CommandBuffer::from_metal3_associated)
+            }
         }
     }
 

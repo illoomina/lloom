@@ -199,6 +199,31 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         })
     }
 
+    /// Requested first slab inline/vector layouts, matching prepare_admitted.
+    /// Excludes Arc header, producer/service vectors and allocator rounding.
+    pub(crate) fn requested_slab_bytes() -> Result<usize, RegistryError> {
+        Slab::<C, A, F>::layout_bytes(CELLS, CELLS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_layout_fixture(&self) -> (usize, usize, usize, usize) {
+        // Manual scalar service only. Inspect the actual first cold slab while
+        // its producer root remains live; no new mutex or allocation is added.
+        let producer = self.producer.lock();
+        let Some(slab) = producer.slabs.first() else {
+            return (0, 0, 0, 0);
+        };
+        let cells = slab.cells.capacity();
+        let ordered = slab.ordered.capacity();
+        let actual = Slab::<C, A, F>::layout_bytes(cells, ordered).expect("fixture managed layout");
+        let charged = slab
+            .metadata_charge
+            .lock()
+            .as_ref()
+            .map_or(0, PhysicalCharge::bytes);
+        (cells, ordered, actual, charged)
+    }
+
     pub(crate) fn prepare_admitted(
         &self,
         payer: DomainKey,

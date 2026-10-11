@@ -55,6 +55,12 @@ mod allocation_alias;
 #[cfg(any(feature = "metal", test))]
 mod allocation_geometry;
 #[cfg(any(feature = "metal", test))]
+mod allocation_header;
+#[cfg(any(feature = "metal", test))]
+mod allocation_header_root;
+#[cfg(any(feature = "metal", test))]
+mod allocation_header_storage;
+#[cfg(any(feature = "metal", test))]
 mod allocation_owner;
 pub mod arms;
 pub mod autorelease;

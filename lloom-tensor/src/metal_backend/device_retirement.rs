@@ -2,6 +2,7 @@
 //! This enrollment does not close raw-derived alias, IO, or admission coverage.
 use super::allocation_namespace::AllocationNamespace;
 use crate::{
+    allocation_header_root::{HeaderPool, HeaderStrong, HeaderWeak},
     allocation_owner::AllocationLease,
     completion_wake::Wake,
     host_anchor::{HostAnchorPermit, HostAnchorRegistry},
@@ -9,6 +10,7 @@ use crate::{
         metal::{Backings, Buffer, Device, InFlightHold, ResidencySet},
         Kernels, MetalKernelError,
     },
+    memory_admission::AllocationContext,
     retirement_owners::FailureSignal,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -45,12 +47,18 @@ struct DeviceAnchors {
 unsafe impl Send for DeviceAnchors {}
 unsafe impl Sync for DeviceAnchors {}
 type Permit = HostAnchorPermit<DeviceCaptures, DeviceAnchors>;
+// This outer cell owns ONLY final permit metadata. The independently registered
+// HostAnchor still holds the actual native C/A and existing terminal joins.
+// Never expose this Arc through captures(), clone it, or construct a Weak/raw
+// acquisition path: all default/view/native holders use the counted cell below.
+type MetadataPool = HeaderPool<Arc<Permit>, (), 1>;
+type MetadataStrong = HeaderStrong<Arc<Permit>, (), 1>;
+type MetadataWeak = HeaderWeak<Arc<Permit>, (), 1>;
 
 /// Only counted host-record metadata; final Drop cannot run the C/A payload.
 /// Keep this concrete type in native owner fields, rather than an arbitrary
 /// Arc destructor smuggled into trusted A.
-#[derive(Clone)]
-pub(crate) struct NamespaceOwner(Arc<Permit>);
+pub(crate) struct NamespaceOwner(MetadataStrong);
 
 /// Weak identity memo only. It cannot keep a namespace payload alive and cannot
 /// confuse reused addresses: its Weak keeps the old Arc allocation distinct.
@@ -74,22 +82,40 @@ impl<T> GenerationMemo<T> {
         self.0 = None;
     }
 }
+/// Generation identity only: opaque rooted HeaderWeak plus ticket/generation
+/// equality prevents reuse confusion. No std Arc allocation/address semantics
+/// or namespace-payload lifetime is inferred from this memo.
 #[derive(Default)]
-pub(crate) struct NamespaceMemo(GenerationMemo<Permit>);
+pub(crate) struct NamespaceMemo(Option<MetadataWeak>);
 impl NamespaceMemo {
     pub(crate) fn reset(&mut self) {
-        self.0.reset();
+        self.0 = None; // Last weak only publishes atoms to the rooted service.
     }
 }
 impl NamespaceOwner {
+    pub(crate) fn try_clone(&self) -> Result<Self, MetalKernelError> {
+        self.0
+            .try_clone()
+            .map(Self)
+            .map_err(|_| MetalKernelError::QueueUnavailable("namespace counted owner exhausted"))
+    }
     pub(crate) fn same(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        MetadataStrong::same(&self.0, &other.0)
     }
     pub(crate) fn already_recorded(&self, memo: &NamespaceMemo) -> bool {
-        memo.0.contains(&self.0)
+        memo.0
+            .as_ref()
+            .is_some_and(|weak| weak.same_strong(&self.0))
     }
-    pub(crate) fn remember(&self, memo: &mut NamespaceMemo) {
-        memo.0.remember(&self.0);
+    pub(crate) fn remember(&self, memo: &mut NamespaceMemo) -> Result<(), MetalKernelError> {
+        // Acquire before replacing the old memo. Refusal leaves it unchanged;
+        // successful native attachment remains rooted and a retry deduplicates.
+        let weak = self
+            .0
+            .downgrade()
+            .map_err(|_| MetalKernelError::QueueUnavailable("namespace counted memo exhausted"))?;
+        memo.0 = Some(weak);
+        Ok(())
     }
 }
 
@@ -116,7 +142,18 @@ impl DeviceTeardown {
         device: Device,
         residency: Arc<ResidencySet>,
         ledger: Arc<crate::kernels::metal::ledger::Ledger>,
+        metadata: &AllocationContext,
     ) -> Result<Arc<Self>, MetalKernelError> {
+        // SAFETY: outer C is metadata-only Permit Arc, never exposed/cloned.
+        // Its actual native C/A remains independently rooted by HostAnchor.
+        // Strong0 authorizes final permit metadata release ONLY, not raw alias
+        // terminality, final physical charge or namespace remove_all.
+        let pool = unsafe { MetadataPool::cold_in(metadata) }.map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace metadata admission refused")
+        })?;
+        let empty = pool.reserve_header().map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace metadata capacity refused")
+        })?;
         // Cold constructor: seed borrow is released before registration/growth.
         let seed_lease = seed.lock().allocation_lease();
         let anchors = DeviceAnchors {
@@ -137,21 +174,49 @@ impl DeviceTeardown {
             Arc::new(Wake::default()),
         )
         .map_err(|_| MetalKernelError::QueueUnavailable("namespace host root unavailable"))?;
-        let permit = register_root(&registry, captures, anchors).map_err(|rejected| {
+        let permit = registry
+            .reserve_in(metadata, captures, anchors)
+            .map(Arc::new)
+            .map_err(|rejected| {
+                crate::kernels::err::CompletionRegistrationError::new(
+                    MetalKernelError::QueueUnavailable("namespace host root registration refused"),
+                    rejected.owner,
+                )
+            })?;
+        let prepared = empty.initialize(permit, ()).map_err(|rejected| {
             crate::kernels::err::CompletionRegistrationError::new(
-                MetalKernelError::QueueUnavailable("namespace host root registration refused"),
-                rejected.owner,
+                MetalKernelError::QueueUnavailable("namespace metadata initialization refused"),
+                rejected.owners,
             )
         })?;
+        let owner = prepared.publish().map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace metadata publication refused")
+        })?;
         Ok(Arc::new(Self {
-            owner: NamespaceOwner(permit),
+            owner: NamespaceOwner(owner),
         }))
     }
-    pub(crate) fn namespace_owner(&self) -> NamespaceOwner {
-        self.owner.clone()
+    pub(crate) fn namespace_owner(&self) -> Result<NamespaceOwner, MetalKernelError> {
+        self.owner.try_clone()
     }
-    pub(crate) fn physical_owner(&self) -> NamespaceOwner {
-        self.owner.clone()
+    pub(crate) fn physical_owner(&self) -> Result<NamespaceOwner, MetalKernelError> {
+        self.owner.try_clone()
+    }
+    /// Outer header plus managed first native-owner slab Layouts only.
+    /// Arc/control/registry/service/namespace/generation storage remain open.
+    pub(crate) fn requested_metadata_bytes() -> Result<usize, MetalKernelError> {
+        let outer = MetadataPool::requested_bytes().map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace metadata layout overflow")
+        })?;
+        let native = HostAnchorRegistry::<DeviceCaptures, DeviceAnchors>::requested_slab_bytes()
+            .map_err(|_| {
+                MetalKernelError::QueueUnavailable("namespace native slab layout overflow")
+            })?;
+        outer
+            .checked_add(native)
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "namespace combined metadata layout overflow",
+            ))
     }
     pub(crate) fn handles(self: &Arc<Self>) -> usize {
         Arc::strong_count(self)

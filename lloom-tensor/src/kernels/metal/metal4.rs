@@ -155,6 +155,13 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
+        // Obtain the real default pin before removing any reusable/native slot.
+        // Counted-clone refusal leaves queue state/capacity unchanged. Initial
+        // cold acquire has None; pristine attachment fills that State below.
+        self.check_failure()?;
+        let physical = self
+            .physical
+            .try_owner(crate::metal_backend::device_retirement::NamespaceOwner::try_clone)?;
         let mut slot = loop {
             let seen = self.ready.snapshot();
             self.check_failure()?;
@@ -220,6 +227,7 @@ impl Queue {
                 slot: Some(slot),
                 callbacks: Vec::new(),
                 events: Vec::new(),
+                physical,
             }),
             feedback: OnceLock::new(),
             callbacks_finished: AtomicBool::new(false),
@@ -393,6 +401,9 @@ struct State {
     slot: Option<Slot>,
     callbacks: Vec<Callback>,
     events: Vec<EventBoundary>,
+    // Prepared once before exposure. Commit/abandonment move this actual pin;
+    // final Submission Drop never needs a fallible owner acquisition.
+    physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 
 pub(crate) struct Submission {
@@ -413,6 +424,32 @@ unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
 
 impl Submission {
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        let mut input = Some(owner);
+        let result = (|| {
+            let mut state = self.recording_state()?;
+            if state.physical.is_some() {
+                return Err(MetalKernelError::QueueUnavailable(
+                    "M4 recording physical owner already installed",
+                ));
+            }
+            // Cold pristine queue/submission attachment before any public
+            // capability escapes. Refusal precedes taking the original input.
+            let queue_pin = input.as_ref().expect("physical input").try_clone()?;
+            self.queue.attach_physical_owner(queue_pin)?;
+            state.physical = input.take(); // Nonpanicking move after publication.
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(crate::kernels::err::CompletionRegistrationError::new(error, input).into())
+            } // Recording guard gone before rejected input can drop.
+        }
+    }
     pub(super) fn retain_namespace(
         &self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -994,6 +1031,7 @@ impl PreparedCommit<'_> {
         submission.queue.check_failure()?;
         let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
+        let physical = state.physical.take();
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);
         let events = std::mem::take(&mut state.events);
@@ -1008,11 +1046,7 @@ impl PreparedCommit<'_> {
             .status
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         drop(state);
-        let owners = super::retirement::NativeOwners::metal4(
-            slot,
-            submission.clone(),
-            submission.queue.physical.owner(),
-        );
+        let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
         match submission
             .retirement
             .replace_prepared(super::retirement::Captures(callbacks), owners)
@@ -1135,11 +1169,12 @@ impl Drop for Submission {
         if let Some(slot) = state.slot.take() {
             let callbacks = std::mem::take(&mut state.callbacks);
             let events = std::mem::take(&mut state.events);
+            let physical = state.physical.take();
             let owners = super::retirement::NativeOwners::metal4_abandoned(
                 slot,
                 self.queue.clone(),
                 events,
-                self.queue.physical.owner(),
+                physical,
             );
             match self
                 .retirement

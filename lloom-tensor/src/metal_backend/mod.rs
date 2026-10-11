@@ -3136,6 +3136,20 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Cold metadata-only process payer. This does not change the native
+        // Legacy origin, acquire a machine owner, or latch first model load.
+        // The process policy remains safely configurable before that load.
+        // Outer header and managed first slab Layouts are quoted; constructor Arc,
+        // registry/service and generation storage still need explicit pricing.
+        let metadata_domain = crate::memory_admission::process_account()
+            .metadata_domain()
+            .map_err(crate::Error::wrap)?;
+        let metadata_bytes =
+            DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
+        let metadata_pass = metadata_domain
+            .reserve(metadata_bytes)
+            .map_err(crate::Error::wrap)?;
+        let metadata = metadata_pass.context();
         let device = Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue().map_err(MetalError::from)?;
         #[cfg(feature = "metal-debug-labels")]
@@ -3188,10 +3202,11 @@ impl BackendDevice for MetalDevice {
             device.clone(),
             residency_set.clone(),
             ledger.clone(),
+            &metadata,
         )
         .map_err(MetalError::from)?;
         commands
-            .attach_physical_owner(teardown.physical_owner())
+            .attach_physical_owner(teardown.physical_owner().map_err(MetalError::from)?)
             .map_err(MetalError::from)?;
 
         Ok(Self {

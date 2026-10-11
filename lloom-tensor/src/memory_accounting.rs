@@ -65,6 +65,10 @@ pub(crate) enum Scope {
 pub(crate) enum Refusal {
     Overflow,
     DifferentDomain,
+    ConfigurationConflict {
+        active: Option<usize>,
+        requested: Option<usize>,
+    },
     Machine(String),
     Limit {
         scope: Scope,
@@ -77,25 +81,94 @@ pub(crate) enum Refusal {
     },
 }
 
+/// Bootstrap metadata may precede configuration. Explicit None is a policy,
+/// not an unspecified default; the first genuine model-load entry freezes it.
+#[derive(Clone, Copy, Default)]
+enum CapPolicy {
+    #[default]
+    Unspecified,
+    Configured(Option<usize>),
+    Frozen(Option<usize>),
+}
+impl CapPolicy {
+    fn cap(self) -> Option<usize> {
+        match self {
+            Self::Unspecified => None,
+            Self::Configured(cap) | Self::Frozen(cap) => cap,
+        }
+    }
+}
 #[derive(Default)]
 struct State {
+    policy: CapPolicy,
     total: Snapshot,
     domains: HashMap<u64, Snapshot>,
     next_id: u64,
 }
 
 pub(crate) struct ProcessAccount {
-    // None is accounting without an aggregate cap, never a machine ceiling.
-    cap: Option<usize>,
+    // Policy and numeric totals share the EXISTING state mutex; never reset
+    // totals/domains or manufacture a second account during cold cap adoption.
     state: Mutex<State>,
 }
 
 impl ProcessAccount {
     pub fn new(cap: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
-            cap,
+            state: Mutex::new(State {
+                policy: CapPolicy::Configured(cap),
+                ..State::default()
+            }),
+        })
+    }
+
+    /// Singleton bootstrap only: accounted metadata can exist before policy.
+    pub fn bootstrap() -> Arc<Self> {
+        Arc::new(Self {
             state: Mutex::new(State::default()),
         })
+    }
+
+    /// Cold one-time adoption serialized with every reserve/cancel/commit.
+    /// Existing pending AND committed bytes participate; refusal publishes
+    /// no policy and permits a later sufficient pre-model-load retry.
+    pub fn configure_cap(&self, requested: Option<usize>) -> Result<(), Refusal> {
+        let mut state = self.state.lock();
+        match state.policy {
+            CapPolicy::Unspecified => {
+                let total = state.total.total()?;
+                if let Some(limit) = requested {
+                    if total > limit {
+                        return Err(Refusal::Limit {
+                            scope: Scope::Process,
+                            limit,
+                            requested_total: total,
+                        });
+                    }
+                }
+                state.policy = CapPolicy::Configured(requested);
+                Ok(())
+            }
+            CapPolicy::Configured(active) | CapPolicy::Frozen(active) if active == requested => {
+                Ok(())
+            }
+            CapPolicy::Configured(active) | CapPolicy::Frozen(active) => {
+                Err(Refusal::ConfigurationConflict { active, requested })
+            }
+        }
+    }
+
+    /// Cold genuine model-load entry, NOT device/bootstrap/domain creation.
+    /// Idempotent for subsequent/hot-swapped models sharing this account.
+    pub fn begin_model_load(&self) {
+        let mut state = self.state.lock();
+        state.policy = CapPolicy::Frozen(state.policy.cap());
+    }
+
+    /// Cold diagnostic: reads the actual authoritative policy, not a stale
+    /// immutable facade copy or a sentinel that loses usize::MAX.
+    pub fn cap(&self) -> Option<usize> {
+        self.state.lock().policy.cap()
     }
 
     pub fn domain(self: &Arc<Self>, quota: Option<usize>) -> Result<Domain, Refusal> {
@@ -182,7 +255,7 @@ impl Domain {
         let own = state.domains[&self.0.id].reserve(bytes, self.0.quota, Scope::Domain)?;
         let total = state
             .total
-            .reserve(bytes, self.0.account.cap, Scope::Process)?;
+            .reserve(bytes, state.policy.cap(), Scope::Process)?;
         let target = u64::try_from(own.total()?).map_err(|_| Refusal::Overflow)?;
         // No update until both scope checks and target conversion succeed.
         state.domains.insert(self.0.id, own);

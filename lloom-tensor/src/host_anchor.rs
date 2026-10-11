@@ -78,6 +78,25 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static> HostAnchorRegistry<C, A
             })?;
         Self::permit(record)
     }
+    /// Requested managed first slab quote only, not the whole registry price.
+    pub(crate) fn requested_slab_bytes() -> Result<usize, RegistryError> {
+        OwnerRegistry::<C, A, ()>::requested_slab_bytes()
+    }
+    #[cfg(test)]
+    pub(crate) fn managed_layout_fixture(&self) -> (usize, usize, usize, usize) {
+        self.registry.managed_layout_fixture()
+    }
+    /// Partition an existing context; never reserve a second load promise.
+    pub(crate) fn reserve_in(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+        captures: C,
+        owner: A,
+    ) -> Result<HostAnchorPermit<C, A>, AnchorRejected<C, A>> {
+        self.reserve_admitted(context.domain_key(), captures, owner, |bytes| {
+            context.take(bytes).map_err(RegistryError::Admission)
+        })
+    }
     /// Retained logical slab-layout admission; the same pin/wrapper protocol as
     /// legacy reserve. The registry holds the ticket's charge until host final
     /// metadata destruction, not only until payload cleanup credit returns.

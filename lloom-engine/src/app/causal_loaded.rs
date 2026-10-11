@@ -74,9 +74,37 @@ pub enum CausalPolicySource {
 }
 use super::request_slot::{Lease as RequestLease, State as Chat};
 
+/// Explicit family-owned recovery boundary before marked model work is reused.
+/// The family covers ALL of its retained scratch/queues/host producers; Device
+/// identity alone is not that proof. A refusal or unwind leaves full Held custody
+/// and NeedsRecovery intact. Hooks run at request checkout, never in Lease Drop.
+/// Held decision-only work preserves the marker until an actual decoding reset,
+/// so the hook must tolerate repeated successful calls before that reset.
+/// Hook storage has its caller origin; prediction/enrollment remain obligations.
+pub trait Recovery<M: CausalLM>: Send + Sync {
+    fn before_reuse(&self, model: &M, device: &Device) -> Result<()>;
+}
+
+/// Explicit opt-in for a family whose pending work uses this Device's registered
+/// Commands. This excludes arbitrary custom queues, raw submissions and IO.
+/// Prefix DATA readiness is not callback/shutdown or per-binding custody proof.
+pub struct AssociatedDeviceRecovery;
+impl<M: CausalLM> Recovery<M> for AssociatedDeviceRecovery {
+    fn before_reuse(&self, _model: &M, device: &Device) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = device {
+            let marker = device.flush_marker()?;
+            return device.wait_marker_prefix_data(&marker);
+        }
+        device.synchronize()
+    }
+}
+
 /// One model, a held chat sequence and request-level executor serialization.
 /// Decisions build one fresh cache, never clone or replace the chat sequence.
-/// The generic generation driver owns reset/recovery for zero-horizon caches.
+/// Sequence prepare handles normal zero-horizon reuse. Incomplete request
+/// recovery requires the explicit family strategy; legacy callers retain custody
+/// but do not acquire a native/reset guarantee from this owner.
 pub struct CausalEngine<M: CausalLM> {
     model: M,
     config: M::Config,
@@ -85,6 +113,8 @@ pub struct CausalEngine<M: CausalLM> {
     tokenizer: Tokenizer,
     policy: Option<CausalPolicy>,
     decode: DecodeConfig,
+    // None retains the explicitly caller-managed legacy generic contract.
+    recovery: Option<Box<dyn Recovery<M>>>,
     chat: Mutex<Option<Chat<M::Cache>>>,
 }
 impl<M: CausalLM> CausalEngine<M>
@@ -94,11 +124,38 @@ where
     /// All producers run inside the existing supplied load scope. This permits
     /// another causal app family to reuse this owner without a second model
     /// budget or a decision-only model copy. CPU/CUDA enrollment is unchanged.
+    /// This original entry retains caller-managed recovery: it cannot infer
+    /// arbitrary M scratch/topology. Families install their explicit strategy
+    /// with load_admitted_with_recovery; default activation remains pending.
     pub fn load_admitted(
         device: &Device,
         load: LoadContext,
         capacity: usize,
         decode: DecodeConfig,
+        produce: impl FnOnce(&Device) -> Result<(M, M::Config, Tokenizer, Option<CausalPolicy>)>,
+    ) -> Result<Loaded<Self>> {
+        Self::load_admitted_inner(device, load, capacity, decode, None, produce)
+    }
+
+    /// Additive family-aware constructor. Do not use the associated-device
+    /// strategy for a custom model unless its complete producer topology fits.
+    pub fn load_admitted_with_recovery(
+        device: &Device,
+        load: LoadContext,
+        capacity: usize,
+        decode: DecodeConfig,
+        recovery: Box<dyn Recovery<M>>,
+        produce: impl FnOnce(&Device) -> Result<(M, M::Config, Tokenizer, Option<CausalPolicy>)>,
+    ) -> Result<Loaded<Self>> {
+        Self::load_admitted_inner(device, load, capacity, decode, Some(recovery), produce)
+    }
+
+    fn load_admitted_inner(
+        device: &Device,
+        load: LoadContext,
+        capacity: usize,
+        decode: DecodeConfig,
+        recovery: Option<Box<dyn Recovery<M>>>,
         produce: impl FnOnce(&Device) -> Result<(M, M::Config, Tokenizer, Option<CausalPolicy>)>,
     ) -> Result<Loaded<Self>> {
         lloom_tensor::memory_admission::begin_model_load();
@@ -116,6 +173,7 @@ where
                 tokenizer,
                 policy,
                 decode,
+                recovery,
                 chat: Mutex::new(Some(Chat {
                     sequence: Some(Sequence::new(cache)),
                     rings: Some(RingPool::new()),
@@ -127,7 +185,11 @@ where
     }
 
     fn checkout(&self) -> Result<RequestLease<'_, M>> {
-        RequestLease::checkout(&self.chat, false)
+        let lease = RequestLease::checkout(&self.chat, self.recovery.is_some())?;
+        if let Some(recovery) = &self.recovery {
+            lease.before_recovery(|| recovery.before_reuse(&self.model, &self.device))?;
+        }
+        Ok(lease)
     }
 
     /// Tokenization is a request producer and runs in that owner's supplied
@@ -206,7 +268,7 @@ where
         let mut lease = self.checkout()?;
         lease.start_decode(&self.model, &self.device, self.decode.clone());
         let tokenizer = &self.tokenizer;
-        lease.session().decode_until(
+        let result = lease.session().decode_until(
             prompt,
             |ids| {
                 tokenizer
@@ -215,7 +277,11 @@ where
             },
             params,
             |fragment| on_fragment(fragment),
-        )
+        );
+        if result.is_ok() {
+            lease.mark_complete();
+        }
+        result
     }
 
     /// Fully prepared programmatic requests preserve explicit renderer/certificate
@@ -237,10 +303,15 @@ where
         check_context_capacity(self.capacity, request.max_prompt_tokens(), 0, 0)
             .map_err(Error::wrap)?;
         // Serialize at request level only; no lock is taken in a decode step.
-        let _lease = self.checkout()?;
+        let mut lease = self.checkout()?;
+        lease.start_external_work();
         let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.device)?;
         let options = self.decode.options(0, ReadbackArm::Blocking, 0);
-        request.execute(&self.model, &self.config, &mut readback, &options)
+        let result = request.execute(&self.model, &self.config, &mut readback, &options);
+        if result.is_ok() {
+            lease.mark_complete();
+        }
+        result
     }
 
     /// Raw ordered endpoint/programmatic preparation and execution belong to one
@@ -388,6 +459,10 @@ fn produce_lfm2_gguf_with<T>(
             tokenizer,
             policy,
             decode,
+            // This concrete immutable quantized model is constructed on the
+            // same supplied Device. Custom generic models opt in separately.
+            // Native per-binding/error retirement closure is still unproven.
+            recovery: Some(Box::new(AssociatedDeviceRecovery)),
             chat: Mutex::new(Some(Chat {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -414,3 +489,6 @@ mod model_stage_tests;
 
 #[cfg(test)]
 mod raw_policy_tests;
+
+#[cfg(test)]
+mod generic_recovery_tests;

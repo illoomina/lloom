@@ -94,6 +94,7 @@ pub(super) fn engine() -> Result<CausalEngine<Tiny>> {
         tokenizer,
         policy: None,
         decode: DecodeConfig::default(),
+        recovery: None,
         chat: Mutex::new(Some(Chat {
             sequence: Some(Sequence::new(cache)),
             rings: Some(RingPool::new()),

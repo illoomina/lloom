@@ -133,6 +133,85 @@ pub struct Engine<M: Qwen3_5Model, X: Layer> {
     single: Mutex<Single<M::Cache>>,
 }
 
+/// Request-level family choice; each variant retains a statically dispatched
+/// decoder and one loaded model. No enum dispatch occurs inside the token loop.
+pub enum Engines<P: Profile> {
+    Dense(Engine<Qwen3_5<P>, lloom::models::qwen3_5::Qwen3_5MtpLayer<P>>),
+    Moe(Engine<Qwen3_5Moe<P>, lloom::models::qwen3_5::Qwen3_5MoeMtpLayer<P>>),
+}
+
+impl<P: Profile> Engines<P> {
+    fn into_served(self) -> Box<dyn Served> {
+        match self {
+            Self::Dense(engine) => Box::new(engine),
+            Self::Moe(engine) => Box::new(engine),
+        }
+    }
+
+    /// Existing chat execution inside this already-loaded owner's pass. The
+    /// caller supplies a whole asynchronous peak, not just one tile's scratch.
+    pub fn complete_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            let out = match engine {
+                Self::Dense(engine) => engine.complete_until(prompt_ids, params, &mut on_fragment),
+                Self::Moe(engine) => engine.complete_until(prompt_ids, params, &mut on_fragment),
+            };
+            out.map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        })?)
+    }
+
+    /// Common retained-trunk decisions on the same weights as chat. Prepared
+    /// request storage retains its origin; fresh cache/snapshot/readout demand
+    /// belongs to this pass. Default server activation still requires complete
+    /// predictor/producer enrollment and verified tokenizer state boundaries.
+    pub fn decide_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        request: &crate::decision::CausalRequest,
+    ) -> Result<crate::decision::SystemOneResponse> {
+        Ok(
+            loaded.with_pass(predicted_extra, |engine, _context| match engine {
+                Self::Dense(engine) => engine.decide_prepared(request),
+                Self::Moe(engine) => engine.decide_prepared(request),
+            })?,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LoadAdmission {
+    Legacy,
+    CallerScoped,
+}
+
+/// Load the complete app engine inside one caller-supplied model domain, including
+/// header/tokenizer metadata, model/MTP, initial cache/rings and warmup. No nested
+/// legacy admission or model-only Loaded wrapper is introduced. Source-only
+/// activation: ordinary/native/host producer enrollment remains prerequisite.
+pub fn load_admitted_as<P: Profile>(
+    opts: LoadOptions,
+    device: &Device,
+    load: lloom::nn::memory::LoadContext,
+) -> Result<lloom::nn::memory::Loaded<Engines<P>>> {
+    if opts.cpu != device.is_cpu() {
+        anyhow::bail!("supplied Qwen3.5 device disagrees with load options");
+    }
+    Ok(lloom::nn::memory::Loaded::new(
+        device,
+        load,
+        |resolved, _context| {
+            load_on::<P>(opts, resolved.clone(), LoadAdmission::CallerScoped)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        },
+    )?)
+}
+
 /// The GGUF's `general.architecture`, when it is this family's.
 pub fn arch_of_path(path: &Path) -> Option<&'static str> {
     let mut f = std::fs::File::open(path).ok()?;
@@ -228,6 +307,14 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
     } else {
         open_device()?
     };
+    load_on::<P>(opts, device, LoadAdmission::Legacy).map(Engines::into_served)
+}
+
+fn load_on<P: Profile>(
+    opts: LoadOptions,
+    device: Device,
+    admission: LoadAdmission,
+) -> Result<Engines<P>> {
     let shards = lloom::hub::gguf_shards(&opts.first_shard);
     let mut f = std::fs::File::open(&opts.first_shard)
         .with_context(|| format!("opening {}", opts.first_shard.display()))?;
@@ -264,13 +351,16 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         mtp: opts.mtp,
         // The verify window of `k + 1` positions as one pass over the rings.
         window: if opts.mtp { opts.mtp_k.max(1) + 1 } else { 0 },
-        machine: Some(lloom::nn::memory::MachineLoad {
-            gate: opts.memory.machine_gate(),
-            label: super::common::machine_label(arch, &opts.first_shard),
-            rows: 1,
-            kv_tokens: opts.kv_capacity,
-            prefill_tile: opts.prefill_tile,
-        }),
+        machine: match admission {
+            LoadAdmission::Legacy => Some(lloom::nn::memory::MachineLoad {
+                gate: opts.memory.machine_gate(),
+                label: super::common::machine_label(arch, &opts.first_shard),
+                rows: 1,
+                kv_tokens: opts.kv_capacity,
+                prefill_tile: opts.prefill_tile,
+            }),
+            LoadAdmission::CallerScoped => None,
+        },
         checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
     };
     let t = Instant::now();
@@ -288,6 +378,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
             Engine::finish(
                 model, head, device, opts, &content, arch, tier, installed, warnings,
             )
+            .map(Engines::Dense)
         }
         _ => {
             if opts.experts != "resident" {
@@ -312,6 +403,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
             Engine::finish(
                 model, head, device, opts, &content, arch, tier, installed, warnings,
             )
+            .map(Engines::Moe)
         }
     }
 }
@@ -334,7 +426,7 @@ where
         mut tier: Value,
         installed: super::report::Installed,
         load_warnings: Vec<LoadWarning>,
-    ) -> Result<Box<dyn Served>> {
+    ) -> Result<Self> {
         if opts.mtp && mtp.is_none() {
             anyhow::bail!("speculative.method = mtp was given but the loader found no MTP block");
         }
@@ -436,7 +528,7 @@ where
         }
         let _ = &mut engine;
         engine.text.prime();
-        Ok(Box::new(engine))
+        Ok(engine)
     }
 
     fn with_single<T>(&self, f: impl FnOnce(&mut DecodeSession<'_, M>) -> Result<T>) -> Result<T> {
@@ -453,6 +545,26 @@ where
         single.seq = Some(seq);
         single.rings = Some(rings);
         out
+    }
+
+    fn decide_prepared(
+        &self,
+        request: &crate::decision::CausalRequest,
+    ) -> lloom_tensor::Result<crate::decision::SystemOneResponse>
+    where
+        M::Cache: lloom::nn::branch::RetainState,
+    {
+        self.check_fits(request.max_prompt_tokens(), 0)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        let single = lock(&self.single);
+        let options = single.decode.options(0, ReadbackArm::Blocking, 0);
+        let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.device)?;
+        request.execute(
+            &*self.model,
+            model_config(&*self.model),
+            &mut readback,
+            &options,
+        )
     }
 
     fn detok(&self) -> impl FnMut(&[u32]) -> lloom_tensor::Result<String> + '_ {

@@ -56,7 +56,7 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
         let heavy = CommandBuffer::new(queue.commandBuffer().unwrap());
         let tiny = CommandBuffer::new(queue.commandBuffer().unwrap());
         {
-            let enc = heavy.compute_command_encoder_no_fence();
+            let enc = heavy.compute_command_encoder_no_fence().unwrap();
             for k in 0..4000 {
                 let (a, b) = if k % 2 == 0 {
                     (&ping, &pong)
@@ -65,12 +65,12 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
                 };
                 cos(&enc, a, b);
             }
-            enc.end_encoding();
+            enc.end_encoding().unwrap();
         }
         {
-            let enc = tiny.compute_command_encoder_no_fence();
+            let enc = tiny.compute_command_encoder_no_fence().unwrap();
             cos(&enc, &small_in, &small_out);
-            enc.end_encoding();
+            enc.end_encoding().unwrap();
         }
         let heavy_done_at_tiny_handler = Arc::new(AtomicBool::new(false));
         let handlers = Arc::new(AtomicU32::new(0));

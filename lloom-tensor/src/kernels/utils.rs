@@ -5,15 +5,6 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 pub struct WrappedEncoder<'a> {
     inner: &'a ComputeCommandEncoder,
-    end_encoding_on_drop: bool,
-}
-
-impl Drop for WrappedEncoder<'_> {
-    fn drop(&mut self) {
-        if self.end_encoding_on_drop {
-            self.inner.end_encoding()
-        }
-    }
 }
 
 impl AsRef<ComputeCommandEncoder> for WrappedEncoder<'_> {
@@ -366,10 +357,7 @@ impl EncoderProvider for &ComputeCommandEncoder {
     where
         Self: 'a;
     fn encoder(&self) -> Self::Encoder<'_> {
-        WrappedEncoder {
-            inner: self,
-            end_encoding_on_drop: false,
-        }
+        WrappedEncoder { inner: self }
     }
 }
 

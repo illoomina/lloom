@@ -27,6 +27,8 @@ pub use allocation_scope::{
     AllocationRequest, AllocationWorker, ExecutionScope, MetalAllocationDomain,
 };
 mod device;
+pub(crate) mod device_retirement;
+pub(crate) use device::retain_evicted_allocations;
 mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
@@ -3134,6 +3136,20 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Cold metadata-only process payer. This does not change the native
+        // Legacy origin, acquire a machine owner, or latch first model load.
+        // The process policy remains safely configurable before that load.
+        // Outer header and managed first slab Layouts are quoted; constructor Arc,
+        // registry/service and generation storage still need explicit pricing.
+        let metadata_domain = crate::memory_admission::process_account()
+            .metadata_domain()
+            .map_err(crate::Error::wrap)?;
+        let metadata_bytes =
+            DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
+        let metadata_pass = metadata_domain
+            .reserve(metadata_bytes)
+            .map_err(crate::Error::wrap)?;
+        let metadata = metadata_pass.context();
         let device = Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue().map_err(MetalError::from)?;
         #[cfg(feature = "metal-debug-labels")]
@@ -3169,14 +3185,29 @@ impl BackendDevice for MetalDevice {
                 .map_err(MetalError::from)?,
         );
         let commands = Arc::new(commands);
-        // The guard holds its own `Arc` to the two things it needs, so it fires
-        // when the last `MetalDevice` handle drops rather than when any clone
-        // does -- every `Tensor` holds a clone, so the difference is a teardown
-        // guard against a per-tensor GPU synchronize (`DESIGN.md` §6.3c).
-        let teardown = Arc::new(DeviceTeardown::new(
-            Arc::clone(&commands),
-            Arc::clone(&residency_set),
-        ));
+        // Cold enrollment before any MetalDevice/recording capability escapes.
+        // Seed uses the same allocation-local membership protocol as backings.
+        let seed_membership = allocation_namespace
+            .membership
+            .for_buffer(&seed.lock())
+            .map_err(crate::Error::wrap)?;
+        let enriched_seed = seed.lock().clone().with_membership(seed_membership);
+        let old_seed = std::mem::replace(&mut *seed.lock(), enriched_seed);
+        drop(old_seed);
+        let teardown = DeviceTeardown::new(
+            allocation_namespace.clone(),
+            seed.clone(),
+            kernels.clone(),
+            commands.in_flight_hold().cloned(),
+            device.clone(),
+            residency_set.clone(),
+            ledger.clone(),
+            &metadata,
+        )
+        .map_err(MetalError::from)?;
+        commands
+            .attach_physical_owner(teardown.physical_owner().map_err(MetalError::from)?)
+            .map_err(MetalError::from)?;
 
         Ok(Self {
             constants: allocation_namespace.constants.clone(),

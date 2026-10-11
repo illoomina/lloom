@@ -25,8 +25,35 @@ impl MetalAllocationDomain {
         // A same-device active payer supplies policy, not ownership of the new domain.
         let source = active(device)?.map_or_else(|| device.clone(), |scope| scope.view.clone());
         Ok(Self {
-            view: source.allocation_view(domain),
+            view: source.allocation_view(domain)?,
         })
+    }
+
+    /// Cold supplied-load route: metadata partitions the SAME existing promise.
+    /// The caller must add the namespace quote exactly once before admission.
+    /// This quote covers outer header and managed first native-owner slab Layouts;
+    /// complete host/native metadata and generation pricing remain required.
+    pub fn new_in(
+        device: &MetalDevice,
+        domain: crate::memory_admission::ModelDomain,
+        metadata: &AllocationContext,
+    ) -> crate::Result<Self> {
+        if metadata.domain_key() != domain.key() {
+            crate::bail!("namespace metadata context differs from supplied model domain");
+        }
+        metadata.check_open().map_err(crate::Error::wrap)?;
+        let source = active(device)?.map_or_else(|| device.clone(), |scope| scope.view.clone());
+        Ok(Self {
+            view: source.allocation_view_in(domain, metadata)?,
+        })
+    }
+
+    /// Partial logical quote, not total metadata/RSS protection. The actual
+    /// caller must carry all additional pricing terms described by the plan.
+    pub fn requested_metadata_bytes() -> crate::Result<usize> {
+        super::device_retirement::DeviceTeardown::requested_metadata_bytes()
+            .map_err(super::MetalError::from)
+            .map_err(Into::into)
     }
 
     pub fn domain(&self) -> &crate::memory_admission::ModelDomain {

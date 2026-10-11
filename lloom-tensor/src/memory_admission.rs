@@ -222,6 +222,12 @@ impl ProcessAccount {
 /// The retained Arc prevents address reuse for as long as this key exists.
 #[derive(Clone)]
 pub struct DomainKey(core::Domain);
+impl DomainKey {
+    /// Exact immutable quota/machine owner, not an ambient execution binding.
+    pub(crate) fn model_domain(&self) -> ModelDomain {
+        ModelDomain(self.0.clone())
+    }
+}
 impl PartialEq for DomainKey {
     fn eq(&self, other: &Self) -> bool {
         self.0.identity() == other.0.identity()
@@ -298,6 +304,22 @@ impl<D: PartialEq> AllocationAffinity<D> {
 #[derive(Clone)]
 pub struct ModelDomain(core::Domain);
 impl ModelDomain {
+    #[cfg(test)]
+    pub(crate) fn isolated_numeric_fixture(cap: usize) -> Self {
+        Self(
+            core::ProcessAccount::new(Some(cap))
+                .domain(Some(cap))
+                .expect("numeric fixture domain"),
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn isolated_numeric_domains(cap: usize, count: usize) -> Vec<Self> {
+        assert!(count <= 16, "bounded scalar fixture domains");
+        let account = core::ProcessAccount::new(Some(cap));
+        (0..count)
+            .map(|_| Self(account.domain(Some(cap)).expect("numeric fixture domain")))
+            .collect()
+    }
     pub fn key(&self) -> DomainKey {
         DomainKey(self.0.clone())
     }
@@ -382,6 +404,11 @@ pub struct AllocationTicket {
     parent: Weak<PassState>,
 }
 impl AllocationTicket {
+    /// Issued promise identity survives parent-pass cancellation. Cold producers
+    /// verify this before allocating; returned keys must die outside their locks.
+    pub(crate) fn domain_key(&self) -> DomainKey {
+        DomainKey(self.promise.as_ref().expect("live ticket").domain().clone())
+    }
     /// The machine decision for this issued promise, not proof of native wiring.
     pub fn machine_status(&self) -> MachineStatus {
         self.promise

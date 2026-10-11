@@ -105,6 +105,10 @@ impl<L> Censused<L> {
 }
 
 impl<T> Censused<parking_lot::RwLock<T>> {
+    /// Nonblocking lifecycle poll: a refusal is not a measured blocked wait.
+    pub(crate) fn try_write(&self) -> Option<parking_lot::RwLockWriteGuard<'_, T>> {
+        self.lock.try_write()
+    }
     #[inline]
     pub fn read(&self, side: Side) -> parking_lot::RwLockReadGuard<'_, T> {
         if let Some(g) = self.lock.try_read() {
@@ -129,6 +133,10 @@ impl<T> Censused<parking_lot::RwLock<T>> {
 }
 
 impl<T> Censused<parking_lot::Mutex<T>> {
+    /// Nonblocking lifecycle poll: a refusal is not a measured blocked wait.
+    pub(crate) fn try_lock(&self) -> Option<parking_lot::MutexGuard<'_, T>> {
+        self.lock.try_lock()
+    }
     /// Preserve uncontended acquisition; allow an owning queue to reject only
     /// the blocking branch (for example, same-queue completion reentry).
     #[inline]

@@ -36,35 +36,7 @@ impl DeviceId {
     }
 }
 
-/// Runs the residency-set teardown when the **last** [`MetalDevice`] handle
-/// drops (`DESIGN.md` §6.3c, issue #163).
-///
-/// # Why this is a separate type rather than `impl Drop for MetalDevice`
-///
-/// `MetalDevice` is `Clone` and every field is shared, so every `Tensor` holds a
-/// clone through its `MetalStorage`. A `Drop` written on `MetalDevice` itself
-/// would therefore fire on **every tensor drop** -- hundreds of times per decode
-/// token -- and each firing would wait for the GPU. That is not a teardown
-/// guard, it is a synchronize on the hot path, and §11.2's 6.1 % non-GPU budget
-/// makes it a regression rather than a subtlety.
-///
-/// Holding the guard behind an `Arc` moves the trigger to the instant the last
-/// handle goes, which is what the panic log shows actually happening:
-/// `main+5200` -> `drop_in_place<MetalDevice>` -> `Arc::drop_slow`, on the main
-/// thread past the `RESULT` line.
-///
-/// # Why it is declared first
-///
-/// Fields drop in declaration order, and this must run **before** `commands`,
-/// `buffers` and `private_buffers` -- the pools are what free the `MTLBuffer`s
-/// the set still lists, and removing an object that is already gone is what
-/// `IOGPUGroupMemory::remove_memory_object()` aborts the machine over. The
-/// original defect *is* a declaration-order property, so the fix has to be one
-/// too.
-pub(crate) struct DeviceTeardown {
-    commands: Arc<Commands>,
-    residency_set: Arc<ResidencySet>,
-}
+pub(crate) use super::device_retirement::DeviceTeardown;
 
 /// Unregisters an evicted buffer from the residency set, so Metal releases the
 /// allocation the pool has just destroyed. A set retains what it holds, so an
@@ -140,7 +112,7 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
 ///
 /// Read once: a per-eviction `var()` would put an environment lookup on the
 /// decode path, which is the shape §6.4a prices.
-fn retain_evicted_allocations() -> bool {
+pub(crate) fn retain_evicted_allocations() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -153,58 +125,6 @@ fn retain_evicted_allocations() -> bool {
             None => t.pool.retain_evicted,
         }
     })
-}
-
-impl DeviceTeardown {
-    pub(crate) fn new(commands: Arc<Commands>, residency_set: Arc<ResidencySet>) -> Self {
-        Self {
-            commands,
-            residency_set,
-        }
-    }
-
-    /// How many `MetalDevice` handles share this guard.
-    ///
-    /// The guard fires when this reaches zero, so a test can assert *when* it
-    /// will run rather than that it did -- the defect's natural expression is a
-    /// machine panic, which is not a testable assertion, so the mechanism is
-    /// what gets tested (issue #166).
-    pub(crate) fn handles(self: &Arc<Self>) -> usize {
-        Arc::strong_count(self)
-    }
-}
-
-impl Drop for DeviceTeardown {
-    fn drop(&mut self) {
-        // 1. Wait. This is the load-bearing step and the one `Drop for Commands`
-        //    does not do: it calls `flush()`, which commits *without* waiting
-        //    (`flush_and_wait` is the one that waits), so without this the pools
-        //    are destroyed while GPU work is still in flight -- §6.3c's
-        //    aggravating condition, and §6.7 L4's rule that a decision about a
-        //    buffer's existence taken on a different clock from the one that
-        //    orders execution is a correctness bug.
-        //
-        //    A failure here is reported and not propagated: this is a
-        //    destructor, and unwinding out of one during teardown would abort.
-        //    Proceeding to unregister after a failed wait is still strictly
-        //    better than not unregistering at all -- the set is emptied either
-        //    way, and it is the *absent object* that panics the kernel, not an
-        //    outstanding command buffer.
-        if let Err(e) = self.commands.wait_until_completed() {
-            // `eprintln!` rather than a panic or a log dependency: candle-core
-            // takes no logger, and a destructor must not unwind.
-            eprintln!("candle: MetalDevice teardown: waiting for GPU work failed: {e}");
-        }
-
-        // 2. Unregister, while the pools still hold the buffers. Emptying the
-        //    set here is what makes the later teardown of the Metal object a
-        //    no-op instead of a removal of objects that no longer exist.
-        self.residency_set.remove_all();
-
-        // 3. The pools drop after this, freeing buffers the set no longer
-        //    lists. That ordering is the whole fix and it is a property of
-        //    where this field is declared, not of anything written here.
-    }
 }
 
 /// What [`MetalDevice::admit_bytes`] decided on: the ledger's committed bytes
@@ -269,14 +189,9 @@ pub struct MetalDevice {
     /// Argument blocks and small tables keyed by their bytes, so a value a
     /// kernel is handed every step — a params block, a chunk table, a live
     /// count — is uploaded once and bound by the same buffer until it
-    /// changes. Declared first so it drops first: its buffers return to the
-    /// pool before the teardown below waits the GPU out.
+    /// changes. Its actual namespace/container owners are independently rooted
+    /// through native generation and Core terminal/unknown custody.
     pub(crate) constants: Arc<ConstantsByValue>,
-    /// Empties the residency set, after waiting for the GPU, when the last
-    /// handle to this device drops. Declared **first** so it runs before the
-    /// pools free the buffers the set lists (`DESIGN.md` §6.3c).
-    pub(crate) teardown: Arc<DeviceTeardown>,
-
     /// Unique identifier, the registryID is not sufficient as it identifies the GPU rather than
     /// the device itself.
     pub(crate) id: DeviceId,
@@ -416,6 +331,8 @@ pub struct MetalDevice {
     /// The emulated arms this device admits: a type its GPU only emulates is
     /// refused unless the operator opted in (`DESIGN.md` §15.2a).
     pub(crate) emulated: Arc<crate::kernels::metal::arms::EmulatedArms>,
+    // LAST: registered roots remain until every ordinary field alias releases.
+    pub(crate) teardown: Arc<DeviceTeardown>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -862,7 +779,26 @@ impl MetalDevice {
 
     /// Source-only domain view constructor. Not exposed to model loaders until
     /// generation-anchor and independent IO custody are wired and reviewed.
-    pub(crate) fn allocation_view(&self, domain: crate::memory_admission::ModelDomain) -> Self {
+    pub(crate) fn allocation_view(
+        &self,
+        domain: crate::memory_admission::ModelDomain,
+    ) -> Result<Self> {
+        // Standalone cold route only. Loaded uses allocation_view_in to split
+        // its ALREADY promised term instead of reserving that term a second time.
+        let bytes = DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
+        let pass = domain.reserve(bytes).map_err(crate::Error::wrap)?;
+        self.allocation_view_in(domain, &pass.context())
+    }
+
+    pub(crate) fn allocation_view_in(
+        &self,
+        domain: crate::memory_admission::ModelDomain,
+        metadata: &crate::memory_admission::AllocationContext,
+    ) -> Result<Self> {
+        if metadata.domain_key() != domain.key() {
+            crate::bail!("namespace metadata and physical domain must name the supplied owner");
+        }
+        metadata.check_open().map_err(crate::Error::wrap)?;
         let namespace = super::allocation_namespace::AllocationNamespace::new(
             &self.device,
             self.commands.clock(),
@@ -889,8 +825,19 @@ impl MetalDevice {
         view.pass_state = namespace.pass_state.clone();
         view.served_pass_pool_requests = namespace.served_pass_pool_requests.clone();
         view.next_pass_variant = namespace.next_pass_variant.clone();
+        view.teardown = DeviceTeardown::new(
+            namespace.clone(),
+            self.seed.clone(),
+            self.kernels.clone(),
+            self.commands.in_flight_hold().cloned(),
+            self.device.clone(),
+            self.residency_set.clone(),
+            self.ledger.clone(),
+            metadata,
+        )
+        .map_err(MetalError::from)?;
         view.allocation_namespace = namespace;
-        view
+        Ok(view)
     }
 
     /// Namespace-only lifetime anchor for the current generation. Resolve before
@@ -898,12 +845,18 @@ impl MetalDevice {
     /// Never capture ExecutionScope here: it owns Commands and would cycle.
     /// Legacy has an explicit namespace too; missing/cancelled accounted scope
     /// is rejected by active(), never replaced by a different payer.
-    pub(crate) fn allocation_namespace_anchor(&self) -> Result<Arc<dyn Send + Sync>> {
-        let namespace = match super::allocation_scope::active(self)? {
-            Some(scope) => scope.view.allocation_namespace.clone(),
-            None => self.allocation_namespace.clone(),
+    pub(crate) fn allocation_namespace_anchor(
+        &self,
+    ) -> Result<super::device_retirement::NamespaceOwner> {
+        let owner = match super::allocation_scope::active(self)? {
+            Some(scope) => scope
+                .view
+                .teardown
+                .namespace_owner()
+                .map_err(MetalError::from)?,
+            None => self.teardown.namespace_owner().map_err(MetalError::from)?,
         };
-        Ok(namespace)
+        Ok(owner)
     }
 
     /// Stamp a newly allocated output with its actual payer namespace. Aliases
@@ -1275,7 +1228,11 @@ impl MetalDevice {
     }
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
-        let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
+        let owner = self.allocation_namespace_anchor()?;
+        let mut command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
+        command_encoder
+            .retain_namespace(owner)
+            .map_err(MetalError::from)?;
         Ok(command_encoder)
     }
 
@@ -1364,9 +1321,13 @@ impl MetalDevice {
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
-        let command_encoder = self
+        let owner = self.allocation_namespace_anchor()?;
+        let mut command_encoder = self
             .commands
             .blit_command_encoder()
+            .map_err(MetalError::from)?;
+        command_encoder
+            .retain_namespace(owner)
             .map_err(MetalError::from)?;
         Ok(command_encoder)
     }
@@ -1451,7 +1412,9 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         // Bind before any gated variant can be selected (`set_eos_gated`
         // last): an open encoder gets the flag now, later ones at creation.
-        self.commands.bind_eos_gate_current();
+        self.commands
+            .bind_eos_gate_current()
+            .map_err(MetalError::from)?;
         self.kernels.set_eos_gated(true);
         Ok(())
     }
@@ -1628,6 +1591,19 @@ impl MetalDevice {
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<()> {
         self.commands
             .wait_marker(marker)
+            .map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(())
+    }
+
+    /// Recovery-only registered-prefix data boundary. M4 joins prior native
+    /// queue work through its front receipt plus own data. M3 joins registered
+    /// ordered callbacks, not untracked raw submissions.
+    /// Error/refusal is not permission to reset mapped scratch or release
+    /// unknown native custody. Later commits remain outside this receipt.
+    pub fn wait_marker_prefix_data(&self, marker: &CommandMarker) -> Result<()> {
+        self.commands
+            .wait_marker_prefix_data(marker)
             .map_err(MetalError::from)?;
         self.drain_completed_buffers();
         Ok(())

@@ -496,17 +496,39 @@ impl CompletionWait {
     ///
     /// Returns `None` for [`Self::Synchronize`], which encodes nothing and
     /// leaves the incumbent path untouched.
-    pub fn encode_signal(&self, cb: &CommandBuffer, event: Option<&SharedEvent>) -> Option<u64> {
+    pub fn encode_signal(
+        &self,
+        cb: &CommandBuffer,
+        event: Option<&SharedEvent>,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        self.encode_signal_with(event, |event, value| cb.signal_event(event, value))
+    }
+
+    pub(super) fn encode_prepared_signal(
+        &self,
+        prepared: &super::command_buffer::PreparedCommandCommit<'_>,
+        event: Option<&SharedEvent>,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        self.encode_signal_with(event, |event, value| prepared.signal_event(event, value))
+    }
+
+    fn encode_signal_with(
+        &self,
+        event: Option<&SharedEvent>,
+        encode: impl FnOnce(
+            &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+            u64,
+        ) -> Result<(), MetalKernelError>,
+    ) -> Result<Option<u64>, MetalKernelError> {
         if !self.needs_event() {
-            return None;
+            return Ok(None);
         }
-        let event = event?;
+        let Some(event) = event else {
+            return Ok(None);
+        };
         let value = event.next_value();
-        // SAFETY-adjacent note rather than an `unsafe` block: the objc2 binding
-        // for `encodeSignalEvent:value:` is safe, and its one documented
-        // precondition -- no open encoder -- is the caller's, discharged above.
-        cb.signal_event(event.raw(), value);
-        Some(value)
+        encode(event.raw(), value)?;
+        Ok(Some(value))
     }
 
     /// Wait until `cb`'s work is done, by this arm's mechanism.

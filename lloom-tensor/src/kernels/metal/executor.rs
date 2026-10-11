@@ -316,6 +316,20 @@ pub enum ExecutorSlot {
 }
 
 impl ExecutorSlot {
+    /// Existing encoders retain their own Arc. Only the displaced installation
+    /// is released here, outside the installation lock: a custom destructor
+    /// may inspect or replace the installed executor again.
+    pub(crate) fn replace_installed(
+        current: &parking_lot::Mutex<std::sync::Arc<Self>>,
+        replacement: std::sync::Arc<Self>,
+    ) {
+        let previous = {
+            let mut current = current.lock();
+            std::mem::replace(&mut *current, replacement)
+        };
+        drop(previous);
+    }
+
     /// True when no executor is installed, so callers can skip building a
     /// [`DispatchRecord`] at all.
     ///
@@ -474,3 +488,51 @@ impl std::fmt::Debug for ExecutorSlot {
 /// or it computes a plausible wrong answer. Read the list in both directions.
 #[derive(Debug)]
 pub struct IcbFeasibility;
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    };
+    type Installed = parking_lot::Mutex<Arc<ExecutorSlot>>;
+    struct ReenterOnDrop {
+        installed: Weak<Installed>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Executor for ReenterOnDrop {}
+    impl Drop for ReenterOnDrop {
+        fn drop(&mut self) {
+            let installed = self.installed.upgrade().expect("installation still alive");
+            let guard = installed
+                .try_lock()
+                .expect("executor destructor ran under installation lock");
+            assert!(guard.is_classical());
+            drop(guard);
+            ExecutorSlot::replace_installed(&installed, Arc::new(ExecutorSlot::Classical));
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn displaced_custom_executor_can_reenter_after_installation_unlocks() {
+        let installed = Arc::new(Installed::new(Arc::new(ExecutorSlot::Classical)));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let make = || {
+            Arc::new(ExecutorSlot::Custom(Arc::new(ReenterOnDrop {
+                installed: Arc::downgrade(&installed),
+                drops: drops.clone(),
+            })))
+        };
+        ExecutorSlot::replace_installed(&installed, make());
+        ExecutorSlot::replace_installed(&installed, Arc::new(ExecutorSlot::Classical));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        ExecutorSlot::replace_installed(&installed, make());
+        // The same independent Arc ownership that a created encoder retains.
+        let encoder_owner = installed.lock().clone();
+        ExecutorSlot::replace_installed(&installed, Arc::new(ExecutorSlot::Classical));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(encoder_owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+}

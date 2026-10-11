@@ -288,6 +288,10 @@ pub(crate) struct Promise {
 }
 
 impl Promise {
+    pub(crate) fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
     /// None means this domain has no machine bridge, not machine coverage.
     pub fn machine_admission(&self) -> Option<&MachineAdmission> {
         self.machine.as_ref()

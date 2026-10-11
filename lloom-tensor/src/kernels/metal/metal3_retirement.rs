@@ -151,9 +151,20 @@ impl Completions {
     pub(super) fn prepare_order(
         &self,
     ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
+        self.prepare_order_mode(false)
+    }
+    fn prepare_order_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
         self.check()?;
         if let Some(guard) = self.tail.try_lock() {
             return Ok(guard);
+        }
+        if nonblocking {
+            return Err(crate::kernels::MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            ));
         }
         crate::completion_scope::before_park(self.identity())
             .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)?;
@@ -238,7 +249,7 @@ impl Completions {
                 || self.wake.notify(),
             )?;
             next.publish_callbacks_finished();
-            self.wake.notify();
+            next.record().notify_lifecycle();
             let previous = {
                 let mut drain = self.drain.lock();
                 let retired = drain.next.take().expect("elected successor remains owned");
@@ -308,8 +319,9 @@ impl Completions {
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
         >,
         marker: &'a Marker,
+        nonblocking: bool,
     ) -> Result<PreparedCommit<'a>, crate::kernels::MetalKernelError> {
-        let order = self.prepare_order()?;
+        let order = self.prepare_order_mode(nonblocking)?;
         if !matches!(
             raw.status(),
             objc2_metal::MTLCommandBufferStatus::NotEnqueued
@@ -439,14 +451,40 @@ pub(super) struct CallbackRejected {
     pub callback: Option<super::retirement::Callback>,
 }
 impl AssociatedBuffer {
+    pub(super) fn queue_identity(&self) -> usize {
+        self.core.identity()
+    }
+    pub(super) fn command_lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
+        self.marker.command_lifecycle()
+    }
+    pub(super) fn notify_lifecycle(&self) {
+        self.marker.record().notify_lifecycle();
+    }
+    pub(super) fn check_lifecycle_failure(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.core.check()
+    }
+    pub(super) fn fail_lifecycle(&self) {
+        self.core
+            .failure
+            .publish(Failure::AdapterFailed, || self.notify_lifecycle());
+    }
+
     pub(super) fn new(
         raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
         core: Arc<Completions>,
-        physical: Option<Arc<dyn Send + Sync>>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         let anchor = core
             .raw_owners
-            .reserve((), Metal3RawOwners { raw, physical }, |_| Ok(()))
+            .reserve(
+                (),
+                Metal3RawOwners {
+                    raw,
+                    physical,
+                    namespaces: Vec::new(),
+                },
+                |_| Ok(()),
+            )
             .map_err(|rejected| {
                 crate::kernels::err::CompletionRegistrationError::new(
                     unavailable("M3 raw owner registration refused"),
@@ -474,6 +512,7 @@ impl AssociatedBuffer {
                         Metal3RawOwners {
                             raw,
                             physical: None,
+                            namespaces: Vec::new(),
                         },
                         anchor,
                     )),
@@ -490,6 +529,7 @@ impl AssociatedBuffer {
                         Metal3RawOwners {
                             raw,
                             physical: None,
+                            namespaces: Vec::new(),
                         },
                         anchor,
                         rejected.rejected,
@@ -506,6 +546,7 @@ impl AssociatedBuffer {
                     Metal3RawOwners {
                         raw,
                         physical: None,
+                        namespaces: Vec::new(),
                     },
                     anchor,
                 )),
@@ -519,6 +560,62 @@ impl AssociatedBuffer {
             anchor,
         })
     }
+    pub(super) fn retain_namespace(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match self.anchor.edit(owner, |_, roots, input| {
+            let owner = input.as_ref().expect("prepared namespace input");
+            if roots.namespaces.iter().any(|old| old.same(owner)) {
+                return Ok(());
+            }
+            roots.namespaces.try_reserve(1).map_err(|_| ())?;
+            roots
+                .namespaces
+                .push(input.take().expect("prepared namespace input"));
+            Ok(())
+        }) {
+            Ok((Ok(()), _)) => Ok(()),
+            Ok((Err(()), input)) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 namespace storage exhausted"),
+                input,
+            )
+            .into()),
+            Err(error) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 namespace attachment refused"),
+                Some(error),
+            )
+            .into()),
+        }
+    }
+
+    /// Constructor-only: install in the original registered raw-owner record,
+    /// not just the wrapper, before any recording capability escapes.
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match self.anchor.edit(owner, |_, roots, input| {
+            if roots.physical.is_some() {
+                return false;
+            }
+            roots.physical = input.take();
+            true
+        }) {
+            Ok((true, None)) => Ok(()),
+            Ok((_, input)) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 physical attachment already installed"),
+                input,
+            )
+            .into()),
+            Err(error) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 physical attachment refused"),
+                Some(error),
+            )
+            .into()),
+        }
+    }
+
     pub(super) fn raw(
         &self,
     ) -> &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>
@@ -528,7 +625,14 @@ impl AssociatedBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.core.prepare_commit(&self.raw, &self.marker)
+        self.prepare_commit_mode(false)
+    }
+    pub(super) fn prepare_commit_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
+        self.core
+            .prepare_commit(&self.raw, &self.marker, nonblocking)
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()
@@ -586,6 +690,22 @@ impl AssociatedBuffer {
         }
         crate::completion_scope::before_park(self.core.identity())
             .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)
+    }
+    /// Own returned handoff plus ordered callback completion; never parks and
+    /// never converts queue failure into native terminality.
+    pub(super) fn poll_logical_completed(&self) -> Result<bool, crate::kernels::MetalKernelError> {
+        use crate::command_lifecycle::LifecycleError;
+        self.core.check()?;
+        match self.command_lifecycle().check_wait_submission() {
+            Ok(()) => {}
+            Err(LifecycleError::NotSubmitted | LifecycleError::Busy) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        if !self.marker.callbacks_finished() {
+            return Ok(false);
+        }
+        self.core.check()?;
+        Ok(true)
     }
     pub(super) fn try_wait(&self, logical: bool) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.try_wait(&self.marker, logical)

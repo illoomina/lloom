@@ -444,8 +444,8 @@ pub fn call_sdpa_full_with_mask_offset(
         "sdpa_full {name_for_label} B={b} H={h} D={d} QL={ql} KL={kl}"
     );
 
-    let nq = (ql + bq - 1) / bq;
-    let nk = (kl + bk - 1) / bk;
+    let nq = ql.div_ceil(bq);
+    let nk = kl.div_ceil(bk);
 
     let nq_aligned = ql / bq;
     let nk_aligned = kl / bk;

@@ -76,6 +76,52 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static> HostAnchorRegistry<C, A
                 error: AnchorError::Registry(rejected.error),
                 owner: Some((rejected.captures, rejected.anchors)),
             })?;
+        Self::permit(record)
+    }
+    /// Requested managed first slab quote only, not the whole registry price.
+    pub(crate) fn requested_slab_bytes() -> Result<usize, RegistryError> {
+        OwnerRegistry::<C, A, ()>::requested_slab_bytes()
+    }
+    #[cfg(test)]
+    pub(crate) fn managed_layout_fixture(&self) -> (usize, usize, usize, usize) {
+        self.registry.managed_layout_fixture()
+    }
+    /// Partition an existing context; never reserve a second load promise.
+    pub(crate) fn reserve_in(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+        captures: C,
+        owner: A,
+    ) -> Result<HostAnchorPermit<C, A>, AnchorRejected<C, A>> {
+        self.reserve_admitted(context.domain_key(), captures, owner, |bytes| {
+            context.take(bytes).map_err(RegistryError::Admission)
+        })
+    }
+    /// Retained logical slab-layout admission; the same pin/wrapper protocol as
+    /// legacy reserve. The registry holds the ticket's charge until host final
+    /// metadata destruction, not only until payload cleanup credit returns.
+    pub(crate) fn reserve_admitted(
+        &self,
+        payer: crate::memory_admission::DomainKey,
+        captures: C,
+        owner: A,
+        admit_growth: impl FnOnce(
+            usize,
+        )
+            -> Result<crate::memory_admission::AllocationTicket, RegistryError>,
+    ) -> Result<HostAnchorPermit<C, A>, AnchorRejected<C, A>> {
+        let record = self
+            .registry
+            .prepare_admitted(payer, captures, owner, admit_growth)
+            .map_err(|rejected| AnchorRejected {
+                error: AnchorError::Registry(rejected.error),
+                owner: Some((rejected.captures, rejected.anchors)),
+            })?;
+        Self::permit(record)
+    }
+    fn permit(
+        record: crate::retirement_registry::Registration<C, A, ()>,
+    ) -> Result<HostAnchorPermit<C, A>, AnchorRejected<C, A>> {
         let pin = match record.pin() {
             Ok(pin) => pin,
             Err(error) => {

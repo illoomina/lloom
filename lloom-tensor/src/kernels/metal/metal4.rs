@@ -63,6 +63,10 @@ pub(crate) struct Queue {
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
+    // LAST: raw/available slots disappear before final capability publication.
+    physical: crate::retirement_service::PhysicalAnchor<
+        crate::metal_backend::device_retirement::NamespaceOwner,
+    >,
 }
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
@@ -91,6 +95,7 @@ impl Queue {
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
+            physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = super::retirement::Metal4Completions::new(
             Arc::as_ptr(&queue) as usize,
@@ -101,9 +106,22 @@ impl Queue {
         Ok(queue)
     }
 
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        self.physical.install(owner).map_err(|owner| {
+            crate::kernels::err::CompletionRegistrationError::new(
+                MetalKernelError::QueueUnavailable("M4 physical owner already installed"),
+                Some(owner),
+            )
+            .into()
+        })
+    }
+
     /// Acquisition and every submission wait use the same Wake. Poison closes
     /// admission without claiming native completion or releasing any payload.
-    fn check_failure(&self) -> Result<(), MetalKernelError> {
+    pub(super) fn check_failure(&self) -> Result<(), MetalKernelError> {
         if self.failure.get().is_some() {
             Err(MetalKernelError::QueueUnavailable(
                 "retirement queue failed",
@@ -137,6 +155,13 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
+        // Obtain the real default pin before removing any reusable/native slot.
+        // Counted-clone refusal leaves queue state/capacity unchanged. Initial
+        // cold acquire has None; pristine attachment fills that State below.
+        self.check_failure()?;
+        let physical = self
+            .physical
+            .try_owner(crate::metal_backend::device_retirement::NamespaceOwner::try_clone)?;
         let mut slot = loop {
             let seen = self.ready.snapshot();
             self.check_failure()?;
@@ -195,12 +220,14 @@ impl Queue {
             queue: Arc::clone(self),
             retirement,
             native_reuse: crate::native_reuse::NativeReuse::new(),
-            committed_signals: OnceLock::new(),
+            command_lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
+            committed_events: OnceLock::new(),
             status: AtomicUsize::new(MTLCommandBufferStatus::NotEnqueued.0),
             state: Mutex::new(State {
                 slot: Some(slot),
                 callbacks: Vec::new(),
-                signals: Vec::new(),
+                events: Vec::new(),
+                physical,
             }),
             feedback: OnceLock::new(),
             callbacks_finished: AtomicBool::new(false),
@@ -224,6 +251,10 @@ pub(super) struct Slot {
     front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    // Retained across safe slot reuse; only the current generation's prefix is
+    // encoded. No allocator reset until every segment and handoff have finished.
+    extra_cbs: Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
+    segment: usize,
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
@@ -236,6 +267,8 @@ pub(super) struct Slot {
     page_reservations: Vec<super::ledger::Reservation>,
     page: usize,
     offset: usize,
+    // LAST: release native resources/allocator/table before root publication.
+    namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 unsafe impl Send for Slot {}
 
@@ -266,6 +299,8 @@ impl Slot {
             front_event,
             generation: 0,
             cb,
+            extra_cbs: Vec::new(),
+            segment: 0,
             allocator,
             table,
             residency,
@@ -278,6 +313,7 @@ impl Slot {
             page_reservations: Vec::new(),
             page: 0,
             offset: 0,
+            namespaces: Vec::new(),
         })
     }
 
@@ -300,7 +336,40 @@ impl Slot {
             }
         }
         self.allocator.reset();
+        self.segment = 0;
         self.cb.beginCommandBufferWithAllocator(&self.allocator);
+        // Native cached references of the prior generation were cleared/reset.
+        // Persistent scratch pages retain their own native reservation owners.
+        self.namespaces.clear();
+    }
+
+    fn command_buffer(&self, index: usize) -> &ProtocolObject<dyn MTL4CommandBuffer> {
+        if index == 0 {
+            &self.cb
+        } else {
+            &self.extra_cbs[index - 1]
+        }
+    }
+    fn current(&self) -> &ProtocolObject<dyn MTL4CommandBuffer> {
+        self.command_buffer(self.segment)
+    }
+
+    fn next_segment(&mut self, device: &Device) -> Result<(), MetalKernelError> {
+        if self.segment == self.extra_cbs.len() {
+            self.extra_cbs
+                .try_reserve(1)
+                .map_err(|_| MetalKernelError::QueueUnavailable("segment storage exhausted"))?;
+            let next = device.as_ref().newCommandBuffer().ok_or_else(|| {
+                MetalKernelError::FailedToCreateResource("MTL4 event segment".into())
+            })?;
+            next.setLabel(self.cb.label().as_deref());
+            self.extra_cbs.push(next);
+        }
+        self.current().endCommandBuffer();
+        self.segment += 1;
+        self.current()
+            .beginCommandBufferWithAllocator(&self.allocator);
+        Ok(())
     }
 
     fn resource(&mut self, resource: &ProtocolObject<dyn MTLResource>) {
@@ -321,10 +390,20 @@ impl Drop for Slot {
     }
 }
 
+pub(super) struct EventBoundary {
+    after_segment: usize,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    value: u64,
+    wait: bool,
+}
+
 struct State {
     slot: Option<Slot>,
     callbacks: Vec<Callback>,
-    signals: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+    events: Vec<EventBoundary>,
+    // Prepared once before exposure. Commit/abandonment move this actual pin;
+    // final Submission Drop never needs a fallible owner acquisition.
+    physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 
 pub(crate) struct Submission {
@@ -333,7 +412,8 @@ pub(crate) struct Submission {
     pub queue: Arc<Queue>,
     retirement: super::retirement::Record,
     native_reuse: crate::native_reuse::NativeReuse<Slot>,
-    committed_signals: OnceLock<Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>>,
+    pub(super) command_lifecycle: crate::command_lifecycle::CommandLifecycle,
+    committed_events: OnceLock<Vec<EventBoundary>>,
     status: AtomicUsize,
     state: Mutex<State>,
     feedback: OnceLock<Feedback>,
@@ -344,7 +424,75 @@ unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
 
 impl Submission {
-    pub fn enqueue(&self) {
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        let mut input = Some(owner);
+        let result = (|| {
+            let mut state = self.recording_state()?;
+            if state.physical.is_some() {
+                return Err(MetalKernelError::QueueUnavailable(
+                    "M4 recording physical owner already installed",
+                ));
+            }
+            // Cold pristine queue/submission attachment before any public
+            // capability escapes. Refusal precedes taking the original input.
+            let queue_pin = input.as_ref().expect("physical input").try_clone()?;
+            self.queue.attach_physical_owner(queue_pin)?;
+            state.physical = input.take(); // Nonpanicking move after publication.
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(crate::kernels::err::CompletionRegistrationError::new(error, input).into())
+            } // Recording guard gone before rejected input can drop.
+        }
+    }
+    pub(super) fn retain_namespace(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        let mut input = Some(owner);
+        let result = (|| {
+            let mut state = self.recording_state()?;
+            let slot = state.slot.as_mut().expect("checked recording");
+            let incoming = input.as_ref().expect("prepared namespace input");
+            if slot.namespaces.iter().any(|old| old.same(incoming)) {
+                return Ok(());
+            }
+            slot.namespaces.try_reserve(1).map_err(|_| {
+                MetalKernelError::QueueUnavailable("M4 namespace storage exhausted")
+            })?;
+            // Capacity prepared before taking input; no allocation after take.
+            slot.namespaces
+                .push(input.take().expect("prepared namespace input"));
+            Ok(())
+        })();
+        // Existing recording_state guard is gone before input/error destruction.
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(crate::kernels::err::CompletionRegistrationError::new(error, input).into())
+            }
+        }
+    }
+
+    pub(super) fn notify_lifecycle(&self) {
+        self.retirement.notify_lifecycle();
+    }
+    pub(super) fn check_lifecycle_failure(&self) -> Result<(), MetalKernelError> {
+        self.queue.check_failure()
+    }
+    pub(super) fn fail_lifecycle(&self) {
+        self.queue
+            .poison(crate::retirement_owners::Failure::AdapterFailed);
+        self.notify_lifecycle();
+    }
+
+    pub fn enqueue(&self) -> Result<(), MetalKernelError> {
+        let _state = self.recording_state()?;
         // Commands has one open recording and commits it in producer order.
         // MTL4 has no native enqueue; this is logical state, not a queue reservation.
         let _ = self.status.compare_exchange(
@@ -353,15 +501,17 @@ impl Submission {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        Ok(())
     }
-    pub fn set_label(&self, label: &str) {
-        self.state
-            .lock()
-            .slot
-            .as_ref()
-            .expect("recording")
-            .cb
-            .setLabel(Some(&objc2_foundation::NSString::from_str(label)));
+    pub fn set_label(&self, label: &str) -> Result<(), MetalKernelError> {
+        let state = self.recording_state()?;
+        let slot = state.slot.as_ref().expect("checked recording");
+        let label = objc2_foundation::NSString::from_str(label);
+        slot.cb.setLabel(Some(&label));
+        for cb in &slot.extra_cbs {
+            cb.setLabel(Some(&label));
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> MTLCommandBufferStatus {
@@ -390,18 +540,29 @@ impl Submission {
     pub fn device(&self) -> &Device {
         &self.queue.device
     }
-    pub fn encoder(self: &Arc<Self>) -> Encoder {
-        let state = self.state.lock();
-        let slot = state.slot.as_ref().expect("uncommitted submission");
-        let raw = slot
-            .cb
-            .computeCommandEncoder()
-            .expect("MTL4 compute encoder");
+    pub fn encoder(self: &Arc<Self>) -> Result<Encoder, MetalKernelError> {
+        let mut state = self.recording_state()?;
+        let last_event_segment = state.events.last().map(|event| event.after_segment);
+        let slot = state
+            .slot
+            .as_mut()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "submission no longer recording",
+            ))?;
+        // A cancelled preparation can leave a terminal signal in this recording.
+        // Preserve that boundary if recording resumes, instead of moving the
+        // signal after newly encoded work. Ordinary prepared commit never resumes.
+        if last_event_segment == Some(slot.segment) {
+            slot.next_segment(&self.queue.device)?;
+        }
+        let raw = slot.current().computeCommandEncoder().ok_or_else(|| {
+            MetalKernelError::FailedToCreateResource("MTL4 compute encoder".into())
+        })?;
         raw.setArgumentTable(Some(&slot.table));
-        Encoder {
+        Ok(Encoder {
             raw,
             submission: Arc::clone(self),
-        }
+        })
     }
     /// Returns rejected captures intact. Error propagation must carry this
     /// owner beyond any caller's recording locks before its eventual Drop.
@@ -418,6 +579,12 @@ impl Submission {
                 ))
             }
         };
+        Self::append_callback(&mut state, f)
+    }
+    fn append_callback(
+        state: &mut State,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
         if state.callbacks.try_reserve(1).is_err() {
             return Err(crate::kernels::err::CompletionRegistrationError::new(
                 MetalKernelError::QueueUnavailable("callback metadata allocation refused"),
@@ -428,10 +595,22 @@ impl Submission {
         Ok(())
     }
     fn recording_state(&self) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
+        self.recording_state_mode(false)
+    }
+    fn recording_state_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
         self.queue.check_failure()?;
         let state = match self.state.try_lock() {
             Some(state) => state,
             None => {
+                if nonblocking {
+                    return Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ));
+                }
+
                 crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
                 self.state.lock()
@@ -445,17 +624,87 @@ impl Submission {
         }
         Ok(state)
     }
-    pub fn signal(&self, event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
-        let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }.unwrap();
-        self.state.lock().signals.push((event, value));
+    pub fn signal(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        self.event_boundary(event, value, false)
+    }
+    /// Prepared commit may append terminal engine signals, but cannot encode
+    /// later work. Keep them after the frozen final segment without splitting.
+    fn append_tail(
+        state: &mut State,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        state
+            .events
+            .try_reserve(1)
+            .map_err(|_| MetalKernelError::QueueUnavailable("terminal event storage exhausted"))?;
+        let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+            .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
+        let after_segment = state.slot.as_ref().expect("checked recording").segment;
+        state.events.push(EventBoundary {
+            after_segment,
+            event,
+            value,
+            wait: false,
+        });
+        Ok(())
+    }
+    pub fn wait_event(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        self.event_boundary(event, value, true)
+    }
+    /// Record a boundary, never a queue operation. The wrapper's boundary
+    /// admission excludes open encoders. All fallible preparation precedes end.
+    fn event_boundary(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+        wait: bool,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self.recording_state()?;
+        state
+            .events
+            .try_reserve(1)
+            .map_err(|_| MetalKernelError::QueueUnavailable("event storage exhausted"))?;
+        let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }
+            .ok_or(MetalKernelError::QueueUnavailable("event retain refused"))?;
+        let slot = state.slot.as_mut().expect("checked recording");
+        let after_segment = slot.segment;
+        slot.next_segment(&self.queue.device)?;
+        state.events.push(EventBoundary {
+            after_segment,
+            event,
+            value,
+            wait,
+        });
+        Ok(())
     }
     /// Reserve ordering and native handler allocations before engine epoch and
     /// subscriber registration. Dropping this value consumes no sequence.
     pub(super) fn prepare_commit(self: &Arc<Self>) -> Result<PreparedCommit<'_>, MetalKernelError> {
+        self.prepare_commit_mode(false)
+    }
+    pub(super) fn prepare_commit_mode(
+        self: &Arc<Self>,
+        nonblocking: bool,
+    ) -> Result<PreparedCommit<'_>, MetalKernelError> {
         self.queue.check_failure()?;
         let order = match self.queue.commit_order.try_lock() {
             Some(guard) => guard,
             None => {
+                if nonblocking {
+                    return Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ));
+                }
+
                 crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
                 self.queue.commit_order.lock()
@@ -471,37 +720,102 @@ impl Submission {
         sequence
             .checked_add(1)
             .ok_or(MetalKernelError::QueueUnavailable("sequence exhausted"))?;
-        let options = MTL4CommitOptions::new();
-        let record = self.retirement.clone();
-        let core = self
-            .queue
-            .completions
-            .get()
-            .expect("queue initialized")
-            .clone();
-        let block = RcBlock::new(
-            move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                core.native_feedback(sequence, record.clone(), || {
-                    // SAFETY: Metal owns its feedback for this invocation.
-                    let feedback = unsafe { feedback.as_ref() };
-                    Feedback {
-                        error: feedback
-                            .error()
-                            .map(|e| e.localizedDescription().to_string()),
-                        start: feedback.GPUStartTime(),
-                        end: feedback.GPUEndTime(),
-                    }
-                });
-            },
-        );
-        // SAFETY: options copies the handler. It retains only rooted metadata.
-        unsafe {
-            options.addFeedbackHandler(RcBlock::as_ptr(&block));
-        }
+        let state = self.recording_state_mode(nonblocking)?;
+        let slot = state.slot.as_ref().expect("checked recording");
+        let count = slot
+            .segment
+            .checked_add(1)
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "segment count exhausted",
+            ))?;
+        let first = slot.cb.clone();
+        let mut extra = Vec::new();
+        extra.try_reserve_exact(count - 1).map_err(|_| {
+            MetalKernelError::QueueUnavailable("segment dispatch storage exhausted")
+        })?;
+        extra.extend(slot.extra_cbs[..count - 1].iter().cloned());
+        // Keep recording exclusion through registration/tail signals and owner
+        // extraction. It is released before the first native queue entry.
+        // No extra feedback join or options Vec on the one-segment fast path.
+        let join = if count == 1 {
+            None
+        } else {
+            Some(Arc::new(
+                crate::command_segments::FeedbackJoin::try_new(count)
+                    .map_err(MetalKernelError::QueueUnavailable)?,
+            ))
+        };
+        let make_options = |index| {
+            let options = MTL4CommitOptions::new();
+            let record = self.retirement.clone();
+            let core = self
+                .queue
+                .completions
+                .get()
+                .expect("queue initialized")
+                .clone();
+            let join = join.clone();
+            let block = RcBlock::new(
+                move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+                    core.native_feedback_if_ready(sequence, record.clone(), || {
+                        let feedback = unsafe { feedback.as_ref() };
+                        let feedback = Feedback {
+                            error: feedback
+                                .error()
+                                .map(|e| e.localizedDescription().to_string()),
+                            start: feedback.GPUStartTime(),
+                            end: feedback.GPUEndTime(),
+                        };
+                        let Some(join) = &join else {
+                            return Some(feedback);
+                        };
+                        if feedback.error.is_some() {
+                            core.segment_failed();
+                        }
+                        let values = join
+                            .publish(index, feedback)
+                            .expect("distinct segment feedback")?;
+                        // Deterministic first error in recording order, not delivery order.
+                        Some(Feedback {
+                            error: values
+                                .iter()
+                                .find_map(|f| f.get().expect("joined feedback").error.clone()),
+                            start: values
+                                .iter()
+                                .map(|f| f.get().unwrap().start)
+                                .fold(f64::INFINITY, f64::min),
+                            end: values
+                                .iter()
+                                .map(|f| f.get().unwrap().end)
+                                .fold(0.0, f64::max),
+                        })
+                    });
+                },
+            );
+            unsafe {
+                options.addFeedbackHandler(RcBlock::as_ptr(&block));
+            }
+            options
+        };
+        let options = if count == 1 {
+            CommitOptions::Single(make_options(0))
+        } else {
+            let mut options = Vec::new();
+            options.try_reserve_exact(count).map_err(|_| {
+                MetalKernelError::QueueUnavailable("segment options allocation refused")
+            })?;
+            for index in 0..count {
+                options.push(make_options(index));
+            }
+            CommitOptions::Segments(options)
+        };
         Ok(PreparedCommit {
             submission: self,
             order,
+            state: std::cell::RefCell::new(Some(state)),
             options,
+            first,
+            extra,
             phase: CommitPhase::Unused,
         })
     }
@@ -538,6 +852,28 @@ impl Submission {
         crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
             .map_err(|_| MetalKernelError::CallbackWouldBlock)
     }
+    /// The retained front event belongs to this logical submission's captured
+    /// generation. It is queued under commit_order before every own segment;
+    /// Apple's MTL4 signalEvent contract completes all earlier queue GPU work.
+    /// Own terminal feedback cannot substitute for this receipt, including an
+    /// empty submission. No arbitrary callback join is required here.
+    pub(super) fn try_wait_prefix_front(&self) -> Result<(), MetalKernelError> {
+        self.queue.check_failure()?;
+        crate::prefix_data::wait_front(
+            || self.front_event.signaledValue() >= self.generation,
+            || {
+                self.queue.check_failure()?;
+                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)
+            },
+            || {
+                self.front_event
+                    .waitUntilSignaledValue_timeoutMS(self.generation, 50)
+            },
+        )?;
+        self.queue.check_failure()
+    }
+
     pub(super) fn try_wait_data_ready(&self) -> Result<(), MetalKernelError> {
         loop {
             let seen = self.done.snapshot();
@@ -617,6 +953,26 @@ impl Submission {
         }
     }
 
+    /// Nonblocking logical retirement check for final Commands teardown.
+    /// Native terminal status alone does not join arbitrary completion callbacks.
+    pub(super) fn poll_logical_completed(&self) -> Result<bool, MetalKernelError> {
+        use crate::command_lifecycle::LifecycleError;
+        self.queue.check_failure()?;
+        match self.command_lifecycle.check_wait_submission() {
+            Ok(()) => {}
+            Err(LifecycleError::Busy | LifecycleError::NotSubmitted) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        if !self.callbacks_finished.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if let Some(error) = self.error() {
+            return Err(MetalKernelError::CommandBufferError(error));
+        }
+        self.queue.check_failure()?;
+        Ok(true)
+    }
+
     pub fn wait(&self) -> Result<(), MetalKernelError> {
         self.try_wait()?;
         if let Some(error) = self.error() {
@@ -633,24 +989,77 @@ enum CommitPhase {
     Returned,
 }
 
+enum CommitOptions {
+    Single(Retained<MTL4CommitOptions>),
+    Segments(Vec<Retained<MTL4CommitOptions>>),
+}
+impl CommitOptions {
+    fn get(&self, index: usize) -> &MTL4CommitOptions {
+        match self {
+            Self::Single(options) => {
+                assert_eq!(index, 0);
+                options
+            }
+            Self::Segments(options) => &options[index],
+        }
+    }
+}
+
 pub(super) struct PreparedCommit<'a> {
     submission: &'a Arc<Submission>,
     order: parking_lot::MutexGuard<'a, u64>,
-    options: Retained<MTL4CommitOptions>,
+    state: std::cell::RefCell<Option<parking_lot::MutexGuard<'a, State>>>,
+    options: CommitOptions,
+    first: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    extra: Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
     phase: CommitPhase,
 }
 impl PreparedCommit<'_> {
+    pub(super) fn on_completion(
+        &self,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        if let Err(error) = self.submission.queue.check_failure() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                error,
+                Some(f),
+            ));
+        }
+        Submission::append_callback(
+            self.state
+                .borrow_mut()
+                .as_mut()
+                .expect("prepared recording"),
+            f,
+        )
+    }
+    pub(super) fn signal_tail(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        self.submission.queue.check_failure()?;
+        Submission::append_tail(
+            self.state
+                .borrow_mut()
+                .as_mut()
+                .expect("prepared recording"),
+            event,
+            value,
+        )
+    }
     pub(super) fn commit(mut self) -> Result<(), MetalKernelError> {
         let submission = self.submission;
-        let mut state = submission.state.lock();
+        submission.queue.check_failure()?;
+        let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
-        let cb = slot.cb.clone();
+        let physical = state.physical.take();
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);
-        let signals = std::mem::take(&mut state.signals);
+        let events = std::mem::take(&mut state.events);
         assert!(
-            submission.committed_signals.set(signals).is_ok(),
-            "signals installed once"
+            submission.committed_events.set(events).is_ok(),
+            "events installed once"
         );
         // Close recording before releasing state. Native feedback may arrive
         // during raw commit and reenter public methods; it must never wait on
@@ -659,7 +1068,7 @@ impl PreparedCommit<'_> {
             .status
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         drop(state);
-        let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), None);
+        let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
         match submission
             .retirement
             .replace_prepared(super::retirement::Captures(callbacks), owners)
@@ -681,7 +1090,7 @@ impl PreparedCommit<'_> {
         // End/commit of the recording's private residency is not native CB
         // execution. Any unwind before queue entry cancels via rooted custody.
         residency.commit();
-        cb.endCommandBuffer();
+        self.extra.last().unwrap_or(&self.first).endCommandBuffer();
         submission.retirement.begin_handoff().map_err(|_| {
             submission
                 .queue
@@ -696,29 +1105,50 @@ impl PreparedCommit<'_> {
         submission
             .status
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
-        let mut raw = NonNull::from(cb.as_ref());
-        // SAFETY: payload roots CB/allocator/resources through real feedback and
-        // handoff-return; options roots metadata, never final physical owners.
-        unsafe {
-            submission.queue.raw.signalEvent_value(
-                ProtocolObject::from_ref(&*submission.front_event),
-                submission.generation,
-            );
-            submission
-                .queue
-                .raw
-                .commit_count_options(NonNull::from(&mut raw), 1, &self.options);
-        }
-        for (event, value) in submission
-            .committed_signals
+        // All queue calls for this logical recording remain under commit_order.
+        // Partial/unknown entry retains every segment via the same rooted Slot.
+        submission.queue.raw.signalEvent_value(
+            ProtocolObject::from_ref(&*submission.front_event),
+            submission.generation,
+        );
+        let events = submission
+            .committed_events
             .get()
-            .expect("closed recording signals")
-        {
-            submission
-                .queue
-                .raw
-                .signalEvent_value(ProtocolObject::from_ref(&**event), *value);
-        }
+            .expect("closed recording events");
+        crate::command_segments::dispatch(
+            self.extra.len() + 1,
+            events,
+            |boundary| boundary.after_segment,
+            |index| {
+                let buffer = if index == 0 {
+                    &self.first
+                } else {
+                    &self.extra[index - 1]
+                };
+                let mut raw = NonNull::from(buffer.as_ref());
+                unsafe {
+                    submission.queue.raw.commit_count_options(
+                        NonNull::from(&mut raw),
+                        1,
+                        self.options.get(index),
+                    );
+                }
+            },
+            |boundary| {
+                let event = ProtocolObject::from_ref(&*boundary.event);
+                if boundary.wait {
+                    submission
+                        .queue
+                        .raw
+                        .waitForEvent_value(event, boundary.value);
+                } else {
+                    submission
+                        .queue
+                        .raw
+                        .signalEvent_value(event, boundary.value);
+                }
+            },
+        );
         // Reuse publication is independent of cleanup readiness. It happens
         // only after all native entry calls return; callbacks may precede it.
         submission.publish_native_reuse(crate::native_reuse::ReuseSide::HandoffReturned);
@@ -760,12 +1190,13 @@ impl Drop for Submission {
         let state = self.state.get_mut();
         if let Some(slot) = state.slot.take() {
             let callbacks = std::mem::take(&mut state.callbacks);
-            let signals = std::mem::take(&mut state.signals);
+            let events = std::mem::take(&mut state.events);
+            let physical = state.physical.take();
             let owners = super::retirement::NativeOwners::metal4_abandoned(
                 slot,
                 self.queue.clone(),
-                signals,
-                None,
+                events,
+                physical,
             );
             match self
                 .retirement
@@ -951,7 +1382,7 @@ mod tests {
             .raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
         let submission = queue.acquire().unwrap();
-        let encoder = submission.encoder();
+        let encoder = submission.encoder().unwrap();
         encoder.raw.endEncoding();
         submission.commit().unwrap();
         let recording = submission.state.lock();
@@ -1007,7 +1438,7 @@ mod tests {
                     tx.send(observed.status()).unwrap();
                 })
                 .unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             unsafe {
@@ -1089,7 +1520,7 @@ mod tests {
                 unsafe {
                     *buffer.contents().as_ptr().cast::<f32>() = 0.;
                 }
-                let encoder = submission.encoder();
+                let encoder = submission.encoder().unwrap();
                 encoder.pipeline(&pipeline);
                 encoder.buffer(0, Some(&buffer), 0);
                 for _ in 0..count {
@@ -1166,7 +1597,7 @@ mod tests {
         let mut submissions = Vec::new();
         for _ in 0..SLOTS {
             let submission = queue.acquire().unwrap();
-            submission.encoder().raw.endEncoding();
+            submission.encoder().unwrap().raw.endEncoding();
             submission.commit().unwrap();
             submissions.push(submission);
         }
@@ -1229,7 +1660,7 @@ mod tests {
                 .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
                 .unwrap();
             let submission = queue.acquire().unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             // Each recording crosses the regular page boundary and also uses
@@ -1334,7 +1765,7 @@ mod tests {
         }
         let record = |queue: &Arc<Queue>, n: u32| {
             let submission = queue.acquire().unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             unsafe {
@@ -1356,7 +1787,7 @@ mod tests {
             submission
         };
         let first = record(&a, 1);
-        first.signal(&event, 1);
+        first.signal(&event, 1).unwrap();
         b.raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
         let second = record(&b, 2);

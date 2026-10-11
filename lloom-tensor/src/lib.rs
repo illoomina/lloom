@@ -51,8 +51,15 @@
 mod accelerate;
 #[cfg(any(feature = "metal", test))]
 mod allocation_admission;
+mod allocation_alias;
 #[cfg(any(feature = "metal", test))]
 mod allocation_geometry;
+#[cfg(any(feature = "metal", test))]
+mod allocation_header;
+#[cfg(any(feature = "metal", test))]
+mod allocation_header_root;
+#[cfg(any(feature = "metal", test))]
+mod allocation_header_storage;
 #[cfg(any(feature = "metal", test))]
 mod allocation_owner;
 pub mod arms;
@@ -61,7 +68,9 @@ pub mod backend;
 pub mod backprop;
 #[doc(hidden)]
 pub mod checkout;
+mod command_lifecycle;
 mod command_policy;
+mod command_segments;
 mod completion_frontier;
 #[cfg(any(feature = "metal", test))]
 mod completion_scope;
@@ -88,6 +97,8 @@ mod indexer;
 pub mod isolation;
 pub mod layout;
 pub mod machine;
+#[cfg(any(feature = "metal", test))]
+mod membership_groups;
 mod memory_accounting;
 mod memory_accounting_machine;
 pub mod memory_admission;
@@ -144,6 +155,8 @@ mod ordered_metadata;
 pub mod pickle;
 #[cfg(any(feature = "metal", test))]
 mod planner_transaction;
+#[cfg(any(feature = "metal", test))]
+mod prefix_data;
 pub mod quantized;
 #[cfg(any(feature = "metal", test))]
 mod residency_ownership;

@@ -20,6 +20,7 @@ pub enum PredictionBasis {
 pub enum AllocationError<E> {
     Admission(AdmissionError),
     Geometry(&'static str),
+    Retirement(String),
     PredictionExceeded {
         predicted: usize,
         actual: usize,
@@ -33,6 +34,7 @@ impl<E: std::fmt::Display> std::fmt::Display for AllocationError<E> {
         match self {
             Self::Admission(e) => write!(f, "{e}"),
             Self::Geometry(e) => write!(f, "allocation geometry: {e}"),
+            Self::Retirement(e) => write!(f, "allocation retirement registration: {e}"),
             Self::PredictionExceeded { predicted, actual, basis } => write!(f,
                 "allocation prediction exceeded: {actual} actual bytes > {predicted} predicted ({basis:?}); raw allocation released; transient peak was not prevented"),
             Self::Native(e) => write!(f, "native allocation: {e}"),

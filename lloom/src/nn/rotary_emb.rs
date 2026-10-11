@@ -19,6 +19,29 @@ pub fn default_rope_tables(
     dtype: DType,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
+    let end = validate_default_rope_tables(head_dim, theta, length, dtype)?;
+
+    let inv_freq: Vec<f32> = (0..head_dim)
+        .step_by(2)
+        .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
+        .collect();
+    let inv_freq = Tensor::new(inv_freq, device)?;
+    let angles = Tensor::arange(0, end, device)?
+        .to_dtype(DType::F32)?
+        .reshape((length, 1))?
+        .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
+    let cos = angles.cos()?.to_dtype(dtype)?;
+    let sin = angles.sin()?.to_dtype(dtype)?;
+    Ok((cos, sin))
+}
+
+/// Allocation-free geometry preflight shared with model load planners.
+pub(crate) fn validate_default_rope_tables(
+    head_dim: usize,
+    theta: f32,
+    length: usize,
+    dtype: DType,
+) -> Result<u32> {
     if head_dim == 0 || head_dim % 2 != 0 || length == 0 {
         lloom_tensor::bail!("default RoPE needs a positive even head dimension and positive length")
     }
@@ -43,18 +66,7 @@ pub fn default_rope_tables(
     checked_bytes(&[length, half, std::mem::size_of::<f32>()])?;
     checked_bytes(&[2, length, half, dtype.size_in_bytes()])?;
 
-    let inv_freq: Vec<f32> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
-        .collect();
-    let inv_freq = Tensor::new(inv_freq, device)?;
-    let angles = Tensor::arange(0, end, device)?
-        .to_dtype(DType::F32)?
-        .reshape((length, 1))?
-        .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
-    let cos = angles.cos()?.to_dtype(dtype)?;
-    let sin = angles.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
+    Ok(end)
 }
 
 /// Interleaved variant of rotary embeddings.

@@ -15,13 +15,130 @@ pub struct PreparedQuestion {
     pub readout: CausalReadout,
 }
 
+/// Resolved prompt labels and their logit groups, derived together from the same
+/// loaded tokenizer. Descriptions stay in the caller's original typed question;
+/// resolving codes never serializes or coerces them to text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CausalLabels {
+    texts: Vec<String>,
+    readout: CausalReadout,
+}
+
+#[derive(Clone, Copy)]
+enum LabelDialect {
+    Python,
+    SystemOne,
+}
+
+impl CausalLabels {
+    /// llama.cpp d1 label policy. `encode` omits automatic BOS/EOS and treats
+    /// strings as ordinary label text, not explicit special-token syntax.
+    /// Noul label texts are true/false while their logit aliases are yes/no.
+    pub fn systemone<T>(
+        question: &Question<T>,
+        mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
+    ) -> Result<Self> {
+        Self::resolve(question, &mut encode, LabelDialect::SystemOne)
+    }
+
+    pub fn texts(&self) -> &[String] {
+        &self.texts
+    }
+
+    pub fn readout(&self) -> &CausalReadout {
+        &self.readout
+    }
+
+    pub fn into_readout(self) -> CausalReadout {
+        self.readout
+    }
+
+    fn resolve<T>(
+        question: &Question<T>,
+        encode: &mut impl FnMut(&str) -> Result<Vec<u32>>,
+        dialect: LabelDialect,
+    ) -> Result<Self> {
+        question.validate()?;
+        let mut texts = Vec::with_capacity(question.option_count());
+        let mut groups = Vec::with_capacity(question.option_count());
+        match question {
+            Question::Noul { .. } => {
+                let yes = single_ids(&["yes", "Yes", "YES"], encode)?;
+                let no = single_ids(&["no", "No", "NO"], encode)?;
+                if yes.is_empty() || no.is_empty() {
+                    bail!("tokenizer has no single-token yes/no aliases");
+                }
+                texts.extend(["true".into(), "false".into()]);
+                groups.extend([yes, no]);
+            }
+            Question::Choice { criteria, .. } => {
+                let labels: Vec<&str> = criteria
+                    .iter()
+                    .map(|(name, _)| match dialect {
+                        LabelDialect::SystemOne => name.as_str(),
+                        LabelDialect::Python => name.trim(),
+                    })
+                    .collect();
+                let native = labels.iter().all(|s| match dialect {
+                    LabelDialect::SystemOne => {
+                        s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic()
+                    }
+                    LabelDialect::Python => {
+                        let mut chars = s.chars();
+                        chars.next().is_some_and(char::is_alphabetic) && chars.next().is_none()
+                    }
+                });
+                let mut used = Vec::with_capacity(labels.len());
+                for (i, label) in labels.iter().enumerate() {
+                    let requested = if native {
+                        (*label).to_string()
+                    } else if labels.len() <= 26 {
+                        ((b'A' + i as u8) as char).to_string()
+                    } else {
+                        format!("{i:02}")
+                    };
+                    let (code, id) = match available(&requested, &used, encode)? {
+                        Some(id) => (requested, id),
+                        None => fallback(&used, encode)?,
+                    };
+                    used.push(id);
+                    let mut group = vec![id];
+                    let spaced = format!(" {code}");
+                    for other in single_ids(&[&spaced], encode)? {
+                        if !group.contains(&other) {
+                            group.push(other);
+                        }
+                    }
+                    texts.push(code);
+                    groups.push(group);
+                }
+            }
+            Question::Score { criteria, .. } => {
+                for i in 0..criteria.len() {
+                    let code = i.to_string();
+                    let group = single_ids(&[&code], encode)?;
+                    if group.is_empty() {
+                        bail!("score level {i} is not a single token");
+                    }
+                    texts.push(code);
+                    groups.push(group);
+                }
+            }
+        }
+        Ok(Self {
+            texts,
+            readout: CausalReadout { groups },
+        })
+    }
+}
+
 impl PreparedQuestion {
     /// `encode` must omit BOS/EOS and other automatically inserted special tokens.
     pub fn causal(
         question: Question,
         encode: impl FnMut(&str) -> Result<Vec<u32>>,
     ) -> Result<Self> {
-        Self::causal_with_labels(question, encode, false)
+        Self::causal_with_labels(question, encode, LabelDialect::Python)
     }
 
     /// Label selection of llama.cpp's `/v1/systemone`: native labels are
@@ -30,25 +147,20 @@ impl PreparedQuestion {
         question: Question,
         encode: impl FnMut(&str) -> Result<Vec<u32>>,
     ) -> Result<Self> {
-        Self::causal_with_labels(question, encode, true)
+        Self::causal_with_labels(question, encode, LabelDialect::SystemOne)
     }
 
     fn causal_with_labels(
         question: Question,
         mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
-        systemone: bool,
+        dialect: LabelDialect,
     ) -> Result<Self> {
-        question.validate()?;
-        let (body, groups) = match &question {
+        let labels = CausalLabels::resolve(&question, &mut encode, dialect)?;
+        let body = match &question {
             Question::Noul {
                 instructions,
                 criteria,
             } => {
-                let yes = single_ids(&["yes", "Yes", "YES"], &mut encode)?;
-                let no = single_ids(&["no", "No", "NO"], &mut encode)?;
-                if yes.is_empty() || no.is_empty() {
-                    bail!("tokenizer has no single-token yes/no aliases");
-                }
                 let extra = match criteria {
                     None => String::new(),
                     Some((yes, no)) => format!(
@@ -57,101 +169,49 @@ impl PreparedQuestion {
                         no.as_deref().unwrap_or("None")
                     ),
                 };
-                (
-                    format!("{instructions}{extra}\n\nReply with yes or no only."),
-                    vec![yes, no],
-                )
+                format!("{instructions}{extra}\n\nReply with yes or no only.")
             }
             Question::Choice {
                 instructions,
                 criteria,
             } => {
-                let labels: Vec<&str> = criteria
+                let lines: Vec<String> = criteria
                     .iter()
-                    .map(|(name, _)| {
-                        if systemone {
-                            name.as_str()
-                        } else {
-                            name.trim()
-                        }
+                    .zip(labels.texts())
+                    .map(|((label, desc), code)| {
+                        let text = desc
+                            .as_ref()
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| label.replace('_', " "));
+                        format!("{code} {text}")
                     })
                     .collect();
-                let native = labels.iter().all(|s| {
-                    if systemone {
-                        s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic()
-                    } else {
-                        let mut chars = s.chars();
-                        chars.next().is_some_and(char::is_alphabetic) && chars.next().is_none()
-                    }
-                });
-                let mut used = Vec::with_capacity(labels.len());
-                let mut groups = Vec::with_capacity(labels.len());
-                let mut lines = Vec::with_capacity(labels.len());
-                for (i, (label, desc)) in criteria.iter().enumerate() {
-                    let requested = if native {
-                        labels[i].to_string()
-                    } else if labels.len() <= 26 {
-                        ((b'A' + i as u8) as char).to_string()
-                    } else {
-                        format!("{i:02}")
-                    };
-                    let (code, id) = match available(&requested, &used, &mut encode)? {
-                        Some(id) => (requested, id),
-                        None => fallback(&used, &mut encode)?,
-                    };
-                    used.push(id);
-                    let mut group = vec![id];
-                    let spaced = format!(" {code}");
-                    for other in single_ids(&[&spaced], &mut encode)? {
-                        if !group.contains(&other) {
-                            group.push(other);
-                        }
-                    }
-                    groups.push(group);
-                    let text = desc
-                        .as_ref()
-                        .filter(|s| !s.is_empty())
-                        .cloned()
-                        .unwrap_or_else(|| label.replace('_', " "));
-                    lines.push(format!("{code} {text}"));
-                }
-                (
-                    format!(
-                        "{instructions}\n\nOptions:\n{}\n\nReply with the option code only.",
-                        lines.join("\n")
-                    ),
-                    groups,
+                format!(
+                    "{instructions}\n\nOptions:\n{}\n\nReply with the option code only.",
+                    lines.join("\n")
                 )
             }
             Question::Score {
                 instructions,
                 criteria,
             } => {
-                let mut groups = Vec::with_capacity(criteria.len());
-                let mut lines = Vec::with_capacity(criteria.len());
-                for (i, description) in criteria.iter().enumerate() {
-                    let code = i.to_string();
-                    let group = single_ids(&[&code], &mut encode)?;
-                    if group.is_empty() {
-                        bail!("score level {i} is not a single token");
-                    }
-                    groups.push(group);
-                    lines.push(format!("{i} {description}"));
-                }
-                (
-                    format!(
-                        "{instructions}\n\n{}\n\nReply with a single digit 0-{} only.",
-                        lines.join("\n"),
-                        criteria.len() - 1
-                    ),
-                    groups,
+                let lines: Vec<String> = criteria
+                    .iter()
+                    .zip(labels.texts())
+                    .map(|(description, code)| format!("{code} {description}"))
+                    .collect();
+                format!(
+                    "{instructions}\n\n{}\n\nReply with a single digit 0-{} only.",
+                    lines.join("\n"),
+                    criteria.len() - 1
                 )
             }
         };
         Ok(Self {
             question,
             suffix: format!("{body}<|im_end|>\n<|im_start|>assistant\n"),
-            readout: CausalReadout { groups },
+            readout: labels.into_readout(),
         })
     }
 }
@@ -260,6 +320,92 @@ fn fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_payload_labels_share_resolution_without_payload_trait_bounds() -> Result<()> {
+        struct Opaque;
+        let raw = Question::Choice {
+            instructions: Opaque,
+            criteria: vec![("multi".into(), Some(Opaque)), ("B".into(), None)],
+        };
+        let encode = |s: &str| match s {
+            "A" => Ok(vec![8, 9]),
+            " B" => Ok(vec![100]),
+            " C" => Ok(vec![101]),
+            _ => bytes(s),
+        };
+        let labels = CausalLabels::systemone(&raw, encode)?;
+        assert_eq!(labels.texts(), &["B", "C"]);
+        assert_eq!(labels.readout().groups(), &[vec![66, 100], vec![67, 101]]);
+        let legacy = PreparedQuestion::systemone_causal(choice(&["multi", "B"]), encode)?;
+        assert_eq!(legacy.readout, labels.readout);
+        assert_eq!(legacy.suffix, "Pick.\n\nOptions:\nB multi\nC B\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n");
+        let score = Question::Score {
+            instructions: Opaque,
+            criteria: vec![Opaque, Opaque],
+        };
+        assert_eq!(CausalLabels::systemone(&score, bytes)?.texts(), &["0", "1"]);
+        let noul = Question::Noul {
+            instructions: Opaque,
+            criteria: None,
+        };
+        let labels = CausalLabels::systemone(&noul, |s| {
+            Ok(match s {
+                "yes" | "Yes" => vec![11],
+                "YES" => vec![12],
+                "no" | "No" | "NO" => vec![13],
+                _ => vec![],
+            })
+        })?;
+        assert_eq!(labels.texts(), &["true", "false"]);
+        assert_eq!(labels.readout().groups(), &[vec![11, 12], vec![13]]);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "serve")]
+    fn resolved_raw_labels_feed_the_actual_named_template_and_readout() -> Result<()> {
+        use crate::decision::{
+            OrderedJson, SystemOneMedia, SystemOneTemplate, SystemOneTemplateKind,
+        };
+        let q = Question::Choice {
+            instructions: OrderedJson::Bool(false),
+            criteria: vec![
+                ("雪".into(), Some(OrderedJson::Number(7.into()))),
+                ("alpha_beta".into(), None),
+            ],
+        };
+        let labels = CausalLabels::systemone(&q, bytes)?;
+        let template = SystemOneTemplate::compile(
+            include_str!("fixtures/d1-systemone.jinja"),
+            SystemOneTemplateKind::D1Causal,
+        )?;
+        let rendered = template.render(
+            "q",
+            &OrderedJson::String("State".into()),
+            &q,
+            labels.texts(),
+            SystemOneMedia::Text,
+        )?;
+        assert!(
+            rendered.contains("Options:\nA 7\nB alpha beta"),
+            "{rendered}"
+        );
+        let probabilities = labels
+            .readout()
+            .probabilities(|id| Ok(if id == u32::from(b'B') { 1.0 } else { 0.0 }), 1.0)?;
+        assert!((probabilities[0] - 0.2689414213699951).abs() < 1e-14);
+        let answer = q
+            .systemone_answer(&probabilities)?
+            .to_json_string()
+            .unwrap();
+        assert!(answer.contains("\"choice\":\"alpha_beta\""), "{answer}");
+        assert!(
+            answer.find("\"雪\":").unwrap() < answer.find("\"alpha_beta\":").unwrap(),
+            "{answer}"
+        );
+        Ok(())
+    }
 
     fn choice(names: &[&str]) -> Question {
         Question::Choice {

@@ -19,7 +19,7 @@ pub use json::OrderedJson;
 pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
 pub use omni_readout::OmniReadout;
 pub use question::{Answer, Question};
-pub use readout::{CausalReadout, PreparedQuestion};
+pub use readout::{CausalLabels, CausalReadout, PreparedQuestion};
 pub use request::{parse_systemone_questions, NoulAliases};
 pub use response::{SystemOneError, SystemOneResponse};
 pub use state::{parse_systemone_state, MediaSource, ParsedState, StateNullability};

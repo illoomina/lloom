@@ -115,7 +115,7 @@ pub(crate) struct ResolvedOmniConfig {
     pub(crate) temperatures: BTreeMap<String, f64>,
 }
 impl ResolvedOmniConfig {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         validate_outer(
             self.image_text_length,
             self.audio_text_length,
@@ -278,7 +278,29 @@ impl QuantizedOmniModel {
         core_vb: QuantizedVarBuilder,
         media_vb: QuantizedVarBuilder,
     ) -> Result<Self> {
+        Self::load_components_inner(cfg, core_vb, media_vb, None)
+    }
+    pub(crate) fn load_components_with_frontend(
+        cfg: ResolvedOmniConfig,
+        core_vb: QuantizedVarBuilder,
+        media_vb: QuantizedVarBuilder,
+        frontend: MelFrontend,
+    ) -> Result<Self> {
+        Self::load_components_inner(cfg, core_vb, media_vb, Some(frontend))
+    }
+    fn load_components_inner(
+        cfg: ResolvedOmniConfig,
+        core_vb: QuantizedVarBuilder,
+        media_vb: QuantizedVarBuilder,
+        frontend: Option<MelFrontend>,
+    ) -> Result<Self> {
         cfg.validate()?;
+        if frontend
+            .as_ref()
+            .is_some_and(|f| f.features() != cfg.audio_config.feat_in)
+        {
+            lloom_tensor::bail!("omni supplied frontend feature count differs from audio config")
+        }
         if !core_vb.device().same_device(media_vb.device()) {
             lloom_tensor::bail!("omni core and media builders must use the same device")
         }
@@ -291,7 +313,10 @@ impl QuantizedOmniModel {
             media_vb.clone(),
         )?;
         let audio = QuantizedAudioEncoder::load(cfg.audio_config.clone(), width, media_vb)?;
-        let frontend = MelFrontend::new(cfg.audio_config.feat_in)?;
+        let frontend = match frontend {
+            Some(frontend) => frontend,
+            None => MelFrontend::new(cfg.audio_config.feat_in)?,
+        };
         let limits = RequestLimits {
             max_length: cfg.core.max_length,
             image_text_length: cfg.image_text_length,

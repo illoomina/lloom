@@ -8,9 +8,14 @@ use crate::nn::memory::LoadContext;
 use lloom_tensor::{DType, Device, Result};
 use std::path::Path;
 
+pub(crate) enum LoadedModel {
+    Dense(OmniModel),
+    Quantized(super::model::QuantizedOmniModel),
+}
+
 pub(crate) struct LoadedOmni {
     // Drop model-owned host tables/tensors before the execution namespace.
-    model: OmniModel,
+    model: LoadedModel,
     #[cfg(feature = "metal")]
     allocations: lloom_tensor::metal_backend::MetalAllocationDomain,
 }
@@ -53,12 +58,60 @@ impl LoadedOmni {
             // scope returns; issued backing charges retain the same domain.
             let domain = load.finish();
             debug_assert_eq!(allocations.domain().key(), domain.key());
-            return Ok(Self { model, allocations });
+            return Ok(Self {
+                model: LoadedModel::Dense(model),
+                allocations,
+            });
         }
         let _ = (config, paths, dtype, device, load);
         lloom_tensor::bail!(
             "admitted omni loading requires enrolled allocator producers; CPU/CUDA enrollment is pending"
         )
+    }
+
+    /// Main and media headers are inspected inside the supplied load scope;
+    /// both eager maps use those same readers, after all-component preflight.
+    /// No companion filename is guessed and no second model domain is made.
+    pub(crate) fn from_gguf(
+        main: &Path,
+        media: &Path,
+        device: &Device,
+        load: LoadContext,
+    ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = device {
+            let allocations = lloom_tensor::metal_backend::MetalAllocationDomain::new(
+                device,
+                load.domain().clone(),
+            )?;
+            let context = load.allocations();
+            let scope = allocations.scope(context.clone())?;
+            let model = scope.run(|resolved| {
+                use crate::quantized_var_builder::VarBuilder;
+                use lloom_tensor::quantized::gguf_file::Content;
+                let device = Device::Metal(resolved.clone());
+                let mut main_file = std::fs::File::open(main)?;
+                let mut media_file = std::fs::File::open(media)?;
+                let main_header = Content::read(&mut main_file)?;
+                let media_header = Content::read(&mut media_file)?;
+                let cfg = super::gguf::resolve(&main_header, &media_header)?;
+                let main_vb = VarBuilder::from_gguf_content(&main_header, &mut main_file, &device)?;
+                let media_vb =
+                    VarBuilder::from_gguf_content(&media_header, &mut media_file, &device)?;
+                let frontend = MelFrontend::new_in(cfg.audio_config.feat_in, &context)?;
+                super::model::QuantizedOmniModel::load_components_with_frontend(
+                    cfg, main_vb, media_vb, frontend,
+                )
+            })?;
+            let domain = load.finish();
+            debug_assert_eq!(allocations.domain().key(), domain.key());
+            return Ok(Self {
+                model: LoadedModel::Quantized(model),
+                allocations,
+            });
+        }
+        let _ = (main, media, device, load);
+        lloom_tensor::bail!("admitted omni GGUF loading requires enrolled allocator producers; CPU/CUDA enrollment is pending")
     }
 
     /// Whole-pass demand comes from the shared predictor/caller, NOT a second
@@ -67,7 +120,7 @@ impl LoadedOmni {
     pub(crate) fn with_pass<T>(
         &self,
         predicted_extra: usize,
-        execute: impl FnOnce(&OmniModel) -> Result<T>,
+        execute: impl FnOnce(&LoadedModel) -> Result<T>,
     ) -> Result<T> {
         #[cfg(feature = "metal")]
         {

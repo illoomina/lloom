@@ -1,10 +1,11 @@
 use super::{Buffer, Device};
 use crate::allocation_owner::{AllocationLease, AllocationOwner};
+use crate::completion_wake::{Wake, WakeMutex};
 use crate::residency_ownership::ResidencyOwners;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 type ResidencyLease = AllocationLease<Retained<ProtocolObject<dyn MTLAllocation>>>;
 
@@ -125,7 +126,7 @@ pub struct ResidencySet {
     /// atomic against a concurrent remove of the same buffer. That pair is
     /// precisely the double-unregister #165's audit found reachable in
     /// principle.
-    members: Mutex<ResidencyOwners<ResidencyLease>>,
+    members: WakeMutex<ResidencyOwners<ResidencyLease>>,
 
     /// See [`ResidencyCounters`]. Atomics rather than fields inside `members`
     /// so a reader never contends with an allocation for the lock, and
@@ -149,6 +150,10 @@ pub struct ResidencySet {
     dirty: std::sync::atomic::AtomicBool,
 }
 
+/// Host membership mutex was contended; no staged state was changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResidencyBusy;
+
 unsafe impl Send for ResidencySet {}
 unsafe impl Sync for ResidencySet {}
 
@@ -162,7 +167,7 @@ impl ResidencySet {
             .inspect(|set| set.requestResidency());
         ResidencySet {
             raw,
-            members: Mutex::new(ResidencyOwners::default()),
+            members: WakeMutex::new(ResidencyOwners::default()),
             commits: AtomicU64::new(0),
             added: AtomicU64::new(0),
             removed: AtomicU64::new(0),
@@ -171,6 +176,14 @@ impl ResidencySet {
             remove_batches: AtomicU64::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Install the exact shared service notification before a final lifecycle
+    /// entry becomes pollable. Existing guards load it AFTER unlocking, so an
+    /// acquisition predating installation cannot silently strand a Busy poll.
+    /// Conflicting ownership is returned, not replaced or inferred from Device.
+    pub(crate) fn install_retirement_wake(&self, wake: Arc<Wake>) -> Result<(), Arc<Wake>> {
+        self.members.install_wake(wake)
     }
 
     /// What this set has done. See [`ResidencyCounters`].
@@ -343,6 +356,34 @@ impl ResidencySet {
         };
         drop(members);
         (committed, PublishedRemovals(released))
+    }
+
+    /// Nonblocking HOST membership acquisition for final lifecycle polling.
+    /// Busy never notifies itself or changes dirty/native/custody state. Every
+    /// successful guard unlock notifies the installed service; once commit
+    /// succeeds dirty is cleared, so a later retry with no new producer work
+    /// follows the no-lock/no-notify fast path rather than self-waking forever.
+    /// Native set.commit remains synchronous and is not claimed bounded here.
+    /// The returned custody must outlive outer EntryState exactly as in the
+    /// blocking extraction API; commit still happens BEFORE native submission.
+    pub(crate) fn try_commit_pending_extracted(
+        &self,
+    ) -> Result<(bool, PublishedRemovals), ResidencyBusy> {
+        let Some(set) = &self.raw else {
+            return Ok((false, PublishedRemovals(Vec::new())));
+        };
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok((false, PublishedRemovals(Vec::new())));
+        }
+        let mut members = self.members.try_lock().ok_or(ResidencyBusy)?;
+        let committed = self.dirty.load(Ordering::Relaxed);
+        let released = if committed {
+            self.publish(set, &mut members)
+        } else {
+            Vec::new()
+        };
+        drop(members);
+        Ok((committed, PublishedRemovals(released)))
     }
 
     /// Adds multiple buffers in a single commit.

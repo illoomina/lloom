@@ -164,9 +164,10 @@ fn repeat_first_padding_and_attention_callback_preserve_explicit_contract() -> R
         &Device::Cpu,
     )?;
     let dense = tower
+        .inner
         .encoder
         .forward(&embedded, Some(&mask.broadcast_as((1, 1, 6, 6))?))?
-        .apply(&tower.post_layernorm)?;
+        .apply(&tower.inner.post_layernorm)?;
     let mut calls = 0;
     let mut previous = None;
     for _ in 0..3 {

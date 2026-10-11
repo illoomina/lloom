@@ -2,10 +2,13 @@
 //! RGB decoding is external. Checked geometry is NOT pass admission; callers
 //! must reserve image/preparation/encoder/projector work in their model Domain.
 use crate::models::lfm2_vl::{
-    ImageProcessor, Lfm2VlConfig, MultiModalProjector, RgbNormalization, TileLayout, VisionConfig,
-    VisionPositionPadding, VisionTower,
+    ImageProcessor, Lfm2VlConfig, MultiModalProjector, ProjectorCore, RgbNormalization, TileLayout,
+    VisionConfig, VisionPositionPadding, VisionTower, VisionTowerCore,
 };
-use crate::nn::{Activation, VarBuilder};
+use crate::models::siglip::{Attention, Encoder, EncoderLayer, Mlp};
+use crate::nn::linear::{ContiguousInput, Projection};
+use crate::nn::{Activation, Linear, VarBuilder};
+use crate::{quantized_nn as qnn, quantized_var_builder::VarBuilder as QuantizedVarBuilder};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
@@ -156,13 +159,23 @@ impl PreparedVisionImage {
 
 #[derive(Debug, Clone)]
 pub struct Vision {
+    inner: VisionInner<Linear>,
+}
+
+#[derive(Debug, Clone)]
+struct VisionInner<P> {
     owner: Arc<()>,
-    tower: VisionTower,
-    projector: MultiModalProjector,
+    tower: VisionTowerCore<P>,
+    projector: ProjectorCore<P>,
     hidden: usize,
     out: usize,
     dtype: DType,
     device: Device,
+}
+type QuantizedProjection = ContiguousInput<qnn::Linear>;
+#[derive(Debug, Clone)]
+pub(crate) struct QuantizedVision {
+    inner: VisionInner<QuantizedProjection>,
 }
 impl Vision {
     pub(crate) fn validate_config(
@@ -215,7 +228,7 @@ impl Vision {
         vb: VarBuilder,
     ) -> Result<Self> {
         Self::validate_config(cfg, projector_hidden, out, vb.dtype())?;
-        let tower = VisionTower::new(cfg, vb.pp("tower"))?;
+        let tower = VisionTower::new(cfg, vb.pp("tower"))?.into_inner();
         let projector_cfg = Lfm2VlConfig {
             vision_config: cfg.clone(),
             image_token_id: 0,
@@ -228,18 +241,161 @@ impl Vision {
             tile_size: TILE,
             use_image_special_tokens: false,
         };
-        let projector = MultiModalProjector::new(&projector_cfg, out, vb.pp("projector"))?;
+        let projector =
+            MultiModalProjector::new(&projector_cfg, out, vb.pp("projector"))?.into_inner();
         Ok(Self {
-            owner: Arc::new(()),
-            tower,
-            projector,
-            hidden: cfg.hidden_size,
-            out,
-            dtype: vb.dtype(),
-            device: vb.device().clone(),
+            inner: VisionInner {
+                owner: Arc::new(()),
+                tower,
+                projector,
+                hidden: cfg.hidden_size,
+                out,
+                dtype: vb.dtype(),
+                device: vb.device().clone(),
+            },
         })
     }
 
+    /// Caller owns decoding and pass admission BEFORE this allocates source
+    /// copies, resize intermediates, patch arrays, upload/cast and padding.
+    pub fn prepare_rgb8(
+        &self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+    ) -> Result<PreparedVisionImage> {
+        self.inner.prepare_rgb8(rgb, height, width)
+    }
+    /// Full1024 padded rows, repeat-first positions and boolean-key-mask semantics
+    /// expressed as 0/-infinity additive mask; no full L² mask is constructed.
+    /// Image order, tile row-major order and final thumbnail are preserved.
+    pub fn forward_with_attention<F>(
+        &self,
+        images: &[&PreparedVisionImage],
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(images, attend)
+    }
+}
+
+impl QuantizedVision {
+    /// Official mmproj names. The eager VarBuilder must already belong to the
+    /// enclosing load promise; retained tables/copies require the same domain.
+    pub(crate) fn load(
+        cfg: &VisionConfig,
+        projector_hidden: usize,
+        out: usize,
+        vb: QuantizedVarBuilder,
+    ) -> Result<Self> {
+        Vision::validate_config(cfg, projector_hidden, out, DType::F32)?;
+        super::host::checked_host_capacity::<EncoderLayer<QuantizedProjection>>(
+            cfg.num_hidden_layers,
+        )?;
+        let hidden = cfg.hidden_size;
+        let patch = vb.get((hidden, 3, PATCH, PATCH), "v.patch_embd.weight")?;
+        if !matches!(
+            patch.dtype(),
+            lloom_tensor::quantized::GgmlDType::F16 | lloom_tensor::quantized::GgmlDType::F32
+        ) {
+            lloom_tensor::bail!("official vision patch projection must be F16 or F32")
+        }
+        // The converter permutes [D,P,P,C] to [D,C,P,P]. Invert once at load.
+        let patch = patch
+            .dequantize(vb.device())?
+            .to_dtype(DType::F32)?
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((hidden, 3 * PATCH * PATCH))?;
+        let patch_bias = vb
+            .get(hidden, "v.patch_embd.bias")?
+            .dequantize(vb.device())?;
+        let positions = vb
+            .get((cfg.num_patches, hidden), "v.position_embd.weight")?
+            .dequantize(vb.device())?;
+        let mut layers = super::host::prepared_vec(cfg.num_hidden_layers)?;
+        for i in 0..cfg.num_hidden_layers {
+            let block = vb.pp(format!("v.blk.{i}"));
+            let projection =
+                |name: &str, input: usize, output: usize| -> Result<QuantizedProjection> {
+                    Ok(ContiguousInput::new(qnn::linear(
+                        input,
+                        output,
+                        block.pp(name),
+                    )?))
+                };
+            let attention = Attention::from_projections(
+                projection("attn_q", hidden, hidden)?,
+                projection("attn_k", hidden, hidden)?,
+                projection("attn_v", hidden, hidden)?,
+                projection("attn_out", hidden, hidden)?,
+                cfg.num_attention_heads,
+            )?;
+            let mlp = Mlp::from_parts(
+                projection("ffn_up", hidden, cfg.intermediate_size)?,
+                projection("ffn_down", cfg.intermediate_size, hidden)?,
+                cfg.hidden_act,
+            );
+            layers.push(EncoderLayer::from_parts(
+                attention,
+                qnn::layer_norm(hidden, cfg.layer_norm_eps, block.pp("ln1"))?,
+                mlp,
+                qnn::layer_norm(hidden, cfg.layer_norm_eps, block.pp("ln2"))?,
+            ));
+        }
+        let tower = VisionTowerCore::from_components(
+            cfg,
+            Linear::new(patch, Some(patch_bias)),
+            positions,
+            Encoder::from_layers(layers),
+            qnn::layer_norm(hidden, cfg.layer_norm_eps, vb.pp("v.post_ln"))?,
+        )?;
+        let projector = ProjectorCore::from_components(
+            ContiguousInput::new(qnn::linear(
+                product(&[hidden, 4])?,
+                projector_hidden,
+                vb.pp("mm.1"),
+            )?),
+            ContiguousInput::new(qnn::linear(projector_hidden, out, vb.pp("mm.2"))?),
+            Activation::Gelu,
+            2,
+            None,
+        )?;
+        Ok(Self {
+            inner: VisionInner {
+                owner: Arc::new(()),
+                tower,
+                projector,
+                hidden,
+                out,
+                dtype: DType::F32,
+                device: vb.device().clone(),
+            },
+        })
+    }
+    pub(crate) fn prepare_rgb8(
+        &self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+    ) -> Result<PreparedVisionImage> {
+        self.inner.prepare_rgb8(rgb, height, width)
+    }
+    pub(crate) fn forward_with_attention<F>(
+        &self,
+        images: &[&PreparedVisionImage],
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(images, attend)
+    }
+}
+
+impl<P: Projection> VisionInner<P> {
     /// Caller owns decoding and pass admission BEFORE this allocates source
     /// copies, resize intermediates, patch arrays, upload/cast and padding.
     pub fn prepare_rgb8(

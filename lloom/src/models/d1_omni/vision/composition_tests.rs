@@ -195,12 +195,12 @@ fn tile(seed: usize) -> Result<VisionTile> {
 fn loaded_namespace_and_ordered_prefix_composition_cpu() -> Result<()> {
     let vision = fixture()?;
     let first = PreparedVisionImage {
-        owner: vision.owner.clone(),
+        owner: vision.inner.owner.clone(),
         tiles: vec![tile(1)?, tile(5)?],
         prefix_tokens: 2,
     };
     let second = PreparedVisionImage {
-        owner: vision.owner.clone(),
+        owner: vision.inner.owner.clone(),
         tiles: vec![tile(9)?],
         prefix_tokens: 1,
     };
@@ -209,13 +209,13 @@ fn loaded_namespace_and_ordered_prefix_composition_cpu() -> Result<()> {
         // Bypass Vision.forward iteration/cat with explicit per-tile calls.
         // Projector arithmetic has a separate independent scalar fixture below;
         // this control proves ordering/composition, not independent tower math.
-        let embeddings = vision.tower.embeddings_with_padding(
+        let embeddings = vision.inner.tower.embeddings_with_padding(
             &t.patches,
             2,
             2,
             VisionPositionPadding::RepeatFirst,
         )?;
-        let output = vision.tower.forward_with_attention(
+        let output = vision.inner.tower.forward_with_attention(
             &t.patches,
             2,
             2,
@@ -226,6 +226,7 @@ fn loaded_namespace_and_ordered_prefix_composition_cpu() -> Result<()> {
         assert_eq!(embeddings.dims(), [1, 6, 4]);
         expected.extend(flat(
             &vision
+                .inner
                 .projector
                 .forward(&output.narrow(1, 0, 4)?.reshape((1, 2, 2, 4))?)?,
         )?);
@@ -281,7 +282,7 @@ fn projector_matches_independent_scalar_nontrivial_unshuffle_cpu() -> Result<()>
         .map(|x| x.as_f64().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(expected.len(), 8);
-    let output = vision.projector.forward(&input)?;
+    let output = vision.inner.projector.forward(&input)?;
     assert_eq!(output.dims(), [2, 4]);
     for (i, (a, b)) in flat(&output)?.iter().zip(expected).enumerate() {
         assert!(
@@ -290,7 +291,7 @@ fn projector_matches_independent_scalar_nontrivial_unshuffle_cpu() -> Result<()>
         );
     }
     let swapped = input.transpose(1, 2)?.contiguous()?;
-    let wrong = vision.projector.forward(&swapped)?;
+    let wrong = vision.inner.projector.forward(&swapped)?;
     assert!(
         flat(&output)?
             .iter()
@@ -298,5 +299,177 @@ fn projector_matches_independent_scalar_nontrivial_unshuffle_cpu() -> Result<()>
             .any(|(a, b)| (a - b).abs() > 1e-4),
         "unshuffle-axis discriminator vacuous"
     );
+    Ok(())
+}
+
+fn gguf_fixture(weights: &HashMap<String, Tensor>, convert_patch: bool) -> Result<Vec<u8>> {
+    use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::io::Cursor;
+    let aliases = [
+        (
+            "tower.vision_model.embeddings.patch_embedding",
+            "v.patch_embd",
+        ),
+        (
+            "tower.vision_model.embeddings.position_embedding",
+            "v.position_embd",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.self_attn.q_proj",
+            "v.blk.0.attn_q",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.self_attn.k_proj",
+            "v.blk.0.attn_k",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.self_attn.v_proj",
+            "v.blk.0.attn_v",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.self_attn.out_proj",
+            "v.blk.0.attn_out",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.layer_norm1",
+            "v.blk.0.ln1",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.layer_norm2",
+            "v.blk.0.ln2",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.mlp.fc1",
+            "v.blk.0.ffn_up",
+        ),
+        (
+            "tower.vision_model.encoder.layers.0.mlp.fc2",
+            "v.blk.0.ffn_down",
+        ),
+        ("tower.vision_model.post_layernorm", "v.post_ln"),
+        ("projector.linear_1", "mm.1"),
+        ("projector.linear_2", "mm.2"),
+    ];
+    let mut tensors = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (name, weight) in weights {
+        let short = name.strip_prefix("wrapper.vision.").unwrap();
+        let matches: Vec<_> = aliases
+            .iter()
+            .filter(|(a, _)| short.starts_with(*a))
+            .collect();
+        assert_eq!(matches.len(), 1, "canonical alias: {short}");
+        let (from, to) = matches[0];
+        let name = format!("{to}{}", &short[from.len()..]);
+        assert!(names.insert(name.clone()));
+        let converted = if name == "v.patch_embd.weight" {
+            let values = flat(weight)?;
+            let mut stored = vec![0f32; 4 * 3 * 16 * 16];
+            for d in 0..4 {
+                for c in 0..3 {
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            let dest = ((d * 3 + c) * 16 + y) * 16 + x;
+                            let source = ((d * 16 + y) * 16 + x) * 3 + c;
+                            stored[dest] = values[if convert_patch { source } else { dest }];
+                        }
+                    }
+                }
+            }
+            Tensor::from_vec(stored, (4, 3, 16, 16), &Device::Cpu)?
+        } else {
+            weight.clone()
+        };
+        tensors.push((name, QTensor::quantize(&converted, GgmlDType::F32)?));
+    }
+    assert_eq!(tensors.len(), 25);
+    let entries: Vec<_> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let mut bytes = Cursor::new(Vec::new());
+    gguf_file::write(&mut bytes, &[], &entries)?;
+    assert!(bytes.get_ref().len() < 20 * 1024);
+    Ok(bytes.into_inner())
+}
+
+#[test]
+fn gguf_vision_patch_permutation_and_full_composition_cpu() -> Result<()> {
+    if std::env::var("CANDLE_NUM_THREADS").as_deref() == Ok("1") {
+        let workers = lloom_tensor::utils::barrier_pool().n_workers();
+        eprintln!("BOUNDED_BARRIER_WORKERS={workers}");
+        assert_eq!(workers, 0);
+    }
+    let (cfg, weights) = fixture_parts()?;
+    let bytes = gguf_fixture(&weights, true)?;
+    let quantized = QuantizedVision::load(
+        &cfg,
+        8,
+        4,
+        QuantizedVarBuilder::from_gguf_buffer(&bytes, &Device::Cpu)?,
+    )?;
+    let wrong = QuantizedVision::load(
+        &cfg,
+        8,
+        4,
+        QuantizedVarBuilder::from_gguf_buffer(&gguf_fixture(&weights, false)?, &Device::Cpu)?,
+    )?;
+    // Independent scalar patch indexing and dot, including B>1/L>1.
+    let values: Vec<_> = (0..2 * 6 * 768)
+        .map(|i| ((i * 7 % 19) as f32 - 9.) / 16.)
+        .collect();
+    let patches = Tensor::from_vec(values.clone(), (2, 6, 768), &Device::Cpu)?;
+    let w = flat(&weights["wrapper.vision.tower.vision_model.embeddings.patch_embedding.weight"])?;
+    let bias = flat(&weights["wrapper.vision.tower.vision_model.embeddings.patch_embedding.bias"])?;
+    let actual = flat(&quantized.inner.tower.patch_embed_only(&patches)?)?;
+    assert_eq!(actual.len(), 48);
+    for row in 0..12 {
+        for d in 0..4 {
+            let expected = (0..768)
+                .map(|i| values[row * 768 + i] as f64 * w[d * 768 + i] as f64)
+                .sum::<f64>()
+                + bias[d] as f64;
+            assert!(
+                (actual[row * 4 + d] as f64 - expected).abs() < 3e-5,
+                "patch scalar row{row}/d{d}: {} != {expected}",
+                actual[row * 4 + d]
+            );
+        }
+    }
+    let incorrect = flat(&wrong.inner.tower.patch_embed_only(&patches)?)?;
+    assert!(
+        actual
+            .iter()
+            .zip(incorrect)
+            .any(|(a, b)| (*a - b).abs() > 1e-3),
+        "patch permutation discriminator vacuous"
+    );
+    let dense = Vision::load(
+        &cfg,
+        8,
+        4,
+        VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu).pp("wrapper.vision"),
+    )?;
+    let images = |owner: &Arc<()>| -> Result<PreparedVisionImage> {
+        Ok(PreparedVisionImage {
+            owner: owner.clone(),
+            tiles: vec![tile(1)?, tile(5)?],
+            prefix_tokens: 2,
+        })
+    };
+    let dense_image = images(&dense.inner.owner)?;
+    let gguf_image = images(&quantized.inner.owner)?;
+    let expected = flat(&dense.forward_with_attention(&[&dense_image], &mut attend)?)?;
+    assert_eq!(expected.len(), 8);
+    for _ in 0..3 {
+        let got = flat(&quantized.forward_with_attention(&[&gguf_image], &mut attend)?)?;
+        assert_eq!(got.len(), 8);
+        for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (*a - *b).abs() < 2e-5,
+                "vision format composition index{i}: {a} != {b}"
+            );
+        }
+    }
+    assert!(quantized
+        .forward_with_attention(&[&dense_image], &mut attend)
+        .is_err());
     Ok(())
 }

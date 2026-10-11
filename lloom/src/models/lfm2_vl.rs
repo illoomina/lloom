@@ -30,6 +30,7 @@
 //! - `google/siglip2-so400m-patch16-naflex` — the tower's upstream checkpoint,
 //!   named in `text_config.mm_config_image_embedder.pretrained_model_name_or_path`.
 
+use crate::nn::linear::Projection;
 use crate::nn::{layer_norm, linear, LayerNorm, Linear, VarBuilder};
 use lloom_tensor::{DType, Device, Result, Tensor, D};
 
@@ -364,10 +365,13 @@ impl VisionEmbeddings {
 /// The SigLIP2-NaFlex vision tower.
 #[derive(Debug, Clone)]
 pub struct VisionTower {
+    inner: VisionTowerCore<Linear>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VisionTowerCore<P> {
     embeddings: VisionEmbeddings,
-    /// `siglip.rs`'s encoder, composed rather than reimplemented. See the note
-    /// above the `TransformerConfig` impl.
-    encoder: super::siglip::Encoder,
+    encoder: super::siglip::Encoder<P>,
     post_layernorm: LayerNorm,
 }
 
@@ -382,24 +386,139 @@ impl VisionTower {
             vb_m.pp("post_layernorm"),
         )?;
         Ok(Self {
-            embeddings,
+            inner: VisionTowerCore {
+                embeddings,
+                encoder,
+                post_layernorm,
+            },
+        })
+    }
+
+    pub(crate) fn into_inner(self) -> VisionTowerCore<Linear> {
+        self.inner
+    }
+    /// The patch projection alone, for a staged parity gate.
+    pub fn patch_embed_only(&self, patches: &Tensor) -> Result<Tensor> {
+        self.inner.patch_embed_only(patches)
+    }
+    /// Patch projection plus position embeddings, before the encoder.
+    pub fn embeddings_only(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+        self.inner.embeddings_only(patches, rows, cols)
+    }
+    /// Full padded embedding intermediate, including the chosen position tail.
+    pub fn embeddings_with_padding(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+        padding: VisionPositionPadding,
+    ) -> Result<Tensor> {
+        self.inner
+            .embeddings_with_padding(patches, rows, cols, padding)
+    }
+    /// Additive policy entry. Existing `forward` remains the unpadded dense path.
+    /// Mask is passed unchanged to the monomorphized callback; caller owns its
+    /// numerical semantics, compact representation and whole-pass admission.
+    /// Encode one image's patches to `[1, rows*cols, hidden]`.
+    ///
+    /// `patches` is `[1, rows*cols, C*P*P]` in row-major patch order. There is
+    /// no padding at this entry point, so no attention mask is needed — see the
+    /// module docs on why the single-tile path is exact without one.
+    pub fn forward_with_attention<F>(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+        padding: VisionPositionPadding,
+        attention_mask: Option<&Tensor>,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner
+            .forward_with_attention(patches, rows, cols, padding, attention_mask, attend)
+    }
+    pub fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+        self.inner.forward(patches, rows, cols)
+    }
+}
+
+impl<P: Projection> VisionTowerCore<P> {
+    pub(crate) fn from_components(
+        cfg: &VisionConfig,
+        patch_embedding: Linear,
+        positions: Tensor,
+        encoder: super::siglip::Encoder<P>,
+        post_layernorm: LayerNorm,
+    ) -> Result<Self> {
+        let hidden = cfg.hidden_size;
+        let patch_elems =
+            checked_vision_product(&[cfg.num_channels, cfg.patch_size, cfg.patch_size])?;
+        let side = cfg.pos_embed_side();
+        checked_vision_product(&[cfg.num_patches, hidden, std::mem::size_of::<f32>()])?;
+        if hidden == 0
+            || patch_elems == 0
+            || side == 0
+            || checked_vision_product(&[side, side])? != cfg.num_patches
+            || patch_embedding.weight().dims() != [hidden, patch_elems]
+            || positions.dims() != [cfg.num_patches, hidden]
+            || post_layernorm.weight().dims() != [hidden]
+            || !post_layernorm.remove_mean()
+            || !post_layernorm.eps().is_finite()
+            || post_layernorm.eps() <= 0.
+            || !matches!(positions.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        {
+            lloom_tensor::bail!(
+                "vision components need positive compatible projection/position/norm geometry"
+            )
+        }
+        for t in std::iter::once(patch_embedding.weight())
+            .chain(patch_embedding.bias())
+            .chain(std::iter::once(post_layernorm.weight()))
+            .chain(post_layernorm.bias())
+        {
+            if t.dtype() != positions.dtype() || !t.device().same_device(positions.device()) {
+                lloom_tensor::bail!("vision component dtype/device mismatch")
+            }
+        }
+        if patch_embedding.bias().is_some_and(|b| b.dims() != [hidden])
+            || post_layernorm.bias().is_some_and(|b| b.dims() != [hidden])
+        {
+            lloom_tensor::bail!("vision component bias width mismatch")
+        }
+        let pos_table = positions
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(Self {
+            embeddings: VisionEmbeddings {
+                patch_embedding,
+                pos_table,
+                pos_side: side,
+                hidden,
+            },
             encoder,
             post_layernorm,
         })
     }
-
     /// The patch projection alone, for a staged parity gate.
-    pub fn patch_embed_only(&self, patches: &Tensor) -> Result<Tensor> {
+    pub(crate) fn patch_embed_only(&self, patches: &Tensor) -> Result<Tensor> {
         patches.apply(&self.embeddings.patch_embedding)
     }
 
     /// Patch projection plus position embeddings, before the encoder.
-    pub fn embeddings_only(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    pub(crate) fn embeddings_only(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor> {
         self.embeddings.forward(patches, rows, cols)
     }
 
     /// Full padded embedding intermediate, including the chosen position tail.
-    pub fn embeddings_with_padding(
+    pub(crate) fn embeddings_with_padding(
         &self,
         patches: &Tensor,
         rows: usize,
@@ -413,7 +532,7 @@ impl VisionTower {
     /// Additive policy entry. Existing `forward` remains the unpadded dense path.
     /// Mask is passed unchanged to the monomorphized callback; caller owns its
     /// numerical semantics, compact representation and whole-pass admission.
-    pub fn forward_with_attention<F>(
+    pub(crate) fn forward_with_attention<F>(
         &self,
         patches: &Tensor,
         rows: usize,
@@ -439,7 +558,7 @@ impl VisionTower {
     /// `patches` is `[1, rows*cols, C*P*P]` in row-major patch order. There is
     /// no padding at this entry point, so no attention mask is needed — see the
     /// module docs on why the single-tile path is exact without one.
-    pub fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    pub(crate) fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
         let xs = self.embeddings.forward(patches, rows, cols)?;
         let xs = self.encoder.forward(&xs, None)?;
         xs.apply(&self.post_layernorm)
@@ -449,13 +568,17 @@ impl VisionTower {
 /// The multi-modal projector: `pixel_unshuffle` then a two-layer MLP.
 #[derive(Debug, Clone)]
 pub struct MultiModalProjector {
+    inner: ProjectorCore<Linear>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectorCore<P> {
     layer_norm: Option<LayerNorm>,
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: P,
+    linear_2: P,
     act: crate::nn::Activation,
     factor: usize,
 }
-
 impl MultiModalProjector {
     pub fn new(cfg: &Lfm2VlConfig, text_hidden_size: usize, vb: VarBuilder) -> Result<Self> {
         let in_channels = cfg.vision_config.hidden_size * cfg.downsample_factor.pow(2);
@@ -492,14 +615,66 @@ impl MultiModalProjector {
             )
         };
         Ok(Self {
-            layer_norm,
-            linear_1: l1,
-            linear_2: l2,
-            act: cfg.projector_hidden_act,
-            factor: cfg.downsample_factor,
+            inner: ProjectorCore {
+                layer_norm,
+                linear_1: l1,
+                linear_2: l2,
+                act: cfg.projector_hidden_act,
+                factor: cfg.downsample_factor,
+            },
         })
     }
 
+    pub(crate) fn into_inner(self) -> ProjectorCore<Linear> {
+        self.inner
+    }
+    /// `image_features` is `[1, rows, cols, vision_hidden]` — the tower's output
+    /// folded back to its 2-D patch layout. Returns `[n_tokens, text_hidden]`.
+    pub fn forward(&self, image_features: &Tensor) -> Result<Tensor> {
+        self.inner.forward(image_features)
+    }
+}
+impl<P: Projection> ProjectorCore<P> {
+    pub(crate) fn from_components(
+        linear_1: P,
+        linear_2: P,
+        act: crate::nn::Activation,
+        factor: usize,
+        layer_norm: Option<LayerNorm>,
+    ) -> Result<Self> {
+        let (middle, input) = linear_1.dimensions()?;
+        let (output, input2) = linear_2.dimensions()?;
+        let group = checked_vision_product(&[factor, factor])?;
+        if group == 0
+            || middle == 0
+            || input == 0
+            || output == 0
+            || input2 != middle
+            || input % group != 0
+            || linear_1
+                .projection_bias()
+                .is_some_and(|b| b.dims() != [middle])
+            || linear_2
+                .projection_bias()
+                .is_some_and(|b| b.dims() != [output])
+            || layer_norm.as_ref().is_some_and(|n| {
+                n.weight().dims() != [input]
+                    || n.bias().is_some_and(|b| b.dims() != [input])
+                    || !n.remove_mean()
+                    || !n.eps().is_finite()
+                    || n.eps() <= 0.
+            })
+        {
+            lloom_tensor::bail!("projector components need positive matching dimensions and factor")
+        }
+        Ok(Self {
+            layer_norm,
+            linear_1,
+            linear_2,
+            act,
+            factor,
+        })
+    }
     /// `xs` is `[1, rows, cols, hidden]`; the result is
     /// `[1, ceil(cols/f), ceil(rows/f), hidden * f^2]`.
     ///
@@ -522,7 +697,7 @@ impl MultiModalProjector {
 
     /// `image_features` is `[1, rows, cols, vision_hidden]` — the tower's output
     /// folded back to its 2-D patch layout. Returns `[n_tokens, text_hidden]`.
-    pub fn forward(&self, image_features: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, image_features: &Tensor) -> Result<Tensor> {
         let xs = self.pixel_unshuffle(image_features)?;
         let xs = match self.layer_norm.as_ref() {
             None => xs,

@@ -3691,14 +3691,6 @@ impl VerifyWords {
     }
 }
 
-fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
-    let head_dim = cfg.head_dim();
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
-        .collect()
-}
-
 impl<P: Profile> crate::nn::model::CacheShare for State<P> {
     fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize> {
         State::<P>::share_prefix_from(self, src, n_tokens)
@@ -4005,15 +3997,13 @@ impl<P: Profile> State<P> {
             }
         }
 
-        let theta = calculate_default_inv_freq(config);
-        let theta = Tensor::new(theta, device)?;
-
-        let idx_theta = Tensor::arange(0, config.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
+        let (cos, sin) = crate::nn::rotary_emb::default_rope_tables(
+            config.head_dim(),
+            config.rope_theta,
+            config.max_position_embeddings,
+            dtype,
+            device,
+        )?;
 
         let num_layers = config.num_hidden_layers;
         let kv = kv(slab, num_layers)?;

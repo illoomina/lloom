@@ -3,9 +3,10 @@
 //! Backend attention and request admission are supplied by the loaded owner.
 use super::host::{checked_host_capacity, prepared_vec};
 use crate::nn::blocks::{Neox, Rope, SwiGlu};
+use crate::nn::linear::ContiguousInput;
 use crate::nn::short_conv::{Centered, ShortConv};
 use crate::nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
-use crate::quantized_nn::Linear as QuantizedLinear;
+type QuantizedLinear = ContiguousInput<crate::quantized_nn::Linear>;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Module, Result, Tensor};
 
@@ -227,12 +228,21 @@ impl Gqa {
     }
 }
 
+fn qlinear(
+    input: usize,
+    output: usize,
+    vb: crate::quantized_var_builder::VarBuilder,
+) -> Result<QuantizedLinear> {
+    Ok(ContiguousInput::new(crate::quantized_nn::linear_no_bias(
+        input, output, vb,
+    )?))
+}
+
 impl Gqa<QuantizedLinear> {
     fn load_gguf(
         cfg: &ResolvedTextConfig,
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
-        use crate::quantized_nn::linear_no_bias as qlinear;
         let d = cfg.hidden_size;
         let hd = d / cfg.num_attention_heads;
         let kv = product(&[cfg.num_key_value_heads, hd])?;
@@ -633,7 +643,6 @@ impl QuantizedTrunk {
         cfg: ResolvedTextConfig,
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
-        use crate::quantized_nn::linear_no_bias as qlinear;
         let intermediate = Self::validate_config(&cfg)?;
         let d = cfg.hidden_size;
         let embedding = Embedding::new(

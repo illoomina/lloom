@@ -32,7 +32,7 @@ fn matrix(out: usize, input: usize, seed: usize) -> Result<Tensor> {
         &Device::Cpu,
     )
 }
-fn core() -> Result<DecisionCore> {
+fn weights() -> Result<HashMap<String, Tensor>> {
     let mut w = HashMap::new();
     w.insert("encoder.embed_tokens.weight".into(), matrix(8, D, 0)?);
     for (name, out, input, seed) in [
@@ -102,7 +102,13 @@ fn core() -> Result<DecisionCore> {
             Tensor::zeros(D, DType::F32, &Device::Cpu)?,
         );
     }
-    DecisionCore::load(cfg(), VarBuilder::from_tensors(w, DType::F32, &Device::Cpu))
+    Ok(w)
+}
+fn core() -> Result<DecisionCore> {
+    DecisionCore::load(
+        cfg(),
+        VarBuilder::from_tensors(weights()?, DType::F32, &Device::Cpu),
+    )
 }
 // Dense math is confined to this fixed tiny fixture; never a production policy.
 fn head_attention(
@@ -326,4 +332,195 @@ fn outer_limit_rejects_before_weight_loading() {
         .unwrap_err();
         assert!(err.to_string().contains("outer maximum"));
     }
+}
+
+// GGUF batch-vs-isolated composition control, not an independent arithmetic or
+// official-checkpoint oracle. Existing scalar block fixtures cover arithmetic.
+#[test]
+fn gguf_core_shares_request_identity_padding_and_marker_semantics() -> Result<()> {
+    use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::io::Cursor;
+    let mut tuning = lloom_tensor::tuning::Tuning::default();
+    tuning.cpu.num_threads = 1;
+    tuning.qmm.dequantize_all = false;
+    tuning.qmm.dequantize_all_f16 = false;
+    lloom_tensor::tuning::install(tuning)
+        .expect("isolated GGUF core fixture (nextest or exact filter)");
+    assert_eq!(lloom_tensor::utils::barrier_pool().n_workers(), 0);
+    eprintln!("BOUNDED_BARRIER_WORKERS=0");
+    let aliases = [
+        ("encoder.embed_tokens", "token_embd"),
+        ("encoder.embedding_norm", "token_embd_norm"),
+        ("encoder.layers.0.conv.in_proj", "blk.0.shortconv.in_proj"),
+        ("encoder.layers.0.conv.out_proj", "blk.0.shortconv.out_proj"),
+        ("encoder.layers.0.conv.conv", "blk.0.shortconv.conv"),
+        ("encoder.layers.0.operator_norm", "blk.0.attn_norm"),
+        ("encoder.layers.0.ffn_norm", "blk.0.ffn_norm"),
+        ("encoder.layers.0.feed_forward.w1", "blk.0.ffn_gate"),
+        ("encoder.layers.0.feed_forward.w3", "blk.0.ffn_up"),
+        ("encoder.layers.0.feed_forward.w2", "blk.0.ffn_down"),
+        ("encoder.layers.1.self_attn.q_proj", "blk.1.attn_q"),
+        ("encoder.layers.1.self_attn.k_proj", "blk.1.attn_k"),
+        ("encoder.layers.1.self_attn.v_proj", "blk.1.attn_v"),
+        ("encoder.layers.1.self_attn.out_proj", "blk.1.attn_output"),
+        (
+            "encoder.layers.1.self_attn.q_layernorm",
+            "blk.1.attn_q_norm",
+        ),
+        (
+            "encoder.layers.1.self_attn.k_layernorm",
+            "blk.1.attn_k_norm",
+        ),
+        ("encoder.layers.1.operator_norm", "blk.1.attn_norm"),
+        ("encoder.layers.1.ffn_norm", "blk.1.ffn_norm"),
+        ("encoder.layers.1.feed_forward.w1", "blk.1.ffn_gate"),
+        ("encoder.layers.1.feed_forward.w3", "blk.1.ffn_up"),
+        ("encoder.layers.1.feed_forward.w2", "blk.1.ffn_down"),
+        ("head.type_emb", "token_types"),
+        ("head.head.layers.0.self_attn.in_proj", "blk.2.attn_qkv"),
+        ("head.head.layers.0.self_attn.out_proj", "blk.2.attn_output"),
+        ("head.head.layers.0.linear1", "blk.2.ffn_up"),
+        ("head.head.layers.0.linear2", "blk.2.ffn_down"),
+        ("head.head.layers.0.norm1", "blk.2.attn_norm"),
+        ("head.head.layers.0.norm2", "blk.2.ffn_norm"),
+        ("head.scorer.0", "cls.norm"),
+        ("head.scorer.1", "cls"),
+        ("head.scorer.3", "cls.output"),
+    ];
+    let mut tensors = Vec::new();
+    let mut q8_count = 0;
+    for (name, tensor) in weights()? {
+        let (base, suffix) = aliases
+            .iter()
+            .find_map(|(old, new)| {
+                let separator = if old.ends_with("in_proj") && old.starts_with("head.") {
+                    "_"
+                } else {
+                    "."
+                };
+                name.strip_prefix(&format!("{old}{separator}"))
+                    .map(|suffix| (*new, suffix))
+            })
+            .unwrap();
+        let tensor = if base == "blk.0.shortconv.conv" {
+            tensor.squeeze(1)?
+        } else {
+            tensor
+        };
+        let dtype = if suffix == "weight"
+            && tensor.rank() == 2
+            && !["token_embd", "token_types", "blk.0.shortconv.conv"].contains(&base)
+        {
+            q8_count += 1;
+            GgmlDType::Q8_0
+        } else {
+            GgmlDType::F32
+        };
+        tensors.push((
+            format!("{base}.{suffix}"),
+            QTensor::quantize(&tensor, dtype)?,
+        ));
+    }
+    assert_eq!(q8_count, 18);
+    assert_eq!(tensors.len(), 40);
+    tensors.sort_by(|a, b| a.0.cmp(&b.0));
+    let entries: Vec<_> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let mut bytes = Cursor::new(Vec::new());
+    gguf_file::write(&mut bytes, &[], &entries)?;
+    assert!(bytes.get_ref().len() < 256 * 1024);
+    let vb =
+        crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
+    let text = ResolvedTextConfig {
+        vocab_size: 8,
+        hidden_size: D,
+        intermediate_size: D,
+        num_hidden_layers: 2,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        layer_types: vec!["conv".into(), "full_attention".into()],
+        norm_eps: 1e-5,
+        conv_l_cache: 3,
+        max_position_embeddings: 32,
+        rope_theta: 1e6,
+    };
+    let config = ResolvedDecisionCoreConfig {
+        text,
+        head_layers: 1,
+        max_length: 8,
+    };
+    let model = QuantizedDecisionCore::load(config.clone(), vb.clone())?;
+    let prefix = matrix(2, D, 21)?.unsqueeze(0)?;
+    let rows = [
+        DecisionRow {
+            tokens: &[1, 2],
+            markers: &[1, 0],
+            question_type: 0,
+            prefix: Some(&prefix),
+        },
+        DecisionRow {
+            tokens: &[3, 4, 5],
+            markers: &[2],
+            question_type: 2,
+            prefix: None,
+        },
+    ];
+    let prepared = model.prepare_rows(&rows)?;
+    assert_eq!(prepared.dimensions(), (2, 4, 3));
+    assert_eq!(prepared.option_counts(), [2, 1]);
+    assert_eq!(prepared.input_tokens(), 7);
+    let actual = model
+        .forward_with_attention(&prepared, &mut trunk_attention, &mut head_attention)?
+        .to_vec2::<f32>()?;
+    assert_eq!(actual.len(), 2);
+    assert!(actual.iter().all(|row| row.len() == 2));
+    assert_eq!(actual[1][1], -1e4);
+    // Bypass Core preparation/forward: each question has no padding and joins
+    // its prefix directly. The quantized blocks themselves are shared here.
+    for (i, row) in rows.iter().enumerate() {
+        let text = model.inner.trunk.embed(row.tokens, 1, row.tokens.len())?;
+        let (hidden, p) = if let Some(prefix) = row.prefix {
+            (Tensor::cat(&[prefix, &text], 1)?, prefix.dim(1)?)
+        } else {
+            (text, 0)
+        };
+        let total = hidden.dim(1)?;
+        let trunk = model.inner.trunk.prepare_batch(total, &[total], &[p])?;
+        let h = model.inner.trunk.forward_with_attention(
+            &hidden,
+            &trunk,
+            &model.inner.cos.narrow(0, 0, total)?,
+            &model.inner.sin.narrow(0, 0, total)?,
+            &mut trunk_attention,
+        )?;
+        let text = h.narrow(1, p, row.tokens.len())?;
+        let head = model.inner.head.prepare_batch(
+            row.tokens.len(),
+            &[row.tokens.len()],
+            &[row.markers],
+            &[row.question_type],
+        )?;
+        let expected = model
+            .inner
+            .head
+            .forward_with_attention(&text, &head, &mut head_attention)?
+            .to_vec2::<f32>()?;
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].len(), row.markers.len());
+        for (j, &e) in expected[0].iter().enumerate() {
+            assert!(
+                (actual[i][j] - e).abs() < 2e-4,
+                "GGUF Core row{i} marker{j}: {} != {e}",
+                actual[i][j]
+            );
+        }
+    }
+    let foreign = QuantizedDecisionCore::load(config, vb)?;
+    assert!(foreign
+        .forward_with_attention(&prepared, &mut trunk_attention, &mut head_attention)
+        .is_err());
+    assert!(model
+        .clone()
+        .forward_with_attention(&prepared, &mut trunk_attention, &mut head_attention)
+        .is_ok());
+    Ok(())
 }

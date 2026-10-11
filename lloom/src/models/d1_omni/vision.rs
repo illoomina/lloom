@@ -166,7 +166,8 @@ pub struct Vision {
 }
 impl Vision {
     /// `vb` is rooted at the checkpoint's `vision` namespace. The caller selects
-    /// safetensors/GGUF and propagates admitted allocation ownership in the device.
+    /// safetensors/GGUF and establishes the shared load/allocation context.
+    /// Device identity alone is not model-domain identity.
     /// Checkpoint tensor names remain separately verified at family loader time.
     pub fn load(
         cfg: &VisionConfig,

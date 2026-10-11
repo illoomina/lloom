@@ -392,7 +392,8 @@ impl ConformerLayer {
 }
 
 /// Loaded learned audio encoder, adapter and residual. No waveform decode or
-/// host/device fallback is hidden here. Model-domain ownership comes from vb.
+/// host/device fallback is hidden here. VarBuilder supplies dtype/device, not
+/// a ModelDomain; the eventual factory must establish shared load/pass scopes.
 #[derive(Debug)]
 pub struct AudioEncoder {
     cfg: AudioConfig,

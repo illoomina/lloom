@@ -16,4 +16,7 @@ mod vision;
 pub use vision::{PreparedVisionImage, Vision, VisionImagePlan};
 
 mod audio;
-pub use audio::{AudioConfig, AudioEncoder, RelativeAttentionPlan, RelativeInputs, RelativeScratch};
+pub use audio::{
+    AudioConfig, AudioEncoder, FrontendScratch, MelFeatures, MelFrontend, RelativeAttentionPlan,
+    RelativeInputs, RelativeScratch,
+};

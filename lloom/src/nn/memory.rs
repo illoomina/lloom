@@ -356,6 +356,96 @@ impl LoadContext {
     }
 }
 
+/// A loaded value and its existing model allocation namespace.
+///
+/// This generalizes the omni factory owner; it does not create a second domain
+/// or infer ownership from a native device. The caller obtains `LoadContext`
+/// from the existing family admission/predictor before any producer runs.
+///
+/// Source integration only: ordinary allocator, native custody, host metadata,
+/// and worker enrollment must be complete before a factory enables this route.
+/// CPU/CUDA producers are not yet enrolled and are refused before `producer`.
+/// This temporary activation guard is not the final backend support contract.
+pub struct Loaded<T> {
+    // Drop value-owned tensors/tables before the namespace. Physical charges
+    // and pending native retirement retain their own origin independently.
+    value: T,
+    #[cfg(feature = "metal")]
+    allocations: lloom_tensor::metal_backend::MetalAllocationDomain,
+}
+
+impl<T> Loaded<T> {
+    /// Construct inside the supplied load scope, including eager weight builders.
+    /// `producer` receives the resolved device and the same context for explicit
+    /// host tickets. Returning from this synchronous callback closes unused load
+    /// issuance; workers must finish/settle before returning, not inherit TLS.
+    ///
+    /// Checked representability and actual load prediction remain the caller's
+    /// obligations. A context alone does not enroll an unmodified producer.
+    pub fn new(
+        device: &Device,
+        load: LoadContext,
+        producer: impl FnOnce(&Device, &AllocationContext) -> Result<T>,
+    ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = device {
+            let allocations = lloom_tensor::metal_backend::MetalAllocationDomain::new(
+                device,
+                load.domain().clone(),
+            )?;
+            let context = load.allocations();
+            let scope = allocations.scope(context.clone())?;
+            let value =
+                scope.run(|resolved| producer(&Device::Metal(resolved.clone()), &context))?;
+            let domain = load.finish();
+            debug_assert_eq!(allocations.domain().key(), domain.key());
+            return Ok(Self { value, allocations });
+        }
+        let _ = (device, load, producer);
+        lloom_tensor::bail!(
+            "admitted loading requires enrolled allocator producers; CPU/CUDA enrollment is pending"
+        )
+    }
+
+    /// Reserve a whole pass from the SAME model domain, then enter its namespace.
+    /// The context is provided for explicit host tickets and worker propagation;
+    /// it is not an independent entitlement or a worker-lifetime extension.
+    /// Metal workers use the existing namespace-bound `AllocationWorker`: capture
+    /// the service inside load scope, then capture/run each request inside this
+    /// pass scope. Sending `AllocationContext` alone does not carry that namespace.
+    ///
+    /// `predicted_extra` must cover all simultaneous and asynchronously retained
+    /// allocations, not only one tile's scratch. Workers must release borrowed
+    /// work before this callback returns. Dropping the pass cancels future
+    /// issuance; already-issued charges remain with outputs/native retirement.
+    /// This method does not serialize a model's executor or make failure rollback
+    /// transactional; the embedding/engine caller owns those obligations.
+    pub fn with_pass<U>(
+        &self,
+        predicted_extra: usize,
+        execute: impl FnOnce(&T, &AllocationContext) -> Result<U>,
+    ) -> Result<U> {
+        #[cfg(feature = "metal")]
+        {
+            let pass = self
+                .allocations
+                .domain()
+                .reserve(predicted_extra)
+                .map_err(lloom_tensor::Error::wrap)?;
+            let context = pass.context();
+            let scope = self.allocations.scope(context.clone())?;
+            let output = scope.run(|_| execute(&self.value, &context));
+            drop(pass);
+            output
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (predicted_extra, execute, &self.value);
+            lloom_tensor::bail!("admitted execution backend enrollment is pending")
+        }
+    }
+}
+
 impl MachineLoad {
     /// Shared gate/log path. Add the exact pool term ONCE and retain its checked
     /// total for the load promise; neither public route reconstructs that sum.
@@ -449,6 +539,38 @@ mod load_context_tests {
             kv_tokens: 1,
             prefill_tile: 1,
         }
+    }
+
+    /// Until CPU producer enrollment exists, the new route must refuse before
+    /// calling any eager producer and cancel its existing load promise. This is
+    /// a numeric ownership control, not a tensor/native allocation test.
+    #[test]
+    fn loaded_unenrolled_cpu_refuses_before_producer_and_cancels_load() {
+        let load = off()
+            .admit_context(&Device::Cpu, Peak::new().with("weights", 12), Some(12))
+            .unwrap();
+        let domain = load.domain().clone();
+        let context = load.allocations();
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 12,
+                committed: 0
+            }
+        );
+        let calls = std::cell::Cell::new(0usize);
+        let result = Loaded::new(&Device::Cpu, load, |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unenrolled CPU producer was enabled"),
+        };
+        assert!(error.to_string().contains("CPU/CUDA enrollment is pending"));
+        assert_eq!(calls.get(), 0);
+        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
 
     #[test]

@@ -126,12 +126,50 @@ fn explicit_cache_continues_tiles_and_retains_long_suffixes() -> Result<()> {
         for suffix in [
             &[4, 5, 1, 2, 3, 4, 5, 6, 7][..],
             &[7, 2, 6, 1, 5, 3, 4, 0, 2][..],
+            &[4, 5, 1, 2, 3, 4, 5, 6][..],
+            &[7, 2, 6, 1, 5, 3, 4, 0][..],
         ] {
             cache.restore_retained(&saved)?;
-            let actual = run(&model, &mut cache, suffix, 3)?;
-            let all = prefix.iter().chain(suffix).copied().collect::<Vec<_>>();
-            let expected = run(&model, &mut model.new_cache()?, &all, 1)?;
-            close(&actual, &expected);
+            let mut consumed = 0;
+            for chunk in suffix.chunks(3) {
+                let actual = run(&model, &mut cache, chunk, 3)?;
+                consumed += chunk.len();
+                let all = prefix
+                    .iter()
+                    .chain(&suffix[..consumed])
+                    .copied()
+                    .collect::<Vec<_>>();
+                let mut reference = model.new_cache()?;
+                let expected = run(&model, &mut reference, &all, 1)?;
+                // A full final tile can hide lost history in the logits.
+                // Pin the carried window independently at every tile boundary.
+                for (layer, (actual, expected)) in
+                    cache.layers.iter().zip(&reference.layers).enumerate()
+                {
+                    if let LayerState::ShortConv(Some(b)) = expected {
+                        let LayerState::ShortConv(Some(a)) = actual else {
+                            panic!("carried convolution state missing layer={layer}");
+                        };
+                        assert_eq!(a.dims(), &[1, 4, 3]);
+                        assert_eq!(a.dims(), b.dims());
+                        for (slot, (a, b)) in a
+                            .flatten_all()?
+                            .to_vec1::<f32>()?
+                            .iter()
+                            .zip(b.flatten_all()?.to_vec1::<f32>()?)
+                            .enumerate()
+                        {
+                            assert!(
+                                (a - b).abs() < 3e-5,
+                                "carried convolution mismatch layer={layer} slot={slot} prefix={} suffix={consumed}: {a} != {b}",
+                                prefix.len(),
+                            );
+                        }
+                    }
+                }
+                close(&actual, &expected);
+            }
+            assert_eq!(consumed, suffix.len());
         }
         cache.reset();
         assert!(cache.restore_retained(&saved).is_err());

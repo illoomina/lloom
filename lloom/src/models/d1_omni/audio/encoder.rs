@@ -2,6 +2,7 @@
 //! normalized mel; the loaded family supplies admission and attention policy.
 use super::relative::RelativeInputs;
 use crate::models::siglip::Mlp;
+use crate::nn::linear::{ContiguousInput, Projection};
 use crate::nn::{
     batch_norm, conv1d, conv2d, layer_norm, linear, linear_no_bias, Activation, BatchNorm,
     ChannelAffine, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
@@ -121,9 +122,9 @@ enum SubsampleOp {
     Relu,
 }
 #[derive(Debug)]
-struct Subsampling {
+struct Subsampling<P = Linear> {
     ops: Vec<SubsampleOp>,
-    output: Linear,
+    output: P,
 }
 impl Subsampling {
     fn load(cfg: &AudioConfig, vb: VarBuilder) -> Result<Self> {
@@ -154,6 +155,8 @@ impl Subsampling {
             output: linear(product(&[c, freq])?, cfg.d_model, vb.pp("out"))?,
         })
     }
+}
+impl<P: Module> Subsampling<P> {
     fn forward(&self, mel: &Tensor, valid: usize) -> Result<(Tensor, usize)> {
         let mut t = mel.dim(2)?;
         let mut n = valid;
@@ -200,12 +203,12 @@ impl Subsampling {
 }
 
 #[derive(Debug)]
-struct RelativeProjection {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    p: Linear,
-    out: Linear,
+struct RelativeProjection<P = Linear> {
+    q: P,
+    k: P,
+    v: P,
+    p: P,
+    out: P,
     u: Tensor,
     v_bias: Tensor,
     heads: usize,
@@ -228,6 +231,8 @@ impl RelativeProjection {
             width,
         })
     }
+}
+impl<P: Module> RelativeProjection<P> {
     fn forward<F>(&self, x: &Tensor, pos: &Tensor, valid: usize, attend: &mut F) -> Result<Tensor>
     where
         F: FnMut(RelativeInputs<'_>) -> Result<Tensor>,
@@ -333,9 +338,8 @@ impl ConvModule<ChannelAffine> {
         let d = cfg.d_model;
         let twice = product(&[2, d])?;
         let k = cfg.conv_kernel_size;
-        let weight = |shape: &[usize], name: &str| -> Result<Tensor> {
-            vb.get(shape, name)?.dequantize(vb.device())
-        };
+        let weight =
+            |shape: &[usize], name: &str| -> Result<Tensor> { float_weight(&vb, shape, name) };
         let input = Conv1d::new(
             weight(&[twice, d], "conv_pw1.weight")?.unsqueeze(2)?,
             Some(weight(&[twice], "conv_pw1.bias")?),
@@ -385,15 +389,15 @@ impl<N: ChannelNormalization> ConvModule<N> {
     }
 }
 #[derive(Debug)]
-struct ConformerLayer {
+struct ConformerLayer<P = Linear, N = BatchNorm> {
     norm_ff1: LayerNorm,
-    ff1: Mlp,
+    ff1: Mlp<P>,
     norm_att: LayerNorm,
-    att: RelativeProjection,
+    att: RelativeProjection<P>,
     norm_conv: LayerNorm,
-    conv: ConvModule,
+    conv: ConvModule<N>,
     norm_ff2: LayerNorm,
-    ff2: Mlp,
+    ff2: Mlp<P>,
     norm_out: LayerNorm,
 }
 impl ConformerLayer {
@@ -428,6 +432,8 @@ impl ConformerLayer {
             norm_out: layer_norm(d, 1e-5, vb.pp("norm_out"))?,
         })
     }
+}
+impl<P: Projection, N: ChannelNormalization> ConformerLayer<P, N> {
     fn forward<F>(
         &self,
         x: &Tensor,
@@ -459,15 +465,20 @@ impl ConformerLayer {
 /// a ModelDomain; the eventual factory must establish shared load/pass scopes.
 #[derive(Debug)]
 pub struct AudioEncoder {
+    inner: AudioInner<Linear, BatchNorm>,
+}
+
+#[derive(Debug)]
+struct AudioInner<P, N> {
     cfg: AudioConfig,
     out: usize,
-    subsample: Subsampling,
-    layers: Vec<ConformerLayer>,
+    subsample: Subsampling<P>,
+    layers: Vec<ConformerLayer<P, N>>,
     positions: Tensor,
     adapter_norm: LayerNorm,
-    adapter: Mlp,
+    adapter: Mlp<P>,
     residual_norm: LayerNorm,
-    residual: Mlp,
+    residual: Mlp<P>,
     dtype: DType,
     device: Device,
 }
@@ -480,54 +491,78 @@ impl AudioEncoder {
         let layers = (0..cfg.n_layers)
             .map(|i| ConformerLayer::load(&cfg, vb.pp(format!("encoder.layers.{i}"))))
             .collect::<Result<Vec<_>>>()?;
-        // Source specifically builds F32 on CPU, even for a device/half model.
-        // Frequencies use exp, not the pow-based default RoPE generator, and
-        // layout is interleaved, not Whisper/Gemma's concatenated halves.
-        let index =
-            Tensor::arange_step(0u32, d as u32, 2u32, &Device::Cpu)?.to_dtype(DType::F32)?;
-        let inv = index.affine(-(10000f64).ln() / d as f64, 0.)?.exp()?;
-        let pos = Tensor::arange_step(
-            (MAX_ENCODED_FRAMES - 1) as f32,
-            -(MAX_ENCODED_FRAMES as f32),
-            -1f32,
-            &Device::Cpu,
-        )?;
-        let angles = pos.unsqueeze(1)?.broadcast_mul(&inv.unsqueeze(0)?)?;
-        let positions = Tensor::stack(&[angles.sin()?, angles.cos()?], 2)?
-            .flatten_from(1)?
-            .unsqueeze(0)?
-            .to_device(vb.device())?
-            .to_dtype(vb.dtype())?;
+        let positions = relative_positions(d, vb.dtype(), vb.device())?;
         Ok(Self {
-            adapter_norm: layer_norm(d, 1e-5, vb.pp("adapter.norm"))?,
-            adapter: mlp(
-                d,
+            inner: AudioInner {
+                adapter_norm: layer_norm(d, 1e-5, vb.pp("adapter.norm"))?,
+                adapter: mlp(
+                    d,
+                    out,
+                    out,
+                    "linear_1",
+                    "linear_2",
+                    Activation::Gelu,
+                    vb.pp("adapter"),
+                )?,
+                residual_norm: layer_norm(out, 1e-5, vb.pp("residual.ln"))?,
+                residual: mlp(
+                    out,
+                    cfg.residual_width,
+                    out,
+                    "down",
+                    "up",
+                    Activation::Gelu,
+                    vb.pp("residual"),
+                )?,
+                dtype: vb.dtype(),
+                device: vb.device().clone(),
+                cfg,
                 out,
-                out,
-                "linear_1",
-                "linear_2",
-                Activation::Gelu,
-                vb.pp("adapter"),
-            )?,
-            residual_norm: layer_norm(out, 1e-5, vb.pp("residual.ln"))?,
-            residual: mlp(
-                out,
-                cfg.residual_width,
-                out,
-                "down",
-                "up",
-                Activation::Gelu,
-                vb.pp("residual"),
-            )?,
-            dtype: vb.dtype(),
-            device: vb.device().clone(),
-            cfg,
-            out,
-            subsample,
-            layers,
-            positions,
+                subsample,
+                layers,
+                positions,
+            },
         })
     }
+    /// Input is one already-normalized mel clip[1,F,T] in the model dtype.
+    /// `valid` is the frontend's floor(samples/hop), not its extra STFT endpoint.
+    /// Caller reserves the complete load/pass and asynchronous retirement, not
+    /// merely each relative-attention row's scratch. This API is not admission.
+    pub fn forward_with_attention<F>(
+        &self,
+        mel: &Tensor,
+        valid: usize,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(RelativeInputs<'_>) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(mel, valid, attend)
+    }
+}
+
+fn relative_positions(d: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    // Source specifically builds F32 on CPU, even for a device/half model.
+    // Frequencies use exp, not the pow-based default RoPE generator, and
+    // layout is interleaved, not Whisper/Gemma's concatenated halves.
+    let index = Tensor::arange_step(0u32, d as u32, 2u32, &Device::Cpu)?.to_dtype(DType::F32)?;
+    let inv = index.affine(-(10000f64).ln() / d as f64, 0.)?.exp()?;
+    let pos = Tensor::arange_step(
+        (MAX_ENCODED_FRAMES - 1) as f32,
+        -(MAX_ENCODED_FRAMES as f32),
+        -1f32,
+        &Device::Cpu,
+    )?;
+    let angles = pos.unsqueeze(1)?.broadcast_mul(&inv.unsqueeze(0)?)?;
+    let positions = Tensor::stack(&[angles.sin()?, angles.cos()?], 2)?
+        .flatten_from(1)?
+        .unsqueeze(0)?
+        .to_device(device)?
+        .to_dtype(dtype)?;
+    Ok(positions)
+}
+
+impl<P: Projection, N: ChannelNormalization> AudioInner<P, N> {
     /// Input is one already-normalized mel clip[1,F,T] in the model dtype.
     /// `valid` is the frontend's floor(samples/hop), not its extra STFT endpoint.
     /// Caller reserves the complete load/pass and asynchronous retirement, not
@@ -581,6 +616,199 @@ impl AudioEncoder {
             lloom_tensor::bail!("omni audio output shape mismatch")
         }
         Ok(output)
+    }
+}
+
+type QuantizedLinear = ContiguousInput<crate::quantized_nn::Linear>;
+type QuantizedVarBuilder = crate::quantized_var_builder::VarBuilder;
+
+fn qlinear(
+    input: usize,
+    output: usize,
+    bias: bool,
+    vb: QuantizedVarBuilder,
+) -> Result<QuantizedLinear> {
+    Ok(ContiguousInput::new(crate::quantized_nn::linear_b(
+        input, output, bias, vb,
+    )?))
+}
+
+fn qmlp(
+    input: usize,
+    hidden: usize,
+    output: usize,
+    a: &str,
+    b: &str,
+    act: Activation,
+    vb: QuantizedVarBuilder,
+) -> Result<Mlp<QuantizedLinear>> {
+    Ok(Mlp::from_parts(
+        qlinear(input, hidden, true, vb.pp(a))?,
+        qlinear(hidden, output, true, vb.pp(b))?,
+        act,
+    ))
+}
+
+/// Converter keeps these convolution coefficients in F32. Check both the
+/// stored geometry and dtype before any dequantization or singleton restoration.
+fn float_weight(vb: &QuantizedVarBuilder, shape: &[usize], name: &str) -> Result<Tensor> {
+    product(&[product(shape)?, 4])?;
+    let weight = vb.get(shape, name)?;
+    if weight.dtype() != lloom_tensor::quantized::GgmlDType::F32 {
+        lloom_tensor::bail!("omni audio convolution coefficient {name} must be F32")
+    }
+    weight.dequantize(vb.device())
+}
+
+impl Subsampling<QuantizedLinear> {
+    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
+        let c = cfg.subsampling_conv_channels;
+        let mut ops = Vec::with_capacity(8);
+        for (index, input, kernel, stride, groups, relu) in [
+            (0, 1, 3, 2, 1, true),
+            (2, c, 3, 2, c, false),
+            (3, c, 1, 1, 1, true),
+            (5, c, 3, 2, c, false),
+            (6, c, 1, 1, 1, true),
+        ] {
+            let w = float_weight(
+                &vb,
+                &[c, input / groups, kernel, kernel],
+                &format!("a.conv1d.{index}.weight"),
+            )?;
+            let b = float_weight(&vb, &[c, 1, 1], &format!("a.conv1d.{index}.bias"))?.reshape(c)?;
+            ops.push(SubsampleOp::Conv(Conv2d::new(
+                w,
+                Some(b),
+                Conv2dConfig {
+                    stride,
+                    padding: kernel / 2,
+                    groups,
+                    ..Default::default()
+                },
+            )));
+            if relu {
+                ops.push(SubsampleOp::Relu);
+            }
+        }
+        let freq = ceil_half(ceil_half(ceil_half(cfg.feat_in)));
+        Ok(Self {
+            ops,
+            output: qlinear(
+                product(&[c, freq])?,
+                cfg.d_model,
+                true,
+                vb.pp("a.pre_encode.out"),
+            )?,
+        })
+    }
+}
+
+impl RelativeProjection<QuantizedLinear> {
+    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
+        let d = cfg.d_model;
+        let h = cfg.n_heads;
+        let width = d / h;
+        Ok(Self {
+            q: qlinear(d, d, true, vb.pp("attn_q"))?,
+            k: qlinear(d, d, true, vb.pp("attn_k"))?,
+            v: qlinear(d, d, true, vb.pp("attn_v"))?,
+            p: qlinear(d, d, false, vb.pp("linear_pos"))?,
+            out: qlinear(d, d, true, vb.pp("attn_out"))?,
+            u: vb.get((h, width), "pos_bias_u")?.dequantize(vb.device())?,
+            v_bias: vb.get((h, width), "pos_bias_v")?.dequantize(vb.device())?,
+            heads: h,
+            width,
+        })
+    }
+}
+
+impl ConformerLayer<QuantizedLinear, ChannelAffine> {
+    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
+        use crate::quantized_nn::layer_norm as norm;
+        let d = cfg.d_model;
+        let ff = product(&[d, cfg.ff_expansion_factor])?;
+        Ok(Self {
+            norm_ff1: norm(d, 1e-5, vb.pp("ffn_norm"))?,
+            ff1: qmlp(d, ff, d, "ffn_up", "ffn_down", Activation::Silu, vb.clone())?,
+            norm_att: norm(d, 1e-5, vb.pp("ln1"))?,
+            att: RelativeProjection::<QuantizedLinear>::load_gguf(cfg, vb.clone())?,
+            norm_conv: norm(d, 1e-5, vb.pp("norm_conv"))?,
+            conv: ConvModule::<ChannelAffine>::load_gguf(cfg, vb.clone())?,
+            norm_ff2: norm(d, 1e-5, vb.pp("ffn_norm_1"))?,
+            ff2: qmlp(
+                d,
+                ff,
+                d,
+                "ffn_up_1",
+                "ffn_down_1",
+                Activation::Silu,
+                vb.clone(),
+            )?,
+            norm_out: norm(d, 1e-5, vb.pp("ln2"))?,
+        })
+    }
+}
+
+/// Official mmproj audio namespace, preserving Python masking and final crop.
+/// The caller owns the shared checkpoint map, model Domain and load/pass scopes.
+#[derive(Debug)]
+pub(crate) struct QuantizedAudioEncoder {
+    inner: AudioInner<QuantizedLinear, ChannelAffine>,
+}
+impl QuantizedAudioEncoder {
+    pub(crate) fn load(cfg: AudioConfig, out: usize, vb: QuantizedVarBuilder) -> Result<Self> {
+        use crate::quantized_nn::layer_norm as norm;
+        cfg.validate(out, DType::F32)?;
+        product(&[
+            cfg.n_layers,
+            std::mem::size_of::<ConformerLayer<QuantizedLinear, ChannelAffine>>(),
+        ])?;
+        let d = cfg.d_model;
+        let subsample = Subsampling::<QuantizedLinear>::load_gguf(&cfg, vb.clone())?;
+        let layers = (0..cfg.n_layers)
+            .map(|i| {
+                ConformerLayer::<QuantizedLinear, ChannelAffine>::load_gguf(
+                    &cfg,
+                    vb.pp(format!("a.blk.{i}")),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let positions = relative_positions(d, DType::F32, vb.device())?;
+        Ok(Self {
+            inner: AudioInner {
+                adapter_norm: norm(d, 1e-5, vb.pp("mm.a.mlp.0"))?,
+                adapter: qmlp(d, out, out, "1", "3", Activation::Gelu, vb.pp("mm.a.mlp"))?,
+                residual_norm: norm(out, 1e-5, vb.pp("mm.a.mlp.4"))?,
+                residual: qmlp(
+                    out,
+                    cfg.residual_width,
+                    out,
+                    "5",
+                    "6",
+                    Activation::Gelu,
+                    vb.pp("mm.a.mlp"),
+                )?,
+                dtype: DType::F32,
+                device: vb.device().clone(),
+                cfg,
+                out,
+                subsample,
+                layers,
+                positions,
+            },
+        })
+    }
+    pub(crate) fn forward_with_attention<F>(
+        &self,
+        mel: &Tensor,
+        valid: usize,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(RelativeInputs<'_>) -> Result<Tensor>,
+    {
+        self.inner.forward_with_attention(mel, valid, attend)
     }
 }
 

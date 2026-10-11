@@ -68,8 +68,8 @@ fn compare(t: &Tensor, expected: &Value, n: usize, tolerance: f64, label: &str) 
 #[test]
 fn learned_audio_matches_scalar_padded_stages_and_cropped_prefix() -> Result<()> {
     let (encoder, data) = fixture()?;
-    assert_eq!(encoder.positions.dims(), [1, 751, 4]);
-    let positions = encoder.positions.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(encoder.inner.positions.dims(), [1, 751, 4]);
+    let positions = encoder.inner.positions.flatten_all()?.to_vec1::<f32>()?;
     for row in [0usize, 375, 750] {
         let position = 375f64 - row as f64;
         for pair in 0..2 {
@@ -89,7 +89,7 @@ fn learned_audio_matches_scalar_padded_stages_and_cropped_prefix() -> Result<()>
         let real = ceil_half(ceil_half(ceil_half(valid)));
         assert_eq!(computed, real + 1);
         let mel = Tensor::from_vec(floats(&case["mel"]), (1, 8, time), &Device::Cpu)?;
-        let (sub, n) = encoder.subsample.forward(&mel, valid)?;
+        let (sub, n) = encoder.inner.subsample.forward(&mel, valid)?;
         assert_eq!(n, real);
         assert_eq!(sub.dims(), [1, computed, 4]);
         compare(
@@ -115,9 +115,11 @@ fn learned_audio_matches_scalar_padded_stages_and_cropped_prefix() -> Result<()>
         );
         // Full encoder intermediate is compared to an independent scalar
         // oracle, including padded rows; this is not new-vs-new equivalence.
-        let pos = encoder
-            .positions
-            .narrow(1, MAX_ENCODED_FRAMES - computed, 2 * computed - 1)?;
+        let pos =
+            encoder
+                .inner
+                .positions
+                .narrow(1, MAX_ENCODED_FRAMES - computed, 2 * computed - 1)?;
         let mask = Tensor::from_vec(
             (0..computed)
                 .map(|i| u8::from(i < real))
@@ -127,7 +129,7 @@ fn learned_audio_matches_scalar_padded_stages_and_cropped_prefix() -> Result<()>
         )?;
         let zero = Tensor::zeros((1, 1, computed), DType::F32, &Device::Cpu)?;
         let mut hidden = sub;
-        for layer in &encoder.layers {
+        for layer in &encoder.inner.layers {
             hidden = layer.forward(&hidden, &pos, real, &mask, &zero, &mut |input| {
                 RelativeAttentionPlan::new(input)?.execute()
             })?;
@@ -219,7 +221,7 @@ fn gguf_folded_channel_norm_composes_existing_convolution_loop() -> Result<()> {
     use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
     use std::io::Cursor;
     let (encoder, _) = fixture()?;
-    let old = &encoder.layers[0].conv;
+    let old = &encoder.inner.layers[0].conv;
     let (gamma, beta) = old.norm.weight_and_bias().unwrap();
     // Emulate the pinned converter once at fixture generation, not in load.
     let a = gamma.div(&(old.norm.running_var() + old.norm.eps())?.sqrt()?)?;
@@ -250,7 +252,7 @@ fn gguf_folded_channel_norm_composes_existing_convolution_loop() -> Result<()> {
         crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
     assert!(!vb.contains_key("a.blk.0.conv_norm.running_mean"));
     assert!(!vb.contains_key("a.blk.0.conv_norm.running_var"));
-    let folded = ConvModule::<ChannelAffine>::load_gguf(&encoder.cfg, vb.pp("a.blk.0"))?;
+    let folded = ConvModule::<ChannelAffine>::load_gguf(&encoder.inner.cfg, vb.pp("a.blk.0"))?;
     assert_eq!(folded.input.weight().dims(), [8, 4, 1]);
     assert_eq!(folded.depth.weight().dims(), [4, 1, 3]);
     assert_eq!(folded.output.weight().dims(), [4, 4, 1]);
@@ -285,6 +287,189 @@ fn gguf_folded_channel_norm_composes_existing_convolution_loop() -> Result<()> {
                 "folded convolution valid{valid} index{i}: {a} != {b}"
             );
         }
+    }
+    Ok(())
+}
+
+/// F32 format assembly, not packed-Q8 arithmetic or official-checkpoint parity.
+#[test]
+fn gguf_audio_namespace_and_fold_match_scalar_padded_and_cropped_reference() -> Result<()> {
+    use lloom_tensor::quantized::{gguf_file, GgmlDType, QTensor};
+    use std::io::Cursor;
+    if std::env::var("CANDLE_NUM_THREADS").as_deref() == Ok("1") {
+        let workers = lloom_tensor::utils::barrier_pool().n_workers();
+        eprintln!("BOUNDED_BARRIER_WORKERS={workers}");
+        assert_eq!(workers, 0);
+    }
+    let data: Value = serde_json::from_str(include_str!("scalar_fixture.json")).unwrap();
+    let cfg: AudioConfig = serde_json::from_value(data["config"].clone()).unwrap();
+    let weights = data["weights"].as_object().unwrap();
+    assert_eq!(weights.len(), 63);
+    let bn = "fixture.audio.encoder.layers.0.conv.batch_norm.";
+    let gamma = floats(&weights[&format!("{bn}weight")]["data"]);
+    let beta = floats(&weights[&format!("{bn}bias")]["data"]);
+    let mean = floats(&weights[&format!("{bn}running_mean")]["data"]);
+    let var = floats(&weights[&format!("{bn}running_var")]["data"]);
+    let scale: Vec<f32> = gamma
+        .iter()
+        .zip(&var)
+        .map(|(g, v)| g / (v + 1e-5f32).sqrt())
+        .collect();
+    let bias: Vec<f32> = beta
+        .iter()
+        .zip(&mean)
+        .zip(&scale)
+        .map(|((b, m), a)| b - m * a)
+        .collect();
+    // Literal aliases from the pinned converter/mapping, independent of loader lookup.
+    let aliases = [
+        ("encoder.pre_encode.conv.", "a.conv1d."),
+        ("encoder.pre_encode.out", "a.pre_encode.out"),
+        ("encoder.layers.0.norm_feed_forward1", "a.blk.0.ffn_norm"),
+        ("encoder.layers.0.norm_feed_forward2", "a.blk.0.ffn_norm_1"),
+        ("encoder.layers.0.norm_self_att", "a.blk.0.ln1"),
+        ("encoder.layers.0.norm_out", "a.blk.0.ln2"),
+        ("encoder.layers.0.norm_conv", "a.blk.0.norm_conv"),
+        ("encoder.layers.0.feed_forward1.linear1", "a.blk.0.ffn_up"),
+        ("encoder.layers.0.feed_forward1.linear2", "a.blk.0.ffn_down"),
+        ("encoder.layers.0.feed_forward2.linear1", "a.blk.0.ffn_up_1"),
+        (
+            "encoder.layers.0.feed_forward2.linear2",
+            "a.blk.0.ffn_down_1",
+        ),
+        ("encoder.layers.0.self_attn.linear_q", "a.blk.0.attn_q"),
+        ("encoder.layers.0.self_attn.linear_k", "a.blk.0.attn_k"),
+        ("encoder.layers.0.self_attn.linear_v", "a.blk.0.attn_v"),
+        ("encoder.layers.0.self_attn.linear_out", "a.blk.0.attn_out"),
+        (
+            "encoder.layers.0.self_attn.linear_pos",
+            "a.blk.0.linear_pos",
+        ),
+        (
+            "encoder.layers.0.self_attn.pos_bias_u",
+            "a.blk.0.pos_bias_u",
+        ),
+        (
+            "encoder.layers.0.self_attn.pos_bias_v",
+            "a.blk.0.pos_bias_v",
+        ),
+        ("encoder.layers.0.conv.pointwise_conv1", "a.blk.0.conv_pw1"),
+        ("encoder.layers.0.conv.pointwise_conv2", "a.blk.0.conv_pw2"),
+        ("encoder.layers.0.conv.depthwise_conv", "a.blk.0.conv_dw"),
+        ("encoder.layers.0.conv.batch_norm", "a.blk.0.conv_norm"),
+        ("adapter.norm", "mm.a.mlp.0"),
+        ("adapter.linear_1", "mm.a.mlp.1"),
+        ("adapter.linear_2", "mm.a.mlp.3"),
+        ("residual.ln", "mm.a.mlp.4"),
+        ("residual.down", "mm.a.mlp.5"),
+        ("residual.up", "mm.a.mlp.6"),
+    ];
+    let mut tensors = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (original, value) in weights {
+        if original.ends_with("running_mean") || original.ends_with("running_var") {
+            continue;
+        }
+        let short = original.strip_prefix("fixture.audio.").unwrap();
+        let matches: Vec<_> = aliases
+            .iter()
+            .filter(|(from, _)| short.starts_with(*from))
+            .collect();
+        assert_eq!(matches.len(), 1, "one canonical mapping for {short}");
+        let (from, to) = matches[0];
+        let name = format!("{to}{}", &short[from.len()..]);
+        assert!(names.insert(name.clone()));
+        let mut shape: Vec<usize> = value["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as usize)
+            .collect();
+        let values = if original == &format!("{bn}weight") {
+            scale.clone()
+        } else if original == &format!("{bn}bias") {
+            bias.clone()
+        } else {
+            floats(&value["data"])
+        };
+        if short.starts_with("encoder.pre_encode.conv.") && short.ends_with(".bias") {
+            shape.extend([1, 1]);
+        }
+        if short.contains("conv.pointwise_conv") && short.ends_with(".weight") {
+            assert_eq!(shape.pop(), Some(1));
+        }
+        if short.contains("conv.depthwise_conv") && short.ends_with(".weight") {
+            assert_eq!(shape.remove(1), 1);
+        }
+        let t = Tensor::from_vec(values, shape.as_slice(), &Device::Cpu)?;
+        tensors.push((name, QTensor::quantize(&t, GgmlDType::F32)?));
+    }
+    assert_eq!(tensors.len(), 61);
+    let entries: Vec<_> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let mut bytes = Cursor::new(Vec::new());
+    gguf_file::write(&mut bytes, &[], &entries)?;
+    assert!(bytes.get_ref().len() < 16 * 1024);
+    let vb = QuantizedVarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
+    let encoder = QuantizedAudioEncoder::load(cfg, 4, vb)?;
+    assert_eq!(encoder.inner.positions.dims(), [1, 751, 4]);
+    for case in data["cases"].as_array().unwrap() {
+        let time = case["time"].as_u64().unwrap() as usize;
+        let valid = case["valid"].as_u64().unwrap() as usize;
+        let computed = ceil_half(ceil_half(ceil_half(time)));
+        let real = ceil_half(ceil_half(ceil_half(valid)));
+        assert_eq!(computed, real + 1);
+        let mel = Tensor::from_vec(floats(&case["mel"]), (1, 8, time), &Device::Cpu)?;
+        let (sub, n) = encoder.inner.subsample.forward(&mel, valid)?;
+        assert_eq!(n, real);
+        compare(
+            &sub,
+            &case["subsample"],
+            computed * 4,
+            3e-6,
+            "GGUF padded subsample",
+        )?;
+        let pos =
+            encoder
+                .inner
+                .positions
+                .narrow(1, MAX_ENCODED_FRAMES - computed, 2 * computed - 1)?;
+        let mask = Tensor::from_vec(
+            (0..computed)
+                .map(|i| u8::from(i < real))
+                .collect::<Vec<_>>(),
+            (1, 1, computed),
+            &Device::Cpu,
+        )?;
+        let zero = Tensor::zeros((1, 1, computed), DType::F32, &Device::Cpu)?;
+        let mut hidden = sub;
+        for layer in &encoder.inner.layers {
+            hidden = layer.forward(&hidden, &pos, real, &mask, &zero, &mut |input| {
+                RelativeAttentionPlan::new(input)?.execute()
+            })?;
+        }
+        compare(
+            &hidden,
+            &case["encoded_full"],
+            computed * 4,
+            2e-5,
+            "GGUF full Conformer",
+        )?;
+        let mut calls = 0;
+        let output = encoder.forward_with_attention(&mel, valid, &mut |input| {
+            calls += 1;
+            assert_eq!(input.content_query.dims(), [1, 2, computed, 2]);
+            assert_eq!(input.valid, real);
+            RelativeAttentionPlan::new(input)?.execute()
+        })?;
+        assert_eq!(calls, 1);
+        assert_eq!(output.dims(), [1, real, 4]);
+        compare(
+            &output,
+            &case["output"],
+            real * 4,
+            2e-5,
+            "GGUF cropped adapter residual",
+        )?;
     }
     Ok(())
 }

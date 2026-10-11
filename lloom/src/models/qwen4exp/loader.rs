@@ -672,76 +672,7 @@ fn plan_slots<Rd: Read + Seek>(
         0usize
     };
     #[cfg(feature = "metal")]
-    let slots = {
-        use lloom_tensor::kernels::metal::ledger::{
-            arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
-        };
-        let fixed = |id: u32, name: &str, bytes: usize, unit: usize, class: Class| TenantRow {
-            id: TenantId(id),
-            name: name.to_string(),
-            claim: Claim {
-                floor: bytes,
-                want: bytes,
-                unit: unit.max(1),
-                class,
-            },
-            held: 0,
-        };
-        let mut rows = vec![fixed(
-            1,
-            "qwen4exp-resident",
-            plan.resident_bytes,
-            1 << 20,
-            Class::Capability,
-        )];
-        for (i, c) in claims.iter().enumerate() {
-            let class = if c.capability {
-                Class::Capability
-            } else {
-                Class::Scratch
-            };
-            rows.push(fixed(2 + i as u32, c.name, c.bytes, c.unit, class));
-        }
-        let experts = TenantId(100);
-        rows.push(TenantRow {
-            id: experts,
-            name: "qwen4exp-experts".to_string(),
-            claim: Claim {
-                floor: (cfg.n_experts_per_tok + 1) * per_slot,
-                want: cfg.n_experts * per_slot,
-                unit: per_slot,
-                class: Class::Cache,
-            },
-            held: 0,
-        });
-        if plan.working_set == 0 {
-            0
-        } else {
-            match arbitrate(plan.budget(), &rows) {
-                Arbitration::Granted(grants) => grants
-                    .iter()
-                    .find(|g| g.id == experts)
-                    .map_or(0, |g| g.bytes / per_slot),
-                Arbitration::Refused { floors, quota } => {
-                    let gb = |b: usize| b as f64 / 1e9;
-                    lloom_tensor::bail!(
-                        "the streamed load does not fit: the floors alone — the resident tier \
-                     {:.2} GB, the session's claims {:.2} GB, the pool's {} slots {:.2} GB — \
-                     are {:.2} GB against a budget of {:.2} GB ({fraction} x \
-                     recommendedMaxWorkingSetSize {:.2} GB): a smaller context, a smaller \
-                     tile, or a larger fraction",
-                        gb(plan.resident_bytes),
-                        gb(reserve_bytes),
-                        cfg.n_experts_per_tok + 1,
-                        gb((cfg.n_experts_per_tok + 1) * per_slot),
-                        gb(floors),
-                        gb(quota),
-                        gb(plan.working_set),
-                    )
-                }
-            }
-        }
-    };
+    let slots = arbitrate_slots(&plan, cfg, fraction, claims, reserve_bytes)?;
     let slots = slots.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
     Ok(SlotPlan {
         slots,
@@ -749,6 +680,98 @@ fn plan_slots<Rd: Read + Seek>(
         resident_bytes: plan.resident_bytes,
         expert_bytes_per_slot: plan.expert_bytes_per_slot,
         reserve_bytes,
+    })
+}
+
+// Pure production loader policy, also compiled by CPU unit tests. No model
+// load or native object is needed to exercise the real Refused consumer.
+#[cfg(any(feature = "metal", test))]
+fn arbitrate_slots(
+    plan: &LoadPlan,
+    cfg: &Config,
+    fraction: f64,
+    claims: &[SessionClaim],
+    reserve_bytes: usize,
+) -> Result<usize> {
+    use lloom_tensor::memory_arbitration::{
+        arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
+    };
+    let per_slot = plan.expert_bytes_per_slot.max(1);
+    let min_slots = cfg
+        .n_experts_per_tok
+        .checked_add(1)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor overflows usize".into()))?;
+    let expert_floor = min_slots
+        .checked_mul(per_slot)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor bytes overflow usize".into()))?;
+    let expert_want = cfg
+        .n_experts
+        .checked_mul(per_slot)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot want bytes overflow usize".into()))?;
+    let fixed = |id: u32, name: &str, bytes: usize, unit: usize, class: Class| TenantRow {
+        id: TenantId(id),
+        name: name.to_string(),
+        claim: Claim {
+            floor: bytes,
+            want: bytes,
+            unit: unit.max(1),
+            class,
+        },
+        held: 0,
+    };
+    let mut rows = vec![fixed(
+        1,
+        "qwen4exp-resident",
+        plan.resident_bytes,
+        1 << 20,
+        Class::Capability,
+    )];
+    for (i, c) in claims.iter().enumerate() {
+        let class = if c.capability {
+            Class::Capability
+        } else {
+            Class::Scratch
+        };
+        rows.push(fixed(2 + i as u32, c.name, c.bytes, c.unit, class));
+    }
+    let experts = TenantId(100);
+    rows.push(TenantRow {
+        id: experts,
+        name: "qwen4exp-experts".to_string(),
+        claim: Claim {
+            floor: expert_floor,
+            want: expert_want,
+            unit: per_slot,
+            class: Class::Cache,
+        },
+        held: 0,
+    });
+    Ok(if plan.working_set == 0 {
+        0
+    } else {
+        match arbitrate(plan.budget(), &rows) {
+            Arbitration::Granted(grants) => grants
+                .iter()
+                .find(|g| g.id == experts)
+                .map_or(0, |g| g.bytes / per_slot),
+            Arbitration::Refused { floors, quota } => {
+                let gb = |b: usize| b as f64 / 1e9;
+                lloom_tensor::bail!(
+                    "the streamed load does not fit: the floors alone — the resident tier \
+                 {:.2} GB, the session's claims {:.2} GB, the pool's {} slots {:.2} GB — \
+                 are {:.2} GB against a budget of {:.2} GB ({fraction} x \
+                 recommendedMaxWorkingSetSize {:.2} GB): a smaller context, a smaller \
+                 tile, or a larger fraction",
+                    gb(plan.resident_bytes),
+                    gb(reserve_bytes),
+                    min_slots,
+                    gb(expert_floor),
+                    floors as f64 / 1e9,
+                    gb(quota),
+                    gb(plan.working_set),
+                )
+            }
+        }
     })
 }
 
@@ -1620,6 +1643,48 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_arbitration_loader_consumer_handles_wide_refusal_and_overflow() {
+        let mut cfg = Config::tiny();
+        cfg.n_experts_per_tok = 1;
+        cfg.n_experts = 4;
+        let mut plan = LoadPlan {
+            resident_bytes: 0,
+            expert_bytes_per_slot: 1,
+            expert_bytes_total: 4,
+            slots: None,
+            working_set: 4,
+            fraction: 1.0,
+        };
+        assert_eq!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0).unwrap(), 4);
+        plan.working_set = 3;
+        assert_eq!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0).unwrap(), 3);
+        plan.resident_bytes = usize::MAX;
+        let err = arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("floors alone"), "{err}");
+        assert!(err.contains("against a budget"), "{err}");
+        plan.resident_bytes = 0;
+        cfg.n_experts_per_tok = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("floor overflows"));
+        cfg.n_experts_per_tok = 1;
+        plan.expert_bytes_per_slot = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("floor bytes overflow"));
+        cfg.n_experts_per_tok = 0;
+        plan.expert_bytes_per_slot = 2;
+        cfg.n_experts = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("want bytes overflow"));
+    }
     use super::*;
 
     /// Holding a layer's experts whole (the MTP head, `qwen4exp.mtp_experts

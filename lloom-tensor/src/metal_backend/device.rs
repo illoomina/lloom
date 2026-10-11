@@ -935,8 +935,8 @@ impl MetalDevice {
             return a;
         }
         let ask = |committed: usize| {
-            self.ledger
-                .admit_machine(committed.saturating_add(need) as u64)
+            let target = crate::memory_arbitration::machine_target(committed, need)?;
+            self.ledger.admit_machine(target)
         };
         let mut asked = ask(a.committed);
         if asked.is_err() {
@@ -963,8 +963,9 @@ impl MetalDevice {
     }
 
     fn admit_quota(&self, need: usize, budget: usize) -> PassAdmission {
+        use crate::memory_arbitration::{fits_budget, reclaim_target};
         let committed = self.ledger.committed();
-        if committed.saturating_add(need) <= budget {
+        if fits_budget(committed, need, budget) {
             return PassAdmission {
                 committed,
                 reclaimed: 0,
@@ -977,7 +978,7 @@ impl MetalDevice {
         let mut reclaimed = self.trim_unused_buffers();
         let mut committed = self.ledger.committed();
         let mut drained = false;
-        if committed.saturating_add(need) > budget && admission_drain_on() {
+        if !fits_budget(committed, need, budget) && admission_drain_on() {
             drained = true;
             self.ledger.note_drain();
             // The second rung: what the host released and the GPU may still
@@ -992,12 +993,12 @@ impl MetalDevice {
             }
         }
         let mut pledged = 0;
-        if committed.saturating_add(need) > budget {
+        if !fits_budget(committed, need, budget) {
             // The third rung (§4.2, caches yield): the tenants that can
             // shrink pledge units — the expert tier's slots — until the
             // shortfall is covered or none can give more. The pledge is
             // applied by the tenants' owner, which asks again.
-            let short = committed.saturating_add(need) - budget;
+            let short = reclaim_target(committed, need, budget);
             pledged = self.ledger.yield_for(short);
             committed = self.ledger.committed();
         }
@@ -1007,7 +1008,7 @@ impl MetalDevice {
             reclaimed,
             pledged,
             drained,
-            fits: committed.saturating_add(need) <= budget,
+            fits: fits_budget(committed, need, budget),
             machine: None,
         }
     }

@@ -73,6 +73,13 @@ pub mod isolation;
 pub mod layout;
 pub mod machine;
 mod memory_accounting;
+mod memory_accounting_machine;
+pub mod memory_arbitration;
+// Compile the actual production ledger and its lifecycle tests without Metal.
+// The ledger itself depends only on numeric accounting and machine ownership.
+#[cfg(all(test, not(feature = "metal")))]
+#[path = "kernels/metal/ledger.rs"]
+mod memory_ledger_cpu_tests;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their
 /// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).

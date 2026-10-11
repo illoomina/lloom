@@ -6,7 +6,20 @@
 //! backing/retirement wiring, NOT yet an enforcement path for Metal allocations.
 //! Reclaim and machine admission belong outside this lock. Native owners must
 //! retain PhysicalCharge until actual retirement, not merely Rust view drop.
+//!
+//! Lock scope: domain creation may grow the HashMap and allocate an Arc;
+//! commit allocates an Arc. The allocator and contended mutex may enter the
+//! OS. This is NOT an allocation-free or syscall-free critical section.
+//! No explicit native allocation, reclaim callback, or registry operation is
+//! performed while numeric state is locked. Machine growth runs after unlock;
+//! native allocation and reclaim remain outer-protocol operations.
+//! Promise, DomainInner and final PhysicalCharge destruction acquire this
+//! shared mutex. They must run on host retirement paths, NOT native completion
+//! callbacks. A callback may publish progress; it must not become the last
+//! owner of one of these tokens. Native resource/residency release must precede
+//! final charge retirement, even if GPU completion has already been observed.
 
+use crate::memory_accounting_machine::{MachineAdmission, MachineOwner};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,9 +61,11 @@ pub(crate) enum Scope {
     Domain,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Overflow,
+    DifferentDomain,
+    Machine(String),
     Limit {
         scope: Scope,
         limit: usize,
@@ -84,6 +99,24 @@ impl ProcessAccount {
     }
 
     pub fn domain(self: &Arc<Self>, quota: Option<usize>) -> Result<Domain, Refusal> {
+        self.make_domain(quota, None)
+    }
+
+    /// Internal bridge: consume one machine owner into exactly one domain.
+    /// Existing public loader/ledger attachment paths have not migrated here.
+    pub fn domain_with_machine(
+        self: &Arc<Self>,
+        quota: Option<usize>,
+        machine: MachineOwner,
+    ) -> Result<Domain, Refusal> {
+        self.make_domain(quota, Some(machine))
+    }
+
+    fn make_domain(
+        self: &Arc<Self>,
+        quota: Option<usize>,
+        machine: Option<MachineOwner>,
+    ) -> Result<Domain, Refusal> {
         let mut state = self.state.lock();
         let id = state.next_id;
         let next_id = id.checked_add(1).ok_or(Refusal::Overflow)?;
@@ -93,6 +126,7 @@ impl ProcessAccount {
             account: self.clone(),
             id,
             quota,
+            machine,
         })))
     }
 
@@ -108,6 +142,7 @@ struct DomainInner {
     account: Arc<ProcessAccount>,
     id: u64,
     quota: Option<usize>,
+    machine: Option<MachineOwner>,
 }
 
 impl Drop for DomainInner {
@@ -124,18 +159,42 @@ impl Domain {
     }
 
     pub fn try_reserve(&self, bytes: usize) -> Result<Promise, Refusal> {
+        self.reserve_with(bytes, |_| {})
+    }
+
+    // The hook permits deterministic scheduling AFTER publishing the intent
+    // and unlocking, before machine growth. Production's hook is empty.
+    fn reserve_with(
+        &self,
+        bytes: usize,
+        before_machine: impl FnOnce(u64),
+    ) -> Result<Promise, Refusal> {
         let mut state = self.0.account.state.lock();
         let own = state.domains[&self.0.id].reserve(bytes, self.0.quota, Scope::Domain)?;
         let total = state
             .total
             .reserve(bytes, self.0.account.cap, Scope::Process)?;
-        // No update until both scope checks succeed.
+        let target = u64::try_from(own.total()?).map_err(|_| Refusal::Overflow)?;
+        // No update until both scope checks and target conversion succeed.
         state.domains.insert(self.0.id, own);
         state.total = total;
-        Ok(Promise {
+        let mut promise = Promise {
             domain: self.clone(),
             remaining: bytes,
-        })
+            machine: None,
+        };
+        drop(state);
+        before_machine(target);
+        // Never hold the numeric mutex across registry/flock/host observation.
+        // On failure, the unpublished promise drops and cancels its intent.
+        if let Some(owner) = &self.0.machine {
+            promise.machine = Some(
+                owner
+                    .ensure_reserved(target)
+                    .map_err(|e| Refusal::Machine(e.to_string()))?,
+            );
+        }
+        Ok(promise)
     }
 }
 
@@ -143,9 +202,49 @@ impl Domain {
 pub(crate) struct Promise {
     domain: Domain,
     remaining: usize,
+    machine: Option<MachineAdmission>,
 }
 
 impl Promise {
+    /// None means this domain has no machine bridge, not machine coverage.
+    pub fn machine_admission(&self) -> Option<&MachineAdmission> {
+        self.machine.as_ref()
+    }
+
+    /// Partition already-admitted demand. No counter or machine target changes.
+    /// The child owns its domain even if the originating pass is canceled.
+    pub fn split(&mut self, bytes: usize) -> Result<Self, Refusal> {
+        if bytes > self.remaining {
+            return Err(Refusal::PromiseTooSmall {
+                remaining: self.remaining,
+                requested: bytes,
+            });
+        }
+        let child = Self {
+            domain: self.domain.clone(),
+            remaining: bytes,
+            machine: self.machine.clone(),
+        };
+        self.remaining -= bytes;
+        Ok(child)
+    }
+
+    /// Return an unused/partially consumed partition without releasing the
+    /// pass's admission. Failure changes neither owner. Charges already made
+    /// from `child` are NOT returned, only its unused remainder.
+    pub fn rejoin(&mut self, child: &mut Self) -> Result<(), Refusal> {
+        if !Arc::ptr_eq(&self.domain.0, &child.domain.0) {
+            return Err(Refusal::DifferentDomain);
+        }
+        let remaining = self
+            .remaining
+            .checked_add(child.remaining)
+            .ok_or(Refusal::Overflow)?;
+        self.remaining = remaining;
+        child.remaining = 0;
+        Ok(())
+    }
+
     /// Transfer already promised bytes, without a second quota charge.
     /// Caller must reserve a verified upper bound BEFORE native allocation.
     pub fn commit(&mut self, bytes: usize) -> Result<PhysicalCharge, Refusal> {
@@ -380,5 +479,265 @@ mod tests {
         assert_eq!(account.snapshot(), Snapshot::default());
         drop(charge);
         assert!(account.state.lock().domains.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod machine_bridge_tests {
+    use super::*;
+    use crate::machine::{Gate, GateConfig, Peak};
+    use std::path::PathBuf;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    struct RegistryDir(PathBuf);
+    impl RegistryDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "lloom-domain-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn gate(&self, available: u64) -> Gate {
+            Gate::new(GateConfig {
+                registry: Some(self.0.clone()),
+                available: Some(available),
+                total: Some(available),
+                reserve: Some(0),
+                ..Default::default()
+            })
+        }
+        fn owner(&self, label: &str, initial: u64) -> (MachineOwner, PathBuf) {
+            let admitted = self
+                .gate(10_000)
+                .admit(label, &Peak::new().with("numeric", initial))
+                .unwrap();
+            let path = admitted.holding.as_ref().unwrap().path().to_path_buf();
+            (MachineOwner::new(admitted).unwrap(), path)
+        }
+    }
+    impl Drop for RegistryDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn partition_return_preserves_admission_and_refuses_cross_domain_transfer() {
+        let account = ProcessAccount::new(Some(101));
+        let domain = account.domain(Some(100)).unwrap();
+        let other = account.domain(Some(1)).unwrap();
+        let mut parent = domain.try_reserve(100).unwrap();
+        let mut child = parent.split(40).unwrap();
+        let charge = child.commit(15).unwrap();
+        parent.rejoin(&mut child).unwrap();
+        assert_eq!(parent.remaining, 85);
+        assert_eq!(child.remaining, 0);
+        assert_eq!(
+            account.snapshot(),
+            Snapshot {
+                pending: 85,
+                committed: 15
+            }
+        );
+        assert!(parent.split(86).is_err());
+        assert_eq!(parent.remaining, 85);
+        let mut foreign = other.try_reserve(1).unwrap();
+        assert_eq!(parent.rejoin(&mut foreign), Err(Refusal::DifferentDomain));
+        assert_eq!((parent.remaining, foreign.remaining), (85, 1));
+        drop(foreign);
+        drop(child);
+        drop(parent);
+        assert_eq!(
+            account.snapshot(),
+            Snapshot {
+                pending: 0,
+                committed: 15
+            }
+        );
+        drop(charge);
+        assert_eq!(account.snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn canceled_pass_worker_and_physical_charge_keep_machine_owner_alive() {
+        let dir = RegistryDir::new();
+        let (owner, path) = dir.owner("cancel", 0);
+        let account = ProcessAccount::new(None);
+        let domain = account.domain_with_machine(None, owner).unwrap();
+        let mut pass = domain.try_reserve(100).unwrap();
+        let mut worker = pass.split(40).unwrap();
+        let (resume_tx, resume_rx) = channel();
+        let join = std::thread::spawn(move || {
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let physical = worker.commit(20).unwrap();
+            drop(worker); // unused 20 canceled, committed 20 stays owned
+            physical
+        });
+        drop(pass);
+        drop(domain);
+        assert_eq!(
+            account.snapshot(),
+            Snapshot {
+                pending: 40,
+                committed: 0
+            }
+        );
+        assert!(path.exists());
+        resume_tx.send(()).unwrap();
+        let charge = join.join().unwrap();
+        assert!(path.exists(), "worker result still owns physical bytes");
+        assert_eq!(
+            account.snapshot(),
+            Snapshot {
+                pending: 0,
+                committed: 20
+            }
+        );
+        drop(charge);
+        assert!(!path.exists(), "final charge releases holding on host");
+        assert_eq!(account.snapshot(), Snapshot::default());
+    }
+
+    #[test]
+    fn older_intent_never_shrinks_target_and_other_domain_pays_its_own_growth() {
+        let dir = RegistryDir::new();
+        let account = ProcessAccount::new(Some(200));
+        let (owner_a, path_a) = dir.owner("a", 0);
+        let (owner_b, path_b) = dir.owner("b", 0);
+        let a = account.domain_with_machine(Some(100), owner_a).unwrap();
+        let b = account.domain_with_machine(Some(150), owner_b).unwrap();
+        let (paused_tx, paused_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+        let cloned = a.clone();
+        let worker = std::thread::spawn(move || {
+            cloned
+                .reserve_with(30, |target| {
+                    assert_eq!(target, 30);
+                    // Reading snapshot here proves the account mutex was released.
+                    assert_eq!(cloned.snapshot().pending, 30);
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+                .unwrap()
+        });
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let newer = a.try_reserve(70).unwrap();
+        resume_tx.send(()).unwrap();
+        let older = worker.join().unwrap();
+        for promise in [&older, &newer] {
+            assert!(matches!(
+                promise.machine_admission(),
+                Some(MachineAdmission::Registered { reserved: 100, .. })
+            ));
+        }
+        let separate = b.try_reserve(80).unwrap();
+        assert!(matches!(
+            separate.machine_admission(),
+            Some(MachineAdmission::Registered { reserved: 80, .. })
+        ));
+        assert!(matches!(
+            b.try_reserve(21),
+            Err(Refusal::Limit {
+                scope: Scope::Process,
+                ..
+            })
+        )); // shared cap; unchanged owner
+        assert_eq!(account.snapshot().pending, 180);
+        drop(a);
+        drop(older);
+        drop(newer);
+        assert!(!path_a.exists());
+        assert!(path_b.exists(), "a's teardown cannot erase b's reservation");
+        drop(b);
+        drop(separate);
+        assert!(!path_b.exists());
+    }
+
+    #[test]
+    fn failed_growth_cancels_only_unpublished_intent_and_keeps_durable_target() {
+        let dir = RegistryDir::new();
+        let (owner, path) = dir.owner("rollback", 10);
+        let account = ProcessAccount::new(None);
+        let domain = account.domain_with_machine(None, owner).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            domain.try_reserve(20_000),
+            Err(Refusal::Machine(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(domain.snapshot(), Snapshot::default());
+        assert_eq!(account.snapshot(), Snapshot::default());
+        let good = domain.try_reserve(100).unwrap();
+        assert!(matches!(
+            good.machine_admission(),
+            Some(MachineAdmission::Registered {
+                reserved: 100,
+                growth: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(domain.snapshot().pending, 100);
+        drop(good);
+        drop(domain);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn force_and_off_are_explicit_not_machine_coverage_or_overflow_permission() {
+        let dir = RegistryDir::new();
+        let account = ProcessAccount::new(None);
+        let off = Gate::new(GateConfig {
+            off: true,
+            ..Default::default()
+        })
+        .admit("off", &Peak::new())
+        .unwrap();
+        let domain = account
+            .domain_with_machine(None, MachineOwner::new(off).unwrap())
+            .unwrap();
+        let p = domain.try_reserve(usize::MAX).unwrap();
+        assert!(matches!(p.machine_admission(), Some(MachineAdmission::Off)));
+        assert!(matches!(domain.try_reserve(1), Err(Refusal::Overflow)));
+        drop(p);
+        drop(domain);
+        let mut config = dir.gate(0).config().clone();
+        config.force = true;
+        let admitted = Gate::new(config.clone())
+            .admit("forced", &Peak::new().with("numeric", 1))
+            .unwrap();
+        let domain = account
+            .domain_with_machine(None, MachineOwner::new(admitted).unwrap())
+            .unwrap();
+        let p = domain.try_reserve(2).unwrap();
+        assert!(matches!(
+            p.machine_admission(),
+            Some(MachineAdmission::Registered {
+                forced: true,
+                reserved: 2,
+                ..
+            })
+        ));
+        drop(p);
+        drop(domain);
+        // Deliberate fixture: a file cannot be opened as a registry directory.
+        let blocked = dir.0.join("not-a-directory");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        config.registry = Some(blocked);
+        let unregistered = Gate::new(config)
+            .admit("unregistered", &Peak::new().with("numeric", 1))
+            .unwrap();
+        let domain = account
+            .domain_with_machine(None, MachineOwner::new(unregistered).unwrap())
+            .unwrap();
+        let p = domain.try_reserve(2).unwrap();
+        assert!(matches!(p.machine_admission(),
+            Some(MachineAdmission::ForcedUnregistered { initial }) if initial.forced));
     }
 }

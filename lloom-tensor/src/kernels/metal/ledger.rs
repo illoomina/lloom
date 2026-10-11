@@ -22,40 +22,9 @@ use std::sync::{Arc, Weak};
 
 use crate::machine::Holding;
 
-/// What a tenant's memory is to the process (§2 principle 5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Class {
-    /// Chosen by the caller (a context, a row count, a tile): refused when
-    /// it does not fit, never silently reduced.
-    Capability,
-    /// Shrinks under pressure and refills later (expert slots, free lists,
-    /// quarantines, staging spares).
-    Cache,
-    /// Per-pass transients.
-    Scratch,
-}
-
-impl Class {
-    pub fn name(self) -> &'static str {
-        match self {
-            Class::Capability => "capability",
-            Class::Cache => "cache",
-            Class::Scratch => "scratch",
-        }
-    }
-}
-
-/// A tenant's claim on the quota, in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Claim {
-    /// Below this the tenant cannot work; a capability's floor is a refusal.
-    pub floor: usize,
-    /// What it would use if memory were free.
-    pub want: usize,
-    /// It grows and shrinks in these steps.
-    pub unit: usize,
-    pub class: Class,
-}
+pub use crate::memory_arbitration::{
+    arbitrate, Arbitration, Claim, Class, Grant, LedgerSnapshot, TenantId, TenantRow,
+};
 
 /// A holder of memory the ledger can ask about. Reads must be cheap: the
 /// snapshot runs on a report, never on a step, but a tenant's `claim` and
@@ -113,10 +82,6 @@ impl Tenant for Gauge {
     }
 }
 
-/// A registered tenant's handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TenantId(pub u32);
-
 /// Bytes committed for the life of the holder: released on drop, so the
 /// ledger's committed figure is a sum of what exists.
 #[must_use = "a reservation released at once accounts for nothing"]
@@ -137,68 +102,6 @@ impl Drop for Reservation {
         self.ledger
             .committed
             .fetch_sub(self.bytes, Ordering::AcqRel);
-    }
-}
-
-/// One tenant's row in a snapshot.
-#[derive(Clone, Debug)]
-pub struct TenantRow {
-    pub id: TenantId,
-    pub name: String,
-    pub claim: Claim,
-    pub held: usize,
-}
-
-/// The ledger at one instant.
-#[derive(Clone, Debug, Default)]
-pub struct LedgerSnapshot {
-    /// `fraction × recommendedMaxWorkingSetSize`; 0 until the binary sets it.
-    pub quota: usize,
-    /// Bytes under live reservations.
-    pub committed: usize,
-    /// Pass-level admissions that reclaimed the free lists, and their bytes.
-    pub reclaims: (u32, usize),
-    /// Refusals that waited the queue out for the pending lists (the
-    /// admission's second rung, `MetalDevice::admit_bytes`).
-    pub drains: u32,
-    pub tenants: Vec<TenantRow>,
-}
-
-impl LedgerSnapshot {
-    /// The sum of the tenants' floors and wants.
-    pub fn floors(&self) -> usize {
-        self.tenants.iter().map(|t| t.claim.floor).sum()
-    }
-
-    pub fn wants(&self) -> usize {
-        self.tenants.iter().map(|t| t.claim.want).sum()
-    }
-
-    /// One line for a report: the quota, the committed bytes, then each
-    /// tenant as `name:class floor/want/held` in MiB.
-    pub fn line(&self) -> String {
-        let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-        let mut s = format!(
-            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB reclaims={}/{:.1} MiB drains={}",
-            mib(self.quota),
-            mib(self.committed),
-            mib(self.floors()),
-            mib(self.wants()),
-            self.reclaims.0,
-            mib(self.reclaims.1),
-            self.drains
-        );
-        for t in &self.tenants {
-            s.push_str(&format!(
-                " {}:{} floor={:.1} want={:.1} held={:.1}",
-                t.name,
-                t.claim.class.name(),
-                mib(t.claim.floor),
-                mib(t.claim.want),
-                mib(t.held)
-            ));
-        }
-        s
     }
 }
 
@@ -442,178 +345,9 @@ impl Ledger {
 }
 
 /// One tenant's grant from an arbitration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Grant {
-    pub id: TenantId,
-    pub bytes: usize,
-}
-
-/// What the arbiter decided (`profiles-and-memory-design.md` §4.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Arbitration {
-    /// Every tenant's grant: at least its floor, at most its want.
-    Granted(Vec<Grant>),
-    /// The floors alone exceed the quota: the arithmetic, for the refusal's
-    /// message (§9.5g's shape). Only a `Capability` floor can cause this.
-    Refused { floors: usize, quota: usize },
-}
-
-/// The arbiter's arithmetic, over a snapshot of the tenants' claims:
-/// 1. floors first — if Σ floors > quota, refuse with the arithmetic;
-/// 2. if Σ wants ≤ quota, grant every want (nothing shrinks);
-/// 3. else fill upward from the floors, a unit at a time, to the tenant
-///    whose next unit is worth most — by class order (`Capability`, then
-///    `Cache`, then `Scratch`), the tenants of a class in registration
-///    order; a tenant whose next unit would pass its want, or the quota,
-///    is skipped. (`marginal_value` is §14 Q2's later hook.)
-///
-/// Pure: no tenant is resized here; the ledger's [`Ledger::arbitrate`]
-/// applies the grants that moved. Deterministic in the snapshot's order.
-pub fn arbitrate(quota: usize, tenants: &[TenantRow]) -> Arbitration {
-    let floors: usize = tenants.iter().map(|t| t.claim.floor).sum();
-    if floors > quota {
-        return Arbitration::Refused { floors, quota };
-    }
-    let wants: usize = tenants
-        .iter()
-        .map(|t| t.claim.want.max(t.claim.floor))
-        .sum();
-    if wants <= quota {
-        return Arbitration::Granted(
-            tenants
-                .iter()
-                .map(|t| Grant {
-                    id: t.id,
-                    bytes: t.claim.want.max(t.claim.floor),
-                })
-                .collect(),
-        );
-    }
-    let mut grants: Vec<Grant> = tenants
-        .iter()
-        .map(|t| Grant {
-            id: t.id,
-            bytes: t.claim.floor,
-        })
-        .collect();
-    let mut left = quota - floors;
-    // Class order, registration order within a class.
-    let mut order: Vec<usize> = (0..tenants.len()).collect();
-    order.sort_by_key(|&i| match tenants[i].claim.class {
-        Class::Capability => 0u8,
-        Class::Cache => 1,
-        Class::Scratch => 2,
-    });
-    // Each unit to the first tenant in class order with room for it: the
-    // capability fills to its want before the cache takes a unit, the
-    // cache before the scratch.
-    loop {
-        let next = order.iter().copied().find(|&i| {
-            let t = &tenants[i];
-            let unit = t.claim.unit.max(1);
-            let want = t.claim.want.max(t.claim.floor);
-            grants[i].bytes + unit <= want && unit <= left
-        });
-        let Some(i) = next else {
-            break;
-        };
-        let unit = tenants[i].claim.unit.max(1);
-        grants[i].bytes += unit;
-        left -= unit;
-    }
-    Arbitration::Granted(grants)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn row(id: u32, class: Class, floor: usize, want: usize, unit: usize) -> TenantRow {
-        TenantRow {
-            id: TenantId(id),
-            name: format!("t{id}"),
-            claim: Claim {
-                floor,
-                want,
-                unit,
-                class,
-            },
-            held: 0,
-        }
-    }
-
-    #[test]
-    fn the_arbiter_refuses_on_the_floors_grants_every_want_that_fits_and_fills_by_class() {
-        let mib = 1usize << 20;
-        let kv = row(1, Class::Capability, 64 * mib, 136 * mib, 4 * mib);
-        let experts = row(2, Class::Cache, 80 * mib, 400 * mib, 8 * mib);
-        let scratch = row(3, Class::Scratch, 0, 32 * mib, 1 * mib);
-        // 1. The floors alone exceed the quota: refused with the arithmetic.
-        assert_eq!(
-            arbitrate(100 * mib, &[kv.clone(), experts.clone()]),
-            Arbitration::Refused {
-                floors: 144 * mib,
-                quota: 100 * mib
-            }
-        );
-        // 2. Every want fits: every want granted, nothing shrinks.
-        assert_eq!(
-            arbitrate(1000 * mib, &[kv.clone(), experts.clone(), scratch.clone()]),
-            Arbitration::Granted(vec![
-                Grant {
-                    id: TenantId(1),
-                    bytes: 136 * mib
-                },
-                Grant {
-                    id: TenantId(2),
-                    bytes: 400 * mib
-                },
-                Grant {
-                    id: TenantId(3),
-                    bytes: 32 * mib
-                },
-            ])
-        );
-        // 3. Between: the floors, then units upward by class — the
-        // capability fills first, the cache next, the scratch last; a
-        // tenant at its want is skipped; the sum never passes the quota.
-        let quota = 144 * mib + 100 * mib;
-        let Arbitration::Granted(g) =
-            arbitrate(quota, &[scratch.clone(), experts.clone(), kv.clone()])
-        else {
-            panic!("fits above the floors")
-        };
-        let by = |id: u32| g.iter().find(|x| x.id == TenantId(id)).unwrap().bytes;
-        assert_eq!(by(1), 136 * mib, "the capability reached its want");
-        assert!(
-            by(2) >= 80 * mib && by(2) < 400 * mib,
-            "the cache got the rest: {}",
-            by(2)
-        );
-        assert!(by(3) < 32 * mib, "the scratch got what was left: {}", by(3));
-        let total: usize = g.iter().map(|x| x.bytes).sum();
-        assert!(
-            total <= quota && total > quota - 8 * mib,
-            "{total} vs {quota}"
-        );
-        assert_eq!(by(1) + by(2) + by(3), total);
-        // Registration order within a class decides between equals.
-        let a = row(4, Class::Cache, 0, 10 * mib, 10 * mib);
-        let b = row(5, Class::Cache, 0, 10 * mib, 10 * mib);
-        assert_eq!(
-            arbitrate(10 * mib, &[a, b]),
-            Arbitration::Granted(vec![
-                Grant {
-                    id: TenantId(4),
-                    bytes: 10 * mib
-                },
-                Grant {
-                    id: TenantId(5),
-                    bytes: 0
-                },
-            ])
-        );
-    }
 
     /// A tenant that yields: its `resize` drops a unit's reservation at
     /// once and reports the pledge; a fixed tenant (a `Gauge`) holds what
@@ -801,7 +535,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod device_tests {
     //! The device's persistent paths commit their bytes for the handle's
     //! life (`MetalDevice::new_persistent_*`, `new_unpooled_shared`): the
@@ -835,7 +569,7 @@ mod device_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod admit_tests {
     //! A pass-level admission that would refuse gives the pools' free lists
     //! back first and decides on the figure after (`MetalDevice::admit_bytes`).

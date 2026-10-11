@@ -18,6 +18,59 @@ use tokenizers::Tokenizer;
 /// simply never matches, so a run produces exactly `max_tokens` tokens.
 pub const NEVER_EOS: [u32; 1] = [u32::MAX];
 
+/// Check all context positions before constructing prompts, caches or work.
+/// `extra` is the separately counted first sample in throughput cells; callers
+/// must not add it to generation before entering this checked boundary.
+pub fn check_context_capacity(
+    capacity: usize,
+    prompt: usize,
+    generation: usize,
+    extra: usize,
+) -> Result<()> {
+    let generated = generation.checked_add(extra).ok_or_else(|| {
+        anyhow::anyhow!("generation {generation} + extra {extra} positions overflows usize")
+    })?;
+    let need = prompt.checked_add(generated).ok_or_else(|| {
+        anyhow::anyhow!(
+            "prompt {prompt} + generation {generation} + extra {extra} positions overflows usize"
+        )
+    })?;
+    if need > capacity {
+        anyhow::bail!(
+            "prompt {prompt} + generation {generation} + extra {extra} = {need} positions exceeds \
+             the KV capacity {capacity} (start with --kv-capacity >= {need})"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::check_context_capacity;
+
+    #[test]
+    fn context_capacity_checks_each_sum_without_allocating() {
+        for (capacity, prompt, generation, extra) in [
+            (0, 0, 0, 0),
+            (8, 5, 3, 0),
+            (8, 5, 2, 1),
+            (usize::MAX, usize::MAX - 2, 1, 1),
+        ] {
+            check_context_capacity(capacity, prompt, generation, extra).unwrap();
+        }
+        for (capacity, prompt, generation, extra, expected) in [
+            (8, 5, 3, 1, "exceeds the KV capacity 8"),
+            (0, 1, 0, 0, "exceeds the KV capacity 0"),
+            (usize::MAX, usize::MAX, 1, 0, "overflows usize"),
+            (usize::MAX, 0, usize::MAX, 1, "overflows usize"),
+            (usize::MAX, 1, usize::MAX - 1, 1, "overflows usize"),
+        ] {
+            let error = check_context_capacity(capacity, prompt, generation, extra).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+}
+
 /// Text: the tokenizer, the checkpoint's own chat template, and the ids the
 /// requests are shaped by.
 pub struct Text {

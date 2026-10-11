@@ -1988,7 +1988,7 @@ impl<P: Lfm2Shape> Engine<P> {
         decode_tokens: usize,
         batch: usize,
     ) -> Result<DecodeTiming> {
-        self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        super::common::check_context_capacity(self.kv_capacity, prompt_tokens, decode_tokens, 1)?;
         if batch <= 1 && self.sched.is_none() {
             return self.decode_throughput_single(prompt_tokens, decode_tokens);
         }
@@ -2474,15 +2474,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
-        let need = prompt + gen;
-        if need > self.kv_capacity {
-            anyhow::bail!(
-                "prompt {prompt} + generation {gen} = {need} positions exceeds the KV capacity \
-                 {} (start lloom-serve with --kv-capacity >= {need})",
-                self.kv_capacity
-            );
-        }
-        Ok(())
+        super::common::check_context_capacity(self.kv_capacity, prompt, gen, 0)
     }
 
     /// A cell's `batch` must fit the pool the server was started with.

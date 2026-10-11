@@ -465,15 +465,7 @@ where
     }
 
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
-        let need = prompt + gen;
-        if need > self.kv_capacity {
-            anyhow::bail!(
-                "prompt {prompt} + generation {gen} = {need} positions exceeds the KV capacity \
-                 {} (start with --kv-capacity >= {need})",
-                self.kv_capacity
-            );
-        }
-        Ok(())
+        super::common::check_context_capacity(self.kv_capacity, prompt, gen, 0)
     }
 
     /// The MTP drafter for one run: the head, the shared embedding and
@@ -693,7 +685,7 @@ where
         batch: usize,
     ) -> Result<DecodeTiming> {
         self.check_batch(batch)?;
-        self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        super::common::check_context_capacity(self.kv_capacity, prompt_tokens, decode_tokens, 1)?;
         let prompt = self.seed_prompt_row(prompt_tokens, 0);
         let device = self.device.clone();
         let readback = self.readback;

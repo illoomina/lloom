@@ -18,7 +18,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const GIB: u64 = 1 << 30;
@@ -859,6 +859,7 @@ impl Registry {
             path,
             entry: parking_lot::Mutex::new(entry),
             reserved: AtomicU64::new(bytes),
+            domain_bound: AtomicBool::new(false),
             gate: Gate::new(cfg),
         })
     }
@@ -971,10 +972,33 @@ pub struct Holding {
     path: PathBuf,
     entry: parking_lot::Mutex<Entry>,
     reserved: AtomicU64,
+    // One independently counted domain may use this owner-directed target.
+    // Arc< Holding > aliases in public Admitted values do not grant a second
+    // domain the right to count the same high-water as its own coverage.
+    domain_bound: AtomicBool,
     gate: Gate,
 }
 
+/// An exclusive internal domain binding, retained through promises/charges.
+/// Not Clone. Last drop may release Holding (registry work): host paths only.
+pub(crate) struct HoldingDomainBinding {
+    holding: Arc<Holding>,
+}
+
+impl Drop for HoldingDomainBinding {
+    fn drop(&mut self) {
+        self.holding.domain_bound.store(false, Ordering::Release);
+    }
+}
+
 impl Holding {
+    pub(crate) fn try_bind_domain(self: &Arc<Self>) -> crate::Result<HoldingDomainBinding> {
+        if self.domain_bound.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            crate::bail!("machine holding already belongs to an admission domain; reuse that Domain or obtain a distinct holding with Gate::admit");
+        }
+        Ok(HoldingDomainBinding { holding: self.clone() })
+    }
+
     /// Bytes reserved now.
     pub fn reserved(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)

@@ -213,6 +213,8 @@ impl Promise {
 
     /// Partition already-admitted demand. No counter or machine target changes.
     /// The child owns its domain even if the originating pass is canceled.
+    /// Cloning machine diagnostics can allocate Verdict vectors/strings; this
+    /// is host-side ownership work, not an allocation-free hot-path claim.
     pub fn split(&mut self, bytes: usize) -> Result<Self, Refusal> {
         if bytes > self.remaining {
             return Err(Refusal::PromiseTooSmall {
@@ -229,8 +231,9 @@ impl Promise {
         Ok(child)
     }
 
-    /// Return an unused/partially consumed partition without releasing the
-    /// pass's admission. Failure changes neither owner. Charges already made
+    /// Join unused admitted demand from ANY promise in this same domain, not
+    /// only a split child. This explicitly transfers the caller's remaining
+    /// pass entitlement. Failure changes neither owner. Charges already made
     /// from `child` are NOT returned, only its unused remainder.
     pub fn rejoin(&mut self, child: &mut Self) -> Result<(), Refusal> {
         if !Arc::ptr_eq(&self.domain.0, &child.domain.0) {
@@ -687,6 +690,85 @@ mod machine_bridge_tests {
         drop(good);
         drop(domain);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn reconstructed_admitted_cannot_bind_one_holding_to_two_domains() {
+        let dir = RegistryDir::new();
+        let admitted = dir.gate(10_000).admit("alias", &Peak::new()).unwrap();
+        let shared = admitted.holding.as_ref().unwrap().clone();
+        let verdict = admitted.verdict.clone();
+        let alias = || crate::machine::Admitted {
+            holding: Some(shared.clone()),
+            verdict: verdict.clone(),
+        };
+        let account = ProcessAccount::new(None);
+        let domain = account
+            .domain_with_machine(None, MachineOwner::new(admitted).unwrap())
+            .unwrap();
+        let mut promise = domain.try_reserve(80).unwrap();
+        let err = match MachineOwner::new(alias()) {
+            Ok(_) => panic!("aliased holding was bound to a second domain"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("reuse that Domain"), "{err}");
+        // Recovery 1: share the original domain, hence the same pending total.
+        let same = domain.clone();
+        let extra = same.try_reserve(20).unwrap();
+        assert_eq!(shared.reserved(), 100);
+        // Recovery 2: distinct admission/holding, independently counted target.
+        let (fresh, _) = dir.owner("distinct", 0);
+        let independent = account.domain_with_machine(None, fresh).unwrap();
+        let independent_promise = independent.try_reserve(80).unwrap();
+        assert!(matches!(
+            independent_promise.machine_admission(),
+            Some(MachineAdmission::Registered { reserved: 80, .. })
+        ));
+        let charge = promise.commit(30).unwrap();
+        drop(promise);
+        drop(extra);
+        drop(same);
+        drop(domain);
+        assert!(
+            MachineOwner::new(alias()).is_err(),
+            "charge retains exclusive binding"
+        );
+        drop(charge);
+        // An external Arc may keep the old high-water ticket alive, but once
+        // the domain/charges are gone, a new domain can bind it conservatively.
+        let rebound = MachineOwner::new(alias()).unwrap();
+        assert!(matches!(
+            rebound.ensure_reserved(20).unwrap(),
+            MachineAdmission::Registered { reserved: 100, .. }
+        ));
+    }
+
+    #[test]
+    fn racing_reconstructed_admitted_values_get_one_exclusive_binding() {
+        let dir = RegistryDir::new();
+        let admitted = dir.gate(10_000).admit("bind race", &Peak::new()).unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let alias = crate::machine::Admitted {
+                holding: admitted.holding.clone(),
+                verdict: admitted.verdict.clone(),
+            };
+            let ready = ready.clone();
+            threads.push(std::thread::spawn(move || {
+                ready.wait();
+                MachineOwner::new(alias)
+            }));
+        }
+        ready.wait();
+        // Retain successful results while all other attempts finish.
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        drop(results);
+        assert!(
+            MachineOwner::new(admitted).is_ok(),
+            "binding released after winner drops"
+        );
     }
 
     #[test]

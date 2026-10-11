@@ -4,7 +4,7 @@
 //! into one domain; its promises and physical charges retain that domain. Never
 //! grow the first member of a weak aggregate list on another model's behalf.
 
-use crate::machine::{Admitted, Verdict};
+use crate::machine::{Admitted, HoldingDomainBinding, Verdict};
 
 /// Explicit policy outcome; absence of a registered holding is not "covered".
 #[derive(Clone, Debug)]
@@ -20,11 +20,13 @@ pub(crate) enum MachineAdmission {
     },
 }
 
-/// Intentionally not Clone. Domain creation consumes it, preventing accidental
-/// assignment of one holding's target to two independently counted domains.
+/// Intentionally not Clone, and holds an exclusive binding on the Holding.
+/// Non-Clone alone is insufficient: callers can reconstruct public Admitted
+/// values sharing one Arc<Holding>. The binding rejects that aliasing route.
 /// Last destruction is host-only: Holding::drop performs registry operations.
 pub(crate) struct MachineOwner {
     admitted: Admitted,
+    _binding: Option<HoldingDomainBinding>,
 }
 
 impl MachineOwner {
@@ -32,7 +34,15 @@ impl MachineOwner {
         if admitted.holding.is_none() && admitted.verdict.as_ref().is_some_and(|v| !v.forced) {
             crate::bail!("machine owner has no holding and no explicit force/off override");
         }
-        Ok(Self { admitted })
+        let binding = admitted
+            .holding
+            .as_ref()
+            .map(|h| h.try_bind_domain())
+            .transpose()?;
+        Ok(Self {
+            admitted,
+            _binding: binding,
+        })
     }
 
     /// Called AFTER publishing numeric pending demand and releasing all account

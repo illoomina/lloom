@@ -846,22 +846,34 @@ pub struct LoadPlan {
 }
 
 impl LoadPlan {
-    /// Bytes the load holds on the device.
-    pub fn predicted(&self) -> usize {
+    /// Exact predicted bytes, including totals not representable by a native
+    /// allocation size. Public return widened from usize to u128 for #952.
+    /// On supported 32/64-bit targets max_slots * max_slot_bytes + max_resident
+    /// fits u128. Upstream header/predictor inputs still require checked math.
+    pub fn predicted(&self) -> u128 {
         let experts = match self.slots {
-            Some(n) => n * self.expert_bytes_per_slot,
-            None => self.expert_bytes_total,
+            Some(n) => n as u128 * self.expert_bytes_per_slot as u128,
+            None => self.expert_bytes_total as u128,
         };
-        self.resident_bytes + experts
+        self.resident_bytes as u128 + experts
+    }
+
+    fn physical_bytes(&self) -> Result<usize> {
+        usize::try_from(self.predicted()).map_err(|_| lloom_tensor::Error::Msg(format!(
+            "unrepresentable physical memory demand: {} bytes exceeds native usize maximum {}; reduce dimensions or slots; changing the quota or forcing admission cannot represent this size",
+            self.predicted(), usize::MAX,
+        )))
     }
     /// `fraction × working_set`.
     pub fn budget(&self) -> usize {
         (self.working_set as f64 * self.fraction) as usize
     }
     /// Whether the load is admitted: exactly on the budget is; no working
-    /// set (not Metal) or a zero fraction never refuses.
+    /// set (not Metal) or nonpositive fraction bypasses ONLY the quota.
+    /// An unrepresentable physical demand is refused before either bypass.
     pub fn fits(&self) -> bool {
-        self.working_set == 0 || self.fraction <= 0.0 || self.predicted() <= self.budget()
+        let Ok(predicted) = usize::try_from(self.predicted()) else { return false; };
+        self.working_set == 0 || self.fraction <= 0.0 || predicted <= self.budget()
     }
     /// The slots a streamed pool could hold under this budget (at least
     /// `topk + 1` is the pool's own floor, checked by the loader).
@@ -881,6 +893,10 @@ impl LoadPlan {
     /// §9.5g's report: the arithmetic and, on a refusal, the reductions
     /// that would fit in the order of what they cost.
     pub fn describe(&self) -> String {
+        let predicted = match self.physical_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return error.to_string(),
+        };
         let gb = |b: usize| b as f64 / 1e9;
         let experts = match self.slots {
             Some(n) => format!(
@@ -895,7 +911,7 @@ impl LoadPlan {
         };
         let head = format!(
             "predicted {:.2} GB = resident {:.2} GB + experts {experts}; budget {:.2} GB = {:.2} x recommendedMaxWorkingSetSize {:.2} GB",
-            gb(self.predicted()),
+            gb(predicted),
             gb(self.resident_bytes),
             gb(self.budget()),
             self.fraction,
@@ -904,12 +920,12 @@ impl LoadPlan {
         if self.fits() {
             return format!(
                 "memory budget OK at load: {head}; residual {:.2} GB for the KV, the prefill passes and the pool",
-                gb(self.budget().saturating_sub(self.predicted()))
+                gb(self.budget().saturating_sub(predicted))
             );
         }
         let mut s = format!(
             "memory budget exceeded at load: {head}; over by {:.2} GB. Nothing was loaded (DESIGN.md 9.5g: refuse rather than silently reduce). What would fit:",
-            gb(self.predicted().saturating_sub(self.budget()))
+            gb(predicted.saturating_sub(self.budget()))
         );
         if self.slots.is_none() {
             s.push_str(&format!(
@@ -922,7 +938,7 @@ impl LoadPlan {
         s.push_str(&format!(
             "\n  --memory-fraction {:.2} (this load's share of the working set; the machine then has {:.2} GB for everything else, the OS included)",
             (self.fraction_needed() * 100.0).ceil() / 100.0,
-            gb(self.working_set.saturating_sub(self.predicted()))
+            gb(self.working_set.saturating_sub(predicted))
         ));
         s
     }
@@ -942,6 +958,9 @@ fn admit_machine<Rd: Read + Seek>(
     plan: &LoadPlan,
     stream: Option<&StreamOptions>,
 ) -> Result<Reservation> {
+    let physical = plan.physical_bytes()?;
+    let resident = u64::try_from(plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
+    let experts = u64::try_from(physical - plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
     let Some(m) = &opts.machine else {
         return Ok(None);
     };
@@ -971,13 +990,13 @@ fn admit_machine<Rd: Read + Seek>(
         .collect(),
     };
     let mut peak = lloom_tensor::machine::Peak::new()
-        .with("weights (resident tier)", plan.resident_bytes as u64)
+        .with("weights (resident tier)", resident)
         .with(
             match plan.slots {
                 Some(n) => format!("weights (experts, {n} slots)"),
                 None => "weights (experts, every one resident)".to_string(),
             },
-            (plan.predicted() - plan.resident_bytes) as u64,
+            experts,
         );
     for c in &claims {
         peak.push(c.name, c.bytes as u64);
@@ -1644,6 +1663,61 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn numeric_load_plan_extremes_refuse_before_quota_bypasses() {
+        let max = usize::MAX;
+        let mut plan = LoadPlan {
+            resident_bytes: max, expert_bytes_per_slot: 1, expert_bytes_total: 0,
+            slots: None, working_set: max, fraction: 1.0,
+        };
+        assert_eq!(plan.predicted(), max as u128);
+        assert!(plan.fits());
+        assert!(admit_load(&plan).is_ok());
+        plan.expert_bytes_total = 1;
+        assert_eq!(plan.predicted(), max as u128 + 1);
+        for working_set in [0, max] {
+            for fraction in [0.0, -1.0, 1.0, f64::INFINITY, f64::NAN] {
+                plan.working_set = working_set;
+                plan.fraction = fraction;
+                assert!(!plan.fits());
+                let err = admit_load(&plan).unwrap_err().to_string();
+                assert!(err.contains("unrepresentable physical memory demand"), "{err}");
+                assert!(err.contains(&(max as u128 + 1).to_string()), "{err}");
+                assert!(!err.contains("budget OK"));
+                assert!(!err.contains("--memory-fraction"));
+            }
+        }
+        plan.slots = Some(max);
+        plan.expert_bytes_per_slot = max;
+        assert_eq!(plan.predicted(), max as u128 * max as u128 + max as u128);
+        assert!(!plan.fits());
+        assert!(admit_load(&plan).is_err());
+        assert!(plan.physical_bytes().is_err());
+    }
+
+    #[test]
+    fn numeric_load_plan_fraction_compatibility_is_not_new_policy_validation() {
+        let mut plan = LoadPlan {
+            resident_bytes: 1, expert_bytes_per_slot: 0, expert_bytes_total: 0,
+            slots: None, working_set: 10, fraction: -1.0,
+        };
+        // Existing policy, not a new recommendation: <=0 bypasses quota,
+        // infinity casts its budget to MAX; NaN casts to zero.
+        assert!(plan.fits());
+        plan.fraction = f64::INFINITY;
+        assert!(plan.fits());
+        plan.fraction = f64::NAN;
+        assert!(!plan.fits());
+        plan.working_set = 0;
+        assert!(plan.fits());
+        plan.working_set = 10;
+        plan.fraction = 0.5;
+        plan.resident_bytes = 5;
+        assert!(plan.fits());
+        plan.resident_bytes = 6;
+        assert!(!plan.fits());
+    }
+
+    #[test]
     fn numeric_arbitration_loader_consumer_handles_wide_refusal_and_overflow() {
         let mut cfg = Config::tiny();
         cfg.n_experts_per_tok = 1;
@@ -1736,7 +1810,7 @@ mod tests {
         // 4 slots of the other layers plus every expert of the held one.
         assert_eq!(
             mtp.predicted(),
-            all.resident_bytes + held_bytes + 4 * mtp.expert_bytes_per_slot
+            (all.resident_bytes + held_bytes + 4 * mtp.expert_bytes_per_slot) as u128
         );
         Ok(())
     }
@@ -1778,7 +1852,7 @@ mod tests {
     #[test]
     fn the_boundary_is_inclusive_and_the_check_is_metal_only() {
         let mut plan = this_machine(None, 1.0);
-        plan.working_set = plan.predicted();
+        plan.working_set = usize::try_from(plan.predicted()).unwrap();
         assert!(plan.fits());
         plan.working_set -= 1;
         assert!(!plan.fits());

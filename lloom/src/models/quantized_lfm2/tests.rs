@@ -184,6 +184,16 @@ fn public_cache_refuses_before_writes_and_invalidates_failed_state() -> Result<(
         "owner control must not fail on position"
     );
     assert!(foreign.restore_retained(&saved).is_err());
+    assert!(
+        model
+            .forward_embeds(&one, foreign.pos, &mut foreign)
+            .is_err(),
+        "foreign model cache was accepted by forward"
+    );
+    assert_eq!(
+        foreign.pos, saved.pos,
+        "foreign refusal must precede writes"
+    );
     // Simulate a partial-write failure at the cache boundary; poison refuses
     // further model work until reset, it is not transactional state rollback.
     cache.failed = true;

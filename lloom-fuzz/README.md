@@ -83,10 +83,23 @@ engine's own `sanitize` profile covers the device path (§15.1g).
 
 ## The persistent record
 
-Every client keeps the last `--record N` (default 64) inputs it executed. On an
-oracle failure, a panic or a signal the whole ring is written to
-`--record-dir` as `record-<pid>-<k>/0000.bin … NNNN.bin` (oldest first, the
-dying input last) with `reason.txt`. Replay it in one fresh process:
+Every client keeps the last `--record N` (default 64) inputs it executed.
+Oracle failure, panic and signal paths attempt capture under `--record-dir`.
+Capture is not guaranteed: a busy byte-ring snapshot is refused, filesystem
+errors can prevent a dump, and the signal writer/handler composition still
+needs its separate safety repair. Do not infer successful capture from a crash.
+
+New directories retain numbered `.bin` inputs (oldest first), `reason.txt`,
+`record.format` and a final `record.complete` count/length manifest. Failed writes
+leave inspectable partial evidence, not a successful directory result. Filesystem
+I/O allocates and may block; it is not async-signal-safe. Replay validates the
+format, complete count, numeric filename order and each size before executing
+any input. Unknown formats and incomplete v1 records report incompatibility.
+Legacy numbered directories still replay, with an explicit weaker-guarantee
+warning: a missing last input cannot be detected without their absent manifest.
+Same-length corruption/concurrent rewriting, build/configuration identity and
+schedule schemas are not verified by this input-file format. Do not modify a
+record while replaying it. Replay in one fresh process:
 
 ```sh
 fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0

@@ -29,7 +29,8 @@
 //!    chained ahead of them so the record exists before the fuzzer's report.
 //!
 //! The dump is a directory `record-<pid>-<seq>/` holding `0000.bin … NNNN.bin`
-//! (oldest first, the dying input last) and `reason.txt`. [`replay`] executes
+//! (oldest first, the dying input last), `reason.txt`, and a versioned
+//! completion manifest. [`replay`] validates counts/sizes, then executes
 //! a directory in order through the same harness and reports which entry fails.
 //!
 //! The ring lives in a global because the signal path cannot take a lock or
@@ -38,6 +39,7 @@
 //! recording rather than racing the payload. Signal-safe I/O and handler
 //! composition remain separate obligations: the current dump still allocates.
 
+mod archive;
 mod inputs;
 
 use inputs::InputRing;
@@ -101,7 +103,9 @@ impl Record {
 
     /// Write the ring, oldest first, and the reason. Returns the directory.
     ///
-    /// Allocates and formats. Returns no directory if a writer or another dump
+    /// Allocates, formats and synchronizes files; this can block on filesystem
+    /// I/O. Returns a directory only after the completion manifest is written.
+    /// Returns no directory if a writer or another dump
     /// owns the history. The signal path currently shares this allocating I/O;
     /// async-signal safety is not claimed by the payload ownership repair.
     pub fn dump(self, reason: &str) -> Option<PathBuf> {
@@ -243,18 +247,12 @@ fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
     if snapshot.inputs().next().is_none() {
         return None;
     }
-    let seq = r.dumps.fetch_add(1, Ordering::AcqRel);
+    let seq = r
+        .dumps
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+        .ok()?;
     let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));
-    fs::create_dir_all(&dir).ok()?;
-    for (k, bytes) in snapshot.inputs().enumerate() {
-        if let Ok(mut f) = fs::File::create(dir.join(format!("{k:04}.bin"))) {
-            let _ = f.write_all(bytes);
-        }
-    }
-    if let Ok(mut f) = fs::File::create(dir.join("reason.txt")) {
-        let _ = f.write_all(reason);
-        let _ = f.write_all(b"\n");
-    }
+    archive::write(&dir, snapshot.inputs(), reason).ok()?;
     Some(dir)
 }
 
@@ -270,20 +268,17 @@ pub fn replay<F>(path: &Path, mut harness: F) -> Result<usize, (usize, String)>
 where
     F: FnMut(&[u8]) -> Result<(), String>,
 {
-    let inputs: Vec<PathBuf> = if path.is_dir() {
-        let mut v: Vec<PathBuf> = fs::read_dir(path)
-            .map_err(|e| (0, format!("{}: {e}", path.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "bin"))
-            .collect();
-        v.sort();
-        v
-    } else {
-        vec![path.to_path_buf()]
-    };
-    for (i, p) in inputs.iter().enumerate() {
-        let bytes = fs::read(p).map_err(|e| (i, format!("{}: {e}", p.display())))?;
+    let replay = archive::prepare(path, MAX_INPUT)
+        .map_err(|error| (0, format!("{}: {error}", path.display())))?;
+    if replay.legacy {
+        eprintln!(
+            "legacy record: numeric order checked; completeness/build/schema metadata unavailable"
+        );
+    }
+    for (i, (p, length)) in replay.paths.iter().zip(&replay.lengths).enumerate() {
+        let bytes = archive::read(p, *length, MAX_INPUT)
+            .map_err(|error| (i, format!("{}: {error}", p.display())))?;
         harness(&bytes).map_err(|m| (i, format!("{}: {m}", p.display())))?;
     }
-    Ok(inputs.len())
+    Ok(replay.paths.len())
 }

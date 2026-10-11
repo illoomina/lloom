@@ -84,20 +84,23 @@ const TILE_16_16_16_2_2: TileConfig = TileConfig::new(16, 16, 16, 2, 2);
 /// determinism run, and the whole point of this knob is to be A/B'd.
 fn forced_tile() -> Option<TileConfig> {
     static TILE: std::sync::OnceLock<Option<TileConfig>> = std::sync::OnceLock::new();
-    *TILE.get_or_init(|| match crate::tuning::tuning().gemm.tile.as_deref() {
-        Some(v) => Some(match v {
-            "32x32" => TILE_32_32_16_2_2,
-            "32x16" => TILE_32_16_16_2_2,
-            "16x32" => TILE_16_32_16_2_2,
-            "16x16" => TILE_16_16_16_2_2,
-            "64x32" => TILE_64_32_32_2_2,
-            "64x64" => TILE_64_64_16_2_2,
-            other => panic!(
-                "LLOOM_383_TILE must be one of \
+    *TILE.get_or_init(|| {
+        crate::tuning::tuning()
+            .gemm
+            .tile
+            .as_deref()
+            .map(|v| match v {
+                "32x32" => TILE_32_32_16_2_2,
+                "32x16" => TILE_32_16_16_2_2,
+                "16x32" => TILE_16_32_16_2_2,
+                "16x16" => TILE_16_16_16_2_2,
+                "64x32" => TILE_64_32_32_2_2,
+                "64x64" => TILE_64_64_16_2_2,
+                other => panic!(
+                    "LLOOM_383_TILE must be one of \
                  32x32|32x16|16x32|16x16|64x32|64x64, got {other:?}"
-            ),
-        }),
-        None => None,
+                ),
+            })
     })
 }
 

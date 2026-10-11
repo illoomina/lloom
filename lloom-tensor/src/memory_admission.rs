@@ -296,6 +296,12 @@ impl AllocationTicket {
     /// Commit only after allocation with a validated upper bound. Any unused
     /// remainder returns on drop; an over-bound commit fails without charging.
     pub fn commit(mut self, actual: usize) -> Result<PhysicalCharge> {
+        self.try_commit(actual)
+    }
+    /// Transfer demand without consuming the ticket on refusal. Native callers
+    /// must destroy an unchargeable raw allocation BEFORE dropping this ticket.
+    /// Success can leave unused demand; dropping the ticket returns it normally.
+    pub fn try_commit(&mut self, actual: usize) -> Result<PhysicalCharge> {
         Ok(PhysicalCharge(
             self.promise.as_mut().expect("live ticket").commit(actual)?,
         ))

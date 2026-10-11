@@ -36,8 +36,12 @@
 use super::heap::{HeapChunks, HeapStats};
 use super::ledger::{Ledger, Reservation};
 use super::{Buffer, Device, ResidencySet};
+pub use crate::allocation_admission::PredictionBasis;
+use crate::allocation_admission::{self, Prediction};
 use crate::kernels::MetalKernelError;
-use objc2_metal::MTLResourceOptions;
+use crate::memory_admission::AllocationContext;
+pub type BackingAdmissionError = crate::allocation_admission::AllocationError<MetalKernelError>;
+use objc2_metal::{MTLDevice as _, MTLResource as _, MTLResourceOptions};
 use std::sync::Arc;
 
 /// What a backing holds, in the heap's terms (a whole-buffer backing
@@ -65,6 +69,17 @@ impl From<Buffer> for Allocation {
 pub trait Backing: Send + Sync + std::fmt::Debug {
     /// `bytes` resident bytes of this backing's storage mode.
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError>;
+    /// Explicit admitted route. Unsupported implementations MUST NOT silently
+    /// fall back to legacy unadmitted allocation. Heap enrollment remains pending.
+    fn alloc_in(
+        &self,
+        _bytes: usize,
+        _context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        Err(BackingAdmissionError::Unsupported(
+            "backing has no admitted allocation route",
+        ))
+    }
     /// Take `buffer`'s range back, if it is this backing's sub-allocation;
     /// `false` for a buffer that is not (or is a whole allocation, which
     /// frees when its last handle drops — its residency entry is the
@@ -130,6 +145,46 @@ impl std::fmt::Debug for DeviceBuffer {
 }
 
 impl Backing for DeviceBuffer {
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        let requested = bytes.max(1);
+        if requested > self.device.as_ref().maxBufferLength() {
+            return Err(BackingAdmissionError::Geometry(
+                "request exceeds device maxBufferLength",
+            ));
+        }
+        let estimate = self
+            .device
+            .as_ref()
+            .heapBufferSizeAndAlignWithLength_options(requested, self.options);
+        let prediction = Prediction::standalone(requested, estimate.size, estimate.align)?;
+        let (raw, owner) = allocation_admission::allocate(
+            context,
+            prediction,
+            |length| {
+                self.device
+                    .as_ref()
+                    .newBufferWithLength_options(length, self.options)
+                    .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+            },
+            |raw| raw.allocatedSize(),
+        )?;
+        let buffer = Buffer::new_owned(raw, owner);
+        match self.commit {
+            Commit::Deferred => self.residency.add(&buffer),
+            Commit::Now => self.residency.insert(&buffer),
+        };
+        // Parallel legacy grant/pacer diagnostics, not another process charge.
+        let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
+        Ok(Allocation {
+            buffer,
+            reservation,
+        })
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let buffer = self.device.new_buffer(bytes.max(1), self.options)?;
         match self.commit {
@@ -203,6 +258,16 @@ impl std::fmt::Debug for Mapped {
 }
 
 impl Backing for Mapped {
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        let a = self.inner.alloc_in(bytes, context)?;
+        wire_pages(a.buffer.contents(), bytes);
+        Ok(a)
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let a = self.inner.alloc(bytes)?;
         wire_pages(a.buffer.contents(), bytes);
@@ -226,6 +291,19 @@ pub struct Fallback<A, B> {
 }
 
 impl<A: Backing, B: Backing> Backing for Fallback<A, B> {
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        match self.first.alloc_in(bytes, context) {
+            Err(error) if error.permits_fallback(native_allocation_refusal) => {
+                self.then.alloc_in(bytes, context)
+            }
+            result => result,
+        }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         match self.first.alloc(bytes) {
             Ok(b) => Ok(b),
@@ -285,5 +363,13 @@ impl std::fmt::Debug for Backings {
             .field("transient_shared", &self.transient_shared)
             .field("transient_private", &self.transient_private)
             .finish()
+    }
+}
+
+fn native_allocation_refusal(error: &MetalKernelError) -> bool {
+    match error {
+        MetalKernelError::FailedToCreateResource(_) => true,
+        MetalKernelError::WithBacktrace { inner, .. } => native_allocation_refusal(inner),
+        _ => false,
     }
 }

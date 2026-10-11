@@ -50,6 +50,8 @@
 #[cfg(feature = "accelerate")]
 mod accelerate;
 #[cfg(any(feature = "metal", test))]
+mod allocation_admission;
+#[cfg(any(feature = "metal", test))]
 mod allocation_geometry;
 #[cfg(any(feature = "metal", test))]
 mod allocation_owner;

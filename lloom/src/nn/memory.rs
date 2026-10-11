@@ -391,11 +391,14 @@ impl<T> Loaded<T> {
         lloom_tensor::memory_admission::begin_model_load();
         #[cfg(feature = "metal")]
         if let Device::Metal(device) = device {
-            let allocations = lloom_tensor::metal_backend::MetalAllocationDomain::new(
+            // Namespace metadata partitions this load's ALREADY promised term;
+            // never reserve that term again alongside the whole-load promise.
+            let context = load.allocations();
+            let allocations = lloom_tensor::metal_backend::MetalAllocationDomain::new_in(
                 device,
                 load.domain().clone(),
+                &context,
             )?;
-            let context = load.allocations();
             let scope = allocations.scope(context.clone())?;
             let value =
                 scope.run(|resolved| producer(&Device::Metal(resolved.clone()), &context))?;
@@ -479,6 +482,28 @@ impl MachineLoad {
         Ok((admitted, bytes))
     }
 
+    /// Add the known namespace quote exactly once before the shared checked gate.
+    /// Only the outer header and first managed native-owner slab Layouts are
+    /// quoted here; complete host/native/generation pricing remains outstanding.
+    fn admit_context_unattached(
+        &self,
+        peak: Peak,
+        pool_bound: usize,
+        namespace_metadata: usize,
+    ) -> Result<(Admitted, usize)> {
+        let namespace_metadata =
+            u64::try_from(namespace_metadata).map_err(lloom_tensor::Error::wrap)?;
+        let peak = if namespace_metadata == 0 {
+            peak
+        } else {
+            peak.with(
+                "model namespace metadata (partial quote)",
+                namespace_metadata,
+            )
+        };
+        self.admit_unattached(peak, pool_bound)
+    }
+
     /// Legacy route: preserves device-ledger attachment and visible policy
     /// logging. Checked augmented geometry precedes the gate, including off.
     pub fn admit(&self, device: &Device, peak: Peak) -> Result<Admitted> {
@@ -492,13 +517,25 @@ impl MachineLoad {
     /// Additive admitted ownership route: one domain, one load promise, no
     /// legacy weak-list attachment. Configure process policy before first use.
     /// Native/family/worker allocation paths are NOT implicitly migrated.
+    /// `peak` names model demand excluding the known namespace quote added here;
+    /// complete metadata pricing remains the caller's separate coverage contract.
     pub fn admit_context(
         &self,
         device: &Device,
         peak: Peak,
         quota: Option<usize>,
     ) -> Result<LoadContext> {
-        let (admitted, bytes) = self.admit_unattached(peak, pool_bound_bytes(device))?;
+        #[cfg(feature = "metal")]
+        let namespace_metadata = match device {
+            Device::Metal(_) => {
+                lloom_tensor::metal_backend::MetalAllocationDomain::requested_metadata_bytes()?
+            }
+            _ => 0,
+        };
+        #[cfg(not(feature = "metal"))]
+        let namespace_metadata = 0;
+        let (admitted, bytes) =
+            self.admit_context_unattached(peak, pool_bound_bytes(device), namespace_metadata)?;
         LoadContext::from_admitted(admitted, bytes, quota)
     }
 }
@@ -638,5 +675,67 @@ mod load_context_tests {
         drop(load);
         assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[cfg(test)]
+    mod namespace_quote_tests {
+        use super::*;
+
+        #[test]
+        fn known_quote_is_included_once_and_partitions_same_load_promise() {
+            let (admitted, bytes) = off()
+                .admit_context_unattached(Peak::new().with("weights", 7), 5, 3)
+                .unwrap();
+            assert_eq!(bytes, 15, "known namespace quote missing or duplicated");
+            let load = LoadContext::from_admitted(admitted, bytes, Some(15)).unwrap();
+            let domain = load.domain().clone();
+            let context = load.allocations();
+            assert_eq!(
+                domain.snapshot(),
+                AccountSnapshot {
+                    pending: 15,
+                    committed: 0
+                }
+            );
+            let metadata_ticket = context.take(3).unwrap();
+            let metadata_charge = metadata_ticket.commit(3).unwrap();
+            assert_eq!(
+                domain.snapshot(),
+                AccountSnapshot {
+                    pending: 12,
+                    committed: 3
+                },
+                "namespace metadata added a second reservation"
+            );
+            assert_eq!(metadata_charge.domain_key(), context.domain_key());
+            load.finish();
+            assert_eq!(
+                domain.snapshot(),
+                AccountSnapshot {
+                    pending: 0,
+                    committed: 3
+                }
+            );
+            assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+            drop(metadata_charge);
+            assert_eq!(domain.snapshot(), AccountSnapshot::default());
+        }
+
+        #[test]
+        fn known_quote_overflow_refuses_and_zero_preserves_existing_total() {
+            assert!(
+                off()
+                    .admit_context_unattached(Peak::new().with("weights", u64::MAX), 0, 1)
+                    .is_err(),
+                "namespace quote overflow reached the gate-off admission"
+            );
+            let (_, bytes) = off()
+                .admit_context_unattached(Peak::new().with("weights", 7), 5, 0)
+                .unwrap();
+            assert_eq!(
+                bytes, 12,
+                "zero quote changed incumbent pool-inclusive demand"
+            );
+        }
     }
 }

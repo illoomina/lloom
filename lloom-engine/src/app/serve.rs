@@ -128,23 +128,68 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let shape = super::Shape::of(&options, false, seed_text);
     let reuse_prefix = shape.reuse_prefix;
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
+    run_owner(
+        options,
+        engine,
+        model_path,
+        Some((load_start, reuse_prefix)),
+    )
+}
+
+/// Serve an already-loaded owner without creating a device, tokenizer, model or
+/// admission domain. The caller creates its device, configures the same process
+/// account, and completes the genuine load before entering this frontend.
+///
+/// Only `options.server.host`, `options.server.port` and `options.sampling` are
+/// honored; the remaining options do not reconfigure this owner. Shape, decode,
+/// cache, seed, prefix reuse, batch and memory policy are the already-loaded
+/// owner's contract, not inferred from these options. `model_path` is a caller-
+/// supplied provenance label, never opened or used to load another model.
+/// This route does not activate default registration or complete admission.
+pub fn run_loaded(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+) -> Result<()> {
+    run_owner(options, engine, model_path, None)
+}
+
+fn run_owner(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    load_facts: Option<(Instant, bool)>,
+) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config().as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
-    eprintln!(
-        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
-        model_name,
-        model_path.display(),
-        load_start.elapsed().as_secs_f64(),
-        engine.device(),
-        engine.kv_capacity(),
-        engine.readback().name(),
-        reuse_prefix,
-        engine.describe_checked()?,
-    );
+    let description = engine.describe_checked()?;
+    if let Some((load_start, reuse_prefix)) = load_facts {
+        eprintln!(
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
+            model_name,
+            model_path.display(),
+            load_start.elapsed().as_secs_f64(),
+            engine.device(),
+            engine.kv_capacity(),
+            engine.readback().name(),
+            reuse_prefix,
+            description,
+        );
+    } else {
+        eprintln!(
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} {}]",
+            model_name,
+            model_path.display(),
+            engine.device(),
+            engine.kv_capacity(),
+            engine.readback().name(),
+            description,
+        );
+    }
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
     let (host, port) = (options.server.host.clone(), options.server.port);

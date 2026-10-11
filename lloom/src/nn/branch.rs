@@ -55,12 +55,22 @@ where
     M::Cache: RetainState,
 {
     pub fn new(model: &'m M, cfg: &M::Config, device: &Device) -> Result<Self> {
-        Ok(Self {
-            session: Session::new(model, model.new_cache(cfg, device)?),
+        Ok(Self::from_cache(model, model.new_cache(cfg, device)?))
+    }
+
+    /// Use a freshly constructed, exclusively owned cache of this loaded model.
+    /// This supports a family's explicit capacity/bucket options without a second
+    /// cache allocation or a second loop. The caller must not supply the chat
+    /// cache, a shallow clone, or backing concurrently writable through aliases.
+    /// Construction and all retained/pass allocations remain in the caller's
+    /// existing model domain. `begin` invokes the cache's continuation hook.
+    pub fn from_cache(model: &'m M, cache: M::Cache) -> Self {
+        Self {
+            session: Session::new(model, cache),
             owner: Arc::new(()),
             trunk: None,
             failed: false,
-        })
+        }
     }
 
     /// Prefill the shared state once, including an empty or one-token trunk.

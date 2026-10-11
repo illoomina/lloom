@@ -236,6 +236,35 @@ impl<P: Profile> crate::MakeDriver<Model<P>> for Speculators {
 
 pub type Extra = Speculators;
 
+/// The private-sequence policy shared by initial chat and decision caches.
+/// Pooled batch rows retain their separate shared-pool constructor.
+#[derive(Clone, Copy)]
+struct PrivateCachePolicy {
+    capacity: usize,
+    bucket: usize,
+    grow_fraction: Option<f64>,
+}
+
+impl PrivateCachePolicy {
+    fn create<P: Lfm2Shape>(
+        self,
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<State<P>> {
+        let mut cache = P::state(config, dtype, device, self.capacity, None)
+            .context("allocating the KV cache")?
+            .with_kv_bucket(self.bucket)
+            .context("memory.kv_bucket")?;
+        if let Some(fraction) = self.grow_fraction {
+            cache = cache
+                .with_kv_grow_fraction(fraction)
+                .context("memory.kv_grow_fraction")?;
+        }
+        Ok(cache)
+    }
+}
+
 pub struct Engine<P: Profile> {
     pub core: Arc<Core<P>>,
     pub text: Text,
@@ -293,6 +322,7 @@ pub struct Engine<P: Profile> {
     load_warnings: Vec<LoadWarning>,
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
+    private_cache: PrivateCachePolicy,
     single: Mutex<Single<P>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -536,16 +566,111 @@ pub fn load(opts: LoadOptions) -> Result<Box<dyn super::served::Served>> {
     })
 }
 
+/// Internal choice only: CallerScoped is reached exclusively inside Loaded::new.
+#[derive(Clone, Copy)]
+enum LoadAdmission {
+    Legacy,
+    CallerScoped,
+}
+
 impl<P: Lfm2Shape> Engine<P> {
     /// The engine at the shape `P` names; `load` picks `P` from the
     /// resolved config (`shape_key`) and dispatches here.
     pub fn load_as(opts: LoadOptions) -> Result<Self> {
-        let model_dir = opts.model_dir.clone();
         let device = if opts.cpu {
             Device::Cpu
         } else {
             open_device()?
         };
+        Self::load_on(opts, device, LoadAdmission::Legacy)
+    }
+
+    /// Additive embedding factory using one caller-supplied model domain.
+    /// The caller admits checkpoint/header metadata and the complete load peak
+    /// BEFORE this entry; no second `MachineLoad::admit` runs inside it.
+    ///
+    /// Source integration only: allocator/native/host producer enrollment must
+    /// be complete before enabling this in the default CLI/server factory. All
+    /// subsequent chat AND decision work must use the returned owner's pass
+    /// scope; extracting an unscoped engine is deliberately not offered.
+    ///
+    /// The current admitted variant is single-sequence: the batch scheduler's
+    /// cross-thread pass propagation is still pending. Incumbent batch/CPU/CUDA
+    /// routes remain available unchanged through `load_as`.
+    pub fn load_as_admitted(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+    ) -> Result<lloom::nn::memory::Loaded<Self>> {
+        if opts.cpu != device.is_cpu() {
+            anyhow::bail!("supplied LFM2 device disagrees with load options");
+        }
+        if opts.batch != 1 {
+            anyhow::bail!("admitted LFM2 batch scheduler pass propagation is pending");
+        }
+        Ok(lloom::nn::memory::Loaded::new(
+            device,
+            load,
+            |resolved, _context| {
+                Self::load_on(opts, resolved.clone(), LoadAdmission::CallerScoped)
+                    .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+            },
+        )?)
+    }
+
+    /// Chat on the admitted loaded owner, using the incumbent decode loop and
+    /// held chat cache. `predicted_extra` covers the complete asynchronous pass;
+    /// borrowed prompt/callback allocations retain their own origin. This does
+    /// not enable the default server factory before producer enrollment.
+    pub fn complete_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            engine
+                .complete_until(prompt_ids, params, on_fragment)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        })?)
+    }
+
+    /// Decisions on the SAME loaded model as `complete_admitted`, without
+    /// touching its held chat sequence or loading another checkpoint. The
+    /// already-prepared request's host storage keeps its origin; the pass must
+    /// cover a fresh configured cache, retained frames and all readout scratch.
+    /// A common single-sequence lock serializes both callers' model executor.
+    /// Media expansion, raw HTTP rendering and full producer enrollment remain
+    /// factory/frontend obligations, not implicit behavior of this token API.
+    pub fn decide_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        request: &crate::decision::CausalRequest,
+    ) -> Result<crate::decision::SystemOneResponse> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            engine
+                .check_fits(request.max_prompt_tokens(), 0)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+            let single = lock(&engine.single);
+            let options = single.decode.options(0, ReadbackArm::Blocking, 0);
+            let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &engine.core.device)?;
+            request.execute_with_cache_factory(
+                &engine.core.model,
+                &mut readback,
+                &options,
+                |_model, device| {
+                    engine
+                        .private_cache
+                        .create::<P>(&engine.config, engine.dtype, device)
+                        .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+                },
+            )
+        })?)
+    }
+
+    fn load_on(opts: LoadOptions, device: Device, admission: LoadAdmission) -> Result<Self> {
+        let model_dir = opts.model_dir.clone();
         let dtype = if device.is_cpu() {
             DType::F32
         } else {
@@ -855,15 +980,22 @@ impl<P: Lfm2Shape> Engine<P> {
             let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
             peak.push("drafter", drafter);
         }
-        let machine = lloom::nn::memory::MachineLoad {
-            gate: opts.memory.machine_gate(),
-            label: super::common::machine_label("lfm2", &model_dir),
-            rows: opts.batch.max(1),
-            kv_tokens: kv_floor,
-            prefill_tile: opts.prefill_tile,
-        }
-        .admit(&device, peak)?
-        .holding;
+        let machine = match admission {
+            LoadAdmission::Legacy => {
+                lloom::nn::memory::MachineLoad {
+                    gate: opts.memory.machine_gate(),
+                    label: super::common::machine_label("lfm2", &model_dir),
+                    rows: opts.batch.max(1),
+                    kv_tokens: kv_floor,
+                    prefill_tile: opts.prefill_tile,
+                }
+                .admit(&device, peak)?
+                .holding
+            }
+            // Loaded<Self> retains the caller's admitted domain. Attaching a
+            // second legacy Holding here would double-admit the same model.
+            LoadAdmission::CallerScoped => None,
+        };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         load_warnings.splice(0..0, model.load_warnings().iter().cloned());
         let vision = if vl {
@@ -881,18 +1013,12 @@ impl<P: Lfm2Shape> Engine<P> {
         } else {
             None
         };
-        let make_cache = |device: &Device| {
-            let mut cache = P::state(&config, dtype, device, opts.kv_capacity, None)
-                .context("allocating the KV cache")?
-                .with_kv_bucket(opts.memory.kv_bucket)
-                .context("memory.kv_bucket")?;
-            if let Some(fraction) = opts.memory.kv_grow_fraction {
-                cache = cache
-                    .with_kv_grow_fraction(fraction)
-                    .context("memory.kv_grow_fraction")?;
-            }
-            Ok::<_, anyhow::Error>(cache)
+        let private_cache = PrivateCachePolicy {
+            capacity: opts.kv_capacity,
+            bucket: opts.memory.kv_bucket,
+            grow_fraction: opts.memory.kv_grow_fraction,
         };
+        let make_cache = |device: &Device| private_cache.create::<P>(&config, dtype, device);
         let cache = make_cache(&device)?;
 
         // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
@@ -978,6 +1104,7 @@ impl<P: Lfm2Shape> Engine<P> {
             warm_in_flight: None,
             load_warnings,
             machine,
+            private_cache,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),

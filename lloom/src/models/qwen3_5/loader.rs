@@ -83,6 +83,22 @@ impl LoadOptions {
     }
 }
 
+/// Reuse an already admitted load without acquiring another legacy Holding.
+/// Only the machine gate is removed from the copied options; the family's
+/// schema, fraction/working-set checks, MTP and cache geometry stay unchanged.
+fn in_admitted_load<T>(
+    device: &Device,
+    load: crate::nn::memory::LoadContext,
+    opts: &LoadOptions,
+    build: impl FnOnce(&Device, &LoadOptions) -> Result<T>,
+) -> Result<crate::nn::memory::Loaded<T>> {
+    crate::nn::memory::Loaded::new(device, load, |resolved, _context| {
+        let mut scoped = opts.clone();
+        scoped.machine = None;
+        build(resolved, &scoped)
+    })
+}
+
 impl Config {
     /// The config from a `qwen35` / `qwen35moe` GGUF header. The vocabulary
     /// is `token_embd.weight`'s row count, filled in by the loader.
@@ -839,6 +855,26 @@ pub fn arch_of(content: &Content) -> Option<&'static str> {
 }
 
 impl<P: Profile> Qwen3_5<P> {
+    /// The dense model and optional MTP head in one caller-supplied domain.
+    /// Header readers, schema checks and all eager weight/table construction run
+    /// inside the existing load scope. No second machine reservation is made.
+    ///
+    /// Source integration only: complete host/native/worker producer enrollment
+    /// and checked caller load prediction precede engine activation. Existing
+    /// CPU/CUDA and legacy constructors remain unchanged. Request execution must
+    /// enter the returned owner's pass scope, including fresh cache creation.
+    pub fn from_gguf_shards_with_mtp_admitted(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+        load: crate::nn::memory::LoadContext,
+    ) -> Result<crate::nn::memory::Loaded<(Self, Option<Qwen3_5MtpHead<P>>)>> {
+        in_admitted_load(device, load, opts, |resolved, scoped| {
+            Self::from_gguf_shards_with_mtp(paths, sidecar, resolved, scoped)
+        })
+    }
+
     /// The dense model from one open GGUF (`opts.mtp` off).
     pub fn from_gguf<R: Read + Seek>(
         content: Content,
@@ -906,6 +942,26 @@ impl<P: Profile> Qwen3_5<P> {
 }
 
 impl<P: Profile> Qwen3_5Moe<P> {
+    /// The MoE model and optional MTP head in one caller-supplied domain.
+    /// Header readers, schema checks and all eager weight/table construction run
+    /// inside the existing load scope. No second machine reservation is made.
+    ///
+    /// Source integration only: complete host/native/worker producer enrollment
+    /// and checked caller load prediction precede engine activation. Existing
+    /// CPU/CUDA and legacy constructors remain unchanged. Request execution must
+    /// enter the returned owner's pass scope, including fresh cache creation.
+    pub fn from_gguf_shards_with_mtp_admitted(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+        load: crate::nn::memory::LoadContext,
+    ) -> Result<crate::nn::memory::Loaded<(Self, Option<Qwen3_5MoeMtpHead<P>>)>> {
+        in_admitted_load(device, load, opts, |resolved, scoped| {
+            Self::from_gguf_shards_with_mtp(paths, sidecar, resolved, scoped)
+        })
+    }
+
     /// The MoE model from one open GGUF, every expert resident (`opts.mtp`
     /// off).
     pub fn from_gguf<R: Read + Seek>(

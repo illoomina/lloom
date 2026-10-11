@@ -111,6 +111,15 @@ impl CausalRequest {
         self.input_tokens
     }
 
+    /// Longest complete task prompt, for the loaded engine's capacity check.
+    pub fn max_prompt_tokens(&self) -> usize {
+        self.tasks
+            .iter()
+            .map(|task| task.prompt.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Production programmatic executor; no model load, generation or chat-cache
     /// clone. The same borrowed model can also serve chat. The caller serializes
     /// model executor access and reserves the fresh cache, retained recurrent
@@ -123,6 +132,30 @@ impl CausalRequest {
         cfg: &M::Config,
         readback: &mut R,
         opts: &DecodeOptions,
+    ) -> Result<SystemOneResponse>
+    where
+        M: CausalLM,
+        M::Cache: RetainState,
+        R: ReadbackStrategy,
+    {
+        self.execute_with_cache_factory(model, readback, opts, |model, device| {
+            model.new_cache(cfg, device)
+        })
+    }
+
+    /// The same common executor with a family's fresh-cache constructor.
+    /// Validate task tokens before invoking `make_cache`, exactly once. The
+    /// factory runs in the caller's already reserved pass and must return an
+    /// exclusively owned fresh cache, never the held chat cache or its clone.
+    /// Capacity is validated when preparing this request; an engine additionally
+    /// checks `max_prompt_tokens()` against its actual configured ceiling before
+    /// this entry. The factory preserves its capacity/bucket/grow policy.
+    pub fn execute_with_cache_factory<M, R>(
+        &self,
+        model: &M,
+        readback: &mut R,
+        opts: &DecodeOptions,
+        make_cache: impl FnOnce(&M, &lloom_tensor::Device) -> Result<M::Cache>,
     ) -> Result<SystemOneResponse>
     where
         M: CausalLM,
@@ -147,7 +180,8 @@ impl CausalRequest {
             .try_reserve_exact(self.tasks.len())
             .map_err(Error::wrap)?;
         let device = readback.device().clone();
-        let mut session = BranchSession::new(model, cfg, &device)?;
+        let cache = make_cache(model, &device)?;
+        let mut session = BranchSession::from_cache(model, cache);
         session.begin(readback, self.trunk_tokens(), opts)?;
         for task in &self.tasks {
             let logits = session.suffix(readback, &task.prompt[self.trunk..], opts)?;
@@ -349,6 +383,40 @@ mod tests {
             logits[66] = -0.25;
             Tensor::from_vec(logits, (1, 256), &Device::Cpu)
         }
+    }
+
+    #[test]
+    fn cache_factory_runs_once_and_only_after_token_validation() -> Result<()> {
+        let model = Tiny::default();
+        let calls = Cell::new(0);
+        let mut rb = Blocking::new(&[255], &Device::Cpu)?;
+        let opts = DecodeOptions::new(0);
+        let invalid = CausalRequest::new(vec![task("bad", vec![1, 256])?], &[1], 8)?;
+        let error = invalid
+            .execute_with_cache_factory(&model, &mut rb, &opts, |model, device| {
+                calls.set(calls.get() + 1);
+                model.new_cache(&(), device)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("outside loaded vocabulary"));
+        assert_eq!(
+            calls.get(),
+            0,
+            "cache allocated before invalid token refusal"
+        );
+        assert_eq!(model.cache_count.get(), 0);
+        let valid = CausalRequest::new(vec![task("ok", vec![1, 2])?], &[1], 8)?;
+        assert_eq!(valid.max_prompt_tokens(), 2);
+        let response =
+            valid.execute_with_cache_factory(&model, &mut rb, &opts, |model, device| {
+                calls.set(calls.get() + 1);
+                model.new_cache(&(), device)
+            })?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(model.cache_count.get(), 1);
+        assert_eq!(model.captures.get(), 1);
+        assert_eq!(response.answers().len(), 1);
+        Ok(())
     }
 
     #[test]

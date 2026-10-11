@@ -1403,7 +1403,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
             slots,
             cfg0.n_experts,
             cfg0.n_experts_per_tok,
-        );
+        )?;
         if held.is_some() {
             if let Some(head) = model.mtp_head() {
                 // In groups of at most half the bytes the loads pass through

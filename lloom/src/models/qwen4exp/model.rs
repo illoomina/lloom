@@ -1722,6 +1722,25 @@ pub struct Ple<P: Profile> {
 /// quarantine and give the parked slots' pages back.
 pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
 
+fn expert_tenant(
+    bytes_per_slot: usize,
+    slots: usize,
+    n_experts: usize,
+    topk: usize,
+) -> Result<ExpertTenant> {
+    let floor = topk.checked_add(1).ok_or_else(|| {
+        lloom_tensor::Error::Msg("qwen4exp expert tenant: topk + 1 exceeds usize".into())
+    })?;
+    ExpertTenant::new(
+        "qwen4exp-experts",
+        bytes_per_slot,
+        slots,
+        floor,
+        n_experts,
+        slots,
+    )
+}
+
 #[derive(Debug)]
 pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
@@ -2404,24 +2423,19 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         slots: usize,
         n_experts: usize,
         topk: usize,
-    ) {
+    ) -> Result<()> {
+        let tenant = expert_tenant(bytes_per_slot, slots, n_experts, topk)?;
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = device {
             use lloom_tensor::kernels::metal::ledger::Tenant;
-            let tenant = std::sync::Arc::new(ExpertTenant::new(
-                "qwen4exp-experts",
-                bytes_per_slot,
-                slots,
-                topk + 1,
-                n_experts,
-                slots,
-            ));
+            let tenant = std::sync::Arc::new(tenant);
             let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
             m.ledger().register(&dyn_tenant);
             self.ledger_gauge = Some(tenant);
         }
         #[cfg(not(feature = "metal"))]
-        let _ = (device, bytes_per_slot, slots, n_experts, topk);
+        let _ = (device, tenant);
+        Ok(())
     }
 
     /// Apply the expert tenant's grant to every layer's tier: shrink the
@@ -6304,6 +6318,24 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_expert_tenant_checks_the_actual_registration_input() {
+        assert!(super::expert_tenant(1, 1, 1, usize::MAX).is_err());
+        assert!(super::expert_tenant(usize::MAX, 2, 2, 0).is_err());
+        assert!(super::expert_tenant(usize::MAX, 1, 2, 0).is_err());
+        let tenant = super::expert_tenant(100, 8, 30, 2).unwrap();
+        assert_eq!(
+            (
+                tenant.unit(),
+                tenant.wanted_units(),
+                tenant.floor_units(),
+                tenant.max_units()
+            ),
+            (100, 8, 3, 8)
+        );
+        assert!(super::expert_tenant(0, usize::MAX, usize::MAX, usize::MAX - 1).is_ok());
+    }
+
     /// The KV store reaches the caches built from the config, and the
     /// shapes it has no arm on are refused by name: a quantized store on a
     /// device without the kernels (CPU), and any non-default store on the

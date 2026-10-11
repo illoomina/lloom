@@ -15,6 +15,7 @@
 //! refused on the figure after (the Qwen long prompt at `--slots auto`,
 //! `gates-a6b/long-auto-branch.txt`: the first form of this did that).
 
+use lloom_tensor::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
@@ -44,15 +45,31 @@ impl GroupTenant {
         floor_units: usize,
         want_units: usize,
         max_units: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let floor_units = floor_units.min(units.max(1));
+        let max_units = max_units.max(units.max(1));
+        // These bounds cover both the initial holding and every later grant.
+        // Keep zero-byte units valid: their byte products are all zero.
+        for (kind, count) in [
+            ("floor", floor_units),
+            ("want", want_units),
+            ("maximum", max_units),
+            ("initial", units),
+        ] {
+            if unit.checked_mul(count).is_none() {
+                lloom_tensor::bail!(
+                    "group tenant: {kind} {count} units of {unit} bytes exceeds usize"
+                )
+            }
+        }
+        Ok(Self {
             name: name.into(),
             unit,
-            floor_units: floor_units.min(units.max(1)),
+            floor_units,
             want_units,
-            max_units: max_units.max(units.max(1)),
+            max_units,
             wanted: AtomicUsize::new(units),
-        }
+        })
     }
 
     pub fn unit(&self) -> usize {
@@ -106,8 +123,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_bounds_are_checked_after_normalization() {
+        assert!(GroupTenant::new("floor", usize::MAX, 2, 2, 0, 0).is_err());
+        assert!(GroupTenant::new("want", usize::MAX, 1, 0, 2, 1).is_err());
+        assert!(GroupTenant::new("maximum", usize::MAX, 1, 0, 0, 2).is_err());
+        // The normalized maximum also covers the initial holding.
+        assert!(GroupTenant::new("initial", usize::MAX, 2, 0, 0, 0).is_err());
+        let t = GroupTenant::new("normalized", usize::MAX, 0, usize::MAX, 1, 0).unwrap();
+        assert_eq!(
+            (t.floor_units(), t.max_units(), t.wanted_units()),
+            (1, 1, 0)
+        );
+        let t = GroupTenant::new("zero", 0, usize::MAX, usize::MAX, usize::MAX, 0).unwrap();
+        assert_eq!(
+            (t.unit(), t.floor_units(), t.max_units(), t.wanted_units()),
+            (0, usize::MAX, usize::MAX, usize::MAX)
+        );
+    }
+
+    #[test]
     fn a_grant_is_recorded_in_units_between_the_floor_and_the_pool() {
-        let t = GroupTenant::new("t", 100, 8, 3, 30, 10);
+        let t = GroupTenant::new("t", 100, 8, 3, 30, 10).unwrap();
         assert_eq!(
             (t.wanted_units(), t.floor_units(), t.max_units()),
             (8, 3, 10)
@@ -131,7 +167,7 @@ mod tests {
                 1000,
                 "never above the pool, whatever the want"
             );
-            let d = GroupTenant::new("dense", 100, 8, 3, 30, 30);
+            let d = GroupTenant::new("dense", 100, 8, 3, 30, 30).unwrap();
             assert_eq!(
                 d.resize(1 << 40),
                 3000,
@@ -147,7 +183,7 @@ mod tests {
     #[cfg(feature = "metal")]
     fn the_yield_walks_down_one_unit_at_a_time_and_stops_at_the_floor() {
         use lloom_tensor::kernels::metal::ledger::Tenant;
-        let t = GroupTenant::new("t", 100, 8, 3, 30, 8);
+        let t = GroupTenant::new("t", 100, 8, 3, 30, 8).unwrap();
         let mut pledged = 0;
         let mut rounds = 0;
         loop {

@@ -286,3 +286,29 @@ fn transposed_batch_linear_matches_scalar_rows() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn owned_rotary_preparation_reuses_shared_generator_and_config_limits() -> Result<()> {
+    let trunk = trunk()?;
+    let (cos, sin) = trunk.rope_tables(4)?;
+    assert_eq!(cos.dims(), [4, 1]);
+    assert_eq!(sin.dims(), [4, 1]);
+    let actual_cos = cos.to_vec2::<f32>()?;
+    let actual_sin = sin.to_vec2::<f32>()?;
+    for position in 0..4 {
+        assert!((actual_cos[position][0] - (position as f32).cos()).abs() < 1e-7);
+        assert!((actual_sin[position][0] - (position as f32).sin()).abs() < 1e-7);
+    }
+    let batch = trunk.prepare_batch(4, &[4, 3], &[2, 1])?;
+    let (h, _, _) = inputs()?;
+    let output = trunk.forward_with_attention(&h, &batch, &cos, &sin, &mut attention)?;
+    assert_eq!(output.dims(), [2, 4, 4]);
+    assert!(trunk.rope_tables(0).is_err());
+    assert!(trunk.rope_tables(33).is_err());
+    for theta in [f64::MAX, 1e-300] {
+        let mut invalid = trunk.clone();
+        invalid.cfg.rope_theta = theta;
+        assert!(invalid.rope_tables(4).is_err());
+    }
+    Ok(())
+}

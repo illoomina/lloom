@@ -284,6 +284,25 @@ impl Trunk {
         })
     }
 
+    /// Prepare default NeoX tables on the trunk's dtype/device through the
+    /// shared LFM2 generator. A loaded owner can retain a maximum-length table
+    /// and pass contiguous prefix views to `forward_with_attention`.
+    /// The reference's F32 frequency arithmetic rounds the JSON theta to F32;
+    /// a cast that becomes zero or nonfinite is rejected by the shared helper.
+    pub fn rope_tables(&self, length: usize) -> Result<(Tensor, Tensor)> {
+        if length > self.cfg.max_position_embeddings {
+            lloom_tensor::bail!("omni rotary table exceeds configured maximum positions")
+        }
+        let weights = self.embedding.embeddings();
+        crate::nn::rotary_emb::default_rope_tables(
+            self.cfg.hidden_size / self.cfg.num_attention_heads,
+            self.cfg.rope_theta as f32,
+            length,
+            weights.dtype(),
+            weights.device(),
+        )
+    }
+
     /// Host token validation precedes native gather. Media embeddings join the
     /// returned text embeddings in the request owner, before trunk execution.
     pub fn embed(&self, tokens: &[u32], batch: usize, length: usize) -> Result<Tensor> {
@@ -385,7 +404,7 @@ impl Trunk {
 
     /// Full bidirectional trunk over [B,L,D]. `cos/sin` are contiguous [L,Dh/2]
     /// NeoX tables on the weight dtype/device, prepared once by the caller.
-    /// This temporary composition seam does not duplicate a RoPE generator.
+    /// `rope_tables` prepares them through the shared default generator.
     /// The callback sees full K/V (already GQA-expanded), compact segment masks,
     /// and no causal flag. It owns bounded backend dispatch, not this block.
     pub fn forward_with_attention<F>(

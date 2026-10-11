@@ -521,6 +521,7 @@ fn open<R: Read + Seek>(
     opts: &LoadOptions,
     want_moe: bool,
     phases: usize,
+    preflight: impl FnOnce(&Config) -> Result<()>,
 ) -> Result<(Config, TokenEmbed, NormHead<RmsNorm>, Holds)> {
     let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
     // A sidecar's MTP block (bartowski's `mtp-*.gguf`): the main header
@@ -557,6 +558,8 @@ fn open<R: Read + Seek>(
     cfg.vocab_size = embed_shape[0];
     let schema = super::schema::tensor_schema(&cfg, &Default::default());
     schema.validate(gg.table())?;
+    // Same resolved schema/config, before the first weight/table producer.
+    preflight(&cfg)?;
     admit(gg, opts.fraction())?;
     let reservation = match &opts.machine {
         Some(m) => {
@@ -721,8 +724,9 @@ fn load_nextn<L: crate::nn::decoder::Layer, R: Read + Seek>(
 fn build_dense<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
+    preflight: impl FnOnce(&Config) -> Result<()>,
 ) -> Result<(Qwen3_5<P>, Option<Qwen3_5MtpHead<P>>)> {
-    let (cfg, embed, head, holds) = open(gg, opts, false, state_phases::<P>(opts))?;
+    let (cfg, embed, head, holds) = open(gg, opts, false, state_phases::<P>(opts), preflight)?;
     let mut layers: Vec<Qwen3_5Layer<P>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -768,8 +772,9 @@ fn build_dense<P: Profile, R: Read + Seek>(
 fn build_moe<P: Profile, R: Read + Seek>(
     gg: &mut Gguf<'_, R>,
     opts: &LoadOptions,
+    preflight: impl FnOnce(&Config) -> Result<()>,
 ) -> Result<(Qwen3_5Moe<P>, Option<Qwen3_5MoeMtpHead<P>>)> {
-    let (cfg, embed, head, holds) = open(gg, opts, true, state_phases::<P>(opts))?;
+    let (cfg, embed, head, holds) = open(gg, opts, true, state_phases::<P>(opts), preflight)?;
     let mut layers: Vec<Qwen3_5MoeLayer<P, Resident>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let p = format!("blk.{l}");
@@ -903,7 +908,7 @@ impl<P: Profile> Qwen3_5<P> {
             device,
         )?;
         gg.dense_f32 = opts.dense_f32;
-        build_dense::<P, R>(&mut gg, opts)
+        build_dense::<P, R>(&mut gg, opts, |_| Ok(()))
     }
 
     /// The dense model from a checkpoint's shards (`opts.mtp` off).
@@ -924,6 +929,19 @@ impl<P: Profile> Qwen3_5<P> {
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<(Self, Option<Qwen3_5MtpHead<P>>)> {
+        Self::from_gguf_shards_with_mtp_preflight(paths, sidecar, device, opts, |_| Ok(()))
+    }
+
+    /// Family metadata/policy validation against the same resolved weight
+    /// schema before weight/table materialization. No second schema, domain or
+    /// tokenizer/model is created; the caller owns host metadata enrollment.
+    pub fn from_gguf_shards_with_mtp_preflight(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+        preflight: impl FnOnce(&Config) -> Result<()>,
+    ) -> Result<(Self, Option<Qwen3_5MtpHead<P>>)> {
         let (contents, mut files, all) = open_shards_with_sidecar(paths, sidecar)?;
         let shards = contents
             .into_iter()
@@ -937,7 +955,7 @@ impl<P: Profile> Qwen3_5<P> {
             .collect();
         let mut gg = Gguf::new(shards, device)?;
         gg.dense_f32 = opts.dense_f32;
-        build_dense::<P, _>(&mut gg, opts)
+        build_dense::<P, _>(&mut gg, opts, preflight)
     }
 }
 
@@ -991,7 +1009,7 @@ impl<P: Profile> Qwen3_5Moe<P> {
             device,
         )?;
         gg.dense_f32 = opts.dense_f32;
-        build_moe::<P, R>(&mut gg, opts)
+        build_moe::<P, R>(&mut gg, opts, |_| Ok(()))
     }
 
     /// The MoE model from a checkpoint's shards, every expert resident
@@ -1013,6 +1031,19 @@ impl<P: Profile> Qwen3_5Moe<P> {
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<(Self, Option<Qwen3_5MoeMtpHead<P>>)> {
+        Self::from_gguf_shards_with_mtp_preflight(paths, sidecar, device, opts, |_| Ok(()))
+    }
+
+    /// Family metadata/policy validation against the same resolved weight
+    /// schema before weight/table materialization. No second schema, domain or
+    /// tokenizer/model is created; the caller owns host metadata enrollment.
+    pub fn from_gguf_shards_with_mtp_preflight(
+        paths: &[PathBuf],
+        sidecar: Option<&PathBuf>,
+        device: &Device,
+        opts: &LoadOptions,
+        preflight: impl FnOnce(&Config) -> Result<()>,
+    ) -> Result<(Self, Option<Qwen3_5MoeMtpHead<P>>)> {
         let (contents, mut files, all) = open_shards_with_sidecar(paths, sidecar)?;
         let shards = contents
             .into_iter()
@@ -1026,7 +1057,7 @@ impl<P: Profile> Qwen3_5Moe<P> {
             .collect();
         let mut gg = Gguf::new(shards, device)?;
         gg.dense_f32 = opts.dense_f32;
-        build_moe::<P, _>(&mut gg, opts)
+        build_moe::<P, _>(&mut gg, opts, preflight)
     }
 }
 

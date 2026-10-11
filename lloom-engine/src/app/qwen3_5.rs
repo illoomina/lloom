@@ -9,9 +9,10 @@
 //! tier — each refused by name in `family.rs`.
 
 use super::common::{
-    lock, model_name_from_dir, ms, newest_snapshot, open_device, DecodeTiming, MemGauge, MemReport,
+    model_name_from_dir, ms, newest_snapshot, open_device, DecodeTiming, MemGauge, MemReport,
     PrefillTiming, Text, NEVER_EOS,
 };
+use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
 use super::served::Served;
 use super::template::{Rendered, Template};
 use crate::{DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
@@ -27,10 +28,10 @@ use lloom::profile::{Profile, ProfileKey, RewindProof, Shaped};
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Device, Tensor, D};
+use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
@@ -99,12 +100,32 @@ impl<P: Profile, L: Layer + 'static> Qwen3_5Model
     }
 }
 
-/// The one sequence every request drives, and the rings kept across
-/// requests.
-struct Single<C> {
-    seq: Option<Sequence<C>>,
-    rings: Option<RingPool>,
+/// Side state travels with the target sequence under one request checkout.
+struct SingleExtra<X: Layer> {
     decode: crate::DecodeConfig,
+    lanes: Option<NextnLanes<X::State>>,
+}
+impl<X: Layer> AbortState for SingleExtra<X> {
+    fn abort(&mut self) {
+        if let Some(lanes) = &mut self.lanes {
+            NextnDrafter::<X>::reset_lanes(lanes);
+        }
+    }
+}
+
+/// Preserve the drafter's complete lane state even if a callback unwinds. The
+/// outer request lease marks incomplete target/lane reuse; the next started
+/// request resets both before execution, outside callback unwind.
+struct DrafterLease<'m, 's, X: Layer> {
+    slot: &'s mut Option<NextnLanes<X::State>>,
+    drafter: Option<NextnDrafter<'m, X>>,
+}
+impl<X: Layer> Drop for DrafterLease<'_, '_, X> {
+    fn drop(&mut self) {
+        if let Some(drafter) = self.drafter.take() {
+            *self.slot = Some(drafter.into_lanes());
+        }
+    }
 }
 
 /// The engine over a model `M` of this family (the dense or the MoE
@@ -114,9 +135,6 @@ pub struct Engine<M: Qwen3_5Model, X: Layer> {
     /// The MTP head, when the run decodes through the speculative body.
     mtp: Option<NextnHead<X>>,
     mtp_k: usize,
-    /// The drafter's lane across requests (its layer's KV follows the
-    /// single sequence's prefix reuse, `Speculator::begin_at`).
-    mtp_lanes: Mutex<Option<NextnLanes<X::State>>>,
     device: Device,
     text: Text,
     model_name: String,
@@ -130,7 +148,7 @@ pub struct Engine<M: Qwen3_5Model, X: Layer> {
     arch: &'static str,
     tier: Value,
     load_warnings: Vec<LoadWarning>,
-    single: Mutex<Single<M::Cache>>,
+    single: Mutex<Option<RequestState<M::Cache, SingleExtra<X>>>>,
 }
 
 /// Request-level family choice; each variant retains a statically dispatched
@@ -279,6 +297,107 @@ fn resolve_text(
     }
 }
 
+/// The same owned tokenizer/template/seed moves from cheap preparation to the
+/// full engine; no model load precedes these configuration refusals.
+struct PreparedText {
+    text: Text,
+    model_name: String,
+    source: String,
+}
+impl PreparedText {
+    fn validate(&self, cfg: &Config) -> lloom_tensor::Result<()> {
+        let text = &self.text;
+        let outside = |id: u32| id as usize >= cfg.vocab_size;
+        if cfg.vocab_size == 0
+            || text
+                .tokenizer
+                .get_vocab(true)
+                .values()
+                .copied()
+                .any(outside)
+            || text.eos_ids.iter().copied().any(outside)
+            || text.seed_tokens.iter().copied().any(outside)
+        {
+            lloom_tensor::bail!(
+                "Qwen serving tokenizer/EOS/seed ids must fit the resolved vocabulary"
+            )
+        }
+        if let Some(tags) = text.think_tags() {
+            if [Some(tags.start), Some(tags.end), tags.tool_call]
+                .into_iter()
+                .flatten()
+                .any(outside)
+            {
+                lloom_tensor::bail!(
+                    "Qwen serving thinking marker ids must fit the resolved vocabulary"
+                )
+            }
+        }
+        for kwarg in [None, Some(true), Some(false)] {
+            for want in [None, Some(true), Some(false)] {
+                if text
+                    .generation_prompt(kwarg, want)
+                    .is_some_and(|ids| ids.iter().copied().any(outside))
+                {
+                    lloom_tensor::bail!(
+                        "Qwen serving prompt probe ids must fit the resolved vocabulary"
+                    )
+                }
+            }
+        }
+        Ok(())
+    }
+}
+fn prepare_text(opts: &mut LoadOptions, content: &Content, arch: &str) -> Result<PreparedText> {
+    if opts.kv_capacity == 0 {
+        anyhow::bail!("Qwen serving context capacity must be positive")
+    }
+    let (tokenizer, template, source) = resolve_text(opts, content)?;
+    let mut eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
+        .iter()
+        .filter_map(|t| tokenizer.token_to_id(t))
+        .collect();
+    eos_ids.dedup();
+    if eos_ids.is_empty() {
+        anyhow::bail!("the tokenizer has neither <|im_end|> nor <|endoftext|>");
+    }
+    let seed_tokens = tokenizer
+        .encode(opts.seed_text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
+        .get_ids()
+        .to_vec();
+    if seed_tokens.is_empty() {
+        anyhow::bail!("the prompt seed tokenized to nothing");
+    }
+    let model_name = opts
+        .model_name
+        .take()
+        .unwrap_or_else(|| match base_model_snapshot(content) {
+            Some(dir) => model_name_from_dir(&dir),
+            None => opts
+                .first_shard
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| arch.to_string()),
+        });
+    let text = Text {
+        tokenizer,
+        template,
+        bos_token: String::new(),
+        bos_id: None,
+        eos_ids,
+        seed_tokens,
+        think: Default::default(),
+        gen_prompts: Default::default(),
+    };
+    text.prime();
+    Ok(PreparedText {
+        text,
+        model_name,
+        source,
+    })
+}
+
 /// Detect, hold the regime, load — at `Ring × One` under
 /// `speculative.method = mtp` (the verify window), `No × One` otherwise.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
@@ -311,7 +430,7 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
 }
 
 fn load_on<P: Profile>(
-    opts: LoadOptions,
+    mut opts: LoadOptions,
     device: Device,
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
@@ -327,6 +446,7 @@ fn load_on<P: Profile>(
         .with_context(|| format!("reading the GGUF header of {}", opts.first_shard.display()))?;
     let arch = arch_of(&content).context("not a qwen35 / qwen35moe GGUF")?;
     drop(f);
+    let text = prepare_text(&mut opts, &content, arch)?;
     let installed = super::common::install_executor(&device, &opts.executor, opts.mtp)?;
     #[cfg(feature = "metal")]
     if let Some(mb) = opts.memory.free_budget_mb {
@@ -372,16 +492,17 @@ fn load_on<P: Profile>(
     let mut warnings = Vec::new();
     match arch {
         lloom::models::qwen3_5::ARCH_DENSE | lloom::models::qwen3_5::ARCH_CLEF => {
-            let (model, head): (Qwen3_5<P>, _) = Qwen3_5::from_gguf_shards_with_mtp(
+            let (model, head): (Qwen3_5<P>, _) = Qwen3_5::from_gguf_shards_with_mtp_preflight(
                 &shards,
                 opts.mtp_sidecar.as_ref(),
                 &device,
                 &mload,
+                |cfg| text.validate(cfg),
             )
             .context("loading Qwen3.5 (dense)")?;
             let tier = json!({ "arch": arch, "shards": shards.len(), "load_ms": ms(t.elapsed()) });
             Engine::finish(
-                model, head, device, opts, &content, arch, tier, installed, warnings,
+                model, head, device, opts, text, arch, tier, installed, warnings,
             )
             .map(Engines::Dense)
         }
@@ -397,16 +518,18 @@ fn load_on<P: Profile>(
                     note,
                 ));
             }
-            let (model, head): (Qwen3_5Moe<P>, _) = Qwen3_5Moe::from_gguf_shards_with_mtp(
-                &shards,
-                opts.mtp_sidecar.as_ref(),
-                &device,
-                &mload,
-            )
-            .context("loading Qwen3.5 (MoE, resident)")?;
+            let (model, head): (Qwen3_5Moe<P>, _) =
+                Qwen3_5Moe::from_gguf_shards_with_mtp_preflight(
+                    &shards,
+                    opts.mtp_sidecar.as_ref(),
+                    &device,
+                    &mload,
+                    |cfg| text.validate(cfg),
+                )
+                .context("loading Qwen3.5 (MoE, resident)")?;
             let tier = json!({ "arch": arch, "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()) });
             Engine::finish(
-                model, head, device, opts, &content, arch, tier, installed, warnings,
+                model, head, device, opts, text, arch, tier, installed, warnings,
             )
             .map(Engines::Moe)
         }
@@ -426,7 +549,7 @@ where
         mtp: Option<NextnHead<X>>,
         device: Device,
         opts: LoadOptions,
-        content: &Content,
+        prepared: PreparedText,
         arch: &'static str,
         mut tier: Value,
         installed: super::report::Installed,
@@ -435,36 +558,12 @@ where
         if opts.mtp && mtp.is_none() {
             anyhow::bail!("speculative.method = mtp was given but the loader found no MTP block");
         }
-        let (tokenizer, template, text_source) = resolve_text(&opts, content)?;
-        // The turn end and the checkpoint's own EOS (`generation_config.json`
-        // lists both 248046 and 248044).
-        let mut eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
-            .iter()
-            .filter_map(|t| tokenizer.token_to_id(t))
-            .collect();
-        eos_ids.dedup();
-        if eos_ids.is_empty() {
-            anyhow::bail!("the tokenizer has neither <|im_end|> nor <|endoftext|>");
-        }
-        let seed_tokens = tokenizer
-            .encode(opts.seed_text.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
-            .get_ids()
-            .to_vec();
-        if seed_tokens.is_empty() {
-            anyhow::bail!("the prompt seed tokenized to nothing");
-        }
-        let model_name = opts
-            .model_name
-            .unwrap_or_else(|| match base_model_snapshot(content) {
-                Some(dir) => model_name_from_dir(&dir),
-                None => opts
-                    .first_shard
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| arch.to_string()),
-            });
-        tier["tokenizer"] = json!(text_source);
+        let PreparedText {
+            text,
+            model_name,
+            source,
+        } = prepared;
+        tier["tokenizer"] = json!(source);
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
         tier["mtp"] = json!(mtp.is_some());
         if let Some(p) = &opts.mtp_sidecar {
@@ -485,23 +584,13 @@ where
         );
         tier["turn_checkpoints"] =
             json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
-        let mut engine = Engine {
+        let engine = Engine {
             model: Arc::new(model),
             mtp,
             mtp_k: opts.mtp_k.max(1),
-            mtp_lanes: Mutex::new(None),
             installed,
             device,
-            text: Text {
-                tokenizer,
-                template,
-                bos_token: String::new(),
-                bos_id: None,
-                eos_ids,
-                seed_tokens,
-                think: Default::default(),
-                gen_prompts: Default::default(),
-            },
+            text,
             model_name,
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
@@ -512,11 +601,15 @@ where
             arch,
             tier,
             load_warnings,
-            single: Mutex::new(Single {
-                seq: Some(Sequence::new(cache)),
+            single: Mutex::new(Some(RequestState {
+                sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
-                decode: opts.decode.clone(),
-            }),
+                extra: SingleExtra {
+                    decode: opts.decode.clone(),
+                    lanes: None,
+                },
+                needs_recovery: false,
+            })),
         };
         if opts.warmup {
             let t = Instant::now();
@@ -525,30 +618,27 @@ where
                 Device::Metal(m) => Some(m.pause_pass_plans()?),
                 _ => None,
             };
-            let (libs, pipes) = engine.with_single(|s| Ok(s.warmup()?))?;
+            let (libs, pipes) = engine.with_single(|s, _extra| Ok(s.warmup()?))?;
             eprintln!(
                 "[warmup: {libs} libraries, {pipes} pipelines compiled in {:.1} ms]",
                 ms(t.elapsed())
             );
         }
-        let _ = &mut engine;
-        engine.text.prime();
         Ok(engine)
     }
 
-    fn with_single<T>(&self, f: impl FnOnce(&mut DecodeSession<'_, M>) -> Result<T>) -> Result<T> {
-        let mut single = lock(&self.single);
-        let seq = single
-            .seq
-            .take()
-            .context("the sequence is checked out — a previous request panicked mid-decode")?;
-        let rings = single.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&*self.model, seq, self.device.clone(), rings)
-            .with_config(single.decode.clone());
-        let out = f(&mut session);
-        let (seq, rings) = session.into_parts();
-        single.seq = Some(seq);
-        single.rings = Some(rings);
+    fn with_single<T>(
+        &self,
+        f: impl FnOnce(&mut DecodeSession<'_, M>, &mut SingleExtra<X>) -> Result<T>,
+    ) -> Result<T> {
+        let mut lease = RequestLease::<M, _>::checkout(&self.single, true)?;
+        let decode = lease.extra().decode.clone();
+        lease.start_decode(&self.model, &self.device, decode);
+        let (session, extra) = lease.parts_mut();
+        let out = f(session, extra);
+        if out.is_ok() {
+            lease.mark_complete();
+        }
         out
     }
 
@@ -561,8 +651,8 @@ where
     {
         self.check_fits(request.max_prompt_tokens(), 0)
             .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
-        let single = lock(&self.single);
-        let options = single.decode.options(0, ReadbackArm::Blocking, 0);
+        let lease = RequestLease::<M, _>::checkout(&self.single, true)?;
+        let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
         let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.device)?;
         request.execute(
             &*self.model,
@@ -742,22 +832,28 @@ where
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
         let reuse = self.reuse_prefix;
         let detok = self.detok();
-        self.with_single(|s| {
+        self.with_single(|s, extra| {
             if !reuse {
                 s.reset();
             }
             if self.mtp.is_some() {
-                let lanes = lock(&self.mtp_lanes).take();
-                let mut drafter = self.drafter(lanes)?;
+                // Fallible construction precedes consuming the retained lanes.
+                let drafter = self.drafter(None)?.with_lanes(extra.lanes.take());
+                let mut lease = DrafterLease {
+                    slot: &mut extra.lanes,
+                    drafter: Some(drafter),
+                };
                 let out = s.decode_speculative_until(
                     rewindable::<M>()?,
-                    &mut drafter,
+                    lease
+                        .drafter
+                        .as_mut()
+                        .expect("drafter lease owns its lanes"),
                     prompt_ids,
                     detok,
                     params,
                     |f| on_fragment(f),
                 );
-                *lock(&self.mtp_lanes) = Some(drafter.into_lanes());
                 out.map_err(anyhow::Error::from)
             } else {
                 s.decode_until(prompt_ids, detok, params, |f| on_fragment(f))
@@ -772,7 +868,7 @@ where
         let device = self.device.clone();
         let tile = self.prefill_tile;
         let gauge = MemGauge::start(&device, self.mem_sample);
-        let (prefill, forwards) = self.with_single(|s| {
+        let (prefill, forwards) = self.with_single(|s, _extra| {
             s.reset();
             let params = DecodeParams {
                 max_tokens: 1,
@@ -809,7 +905,7 @@ where
         let prefill_tile = self.prefill_tile;
         let detok = self.detok();
         let gauge = MemGauge::start(&device, self.mem_sample);
-        let mut timing = self.with_single(|s| {
+        let mut timing = self.with_single(|s, _extra| {
             s.reset();
             let mut detok = detok;
             if self.mtp.is_some() {
@@ -950,7 +1046,7 @@ where
         self.check_fits(prompt_ids.len(), 1)?;
         let device = self.device.clone();
         let ids = prompt_ids.to_vec();
-        let logits = self.with_single(|s| {
+        let logits = self.with_single(|s, _extra| {
             s.reset();
             let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
             let logits = s.model().forward(&input, 0, s.cache_mut())?;

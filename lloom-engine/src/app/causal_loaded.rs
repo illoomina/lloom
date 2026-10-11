@@ -10,7 +10,7 @@ use crate::decision::{
     StateNullability, SystemOneError, SystemOneResponse, SystemOneTemplate, SystemOneTemplateKind,
     Temperature,
 };
-use crate::{DecodeConfig, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
+use crate::{DecodeConfig, DecodeParams, Decoded, ReadbackArm, RingPool};
 use lloom::nn::branch::RetainState;
 use lloom::nn::memory::{LoadContext, Loaded};
 use lloom::nn::{CacheReset, CacheRewind, CausalLM, Sequence};
@@ -41,53 +41,7 @@ pub enum CausalPolicySource {
         state_nullability: StateNullability,
     },
 }
-struct Chat<C> {
-    sequence: Option<Sequence<C>>,
-    rings: Option<RingPool>,
-}
-
-enum LeaseState<'m, M: CausalLM> {
-    Held(Chat<M::Cache>),
-    Decoding(DecodeSession<'m, M>),
-}
-struct RequestLease<'m, M: CausalLM> {
-    slot: &'m Mutex<Option<Chat<M::Cache>>>,
-    state: Option<LeaseState<'m, M>>,
-}
-impl<'m, M: CausalLM> RequestLease<'m, M> {
-    fn start_decode(&mut self, model: &'m M, device: &Device, decode: DecodeConfig) {
-        let Some(LeaseState::Held(mut chat)) = self.state.take() else {
-            unreachable!("request starts exactly one decode session")
-        };
-        let sequence = chat.sequence.take().expect("held chat owns its sequence");
-        let rings = chat.rings.take().unwrap_or_default();
-        self.state = Some(LeaseState::Decoding(
-            DecodeSession::from_parts(model, sequence, device.clone(), rings).with_config(decode),
-        ));
-    }
-    fn session(&mut self) -> &mut DecodeSession<'m, M> {
-        match self.state.as_mut() {
-            Some(LeaseState::Decoding(session)) => session,
-            _ => unreachable!("decode session was not started"),
-        }
-    }
-}
-impl<M: CausalLM> Drop for RequestLease<'_, M> {
-    fn drop(&mut self) {
-        let chat = match self.state.take() {
-            Some(LeaseState::Held(chat)) => chat,
-            Some(LeaseState::Decoding(session)) => {
-                let (sequence, rings) = session.into_parts();
-                Chat {
-                    sequence: Some(sequence),
-                    rings: Some(rings),
-                }
-            }
-            None => return,
-        };
-        *self.slot.lock() = Some(chat);
-    }
-}
+use super::request_slot::{Lease as RequestLease, State as Chat};
 
 /// One model, a held chat sequence and request-level executor serialization.
 /// Decisions build one fresh cache, never clone or replace the chat sequence.
@@ -133,21 +87,15 @@ where
                 chat: Mutex::new(Some(Chat {
                     sequence: Some(Sequence::new(cache)),
                     rings: Some(RingPool::new()),
+                    extra: (),
+                    needs_recovery: false,
                 })),
             })
         })
     }
 
     fn checkout(&self) -> Result<RequestLease<'_, M>> {
-        let chat = self.chat.lock().take().ok_or_else(|| {
-            Error::msg(
-                "causal owner is busy; queue or retry the request (callback reentry is refused)",
-            )
-        })?;
-        Ok(RequestLease {
-            slot: &self.chat,
-            state: Some(LeaseState::Held(chat)),
-        })
+        RequestLease::checkout(&self.chat, false)
     }
 
     /// Tokenization is a request producer and runs in that owner's supplied
@@ -430,6 +378,8 @@ fn produce_lfm2_gguf_with<T>(
             chat: Mutex::new(Some(Chat {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
+                extra: (),
+                needs_recovery: false,
             })),
         },
         prepared,
@@ -442,3 +392,6 @@ pub mod served;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod request_slot_tests;

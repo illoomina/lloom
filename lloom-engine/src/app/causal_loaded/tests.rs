@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 // Ownership/callback controls only: V8, max3positions, no weights/checkpoint,
 // native device or admission proof. Tiny's constant logits are not a model oracle.
-struct Tiny {
+pub(super) struct Tiny {
     caches: AtomicUsize,
 }
-struct Cache {
-    pos: usize,
+pub(super) struct Cache {
+    pub(super) pos: usize,
 }
 impl CacheReset for Cache {
     fn reset(&mut self) {
@@ -70,7 +70,7 @@ impl CausalLM for Tiny {
         8
     }
 }
-fn engine() -> Result<CausalEngine<Tiny>> {
+pub(super) fn engine() -> Result<CausalEngine<Tiny>> {
     let tokenizer = Tokenizer::new(
         tokenizers::models::wordlevel::WordLevel::builder()
             .vocab(
@@ -97,6 +97,8 @@ fn engine() -> Result<CausalEngine<Tiny>> {
         chat: Mutex::new(Some(Chat {
             sequence: Some(Sequence::new(cache)),
             rings: Some(RingPool::new()),
+            extra: (),
+            needs_recovery: false,
         })),
     })
 }

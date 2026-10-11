@@ -178,6 +178,13 @@ pub(crate) fn resolve(main: &Content, media: &Content) -> Result<ResolvedOmniCon
             lloom_tensor::bail!("omni GGUF {key} differs from fixed byte normalization")
         }
     }
+    // Before constructing per-layer plans, bound each count by parsed metadata
+    // size. Complete name/shape/dtype demand validation follows separately.
+    for key in ["clip.vision.block_count", "clip.audio.block_count"] {
+        if v.number(key)? > media.tensor_infos.len() {
+            lloom_tensor::bail!("omni GGUF {key} exceeds available tensor headers")
+        }
+    }
     let vh = v.number("clip.vision.embedding_length")?;
     let (positions, position_width) = v.shape("v.position_embd.weight")?.dims2()?;
     let (projector, projector_input) = v.shape("mm.1.weight")?.dims2()?;
@@ -254,3 +261,28 @@ pub(crate) fn resolve(main: &Content, media: &Content) -> Result<ResolvedOmniCon
 
 #[cfg(test)]
 mod tests;
+
+/// Validate the same typed demands consumed by production component loaders.
+/// Required-weight checks do not replace all-payload bounds for eager extras.
+pub(super) fn validate_demands(
+    cfg: &ResolvedOmniConfig,
+    main: &Content,
+    media: &Content,
+) -> Result<()> {
+    use super::weights::WeightPlan;
+    super::trunk::TrunkWeights::new(&cfg.core.text)?.validate_headers(main)?;
+    super::head::HeadWeights::new(
+        cfg.core.text.hidden_size,
+        cfg.core.head_layers,
+        cfg.core.text.num_hidden_layers,
+    )?
+    .validate_headers(main)?;
+    super::vision::VisionWeights::new(
+        &cfg.vision_config,
+        cfg.projector_hidden_size,
+        cfg.core.text.hidden_size,
+    )?
+    .validate_headers(media)?;
+    super::audio::AudioWeights::new(&cfg.audio_config, cfg.core.text.hidden_size)?
+        .validate_headers(media)
+}

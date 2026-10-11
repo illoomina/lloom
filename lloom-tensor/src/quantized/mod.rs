@@ -404,6 +404,37 @@ pub enum GgmlDType {
 pub const GGUF_TYPE_FP8_E4M3: u32 = 1 << 24;
 
 impl GgmlDType {
+    /// Reject activation-only encodings before allocating a file payload.
+    /// This says nothing about a backend's matrix-multiplication support.
+    pub(crate) fn validate_file_weight(self) -> Result<()> {
+        match self {
+            Self::Q8_1 | Self::Q8K => crate::bail!("quantized type {self:?} is not supported yet"),
+            Self::F32
+            | Self::F16
+            | Self::BF16
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ4NL
+            | Self::IQ4XS
+            | Self::Q2_0
+            | Self::MXFP4
+            | Self::FP8E4M3 => Ok(()),
+        }
+    }
+
     /// Whether lloom only reads blocks of this type. For the IQ family and
     /// Q2_0 only the dequant is ported: there is no quantizer to produce them
     /// and no CPU dot product to multiply by them, so both are refused by name

@@ -119,12 +119,15 @@ impl TensorInfo {
         Ok(bytes)
     }
 
-    pub fn read<R: std::io::Seek + std::io::Read>(
+    /// Check materialization geometry and file extent without reading payload
+    /// or allocating tensor storage. This is not a memory admission promise.
+    /// The reader position is left at EOF; callers must seek before reading.
+    pub fn validate_payload<R: std::io::Seek>(
         &self,
         reader: &mut R,
         tensor_data_offset: u64,
-        device: &Device,
-    ) -> Result<QTensor> {
+    ) -> Result<(u64, usize)> {
+        self.ggml_dtype.validate_file_weight()?;
         let size_in_bytes = self.materialized_size_in_bytes()?;
         let tensor_start = tensor_data_offset
             .checked_add(self.offset)
@@ -138,6 +141,16 @@ impl TensorInfo {
                 "tensor needs {size_in_bytes} bytes at offset {tensor_start}, only {remaining} remaining in file"
             )
         }
+        Ok((tensor_start, size_in_bytes))
+    }
+
+    pub fn read<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let (tensor_start, size_in_bytes) = self.validate_payload(reader, tensor_data_offset)?;
         let mut raw_data = Vec::new();
         raw_data.try_reserve_exact(size_in_bytes).map_err(|e| {
             crate::Error::Msg(format!(
@@ -625,6 +638,16 @@ impl Content {
             tensor_infos,
             tensor_data_offset,
         })
+    }
+
+    /// Validate every payload an eager loader will materialize, including
+    /// unrequested extra tensors. Header-only `read` deliberately stays lazy.
+    /// No tensor bytes are read or allocated. The reader is left at EOF.
+    pub fn validate_payloads<R: std::io::Seek>(&self, reader: &mut R) -> Result<()> {
+        for info in self.tensor_infos.values() {
+            info.validate_payload(reader, self.tensor_data_offset)?;
+        }
+        Ok(())
     }
 
     pub fn tensor<R: std::io::Seek + std::io::Read>(

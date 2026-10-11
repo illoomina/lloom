@@ -409,6 +409,11 @@ fn gguf_audio_namespace_and_fold_match_scalar_padded_and_cropped_reference() -> 
     let mut bytes = Cursor::new(Vec::new());
     gguf_file::write(&mut bytes, &[], &entries)?;
     assert!(bytes.get_ref().len() < 16 * 1024);
+    crate::models::d1_omni::weights::assert_fixture_demands(
+        &AudioWeights::new(&cfg, 4)?,
+        gguf_file::Content::read(&mut Cursor::new(bytes.get_ref()))?,
+        61,
+    )?;
     let vb = QuantizedVarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
     let encoder = QuantizedAudioEncoder::load(cfg, 4, vb)?;
     assert_eq!(encoder.inner.positions.dims(), [1, 751, 4]);

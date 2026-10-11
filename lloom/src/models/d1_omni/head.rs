@@ -1,3 +1,4 @@
+use super::weights::{LinearWeights, NormWeights, Weight, WeightPlan};
 use crate::models::siglip::{
     Attention, Encoder, EncoderLayer, Mlp, PackedQkv, QkvProjection, SeparateQkv,
 };
@@ -276,6 +277,71 @@ impl<P: Projection, Q: QkvProjection> HeadInner<P, Q> {
 pub(crate) struct QuantizedDecisionHead {
     inner: HeadInner<QuantizedLinear, PackedQkv<QuantizedLinear>>,
 }
+#[derive(Debug)]
+struct HeadBlockWeights {
+    attention: [LinearWeights; 2],
+    norms: [NormWeights; 2],
+    mlp: [LinearWeights; 2],
+}
+impl WeightPlan for HeadBlockWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.attention.as_slice().visit(f)?;
+        self.norms[0].visit(f)?;
+        self.mlp.as_slice().visit(f)?;
+        self.norms[1].visit(f)
+    }
+}
+#[derive(Debug)]
+pub(super) struct HeadWeights {
+    type_embedding: Weight,
+    blocks: Vec<HeadBlockWeights>,
+    scorer_norm: NormWeights,
+    scorer: [LinearWeights; 2],
+}
+impl HeadWeights {
+    pub(super) fn new(width: usize, layers: usize, trunk_layers: usize) -> Result<Self> {
+        let (_, packed, intermediate) = QuantizedDecisionHead::validate_config(width, layers)?;
+        trunk_layers
+            .checked_add(layers)
+            .ok_or_else(|| lloom_tensor::Error::Msg("GGUF head layer index overflow".into()))?;
+        let mut blocks = super::host::prepared_vec(layers)?;
+        for i in 0..layers {
+            let p = format!("blk.{}", trunk_layers + i);
+            blocks.push(HeadBlockWeights {
+                attention: [
+                    LinearWeights::new(&format!("{p}.attn_qkv"), width, packed, true),
+                    LinearWeights::new(&format!("{p}.attn_output"), width, width, true),
+                ],
+                norms: [
+                    NormWeights::new(&format!("{p}.attn_norm"), width),
+                    NormWeights::new(&format!("{p}.ffn_norm"), width),
+                ],
+                mlp: [
+                    LinearWeights::new(&format!("{p}.ffn_up"), width, intermediate, true),
+                    LinearWeights::new(&format!("{p}.ffn_down"), intermediate, width, true),
+                ],
+            });
+        }
+        Ok(Self {
+            type_embedding: Weight::new("token_types.weight", (3, width)),
+            blocks,
+            scorer_norm: NormWeights::new("cls.norm", width),
+            scorer: [
+                LinearWeights::new("cls", width, width, true),
+                LinearWeights::new("cls.output", width, 1, true),
+            ],
+        })
+    }
+}
+impl WeightPlan for HeadWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.type_embedding.visit(f)?;
+        self.blocks.as_slice().visit(f)?;
+        self.scorer_norm.visit(f)?;
+        self.scorer.as_slice().visit(f)
+    }
+}
+
 impl QuantizedDecisionHead {
     pub(crate) fn validate_config(width: usize, layers: usize) -> Result<(usize, usize, usize)> {
         HeadInner::<QuantizedLinear, PackedQkv<QuantizedLinear>>::validate_config(
@@ -290,33 +356,25 @@ impl QuantizedDecisionHead {
         trunk_layers: usize,
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
-        use crate::quantized_nn as qnn;
-        let (heads, packed, intermediate) = Self::validate_config(width, layers)?;
-        trunk_layers
-            .checked_add(layers)
-            .ok_or_else(|| lloom_tensor::Error::Msg("GGUF head layer index overflow".into()))?;
-        let type_embedding = Embedding::new(
-            vb.get((3, width), "token_types.weight")?
-                .dequantize(vb.device())?,
-            width,
-        );
+        let weights = HeadWeights::new(width, layers, trunk_layers)?;
+        let heads = width / 64;
+        let type_embedding = Embedding::new(weights.type_embedding.dequantize(&vb)?, width);
         let mut stack = Vec::with_capacity(layers);
-        for i in 0..layers {
-            let layer = vb.pp(format!("blk.{}", trunk_layers + i));
+        for block in &weights.blocks {
             let attention = Attention::from_qkv(
-                PackedQkv::new(qnn::linear(width, packed, layer.pp("attn_qkv"))?)?,
-                qnn::linear(width, width, layer.pp("attn_output"))?,
+                PackedQkv::new(block.attention[0].load(&vb)?)?,
+                block.attention[1].load(&vb)?,
                 heads,
             )?;
             stack.push(EncoderLayer::from_parts(
                 attention,
-                qnn::layer_norm(width, 1e-5, layer.pp("attn_norm"))?,
+                block.norms[0].load(&vb, 1e-5)?,
                 Mlp::from_parts(
-                    qnn::linear(width, intermediate, layer.pp("ffn_up"))?,
-                    qnn::linear(intermediate, width, layer.pp("ffn_down"))?,
+                    block.mlp[0].load(&vb)?,
+                    block.mlp[1].load(&vb)?,
                     Activation::Relu,
                 ),
-                qnn::layer_norm(width, 1e-5, layer.pp("ffn_norm"))?,
+                block.norms[1].load(&vb, 1e-5)?,
             ));
         }
         Ok(Self {
@@ -324,9 +382,9 @@ impl QuantizedDecisionHead {
                 width,
                 type_embedding,
                 encoder: Encoder::from_layers(stack),
-                scorer_norm: qnn::layer_norm(width, 1e-5, vb.pp("cls.norm"))?,
-                scorer_hidden: qnn::linear(width, width, vb.pp("cls"))?,
-                scorer_output: qnn::linear(width, 1, vb.pp("cls.output"))?,
+                scorer_norm: weights.scorer_norm.load(&vb, 1e-5)?,
+                scorer_hidden: weights.scorer[0].load(&vb)?,
+                scorer_output: weights.scorer[1].load(&vb)?,
             },
         })
     }

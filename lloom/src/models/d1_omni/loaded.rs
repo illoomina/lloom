@@ -95,6 +95,9 @@ impl LoadedOmni {
                 let main_header = Content::read(&mut main_file)?;
                 let media_header = Content::read(&mut media_file)?;
                 let cfg = super::gguf::resolve(&main_header, &media_header)?;
+                super::gguf::validate_demands(&cfg, &main_header, &media_header)?;
+                main_header.validate_payloads(&mut main_file)?;
+                media_header.validate_payloads(&mut media_file)?;
                 let main_vb = VarBuilder::from_gguf_content(&main_header, &mut main_file, &device)?;
                 let media_vb =
                     VarBuilder::from_gguf_content(&media_header, &mut media_file, &device)?;

@@ -2,6 +2,7 @@
 //! encoder.py at 02b55d7076f15129e59ab3f94783f32c4b088674.
 //! Backend attention and request admission are supplied by the loaded owner.
 use super::host::{checked_host_capacity, prepared_vec};
+use super::weights::{LinearWeights, Weight, WeightPlan};
 use crate::nn::blocks::{Neox, Rope, SwiGlu};
 use crate::nn::linear::ContiguousInput;
 use crate::nn::short_conv::{Centered, ShortConv};
@@ -228,40 +229,22 @@ impl Gqa {
     }
 }
 
-fn qlinear(
-    input: usize,
-    output: usize,
-    vb: crate::quantized_var_builder::VarBuilder,
-) -> Result<QuantizedLinear> {
-    Ok(ContiguousInput::new(crate::quantized_nn::linear_no_bias(
-        input, output, vb,
-    )?))
-}
-
 impl Gqa<QuantizedLinear> {
-    fn load_gguf(
+    fn load_planned(
         cfg: &ResolvedTextConfig,
-        vb: crate::quantized_var_builder::VarBuilder,
+        weights: &GqaWeights,
+        vb: &crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
-        let d = cfg.hidden_size;
-        let hd = d / cfg.num_attention_heads;
-        let kv = product(&[cfg.num_key_value_heads, hd])?;
         Ok(Self {
-            q: qlinear(d, d, vb.pp("attn_q"))?,
-            k: qlinear(d, kv, vb.pp("attn_k"))?,
-            v: qlinear(d, kv, vb.pp("attn_v"))?,
-            out: qlinear(d, d, vb.pp("attn_output"))?,
-            q_norm: RmsNorm::new(
-                vb.get(hd, "attn_q_norm.weight")?.dequantize(vb.device())?,
-                cfg.norm_eps,
-            ),
-            k_norm: RmsNorm::new(
-                vb.get(hd, "attn_k_norm.weight")?.dequantize(vb.device())?,
-                cfg.norm_eps,
-            ),
+            q: ContiguousInput::new(weights.projections[0].load(vb)?),
+            k: ContiguousInput::new(weights.projections[1].load(vb)?),
+            v: ContiguousInput::new(weights.projections[2].load(vb)?),
+            out: ContiguousInput::new(weights.projections[3].load(vb)?),
+            q_norm: RmsNorm::new(weights.norms[0].dequantize(vb)?, cfg.norm_eps),
+            k_norm: RmsNorm::new(weights.norms[1].dequantize(vb)?, cfg.norm_eps),
             heads: cfg.num_attention_heads,
             kv_heads: cfg.num_key_value_heads,
-            head_dim: hd,
+            head_dim: cfg.hidden_size / cfg.num_attention_heads,
         })
     }
 }
@@ -635,6 +618,123 @@ impl<P: Module> TrunkInner<P> {
 pub(crate) struct QuantizedTrunk {
     inner: TrunkInner<QuantizedLinear>,
 }
+#[derive(Debug)]
+struct GqaWeights {
+    projections: [LinearWeights; 4],
+    norms: [Weight; 2],
+}
+impl WeightPlan for GqaWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.projections.as_slice().visit(f)?;
+        self.norms.as_slice().visit(f)
+    }
+}
+#[derive(Debug)]
+enum MixerWeights {
+    Attention(GqaWeights),
+    Conv {
+        input: LinearWeights,
+        conv: Weight,
+        output: LinearWeights,
+    },
+}
+impl WeightPlan for MixerWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Attention(weights) => weights.visit(f),
+            Self::Conv {
+                input,
+                conv,
+                output,
+            } => {
+                input.visit(f)?;
+                conv.visit(f)?;
+                output.visit(f)
+            }
+        }
+    }
+}
+#[derive(Debug)]
+struct TrunkBlockWeights {
+    mixer: MixerWeights,
+    ffn: [Weight; 3],
+    norms: [Weight; 2],
+}
+impl WeightPlan for TrunkBlockWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.mixer.visit(f)?;
+        self.ffn.as_slice().visit(f)?;
+        self.norms.as_slice().visit(f)
+    }
+}
+#[derive(Debug)]
+pub(super) struct TrunkWeights {
+    embedding: Weight,
+    blocks: Vec<TrunkBlockWeights>,
+    norm: Weight,
+}
+impl TrunkWeights {
+    pub(super) fn new(cfg: &ResolvedTextConfig) -> Result<Self> {
+        let intermediate = QuantizedTrunk::validate_config(cfg)?;
+        let d = cfg.hidden_size;
+        let hd = d / cfg.num_attention_heads;
+        let kv = product(&[cfg.num_key_value_heads, hd])?;
+        let mut blocks = prepared_vec(cfg.num_hidden_layers)?;
+        for (i, kind) in cfg.layer_types.iter().enumerate() {
+            let p = format!("blk.{i}");
+            let mixer = if kind == "full_attention" {
+                MixerWeights::Attention(GqaWeights {
+                    projections: [
+                        LinearWeights::new(&format!("{p}.attn_q"), d, d, false),
+                        LinearWeights::new(&format!("{p}.attn_k"), d, kv, false),
+                        LinearWeights::new(&format!("{p}.attn_v"), d, kv, false),
+                        LinearWeights::new(&format!("{p}.attn_output"), d, d, false),
+                    ],
+                    norms: [
+                        Weight::new(format!("{p}.attn_q_norm.weight"), hd),
+                        Weight::new(format!("{p}.attn_k_norm.weight"), hd),
+                    ],
+                })
+            } else {
+                MixerWeights::Conv {
+                    input: LinearWeights::new(
+                        &format!("{p}.shortconv.in_proj"),
+                        d,
+                        product(&[3, d])?,
+                        false,
+                    ),
+                    conv: Weight::new(format!("{p}.shortconv.conv.weight"), (d, 3)),
+                    output: LinearWeights::new(&format!("{p}.shortconv.out_proj"), d, d, false),
+                }
+            };
+            blocks.push(TrunkBlockWeights {
+                mixer,
+                ffn: [
+                    Weight::new(format!("{p}.ffn_gate.weight"), (intermediate, d)),
+                    Weight::new(format!("{p}.ffn_up.weight"), (intermediate, d)),
+                    Weight::new(format!("{p}.ffn_down.weight"), (d, intermediate)),
+                ],
+                norms: [
+                    Weight::new(format!("{p}.attn_norm.weight"), d),
+                    Weight::new(format!("{p}.ffn_norm.weight"), d),
+                ],
+            });
+        }
+        Ok(Self {
+            embedding: Weight::new("token_embd.weight", (cfg.vocab_size, d)),
+            blocks,
+            norm: Weight::new("token_embd_norm.weight", d),
+        })
+    }
+}
+impl WeightPlan for TrunkWeights {
+    fn visit(&self, f: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.embedding.visit(f)?;
+        self.blocks.as_slice().visit(f)?;
+        self.norm.visit(f)
+    }
+}
+
 impl QuantizedTrunk {
     pub(crate) fn validate_config(cfg: &ResolvedTextConfig) -> Result<usize> {
         TrunkInner::<QuantizedLinear>::validate_config(cfg, DType::F32)
@@ -643,53 +743,40 @@ impl QuantizedTrunk {
         cfg: ResolvedTextConfig,
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
-        let intermediate = Self::validate_config(&cfg)?;
+        let weights = TrunkWeights::new(&cfg)?;
+        let intermediate = cfg.intermediate_size;
         let d = cfg.hidden_size;
-        let embedding = Embedding::new(
-            vb.get((cfg.vocab_size, d), "token_embd.weight")?
-                .dequantize(vb.device())?,
-            d,
-        );
+        let embedding = Embedding::new(weights.embedding.dequantize(&vb)?, d);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for (i, kind) in cfg.layer_types.iter().enumerate() {
-            let layer = vb.pp(format!("blk.{i}"));
-            let mixer = if kind == "full_attention" {
-                Mixer::Attention(Gqa::load_gguf(&cfg, layer.clone())?)
-            } else {
-                Mixer::Conv {
-                    input: qlinear(d, product(&[3, d])?, layer.pp("shortconv.in_proj"))?,
-                    conv: ShortConv::<Centered>::new(
-                        layer
-                            .get((d, 3), "shortconv.conv.weight")?
-                            .dequantize(vb.device())?,
-                    )?,
-                    output: qlinear(d, d, layer.pp("shortconv.out_proj"))?,
+        for block in &weights.blocks {
+            let mixer = match &block.mixer {
+                MixerWeights::Attention(weights) => {
+                    Mixer::Attention(Gqa::load_planned(&cfg, weights, &vb)?)
                 }
+                MixerWeights::Conv {
+                    input,
+                    conv,
+                    output,
+                } => Mixer::Conv {
+                    input: ContiguousInput::new(input.load(&vb)?),
+                    conv: ShortConv::<Centered>::new(conv.dequantize(&vb)?)?,
+                    output: ContiguousInput::new(output.load(&vb)?),
+                },
             };
             layers.push(Layer {
                 mixer,
                 ffn: SwiGlu::new(
-                    QMatMul::from_arc(layer.get((intermediate, d), "ffn_gate.weight")?)?,
-                    QMatMul::from_arc(layer.get((intermediate, d), "ffn_up.weight")?)?,
-                    QMatMul::from_arc(layer.get((d, intermediate), "ffn_down.weight")?)?,
+                    QMatMul::from_arc(block.ffn[0].get(&vb)?)?,
+                    QMatMul::from_arc(block.ffn[1].get(&vb)?)?,
+                    QMatMul::from_arc(block.ffn[2].get(&vb)?)?,
                     d,
                     intermediate,
                 ),
-                operator_norm: RmsNorm::new(
-                    layer.get(d, "attn_norm.weight")?.dequantize(vb.device())?,
-                    cfg.norm_eps,
-                ),
-                ffn_norm: RmsNorm::new(
-                    layer.get(d, "ffn_norm.weight")?.dequantize(vb.device())?,
-                    cfg.norm_eps,
-                ),
+                operator_norm: RmsNorm::new(block.norms[0].dequantize(&vb)?, cfg.norm_eps),
+                ffn_norm: RmsNorm::new(block.norms[1].dequantize(&vb)?, cfg.norm_eps),
             });
         }
-        let norm = RmsNorm::new(
-            vb.get(d, "token_embd_norm.weight")?
-                .dequantize(vb.device())?,
-            cfg.norm_eps,
-        );
+        let norm = RmsNorm::new(weights.norm.dequantize(&vb)?, cfg.norm_eps);
         Ok(Self {
             inner: TrunkInner {
                 cfg,

@@ -28,3 +28,5 @@ pub use model::{OmniConfig, OmniImage, OmniModel};
 mod loaded;
 
 mod gguf;
+
+mod weights;

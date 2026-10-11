@@ -1,6 +1,7 @@
 //! d1-omni vision composition over the shared LFM2-VL/SigLIP mechanisms.
 //! RGB decoding is external. Checked geometry is NOT pass admission; callers
 //! must reserve image/preparation/encoder/projector work in their model Domain.
+use super::weights::{LinearWeights, NormWeights, Weight, WeightDType, WeightPlan};
 use crate::models::lfm2_vl::{
     ImageProcessor, Lfm2VlConfig, MultiModalProjector, ProjectorCore, RgbNormalization, TileLayout,
     VisionConfig, VisionPositionPadding, VisionTower, VisionTowerCore,
@@ -8,7 +9,7 @@ use crate::models::lfm2_vl::{
 use crate::models::siglip::{Attention, Encoder, EncoderLayer, Mlp};
 use crate::nn::linear::{ContiguousInput, Projection};
 use crate::nn::{Activation, Linear, VarBuilder};
-use crate::{quantized_nn as qnn, quantized_var_builder::VarBuilder as QuantizedVarBuilder};
+use crate::quantized_var_builder::VarBuilder as QuantizedVarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
@@ -172,7 +173,7 @@ struct VisionInner<P> {
     dtype: DType,
     device: Device,
 }
-type QuantizedProjection = ContiguousInput<qnn::Linear>;
+type QuantizedProjection = ContiguousInput<crate::quantized_nn::Linear>;
 #[derive(Debug, Clone)]
 pub(crate) struct QuantizedVision {
     inner: VisionInner<QuantizedProjection>,
@@ -281,6 +282,76 @@ impl Vision {
     }
 }
 
+#[derive(Debug)]
+struct VisionBlockWeights {
+    attention: [LinearWeights; 4],
+    mlp: [LinearWeights; 2],
+    norms: [NormWeights; 2],
+}
+impl WeightPlan for VisionBlockWeights {
+    fn visit(&self, visitor: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.attention.as_slice().visit(visitor)?;
+        self.mlp.as_slice().visit(visitor)?;
+        self.norms.as_slice().visit(visitor)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VisionWeights {
+    patch: Weight,
+    patch_bias: Weight,
+    positions: Weight,
+    blocks: Vec<VisionBlockWeights>,
+    post_norm: NormWeights,
+    projector: [LinearWeights; 2],
+}
+impl VisionWeights {
+    pub(super) fn new(cfg: &VisionConfig, projector: usize, out: usize) -> Result<Self> {
+        QuantizedVision::validate_config(cfg, projector, out)?;
+        let h = cfg.hidden_size;
+        let mut blocks = super::host::prepared_vec(cfg.num_hidden_layers)?;
+        for i in 0..cfg.num_hidden_layers {
+            let prefix = format!("v.blk.{i}");
+            blocks.push(VisionBlockWeights {
+                attention: ["attn_q", "attn_k", "attn_v", "attn_out"]
+                    .map(|name| LinearWeights::new(&format!("{prefix}.{name}"), h, h, true)),
+                mlp: [
+                    LinearWeights::new(&format!("{prefix}.ffn_up"), h, cfg.intermediate_size, true),
+                    LinearWeights::new(
+                        &format!("{prefix}.ffn_down"),
+                        cfg.intermediate_size,
+                        h,
+                        true,
+                    ),
+                ],
+                norms: ["ln1", "ln2"].map(|name| NormWeights::new(&format!("{prefix}.{name}"), h)),
+            });
+        }
+        Ok(Self {
+            patch: Weight::new("v.patch_embd.weight", (h, 3, PATCH, PATCH))
+                .dtype(WeightDType::F16OrF32),
+            patch_bias: Weight::new("v.patch_embd.bias", h),
+            positions: Weight::new("v.position_embd.weight", (cfg.num_patches, h)),
+            blocks,
+            post_norm: NormWeights::new("v.post_ln", h),
+            projector: [
+                LinearWeights::new("mm.1", product(&[h, 4])?, projector, true),
+                LinearWeights::new("mm.2", projector, out, true),
+            ],
+        })
+    }
+}
+impl WeightPlan for VisionWeights {
+    fn visit(&self, visitor: &mut impl FnMut(&Weight) -> Result<()>) -> Result<()> {
+        self.patch.visit(visitor)?;
+        self.patch_bias.visit(visitor)?;
+        self.positions.visit(visitor)?;
+        self.blocks.as_slice().visit(visitor)?;
+        self.post_norm.visit(visitor)?;
+        self.projector.as_slice().visit(visitor)
+    }
+}
+
 impl QuantizedVision {
     pub(crate) fn validate_config(
         cfg: &VisionConfig,
@@ -301,56 +372,40 @@ impl QuantizedVision {
         out: usize,
         vb: QuantizedVarBuilder,
     ) -> Result<Self> {
-        Self::validate_config(cfg, projector_hidden, out)?;
+        let weights = VisionWeights::new(cfg, projector_hidden, out)?;
         let hidden = cfg.hidden_size;
-        let patch = vb.get((hidden, 3, PATCH, PATCH), "v.patch_embd.weight")?;
-        if !matches!(
-            patch.dtype(),
-            lloom_tensor::quantized::GgmlDType::F16 | lloom_tensor::quantized::GgmlDType::F32
-        ) {
-            lloom_tensor::bail!("official vision patch projection must be F16 or F32")
-        }
         // The converter permutes [D,P,P,C] to [D,C,P,P]. Invert once at load.
-        let patch = patch
-            .dequantize(vb.device())?
+        let patch = weights
+            .patch
+            .dequantize(&vb)?
             .to_dtype(DType::F32)?
             .permute((0, 2, 3, 1))?
             .contiguous()?
             .reshape((hidden, 3 * PATCH * PATCH))?;
-        let patch_bias = vb
-            .get(hidden, "v.patch_embd.bias")?
-            .dequantize(vb.device())?;
-        let positions = vb
-            .get((cfg.num_patches, hidden), "v.position_embd.weight")?
-            .dequantize(vb.device())?;
+        let patch_bias = weights.patch_bias.dequantize(&vb)?;
+        let positions = weights.positions.dequantize(&vb)?;
         let mut layers = super::host::prepared_vec(cfg.num_hidden_layers)?;
-        for i in 0..cfg.num_hidden_layers {
-            let block = vb.pp(format!("v.blk.{i}"));
-            let projection =
-                |name: &str, input: usize, output: usize| -> Result<QuantizedProjection> {
-                    Ok(ContiguousInput::new(qnn::linear(
-                        input,
-                        output,
-                        block.pp(name),
-                    )?))
-                };
+        for block in &weights.blocks {
+            let projection = |weight: &LinearWeights| -> Result<QuantizedProjection> {
+                Ok(ContiguousInput::new(weight.load(&vb)?))
+            };
             let attention = Attention::from_projections(
-                projection("attn_q", hidden, hidden)?,
-                projection("attn_k", hidden, hidden)?,
-                projection("attn_v", hidden, hidden)?,
-                projection("attn_out", hidden, hidden)?,
+                projection(&block.attention[0])?,
+                projection(&block.attention[1])?,
+                projection(&block.attention[2])?,
+                projection(&block.attention[3])?,
                 cfg.num_attention_heads,
             )?;
             let mlp = Mlp::from_parts(
-                projection("ffn_up", hidden, cfg.intermediate_size)?,
-                projection("ffn_down", cfg.intermediate_size, hidden)?,
+                projection(&block.mlp[0])?,
+                projection(&block.mlp[1])?,
                 cfg.hidden_act,
             );
             layers.push(EncoderLayer::from_parts(
                 attention,
-                qnn::layer_norm(hidden, cfg.layer_norm_eps, block.pp("ln1"))?,
+                block.norms[0].load(&vb, cfg.layer_norm_eps)?,
                 mlp,
-                qnn::layer_norm(hidden, cfg.layer_norm_eps, block.pp("ln2"))?,
+                block.norms[1].load(&vb, cfg.layer_norm_eps)?,
             ));
         }
         let tower = VisionTowerCore::from_components(
@@ -358,15 +413,11 @@ impl QuantizedVision {
             Linear::new(patch, Some(patch_bias)),
             positions,
             Encoder::from_layers(layers),
-            qnn::layer_norm(hidden, cfg.layer_norm_eps, vb.pp("v.post_ln"))?,
+            weights.post_norm.load(&vb, cfg.layer_norm_eps)?,
         )?;
         let projector = ProjectorCore::from_components(
-            ContiguousInput::new(qnn::linear(
-                product(&[hidden, 4])?,
-                projector_hidden,
-                vb.pp("mm.1"),
-            )?),
-            ContiguousInput::new(qnn::linear(projector_hidden, out, vb.pp("mm.2"))?),
+            ContiguousInput::new(weights.projector[0].load(&vb)?),
+            ContiguousInput::new(weights.projector[1].load(&vb)?),
             Activation::Gelu,
             2,
             None,

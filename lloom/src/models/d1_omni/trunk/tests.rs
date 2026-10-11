@@ -417,6 +417,11 @@ fn gguf_f32_trunk_matches_independent_nonzero_scalar_reference() -> Result<()> {
     let mut bytes = Cursor::new(Vec::new());
     gguf_file::write(&mut bytes, &[], &entries)?;
     assert!(bytes.get_ref().len() < 16 * 1024);
+    super::super::weights::assert_fixture_demands(
+        &TrunkWeights::new(&config().resolved()?)?,
+        gguf_file::Content::read(&mut Cursor::new(bytes.get_ref()))?,
+        21,
+    )?;
     let vb =
         crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
     let trunk = QuantizedTrunk::load(config().resolved()?, vb)?;

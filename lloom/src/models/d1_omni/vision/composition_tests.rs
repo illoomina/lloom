@@ -399,6 +399,12 @@ fn gguf_vision_patch_permutation_and_full_composition_cpu() -> Result<()> {
     }
     let (cfg, weights) = fixture_parts()?;
     let bytes = gguf_fixture(&weights, true)?;
+    crate::models::d1_omni::weights::assert_fixture_demands(
+        &VisionWeights::new(&cfg, 8, 4)?,
+        lloom_tensor::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(&bytes))?,
+        25,
+    )?;
+
     let quantized = QuantizedVision::load(
         &cfg,
         8,

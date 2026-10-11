@@ -154,6 +154,14 @@ fn malformed_headers_refuse_before_any_eager_builder() {
             assert!(error.contains(message), "{key}: {error}");
         }
     }
+    for key in ["clip.vision.block_count", "clip.audio.block_count"] {
+        let (main, mut media) = fixture();
+        media.metadata.insert(key.into(), Value::U32(u32::MAX));
+        assert!(resolve(&main, &media)
+            .unwrap_err()
+            .to_string()
+            .contains("available tensor headers"));
+    }
     let (main, mut media) = fixture();
     media
         .tensor_infos
@@ -170,4 +178,15 @@ fn malformed_headers_refuse_before_any_eager_builder() {
         .unwrap_err()
         .to_string()
         .contains("normalization"));
+}
+
+#[test]
+fn incomplete_weight_headers_refuse_before_payload_materialization() -> Result<()> {
+    let (main, media) = fixture();
+    let cfg = resolve(&main, &media)?;
+    assert!(validate_demands(&cfg, &main, &media)
+        .unwrap_err()
+        .to_string()
+        .contains("tensor header"));
+    Ok(())
 }

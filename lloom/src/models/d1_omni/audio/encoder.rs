@@ -1,6 +1,8 @@
 //! Pinned omni audio.py Conformer/adapter composition. The frontend supplies
 //! normalized mel; the loaded family supplies admission and attention policy.
 use super::relative::RelativeInputs;
+mod weights;
+use crate::models::d1_omni::weights::LinearWeights;
 use crate::models::siglip::Mlp;
 use crate::nn::linear::{ContiguousInput, Projection};
 use crate::nn::{
@@ -8,6 +10,8 @@ use crate::nn::{
     ChannelAffine, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder,
 };
 use lloom_tensor::{DType, Device, Module, ModuleT, Result, Tensor};
+pub(in crate::models::d1_omni) use weights::AudioWeights;
+use weights::{BlockWeights, ConvWeights, RelativeWeights};
 
 /// The pinned 30-second,16kHz/hop160 frontend has3001 STFT rows,3000 valid.
 const MAX_MEL_FRAMES: usize = 3001;
@@ -334,32 +338,36 @@ impl ConvModule<ChannelAffine> {
     /// weights as matrices and depthwise weights as [D,K], all F32; restore
     /// only singleton convolution axes, never invent missing BN statistics.
     fn load_gguf(cfg: &AudioConfig, vb: crate::quantized_var_builder::VarBuilder) -> Result<Self> {
-        cfg.validate(cfg.d_model, DType::F32)?;
+        let weights = ConvWeights::new(cfg, "")?;
+        Self::load_planned(cfg, &weights, &vb)
+    }
+    fn load_planned(
+        cfg: &AudioConfig,
+        weights: &ConvWeights,
+        vb: &QuantizedVarBuilder,
+    ) -> Result<Self> {
         let d = cfg.d_model;
-        let twice = product(&[2, d])?;
         let k = cfg.conv_kernel_size;
-        let weight =
-            |shape: &[usize], name: &str| -> Result<Tensor> { float_weight(&vb, shape, name) };
         let input = Conv1d::new(
-            weight(&[twice, d], "conv_pw1.weight")?.unsqueeze(2)?,
-            Some(weight(&[twice], "conv_pw1.bias")?),
+            weights.input[0].dequantize(vb)?.unsqueeze(2)?,
+            Some(weights.input[1].dequantize(vb)?),
             Default::default(),
         );
         let depth = Conv1d::new(
-            weight(&[d, k], "conv_dw.weight")?.unsqueeze(1)?,
-            Some(weight(&[d], "conv_dw.bias")?),
+            weights.depth[0].dequantize(vb)?.unsqueeze(1)?,
+            Some(weights.depth[1].dequantize(vb)?),
             Conv1dConfig {
                 groups: d,
                 ..Default::default()
             },
         );
         let norm = ChannelAffine::new(
-            weight(&[d], "conv_norm.weight")?,
-            weight(&[d], "conv_norm.bias")?,
+            weights.norm[0].dequantize(vb)?,
+            weights.norm[1].dequantize(vb)?,
         )?;
         let output = Conv1d::new(
-            weight(&[d, d], "conv_pw2.weight")?.unsqueeze(2)?,
-            Some(weight(&[d], "conv_pw2.bias")?),
+            weights.output[0].dequantize(vb)?.unsqueeze(2)?,
+            Some(weights.output[1].dequantize(vb)?),
             Default::default(),
         );
         Ok(Self {
@@ -622,130 +630,84 @@ impl<P: Projection, N: ChannelNormalization> AudioInner<P, N> {
 type QuantizedLinear = ContiguousInput<crate::quantized_nn::Linear>;
 type QuantizedVarBuilder = crate::quantized_var_builder::VarBuilder;
 
-fn qlinear(
-    input: usize,
-    output: usize,
-    bias: bool,
-    vb: QuantizedVarBuilder,
-) -> Result<QuantizedLinear> {
-    Ok(ContiguousInput::new(crate::quantized_nn::linear_b(
-        input, output, bias, vb,
-    )?))
-}
-
 fn qmlp(
-    input: usize,
-    hidden: usize,
-    output: usize,
-    a: &str,
-    b: &str,
+    weights: &[LinearWeights; 2],
     act: Activation,
-    vb: QuantizedVarBuilder,
+    vb: &QuantizedVarBuilder,
 ) -> Result<Mlp<QuantizedLinear>> {
     Ok(Mlp::from_parts(
-        qlinear(input, hidden, true, vb.pp(a))?,
-        qlinear(hidden, output, true, vb.pp(b))?,
+        ContiguousInput::new(weights[0].load(vb)?),
+        ContiguousInput::new(weights[1].load(vb)?),
         act,
     ))
 }
 
-/// Converter keeps these convolution coefficients in F32. Check both the
-/// stored geometry and dtype before any dequantization or singleton restoration.
-fn float_weight(vb: &QuantizedVarBuilder, shape: &[usize], name: &str) -> Result<Tensor> {
-    product(&[product(shape)?, 4])?;
-    let weight = vb.get(shape, name)?;
-    if weight.dtype() != lloom_tensor::quantized::GgmlDType::F32 {
-        lloom_tensor::bail!("omni audio convolution coefficient {name} must be F32")
-    }
-    weight.dequantize(vb.device())
-}
-
 impl Subsampling<QuantizedLinear> {
-    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
+    fn load_planned(
+        cfg: &AudioConfig,
+        weights: &AudioWeights,
+        vb: &QuantizedVarBuilder,
+    ) -> Result<Self> {
         let c = cfg.subsampling_conv_channels;
         let mut ops = Vec::with_capacity(8);
-        for (index, input, kernel, stride, groups, relu) in [
-            (0, 1, 3, 2, 1, true),
-            (2, c, 3, 2, c, false),
-            (3, c, 1, 1, 1, true),
-            (5, c, 3, 2, c, false),
-            (6, c, 1, 1, 1, true),
-        ] {
-            let w = float_weight(
-                &vb,
-                &[c, input / groups, kernel, kernel],
-                &format!("a.conv1d.{index}.weight"),
-            )?;
-            let b = float_weight(&vb, &[c, 1, 1], &format!("a.conv1d.{index}.bias"))?.reshape(c)?;
+        for conv in &weights.subsample {
+            let w = conv.weight.dequantize(vb)?;
+            let b = conv.bias.dequantize(vb)?.reshape(c)?;
             ops.push(SubsampleOp::Conv(Conv2d::new(
                 w,
                 Some(b),
                 Conv2dConfig {
-                    stride,
-                    padding: kernel / 2,
-                    groups,
+                    stride: conv.stride,
+                    padding: conv.kernel / 2,
+                    groups: conv.groups,
                     ..Default::default()
                 },
             )));
-            if relu {
+            if conv.relu {
                 ops.push(SubsampleOp::Relu);
             }
         }
-        let freq = ceil_half(ceil_half(ceil_half(cfg.feat_in)));
         Ok(Self {
             ops,
-            output: qlinear(
-                product(&[c, freq])?,
-                cfg.d_model,
-                true,
-                vb.pp("a.pre_encode.out"),
-            )?,
+            output: ContiguousInput::new(weights.subsample_output.load(vb)?),
         })
     }
 }
-
 impl RelativeProjection<QuantizedLinear> {
-    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
-        let d = cfg.d_model;
-        let h = cfg.n_heads;
-        let width = d / h;
+    fn load_planned(
+        cfg: &AudioConfig,
+        weights: &RelativeWeights,
+        vb: &QuantizedVarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
-            q: qlinear(d, d, true, vb.pp("attn_q"))?,
-            k: qlinear(d, d, true, vb.pp("attn_k"))?,
-            v: qlinear(d, d, true, vb.pp("attn_v"))?,
-            p: qlinear(d, d, false, vb.pp("linear_pos"))?,
-            out: qlinear(d, d, true, vb.pp("attn_out"))?,
-            u: vb.get((h, width), "pos_bias_u")?.dequantize(vb.device())?,
-            v_bias: vb.get((h, width), "pos_bias_v")?.dequantize(vb.device())?,
-            heads: h,
-            width,
+            q: ContiguousInput::new(weights.projections[0].load(vb)?),
+            k: ContiguousInput::new(weights.projections[1].load(vb)?),
+            v: ContiguousInput::new(weights.projections[2].load(vb)?),
+            p: ContiguousInput::new(weights.projections[3].load(vb)?),
+            out: ContiguousInput::new(weights.projections[4].load(vb)?),
+            u: weights.u.dequantize(vb)?,
+            v_bias: weights.v.dequantize(vb)?,
+            heads: cfg.n_heads,
+            width: cfg.d_model / cfg.n_heads,
         })
     }
 }
-
 impl ConformerLayer<QuantizedLinear, ChannelAffine> {
-    fn load_gguf(cfg: &AudioConfig, vb: QuantizedVarBuilder) -> Result<Self> {
-        use crate::quantized_nn::layer_norm as norm;
-        let d = cfg.d_model;
-        let ff = product(&[d, cfg.ff_expansion_factor])?;
+    fn load_planned(
+        cfg: &AudioConfig,
+        weights: &BlockWeights,
+        vb: &QuantizedVarBuilder,
+    ) -> Result<Self> {
         Ok(Self {
-            norm_ff1: norm(d, 1e-5, vb.pp("ffn_norm"))?,
-            ff1: qmlp(d, ff, d, "ffn_up", "ffn_down", Activation::Silu, vb.clone())?,
-            norm_att: norm(d, 1e-5, vb.pp("ln1"))?,
-            att: RelativeProjection::<QuantizedLinear>::load_gguf(cfg, vb.clone())?,
-            norm_conv: norm(d, 1e-5, vb.pp("norm_conv"))?,
-            conv: ConvModule::<ChannelAffine>::load_gguf(cfg, vb.clone())?,
-            norm_ff2: norm(d, 1e-5, vb.pp("ffn_norm_1"))?,
-            ff2: qmlp(
-                d,
-                ff,
-                d,
-                "ffn_up_1",
-                "ffn_down_1",
-                Activation::Silu,
-                vb.clone(),
-            )?,
-            norm_out: norm(d, 1e-5, vb.pp("ln2"))?,
+            norm_ff1: weights.norms[0].load(vb, 1e-5)?,
+            ff1: qmlp(&weights.ff1, Activation::Silu, vb)?,
+            norm_att: weights.norms[1].load(vb, 1e-5)?,
+            att: RelativeProjection::<QuantizedLinear>::load_planned(cfg, &weights.attention, vb)?,
+            norm_conv: weights.norms[2].load(vb, 1e-5)?,
+            conv: ConvModule::<ChannelAffine>::load_planned(cfg, &weights.conv, vb)?,
+            norm_ff2: weights.norms[3].load(vb, 1e-5)?,
+            ff2: qmlp(&weights.ff2, Activation::Silu, vb)?,
+            norm_out: weights.norms[4].load(vb, 1e-5)?,
         })
     }
 }
@@ -766,33 +728,23 @@ impl QuantizedAudioEncoder {
         Ok(())
     }
     pub(crate) fn load(cfg: AudioConfig, out: usize, vb: QuantizedVarBuilder) -> Result<Self> {
-        use crate::quantized_nn::layer_norm as norm;
-        Self::validate_config(&cfg, out)?;
+        let weights = AudioWeights::new(&cfg, out)?;
         let d = cfg.d_model;
-        let subsample = Subsampling::<QuantizedLinear>::load_gguf(&cfg, vb.clone())?;
-        let layers = (0..cfg.n_layers)
-            .map(|i| {
-                ConformerLayer::<QuantizedLinear, ChannelAffine>::load_gguf(
-                    &cfg,
-                    vb.pp(format!("a.blk.{i}")),
-                )
+        let subsample = Subsampling::<QuantizedLinear>::load_planned(&cfg, &weights, &vb)?;
+        let layers = weights
+            .blocks
+            .iter()
+            .map(|block| {
+                ConformerLayer::<QuantizedLinear, ChannelAffine>::load_planned(&cfg, block, &vb)
             })
             .collect::<Result<Vec<_>>>()?;
         let positions = relative_positions(d, DType::F32, vb.device())?;
         Ok(Self {
             inner: AudioInner {
-                adapter_norm: norm(d, 1e-5, vb.pp("mm.a.mlp.0"))?,
-                adapter: qmlp(d, out, out, "1", "3", Activation::Gelu, vb.pp("mm.a.mlp"))?,
-                residual_norm: norm(out, 1e-5, vb.pp("mm.a.mlp.4"))?,
-                residual: qmlp(
-                    out,
-                    cfg.residual_width,
-                    out,
-                    "5",
-                    "6",
-                    Activation::Gelu,
-                    vb.pp("mm.a.mlp"),
-                )?,
+                adapter_norm: weights.adapter_norm.load(&vb, 1e-5)?,
+                adapter: qmlp(&weights.adapter, Activation::Gelu, &vb)?,
+                residual_norm: weights.residual_norm.load(&vb, 1e-5)?,
+                residual: qmlp(&weights.residual, Activation::Gelu, &vb)?,
                 dtype: DType::F32,
                 device: vb.device().clone(),
                 cfg,

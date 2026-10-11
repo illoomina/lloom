@@ -428,6 +428,11 @@ fn gguf_packed_head_reuses_shared_forward_with_official_names_and_markers() -> R
     let mut bytes = Cursor::new(Vec::new());
     gguf_file::write(&mut bytes, &[], &entries)?;
     assert!(bytes.get_ref().len() < 128 * 1024);
+    super::super::weights::assert_fixture_demands(
+        &HeadWeights::new(WIDTH, 1, 7)?,
+        gguf_file::Content::read(&mut Cursor::new(bytes.get_ref()))?,
+        19,
+    )?;
     let vb =
         crate::quantized_var_builder::VarBuilder::from_gguf_buffer(bytes.get_ref(), &Device::Cpu)?;
     assert_eq!(

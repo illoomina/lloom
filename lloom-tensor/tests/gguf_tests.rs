@@ -359,3 +359,104 @@ fn rejects_alignment_roundup_overflow_with_tiny_virtual_header() {
     let err = Content::read(&mut reader).unwrap_err().to_string();
     assert!(err.contains("aligned tensor data offset overflow"), "{err}");
 }
+
+/// Seek-only virtual extents prove preflight does not read payload or construct
+/// Tensor storage. Extra eager entries are checked even if no model asks for them.
+#[test]
+fn eager_payload_preflight_checks_extras_without_reading_or_allocating_tensors() {
+    use lloom_tensor::quantized::gguf_file::{TensorInfo, VersionedMagic};
+    use lloom_tensor::quantized::GgmlDType;
+    use lloom_tensor::Shape;
+    use std::collections::HashMap;
+    use std::io::{Seek, SeekFrom};
+    struct Extent(u64);
+    impl Seek for Extent {
+        fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
+            assert_eq!(at, SeekFrom::End(0), "preflight only observes extent");
+            Ok(self.0)
+        }
+    }
+    let mut content = Content {
+        magic: VersionedMagic::GgufV3,
+        metadata: HashMap::new(),
+        tensor_infos: HashMap::from([
+            (
+                "required".into(),
+                TensorInfo {
+                    shape: Shape::from(4),
+                    ggml_dtype: GgmlDType::F32,
+                    offset: 0,
+                },
+            ),
+            (
+                "extra".into(),
+                TensorInfo {
+                    shape: Shape::from(4),
+                    ggml_dtype: GgmlDType::F32,
+                    offset: 48,
+                },
+            ),
+        ]),
+        tensor_data_offset: 0,
+    };
+    content.validate_payloads(&mut Extent(64)).unwrap();
+    for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
+        let extra = content.tensor_infos.get_mut("extra").unwrap();
+        extra.ggml_dtype = dtype;
+        extra.shape = Shape::from(dtype.block_size());
+        let error = content
+            .validate_payloads(&mut Extent(u64::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported yet"), "{error}");
+        // The direct shared reader must select the same refusal before it can
+        // inspect these deliberately empty raw bytes or attempt conversion.
+        let error = lloom_tensor::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &[],
+            vec![dtype.block_size()],
+            &Device::Cpu,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not supported yet"), "{error}");
+    }
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.ggml_dtype = GgmlDType::F32;
+    extra.shape = Shape::from(4);
+
+    let error = content
+        .validate_payloads(&mut Extent(63))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only 15 remaining"), "{error}");
+    // Preserve zero-element header semantics at EOF, not a blanket positive cap.
+    content.tensor_infos.get_mut("extra").unwrap().shape = Shape::from(0);
+    content.tensor_infos.get_mut("extra").unwrap().offset = 64;
+    content.validate_payloads(&mut Extent(64)).unwrap();
+    content.tensor_data_offset = 1;
+    content.tensor_infos.get_mut("extra").unwrap().offset = u64::MAX;
+    assert!(content
+        .validate_payloads(&mut Extent(u64::MAX))
+        .unwrap_err()
+        .to_string()
+        .contains("offset overflow"));
+    content.tensor_data_offset = 0;
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.offset = 0;
+    extra.shape = Shape::from(31);
+    extra.ggml_dtype = GgmlDType::Q4_0;
+    assert!(content
+        .validate_payloads(&mut Extent(64))
+        .unwrap_err()
+        .to_string()
+        .contains("not divisible"));
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.shape = Shape::from(isize::MAX as usize / 4 + 1);
+    extra.ggml_dtype = GgmlDType::F32;
+    assert!(content
+        .validate_payloads(&mut Extent(u64::MAX))
+        .unwrap_err()
+        .to_string()
+        .contains("host allocation limit"));
+}

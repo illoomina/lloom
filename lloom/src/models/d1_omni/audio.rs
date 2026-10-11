@@ -4,3 +4,6 @@ mod relative;
 pub use relative::{RelativeAttentionPlan, RelativeInputs, RelativeScratch};
 #[cfg(test)]
 mod relative_tests;
+
+mod encoder;
+pub use encoder::{AudioConfig, AudioEncoder};

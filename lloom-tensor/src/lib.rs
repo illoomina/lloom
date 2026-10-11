@@ -119,6 +119,8 @@ pub mod retire;
 #[cfg(any(feature = "metal", test))]
 mod retirement_mailbox;
 mod retirement_owners;
+#[cfg(any(feature = "metal", test))]
+mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;

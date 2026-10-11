@@ -23,6 +23,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
+mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,

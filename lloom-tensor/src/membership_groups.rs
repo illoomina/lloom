@@ -53,13 +53,23 @@ pub(crate) enum SelectError<E> {
 type ChargeOwners = HostAnchorRegistry<(), Option<PhysicalCharge>>;
 type ChargePermit = HostAnchorPermit<(), Option<PhysicalCharge>>;
 
-pub(crate) struct Groups<T: Clone + Send + Sync + 'static> {
+/// Trusted engine metadata, not an arbitrary Clone/Drop callback surface.
+///
+/// # Safety
+/// Clone is nonallocating, nonpanicking counted metadata retention; it runs
+/// under the head lock. Drop is nonpanicking metadata release/publication only:
+/// resource owners remain in independently rooted host records. No recursive
+/// retirement-service invocation, native payload destructor or user closure.
+/// Implementation requires a concrete caller/field census.
+pub(crate) unsafe trait GroupMetadata: Clone + Send + Sync + 'static {}
+
+pub(crate) struct Groups<T: GroupMetadata> {
     head: Mutex<Option<HostMetadataHandle<GroupNode<T>>>>,
     owners: Mutex<Option<Arc<ChargeOwners>>>,
     service: OnceLock<Result<Arc<HostRetirementService>, ServiceError>>,
     failure: Arc<FailureSignal>,
 }
-struct GroupNode<T: Clone + Send + Sync + 'static> {
+struct GroupNode<T: GroupMetadata> {
     origin: AllocationOrigin,
     value: T,
     next: OnceLock<HostMetadataHandle<GroupNode<T>>>,
@@ -70,7 +80,7 @@ struct GroupNode<T: Clone + Send + Sync + 'static> {
     // deallocation returns. Unpublished nodes are try_unwrapped first instead.
     charge_permit: Option<ChargePermit>,
 }
-impl<T: Clone + Send + Sync + 'static> MetadataWake for GroupNode<T> {
+impl<T: GroupMetadata> MetadataWake for GroupNode<T> {
     fn metadata_wake(&self) -> &Arc<Wake> {
         &self.wake
     }
@@ -80,7 +90,7 @@ impl<T: Clone + Send + Sync + 'static> MetadataWake for GroupNode<T> {
 // All nodes are independently registered before linking; no Weak/raw acquisition
 // exists, and external head/link handles release their Arc before waking. T's
 // own host-record permit retains native/charge ownership independently.
-unsafe impl<T: Clone + Send + Sync + 'static> CleanupInbox for GroupNode<T> {
+unsafe impl<T: GroupMetadata> CleanupInbox for GroupNode<T> {
     fn begin_retire(&self) -> bool {
         false
     }
@@ -96,7 +106,7 @@ unsafe impl<T: Clone + Send + Sync + 'static> CleanupInbox for GroupNode<T> {
         self.failure.publish(reason, || self.wake.notify());
     }
 }
-impl<T: Clone + Send + Sync + 'static> Groups<T> {
+impl<T: GroupMetadata> Groups<T> {
     pub(crate) fn new() -> Self {
         Self {
             head: Mutex::new(None),
@@ -291,11 +301,15 @@ impl<T: Clone + Send + Sync + 'static> Groups<T> {
     fn drop_unpublished(node: Arc<GroupNode<T>>) {
         match Arc::try_unwrap(node) {
             Ok(node) => drop(node), // Arc allocation gone before permit publishes.
-            Err(node) => std::mem::forget(node), // Unexpected custody: retain, never invent quiescence.
+            Err(node) => {
+                node.failure
+                    .publish(Failure::AdapterFailed, || node.wake.notify());
+                std::mem::forget(node); // Unexpected custody: retain, never invent quiescence.
+            }
         }
     }
 }
-impl<T: Clone + Send + Sync + 'static> Drop for Groups<T> {
+impl<T: GroupMetadata> Drop for Groups<T> {
     fn drop(&mut self) {
         let head = self.head.get_mut().take();
         drop(head); // Roots and links remain independently service-owned.
@@ -306,6 +320,8 @@ impl<T: Clone + Send + Sync + 'static> Drop for Groups<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    // SAFETY: usize copy/drop has no allocation, callback or owned payload.
+    unsafe impl GroupMetadata for usize {}
     const CAP: usize = 1 << 20;
     fn drain(service: &HostRetirementService) {
         // Metadata-only root removal may return no payload progress while a
@@ -491,6 +507,10 @@ mod tests {
         in_host_pass: Arc<AtomicBool>,
         drops: Arc<AtomicUsize>,
     }
+    // SAFETY: Arc clone only increments a count. Under this scalar fixture's
+    // valid protocol, final Drop is an unlocked assertion oracle over numeric
+    // metadata; it neither owns native payloads nor recursively services work.
+    unsafe impl GroupMetadata for Arc<DropOracle> {}
     impl Drop for DropOracle {
         fn drop(&mut self) {
             assert!(

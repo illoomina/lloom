@@ -67,9 +67,11 @@ struct Slab<C, A, F> {
     cleanup_policy: CleanupPolicy,
     active: Active<C, A, F>,
     origin: AllocationOrigin,
-    // Rust drops fields in declaration order: metadata/payload storage first,
-    // retained logical-layout charge last. Arc/control headers are not covered.
-    metadata_charge: Option<PhysicalCharge>,
+    // Extracted into post-drop service custody BEFORE final Arc destruction.
+    // A direct last charge field would precede enclosing inline deallocation.
+    // Actual vector capacities and Self inline layout are covered; Arc headers
+    // and allocator rounding are explicitly outside this managed contract.
+    metadata_charge: Mutex<Option<PhysicalCharge>>,
 }
 
 /// A native block retains this metadata handle, not an independently owned
@@ -240,7 +242,7 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
                     }
                 };
             match ticket.try_commit(actual) {
-                Ok(charge) => slab.metadata_charge = Some(charge),
+                Ok(charge) => *slab.metadata_charge.get_mut() = Some(charge),
                 Err(error) => {
                     // Unpublished allocation dies while its promise still lives.
                     drop(slab);
@@ -276,7 +278,7 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         let mut producer = self.producer.lock();
         if let Some(reason) = self.failure.get() {
             drop(producer);
-            drop(candidate);
+            Self::discard_candidate(candidate);
             return Err(Self::reject(
                 RegistryError::Mailbox(MailboxError::Failed(reason)),
                 owner,
@@ -287,7 +289,7 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         if let Some(found) = Self::find_cell(&producer, origin) {
             let result = Self::prepare_cell(&mut producer, found, owner);
             drop(producer);
-            drop(candidate);
+            Self::discard_candidate(candidate);
             return result;
         }
         let slab = match candidate {
@@ -299,14 +301,14 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         };
         if producer.slabs.try_reserve(1).is_err() {
             drop(producer);
-            drop(slab);
+            Self::drop_unpublished(slab);
             return Err(Self::reject(RegistryError::MetadataAllocation, owner));
         }
         let inbox: Arc<dyn CleanupInbox> = slab.clone();
         if let Err(error) = self.service.register(&inbox) {
             drop(producer);
             drop(inbox);
-            drop(slab);
+            Self::drop_unpublished(slab);
             return Err(Self::reject(RegistryError::Service(error), owner));
         }
         let index = producer.slabs.len();
@@ -320,6 +322,29 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         result
     }
 
+    fn discard_candidate(candidate: Result<Arc<Slab<C, A, F>>, RegistryError>) {
+        if let Ok(slab) = candidate {
+            Self::drop_unpublished(slab);
+        }
+    }
+    fn drop_unpublished(slab: Arc<Slab<C, A, F>>) {
+        // Caller census: cold unregistered slab; no prepared cell, C/A/F,
+        // panic, ordered successor, active record or escaped handle exists.
+        // Empty metadata field destruction is trusted nonpanicking engine code.
+        // try_unwrap frees the Arc allocation before returned inline/Vec fields;
+        // charge remains alive until all those fields have been destroyed.
+        match Arc::try_unwrap(slab) {
+            Ok(mut slab) => {
+                let charge = slab.metadata_charge.get_mut().take();
+                drop(slab);
+                drop(charge);
+            }
+            Err(slab) => {
+                slab.fail(Failure::AdapterFailed);
+                std::mem::forget(slab); // Retain unexplained custody, never cancel.
+            }
+        }
+    }
     fn find_cell(
         producer: &Producer<C, A, F>,
         origin: &AllocationOrigin,
@@ -438,7 +463,7 @@ impl<C, A, F> Slab<C, A, F> {
             cleanup_policy,
             active: ActiveRetirement::new(),
             origin,
-            metadata_charge: None,
+            metadata_charge: Mutex::new(None),
         })
     }
     fn reserve(&self) -> Option<usize> {
@@ -667,9 +692,14 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync +
         !self.producer_alive.load(Ordering::Acquire)
             && self.occupied.load(Ordering::Acquire) == 0
             && self.active.is_empty()
+            && self.cells.iter().all(OwnerMailbox::metadata_reusable)
+            && self.ordered.iter().all(|ordered| ordered.quiescent())
     }
     fn worker_final_metadata_drop(&self) -> bool {
         true
+    }
+    fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
+        self.metadata_charge.lock().take()
     }
     fn fail(&self, reason: Failure) {
         self.failure.publish(reason, || {
@@ -1169,7 +1199,7 @@ mod metadata_admission_tests {
     fn charge_survives_payload_and_same_domain_warm_reuse() {
         let (service, registry, domain) = setup();
         let first = admitted(&registry, &domain);
-        let bytes = first.slab.metadata_charge.as_ref().unwrap().bytes();
+        let bytes = first.slab.metadata_charge.lock().as_ref().unwrap().bytes();
         assert_eq!(
             domain.snapshot(),
             AccountSnapshot {
@@ -1385,7 +1415,7 @@ mod metadata_admission_tests {
         assert_eq!(domain.snapshot().pending, 0);
         assert_eq!(
             domain.snapshot().committed,
-            outer.slab.metadata_charge.as_ref().unwrap().bytes()
+            outer.slab.metadata_charge.lock().as_ref().unwrap().bytes()
         );
         cancel(&service, &outer);
         drop((winner, outer, registry));

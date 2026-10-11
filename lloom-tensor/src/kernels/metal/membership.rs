@@ -10,7 +10,7 @@ use super::{Buffer, ResidencySet};
 use crate::allocation_owner::AllocationLease;
 use crate::completion_wake::Wake;
 use crate::host_anchor::{AnchorError, HostAnchorPermit, HostAnchorRegistry};
-use crate::membership_groups::{Groups, MembershipSource, SelectError};
+use crate::membership_groups::{GroupMetadata, Groups, MembershipSource, SelectError};
 use crate::memory_admission::{AllocationOrigin, ModelDomain};
 use crate::retirement_owners::FailureSignal;
 use crate::retirement_registry::RegistryError;
@@ -105,6 +105,12 @@ impl std::fmt::Display for MembershipError {
 /// still on the dropping thread; native/raw/charge cleanup is not.
 #[derive(Clone)]
 pub(crate) struct Membership(Arc<Token>);
+// SAFETY: concrete field census is one Arc<Token>. Clone increments that
+// count only. Final Token destruction drops HostAnchorPermit, which publishes
+// cancellation/releases metadata pins only; native keys/leases remain in the
+// independently registered Cleanup/Anchors record. No user/native Drop or
+// recursive service call occurs here.
+unsafe impl GroupMetadata for Membership {}
 struct Token {
     permit: Permit,
 }

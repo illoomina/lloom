@@ -8,6 +8,7 @@
 
 use crate::{
     completion_wake::Wake,
+    memory_admission::PhysicalCharge,
     retirement_owners::{Failure, FailureSignal},
 };
 use parking_lot::Mutex;
@@ -52,6 +53,15 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
     fn worker_final_metadata_drop(&self) -> bool {
         false
     }
+    /// Called only after successful worker-final opt-in root removal under the
+    /// shared census/snapshot lock. No Weak/raw acquisition and count2 then
+    /// leave only removed root + pass, both exclusively service-controlled.
+    /// Extracts metadata charge without payload destruction or panicking.
+    /// Service custody holds it across actual final Arc deallocation, including
+    /// unwind. Default None preserves non-opt-in and lifecycle policy.
+    fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
+        None
+    }
     fn fail(&self, reason: Failure);
 }
 
@@ -83,6 +93,9 @@ pub(crate) struct HostRetirementService {
     // An arbitrary destructor panic can itself carry owned values. Keep those
     // under static host custody too; do not drop/retry them on worker unwind.
     panic_payloads: Mutex<Vec<Box<dyn Any + Send>>>,
+    // One single-worker final metadata Drop at a time. Rooted in this static
+    // service, not the unwinding stack; never cleared if metadata Drop panics.
+    active_metadata_charge: Mutex<Option<PhysicalCharge>>,
 }
 
 impl HostRetirementService {
@@ -98,6 +111,7 @@ impl HostRetirementService {
                 wake: Arc::new(Wake::default()),
                 failure: FailureSignal::default(),
                 panic_payloads: Mutex::new(Vec::new()),
+                active_metadata_charge: Mutex::new(None),
             });
             let worker_service = service.clone();
             std::thread::Builder::new()
@@ -118,6 +132,7 @@ impl HostRetirementService {
             wake: Arc::new(Wake::default()),
             failure: FailureSignal::default(),
             panic_payloads: Mutex::new(Vec::new()),
+            active_metadata_charge: Mutex::new(None),
         })
     }
 
@@ -182,6 +197,13 @@ impl HostRetirementService {
     }
 
     fn pass(&self) -> bool {
+        // Production has one worker and exits on unwind. A manual/erroneous
+        // later pass must not clear a charge retained across prior failed Drop.
+        if self.active_metadata_charge.lock().is_some() {
+            self.failure
+                .publish(Failure::WorkerFailed, || self.wake.notify());
+            return false;
+        }
         let mut index = 0;
         let mut progressed = false;
         loop {
@@ -218,10 +240,39 @@ impl HostRetirementService {
                 // Move on rather than spin while can_unregister stays true.
                 index += 1;
             }
-            // Both root disposal and final local metadata release occur only
-            // after registry unlock. The pass Arc roots the removed inbox.
-            drop(removed);
-            drop(entry);
+            if let Some(removed) = removed {
+                // Only an opted-in metadata inbox participates. Non-opt-in
+                // lifecycle root removal still has its original semantics.
+                let charge = if entry.worker_final_metadata_drop() {
+                    entry.take_final_metadata_charge()
+                } else {
+                    None
+                };
+                let staged_charge = charge.is_some();
+                if let Some(charge) = charge {
+                    let mut active = self.active_metadata_charge.lock();
+                    if active.is_some() {
+                        // A prior unwind must not be retried or overwritten.
+                        // Retain both unexplained inbox custody and charge.
+                        drop(active);
+                        std::mem::forget((charge, removed, entry));
+                        self.failure
+                            .publish(Failure::WorkerFailed, || self.wake.notify());
+                        return progressed;
+                    }
+                    *active = Some(charge);
+                }
+                // No registry/producer/active-charge lock spans metadata Drop.
+                // On unwind the service-rooted charge remains populated.
+                drop(removed);
+                drop(entry);
+                if staged_charge {
+                    let charge = self.active_metadata_charge.lock().take();
+                    drop(charge); // All managed inline and Vec storage is gone.
+                }
+            } else {
+                drop(entry);
+            }
         }
     }
 
@@ -470,5 +521,119 @@ mod tests {
         drop(active.finish().unwrap());
         assert_eq!(&*events.lock(), &["capture", "anchor"]);
         assert!(active.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod metadata_charge_tests {
+    use super::*;
+    use crate::{
+        memory_admission::ModelDomain,
+        retirement_registry::{HostMetadataHandle, MetadataWake},
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MetadataInbox {
+        service: Arc<HostRetirementService>,
+        domain: ModelDomain,
+        wake: Arc<Wake>,
+        drops: Arc<AtomicUsize>,
+        panic: bool,
+        charge: Mutex<Option<PhysicalCharge>>,
+    }
+    impl MetadataWake for MetadataInbox {
+        fn metadata_wake(&self) -> &Arc<Wake> {
+            &self.wake
+        }
+    }
+    // SAFETY: no native/arbitrary callback/payload exists. This fixture opts in
+    // with counted handles only, no Weak/raw acquisition. Charge extraction is
+    // an engine Mutex::take; final metadata Drop assertions/panic are deliberate
+    // source-controlled unwind observations, not a hidden physical owner.
+    unsafe impl CleanupInbox for MetadataInbox {
+        fn begin_retire(&self) -> bool {
+            false
+        }
+        fn drop_captures(&self) {}
+        fn finish_retire(&self) {}
+        fn can_unregister(&self) -> bool {
+            true
+        }
+        fn worker_final_metadata_drop(&self) -> bool {
+            true
+        }
+        fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
+            self.charge.lock().take()
+        }
+        fn fail(&self, _: Failure) {
+            self.wake.notify();
+        }
+    }
+    impl Drop for MetadataInbox {
+        fn drop(&mut self) {
+            assert!(
+                self.service.registry.try_lock().is_some(),
+                "final metadata Drop under registry lock"
+            );
+            assert_eq!(
+                self.domain.snapshot().committed,
+                8,
+                "charge released during final metadata Drop"
+            );
+            assert!(
+                self.service.active_metadata_charge.lock().is_some(),
+                "post-drop charge was not independently rooted"
+            );
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "injected final metadata Drop panic");
+        }
+    }
+    fn setup(panic: bool) -> (Arc<HostRetirementService>, ModelDomain, Arc<AtomicUsize>) {
+        let service = HostRetirementService::manual();
+        let domain = ModelDomain::isolated_numeric_fixture(32);
+        let pass = domain.reserve(8).unwrap();
+        let charge = pass.context().take(8).unwrap().commit(8).unwrap();
+        drop(pass);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let handle = HostMetadataHandle::new(Arc::new(MetadataInbox {
+            service: service.clone(),
+            domain: domain.clone(),
+            wake: service.wake(),
+            drops: drops.clone(),
+            panic,
+            charge: Mutex::new(Some(charge)),
+        }));
+        let inbox: Arc<dyn CleanupInbox> = (*handle).clone();
+        service.register(&inbox).unwrap();
+        drop(inbox);
+        drop(handle); // Counted release before wake, just like actual adapters.
+        (service, domain, drops)
+    }
+    #[test]
+    fn metadata_charge_remains_rooted_through_final_drop_and_returns_afterward() {
+        let (service, domain, drops) = setup(false);
+        service.manual_pass();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(service.active_metadata_charge.lock().is_none());
+        assert_eq!(domain.snapshot().committed, 0);
+        assert_eq!(domain.snapshot().pending, 0);
+    }
+    #[test]
+    fn metadata_charge_unwind_keeps_independent_custody_and_later_pass_refuses() {
+        let (service, domain, drops) = setup(true);
+        let panic = catch_unwind(AssertUnwindSafe(|| service.manual_pass()));
+        assert!(panic.is_err(), "injected final metadata panic was missed");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(domain.snapshot().committed, 8);
+        assert!(service.active_metadata_charge.lock().is_some());
+        assert!(
+            !service.manual_pass(),
+            "later pass resumed failed metadata Drop"
+        );
+        assert_eq!(service.failure.get(), Some(Failure::WorkerFailed));
+        assert_eq!(domain.snapshot().committed, 8);
+        drop(panic);
+        drop(service); // Fake-only teardown; production static never does this.
+        assert_eq!(domain.snapshot().committed, 0);
     }
 }

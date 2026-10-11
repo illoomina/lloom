@@ -765,8 +765,7 @@ impl Commands {
     /// encoder holds its slot from creation so that the per-dispatch path never
     /// has to take this lock. Call before encoding the work being measured.
     pub fn set_executor(&self, executor: Arc<ExecutorSlot>) {
-        // `parking_lot` guards are infallible -- no `Ok` to match.
-        *self.executor.lock() = executor;
+        ExecutorSlot::replace_installed(&self.executor, executor);
     }
 
     /// The executor currently installed.

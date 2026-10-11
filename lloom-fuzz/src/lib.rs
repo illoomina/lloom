@@ -12,6 +12,7 @@
 pub mod campaign;
 pub mod decode;
 pub mod record;
+pub mod schedule;
 
 mod cmp_stubs;
 

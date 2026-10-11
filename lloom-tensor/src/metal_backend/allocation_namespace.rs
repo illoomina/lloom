@@ -67,23 +67,33 @@ impl AllocationNamespace {
         // else from one `MTLBuffer` per miss with its residency committed at
         // the next cut; a persistent allocation takes from a resident
         // backing, wired when it is Shared.
+        let membership = crate::kernels::metal::membership::MembershipDomain::new(
+            residency_set.clone(),
+            super::device::retain_evicted_allocations(),
+        );
         let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
             if transient_heaps_on() {
-                Arc::new(HeapChunks::new(
-                    device,
-                    Arc::clone(residency_set),
-                    options,
-                    heap_chunk_bytes(),
-                    Some(Arc::clone(ledger)),
-                ))
+                Arc::new(
+                    HeapChunks::new(
+                        device,
+                        Arc::clone(residency_set),
+                        options,
+                        heap_chunk_bytes(),
+                        Some(Arc::clone(ledger)),
+                    )
+                    .with_membership(membership.clone()),
+                )
             } else {
-                Arc::new(DeviceBuffer::new(
-                    device,
-                    Arc::clone(residency_set),
-                    options,
-                    Commit::Deferred,
-                    Some(Arc::clone(ledger)),
-                ))
+                Arc::new(
+                    DeviceBuffer::new(
+                        device,
+                        Arc::clone(residency_set),
+                        options,
+                        Commit::Deferred,
+                        Some(Arc::clone(ledger)),
+                    )
+                    .with_membership(membership.clone()),
+                )
             }
         };
         let backings = Arc::new(Backings {
@@ -95,21 +105,24 @@ impl AllocationNamespace {
                 RESOURCE_OPTIONS,
                 Commit::Now,
                 Some(Arc::clone(ledger)),
-            ),
+            )
+            .with_membership(membership.clone()),
             resident_private: DeviceBuffer::new(
                 device,
                 Arc::clone(residency_set),
                 PRIVATE_RESOURCE_OPTIONS,
                 Commit::Now,
                 Some(Arc::clone(ledger)),
-            ),
+            )
+            .with_membership(membership.clone()),
             mapped_shared: Mapped::new(
                 device,
                 Arc::clone(residency_set),
                 RESOURCE_OPTIONS,
                 Commit::Now,
                 Some(Arc::clone(ledger)),
-            ),
+            )
+            .with_membership(membership.clone()),
         });
         // The pools do not subscribe to command-buffer completion. The handler
         // advances the clock, and each pool drains what it made reusable at

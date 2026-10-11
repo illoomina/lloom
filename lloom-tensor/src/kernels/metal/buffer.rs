@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 pub type MetalResource = ProtocolObject<dyn MTLResource>;
 pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Buffer {
     raw: AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>>,
 
@@ -44,6 +44,7 @@ pub struct Buffer {
     /// Whether CPU access is permitted by storage mode and the selected
     /// experimental mapping policy, fixed at construction (see `new`).
     cpu_visible: bool,
+    membership: Option<super::membership::Membership>,
 }
 
 unsafe impl Send for Buffer {}
@@ -89,7 +90,17 @@ impl Buffer {
             base_offset: 0,
             length: None,
             cpu_visible,
+            membership: None,
         }
+    }
+
+    pub(crate) fn with_membership(mut self, membership: super::membership::Membership) -> Self {
+        assert!(
+            self.membership.is_none(),
+            "membership identity is minted once"
+        );
+        self.membership = Some(membership);
+        self
     }
 
     /// A handle addressing `base_offset..base_offset + length` of this buffer.
@@ -122,6 +133,7 @@ impl Buffer {
             base_offset: absolute,
             length: Some(length),
             cpu_visible: self.cpu_visible,
+            membership: self.membership.clone(),
         }
     }
 
@@ -252,6 +264,24 @@ impl Buffer {
 
     pub fn set_label(&self, label: &str) {
         self.raw.raw().setLabel(Some(&NSString::from_str(label)))
+    }
+}
+
+// Ownership metadata is not buffer identity. Preserve the pre-token fields.
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+            && self.base_offset == other.base_offset
+            && self.length == other.length
+            && self.cpu_visible == other.cpu_visible
+    }
+}
+impl std::hash::Hash for Buffer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.raw, state);
+        std::hash::Hash::hash(&self.base_offset, state);
+        std::hash::Hash::hash(&self.length, state);
+        std::hash::Hash::hash(&self.cpu_visible, state);
     }
 }
 

@@ -122,6 +122,7 @@ pub struct DeviceBuffer {
     commit: Commit,
     /// Where each buffer's bytes are committed (`None` in a bare test).
     ledger: Option<Arc<Ledger>>,
+    membership: Arc<super::membership::MembershipDomain>,
 }
 
 type RawBuffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
@@ -146,7 +147,7 @@ impl StagedDeviceBuffer<'_> {
                 Buffer::new_owned(raw, owner)
             }
         };
-        Ok(self.backing.publish(buffer, self.requested))
+        self.backing.publish(buffer, self.requested)
     }
 }
 
@@ -158,13 +159,25 @@ impl DeviceBuffer {
         commit: Commit,
         ledger: Option<Arc<Ledger>>,
     ) -> Self {
+        let membership = super::membership::MembershipDomain::new(
+            residency.clone(),
+            crate::metal_backend::retain_evicted_allocations(),
+        );
         Self {
             device: device.clone(),
             residency,
             options,
             commit,
             ledger,
+            membership,
         }
+    }
+    pub(crate) fn with_membership(
+        mut self,
+        membership: Arc<super::membership::MembershipDomain>,
+    ) -> Self {
+        self.membership = membership;
+        self
     }
     /// The admitted upload preserves native newBufferWithBytes; only the
     /// requested input length reaches the native creator, never padded demand.
@@ -269,17 +282,28 @@ impl DeviceBuffer {
         drop(allocation);
     }
 
-    fn publish(&self, buffer: Buffer, requested: usize) -> Allocation {
+    fn publish(
+        &self,
+        buffer: Buffer,
+        requested: usize,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        // Mint custody before membership publication. Native submission leases
+        // and alias eligibility remain required before family enablement.
+        let token = self
+            .membership
+            .for_buffer(&buffer)
+            .map_err(|e| BackingAdmissionError::Retirement(e.to_string()))?;
+        let buffer = buffer.with_membership(token);
         match self.commit {
             Commit::Deferred => self.residency.add(&buffer),
             Commit::Now => self.residency.insert(&buffer),
         };
         // Parallel legacy diagnostics; physical owner remains on every Buffer alias.
         let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
-        Allocation {
+        Ok(Allocation {
             buffer,
             reservation,
-        }
+        })
     }
 }
 
@@ -308,15 +332,11 @@ impl Backing for DeviceBuffer {
 
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let buffer = self.device.new_buffer(bytes.max(1), self.options)?;
-        match self.commit {
-            Commit::Deferred => self.residency.add(&buffer),
-            Commit::Now => self.residency.insert(&buffer),
-        };
-        let reservation = self.ledger.as_ref().map(|l| l.reserve(bytes.max(1)));
-        Ok(Allocation {
-            buffer,
-            reservation,
-        })
+        self.publish(buffer, bytes.max(1))
+            .map_err(|error| match error {
+                BackingAdmissionError::Native(error) => error,
+                other => MetalKernelError::InvalidInput(other.to_string()),
+            })
     }
 
     fn reclaim(&self, _buffer: &Buffer) -> bool {
@@ -380,6 +400,16 @@ impl Mapped {
         Self {
             inner: DeviceBuffer::new(device, residency, options, commit, ledger),
         }
+    }
+}
+
+impl Mapped {
+    pub(crate) fn with_membership(
+        mut self,
+        membership: Arc<super::membership::MembershipDomain>,
+    ) -> Self {
+        self.inner = self.inner.with_membership(membership);
+        self
     }
 }
 

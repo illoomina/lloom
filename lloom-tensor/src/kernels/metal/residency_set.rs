@@ -542,6 +542,37 @@ impl ResidencySet {
         self.members.lock().contains(allocation_key(buf))
     }
 
+    /// Host-only allocation-local teardown. Each borrowed native allocation is
+    /// independently retained by the retirement record, including retired keys.
+    /// Native commit remains synchronous; final accounting custody leaves this
+    /// method only after the membership lock is released. Never call while an
+    /// outer encoder/planner lock is held.
+    pub(crate) fn remove_allocations_owned<'a>(
+        &self,
+        allocations: impl IntoIterator<Item = &'a ProtocolObject<dyn MTLAllocation>>,
+    ) -> PublishedRemovals {
+        let Some(set) = &self.raw else {
+            return PublishedRemovals(Vec::new());
+        };
+        let mut members = self.members.lock();
+        let mut removed = 0usize;
+        for allocation in allocations {
+            let key = allocation as *const _ as usize;
+            if members.remove_including_retired(key) {
+                set.removeAllocation(allocation);
+                removed += 1;
+            }
+        }
+        let released = if removed != 0 {
+            self.removed.fetch_add(removed as u64, Ordering::Relaxed);
+            self.publish(set, &mut members)
+        } else {
+            Vec::new()
+        };
+        drop(members);
+        PublishedRemovals(released)
+    }
+
     /// Empties the set, in one commit.
     ///
     /// This is the teardown path (`DESIGN.md` §6.3c): the residency set must be

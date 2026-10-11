@@ -114,6 +114,7 @@ struct Chunk {
     // Drop native heap reference before the chunk's accounting owner.
     heap: Arc<HeapAnchor>,
     owner: Option<AllocationOwner>,
+    membership: super::membership::Membership,
     ranges: Ranges,
     ready: bool,
     #[allow(dead_code)]
@@ -138,6 +139,7 @@ struct PendingPlacement {
     placement: Placement,
     heap: Arc<HeapAnchor>,
     owner: Option<AllocationOwner>,
+    membership: super::membership::Membership,
 }
 
 struct State {
@@ -156,6 +158,7 @@ pub struct HeapChunks {
     storage: MTLStorageMode,
     chunk_bytes: usize,
     state: parking_lot::Mutex<State>,
+    membership: Arc<super::membership::MembershipDomain>,
 }
 
 // SAFETY: an `MTLHeap` is a thread-safe Metal object; the state is behind a
@@ -185,9 +188,14 @@ impl HeapChunks {
     ) -> Self {
         // The storage mode is bits 4..8 of the resource options.
         let storage = MTLStorageMode((options.0 >> 4) & 0xF);
+        let membership = super::membership::MembershipDomain::new(
+            residency_set.clone(),
+            crate::metal_backend::retain_evicted_allocations(),
+        );
         Self {
             device: device.clone(),
             residency_set,
+            membership,
             ledger,
             options,
             storage,
@@ -197,6 +205,14 @@ impl HeapChunks {
                 live: HashMap::new(),
             }),
         }
+    }
+
+    pub(crate) fn with_membership(
+        mut self,
+        membership: Arc<super::membership::MembershipDomain>,
+    ) -> Self {
+        self.membership = membership;
+        self
     }
 
     /// Legacy unadmitted placement route, sharing the checked allocator with
@@ -252,6 +268,7 @@ impl HeapChunks {
             },
             heap: chunk.heap.clone(),
             owner: chunk.owner.clone(),
+            membership: chunk.membership.clone(),
         }))
     }
 
@@ -301,10 +318,22 @@ impl HeapChunks {
         let capacity = ranges.capacity();
         let heap = Arc::new(HeapAnchor { raw });
         let owner = owner.map(|owner| owner.with_anchor(heap.clone()));
+        // The heap token, not each placed buffer, owns this membership. Every
+        // placement/view carries it so dropping HeapChunks cannot unregister a
+        // still-live sub-buffer. The token's raw owner has no Chunk backedge.
+        let allocation = unsafe {
+            &*(&*heap.raw as *const ProtocolObject<dyn MTLHeap>
+                as *const ProtocolObject<dyn objc2_metal::MTLAllocation>)
+        };
+        let membership = self
+            .membership
+            .for_allocation(allocation, owner.clone())
+            .map_err(|e| BackingAdmissionError::Retirement(e.to_string()))?;
         let reservation = self.ledger.as_ref().map(|ledger| ledger.reserve(capacity));
         Ok(Chunk {
             heap,
             owner,
+            membership,
             ranges,
             ready: false,
             reservation,
@@ -397,6 +426,7 @@ impl HeapChunks {
                     },
                     heap: chunk.heap.clone(),
                     owner: chunk.owner.clone(),
+                    membership: chunk.membership.clone(),
                 };
                 st.chunks.push(chunk); // Not ready: concurrent scans cannot use it.
                 drop(st);
@@ -435,7 +465,8 @@ impl HeapChunks {
         let buffer = match pending.owner {
             Some(owner) => Buffer::new_owned(raw, owner),
             None => Buffer::new(raw),
-        };
+        }
+        .with_membership(pending.membership);
         self.state
             .lock()
             .live

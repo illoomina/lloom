@@ -140,7 +140,7 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
 ///
 /// Read once: a per-eviction `var()` would put an environment lookup on the
 /// decode path, which is the shape §6.4a prices.
-fn retain_evicted_allocations() -> bool {
+pub(crate) fn retain_evicted_allocations() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

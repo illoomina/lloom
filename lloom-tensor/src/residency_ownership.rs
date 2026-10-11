@@ -19,14 +19,14 @@ impl<L> Record<L> {
 pub(crate) struct ResidencyOwners<L> {
     active: HashMap<usize, Record<L>>,
     pending_remove: Vec<L>,
-    retired: Vec<L>,
+    retired: HashMap<usize, Record<L>>,
 }
 impl<L> Default for ResidencyOwners<L> {
     fn default() -> Self {
         Self {
             active: HashMap::new(),
             pending_remove: Vec::new(),
-            retired: Vec::new(),
+            retired: HashMap::new(),
         }
     }
 }
@@ -41,6 +41,13 @@ impl<L> ResidencyOwners<L> {
         lease: Option<L>,
         same: impl Fn(&L, &L) -> bool,
     ) -> (bool, Option<L>) {
+        // A retired allocation is STILL in the native set. Restore its keyed
+        // custody before merging the new alias; do not issue a second native
+        // add, and do not leave stale retired custody after a later remove.
+        if let Some(retired) = self.retired.remove(&key) {
+            debug_assert!(!self.active.contains_key(&key));
+            self.active.insert(key, retired);
+        }
         match self.active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(Record {
@@ -82,7 +89,22 @@ impl<L> ResidencyOwners<L> {
 
     pub(crate) fn retire(&mut self, key: usize) -> bool {
         if let Some(record) = self.active.remove(&key) {
-            record.append_to(&mut self.retired);
+            let previous = self.retired.insert(key, record);
+            debug_assert!(previous.is_none(), "active and retired keys are disjoint");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Allocation-local finalization, unlike ordinary eviction, also removes
+    /// intentionally retained membership. The caller holds the raw allocation
+    /// independently and issues ONE native remove when this returns true.
+    pub(crate) fn remove_including_retired(&mut self, key: usize) -> bool {
+        if self.remove(key) {
+            true
+        } else if let Some(record) = self.retired.remove(&key) {
+            record.append_to(&mut self.pending_remove);
             true
         } else {
             false
@@ -97,7 +119,9 @@ impl<L> ResidencyOwners<L> {
     /// active membership is empty. The caller drops this vector outside locks.
     pub(crate) fn cleared(&mut self) -> Vec<L> {
         let mut released = self.published_removals();
-        released.append(&mut self.retired);
+        for (_, record) in self.retired.drain() {
+            record.append_to(&mut released);
+        }
         for (_, record) in self.active.drain() {
             record.append_to(&mut released);
         }
@@ -251,6 +275,43 @@ mod tests {
         assert_eq!(domain.snapshot().committed, 0);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert!(state.cleared().is_empty());
+    }
+
+    #[test]
+    fn numeric_retired_readd_and_targeted_finalization_keep_one_native_key() {
+        let (domain, pass, drops) = fixture();
+        let mut state = ResidencyOwners::default();
+        let allocation = lease(&domain, &pass, &drops);
+        assert!(state.insert(7, Some(allocation.clone()), same).0);
+        assert!(state.retire(7));
+        // Native membership survived retirement: reinsertion must not ask the
+        // native set to add the same key a second time.
+        let (added, redundant) = state.insert(7, Some(allocation), same);
+        assert!(!added);
+        drop(redundant);
+        assert!(state.remove(7));
+        assert!(!state.remove_including_retired(7));
+        assert_eq!(domain.snapshot().committed, 8);
+        drop(state.published_removals());
+        assert_eq!(domain.snapshot().committed, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        state.insert(9, Some(lease(&domain, &pass, &drops)), same);
+        state.insert(11, Some(lease(&domain, &pass, &drops)), same);
+        assert!(state.retire(9));
+        assert!(state.retire(11));
+        assert!(state.remove_including_retired(9));
+        assert!(!state.remove_including_retired(9));
+        drop(state.published_removals());
+        assert_eq!(
+            domain.snapshot().committed,
+            8,
+            "another namespace stays resident"
+        );
+        assert!(state.remove_including_retired(11));
+        drop(state.published_removals());
+        assert_eq!(domain.snapshot().committed, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     #[test]

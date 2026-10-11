@@ -56,6 +56,8 @@ pub mod backprop;
 mod command_policy;
 mod completion_frontier;
 #[cfg(any(feature = "metal", test))]
+mod completion_scope;
+#[cfg(any(feature = "metal", test))]
 mod completion_wake;
 pub mod conv;
 mod convert;
@@ -75,6 +77,8 @@ pub mod error;
 mod indexer;
 pub mod isolation;
 pub mod layout;
+#[cfg(any(feature = "metal", test))]
+mod native_reuse;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their
 /// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).

@@ -65,6 +65,22 @@ pub(crate) struct Rejected<T> {
     pub value: T,
 }
 
+/// Rejection preserves caller ownership. Observer failure occurs only after
+/// feedback moved into rooted custody; that value is deliberately not returned.
+#[derive(Debug)]
+pub(crate) enum FeedbackPublicationError<F> {
+    Rejected(Rejected<F>),
+    ObserverPanicked,
+}
+
+/// Generic protocol retains its terminal-feedback cleanup capability. Native
+/// adapters that also require host call-return choose the stricter policy.
+#[derive(Clone, Copy)]
+pub(crate) enum CleanupPolicy {
+    TerminalFeedback,
+    ReturnedHandoff,
+}
+
 pub(crate) struct Detached<T, F> {
     pub owner: T,
     pub feedback: Option<F>,
@@ -85,7 +101,9 @@ pub(crate) struct OwnerMailbox<T, F> {
 }
 
 // SAFETY: phase ownership serializes writes and the only shared payload borrow
-// is within CallbackActive. Reclamation requires Taking and no callback borrow.
+// is within WritingFeedback (shared) or CallbackActive (mutable), each with
+// exactly one phase owner. Reclamation
+// requires Taking and no callback borrow.
 // T/F cross threads and may be shared by a callback, hence Send + Sync.
 unsafe impl<T: Send + Sync, F: Send + Sync> Send for OwnerMailbox<T, F> {}
 unsafe impl<T: Send + Sync, F: Send + Sync> Sync for OwnerMailbox<T, F> {}
@@ -151,6 +169,24 @@ impl<T, F> OwnerMailbox<T, F> {
             Ordering::Release,
         );
         Ok(ticket)
+    }
+
+    /// Install a payload into capacity reserved before submission side effects.
+    /// No arbitrary callback or destructor runs while the phase is exclusive;
+    /// the displaced value returns to caller custody.
+    pub(crate) fn replace_prepared(&self, ticket: Ticket, owner: T) -> Result<T, Rejected<T>> {
+        if let Err(error) = self.transition(ticket, Phase::Prepared, Phase::Preparing, 0) {
+            return Err(Rejected {
+                error,
+                value: owner,
+            });
+        }
+        // SAFETY: Preparing excludes callbacks, cancellation and handoff. Pins
+        // borrow metadata only. A prepared cell always contains one owner.
+        let previous = unsafe { (*self.owner.get()).replace(owner).expect("prepared owner") };
+        self.transition(ticket, Phase::Preparing, Phase::Prepared, 0)
+            .expect("exclusive prepared replacement retains its phase");
+        Ok(previous)
     }
 
     fn state_for(&self, ticket: Ticket) -> Result<u64, MailboxError> {
@@ -232,16 +268,58 @@ impl<T, F> OwnerMailbox<T, F> {
     }
 
     pub fn publish_feedback(&self, ticket: Ticket, feedback: F) -> Result<(), Rejected<F>> {
+        match self.publish_feedback_observed(ticket, feedback, |_, _| {}, || {}) {
+            Ok(()) => Ok(()),
+            Err(FeedbackPublicationError::Rejected(rejected)) => Err(rejected),
+            Err(FeedbackPublicationError::ObserverPanicked) => {
+                unreachable!("the default feedback observer does not execute code")
+            }
+        }
+    }
+
+    /// Internal native data/error publication, never a user callback. The
+    /// WritingFeedback phase exclusively borrows initialized owner and feedback;
+    /// logical callbacks and cleanup cannot enter until this observer returns.
+    pub(crate) fn publish_feedback_observed(
+        &self,
+        ticket: Ticket,
+        feedback: F,
+        observe: impl FnOnce(&T, &F),
+        wake_all: impl FnOnce(),
+    ) -> Result<(), FeedbackPublicationError<F>> {
         if let Err(error) = self.transition(ticket, Phase::Pending, Phase::WritingFeedback, 0) {
-            return Err(Rejected {
+            return Err(FeedbackPublicationError::Rejected(Rejected {
                 error,
                 value: feedback,
-            });
+            }));
         }
         // SAFETY: WritingFeedback is exclusively ours; feedback was empty.
         // Handoff-return changes only atomic flags, never this value.
         unsafe {
             *self.feedback.get() = Some(feedback);
+        }
+        // SAFETY: WritingFeedback owns both fields, excludes replacement,
+        // callbacks, detach and reuse; handoff exit changes atomic flags only.
+        // The shared references cannot outlive observe. Catch before leaving
+        // this phase so even observer panic retains the moved feedback/owner.
+        let observed = catch_unwind(AssertUnwindSafe(|| unsafe {
+            observe(
+                (*self.owner.get()).as_ref().expect("registered owner"),
+                (*self.feedback.get()).as_ref().expect("published feedback"),
+            );
+        }));
+        if let Err(payload) = observed {
+            // SAFETY: exclusive writer; no previous panic in this phase.
+            unsafe {
+                *self.panic.get() = Some(payload);
+            }
+            self.transition(ticket, Phase::WritingFeedback, Phase::CallbackFailed, 0)
+                .expect("failed feedback observer retains exclusive phase");
+            self.failure.publish(Failure::CallbackPanic, || {
+                self.wake.notify();
+                wake_all();
+            });
+            return Err(FeedbackPublicationError::ObserverPanicked);
         }
         self.transition(ticket, Phase::WritingFeedback, Phase::Ready, 0)
             .expect("exclusive feedback writer retains its phase");
@@ -254,16 +332,16 @@ impl<T, F> OwnerMailbox<T, F> {
     pub fn with_callbacks(
         &self,
         ticket: Ticket,
-        run: impl FnOnce(&T, &F),
+        run: impl FnOnce(&mut T, &F),
         wake_all: impl FnOnce(),
     ) -> Result<(), MailboxError> {
         self.transition(ticket, Phase::Ready, Phase::CallbackActive, 0)?;
         // SAFETY: Ready publication makes both initialized values visible.
-        // CallbackActive excludes detach/reuse; these references do not escape
+        // CallbackActive excludes every other owner access, detach and reuse; references do not escape
         // the closure call. Native handoff-return touches only atomic flags.
         let result = catch_unwind(AssertUnwindSafe(|| unsafe {
             run(
-                (*self.owner.get()).as_ref().expect("registered owner"),
+                (*self.owner.get()).as_mut().expect("registered owner"),
                 (*self.feedback.get()).as_ref().expect("published feedback"),
             );
         }));
@@ -282,6 +360,41 @@ impl<T, F> OwnerMailbox<T, F> {
                     wake_all();
                 });
                 Err(MailboxError::CallbackPanicked)
+            }
+        }
+    }
+
+    /// The native boundary retains an internal Rust panic without replacing a
+    /// panic already caught during callbacks. A rejected box stays caller-owned.
+    /// No claim of foreign exception recovery is made.
+    pub(crate) fn retain_boundary_panic(
+        &self,
+        ticket: Ticket,
+        payload: Box<dyn Any + Send>,
+    ) -> Result<(), Box<dyn Any + Send>> {
+        loop {
+            let Ok(state) = self.state_for(ticket) else {
+                return Err(payload);
+            };
+            let phase = state & PHASE_MASK;
+            if !matches!(phase, x if x == Phase::Pending as u64
+                || x == Phase::Ready as u64 || x == Phase::CallbacksFinished as u64
+                || x == Phase::CleanupReady as u64)
+            {
+                return Err(payload);
+            }
+            let next = (state & !PHASE_MASK) | Phase::CallbackFailed as u64;
+            if self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // SAFETY: claimed failure phase excludes callbacks and cleanup.
+                // These source phases never contain an earlier panic payload.
+                unsafe {
+                    *self.panic.get() = Some(payload);
+                }
+                return Ok(());
             }
         }
     }
@@ -319,7 +432,22 @@ impl<T, F> OwnerMailbox<T, F> {
     }
 
     pub fn try_detach_cleanup(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
+        self.try_detach_cleanup_with_policy(ticket, CleanupPolicy::TerminalFeedback)
+    }
+
+    pub(crate) fn try_detach_cleanup_with_policy(
+        &self,
+        ticket: Ticket,
+        policy: CleanupPolicy,
+    ) -> Result<Detached<T, F>, MailboxError> {
         let state = self.state_for(ticket)?;
+        if matches!(policy, CleanupPolicy::ReturnedHandoff)
+            && (state & RETURNED == 0 || state & UNKNOWN != 0)
+        {
+            return Err(MailboxError::WrongPhase);
+        }
+        // RETURNED and UNKNOWN are mutually exclusive final handoff facts.
+        // Eligibility cannot change from returned to unknown before Taking.
         if state & (RETURNED | UNKNOWN) == 0 {
             return Err(MailboxError::WrongPhase);
         }
@@ -467,6 +595,59 @@ mod tests {
     }
     fn not_timeout(result: parking_lot_core::ParkResult, message: &str) {
         assert_ne!(result, parking_lot_core::ParkResult::TimedOut, "{message}");
+    }
+
+    #[test]
+    fn prepared_replacement_returns_displaced_owner_and_rejects_after_handoff() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cell = cell::<Option<Counted>, ()>();
+        let ticket = cell.prepare(None).unwrap();
+        assert!(cell
+            .replace_prepared(ticket, Some(Counted(drops.clone())))
+            .unwrap()
+            .is_none());
+        let previous = cell.replace_prepared(ticket, None).unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(cell.replace_prepared(ticket, previous).unwrap().is_none());
+        cell.begin_handoff(ticket).unwrap();
+        let rejected = cell
+            .replace_prepared(ticket, Some(Counted(drops.clone())))
+            .unwrap_err();
+        assert_eq!(rejected.error, MailboxError::WrongPhase);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "rejection released either owner"
+        );
+        drop(rejected.value);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        cell.handoff_returned(ticket).unwrap();
+        cell.publish_feedback(ticket, ()).unwrap();
+        let mut removed = None;
+        cell.with_callbacks(
+            ticket,
+            |owner, _| {
+                removed = owner.take();
+                assert!(removed.is_some());
+                assert!(matches!(
+                    cell.try_detach_cleanup(ticket),
+                    Err(MailboxError::WrongPhase)
+                ));
+            },
+            || {},
+        )
+        .unwrap();
+        cell.slot_returned(ticket).unwrap();
+        cell.publish_cleanup(ticket).unwrap();
+        let detached = cell.try_detach_cleanup(ticket).unwrap();
+        assert!(
+            detached.owner.is_none(),
+            "mutable callback update was not retained"
+        );
+        drop(detached);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(removed);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -673,6 +854,83 @@ mod tests {
         drop(cell);
         assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
         assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boundary_panic_claims_only_nonborrowed_phases_and_keeps_rejections_owned() {
+        for phase in 0..4 {
+            let owners = Arc::new(AtomicUsize::new(0));
+            let panics = Arc::new(AtomicUsize::new(0));
+            let cell = cell::<Counted, u64>();
+            let ticket = cell.prepare(Counted(owners.clone())).unwrap();
+            cell.begin_handoff(ticket).unwrap();
+            cell.handoff_returned(ticket).unwrap();
+            if phase >= 1 {
+                cell.publish_feedback(ticket, 9).unwrap();
+            }
+            if phase >= 2 {
+                cell.with_callbacks(ticket, |_, _| {}, || {}).unwrap();
+            }
+            if phase >= 3 {
+                cell.slot_returned(ticket).unwrap();
+                cell.publish_cleanup(ticket).unwrap();
+            }
+            assert!(cell
+                .retain_boundary_panic(ticket, Box::new(Counted(panics.clone())))
+                .is_ok());
+            let rejected = cell
+                .retain_boundary_panic(ticket, Box::new(Counted(panics.clone())))
+                .unwrap_err();
+            assert_eq!(panics.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                cell.try_detach_cleanup(ticket),
+                Err(MailboxError::WrongPhase)
+            ));
+            drop(rejected);
+            assert_eq!(panics.load(Ordering::SeqCst), 1);
+            assert_eq!(owners.load(Ordering::SeqCst), 0);
+            // CPU fixture custody only; production failed cells remain rooted.
+            drop(cell);
+            assert_eq!(owners.load(Ordering::SeqCst), 1);
+            assert_eq!(panics.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn boundary_panic_cannot_mutate_active_callback_owner() {
+        let cell = Arc::new(cell::<u64, u64>());
+        let ticket = cell.prepare(10).unwrap();
+        cell.begin_handoff(ticket).unwrap();
+        cell.handoff_returned(ticket).unwrap();
+        cell.publish_feedback(ticket, 7).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker_cell = cell.clone();
+        let worker = std::thread::spawn(move || {
+            worker_cell.with_callbacks(
+                ticket,
+                |owner, feedback| {
+                    started_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                    *owner += *feedback;
+                },
+                || {},
+            )
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let payload = cell
+            .retain_boundary_panic(ticket, Box::new(99u64))
+            .unwrap_err();
+        assert_eq!(*payload.downcast::<u64>().unwrap(), 99);
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        cell.slot_returned(ticket).unwrap();
+        cell.publish_cleanup(ticket).unwrap();
+        assert_eq!(cell.try_detach_cleanup(ticket).unwrap().owner, 17);
     }
 
     #[test]

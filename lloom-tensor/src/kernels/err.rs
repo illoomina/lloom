@@ -2,6 +2,10 @@ use crate::kernels::kernels::sdpa::SdpaDType;
 
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
+    #[error("a completion callback cannot block on its own queue")]
+    CallbackWouldBlock,
+    #[error("GPU queue unavailable: {0}")]
+    QueueUnavailable(&'static str),
     #[error("Command buffer had following error: {0}")]
     CommandBufferError(String),
     #[error("Could not lock resource: {0}")]

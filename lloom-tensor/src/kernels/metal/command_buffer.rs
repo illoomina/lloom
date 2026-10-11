@@ -18,6 +18,24 @@ enum Backend {
     Metal4(Arc<super::metal4::Submission>),
 }
 
+/// Internal fallible preparation; public void compatibility policy is separate.
+/// M3 retains its raw submission behavior until its queue prefix is integrated.
+pub(super) enum PreparedCommandCommit<'a> {
+    Metal3(&'a Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal4(super::metal4::PreparedCommit<'a>),
+}
+impl PreparedCommandCommit<'_> {
+    pub(super) fn commit(self) -> Result<(), crate::kernels::MetalKernelError> {
+        match self {
+            Self::Metal3(raw) => {
+                raw.commit();
+                Ok(())
+            }
+            Self::Metal4(prepared) => prepared.commit(),
+        }
+    }
+}
+
 impl std::fmt::Debug for CommandBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommandBuffer")
@@ -31,6 +49,17 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    pub(super) fn prepare_commit(
+        &self,
+    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => Ok(PreparedCommandCommit::Metal3(raw)),
+            Backend::Metal4(submission) => submission
+                .prepare_commit()
+                .map(PreparedCommandCommit::Metal4),
+        }
+    }
+
     pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
         Self {
             backend: Backend::Metal3(raw),
@@ -213,6 +242,44 @@ impl CommandBuffer {
         match &self.backend {
             Backend::Metal3(raw) => raw.GPUEndTime(),
             Backend::Metal4(s) => s.gpu_end_time(),
+        }
+    }
+
+    pub(super) fn data_ready(&self) -> bool {
+        self.status().0 >= MTLCommandBufferStatus::Completed.0
+    }
+
+    /// Internal data/error boundary: does not promise own callback return.
+    /// Engine-owned payload custody remains registered independently.
+    pub(super) fn try_wait_data_ready(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => {
+                if raw.status().0 < MTLCommandBufferStatus::Completed.0 {
+                    raw.waitUntilCompleted();
+                }
+                Ok(())
+            }
+            Backend::Metal4(submission) => submission.try_wait_data_ready(),
+        }
+    }
+    pub(super) fn check_data_wait(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(_) => Ok(()), // M3 queue-associated poison remains separate.
+            Backend::Metal4(submission) => submission.check_data_wait(),
+        }
+    }
+
+    /// Fallible completion wait. Queue-associated Metal 4 buffers wait for
+    /// logical callbacks as well as native completion. Standalone Metal 3
+    /// wrappers retain the native API's wait contract until associated with the
+    /// engine retirement queue; they do not promise cross-buffer prefix order.
+    pub fn try_wait_until_completed(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => {
+                raw.waitUntilCompleted();
+                Ok(())
+            }
+            Backend::Metal4(s) => s.try_wait(),
         }
     }
 

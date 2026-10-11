@@ -904,8 +904,20 @@ impl Commands {
             .take_cut(count, self.compute_per_buffer(), &self.node_cut_pending)
     }
 
+    /// Native feedback can arrive before commit_swap_locked releases EntryState.
+    /// Refuse only actual same-queue blocking; available state remains usable.
+    fn lock_state(&self) -> Result<parking_lot::MutexGuard<'_, EntryState>, MetalKernelError> {
+        self.state.lock_checked(Side::Host, || {
+            if let Some(queue) = &self.modern_queue {
+                crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.state.lock(Side::Host);
+        let mut state_guard = self.lock_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
@@ -990,7 +1002,7 @@ impl Commands {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), MetalKernelError> {
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
@@ -1022,7 +1034,7 @@ impl Commands {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), MetalKernelError> {
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
@@ -1039,7 +1051,7 @@ impl Commands {
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.state.lock(Side::Host);
+        let mut state_guard = self.lock_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
@@ -1088,7 +1100,7 @@ impl Commands {
 
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
         let (to_wait, retained_current, commit_error) = {
-            let mut state = self.state.lock(Side::Host);
+            let mut state = self.lock_state()?;
             let commit_error = if state.current.submitted().is_none()
                 && self.compute_count.load(Ordering::Acquire) > 0
             {
@@ -1139,7 +1151,7 @@ impl Commands {
     /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
         let (cb, signalled) = {
-            let mut state = self.state.lock(Side::Host);
+            let mut state = self.lock_state()?;
             let signalled = self.commit_swap_locked(&mut state, 0)?;
             (state.in_flight.last().cloned(), signalled)
         };
@@ -1165,7 +1177,7 @@ impl Commands {
             self.completion_already_complete
                 .fetch_add(outcome.already_complete, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
-            let mut state = self.state.lock(Side::Host);
+            let mut state = self.lock_state()?;
             self.prune_in_flight(&mut state, Some(&cb))?;
         }
         Ok(())
@@ -1180,7 +1192,7 @@ impl Commands {
     /// the reason a readback in one sequence's round stalls behind another
     /// sequence's queued work.
     pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         let signalled = self.commit_swap_locked(&mut state, 0)?;
         let cb = state.in_flight.last().cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
@@ -1207,7 +1219,7 @@ impl Commands {
         {
             return Ok(None);
         }
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         let recovering = state.current.submitted().is_some();
         if !recovering && self.compute_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
@@ -1255,12 +1267,12 @@ impl Commands {
             .fetch_add(outcome.fired, Ordering::Relaxed);
         self.completion_already_complete
             .fetch_add(outcome.already_complete, Ordering::Relaxed);
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         self.prune_in_flight(&mut state, Some(&marker.cb))
     }
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
@@ -1295,7 +1307,7 @@ impl Commands {
     /// anything).
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
-        let mut state = self.state.lock(Side::Host);
+        let mut state = self.lock_state()?;
         if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
@@ -1332,7 +1344,7 @@ impl Commands {
     /// have grown without a commit the caller made.
     #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn in_flight_len(&self) -> Result<usize, MetalKernelError> {
-        Ok(self.state.lock(Side::Host).in_flight.len())
+        Ok(self.lock_state()?.in_flight.len())
     }
 
     fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
@@ -1384,6 +1396,10 @@ impl Commands {
                         "recording command buffer was already submitted outside Commands".into(),
                     ));
                 }
+                // Reserve queue order and native handler allocation before
+                // epoch/signal/subscriber side effects. An unused preparation
+                // consumes no ordered completion sequence.
+                let prepared = cb.prepare_commit()?;
                 self.residency_set.commit_pending();
                 let t_residency = timed.map(|t| t.elapsed());
                 let signalled = self
@@ -1408,7 +1424,7 @@ impl Commands {
                     }
                 });
                 cb.record_gpu_time_on_completion();
-                cb.commit();
+                prepared.commit()?;
                 if let (Some(a), Some(b), Some(c)) =
                     (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
                 {
@@ -1450,7 +1466,18 @@ impl Commands {
     /// differs, which is the property that makes this a seam rather than a
     /// fork.
     fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
-        Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None).map(|_| ())
+        let result = Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None);
+        // Full drain joins callbacks, even a native terminal error. Failed
+        // admission/unknown handoff is not a quiescence proof.
+        if result.is_ok()
+            || matches!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            )
+        {
+            cb.try_wait_until_completed()?;
+        }
+        result.map(|_| ())
     }
 
     /// Whether a listener was allocated for the selected arm (#583).
@@ -1492,9 +1519,10 @@ impl Commands {
                 // `None` here is what routes it to the blocking wait, which is
                 // the fail-safe direction: a poll for a value nothing will
                 // publish is a hang.
+                let prepared = cb.prepare_commit()?;
                 cb.record_gpu_time_on_completion();
-                cb.commit();
-                cb.wait_until_completed();
+                prepared.commit()?;
+                cb.try_wait_data_ready()?;
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
                 outcome = arm.wait_for(cb, event, signalled)?;
@@ -1521,6 +1549,10 @@ impl Commands {
             _ => unreachable!(),
         }
 
+        // Event visibility and Completed status do not alone establish own
+        // callback return. Readback/marker callers require data plus native
+        // error visibility; full drain explicitly joins logical completion.
+        cb.try_wait_data_ready()?;
         if cb.status() == MTLCommandBufferStatus::Error {
             return Err(Self::cb_error(cb));
         }
@@ -1559,7 +1591,7 @@ impl Commands {
                 c.status(),
                 MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
             ) {
-                c.wait_until_completed();
+                c.try_wait_data_ready()?;
             }
         }
         let mut failed = None;

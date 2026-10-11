@@ -24,6 +24,7 @@ pub(crate) enum Failure {
     CallbackPanic = 2,
     WorkerFailed = 3,
     Closing = 4,
+    AdapterFailed = 5,
 }
 
 /// Independently shareable notification predicate. A native adapter supplies
@@ -38,6 +39,7 @@ impl FailureSignal {
             2 => Some(Failure::CallbackPanic),
             3 => Some(Failure::WorkerFailed),
             4 => Some(Failure::Closing),
+            5 => Some(Failure::AdapterFailed),
             _ => unreachable!("only Failure discriminants are published"),
         }
     }

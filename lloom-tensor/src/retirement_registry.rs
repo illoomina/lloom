@@ -6,7 +6,7 @@
 
 use crate::{
     completion_wake::Wake,
-    retirement_mailbox::{Detached, MailboxError, OwnerMailbox, Ticket},
+    retirement_mailbox::{CleanupPolicy, Detached, MailboxError, OwnerMailbox, Ticket},
     retirement_owners::{Failure, FailureSignal},
     retirement_service::{ActiveRetirement, CleanupInbox, HostRetirementService, ServiceError},
 };
@@ -42,6 +42,8 @@ pub(crate) struct OwnerRegistry<C, A, F> {
     service: Arc<HostRetirementService>,
     failure: Arc<FailureSignal>,
     wake: Arc<Wake>,
+    waiters: Arc<Wake>,
+    cleanup_policy: CleanupPolicy,
     producer: Mutex<Producer<C, A, F>>,
 }
 struct Producer<C, A, F> {
@@ -56,6 +58,8 @@ struct Slab<C, A, F> {
     producer_alive: AtomicBool,
     failure: Arc<FailureSignal>,
     wake: Arc<Wake>,
+    waiters: Arc<Wake>,
+    cleanup_policy: CleanupPolicy,
     active: Active<C, A, F>,
 }
 
@@ -89,9 +93,27 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         Ok(Self::from_service(failure, service))
     }
 
+    #[cfg(test)]
+    pub(crate) fn manual(failure: Arc<FailureSignal>, service: Arc<HostRetirementService>) -> Self {
+        Self::from_service(failure, service)
+    }
+
+    pub(crate) fn new_with_waiters(
+        failure: Arc<FailureSignal>,
+        waiters: Arc<Wake>,
+        cleanup_policy: CleanupPolicy,
+    ) -> Result<Self, RegistryError> {
+        let mut registry = Self::new(failure)?;
+        registry.waiters = waiters;
+        registry.cleanup_policy = cleanup_policy;
+        Ok(registry)
+    }
+
     fn from_service(failure: Arc<FailureSignal>, service: Arc<HostRetirementService>) -> Self {
         Self {
             wake: service.wake(),
+            waiters: service.wake(),
+            cleanup_policy: CleanupPolicy::TerminalFeedback,
             service,
             failure,
             producer: Mutex::new(Producer {
@@ -145,7 +167,12 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
                 if producer.slabs.try_reserve(1).is_err() {
                     return Err(reject(RegistryError::MetadataAllocation, owner));
                 }
-                let slab = match Slab::new(self.failure.clone(), self.wake.clone()) {
+                let slab = match Slab::new(
+                    self.failure.clone(),
+                    self.wake.clone(),
+                    self.waiters.clone(),
+                    self.cleanup_policy,
+                ) {
                     Ok(slab) => Arc::new(slab),
                     Err(error) => return Err(reject(error, owner)),
                 };
@@ -194,7 +221,12 @@ impl<C, A, F> Drop for OwnerRegistry<C, A, F> {
 }
 
 impl<C, A, F> Slab<C, A, F> {
-    fn new(failure: Arc<FailureSignal>, wake: Arc<Wake>) -> Result<Self, RegistryError> {
+    fn new(
+        failure: Arc<FailureSignal>,
+        wake: Arc<Wake>,
+        waiters: Arc<Wake>,
+        cleanup_policy: CleanupPolicy,
+    ) -> Result<Self, RegistryError> {
         let mut cells = Vec::new();
         cells
             .try_reserve_exact(CELLS)
@@ -211,6 +243,8 @@ impl<C, A, F> Slab<C, A, F> {
             producer_alive: AtomicBool::new(true),
             failure,
             wake,
+            waiters,
+            cleanup_policy,
             active: ActiveRetirement::new(),
         })
     }
@@ -225,9 +259,24 @@ impl<C, A, F> Slab<C, A, F> {
 }
 
 impl<C, A, F> Registration<C, A, F> {
+    pub(crate) fn replace_prepared(
+        &self,
+        captures: C,
+        anchors: A,
+    ) -> Result<(C, A), crate::retirement_mailbox::Rejected<(C, A)>> {
+        self.slab.cells[self.index].replace_prepared(self.ticket, (captures, anchors))
+    }
+
     pub(crate) fn cancel_before_handoff(&self) -> Result<(), MailboxError> {
         self.slab.cells[self.index].publish_cancelled(self.ticket)
     }
+    pub(crate) fn retain_boundary_panic(
+        &self,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Result<(), Box<dyn std::any::Any + Send>> {
+        self.slab.cells[self.index].retain_boundary_panic(self.ticket, payload)
+    }
+
     pub(crate) fn begin_handoff(&self) -> Result<(), MailboxError> {
         self.slab.cells[self.index].begin_handoff(self.ticket)
     }
@@ -243,16 +292,31 @@ impl<C, A, F> Registration<C, A, F> {
     ) -> Result<(), crate::retirement_mailbox::Rejected<F>> {
         self.slab.cells[self.index].publish_feedback(self.ticket, feedback)
     }
+    /// Native data/error observer sees anchors only, not arbitrary captures.
+    /// It runs before Ready publication and before ordered logical callbacks.
+    pub(crate) fn publish_feedback_observed(
+        &self,
+        feedback: F,
+        observe: impl FnOnce(&A, &F),
+    ) -> Result<(), crate::retirement_mailbox::FeedbackPublicationError<F>> {
+        self.slab.cells[self.index].publish_feedback_observed(
+            self.ticket,
+            feedback,
+            |owner, feedback| observe(&owner.1, feedback),
+            || self.slab.waiters.notify(),
+        )
+    }
+
     /// The queue's elected prefix drainer alone calls this. Slot return and
     /// prefix publication belong inside run, after all logical callbacks.
     pub(crate) fn run_callbacks(
         &self,
-        run: impl FnOnce(&C, &A, &F),
+        run: impl FnOnce(&mut C, &mut A, &F),
         wake_waiters: impl FnOnce(),
     ) -> Result<(), MailboxError> {
         self.slab.cells[self.index].with_callbacks(
             self.ticket,
-            |owner, feedback| run(&owner.0, &owner.1, feedback),
+            |owner, feedback| run(&mut owner.0, &mut owner.1, feedback),
             wake_waiters,
         )?;
         self.slab.cells[self.index].slot_returned(self.ticket)?;
@@ -278,7 +342,7 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync +
             let Ok(Detached {
                 owner: (captures, anchors),
                 feedback,
-            }) = cell.try_detach_cleanup(ticket)
+            }) = cell.try_detach_cleanup_with_policy(ticket, self.cleanup_policy)
             else {
                 continue;
             };
@@ -311,7 +375,10 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync +
             && self.active.is_empty()
     }
     fn fail(&self, reason: Failure) {
-        self.failure.publish(reason, || self.wake.notify());
+        self.failure.publish(reason, || {
+            self.wake.notify();
+            self.waiters.notify();
+        });
     }
 }
 
@@ -514,5 +581,179 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         drop(registry);
         service.manual_pass();
+    }
+    #[test]
+    fn returned_policy_roots_native_owner_after_unknown_external_handles_drop() {
+        use crate::native_reuse::{NativeReuse, ReuseSide};
+        for returned in [false, true] {
+            let service = HostRetirementService::manual();
+            let failure = Arc::new(FailureSignal::default());
+            let mut registry = OwnerRegistry::<(), NativeReuse<Anchor>, ()>::from_service(
+                failure,
+                service.clone(),
+            );
+            registry.cleanup_policy = CleanupPolicy::ReturnedHandoff;
+            let drops = Arc::new(AtomicUsize::new(0));
+            let native = NativeReuse::new();
+            assert!(native.install(Anchor(drops.clone())).is_ok());
+            let record = registry
+                .prepare((), native, |_| Ok(()))
+                .unwrap_or_else(|_| panic!("prepare"));
+            record.begin_handoff().unwrap();
+            if returned {
+                record.handoff_returned().unwrap();
+            } else {
+                record.handoff_unknown(|| {}).unwrap();
+            }
+            record.publish_feedback(()).unwrap();
+            record
+                .run_callbacks(
+                    |_, native, _| {
+                        assert!(native.publish(ReuseSide::CallbacksDone).unwrap().is_none());
+                    },
+                    || {},
+                )
+                .unwrap();
+            drop(record);
+            drop(registry);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                service.manual_pass(),
+                returned,
+                "cleanup policy accepted unknown or refused returned handoff"
+            );
+            assert_eq!(drops.load(Ordering::SeqCst), usize::from(returned));
+            assert!(!service.manual_pass());
+            assert_eq!(drops.load(Ordering::SeqCst), usize::from(returned));
+            // No actual native object/work exists. Dropping manual fixture
+            // custody is not production unknown-handoff recovery permission.
+            drop(service);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn internal_feedback_observer_precedes_ordered_earlier_callback() {
+        use crate::completion_frontier::CompletionFrontier;
+        let service = HostRetirementService::manual();
+        let registry = OwnerRegistry::<usize, (Arc<AtomicUsize>, Anchor), usize>::from_service(
+            Arc::new(FailureSignal::default()),
+            service.clone(),
+        );
+        let ready = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let records: Vec<_> = (0..2)
+            .map(|id| {
+                let record = registry
+                    .prepare(id, (ready.clone(), Anchor(drops.clone())), |_| Ok(()))
+                    .unwrap_or_else(|_| panic!("prepare"));
+                record.begin_handoff().unwrap();
+                record.handoff_returned().unwrap();
+                record
+            })
+            .collect();
+        let mut frontier = CompletionFrontier::<_, 2>::new().unwrap();
+        // Later native completion arrives first, with no earlier callback yet.
+        records[1]
+            .publish_feedback_observed(1, |anchor, value| {
+                anchor.0.fetch_or(1 << value, Ordering::Release);
+            })
+            .unwrap_or_else(|_| panic!("later feedback"));
+        assert_eq!(
+            ready.load(Ordering::Acquire),
+            2,
+            "later data readiness was held behind earlier logical callback"
+        );
+        assert!(!frontier
+            .publish(1, records[1].clone())
+            .unwrap_or_else(|_| panic!("later publish")));
+        assert_eq!(frontier.retired_prefix(), 0);
+        assert!(!service.manual_pass());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        records[0]
+            .publish_feedback_observed(0, |anchor, value| {
+                anchor.0.fetch_or(1 << value, Ordering::Release);
+            })
+            .unwrap_or_else(|_| panic!("first feedback"));
+        assert!(frontier
+            .publish(0, records[0].clone())
+            .unwrap_or_else(|_| panic!("first publish")));
+        let mut callbacks = Vec::new();
+        while let Some((sequence, record)) = frontier.pop_ready_or_release_drainer().unwrap() {
+            record
+                .run_callbacks(
+                    |capture, _, feedback| {
+                        assert_eq!(ready.load(Ordering::Acquire), 3);
+                        assert_eq!(*capture, *feedback);
+                        callbacks.push(*capture);
+                        frontier.finish(sequence).unwrap();
+                    },
+                    || {},
+                )
+                .unwrap();
+        }
+        assert_eq!(callbacks, [0, 1]);
+        drain(&service, &drops, 2);
+    }
+
+    #[test]
+    fn internal_feedback_observer_panic_keeps_consumed_owners_rooted() {
+        use crate::retirement_mailbox::FeedbackPublicationError;
+        let service = HostRetirementService::manual();
+        let failure = Arc::new(FailureSignal::default());
+        let registry =
+            OwnerRegistry::<OnDrop, Anchor, OnDrop>::from_service(failure.clone(), service.clone());
+        let captures = Arc::new(AtomicUsize::new(0));
+        let anchors = Arc::new(AtomicUsize::new(0));
+        let feedbacks = Arc::new(AtomicUsize::new(0));
+        let panics = Arc::new(AtomicUsize::new(0));
+        let counted = |count: &Arc<AtomicUsize>| {
+            let count = count.clone();
+            OnDrop(Some(Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            })))
+        };
+        let record = registry
+            .prepare(counted(&captures), Anchor(anchors.clone()), |_| Ok(()))
+            .unwrap_or_else(|_| panic!("prepare"));
+        record.begin_handoff().unwrap();
+        record.handoff_returned().unwrap();
+        let payload = counted(&panics);
+        let outcome = record.publish_feedback_observed(counted(&feedbacks), |_, _| {
+            std::panic::panic_any(payload);
+        });
+        assert!(matches!(
+            outcome,
+            Err(FeedbackPublicationError::ObserverPanicked)
+        ));
+        assert_eq!(failure.get(), Some(Failure::CallbackPanic));
+        assert_eq!(
+            record.run_callbacks(|_, _, _| panic!("failed observer became Ready"), || {}),
+            Err(MailboxError::WrongPhase)
+        );
+        // Rejected feedback remains caller-owned; consumed feedback is not
+        // fabricated as a return value after the observer panics.
+        let rejected_count = Arc::new(AtomicUsize::new(0));
+        let rejected = record.publish_feedback_observed(counted(&rejected_count), |_, _| {});
+        let Err(FeedbackPublicationError::Rejected(rejected)) = rejected else {
+            panic!("duplicate publication did not return caller feedback");
+        };
+        assert_eq!(rejected_count.load(Ordering::SeqCst), 0);
+        drop(rejected.value);
+        assert_eq!(rejected_count.load(Ordering::SeqCst), 1);
+        drop(record);
+        drop(registry);
+        assert!(!service.manual_pass());
+        for count in [&captures, &anchors, &feedbacks, &panics] {
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                0,
+                "observer failure released rooted custody"
+            );
+        }
+        // Fake-only fixture teardown, not native-quarantine recovery permission.
+        drop(service);
+        for count in [&captures, &anchors, &feedbacks, &panics] {
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 }

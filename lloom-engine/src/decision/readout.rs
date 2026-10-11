@@ -169,7 +169,7 @@ impl CausalReadout {
         mut logit: impl FnMut(u32) -> Result<f64>,
         temperature: f64,
     ) -> Result<Vec<f64>> {
-        let temperature = f64::from(Temperature::try_from(temperature)?);
+        let temperature = Temperature::try_from(temperature)?;
         let mut scores = Vec::with_capacity(self.groups.len());
         for group in &self.groups {
             let mut score = f64::NEG_INFINITY;
@@ -182,17 +182,30 @@ impl CausalReadout {
             }
             scores.push(score);
         }
-        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut sum = 0.0;
-        for score in &mut scores {
-            *score = ((*score - max) / temperature).exp();
-            sum += *score;
-        }
-        for score in &mut scores {
-            *score /= sum;
-        }
-        Ok(scores)
+        normalize_options(scores, temperature)
     }
+}
+
+/// Shared selected-option normalization; never normalizes padded marker slots.
+/// Host F64 arithmetic is intentional; reference F32 parity uses a tolerance.
+pub(super) fn normalize_options(
+    mut scores: Vec<f64>,
+    temperature: Temperature,
+) -> Result<Vec<f64>> {
+    if scores.is_empty() || scores.iter().any(|score| !score.is_finite()) {
+        bail!("decision option logits must be nonempty and finite");
+    }
+    let temperature = f64::from(temperature);
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut sum = 0.0;
+    for score in &mut scores {
+        *score = ((*score - max) / temperature).exp();
+        sum += *score;
+    }
+    for score in &mut scores {
+        *score /= sum;
+    }
+    Ok(scores)
 }
 
 fn single_ids(

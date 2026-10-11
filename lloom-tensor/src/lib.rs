@@ -61,6 +61,7 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+mod current_command;
 mod custom_op;
 mod device;
 pub mod display;

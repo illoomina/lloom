@@ -1,3 +1,4 @@
+use crate::current_command::Current;
 use crate::kernels::metal::{
     cache_pad::CachePadded,
     completion::{CompletionWait, SharedEvent, WaitOutcome},
@@ -7,6 +8,7 @@ use crate::kernels::metal::{
     DispatchGate, Fence, GpuClock, InFlightHold, PrevCeOutputs, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
+use crate::retire::Epoch;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::{HashMap, HashSet};
@@ -176,8 +178,14 @@ pub struct CommandMarker {
     signalled: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct CommitReceipt {
+    epoch: Epoch,
+    signalled: Option<u64>,
+}
+
 struct EntryState {
-    current: CommandBuffer,
+    current: Current<CommandBuffer, CommitReceipt>,
     in_flight: Vec<CommandBuffer>,
     current_encoder: Option<ComputeCommandEncoder>,
 }
@@ -185,7 +193,7 @@ struct EntryState {
 impl EntryState {
     pub fn new(cb: CommandBuffer) -> EntryState {
         EntryState {
-            current: cb,
+            current: Current::new(cb),
             in_flight: vec![],
             current_encoder: None,
         }
@@ -217,6 +225,7 @@ pub struct Commands {
     state: CachePadded<Censused<parking_lot::Mutex<EntryState>>>,
     /// Its own line -- see `state` above.
     compute_count: CachePadded<AtomicUsize>,
+    replacement_pending: CachePadded<AtomicBool>,
     command_queue: CommandQueue,
     modern_queue: Option<Arc<super::metal4::Queue>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
@@ -607,6 +616,7 @@ impl Commands {
         Ok(Self {
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
+            replacement_pending: CachePadded::new(AtomicBool::new(false)),
             command_queue,
             modern_queue,
             compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
@@ -890,20 +900,13 @@ impl Commands {
     /// `compute_count` is still incremented on both paths, so the counter stays
     /// a faithful dispatch count for anything else reading it.
     fn should_cut(&self, count: usize) -> bool {
-        match self.cut_policy {
-            CutPolicy::DispatchCounter => count >= self.compute_per_buffer(),
-            CutPolicy::NodeIndex { .. } => self.node_cut_pending.swap(false, Ordering::Relaxed),
-            CutPolicy::NodeAligned => {
-                self.node_cut_pending.swap(false, Ordering::Relaxed)
-                    || self
-                        .cut_policy
-                        .cuts_at_dispatch(count, self.compute_per_buffer())
-            }
-        }
+        self.cut_policy
+            .take_cut(count, self.compute_per_buffer(), &self.node_cut_pending)
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock(Side::Host);
+        self.ensure_recording_locked(&mut state_guard)?;
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
@@ -942,6 +945,8 @@ impl Commands {
             // after work it never touches.
             let mut enc = state_guard
                 .current
+                .recording()
+                .expect("recording recovered above")
                 .compute_command_encoder_with_executor(&fence, &self.prev_ce_outputs, &executor)
                 .with_clock(Arc::clone(&self.clock));
             if crate::kernels::metal::profile::enabled() {
@@ -986,16 +991,25 @@ impl Commands {
         value: u64,
     ) -> Result<(), MetalKernelError> {
         let mut state = self.state.lock(Side::Host);
+        self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
         if self.modern_queue.is_some() {
             // Queue the signal as part of this commit, before acquiring a
             // replacement slot can apply backpressure.
-            state.current.signal_event(event, value);
+            state
+                .current
+                .recording()
+                .expect("recording recovered above")
+                .signal_event(event, value);
             self.commit_swap_locked(&mut state, 0)?;
         } else {
-            state.current.signal_event(event, value);
+            state
+                .current
+                .recording()
+                .expect("recording recovered above")
+                .signal_event(event, value);
         }
         Ok(())
     }
@@ -1009,18 +1023,24 @@ impl Commands {
         value: u64,
     ) -> Result<(), MetalKernelError> {
         let mut state = self.state.lock(Side::Host);
+        self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
         if self.modern_queue.is_some() {
             self.commit_swap_locked(&mut state, 0)?;
         }
-        state.current.wait_for_event(event, value);
+        state
+            .current
+            .recording()
+            .expect("recording recovered above")
+            .wait_for_event(event, value);
         Ok(())
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock(Side::Host);
+        self.ensure_recording_locked(&mut state_guard)?;
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
@@ -1036,6 +1056,8 @@ impl Commands {
         let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
         let encoder = state_guard
             .current
+            .recording()
+            .expect("recording recovered above")
             .blit_command_encoder(&fence, &self.prev_ce_outputs);
 
         // Wait for all prior encoder fences before any blit commands execute.
@@ -1065,22 +1087,25 @@ impl Commands {
     }
 
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
-        let to_wait = {
+        let (to_wait, retained_current, commit_error) = {
             let mut state = self.state.lock(Side::Host);
-            if self.compute_count.load(Ordering::Acquire) > 0 {
-                self.commit_swap_locked(&mut state, 0)?;
-            }
-            std::mem::take(&mut state.in_flight)
+            let commit_error = if state.current.submitted().is_none()
+                && self.compute_count.load(Ordering::Acquire) > 0
+            {
+                self.commit_swap_locked(&mut state, 0).err()
+            } else {
+                None
+            };
+            let retained = state.current.submitted().map(|(cb, _)| cb.clone());
+            (std::mem::take(&mut state.in_flight), retained, commit_error)
         };
-
-        // Wait only on the last CB. Metal executes CBs in queue order, so all earlier
-        // CBs are guaranteed complete when the last one is. Calling waitUntilCompleted on
-        // each CB individually pays OS notification latency (~1-2ms) N times unnecessarily.
-        if let Some(last) = to_wait.last() {
+        // The retained current is newer than every in-flight record. Waiting
+        // it needs no allocation and remains possible after replacement fails.
+        if let Some(last) = retained_current.as_ref().or_else(|| to_wait.last()) {
             Self::ensure_completed(last)?;
         }
         // Check earlier CBs for errors (no need to block — they're already done).
-        for cb in &to_wait[..to_wait.len().saturating_sub(1)] {
+        for cb in &to_wait {
             if cb.status() == MTLCommandBufferStatus::Error {
                 self.failure.record(cb_error_message(cb));
             }
@@ -1096,6 +1121,9 @@ impl Commands {
             self.live_fences.lock(Side::Host).reap(&mut prev_ce_outputs);
         }
 
+        if let Some(error) = commit_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1174,16 +1202,22 @@ impl Commands {
     /// `None` when there is nothing encoded or more than one committed buffer
     /// is still incomplete; the marker otherwise.
     pub fn flush_marker_if_started(&self) -> Result<Option<CommandMarker>, MetalKernelError> {
-        if self.compute_count.load(Ordering::Acquire) == 0 {
+        if self.compute_count.load(Ordering::Acquire) == 0
+            && !self.replacement_pending.load(Ordering::Acquire)
+        {
             return Ok(None);
         }
         let mut state = self.state.lock(Side::Host);
+        let recovering = state.current.submitted().is_some();
+        if !recovering && self.compute_count.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
         let incomplete = state
             .in_flight
             .iter()
             .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
             .count();
-        if incomplete > 1 {
+        if !recovering && incomplete > 1 {
             return Ok(None);
         }
         let signalled = self.commit_swap_locked(&mut state, 0)?;
@@ -1227,7 +1261,7 @@ impl Commands {
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
         let mut state = self.state.lock(Side::Host);
-        if self.compute_count.load(Ordering::Acquire) > 0 {
+        if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
         Ok(())
@@ -1262,7 +1296,7 @@ impl Commands {
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         let mut state = self.state.lock(Side::Host);
-        if self.compute_count.load(Ordering::Acquire) > 0 {
+        if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
         // Errors are surfaced here rather than swallowed: without a blocking
@@ -1301,6 +1335,27 @@ impl Commands {
         Ok(self.state.lock(Side::Host).in_flight.len())
     }
 
+    fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
+        match &self.modern_queue {
+            Some(queue) => Ok(CommandBuffer::from_metal4(queue.acquire()?)),
+            None => create_command_buffer(&self.command_queue, self.kind),
+        }
+    }
+
+    /// Recovery precedes every recording operation, not just a policy cut.
+    fn ensure_recording_locked(&self, state: &mut EntryState) -> Result<(), MetalKernelError> {
+        state.current.recover_recording(
+            || self.create_replacement(),
+            &mut state.in_flight,
+            &self.compute_count,
+            &self.replacement_pending,
+            0,
+        )?;
+        // A consumed node cut belongs to the already submitted CB; do not
+        // re-arm it for the dispatch whose encoder was never returned.
+        Ok(())
+    }
+
     /// Commit the current buffer, swap in a fresh one, and return the value the
     /// completion arm should wait for -- `None` on the incumbent path.
     ///
@@ -1312,114 +1367,77 @@ impl Commands {
         state: &mut EntryState,
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
-        // Priced on the encoding thread under `CANDLE_METAL_PROFILE=1`: this
-        // is the host-side cost of a command-buffer seam (issue #702).
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
-        // A failed command buffer's writes never happened; nothing encoded
-        // after it is committed as though they had. The encoder is closed
-        // first either way: Metal refuses to release an open one.
-        self.failure.check()?;
         let t_end_enc = timed.map(|t| t.elapsed());
-
-        // Publish any allocations a pool MISS staged with `ResidencySet::add`
-        // (`DESIGN.md` §6.3b) before committing this command buffer, so every
-        // allocation its dispatches may bind is resident before the GPU executes
-        // them (§3.7). A load-and-branch when nothing was staged, which is every
-        // commit that did not follow a miss — the whole steady-state.
-        self.residency_set.commit_pending();
-        let t_residency = timed.map(|t| t.elapsed());
-
-        // The signal goes here and it can go nowhere else. `encodeSignalEvent:
-        // value:` is documented "may only be called if there is no current
-        // command encoder on the receiver" -- so after `end_encoding` above --
-        // and it must precede the `commit` below, because Metal will not accept
-        // an encode onto a committed buffer.
-        //
-        // Probed before this was written (`measurements/probes/issue-559/
-        // shared_event.m`): the signal is observed from the host with **no**
-        // `waitUntilCompleted`, it does **not** advance when no signal is
-        // encoded, and the kernel's writes are visible at the instant the
-        // signal is. That last arm is the one this seam's soundness rests on --
-        // §3.5 makes a read-before-write silent corruption rather than an error.
-        //
-        // `None` on the incumbent path, where nothing is encoded at all: the
-        // default arm's command buffer is byte-for-byte what it was before this
-        // field existed.
-        let signalled = self
-            .completion_wait
-            .encode_signal(&state.current, self.completion_event.as_ref());
-        if signalled.is_some() {
-            self.completion_signals.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Close the epoch this command buffer holds and arrange for the pools to
-        // hear when it finishes. Every closed epoch must be reported exactly
-        // once, or a buffer parked against it waits forever -- so the handler is
-        // attached on the same branch that commits, and an already-committed
-        // buffer (which Metal will not accept a handler for) has its epoch
-        // retired here instead.
-        //
-        // Both happen under the state lock, so no release can observe the new
-        // epoch before the old one is accounted for.
-        crate::kernels::metal::trace::note_command_buffer();
-        let epoch = self.clock.commit_epoch();
-        match state.current.status() {
-            MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+        let receipt = *state
+            .current
+            .submit_marked(&self.replacement_pending, |cb| {
+                self.failure.check()?;
+                if !matches!(
+                    cb.status(),
+                    MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued
+                ) {
+                    return Err(MetalKernelError::CommandBufferError(
+                        "recording command buffer was already submitted outside Commands".into(),
+                    ));
+                }
+                self.residency_set.commit_pending();
+                let t_residency = timed.map(|t| t.elapsed());
+                let signalled = self
+                    .completion_wait
+                    .encode_signal(cb, self.completion_event.as_ref());
+                if signalled.is_some() {
+                    self.completion_signals.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::kernels::metal::trace::note_command_buffer();
+                let epoch = self.clock.commit_epoch();
                 let clock = Arc::clone(&self.clock);
                 let subs: Vec<_> = self.on_complete.lock().clone();
                 let failure = Arc::clone(&self.failure);
-                state.current.on_completion_of(move |error| {
+                cb.on_completion_of(move |error| {
                     if let Some(error) = error {
                         failure.record(error);
                     }
-                    // Order matters: the clock must show the epoch finished
-                    // before subscribers look, or they find nothing drainable
-                    // and the buffers wait for an unrelated later completion.
+                    // Subscribers consume the completed epoch published here.
                     clock.mark_completed(epoch);
                     for f in &subs {
                         f();
                     }
                 });
-                // Registered before commit: GPUStartTime/GPUEndTime only become
-                // valid once the buffer completes, so a completion handler is
-                // the only place they can be read.
-                state.current.record_gpu_time_on_completion();
-                state.current.commit();
-            }
-            // Already committed or finished, so no handler can be attached. It
-            // has been waited on or will be by `flush_and_wait`; retiring the
-            // epoch now keeps the clock from stalling on an epoch that will
-            // never be reported.
-            _ => {
-                self.clock.mark_completed(epoch);
-            }
-        }
-        let t_committed = timed.map(|t| t.elapsed());
-        if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, t_committed) {
-            crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
-        }
+                cb.record_gpu_time_on_completion();
+                cb.commit();
+                if let (Some(a), Some(b), Some(c)) =
+                    (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
+                {
+                    crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
+                }
+                Ok(CommitReceipt { epoch, signalled })
+            })?;
         if let Some(hold) = &self.hold {
             hold.release_completed();
         }
         let created = timed.map(|_| std::time::Instant::now());
-        let new_cb = match &self.modern_queue {
-            Some(queue) => CommandBuffer::from_metal4(queue.acquire()?),
-            None => create_command_buffer(&self.command_queue, self.kind)?,
-        };
+        let recovered = state
+            .current
+            .recover_recording(
+                || self.create_replacement(),
+                &mut state.in_flight,
+                &self.compute_count,
+                &self.replacement_pending,
+                reset_to,
+            )?
+            .expect("submit_marked retained its receipt");
+        debug_assert_eq!(receipt.epoch, recovered.epoch);
         if let Some(t) = created {
             crate::kernels::metal::profile::record_create_cb(t.elapsed());
         }
-        let old_cb = std::mem::replace(&mut state.current, new_cb);
-        state.in_flight.push(old_cb);
-        self.compute_count.store(reset_to, Ordering::Release);
         if let Some(t) = timed {
             crate::kernels::metal::profile::record_commit(t.elapsed());
         }
-
-        Ok(signalled)
+        Ok(receipt.signalled)
     }
 
     /// Wait for `cb` by the blocking incumbent.
@@ -1658,15 +1676,35 @@ fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
 
 impl Drop for Commands {
     fn drop(&mut self) {
+        let retained = self
+            .state
+            .lock(Side::Host)
+            .current
+            .submitted()
+            .map(|(cb, _)| cb.clone());
+        if let Some(cb) = retained {
+            // An already submitted current needs no replacement to be waited.
+            cb.wait_until_completed();
+            return;
+        }
         let _ = self.flush();
-        // What the hold keeps alive is still named by the buffers in flight;
-        // it may only go once they have run.
-        if self.hold.is_some() {
-            let last = self.state.lock(Side::Host).in_flight.last().cloned();
-            if let Some(cb) = last {
-                if cb.status() != MTLCommandBufferStatus::NotEnqueued {
-                    cb.wait_until_completed();
-                }
+        // A normal flush may itself fail after submission; retain that tail
+        // as well as the unretained arm's ordinary in-flight owners.
+        let last = {
+            let state = self.state.lock(Side::Host);
+            state
+                .current
+                .submitted()
+                .map(|(cb, _)| cb.clone())
+                .or_else(|| {
+                    self.hold
+                        .as_ref()
+                        .and_then(|_| state.in_flight.last().cloned())
+                })
+        };
+        if let Some(cb) = last {
+            if cb.status() != MTLCommandBufferStatus::NotEnqueued {
+                cb.wait_until_completed();
             }
         }
     }

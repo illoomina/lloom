@@ -1,5 +1,9 @@
+#[path = "entry_guard.rs"]
+mod entry_guard;
 #[path = "commands_lifecycle.rs"]
 mod lifecycle;
+
+use entry_guard::{DeferredGuard, DeferredSlots};
 
 use crate::current_command::Current;
 use crate::kernels::metal::{
@@ -95,7 +99,7 @@ fn create_command_buffer(
 
 /// RAII guard for compute command encoder operations.
 pub struct CommandsGuard<'a> {
-    guard: parking_lot::MutexGuard<'a, EntryState>,
+    guard: EntryGuard<'a>,
 }
 
 impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
@@ -122,7 +126,7 @@ impl CommandsGuard<'_> {
 
 /// RAII guard for blit command encoder operations.
 pub struct BlitCommandsGuard<'a> {
-    _guard: parking_lot::MutexGuard<'a, EntryState>,
+    _guard: EntryGuard<'a>,
     state: Option<BlitCommandEncoder>,
     core: &'a CommandsCore,
 }
@@ -239,6 +243,16 @@ struct EntryState {
     in_flight: Vec<CommandBuffer>,
     current_encoder: Option<ComputeCommandEncoder>,
 }
+
+// One acquisition can close one compute encoder and construct one replacement.
+// A blit guard additionally closes one pending predecessor and its own encoder.
+#[derive(Default)]
+struct ClosedEncoders {
+    compute: DeferredSlots<ComputeCommandEncoder, 1>,
+    blit: DeferredSlots<PendingBlit, 2>,
+    executor: DeferredSlots<Arc<ExecutorSlot>, 1>,
+}
+type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders>;
 
 impl EntryState {
     pub fn new(cb: CommandBuffer) -> EntryState {
@@ -873,18 +887,25 @@ impl Commands {
 
     /// Bind the armed gate's flag on the encoder that is already open, if
     /// any — `begin` may arm the gate mid-encoder (after a prefill).
-    pub fn bind_eos_gate_current(&self) {
+    pub fn bind_eos_gate_current(&self) -> Result<(), MetalKernelError> {
+        let state = self.lock_state()?;
+        self.core.failure.check()?;
         let Some(flag) = self.core.eos_gate.armed_flag() else {
-            return;
+            return Ok(());
         };
-        let state = self.core.state.lock(Side::Host);
         if let Some(enc) = &state.current_encoder {
+            let _unwind = CloseUnwind {
+                failure: &self.core.failure,
+                message: "compute encoder setup exited exceptionally; custody retained",
+                buffer: Some(&enc.command_buffer),
+            };
             enc.set_input_buffer(
                 crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
                 Some(flag),
                 0,
             );
         }
+        Ok(())
     }
 
     /// The clock the buffer pools decide reuse against.
@@ -1015,18 +1036,21 @@ impl Commands {
 
     /// Native feedback can arrive before commit_swap_locked releases EntryState.
     /// Refuse only actual same-queue blocking; available state remains usable.
-    fn lock_state(&self) -> Result<parking_lot::MutexGuard<'_, EntryState>, MetalKernelError> {
-        self.core.state.lock_checked(Side::Host, || {
-            if let Some(queue) = &self.core.modern_queue {
-                crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
-                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-            }
-            if let Some(core) = &self.core.legacy_completions {
-                crate::completion_scope::before_park(core.identity())
-                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
-            }
-            Ok(())
-        })
+    fn lock_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        self.core
+            .state
+            .lock_checked(Side::Host, || {
+                if let Some(queue) = &self.core.modern_queue {
+                    crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
+                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+                }
+                if let Some(core) = &self.core.legacy_completions {
+                    crate::completion_scope::before_park(core.identity())
+                        .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+                }
+                Ok(())
+            })
+            .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
@@ -1042,14 +1066,19 @@ impl Commands {
         // The per-kernel timing arm: a counter-sampled encoder per dispatch,
         // so each encoder's interval is one kernel's (`profile::encoder_per_dispatch`).
         if crate::kernels::metal::profile::encoder_per_dispatch() {
-            if let Some(enc) = state_guard.current_encoder.as_ref() {
-                self.core.end_encoding(enc)?;
-                state_guard.current_encoder.take();
-            }
+            self.core.close_compute(&mut state_guard)?;
         }
 
         if state_guard.current_encoder.is_none() {
-            let executor = self.executor();
+            let (state_guard, custody) = state_guard.parts_mut();
+            let executor = custody
+                .executor
+                .reserve()
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "encoder construction executor custody bound (1) exhausted",
+                ))?;
+            *executor = Some(self.executor());
+            let executor = executor.as_ref().expect("executor staged above");
             if self.core.hold.is_some() && !executor.is_classical() {
                 // An executor's indirect command buffers and the buffers
                 // their ranges keep resident are its own, replaced as it
@@ -1076,7 +1105,7 @@ impl Commands {
                 .compute_command_encoder_with_executor(
                     &fence,
                     &self.core.encoder_finalizer.prev_ce_outputs,
-                    &executor,
+                    executor,
                 )?
                 .with_clock(Arc::clone(&self.core.clock))
                 .with_finalizer(Arc::clone(&self.core.encoder_finalizer));
@@ -1086,6 +1115,20 @@ impl Commands {
             if crate::kernels::metal::trace::trace_requested() {
                 enc = enc.with_trace(Arc::clone(&self.core.trace));
             }
+            state_guard.current_encoder =
+                Some(enc.into_canonical(self.core.encoder_domain.clone()));
+            let enc = state_guard
+                .current_encoder
+                .as_ref()
+                .expect("encoder staged above");
+            // A custom bind may unwind after partially changing native state.
+            // The canonical wrapper stays rooted, but no later recording gate
+            // may treat it as a successfully initialized encoder.
+            let _unwind = CloseUnwind {
+                failure: &self.core.failure,
+                message: "compute encoder setup exited exceptionally; custody retained",
+                buffer: Some(&enc.command_buffer),
+            };
             if let Some(flag) = self.core.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
@@ -1105,10 +1148,6 @@ impl Commands {
             // `prev_ce_outputs` + `wait_for_buffer` and by no barrier, and #144
             // found 11 real edges that survive on that alone (issue #185).
             crate::kernels::metal::hazard_audit::record_encoder_begin();
-            // This wrapper has never escaped; public guards borrow it under this
-            // EntryState guard, and any explicit clone is counted as external.
-            state_guard.current_encoder =
-                Some(enc.into_canonical(self.core.encoder_domain.clone()));
         }
 
         Ok(CommandsGuard { guard: state_guard })
@@ -1126,10 +1165,7 @@ impl Commands {
     ) -> Result<(), MetalKernelError> {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
-        if let Some(enc) = state.current_encoder.as_ref() {
-            self.core.end_encoding(enc)?;
-            state.current_encoder.take();
-        }
+        self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
             // Queue the signal as part of this commit, before acquiring a
             // replacement slot can apply backpressure.
@@ -1159,10 +1195,7 @@ impl Commands {
     ) -> Result<(), MetalKernelError> {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
-        if let Some(enc) = state.current_encoder.as_ref() {
-            self.core.end_encoding(enc)?;
-            state.current_encoder.take();
-        }
+        self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
             self.commit_swap_locked(&mut state, 0)?;
         }
@@ -1185,10 +1218,7 @@ impl Commands {
         }
 
         // End compute encoder before starting blit.
-        if let Some(enc) = state_guard.current_encoder.as_ref() {
-            self.core.end_encoding(enc)?;
-            state_guard.current_encoder.take();
-        }
+        self.core.close_compute(&mut state_guard)?;
 
         let fence = Arc::new(Fence::held_by(&self.core.device, self.core.hold.clone()));
         let encoder = state_guard
@@ -1508,8 +1538,9 @@ impl Commands {
     }
 
     /// Recovery precedes every recording operation, not just a policy cut.
-    fn ensure_recording_locked(&self, state: &mut EntryState) -> Result<(), MetalKernelError> {
+    fn ensure_recording_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         self.core.close_pending_blit(state)?;
+        let state = &mut **state;
         state.current.recover_recording(
             || self.create_replacement(),
             &mut state.in_flight,
@@ -1530,7 +1561,7 @@ impl Commands {
     /// encoder and committing it, and only this function is at that point.
     fn commit_swap_locked(
         &self,
-        state: &mut EntryState,
+        state: &mut EntryGuard<'_>,
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
@@ -1539,6 +1570,7 @@ impl Commands {
             hold.release_completed();
         }
         let created = timed.map(|_| std::time::Instant::now());
+        let state = &mut **state;
         let recovered = state
             .current
             .recover_recording(
@@ -1747,9 +1779,32 @@ impl Drop for CloseUnwind<'_> {
 }
 
 impl CommandsCore {
-    fn close_pending_blit(&self, state: &mut EntryState) -> Result<(), MetalKernelError> {
+    fn close_compute(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
+        let (state, custody) = state.parts_mut();
+        if let Some(encoder) = state.current_encoder.as_ref() {
+            let destination =
+                custody
+                    .compute
+                    .reserve()
+                    .ok_or(MetalKernelError::QueueUnavailable(
+                        "closed compute custody bound (1) exhausted",
+                    ))?;
+            self.end_encoding(encoder)?;
+            *destination = state.current_encoder.take();
+        }
+        Ok(())
+    }
+
+    fn close_pending_blit(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         self.failure.check()?;
+        let (state, custody) = state.parts_mut();
         if let Some(pending) = state.pending_blit.as_mut() {
+            let destination = custody
+                .blit
+                .reserve()
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "closed blit custody bound (2) exhausted",
+                ))?;
             let _unwind = CloseUnwind {
                 failure: &self.failure,
                 message: "blit close exited exceptionally; custody retained",
@@ -1767,7 +1822,7 @@ impl CommandsCore {
                 }
                 return Err(error);
             }
-            state.pending_blit.take();
+            *destination = state.pending_blit.take();
         }
         Ok(())
     }
@@ -1777,14 +1832,11 @@ impl CommandsCore {
     /// acquiring another native slot.
     fn commit_current_locked(
         &self,
-        state: &mut EntryState,
+        state: &mut EntryGuard<'_>,
         timed: Option<std::time::Instant>,
     ) -> Result<CommitReceipt, MetalKernelError> {
         self.close_pending_blit(state)?;
-        if let Some(enc) = state.current_encoder.as_ref() {
-            self.end_encoding(enc)?;
-            state.current_encoder.take();
-        }
+        self.close_compute(state)?;
         let t_end_enc = timed.map(|t| t.elapsed());
         state
             .current
@@ -2275,5 +2327,40 @@ impl lifecycle::FinalCore for CommandsCore {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod entry_unwind_tests {
+    use super::{CloseUnwind, CommandBufferFailure, DeferredGuard};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::Arc;
+
+    #[test]
+    fn setup_unwind_latches_failure_and_keeps_staged_owner() {
+        let failure = CommandBufferFailure::default();
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let state = parking_lot::Mutex::new(Some(owner));
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _entry = DeferredGuard::new(state.lock(), ());
+            let _setup = CloseUnwind {
+                failure: &failure,
+                message: "compute encoder setup exited exceptionally; custody retained",
+                buffer: None,
+            };
+            panic!("controlled setup unwind");
+        }))
+        .is_err());
+        assert!(failure
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("compute encoder setup exited exceptionally"));
+        assert!(weak.upgrade().is_some(), "partial setup lost durable owner");
+        assert!(state
+            .try_lock()
+            .expect("setup unwind retained EntryState lock")
+            .is_some());
     }
 }

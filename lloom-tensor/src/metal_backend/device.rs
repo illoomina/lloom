@@ -1451,7 +1451,9 @@ impl MetalDevice {
             .map_err(MetalError::from)?;
         // Bind before any gated variant can be selected (`set_eos_gated`
         // last): an open encoder gets the flag now, later ones at creation.
-        self.commands.bind_eos_gate_current();
+        self.commands
+            .bind_eos_gate_current()
+            .map_err(MetalError::from)?;
         self.kernels.set_eos_gated(true);
         Ok(())
     }

@@ -1,3 +1,6 @@
+#[path = "commands_lifecycle.rs"]
+mod lifecycle;
+
 use crate::current_command::Current;
 use crate::kernels::metal::{
     cache_pad::CachePadded,
@@ -249,7 +252,7 @@ impl EntryState {
 }
 
 pub struct Commands {
-    core: Arc<CommandsCore>,
+    core: lifecycle::OwnedCore<CommandsCore>,
 }
 
 struct CommandsCore {
@@ -695,42 +698,40 @@ impl Commands {
             .map_err(|_| MetalKernelError::QueueUnavailable("host teardown service unavailable"))?
             .wake();
         let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
-        Ok(Self {
-            core: Arc::new(CommandsCore {
-                retirement_wake,
-                encoder_domain,
-                state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(
-                    cb,
-                )))),
-                compute_count: CachePadded::new(AtomicUsize::new(0)),
-                replacement_pending: CachePadded::new(AtomicBool::new(false)),
-                command_queue,
-                modern_queue,
-                legacy_completions,
-                compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
-                pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
-                cut_policy,
-                node_cut_pending: AtomicBool::new(false),
-                device,
-                eos_gate: Arc::new(DispatchGate::new()),
-                encoder_finalizer,
-                residency_set,
-                clock,
-                census: Arc::default(),
-                trace: Arc::default(),
-                on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
-                completion_wait,
-                completion_event,
-                completion_polls: AtomicU64::new(0),
-                completion_signals: AtomicU64::new(0),
-                completion_fires: AtomicU64::new(0),
-                completion_already_complete: AtomicU64::new(0),
-                kind,
-                hold,
-                failure,
-            }),
-        })
+        let core = Arc::new(CommandsCore {
+            retirement_wake,
+            encoder_domain,
+            state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
+            compute_count: CachePadded::new(AtomicUsize::new(0)),
+            replacement_pending: CachePadded::new(AtomicBool::new(false)),
+            command_queue,
+            modern_queue,
+            legacy_completions,
+            compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
+            pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
+            cut_policy,
+            node_cut_pending: AtomicBool::new(false),
+            device,
+            eos_gate: Arc::new(DispatchGate::new()),
+            encoder_finalizer,
+            residency_set,
+            clock,
+            census: Arc::default(),
+            trace: Arc::default(),
+            on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
+            completion_wait,
+            completion_event,
+            completion_polls: AtomicU64::new(0),
+            completion_signals: AtomicU64::new(0),
+            completion_fires: AtomicU64::new(0),
+            completion_already_complete: AtomicU64::new(0),
+            kind,
+            hold,
+            failure,
+        });
+        let core = lifecycle::register(core)?;
+        Ok(Self { core })
     }
 
     /// The command-buffer kind this queue creates.
@@ -1789,51 +1790,67 @@ impl CommandsCore {
             .current
             .submit_marked(&self.replacement_pending, |cb| {
                 self.failure.check()?;
-                if !matches!(
-                    cb.status(),
-                    MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued
-                ) {
-                    return Err(MetalKernelError::CommandBufferError(
-                        "recording command buffer was already submitted outside Commands".into(),
-                    ));
-                }
+                self.check_recording_status(cb)?;
                 // Reserve queue order and native handler allocation before
                 // epoch/signal/subscriber side effects. An unused preparation
                 // consumes no ordered completion sequence.
                 let prepared = cb.prepare_commit()?;
                 self.residency_set.commit_pending();
                 let t_residency = timed.map(|t| t.elapsed());
-                let signalled = self
-                    .completion_wait
-                    .encode_prepared_signal(&prepared, self.completion_event.as_ref())?;
-                if signalled.is_some() {
-                    self.completion_signals.fetch_add(1, Ordering::Relaxed);
-                }
-                crate::kernels::metal::trace::note_command_buffer();
-                let epoch = self.clock.commit_epoch();
-                let clock = Arc::clone(&self.clock);
-                let subs: Vec<_> = self.on_complete.lock().clone();
-                let failure = Arc::clone(&self.failure);
-                prepared.on_completion_of(move |error| {
-                    if let Some(error) = error {
-                        failure.record(error);
-                    }
-                    // Subscribers consume the completed epoch published here.
-                    clock.mark_completed(epoch);
-                    for f in &subs {
-                        f();
-                    }
-                })?;
-                prepared.record_gpu_time_on_completion()?;
-                prepared.commit()?;
-                if let (Some(a), Some(b), Some(c)) =
-                    (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
-                {
-                    crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
-                }
-                Ok(CommitReceipt { epoch, signalled })
+                let subs = self.on_complete.lock().clone();
+                self.submit_prepared(prepared, subs, timed, t_end_enc, t_residency)
             })
             .copied()
+    }
+
+    fn check_recording_status(&self, cb: &CommandBuffer) -> Result<(), MetalKernelError> {
+        if !matches!(
+            cb.status(),
+            MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued
+        ) {
+            return Err(MetalKernelError::CommandBufferError(
+                "recording command buffer was already submitted outside Commands".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Common native handoff for ordinary cuts and final no-replacement submit.
+    /// Residency was published by the caller before this point. All selectable
+    /// completion signals, epoch callbacks and GPU profiling use this one body.
+    fn submit_prepared(
+        &self,
+        prepared: super::command_buffer::PreparedCommandCommit<'_>,
+        subs: Vec<Arc<dyn Fn() + Send + Sync>>,
+        timed: Option<std::time::Instant>,
+        t_end_enc: Option<std::time::Duration>,
+        t_residency: Option<std::time::Duration>,
+    ) -> Result<CommitReceipt, MetalKernelError> {
+        let signalled = self
+            .completion_wait
+            .encode_prepared_signal(&prepared, self.completion_event.as_ref())?;
+        if signalled.is_some() {
+            self.completion_signals.fetch_add(1, Ordering::Relaxed);
+        }
+        crate::kernels::metal::trace::note_command_buffer();
+        let epoch = self.clock.commit_epoch();
+        let clock = Arc::clone(&self.clock);
+        let failure = Arc::clone(&self.failure);
+        prepared.on_completion_of(move |error| {
+            if let Some(error) = error {
+                failure.record(error);
+            }
+            clock.mark_completed(epoch);
+            for f in &subs {
+                f();
+            }
+        })?;
+        prepared.record_gpu_time_on_completion()?;
+        prepared.commit()?;
+        if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, timed.map(|t| t.elapsed())) {
+            crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
+        }
+        Ok(CommitReceipt { epoch, signalled })
     }
 
     fn end_encoding(&self, encoder: &ComputeCommandEncoder) -> Result<(), MetalKernelError> {
@@ -2007,43 +2024,9 @@ fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
     }
 }
 
-impl Drop for Commands {
-    fn drop(&mut self) {
-        let retained = self
-            .core
-            .state
-            .lock(Side::Host)
-            .current
-            .submitted()
-            .map(|(cb, _)| cb.clone());
-        if let Some(cb) = retained {
-            // An already submitted current needs no replacement to be waited.
-            cb.wait_until_completed();
-            return;
-        }
-        let _ = self.flush();
-        // A normal flush may itself fail after submission; retain that tail
-        // as well as the unretained arm's ordinary in-flight owners.
-        let last = {
-            let state = self.core.state.lock(Side::Host);
-            state
-                .current
-                .submitted()
-                .map(|(cb, _)| cb.clone())
-                .or_else(|| {
-                    self.core
-                        .hold
-                        .as_ref()
-                        .and_then(|_| state.in_flight.last().cloned())
-                })
-        };
-        if let Some(cb) = last {
-            if cb.status() != MTLCommandBufferStatus::NotEnqueued {
-                cb.wait_until_completed();
-            }
-        }
-    }
-}
+// Final Drop is TeardownRequest's metadata-only publication. The service owns
+// Core before public construction returns; no synchronous wait or replacement
+// allocation is attempted from an arbitrary final-owner thread.
 
 #[cfg(test)]
 mod failure_latch_tests {
@@ -2107,5 +2090,190 @@ mod failure_latch_tests {
                 assert_eq!(message(&latch), final_message);
             }
         }
+    }
+}
+
+impl lifecycle::FinalCore for CommandsCore {
+    type Captures = lifecycle::FinalCaptures;
+    fn install_retirement_wake(
+        &self,
+        wake: Arc<crate::completion_wake::Wake>,
+    ) -> Result<(), MetalKernelError> {
+        self.residency_set
+            .install_retirement_wake(wake)
+            .map_err(|_| MetalKernelError::QueueUnavailable("foreign residency retirement Wake"))
+    }
+    fn record_teardown_failure(&self) {
+        self.failure
+            .record_static("final command teardown failed; custody retained");
+    }
+    /// Sole lifecycle worker after final Commands handle relinquishes. External
+    /// encoder capabilities retain their domain permit until every wrapper field
+    /// has dropped; no producer is revoked while it may still bind/dispatch.
+    fn poll_final_submission(
+        &self,
+        captures: &mut lifecycle::FinalCaptures,
+    ) -> Result<bool, MetalKernelError> {
+        self.failure.check()?;
+        if self.encoder_domain.has_external_handles() {
+            return Ok(false);
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            // EntryState is privately owned, and all public guards borrow
+            // Commands. No such borrow survives final Commands::drop. Treat a
+            // violated ownership invariant as failure, not an unwakeable park.
+            return Err(MetalKernelError::QueueUnavailable(
+                "final EntryState still borrowed",
+            ));
+        };
+        if state.current.submitted().is_some() {
+            return Ok(true);
+        }
+        if let Some(pending) = state.pending_blit.as_mut() {
+            if pending.error.is_some() {
+                return Err(MetalKernelError::QueueUnavailable(
+                    "retained blit close failure",
+                ));
+            }
+            let _unwind = CloseUnwind {
+                failure: &self.failure,
+                message: "final blit close exited exceptionally; custody retained",
+                buffer: None,
+            };
+            if !pending.encoder.try_end_encoding()? {
+                return Ok(false);
+            }
+            // Keep the closed encoder rooted until all native work is terminal.
+        }
+        if let Some(encoder) = state.current_encoder.as_ref() {
+            if !self.encoder_finalizer.try_end_encoding(encoder)? {
+                return Ok(false);
+            }
+            // Do NOT take/drop the canonical encoder under EntryState.
+        }
+        let subscribers = self
+            .on_complete
+            .try_lock()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "final completion subscribers still borrowed",
+            ))?
+            .clone();
+        let submitted = state
+            .current
+            .submit_marked(&self.replacement_pending, |cb| {
+                self.failure.check()?;
+                self.check_recording_status(cb)?;
+                // Busy returns before residency/epoch/event/callback side effects.
+                let prepared = cb.try_prepare_commit()?;
+                if captures.removals.is_some() {
+                    return Err(MetalKernelError::QueueUnavailable(
+                        "final residency custody already staged",
+                    ));
+                }
+                let (_, removals) =
+                    self.residency_set
+                        .try_commit_pending_extracted()
+                        .map_err(|_| {
+                            MetalKernelError::RecordingAdmission(
+                                crate::command_lifecycle::LifecycleError::Busy,
+                            )
+                        })?;
+                // Empty C was staged before entering this method. Even an unwind
+                // after this transfer leaves the opaque raw+charge payload rooted.
+                captures.removals = Some(removals);
+                self.submit_prepared(prepared, subscribers, None, None, None)
+            });
+        match submitted {
+            Ok(_) => Ok(true),
+            Err(MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            )) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Every retained marker, including submitted current, requires its own
+    /// returned handoff and ordered callback completion. Error/poison is never
+    /// a terminality certificate. The final prefix also covers older pruned CBs.
+    fn poll_final_terminality(&self) -> Result<bool, MetalKernelError> {
+        self.failure.check()?;
+        let state = self
+            .state
+            .try_lock()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "final EntryState still borrowed",
+            ))?;
+        let Some((current, _)) = state.current.submitted() else {
+            return Err(MetalKernelError::QueueUnavailable("final receipt absent"));
+        };
+        if !current.poll_logical_completed()? {
+            return Ok(false);
+        }
+        for cb in &state.in_flight {
+            if !cb.poll_logical_completed()? {
+                return Ok(false);
+            }
+        }
+        self.failure.check()?;
+        Ok(true)
+    }
+
+    /// Move C directly into the independently registered active record. All
+    /// locks are acquired before the first transfer. No arbitrary Drop occurs
+    /// under those locks; A remains in the lifecycle inbox throughout.
+    fn transfer_final_captures(
+        &self,
+        captures: &mut lifecycle::FinalCaptures,
+        empty_executor: &Arc<ExecutorSlot>,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self
+            .state
+            .try_lock()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "final EntryState still borrowed",
+            ))?;
+        let mut executor = self
+            .executor
+            .try_lock()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "final executor still borrowed",
+            ))?;
+        let mut subscribers =
+            self.on_complete
+                .try_lock()
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "final completion subscribers still borrowed",
+                ))?;
+        if self.encoder_domain.has_external_handles()
+            || state
+                .current_encoder
+                .as_ref()
+                .is_some_and(|encoder| !encoder.retirement_closed())
+            || state.pending_blit.as_ref().is_some_and(|pending| {
+                pending.error.is_some() || !pending.encoder.retirement_closed()
+            })
+        {
+            return Err(MetalKernelError::QueueUnavailable(
+                "final encoder is not exclusively closed",
+            ));
+        }
+        // Only one terminal transition calls this method; all destinations are
+        // empty, except removals already retained during final submission.
+        debug_assert!(
+            captures.executor.is_none()
+                && captures.subscribers.is_empty()
+                && captures.encoder_executor.is_none()
+        );
+        captures.executor = Some(std::mem::replace(&mut *executor, empty_executor.clone()));
+        captures.subscribers = std::mem::take(&mut *subscribers);
+        // Inert native wrappers stay in Core. Custom executor captures instead
+        // leave through C while Core remains independently rooted.
+        if let Some(encoder) = state.current_encoder.as_mut() {
+            captures.encoder_executor = Some(std::mem::replace(
+                &mut encoder.executor,
+                empty_executor.clone(),
+            ));
+        }
+        Ok(())
     }
 }

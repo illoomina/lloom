@@ -832,6 +832,16 @@ impl ComputeCommandEncoder {
         self.state.external.load(Ordering::Acquire) != 0
     }
 
+    /// Final Core extraction only; no native access is exposed by this check.
+    pub(super) fn retirement_closed(&self) -> bool {
+        self.external.is_none()
+            && !self.has_external_handles()
+            && self
+                .state
+                .try_lock()
+                .is_some_and(|state| state.close_succeeded)
+    }
+
     pub(super) fn with_finalizer(
         mut self,
         finalizer: Arc<super::commands::EncoderFinalizer>,
@@ -1719,6 +1729,10 @@ impl BlitCommandEncoder {
     pub fn end_encoding(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.end_encoding_mode(false)
     }
+    pub(super) fn retirement_closed(&self) -> bool {
+        self.close_succeeded
+    }
+
     pub(super) fn try_end_encoding(&mut self) -> Result<bool, crate::kernels::MetalKernelError> {
         match self.end_encoding_mode(true) {
             Ok(()) => Ok(true),

@@ -220,7 +220,9 @@ impl Peak {
         self.checked_total().unwrap_or(u64::MAX)
     }
 
-    fn checked_total(&self) -> Option<u64> {
+    /// Exact sum, or None when the rows cannot be represented as u64 bytes.
+    /// Unlike `total`, this is suitable for admission before any override.
+    pub fn checked_total(&self) -> Option<u64> {
         self.rows
             .iter()
             .try_fold(0u64, |sum, (_, b)| sum.checked_add(*b))

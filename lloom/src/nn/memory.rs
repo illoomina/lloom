@@ -10,6 +10,9 @@
 //! readings from outside it, and the ones that found the retention.
 
 use lloom_tensor::machine::{Admitted, Gate, Holding, Peak};
+use lloom_tensor::memory_admission::{
+    process_account, AllocationContext, ModelDomain, PassReservation,
+};
 use lloom_tensor::{Device, Result};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,13 +322,54 @@ pub struct MachineLoad {
     pub prefill_tile: usize,
 }
 
+/// One admitted load's domain and whole-load promise. No producer is implicitly
+/// enrolled: factories/workers must consume `allocations()` explicitly. Issued
+/// tickets outlive finish; untouched demand cancels when the load closes.
+#[must_use = "dropping the load cancels unissued demand"]
+pub struct LoadContext {
+    pass: PassReservation,
+    domain: ModelDomain,
+}
+
+impl LoadContext {
+    fn from_admitted(admitted: Admitted, bytes: usize, quota: Option<usize>) -> Result<Self> {
+        let domain = process_account()
+            .domain(quota, admitted)
+            .map_err(lloom_tensor::Error::wrap)?;
+        let pass = domain.reserve(bytes).map_err(lloom_tensor::Error::wrap)?;
+        Ok(Self { pass, domain })
+    }
+
+    pub fn domain(&self) -> &ModelDomain {
+        &self.domain
+    }
+    pub fn allocations(&self) -> AllocationContext {
+        self.pass.context()
+    }
+
+    /// Close future issuance and cancel unissued demand. Already-issued tickets
+    /// and physical charges retain the same domain independently.
+    pub fn finish(self) -> ModelDomain {
+        let Self { pass, domain } = self;
+        drop(pass);
+        domain
+    }
+}
+
 impl MachineLoad {
-    /// Admit `peak` (with the pools' free-list bound added), print the two
-    /// load lines, and count the reservation on the device's ledger for the
-    /// growth check. Refused with the arithmetic before anything is
-    /// allocated.
-    pub fn admit(&self, device: &Device, peak: Peak) -> Result<Admitted> {
-        let peak = peak.with("pool free lists", pool_bound_bytes(device) as u64);
+    /// Shared gate/log path. Add the exact pool term ONCE and retain its checked
+    /// total for the load promise; neither public route reconstructs that sum.
+    fn admit_unattached(&self, peak: Peak, pool_bound: usize) -> Result<(Admitted, usize)> {
+        let pool_bound = u64::try_from(pool_bound).map_err(lloom_tensor::Error::wrap)?;
+        let peak = peak.with("pool free lists", pool_bound);
+        let total = peak.checked_total().ok_or_else(|| {
+            lloom_tensor::Error::Msg(format!(
+                "machine load peak arithmetic overflow: {}; reduce requested sizes",
+                peak.describe()
+            ))
+        })?;
+        let bytes = usize::try_from(total).map_err(lloom_tensor::Error::wrap)?;
+        // Even gate-off must not make an unrepresentable allocation possible.
         let t = std::time::Instant::now();
         let admitted = self.gate.admit(&self.label, &peak)?;
         eprintln!(
@@ -335,13 +379,35 @@ impl MachineLoad {
             t.elapsed().as_secs_f64() * 1e6
         );
         eprintln!("{}", admitted.line());
-        if let (Some(h), Some(v)) = (&admitted.holding, &admitted.verdict) {
+        if let (Some(_), Some(v)) = (&admitted.holding, &admitted.verdict) {
             if v.forced {
                 eprintln!("[machine: {}]", v.describe().replace('\n', "\n  "));
             }
+        }
+        Ok((admitted, bytes))
+    }
+
+    /// Legacy route: preserves device-ledger attachment and visible policy
+    /// logging. Checked augmented geometry precedes the gate, including off.
+    pub fn admit(&self, device: &Device, peak: Peak) -> Result<Admitted> {
+        let (admitted, _) = self.admit_unattached(peak, pool_bound_bytes(device))?;
+        if let (Some(h), Some(_)) = (&admitted.holding, &admitted.verdict) {
             attach(device, h);
         }
         Ok(admitted)
+    }
+
+    /// Additive admitted ownership route: one domain, one load promise, no
+    /// legacy weak-list attachment. Configure process policy before first use.
+    /// Native/family/worker allocation paths are NOT implicitly migrated.
+    pub fn admit_context(
+        &self,
+        device: &Device,
+        peak: Peak,
+        quota: Option<usize>,
+    ) -> Result<LoadContext> {
+        let (admitted, bytes) = self.admit_unattached(peak, pool_bound_bytes(device))?;
+        LoadContext::from_admitted(admitted, bytes, quota)
     }
 }
 
@@ -364,4 +430,89 @@ pub fn pool_bound_bytes(device: &Device) -> usize {
     }
     let _ = device;
     0
+}
+
+#[cfg(test)]
+mod load_context_tests {
+    use super::*;
+    use lloom_tensor::machine::GateConfig;
+    use lloom_tensor::memory_admission::{AccountSnapshot, AdmissionError, MachineStatus};
+
+    fn off() -> MachineLoad {
+        MachineLoad {
+            gate: Gate::new(GateConfig {
+                off: true,
+                ..Default::default()
+            }),
+            label: "numeric-load-context".into(),
+            rows: 1,
+            kv_tokens: 1,
+            prefill_tile: 1,
+        }
+    }
+
+    #[test]
+    fn numeric_gate_off_still_refuses_overflow_before_admission() {
+        let peak = Peak::new().with("a", u64::MAX).with("b", 1);
+        assert_eq!(peak.checked_total(), None);
+        assert!(off()
+            .admit_context(&Device::Cpu, peak.clone(), None)
+            .is_err());
+        assert!(off().admit(&Device::Cpu, peak).is_err());
+        assert!(off()
+            .admit_unattached(Peak::new().with("a", u64::MAX), 1)
+            .is_err());
+        #[cfg(target_pointer_width = "32")]
+        assert!(off()
+            .admit_context(&Device::Cpu, Peak::new().with("a", u64::MAX), None)
+            .is_err());
+    }
+
+    #[test]
+    fn numeric_pool_inclusive_promise_finish_and_issued_ticket() {
+        // The actual helper used by both public routes; injected pool=5 keeps
+        // this CPU-only while checking that the returned total includes it once.
+        let (admitted, bytes) = off()
+            .admit_unattached(Peak::new().with("weights", 7), 5)
+            .unwrap();
+        assert_eq!(bytes, 12);
+        let load = LoadContext::from_admitted(admitted, bytes, Some(16)).unwrap();
+        assert!(matches!(load.domain().machine_status(), MachineStatus::Off));
+        assert_eq!(
+            load.domain().snapshot(),
+            AccountSnapshot {
+                pending: 12,
+                committed: 0
+            }
+        );
+        let context = load.allocations();
+        let ticket = context.take(8).unwrap();
+        let domain = load.finish();
+        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 8,
+                committed: 0
+            }
+        );
+        let charge = ticket.commit(3).unwrap();
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 3
+            }
+        );
+        drop(charge);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+        let load = off()
+            .admit_context(&Device::Cpu, Peak::new().with("weights", 4), Some(4))
+            .unwrap();
+        let context = load.allocations();
+        let domain = load.domain().clone();
+        drop(load);
+        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
 }

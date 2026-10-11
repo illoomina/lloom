@@ -89,6 +89,21 @@ impl HostRetirementService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn manual() -> Arc<Self> {
+        Arc::new(Self {
+            registry: Mutex::new(Vec::new()),
+            wake: Arc::new(Wake::default()),
+            failure: FailureSignal::default(),
+            panic_payloads: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_pass(&self) -> bool {
+        self.pass()
+    }
+
     pub(crate) fn wake(&self) -> Arc<Wake> {
         self.wake.clone()
     }

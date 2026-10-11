@@ -62,6 +62,18 @@ impl Queue {
         }))
     }
 
+    pub(super) fn return_retirement_slot(&self, slot: Slot) -> Result<(), Slot> {
+        self.available.push(slot)?;
+        self.ready.notify();
+        Ok(())
+    }
+
+    pub(super) fn discard_retirement_slot(&self, slot: Slot) {
+        drop(slot);
+        self.allocated.fetch_sub(1, Ordering::AcqRel);
+        self.ready.notify();
+    }
+
     pub fn attach_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
         assert!(
             self.ledger.set(ledger).is_ok(),
@@ -130,7 +142,7 @@ impl Drop for Queue {
     }
 }
 
-struct Slot {
+pub(super) struct Slot {
     front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -391,6 +403,32 @@ impl Submission {
         );
         self.queue.ready.notify();
     }
+    pub(super) fn publish_retirement_feedback(&self, feedback: &Feedback) {
+        let failed = feedback.error.is_some();
+        assert!(
+            self.feedback
+                .set(Feedback {
+                    error: feedback.error.clone(),
+                    start: feedback.start,
+                    end: feedback.end,
+                })
+                .is_ok(),
+            "completion once"
+        );
+        self.status.store(
+            if failed {
+                MTLCommandBufferStatus::Error.0
+            } else {
+                MTLCommandBufferStatus::Completed.0
+            },
+            Ordering::Release,
+        );
+    }
+
+    pub(super) fn notify_retirement_callbacks_finished(&self) {
+        self.done.notify();
+    }
+
     pub fn wait(&self) {
         loop {
             let seen = self.done.snapshot();

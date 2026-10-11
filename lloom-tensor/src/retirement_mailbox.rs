@@ -327,6 +327,38 @@ impl<T, F> OwnerMailbox<T, F> {
         self.take(ticket)
     }
 
+    /// Host cleanup observes only an already published cleanup phase. The
+    /// generation remains checked again by try_detach_cleanup.
+    pub(crate) fn cleanup_ticket(&self) -> Option<Ticket> {
+        let state = self.state.load(Ordering::Acquire);
+        (state & PHASE_MASK == Phase::CleanupReady as u64).then_some(Ticket {
+            mailbox: self.identity,
+            generation: state >> GENERATION_SHIFT,
+        })
+    }
+
+    /// A registration that never began native handoff has no GPU dependency.
+    /// Publish it for host destruction rather than dropping arbitrary captures
+    /// while the producer still owns its recording mutex.
+    pub(crate) fn publish_cancelled(&self, ticket: Ticket) -> Result<(), MailboxError> {
+        loop {
+            let state = self.state_for(ticket)?;
+            if state & PHASE_MASK != Phase::Prepared as u64 {
+                return Err(MailboxError::WrongPhase);
+            }
+            let next =
+                (state & !PHASE_MASK) | Phase::CleanupReady as u64 | RETURNED | SLOT_RETURNED;
+            if self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.wake.notify();
+                return Ok(());
+            }
+        }
+    }
+
     pub fn cancel_prepared(&self, ticket: Ticket) -> Result<Detached<T, F>, MailboxError> {
         self.transition(ticket, Phase::Prepared, Phase::Taking, 0)?;
         self.take(ticket)

@@ -95,6 +95,7 @@ pub mod io_queue;
 pub mod ledger;
 mod metal4;
 mod raw_encoder;
+mod retirement;
 /// The paged KV pool: allocation, free list, refcounts and the page table
 /// (`DESIGN.md` §10.3c–§10.3g, issue #148). Pure functions of a configuration
 /// and an allocation history — no device, no buffer, no dispatch — which is the

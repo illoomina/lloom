@@ -120,6 +120,8 @@ pub mod retire;
 mod retirement_mailbox;
 mod retirement_owners;
 #[cfg(any(feature = "metal", test))]
+mod retirement_registry;
+#[cfg(any(feature = "metal", test))]
 mod retirement_service;
 pub mod safetensors;
 pub mod scalar;

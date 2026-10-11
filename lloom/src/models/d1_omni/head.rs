@@ -1,0 +1,203 @@
+use crate::models::siglip::{Attention, Encoder, EncoderLayer, Mlp};
+use crate::nn::{
+    embedding, layer_norm, linear, Activation, Embedding, LayerNorm, Linear, VarBuilder,
+};
+use lloom_tensor::{DType, Module, Result, Tensor};
+
+/// Prepared, right-padded text rows and option markers for one head invocation.
+/// Mask backing is B*L, not B*H*L*L. Marker indices are B*options, not B*options*D.
+#[derive(Debug)]
+pub struct DecisionHeadBatch {
+    batch: usize,
+    length: usize,
+    width: usize,
+    options: usize,
+    qtypes: Tensor,
+    key_mask: Tensor,
+    marker_rows: Tensor,
+    marker_valid: Tensor,
+    missing_logits: Tensor,
+}
+
+/// Question-type embedding, pre-norm transformer stack and shared marker scorer.
+/// Loads the Python DecisionHead checkpoint namespace (pass its prefix in `vb`).
+#[derive(Debug, Clone)]
+pub struct DecisionHead {
+    width: usize,
+    type_embedding: Embedding,
+    encoder: Encoder,
+    scorer_norm: LayerNorm,
+    scorer_hidden: Linear,
+    scorer_output: Linear,
+}
+
+impl DecisionHead {
+    pub fn load(width: usize, layers: usize, vb: VarBuilder) -> Result<Self> {
+        let heads = width / 64;
+        if heads == 0 || width % heads != 0 {
+            lloom_tensor::bail!("decision head width must be divisible by its width/64 heads")
+        }
+        if !matches!(
+            vb.dtype(),
+            DType::F16 | DType::BF16 | DType::F32 | DType::F64
+        ) {
+            lloom_tensor::bail!("decision head requires floating-point weights")
+        }
+        let packed = width
+            .checked_mul(3)
+            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
+        let intermediate = width
+            .checked_mul(4)
+            .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
+        let type_embedding = embedding(3, width, vb.pp("type_emb"))?;
+        let mut stack = Vec::with_capacity(layers);
+        for i in 0..layers {
+            let layer = vb.pp("head.layers").pp(i);
+            let attn = layer.pp("self_attn");
+            let w = attn.get((packed, width), "in_proj_weight")?;
+            let b = attn.get(packed, "in_proj_bias")?;
+            let projection = |part| -> Result<Linear> {
+                Ok(Linear::new(
+                    w.narrow(0, part * width, width)?,
+                    Some(b.narrow(0, part * width, width)?),
+                ))
+            };
+            let attention = Attention::from_projections(
+                projection(0)?,
+                projection(1)?,
+                projection(2)?,
+                linear(width, width, attn.pp("out_proj"))?,
+                heads,
+            )?;
+            stack.push(EncoderLayer::from_parts(
+                attention,
+                layer_norm(width, 1e-5, layer.pp("norm1"))?,
+                Mlp::from_parts(
+                    linear(width, intermediate, layer.pp("linear1"))?,
+                    linear(intermediate, width, layer.pp("linear2"))?,
+                    Activation::Relu,
+                ),
+                layer_norm(width, 1e-5, layer.pp("norm2"))?,
+            ));
+        }
+        Ok(Self {
+            width,
+            type_embedding,
+            encoder: Encoder::from_layers(stack),
+            scorer_norm: layer_norm(width, 1e-5, vb.pp("scorer.0"))?,
+            scorer_hidden: linear(width, width, vb.pp("scorer.1"))?,
+            scorer_output: linear(width, 1, vb.pp("scorer.3"))?,
+        })
+    }
+
+    /// Validate host metadata before device indexing. Each row has at least one
+    /// real token and marker; marker positions refer only to real text tokens.
+    /// Question types use the checkpoint's 0/1/2 embedding order, not labels.
+    pub fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        markers: &[&[usize]],
+        qtypes: &[u32],
+    ) -> Result<DecisionHeadBatch> {
+        let batch = lengths.len();
+        if batch == 0 || length == 0 || markers.len() != batch || qtypes.len() != batch {
+            lloom_tensor::bail!("decision head requires matching nonempty batch metadata")
+        }
+        let rows = batch
+            .checked_mul(length)
+            .ok_or_else(|| lloom_tensor::Error::Msg("decision head batch overflow".into()))?;
+        if rows > u32::MAX as usize
+            || lengths.iter().any(|&n| n == 0 || n > length)
+            || qtypes.iter().any(|&q| q >= 3)
+        {
+            lloom_tensor::bail!("decision head invalid lengths, question types or row-index range")
+        }
+        let options = markers.iter().map(|row| row.len()).max().unwrap_or(0);
+        if markers
+            .iter()
+            .zip(lengths)
+            .any(|(row, &n)| row.is_empty() || row.iter().any(|&p| p >= n))
+        {
+            lloom_tensor::bail!("decision head markers must index real tokens in every row")
+        }
+        let count = batch.checked_mul(options).ok_or_else(|| {
+            lloom_tensor::Error::Msg("decision head marker count overflow".into())
+        })?;
+        let mut mask = Vec::with_capacity(rows);
+        let mut indices = Vec::with_capacity(count);
+        let mut valid = Vec::with_capacity(count);
+        for (row, (&n, positions)) in lengths.iter().zip(markers).enumerate() {
+            mask.extend((0..length).map(|p| if p < n { 0f32 } else { f32::NEG_INFINITY }));
+            for option in 0..options {
+                let position = positions.get(option);
+                indices.push((row * length + position.copied().unwrap_or(0)) as u32);
+                valid.push(u8::from(position.is_some()));
+            }
+        }
+        let weights = self.type_embedding.embeddings();
+        let device = weights.device();
+        Ok(DecisionHeadBatch {
+            batch,
+            length,
+            width: self.width,
+            options,
+            qtypes: Tensor::from_slice(qtypes, batch, device)?,
+            key_mask: Tensor::from_vec(mask, (batch, 1, 1, length), device)?
+                .to_dtype(weights.dtype())?,
+            marker_rows: Tensor::from_vec(indices, count, device)?,
+            marker_valid: Tensor::from_vec(valid, (batch, options), device)?,
+            missing_logits: Tensor::full(-1e4f32, (batch, options), device)?,
+        })
+    }
+
+    /// Score text hidden states [B,L,D], returning F32 [B,options] logits.
+    /// Missing padded options are -1e4, after scoring and F32 conversion.
+    /// The callback receives the compact additive key mask [B,1,1,L]; it must
+    /// apply that mask without introducing causality. No attention fallback is
+    /// selected here. Calibration and semantic option ordering belong to readout.
+    pub fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &DecisionHeadBatch,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        let weights = self.type_embedding.embeddings();
+        if hidden.dims() != [batch.batch, batch.length, self.width]
+            || batch.width != self.width
+            || hidden.dtype() != weights.dtype()
+            || batch.key_mask.dtype() != weights.dtype()
+            || !hidden.device().same_device(weights.device())
+            || !batch.key_mask.device().same_device(weights.device())
+        {
+            lloom_tensor::bail!(
+                "decision head input and prepared batch must match weight shape, dtype and device"
+            )
+        }
+        let typed =
+            hidden.broadcast_add(&self.type_embedding.forward(&batch.qtypes)?.unsqueeze(1)?)?;
+        let encoded = self
+            .encoder
+            .forward_with_attention(&typed, Some(&batch.key_mask), attend)?;
+        let selected = encoded
+            .reshape((batch.batch * batch.length, self.width))?
+            .index_select(&batch.marker_rows, 0)?
+            .reshape((batch.batch, batch.options, self.width))?;
+        let logits = selected
+            .apply(&self.scorer_norm)?
+            .apply(&self.scorer_hidden)?
+            .apply(&Activation::Gelu)?
+            .apply(&self.scorer_output)?
+            .squeeze(2)?
+            .to_dtype(DType::F32)?;
+        batch
+            .marker_valid
+            .where_cond(&logits, &batch.missing_logits)
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -28,6 +28,7 @@ pub mod colpali;
 pub mod convmixer;
 pub mod convnext;
 pub mod csm;
+pub mod d1_omni;
 pub mod dac;
 pub mod debertav2;
 pub mod deepseek2;

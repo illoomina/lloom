@@ -324,11 +324,37 @@ impl Model {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_content(&ct, reader, device)
+    }
+
+    /// Borrow the already-read header so an app factory can resolve its text
+    /// metadata after complete model preflight/materialization, without a
+    /// second parse or a second weight schema. The incumbent owned entry stays.
+    pub fn from_gguf_content<R: std::io::Seek + std::io::Read>(
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::preflight_gguf_content(ct, reader)?.materialize(reader, device)
+    }
+
+    /// Resolve complete demands and file extents once, without model tensors.
+    /// An app factory can then validate tokenizer/policy before consuming this
+    /// exact plan. Header/plan host storage still requires caller admission.
+    /// The caller must materialize from the same unchanged backing content;
+    /// this plan binds demands/header, not reader identity or a file snapshot.
+    pub fn preflight_gguf_content<'a, R: std::io::Seek>(
+        ct: &'a gguf_file::Content,
+        reader: &mut R,
+    ) -> Result<GgufPlan<'a>> {
         use crate::nn::gguf_weights::WeightPlan;
-        let plan = weights::Lfm2Weights::resolve(&ct)?;
-        plan.validate_headers(&ct)?;
+        let weights = weights::Lfm2Weights::resolve(ct)?;
+        weights.validate_headers(ct)?;
         ct.validate_payloads(reader)?;
-        Self::from_gguf_plan(plan, &ct, reader, device)
+        Ok(GgufPlan {
+            content: ct,
+            weights,
+        })
     }
 
     fn from_gguf_plan<R: std::io::Seek + std::io::Read>(
@@ -505,6 +531,32 @@ impl Model {
     }
 }
 
+/// Resolved, validated demand plan over one immutably borrowed header.
+/// Fields are private: a consumer cannot swap the schema/header after preflight.
+/// Materialization consumes it once; no duplicate factory weight schema exists.
+/// The caller supplies the same unchanged backing content during materialization;
+/// reader identity and file contents are not snapshotted by this demand plan.
+pub struct GgufPlan<'a> {
+    content: &'a gguf_file::Content,
+    weights: weights::Lfm2Weights,
+}
+impl GgufPlan<'_> {
+    pub fn config(&self) -> Config {
+        Config {
+            context_length: self.weights.context,
+            hidden_size: self.weights.width,
+            vocab_size: self.weights.vocab,
+        }
+    }
+    pub fn materialize<R: std::io::Read + std::io::Seek>(
+        self,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Model> {
+        Model::from_gguf_plan(self.weights, self.content, reader, device)
+    }
+}
+
 /// Runtime limits resolved from the actual GGUF header; no inverse FFN guess.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -662,3 +714,18 @@ mod tests;
 
 #[cfg(test)]
 mod weight_plan_tests;
+
+// The generic generation driver may recover by resetting this sequence, but
+// cannot roll back its recurrent channels. RetainState remains the separate
+// decision-branch mechanism; declaring horizon zero does not remove it.
+impl crate::nn::CacheRewind for Cache {
+    fn rewind_horizon(&self) -> usize {
+        0
+    }
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        if n != 0 {
+            bail!("quantized lfm2 has no standing rewind window")
+        }
+        Ok(())
+    }
+}

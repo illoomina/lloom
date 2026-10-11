@@ -193,13 +193,23 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     .into();
                 // The thinking budget's markers, as the template writes them.
                 let engine = shared.engine.as_ref();
-                body["reasoning_tags"] = engine.think_tags().map_or(Value::Null, |t| {
-                    json!({
-                        "start": engine.token_str(t.start),
-                        "end": engine.token_str(t.end),
-                        "tool_call": t.tool_call.map(|id| engine.token_str(id)),
+                let tags: Result<Value> = (|| {
+                    Ok(match engine.think_tags() {
+                        Some(t) => json!({
+                            "start": engine.token_str_checked(t.start)?,
+                            "end": engine.token_str_checked(t.end)?,
+                            "tool_call": t.tool_call.map(|id| engine.token_str_checked(id)).transpose()?,
+                        }),
+                        None => Value::Null,
                     })
-                });
+                })();
+                match tags {
+                    Ok(tags) => body["reasoning_tags"] = tags,
+                    Err(error) => {
+                        let _ = respond_error(request, 500, &format!("{error:#}"));
+                        continue;
+                    }
+                }
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Get, "/v1/models") => {
@@ -638,7 +648,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         };
         let (argmax, all) = engine.next_token_logprobs(&prompt_ids, want)?;
         let top = &all[..top_k.min(all.len())];
-        let content = engine.token_str(argmax);
+        let content = engine.token_str_checked(argmax)?;
         let token_lp = top
             .iter()
             .find(|(t, _)| *t == argmax)
@@ -646,8 +656,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             .unwrap_or(f32::NEG_INFINITY);
         let top_entries: Vec<Value> = top
             .iter()
-            .map(|(t, lp)| json!({ "token": engine.token_str(*t), "logprob": lp }))
-            .collect();
+            .map(|(t, lp)| Ok(json!({ "token": engine.token_str_checked(*t)?, "logprob": lp })))
+            .collect::<Result<_>>()?;
         let decision = if options.is_empty() {
             Value::Null
         } else {
@@ -669,7 +679,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 }
                 scored.push(json!({
                     "text": text,
-                    "token": engine.token_str(first),
+                    "token": engine.token_str_checked(first)?,
                     "token_id": first,
                     "tokens": ids.len(),
                     "logprob": lp,
@@ -1259,8 +1269,8 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
-        .map(|r| engine.seed_prompt_row(prompt_tokens, r))
-        .collect();
+        .map(|r| engine.seed_prompt_row_checked(prompt_tokens, r))
+        .collect::<Result<_>>()?;
     let decoded = concurrent_rows(shared, prompts, &params)?;
     let completion: usize = decoded.iter().map(|d| d.tokens.len()).sum();
     eprintln!(
@@ -1472,7 +1482,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                                 )
                             })?;
                         if think.by == thinking::By::Engine {
-                            prompt.push_str(&engine.token_str(ids[ids.len() - 1]));
+                            prompt.push_str(&engine.token_str_checked(ids[ids.len() - 1])?);
                         }
                         sw.event_line(&json!({
                             "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
@@ -2308,8 +2318,12 @@ pub fn bench(args: BenchArgs) -> Result<()> {
                 Cell::EndToEnd { p, d } => {
                     // The seed tiled to `p` tokens, as text: what the sidecar
                     // posts as `prompt`.
-                    let ids = shared.engine.seed_prompt_row(*p, 0);
-                    let prompt: String = ids.iter().map(|&t| shared.engine.token_str(t)).collect();
+                    let ids = shared.engine.seed_prompt_row_checked(*p, 0)?;
+                    let prompt: String = ids
+                        .iter()
+                        .map(|&t| shared.engine.token_str_checked(t))
+                        .collect::<Result<Vec<_>>>()?
+                        .concat();
                     end_to_end_latency(
                         &shared,
                         &json!({ "prompt": prompt, "decode_tokens": d, "batch": batch }),

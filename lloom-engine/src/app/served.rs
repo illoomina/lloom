@@ -74,6 +74,11 @@ pub trait Served: Send + Sync {
 
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;
+    /// Fallible request seam for admitted adapters; existing families preserve
+    /// their incumbent behavior through this compatibility default.
+    fn token_str_checked(&self, id: u32) -> Result<String> {
+        Ok(self.token_str(id))
+    }
     /// Render `messages` through the checkpoint's own chat template with the
     /// generation prompt appended, `kwargs` laid over its variables and each
     /// of `checked` tested against it (`template::Template::render_checked`).
@@ -115,6 +120,10 @@ pub trait Served: Send + Sync {
     }
     /// The benchmark seed tiled to `n` ids, `row` seed tokens in.
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32>;
+    /// Admission refusal must not masquerade as successful empty prompt data.
+    fn seed_prompt_row_checked(&self, n: usize, row: usize) -> Result<Vec<u32>> {
+        Ok(self.seed_prompt_row(n, row))
+    }
 
     /// One decode over the whole token sequence, streaming fragments; the
     /// hook's `false` ends the run (`Stop::Cancelled`).

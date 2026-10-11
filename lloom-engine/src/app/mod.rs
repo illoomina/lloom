@@ -7,6 +7,7 @@
 //! binary name for the pipette runner and is `lloom serve` verbatim.
 
 pub mod budgets;
+pub mod causal_loaded;
 pub mod chat;
 pub mod common;
 pub mod family;

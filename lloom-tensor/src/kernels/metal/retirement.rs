@@ -39,7 +39,7 @@ pub(super) type Metal3Anchor = crate::host_anchor::HostAnchorPermit<(), Metal3Ra
 /// Raw native lifetime ends before its corresponding physical accounting owner.
 pub(super) struct Metal3RawOwners {
     pub raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    pub physical: Option<Arc<dyn Send + Sync>>,
+    pub physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     // LAST: original raw retain releases before metadata capability publication.
     pub namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
@@ -49,7 +49,7 @@ unsafe impl Sync for Metal3RawOwners {}
 
 pub(super) struct NativeOwners {
     backend: NativeBackend,
-    physical: Option<Arc<dyn Send + Sync>>,
+    physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 enum NativeBackend {
     Vacant,
@@ -84,7 +84,7 @@ impl NativeOwners {
     pub fn metal4(
         slot: metal4::Slot,
         submission: Arc<metal4::Submission>,
-        physical: Option<Arc<dyn Send + Sync>>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Self {
         submission.install_native_slot(slot);
         Self {
@@ -103,7 +103,7 @@ impl NativeOwners {
         slot: metal4::Slot,
         queue: Arc<metal4::Queue>,
         signals: Vec<metal4::EventBoundary>,
-        physical: Option<Arc<dyn Send + Sync>>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Self {
         Self {
             backend: NativeBackend::Metal4 {

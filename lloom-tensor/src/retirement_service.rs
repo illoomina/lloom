@@ -602,18 +602,26 @@ impl<C, A> ActiveRetirement<C, A> {
     }
 }
 
-/// One setup-time anchor shared by submit-capable engine wrappers. It is NOT
+/// One typed setup-time anchor shared by submit-capable engine wrappers. It is NOT
 /// captured by native blocks or retained by an idle Inbox; only rooted payloads
 /// clone its owner across native handoff. Standalone raw wrappers may omit it.
-#[derive(Default)]
-pub(crate) struct PhysicalAnchor {
-    owner: OnceLock<Arc<dyn Send + Sync>>,
+pub(crate) struct PhysicalAnchor<T> {
+    owner: OnceLock<T>,
 }
-impl PhysicalAnchor {
-    pub(crate) fn install(&self, owner: Arc<dyn Send + Sync>) -> Result<(), Arc<dyn Send + Sync>> {
+impl<T> Default for PhysicalAnchor<T> {
+    fn default() -> Self {
+        Self {
+            owner: OnceLock::new(),
+        }
+    }
+}
+impl<T> PhysicalAnchor<T> {
+    pub(crate) fn install(&self, owner: T) -> Result<(), T> {
         self.owner.set(owner)
     }
-    pub(crate) fn owner(&self) -> Option<Arc<dyn Send + Sync>> {
+}
+impl<T: Clone> PhysicalAnchor<T> {
+    pub(crate) fn owner(&self) -> Option<T> {
         self.owner.get().cloned()
     }
 }

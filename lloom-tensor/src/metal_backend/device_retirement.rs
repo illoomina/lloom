@@ -91,9 +91,6 @@ impl NamespaceOwner {
     pub(crate) fn remember(&self, memo: &mut NamespaceMemo) {
         memo.0.remember(&self.0);
     }
-    fn erased(&self) -> Arc<dyn Send + Sync> {
-        self.0.clone()
-    }
 }
 
 // Production and scalar controls share the actual C/A registration boundary.
@@ -153,8 +150,8 @@ impl DeviceTeardown {
     pub(crate) fn namespace_owner(&self) -> NamespaceOwner {
         self.owner.clone()
     }
-    pub(crate) fn physical_owner(&self) -> Arc<dyn Send + Sync> {
-        self.owner.erased()
+    pub(crate) fn physical_owner(&self) -> NamespaceOwner {
+        self.owner.clone()
     }
     pub(crate) fn handles(self: &Arc<Self>) -> usize {
         Arc::strong_count(self)

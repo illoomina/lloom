@@ -469,7 +469,7 @@ impl AssociatedBuffer {
     pub(super) fn new(
         raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
         core: Arc<Completions>,
-        physical: Option<Arc<dyn Send + Sync>>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         let anchor = core
             .raw_owners
@@ -590,7 +590,7 @@ impl AssociatedBuffer {
     /// not just the wrapper, before any recording capability escapes.
     pub(super) fn attach_physical_owner(
         &self,
-        owner: Arc<dyn Send + Sync>,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
     ) -> Result<(), crate::kernels::MetalKernelError> {
         match self.anchor.edit(owner, |_, roots, input| {
             if roots.physical.is_some() {

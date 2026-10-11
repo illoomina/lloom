@@ -459,7 +459,7 @@ impl CommandBuffer {
 
     pub(crate) fn attach_physical_owner(
         &self,
-        owner: Arc<dyn Send + Sync>,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
     ) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.backend {
             Backend::Metal3Associated(buffer) => buffer.attach_physical_owner(owner),
@@ -485,7 +485,7 @@ impl CommandBuffer {
     pub(super) fn associate_metal3(
         self,
         core: Arc<super::metal3_retirement::Completions>,
-        physical: Option<Arc<dyn Send + Sync>>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         match self.backend {
             Backend::Metal3(shared) => match Arc::try_unwrap(shared) {

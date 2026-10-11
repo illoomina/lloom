@@ -64,7 +64,9 @@ pub(crate) struct Queue {
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
     // LAST: raw/available slots disappear before final capability publication.
-    physical: crate::retirement_service::PhysicalAnchor,
+    physical: crate::retirement_service::PhysicalAnchor<
+        crate::metal_backend::device_retirement::NamespaceOwner,
+    >,
 }
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
@@ -106,7 +108,7 @@ impl Queue {
 
     pub(super) fn attach_physical_owner(
         &self,
-        owner: Arc<dyn Send + Sync>,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
     ) -> Result<(), MetalKernelError> {
         self.physical.install(owner).map_err(|owner| {
             crate::kernels::err::CompletionRegistrationError::new(

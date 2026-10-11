@@ -472,7 +472,9 @@ struct CommandsCore {
     /// handler so every later commit and wait reports it.
     failure: Arc<CommandBufferFailure>,
     // LAST: native wrapper fields release before this submit-capability pin.
-    physical: crate::retirement_service::PhysicalAnchor,
+    physical: crate::retirement_service::PhysicalAnchor<
+        crate::metal_backend::device_retirement::NamespaceOwner,
+    >,
 }
 
 /// A command buffer of this queue ended in error.
@@ -801,7 +803,7 @@ impl Commands {
     /// independently registered owner must not retain Commands/modern Queue.
     pub(crate) fn attach_physical_owner(
         &self,
-        owner: Arc<dyn Send + Sync>,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
     ) -> Result<(), MetalKernelError> {
         let state = self.lock_state()?;
         state

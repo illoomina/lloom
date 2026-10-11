@@ -70,7 +70,7 @@ use libafl_bolts::{
 };
 use libafl_targets::{std_edges_map_observer, EDGES_MAP_DEFAULT_SIZE, MAX_EDGES_FOUND};
 
-use crate::record::{replay, Record};
+use crate::record::{replay_with_identity, Record};
 
 /// Points in the shape map. Sized for the probes' `(site, condition,
 /// outcome)` triples and the census labels with room to spare; a
@@ -188,6 +188,10 @@ pub struct Cli {
     /// Replay a record directory (or one input) in order in this process.
     #[arg(long)]
     pub replay: Option<PathBuf>,
+    /// Diagnose an old record with a different build/configuration. This does
+    /// not certify exact replay and never bypasses format/size/completion checks.
+    #[arg(long, requires = "replay")]
+    pub replay_unchecked_identity: bool,
     /// Print the instrumentation readout (guards, map size) and exit.
     #[arg(long)]
     pub instrumentation: bool,
@@ -240,6 +244,21 @@ pub fn run<H>(cli: &Cli, name: &str, harness: H) -> anyhow::Result<()>
 where
     H: FnMut(&[u8]) -> Result<(), String> + 'static,
 {
+    run_with_config(cli, name, &serde_json::Value::Null, harness)
+}
+
+/// Targets with extra options provide their explicit configuration here. It is
+/// compared before replay; directories/log destinations are not target inputs.
+/// Environment/driver/hardware and actual schedules remain separate obligations.
+pub fn run_with_config<H>(
+    cli: &Cli,
+    name: &str,
+    target_config: &serde_json::Value,
+    harness: H,
+) -> anyhow::Result<()>
+where
+    H: FnMut(&[u8]) -> Result<(), String> + 'static,
+{
     if cli.max_len > crate::record::MAX_INPUT {
         return Err(anyhow!(
             "--max-len {} exceeds persistent record capacity {}",
@@ -247,7 +266,9 @@ where
             crate::record::MAX_INPUT
         ));
     }
-    let record = Record::install(&cli.record_dir, cli.record);
+    let identity =
+        crate::record::identity::campaign(name, arm(), cli.timeout_ms, cli.max_len, target_config)?;
+    let record = Record::install_with_identity(&cli.record_dir, cli.record, identity.clone())?;
     banner(name)?;
     let (guards, map) = instrumentation();
     if cli.instrumentation {
@@ -292,12 +313,17 @@ where
     }
     if let Some(path) = &cli.replay {
         let h = Rc::clone(&harness);
-        return match replay(path, move |bytes| {
-            record
-                .push(bytes)
-                .map_err(|e| format!("recorder failure: {e}"))?;
-            (h.borrow_mut())(bytes)
-        }) {
+        return match replay_with_identity(
+            path,
+            Some(&identity),
+            cli.replay_unchecked_identity,
+            move |bytes| {
+                record
+                    .push(bytes)
+                    .map_err(|e| format!("recorder failure: {e}"))?;
+                (h.borrow_mut())(bytes)
+            },
+        ) {
             Ok(n) => {
                 println!("replayed {n} input(s) from {}: all clean", path.display());
                 Ok(())

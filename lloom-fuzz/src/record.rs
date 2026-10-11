@@ -40,6 +40,7 @@
 //! composition remain separate obligations: the current dump still allocates.
 
 mod archive;
+pub(crate) mod identity;
 pub(crate) use archive::read_single;
 mod inputs;
 mod signals;
@@ -60,6 +61,7 @@ struct Ring {
     dir: PathBuf,
     dumps: AtomicUsize,
     dumping: AtomicBool,
+    identity: Option<Vec<u8>>,
 }
 
 static RING: std::sync::OnceLock<Ring> = std::sync::OnceLock::new();
@@ -86,9 +88,42 @@ impl Record {
                 dir: dir.to_path_buf(),
                 dumps: AtomicUsize::new(0),
                 dumping: AtomicBool::new(false),
+                identity: None,
             }
         });
         Record
+    }
+
+    /// Install an identified campaign. Unlike the legacy first-wins API, a
+    /// different second identity/size/path is an error before target execution.
+    pub fn install_with_identity(
+        dir: &Path,
+        n: usize,
+        identity: Vec<u8>,
+    ) -> std::io::Result<Record> {
+        if identity.is_empty() || identity.len() > archive::MAX_IDENTITY {
+            return Err(std::io::Error::other(
+                "record identity is empty or exceeds its bound",
+            ));
+        }
+        std::fs::create_dir_all(dir)?;
+        let n = n.max(1);
+        let ring = RING.get_or_init(|| Ring {
+            inputs: InputRing::new(n, MAX_INPUT),
+            dir: dir.to_path_buf(),
+            dumps: AtomicUsize::new(0),
+            dumping: AtomicBool::new(false),
+            identity: Some(identity.clone()),
+        });
+        if ring.identity.as_deref() != Some(identity.as_slice())
+            || ring.dir != dir
+            || ring.inputs.capacity() != n
+        {
+            return Err(std::io::Error::other(
+                "persistent recorder already installed with different identity/path/capacity",
+            ));
+        }
+        Ok(Record)
     }
 
     /// How many slots the ring holds.
@@ -207,7 +242,7 @@ fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
         .ok()?;
     let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));
-    archive::write(&dir, snapshot.inputs(), reason).ok()?;
+    archive::write_identified(&dir, snapshot.inputs(), reason, r.identity.as_deref()).ok()?;
     Some(dir)
 }
 
@@ -219,12 +254,32 @@ fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
 /// would in the campaign (the hook above dumps a fresh record of the replay,
 /// which is the state-carryover evidence: a record that reproduces where the
 /// single crashing input does not).
-pub fn replay<F>(path: &Path, mut harness: F) -> Result<usize, (usize, String)>
+pub fn replay<F>(path: &Path, harness: F) -> Result<usize, (usize, String)>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
+    replay_with_identity(path, None, false, harness)
+}
+
+/// Replay with an explicitly expected campaign identity. A mismatch is refused
+/// before the first harness invocation. The explicit diagnostic override never
+/// bypasses format/completion/size validation and never certifies exact replay.
+pub fn replay_with_identity<F>(
+    path: &Path,
+    expected: Option<&[u8]>,
+    allow_mismatch: bool,
+    mut harness: F,
+) -> Result<usize, (usize, String)>
 where
     F: FnMut(&[u8]) -> Result<(), String>,
 {
     let replay = archive::prepare(path, MAX_INPUT)
         .map_err(|error| (0, format!("{}: {error}", path.display())))?;
+    let matched = archive::check_identity(replay.identity.as_deref(), expected, allow_mismatch)
+        .map_err(|error| (0, format!("{}: {error}", path.display())))?;
+    if !matched {
+        eprintln!("UNVERIFIED REPLAY IDENTITY: legacy/unidentified input or explicit diagnostic mismatch override; not exact build/configuration/schedule replay");
+    }
     if replay.legacy {
         eprintln!(
             "legacy record: numeric order checked; completeness/build/schema metadata unavailable"

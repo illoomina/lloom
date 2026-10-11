@@ -21,16 +21,21 @@ fn main() -> anyhow::Result<()> {
     // Devices are created on the first execution, in the process that
     // executes (see fuzz_cb_liveness.rs).
     let devs: std::cell::OnceCell<Vec<Device>> = std::cell::OnceCell::new();
-    lloom_fuzz::campaign::run(&args.cli, "token_ring", move |bytes| {
-        let ops = lloom_fuzz::decode::token_ring(bytes);
-        let devs = devs.get_or_init(|| match which.as_str() {
-            "cpu" => vec![Device::Cpu],
-            "metal" => vec![Device::new_metal(0).expect("a Metal device")],
-            _ => devices(),
-        });
-        for d in devs {
-            run_sequence(d, &ops).map_err(|e| format!("{d:?}: {e}"))?;
-        }
-        Ok(())
-    })
+    lloom_fuzz::campaign::run_with_config(
+        &args.cli,
+        "token_ring",
+        &serde_json::json!({"device": args.device}),
+        move |bytes| {
+            let ops = lloom_fuzz::decode::token_ring(bytes);
+            let devs = devs.get_or_init(|| match which.as_str() {
+                "cpu" => vec![Device::Cpu],
+                "metal" => vec![Device::new_metal(0).expect("a Metal device")],
+                _ => devices(),
+            });
+            for d in devs {
+                run_sequence(d, &ops).map_err(|e| format!("{d:?}: {e}"))?;
+            }
+            Ok(())
+        },
+    )
 }

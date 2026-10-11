@@ -101,21 +101,34 @@ Capture is not guaranteed: a busy byte-ring snapshot is refused, filesystem
 errors can prevent a dump, and the signal writer/handler composition still
 needs its separate safety repair. Do not infer successful capture from a crash.
 
-New directories retain numbered `.bin` inputs (oldest first), `reason.txt`,
-`record.format` and a final `record.complete` count/length manifest. Failed writes
-leave inspectable partial evidence, not a successful directory result. Filesystem
-I/O allocates and may block; it is not async-signal-safe. Replay validates the
-format, complete count, numeric filename order and each size before executing
-any input. Unknown formats and incomplete v1 records report incompatibility.
-Legacy numbered directories still replay, with an explicit weaker-guarantee
-warning: a missing last input cannot be detected without their absent manifest.
-Same-length corruption/concurrent rewriting, build/configuration identity and
-schedule schemas are not verified by this input-file format. Do not modify a
-record while replaying it. Replay in one fresh process:
+New campaign directories use `lloom-input-record-v2`: numbered `.bin` inputs
+(oldest first), `reason.txt`, `record.format`, required `record.identity`, and a
+final `record.complete` count/length manifest. The low-level legacy recorder
+still writes v1. Failed writes leave inspectable partial evidence, not a
+successful directory result. Filesystem I/O allocates and may block; it is not
+async-signal-safe. Replay validates format, completion, numeric order and sizes
+before executing any input. Missing/oversized v2 identity is an error, including
+under the diagnostic override. Legacy numbered directories and v1 records remain
+readable with an explicit unidentified-replay warning.
+
+Campaign identity is prepared once at startup: streaming SHA-256 of the file at
+`current_exe()`, target, instrumentation arm, input schema, timeout/max input
+length and explicit target options. Comparison is exact serialized bytes, not
+semantic JSON equivalence. Replay requires the matching binary and options.
+`--replay-unchecked-identity` permits diagnostic replay of an incompatible record
+with an explicit warning; it does not bypass format/completion/size checks.
+
+Identity does NOT capture environment tuning, dylibs, hardware, driver or a
+controlled schedule. The executable hash is not an immutable loaded-image
+attestation. Input files have no content hashes; same-length corruption or
+concurrent rewriting remains undetected. Do not modify a record during replay.
+Replay in one fresh process:
 
 ```sh
 fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0
-fuzz_cb_liveness --cb unretained --once  out/solutions/<id>          # the crashing input alone
+fuzz_cb_liveness --cb unretained --once out/solutions/<id>
+# Deliberately different binary/options: diagnostic only, never exact replay.
+fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0 --replay-unchecked-identity
 ```
 
 `--once` and replay share the 64 KiB input-byte limit. Single-input execution

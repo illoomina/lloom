@@ -5,6 +5,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const FORMAT: &str = "lloom-input-record-v1\n";
+const IDENTIFIED_FORMAT: &str = "lloom-input-record-v2\n";
+const IDENTITY_FILE: &str = "record.identity";
+pub(super) const MAX_IDENTITY: usize = 64 * 1024;
 const FORMAT_FILE: &str = "record.format";
 const COMPLETE_FILE: &str = "record.complete";
 
@@ -21,13 +24,34 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// archive remains inspectable but cannot masquerade as a completed v1 replay.
 /// Successful writes are synchronized; this is not an atomic filesystem snapshot
 /// or a guarantee against later modification, media corruption or machine loss.
+#[cfg(test)]
 pub(super) fn write<'a>(
     dir: &Path,
     inputs: impl Iterator<Item = &'a [u8]>,
     reason: &[u8],
 ) -> io::Result<()> {
+    write_identified(dir, inputs, reason, None)
+}
+
+pub(super) fn write_identified<'a>(
+    dir: &Path,
+    inputs: impl Iterator<Item = &'a [u8]>,
+    reason: &[u8],
+    identity: Option<&[u8]>,
+) -> io::Result<()> {
+    if identity.is_some_and(|bytes| bytes.is_empty() || bytes.len() > MAX_IDENTITY) {
+        return Err(invalid("record identity is empty or exceeds its bound"));
+    }
+    let format = if identity.is_some() {
+        IDENTIFIED_FORMAT
+    } else {
+        FORMAT
+    };
     fs::create_dir(dir)?;
-    write_new(&dir.join(FORMAT_FILE), FORMAT.as_bytes())?;
+    write_new(&dir.join(FORMAT_FILE), format.as_bytes())?;
+    if let Some(identity) = identity {
+        write_new(&dir.join(IDENTITY_FILE), identity)?;
+    }
     let mut lengths = Vec::new();
     for (index, bytes) in inputs.enumerate() {
         write_new(&dir.join(format!("{index:020}.bin")), bytes)?;
@@ -37,7 +61,7 @@ pub(super) fn write<'a>(
         return Err(invalid("record contains no inputs"));
     }
     write_new(&dir.join("reason.txt"), reason)?;
-    let mut manifest = format!("{FORMAT}{}\n", lengths.len());
+    let mut manifest = format!("{format}{}\n", lengths.len());
     for length in lengths {
         use std::fmt::Write as _;
         writeln!(manifest, "{length}").expect("String formatting is infallible");
@@ -101,27 +125,45 @@ pub(super) struct Replay {
     pub(super) paths: Vec<PathBuf>,
     pub(super) lengths: Vec<u64>,
     pub(super) legacy: bool,
+    pub(super) identity: Option<Vec<u8>>,
 }
 
 /// Validate every directory entry and declared size before executing the first
 /// target. Legacy directories remain readable with explicitly weaker guarantees:
 /// their missing final input cannot be detected without a completion manifest.
 pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
-    let (paths, manifest, legacy) = if path.is_dir() {
+    let (paths, manifest, legacy, format, identity) = if path.is_dir() {
         let format = optional(&path.join(FORMAT_FILE))?;
         let manifest = optional(&path.join(COMPLETE_FILE))?;
         match (&format, &manifest) {
-            (Some(format), Some(_)) if format == FORMAT => {}
+            (Some(format), Some(_)) if format == FORMAT || format == IDENTIFIED_FORMAT => {}
             (None, None) => {}
-            (Some(format), _) if format != FORMAT => {
+            (Some(format), _) if format != FORMAT && format != IDENTIFIED_FORMAT => {
                 return Err(invalid("unsupported record format"))
             }
             _ => return Err(invalid("incomplete record: format/completion pair missing")),
         }
+        let identity = if format.as_deref() == Some(IDENTIFIED_FORMAT) {
+            let bytes = read_single(&path.join(IDENTITY_FILE), MAX_IDENTITY).map_err(|error| {
+                io::Error::new(error.kind(), format!("{IDENTITY_FILE}: {error}"))
+            })?;
+            if bytes.is_empty() {
+                return Err(invalid("empty record identity"));
+            }
+            Some(bytes)
+        } else {
+            if path.join(IDENTITY_FILE).try_exists()? {
+                return Err(invalid(
+                    "identity without v2 format; refusing silent downgrade",
+                ));
+            }
+            None
+        };
         let paths = ordered(fs::read_dir(path)?.map(|entry| entry.map(|entry| entry.path())))?;
-        (paths, manifest, format.is_none())
+        let legacy = format.is_none();
+        (paths, manifest, legacy, format, identity)
     } else {
-        (vec![path.to_path_buf()], None, false)
+        (vec![path.to_path_buf()], None, false, None, None)
     };
     let mut lengths = Vec::with_capacity(paths.len());
     for path in &paths {
@@ -129,7 +171,7 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
     }
     if let Some(manifest) = manifest {
         let mut lines = manifest.lines();
-        if lines.next() != Some(FORMAT.trim_end()) {
+        if lines.next() != format.as_deref().map(str::trim_end) {
             return Err(invalid("unsupported completion format"));
         }
         let count = lines
@@ -160,7 +202,21 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
         paths,
         lengths,
         legacy,
+        identity,
     })
+}
+
+pub(super) fn check_identity(
+    actual: Option<&[u8]>,
+    expected: Option<&[u8]>,
+    allow_mismatch: bool,
+) -> io::Result<bool> {
+    match actual {
+        None => Ok(false), // Existing legacy/v1/single-input support, explicitly unidentified.
+        Some(actual) if Some(actual) == expected => Ok(true),
+        Some(_) if allow_mismatch => Ok(false),
+        Some(_) => Err(invalid("incompatible record identity: target/build/configuration differs or expected identity unavailable; use the matching binary/options, or explicitly request unchecked diagnostic replay")),
+    }
 }
 
 fn input_length(path: &Path, maximum: usize) -> io::Result<u64> {
@@ -359,5 +415,97 @@ mod tests {
             5,
             "oversized input read before validation"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "lloom-record-identity-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn identified_archive_roundtrip_and_mismatch_are_explicit() {
+        let tmp = Temp::new();
+        let identity = b"target=a;build=b;config=c;schema=1";
+        write_identified(
+            &tmp.0,
+            [b"B".as_slice(), b"C"].into_iter(),
+            b"reason",
+            Some(identity),
+        )
+        .unwrap();
+        let replay = prepare(&tmp.0, 4).unwrap();
+        assert_eq!(replay.identity.as_deref(), Some(identity.as_slice()));
+        assert!(check_identity(replay.identity.as_deref(), Some(identity), false).unwrap());
+        for expected in [
+            None,
+            Some(b"target=z;build=b;config=c;schema=1".as_slice()),
+            Some(b"target=a;build=z;config=c;schema=1"),
+            Some(b"target=a;build=b;config=z;schema=1"),
+            Some(b"target=a;build=b;config=c;schema=2"),
+        ] {
+            assert!(check_identity(replay.identity.as_deref(), expected, false)
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible record identity"));
+            assert!(!check_identity(replay.identity.as_deref(), expected, true).unwrap());
+        }
+        assert!(!check_identity(None, Some(identity), false).unwrap());
+    }
+    #[test]
+    fn identity_missing_oversized_or_downgraded_is_not_legacy() {
+        let tmp = Temp::new();
+        write_identified(&tmp.0, [b"B".as_slice()].into_iter(), b"reason", Some(b"x")).unwrap();
+        fs::remove_file(tmp.0.join(IDENTITY_FILE)).unwrap();
+        assert!(prepare(&tmp.0, 4).is_err());
+        fs::write(tmp.0.join(IDENTITY_FILE), vec![0; MAX_IDENTITY + 1]).unwrap();
+        assert!(prepare(&tmp.0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("65536-byte bound"));
+        fs::write(tmp.0.join(IDENTITY_FILE), b"x").unwrap();
+        fs::write(tmp.0.join(FORMAT_FILE), FORMAT).unwrap();
+        assert!(prepare(&tmp.0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("silent downgrade"));
+        // Original format recovers; missing completion still cannot be bypassed.
+        fs::write(tmp.0.join(FORMAT_FILE), IDENTIFIED_FORMAT).unwrap();
+        fs::remove_file(tmp.0.join(COMPLETE_FILE)).unwrap();
+        assert!(prepare(&tmp.0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete record"));
+    }
+    #[test]
+    fn identity_refusal_precedes_archive_creation() {
+        let tmp = Temp::new();
+        for identity in [b"".as_slice(), &vec![0; MAX_IDENTITY + 1]] {
+            assert!(write_identified(
+                &tmp.0,
+                [b"B".as_slice()].into_iter(),
+                b"reason",
+                Some(identity)
+            )
+            .is_err());
+            assert!(!tmp.0.exists(), "identity refusal created partial archive");
+        }
     }
 }

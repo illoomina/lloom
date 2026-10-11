@@ -30,9 +30,14 @@ fn main() -> anyhow::Result<()> {
     // `issue-706-raw/probes.log`).
     let dev: std::cell::OnceCell<Device> = std::cell::OnceCell::new();
     let name = format!("cb_liveness_{}", args.cb);
-    lloom_fuzz::campaign::run(&args.cli, &name, move |bytes| {
-        let ops = lloom_fuzz::decode::cb_liveness(bytes);
-        let dev = dev.get_or_init(|| Device::system_default().expect("no Metal device"));
-        lloom_fuzz::cb_liveness::run_sequence(dev, &ops).map(|_| ())
-    })
+    lloom_fuzz::campaign::run_with_config(
+        &args.cli,
+        &name,
+        &serde_json::json!({"cb": args.cb}),
+        move |bytes| {
+            let ops = lloom_fuzz::decode::cb_liveness(bytes);
+            let dev = dev.get_or_init(|| Device::system_default().expect("no Metal device"));
+            lloom_fuzz::cb_liveness::run_sequence(dev, &ops).map(|_| ())
+        },
+    )
 }

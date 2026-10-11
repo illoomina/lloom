@@ -223,3 +223,140 @@ fn loader_checks_geometry_dtype_and_packed_weight_shape() -> Result<()> {
     .is_err());
     Ok(())
 }
+
+#[derive(serde::Deserialize)]
+struct ScalarFixture {
+    hidden: Vec<Vec<Vec<f32>>>,
+    lengths: Vec<usize>,
+    types: Vec<u32>,
+    markers: Vec<Vec<usize>>,
+    expected: Vec<Vec<f64>>,
+    ignored_mask: Vec<Vec<f64>>,
+    wrong_causal: Vec<Vec<f64>>,
+    exact_gelu_one: f64,
+    tanh_gelu_one: f64,
+}
+
+fn scalar_fixture() -> ScalarFixture {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/d1_omni/head_scalar.json"
+    )))
+    .unwrap()
+}
+
+#[test]
+fn asymmetric_scorer_pins_exact_erf_gelu_not_tanh() -> Result<()> {
+    let fixture = scalar_fixture();
+    assert!((fixture.exact_gelu_one - fixture.tanh_gelu_one).abs() > 1e-4);
+    let mut tensors = weights()?;
+    tensors.insert(
+        "scorer.1.weight".into(),
+        Tensor::zeros((WIDTH, WIDTH), DType::F32, &Device::Cpu)?,
+    );
+    let mut bias = vec![0f32; WIDTH];
+    bias[0] = 1.;
+    tensors.insert(
+        "scorer.1.bias".into(),
+        Tensor::from_vec(bias, WIDTH, &Device::Cpu)?,
+    );
+    let head = DecisionHead::load(
+        WIDTH,
+        1,
+        VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+    )?;
+    let batch = head.prepare_batch(1, &[1], &[&[0]], &[0])?;
+    let hidden = Tensor::zeros((1, 1, WIDTH), DType::F32, &Device::Cpu)?;
+    let output = head
+        .forward_with_attention(&hidden, &batch, &mut |_, _, v, _, _| Ok(v.clone()))?
+        .to_vec2::<f32>()?[0][0] as f64;
+    assert!(
+        (output - (fixture.exact_gelu_one + 0.25)).abs() < 2e-6,
+        "exact GELU scorer got={output} expected={}",
+        fixture.exact_gelu_one + 0.25
+    );
+    assert!((output - (fixture.tanh_gelu_one + 0.25)).abs() > 1e-4);
+    Ok(())
+}
+
+#[test]
+fn nonzero_transformer_matches_scalar_reference_and_distinguishes_padding_and_causality(
+) -> Result<()> {
+    let fixture = scalar_fixture();
+    assert!((fixture.expected[1][0] - fixture.ignored_mask[1][0]).abs() > 1.);
+    assert!((fixture.expected[0][1] - fixture.wrong_causal[0][1]).abs() > 0.01);
+    let mut tensors = weights()?;
+    let mut packed = vec![0f32; 3 * WIDTH * WIDTH];
+    for (part, scale) in [0.125, 0.25, 0.5].into_iter().enumerate() {
+        for i in 0..WIDTH {
+            packed[(part * WIDTH + i) * WIDTH + i] = scale;
+        }
+    }
+    tensors.insert(
+        "head.layers.0.self_attn.in_proj_weight".into(),
+        Tensor::from_vec(packed, (3 * WIDTH, WIDTH), &Device::Cpu)?,
+    );
+    tensors.insert(
+        "head.layers.0.self_attn.in_proj_bias".into(),
+        Tensor::zeros(3 * WIDTH, DType::F32, &Device::Cpu)?,
+    );
+    for (name, rows, cols, scale) in [
+        ("head.layers.0.self_attn.out_proj", WIDTH, WIDTH, 0.125f32),
+        ("head.layers.0.linear1", 4 * WIDTH, WIDTH, 0.5),
+        ("head.layers.0.linear2", WIDTH, 4 * WIDTH, 0.25),
+    ] {
+        let mut data = vec![0f32; rows * cols];
+        for i in 0..WIDTH {
+            data[i * cols + i] = scale;
+        }
+        tensors.insert(
+            format!("{name}.weight"),
+            Tensor::from_vec(data, (rows, cols), &Device::Cpu)?,
+        );
+    }
+    let mut bias = vec![0f32; 4 * WIDTH];
+    for (i, value) in bias[..WIDTH].iter_mut().enumerate() {
+        *value = if i % 2 == 0 { 0.02 } else { -0.02 };
+    }
+    tensors.insert(
+        "head.layers.0.linear1.bias".into(),
+        Tensor::from_vec(bias, 4 * WIDTH, &Device::Cpu)?,
+    );
+    let head = DecisionHead::load(
+        WIDTH,
+        1,
+        VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu),
+    )?;
+    let marker_refs: Vec<_> = fixture.markers.iter().map(Vec::as_slice).collect();
+    let batch = head.prepare_batch(3, &fixture.lengths, &marker_refs, &fixture.types)?;
+    let hidden = Tensor::from_vec(
+        fixture
+            .hidden
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>(),
+        (2, 3, WIDTH),
+        &Device::Cpu,
+    )?;
+    let mut calls = 0;
+    let output = head
+        .forward_with_attention(&hidden, &batch, &mut |q, k, v, mask, scale| {
+            calls += 1;
+            let scores = (q.matmul(&k.t()?)? * scale)?.broadcast_add(mask.unwrap())?;
+            crate::nn::ops::softmax_last_dim(&scores)?.matmul(v)
+        })?
+        .to_vec2::<f32>()?;
+    assert_eq!(calls, 1);
+    for (row, expected) in fixture.expected.iter().enumerate() {
+        for (option, &expected) in expected.iter().enumerate() {
+            assert!(
+                (output[row][option] as f64 - expected).abs() < 3e-5,
+                "nonzero transformer row={row} option={option} got={} expected={expected}",
+                output[row][option]
+            );
+        }
+    }
+    assert_eq!(output[1][1], -1e4);
+    Ok(())
+}

@@ -24,6 +24,8 @@ const STEP: u64 = MASK + 1;
 /// Inspectable recording refusal; none of these states proves GPU completion.
 #[derive(thiserror::Error, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleError {
+    #[error("command buffer has not been submitted")]
+    NotSubmitted,
     #[error("recording operation currently busy")]
     Busy,
     #[error("command buffer submission already entered")]
@@ -47,6 +49,27 @@ pub(crate) struct CommandLifecycle(AtomicU64);
 impl CommandLifecycle {
     pub(crate) const fn new() -> Self {
         Self(AtomicU64::new(RECORDING))
+    }
+    /// Permission to begin a potentially blocking native/logical wait. ENTERED
+    /// is not enough: it is published before the actual native call. Refusal is
+    /// read-only and preserves recording for a later explicit commit/retry.
+    pub(crate) fn check_wait_submission(&self) -> Result<(), LifecycleError> {
+        self.check_standalone_wait(false)
+    }
+    /// Standalone raw interop may import an already submitted native object only
+    /// while this wrapper family is still idle. ENTERED/unknown admission never
+    /// borrows native status as proof that its own handoff returned.
+    pub(crate) fn check_standalone_wait(
+        &self,
+        native_submitted: bool,
+    ) -> Result<(), LifecycleError> {
+        match self.0.load(Ordering::Acquire) & MASK {
+            SUBMITTED => Ok(()),
+            RECORDING if native_submitted => Ok(()),
+            RECORDING => Err(LifecycleError::NotSubmitted),
+            ABANDONED | ABANDONED_EDIT => Err(LifecycleError::Abandoned),
+            _ => Err(LifecycleError::Busy),
+        }
     }
     fn identity(&self) -> usize {
         self as *const Self as usize
@@ -310,6 +333,79 @@ impl Drop for Ending<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_refusal_preserves_recording_until_explicit_handoff_returns() {
+        let gate = CommandLifecycle::new();
+        assert_eq!(
+            gate.check_wait_submission(),
+            Err(LifecycleError::NotSubmitted)
+        );
+        let mut encoder = gate.begin_encoder().unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Busy));
+        gate.begin_end_encoder(&mut encoder).unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Busy));
+        gate.finish_end_encoder(&mut encoder).unwrap();
+        let mut prepared = gate.prepare().unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Busy));
+        gate.cancel_prepared(&mut prepared).unwrap();
+        assert_eq!(
+            gate.check_wait_submission(),
+            Err(LifecycleError::NotSubmitted)
+        );
+        let mut retry = gate.prepare().unwrap();
+        gate.entered_native(&mut retry).unwrap();
+        assert_eq!(
+            gate.check_wait_submission(),
+            Err(LifecycleError::Busy),
+            "entry before native handoff was mistaken for returned submission"
+        );
+        gate.handoff_returned(&mut retry).unwrap();
+        assert_eq!(gate.check_wait_submission(), Ok(()));
+    }
+
+    #[test]
+    fn standalone_import_does_not_override_owned_or_unknown_handoff() {
+        let gate = CommandLifecycle::new();
+        // Covers wrapping an already committed/terminal native CB, or an
+        // external raw commit observed after wrapping. It does not mutate gate.
+        assert_eq!(gate.check_standalone_wait(true), Ok(()));
+        assert_eq!(
+            gate.check_wait_submission(),
+            Err(LifecycleError::NotSubmitted)
+        );
+        assert_eq!(
+            gate.check_standalone_wait(false),
+            Err(LifecycleError::NotSubmitted)
+        );
+        let mut prepared = gate.prepare().unwrap();
+        assert_eq!(gate.check_standalone_wait(true), Err(LifecycleError::Busy));
+        gate.entered_native(&mut prepared).unwrap();
+        assert_eq!(gate.check_standalone_wait(true), Err(LifecycleError::Busy));
+        gate.abandon(&mut prepared).unwrap();
+        assert_eq!(
+            gate.check_standalone_wait(true),
+            Err(LifecycleError::Abandoned)
+        );
+    }
+
+    #[test]
+    fn wait_refuses_unknown_handoff_and_abandoned_borrow_without_resetting() {
+        let gate = CommandLifecycle::new();
+        let mut prepared = gate.prepare().unwrap();
+        gate.entered_native(&mut prepared).unwrap();
+        gate.abandon(&mut prepared).unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Abandoned));
+        assert!(matches!(gate.prepare(), Err(LifecycleError::Abandoned)));
+        let gate = CommandLifecycle::new();
+        let mut encoder = gate.begin_encoder().unwrap();
+        let mut edit = gate.begin_edit().unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Busy));
+        gate.abandon(&mut encoder).unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Abandoned));
+        gate.finish_edit(&mut edit).unwrap();
+        assert_eq!(gate.check_wait_submission(), Err(LifecycleError::Abandoned));
+    }
 
     #[test]
     fn boundary_refusal_preserves_open_encoder_and_callback_registration() {

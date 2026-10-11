@@ -594,6 +594,7 @@ impl CommandBuffer {
     /// Internal data/error boundary: does not promise own callback return.
     /// Engine-owned payload custody remains registered independently.
     pub(super) fn try_wait_data_ready(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.check_data_wait()?;
         match &self.backend {
             Backend::Metal3(raw) => {
                 if raw.status().0 < MTLCommandBufferStatus::Completed.0 {
@@ -605,19 +606,54 @@ impl CommandBuffer {
             Backend::Metal4(submission) => submission.try_wait_data_ready(),
         }
     }
+    fn check_wait_admission(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => {
+                let imported = matches!(
+                    raw.status(),
+                    MTLCommandBufferStatus::Committed
+                        | MTLCommandBufferStatus::Scheduled
+                        | MTLCommandBufferStatus::Completed
+                        | MTLCommandBufferStatus::Error
+                );
+                self.lifecycle().check_standalone_wait(imported)
+            }
+            _ => self.lifecycle().check_wait_submission(),
+        }
+        .map_err(lifecycle_error)
+    }
     pub(super) fn check_data_wait(&self) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.backend {
             Backend::Metal3(_) => Ok(()), // Standalone raw wrappers have no engine queue poison.
             Backend::Metal3Associated(buffer) => buffer.check_data_wait(),
             Backend::Metal4(submission) => submission.check_data_wait(),
+        }?;
+        // Independently observed native terminality permits data/error inspection,
+        // not callback join or physical teardown. Otherwise never park before a
+        // known-returned submission, including ENTERED/unknown handoff.
+        if !self.data_ready() {
+            self.check_wait_admission()?;
+            if let Backend::Metal3(raw) = &self.backend {
+                let queue = raw.commandQueue();
+                crate::completion_scope::before_park(Retained::as_ptr(&queue) as usize)
+                    .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)?;
+            }
         }
+        Ok(())
     }
 
     /// Wait for own logical completion, returning native or adapter failures.
     /// Queue-associated wrappers additionally preserve engine prefix ordering.
     /// Standalone M3 retains the native handler-join contract, not a cross-buffer
-    /// logical prefix. Error never establishes teardown quiescence.
+    /// logical prefix. Before explicit commit returns, this refuses NotSubmitted
+    /// or Busy without submitting/cancelling work or awaiting a future producer.
+    /// Standalone idle raw wrappers also accept independently observed native
+    /// submission, preserving imported/external raw commit semantics. Their owned
+    /// ENTERED or unknown handoff still refuses Busy/Abandoned; associated wrappers
+    /// do not substitute native status for the logical prefix contract.
+    /// Error never establishes teardown quiescence.
     pub fn wait_until_completed(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.check_wait_admission()?;
         match &self.backend {
             Backend::Metal3(raw) => {
                 let queue = raw.commandQueue();

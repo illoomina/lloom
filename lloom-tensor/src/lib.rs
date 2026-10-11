@@ -54,6 +54,7 @@ pub mod autorelease;
 pub mod backend;
 pub mod backprop;
 mod command_policy;
+mod completion_frontier;
 pub mod conv;
 mod convert;
 pub mod cpu;

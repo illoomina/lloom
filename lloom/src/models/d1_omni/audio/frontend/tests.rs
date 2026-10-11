@@ -102,3 +102,64 @@ fn frontend_demand_is_checked_without_large_allocation() -> Result<()> {
     assert!(frontend.scratch(8001)?.output_bytes == min.output_bytes);
     Ok(())
 }
+
+#[test]
+fn charged_tables_retain_one_domain_after_scratch_and_pass_release() -> Result<()> {
+    use lloom_tensor::memory_admission::{process_account, AccountSnapshot};
+    let (retained, scratch) = MelFrontend::table_bytes(4)?;
+    assert_eq!((retained, scratch), (6160, 48));
+    // Numerical ownership control only: deliberately no machine admission.
+    let domain = process_account()
+        .unadmitted_domain(Some(retained + scratch))
+        .map_err(lloom_tensor::Error::wrap)?;
+    let pass = domain
+        .reserve(retained + scratch)
+        .map_err(lloom_tensor::Error::wrap)?;
+    let context = pass.context();
+    let frontend = MelFrontend::new_in(4, &context)?;
+    assert_eq!(
+        domain.snapshot(),
+        AccountSnapshot {
+            pending: 0,
+            committed: retained
+        }
+    );
+    let legacy = MelFrontend::new(4)?;
+    assert_eq!(frontend.filterbank.len(), legacy.filterbank.len());
+    assert_eq!(frontend.window.len(), legacy.window.len());
+    for (a, b) in frontend.filterbank.iter().zip(legacy.filterbank.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    for (a, b) in frontend.window.iter().zip(legacy.window.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    drop(pass);
+    assert!(MelFrontend::new_in(4, &context).is_err());
+    assert_eq!(
+        domain.snapshot(),
+        AccountSnapshot {
+            pending: 0,
+            committed: retained
+        }
+    );
+    drop(frontend);
+    assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    Ok(())
+}
+
+#[test]
+fn table_refusal_releases_partial_scratch_without_reopening_issuance() -> Result<()> {
+    use lloom_tensor::memory_admission::{process_account, AccountSnapshot};
+    let domain = process_account()
+        .unadmitted_domain(Some(48))
+        .map_err(lloom_tensor::Error::wrap)?;
+    let pass = domain.reserve(48).map_err(lloom_tensor::Error::wrap)?;
+    let context = pass.context();
+    // Only the six F64 edges fit; filterbank ticket refuses before backing.
+    assert!(MelFrontend::new_in(4, &context).is_err());
+    assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    drop(pass);
+    assert!(MelFrontend::new_in(4, &context).is_err());
+    assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    Ok(())
+}

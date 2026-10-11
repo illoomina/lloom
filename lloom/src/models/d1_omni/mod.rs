@@ -24,3 +24,5 @@ pub use audio::{
 
 mod model;
 pub use model::{OmniConfig, OmniImage, OmniModel};
+
+mod loaded;

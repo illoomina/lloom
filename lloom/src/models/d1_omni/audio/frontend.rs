@@ -1,6 +1,8 @@
 //! Explicit host-F32 frontend for the pinned omni waveform/MelFrontend contract.
 //! No device readback, decoder, resampler, thread pool or backend fallback.
+use super::super::host::HostVec;
 use crate::nn::signal::real_fft;
+use lloom_tensor::memory_admission::AllocationContext;
 use lloom_tensor::Result;
 
 const RATE: usize = 16000;
@@ -51,8 +53,8 @@ pub struct MelFeatures {
 #[derive(Debug)]
 pub struct MelFrontend {
     features: usize,
-    filterbank: Vec<f32>,
-    window: Vec<f32>,
+    filterbank: HostVec<f32>,
+    window: HostVec<f32>,
 }
 impl MelFrontend {
     /// Numeric table footprint, usable before allocation by the outer loader.
@@ -72,27 +74,37 @@ impl MelFrontend {
         Ok((bytes(add(table, FFT)?, 4)?, bytes(edges, 8)?))
     }
     pub fn new(features: usize) -> Result<Self> {
+        Self::construct(features, None)
+    }
+    /// Shared-domain numeric tables plus F64 construction scratch. Request FFT
+    /// allocations remain separate; this does not enroll the entire frontend.
+    pub(crate) fn new_in(features: usize, context: &AllocationContext) -> Result<Self> {
+        Self::construct(features, Some(context))
+    }
+    pub(crate) fn features(&self) -> usize {
+        self.features
+    }
+    fn construct(features: usize, context: Option<&AllocationContext>) -> Result<Self> {
         Self::table_bytes(features)?;
         let f_sp = 200. / 3.;
         let min_log_mel = 1000. / f_sp;
         let logstep = (6.4f64).ln() / 27.;
         let max_mel = min_log_mel + (8f64).ln() / logstep;
         let step = max_mel / (features + 1) as f64;
-        let edges: Vec<f64> = (0..features + 2)
-            .map(|i| {
-                let mel = if i == features + 1 {
-                    max_mel
-                } else {
-                    i as f64 * step
-                };
-                if mel >= min_log_mel {
-                    1000. * (logstep * (mel - min_log_mel)).exp()
-                } else {
-                    f_sp * mel
-                }
-            })
-            .collect();
-        let mut filterbank = vec![0f32; features * BINS];
+        let mut edges = HostVec::<f64>::zeroed(features + 2, context)?;
+        for (i, edge) in edges.iter_mut().enumerate() {
+            let mel = if i == features + 1 {
+                max_mel
+            } else {
+                i as f64 * step
+            };
+            *edge = if mel >= min_log_mel {
+                1000. * (logstep * (mel - min_log_mel)).exp()
+            } else {
+                f_sp * mel
+            };
+        }
+        let mut filterbank = HostVec::<f32>::zeroed(features * BINS, context)?;
         for m in 0..features {
             let left = edges[m + 1] - edges[m];
             let right = edges[m + 2] - edges[m + 1];
@@ -110,7 +122,7 @@ impl MelFrontend {
                 filterbank[m * BINS + bin] = ((triangle as f32) as f64 * norm) as f32;
             }
         }
-        let mut window = vec![0f32; FFT];
+        let mut window = HostVec::<f32>::zeroed(FFT, context)?;
         for i in 0..WINDOW {
             window[(FFT - WINDOW) / 2 + i] =
                 0.5 * (1. - (2. * std::f32::consts::PI * i as f32 / (WINDOW - 1) as f32).cos());

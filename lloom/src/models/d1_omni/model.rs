@@ -39,6 +39,20 @@ impl OmniConfig {
             &self.temperatures,
         )
     }
+    pub(crate) fn validate(&self, dtype: DType) -> Result<()> {
+        self.validate_outer()?;
+        DecisionCore::validate_config(&self.core, dtype)?;
+        Vision::validate_config(
+            &self.vision_config,
+            self.projector_hidden_size,
+            self.core.text_config.hidden_size,
+            dtype,
+        )?;
+        self.audio_config
+            .validate(self.core.text_config.hidden_size, dtype)?;
+        MelFrontend::table_bytes(self.audio_config.feat_in)?;
+        Ok(())
+    }
     /// Pinned request allowance min(configured text limit, outer max-prefix).
     /// Renderer applies the media-specific limit; it never substitutes the
     /// text encoder's larger128000 position limit for outer16384.
@@ -158,17 +172,28 @@ impl OmniModel {
     /// Host frontend tables need real tickets too; vb.device is insufficient.
     /// No per-component reload, separate quota or new checkpoint source exists.
     pub(crate) fn load_components(cfg: OmniConfig, vb: VarBuilder) -> Result<Self> {
-        cfg.validate_outer()?;
-        DecisionCore::validate_config(&cfg.core, vb.dtype())?;
-        Vision::validate_config(
-            &cfg.vision_config,
-            cfg.projector_hidden_size,
-            cfg.core.text_config.hidden_size,
-            vb.dtype(),
-        )?;
-        cfg.audio_config
-            .validate(cfg.core.text_config.hidden_size, vb.dtype())?;
-        MelFrontend::table_bytes(cfg.audio_config.feat_in)?;
+        Self::load_components_inner(cfg, vb, None)
+    }
+    /// Factory supplies the once-built, preticketed frontend; no second copy.
+    pub(crate) fn load_components_with_frontend(
+        cfg: OmniConfig,
+        vb: VarBuilder,
+        frontend: MelFrontend,
+    ) -> Result<Self> {
+        Self::load_components_inner(cfg, vb, Some(frontend))
+    }
+    fn load_components_inner(
+        cfg: OmniConfig,
+        vb: VarBuilder,
+        frontend: Option<MelFrontend>,
+    ) -> Result<Self> {
+        cfg.validate(vb.dtype())?;
+        if frontend
+            .as_ref()
+            .is_some_and(|f| f.features() != cfg.audio_config.feat_in)
+        {
+            lloom_tensor::bail!("omni supplied frontend feature count differs from audio config")
+        }
         let core = DecisionCore::load(cfg.core.clone(), vb.clone())?;
         let width = cfg.core.text_config.hidden_size;
         let vision = Vision::load(
@@ -178,7 +203,10 @@ impl OmniModel {
             vb.pp("vision"),
         )?;
         let audio = AudioEncoder::load(cfg.audio_config.clone(), width, vb.pp("audio"))?;
-        let frontend = MelFrontend::new(cfg.audio_config.feat_in)?;
+        let frontend = match frontend {
+            Some(frontend) => frontend,
+            None => MelFrontend::new(cfg.audio_config.feat_in)?,
+        };
         let limits = RequestLimits {
             max_length: cfg.core.max_length,
             image_text_length: cfg.image_text_length,

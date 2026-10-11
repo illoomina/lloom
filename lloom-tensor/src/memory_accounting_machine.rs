@@ -45,6 +45,23 @@ impl MachineOwner {
         })
     }
 
+    pub fn status(&self) -> MachineAdmission {
+        if let Some(holding) = &self.admitted.holding {
+            MachineAdmission::Registered {
+                reserved: holding.reserved(),
+                forced: self.admitted.verdict.as_ref().is_some_and(|v| v.forced),
+                growth: None,
+            }
+        } else if let Some(initial) = &self.admitted.verdict {
+            // Constructor rejects an unregistered, non-forced verdict.
+            MachineAdmission::ForcedUnregistered {
+                initial: initial.clone(),
+            }
+        } else {
+            MachineAdmission::Off
+        }
+    }
+
     /// Called AFTER publishing numeric pending demand and releasing all account
     /// locks, BEFORE returning an allocatable promise. grow_to serializes and
     /// rechecks under the registry lock; older targets never shrink high-water.

@@ -154,6 +154,10 @@ impl Drop for DomainInner {
 }
 
 impl Domain {
+    pub fn machine_admission(&self) -> Option<MachineAdmission> {
+        self.0.machine.as_ref().map(MachineOwner::status)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         self.0.account.state.lock().domains[&self.0.id]
     }

@@ -74,6 +74,7 @@ pub mod layout;
 pub mod machine;
 mod memory_accounting;
 mod memory_accounting_machine;
+pub mod memory_admission;
 pub mod memory_arbitration;
 // Compile the actual production ledger and its lifecycle tests without Metal.
 // The ledger itself depends only on numeric accounting and machine ownership.

@@ -4,6 +4,7 @@
 use crate::nn::blocks::{Neox, Rope, SwiGlu};
 use crate::nn::short_conv::{Centered, ShortConv};
 use crate::nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
+use crate::quantized_nn::Linear as QuantizedLinear;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Module, Result, Tensor};
 
@@ -31,10 +32,24 @@ fn product(dims: &[usize]) -> Result<usize> {
         .ok_or_else(|| lloom_tensor::Error::Msg("omni trunk shape/byte overflow".into()))
 }
 
-impl TextConfig {
-    /// Reference MLP conversion, not LFM2's automatic-width policy. The official
-    /// 6656 intermediate becomes int(2*6656/3)=4437, then rounds to 4608.
-    pub fn validated_intermediate(&self) -> Result<usize> {
+/// Format-independent trunk geometry. `intermediate_size` is ALREADY resolved;
+/// GGUF supplies this width directly, never an invented inverse Python config.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedTextConfig {
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) layer_types: Vec<String>,
+    pub(crate) norm_eps: f64,
+    pub(crate) conv_l_cache: usize,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) rope_theta: f64,
+}
+impl ResolvedTextConfig {
+    fn validate_geometry(&self) -> Result<()> {
         let d = self.hidden_size;
         let h = self.num_attention_heads;
         let k = self.num_key_value_heads;
@@ -52,13 +67,54 @@ impl TextConfig {
                 .iter()
                 .any(|s| s != "conv" && s != "full_attention")
             || self.conv_l_cache != 3
-            || self.intermediate_size == 0
-            || self.block_multiple_of == 0
             || self.max_position_embeddings == 0
             || !self.norm_eps.is_finite()
             || self.norm_eps <= 0.
             || !self.rope_theta.is_finite()
             || self.rope_theta <= 0.
+        {
+            lloom_tensor::bail!(
+                "invalid omni text geometry, layer types or normalization/rope configuration"
+            )
+        }
+        Ok(())
+    }
+    pub(crate) fn validate(&self, dtype: DType) -> Result<usize> {
+        self.validate_geometry()?;
+        if self.intermediate_size == 0 {
+            lloom_tensor::bail!("omni resolved intermediate width must be positive")
+        }
+        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
+            lloom_tensor::bail!("omni trunk requires floating-point weights")
+        }
+        let d = self.hidden_size;
+        product(&[d, d, 3])?;
+        product(&[self.vocab_size, d, dtype.size_in_bytes()])?;
+        product(&[d, self.intermediate_size, dtype.size_in_bytes()])?;
+        Ok(self.intermediate_size)
+    }
+}
+
+impl TextConfig {
+    /// Resolve the Python conversion once. The returned geometry is also the
+    /// GGUF loader contract; no second conversion occurs inside execution.
+    fn resolved(&self) -> Result<ResolvedTextConfig> {
+        let mut resolved = ResolvedTextConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: 0, // assigned after Python-only arithmetic below
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            layer_types: self.layer_types.clone(),
+            norm_eps: self.norm_eps,
+            conv_l_cache: self.conv_l_cache,
+            max_position_embeddings: self.max_position_embeddings,
+            rope_theta: self.rope_theta,
+        };
+        resolved.validate_geometry()?;
+        if self.intermediate_size == 0
+            || self.block_multiple_of == 0
             || !self.block_ffn_dim_multiplier.is_finite()
             || self.block_ffn_dim_multiplier <= 0.
         {
@@ -66,6 +122,7 @@ impl TextConfig {
                 "invalid omni text geometry, layer types or normalization/rope configuration"
             )
         }
+        let d = self.hidden_size;
         let twice = product(&[2, self.intermediate_size])?;
         // Exact integer quotient agrees with the reference's int(2*I/3) for
         // supported checkpoint dimensions; reject inexact float-size metadata.
@@ -86,7 +143,14 @@ impl TextConfig {
         product(&[d, intermediate])?;
         product(&[d, d, 3])?;
         product(&[self.vocab_size, d])?;
-        Ok(intermediate)
+        resolved.intermediate_size = intermediate;
+        Ok(resolved)
+    }
+
+    /// Python 6656 becomes int(2*6656/3)=4437, rounded to4608. GGUF's stored
+    /// 4608 is already the result and does not enter this raw-config method.
+    pub fn validated_intermediate(&self) -> Result<usize> {
+        Ok(self.resolved()?.intermediate_size)
     }
 }
 
@@ -131,11 +195,11 @@ impl TrunkBatch {
 }
 
 #[derive(Debug, Clone)]
-struct Gqa {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    out: Linear,
+struct Gqa<P = Linear> {
+    q: P,
+    k: P,
+    v: P,
+    out: P,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     heads: usize,
@@ -144,7 +208,7 @@ struct Gqa {
 }
 
 impl Gqa {
-    fn load(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn load(cfg: &ResolvedTextConfig, vb: VarBuilder) -> Result<Self> {
         let d = cfg.hidden_size;
         let hd = d / cfg.num_attention_heads;
         let kv = product(&[cfg.num_key_value_heads, hd])?;
@@ -160,7 +224,38 @@ impl Gqa {
             head_dim: hd,
         })
     }
+}
 
+impl Gqa<QuantizedLinear> {
+    fn load_gguf(
+        cfg: &ResolvedTextConfig,
+        vb: crate::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        use crate::quantized_nn::linear_no_bias as qlinear;
+        let d = cfg.hidden_size;
+        let hd = d / cfg.num_attention_heads;
+        let kv = product(&[cfg.num_key_value_heads, hd])?;
+        Ok(Self {
+            q: qlinear(d, d, vb.pp("attn_q"))?,
+            k: qlinear(d, kv, vb.pp("attn_k"))?,
+            v: qlinear(d, kv, vb.pp("attn_v"))?,
+            out: qlinear(d, d, vb.pp("attn_output"))?,
+            q_norm: RmsNorm::new(
+                vb.get(hd, "attn_q_norm.weight")?.dequantize(vb.device())?,
+                cfg.norm_eps,
+            ),
+            k_norm: RmsNorm::new(
+                vb.get(hd, "attn_k_norm.weight")?.dequantize(vb.device())?,
+                cfg.norm_eps,
+            ),
+            heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: hd,
+        })
+    }
+}
+
+impl<P: Module> Gqa<P> {
     fn forward<F>(
         &self,
         x: &Tensor,
@@ -208,18 +303,18 @@ impl Gqa {
 }
 
 #[derive(Debug, Clone)]
-enum Mixer {
+enum Mixer<P = Linear> {
     Conv {
-        input: Linear,
+        input: P,
         conv: ShortConv<Centered>,
-        output: Linear,
+        output: P,
     },
-    Attention(Gqa),
+    Attention(Gqa<P>),
 }
 
 #[derive(Debug, Clone)]
-struct Layer {
-    mixer: Mixer,
+struct Layer<P = Linear> {
+    mixer: Mixer<P>,
     ffn: SwiGlu,
     operator_norm: RmsNorm,
     ffn_norm: RmsNorm,
@@ -227,26 +322,25 @@ struct Layer {
 
 #[derive(Debug, Clone)]
 pub struct Trunk {
-    cfg: TextConfig,
+    inner: TrunkInner<Linear>,
+}
+
+#[derive(Debug, Clone)]
+struct TrunkInner<P> {
+    cfg: ResolvedTextConfig,
     embedding: Embedding,
-    layers: Vec<Layer>,
+    layers: Vec<Layer<P>>,
     norm: RmsNorm,
 }
 
 impl Trunk {
     pub(crate) fn validate_config(cfg: &TextConfig, dtype: DType) -> Result<usize> {
-        let intermediate = cfg.validated_intermediate()?;
-        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
-            lloom_tensor::bail!("omni trunk requires floating-point weights")
-        }
-        let d = cfg.hidden_size;
-        product(&[cfg.vocab_size, d, dtype.size_in_bytes()])?;
-        product(&[d, intermediate, dtype.size_in_bytes()])?;
-        Ok(intermediate)
+        TrunkInner::<Linear>::validate_config(&cfg.resolved()?, dtype)
     }
 
     pub fn load(cfg: TextConfig, vb: VarBuilder) -> Result<Self> {
-        let intermediate = Self::validate_config(&cfg, vb.dtype())?;
+        let cfg = cfg.resolved()?;
+        let intermediate = TrunkInner::<Linear>::validate_config(&cfg, vb.dtype())?;
         let d = cfg.hidden_size;
         let embedding = embedding(cfg.vocab_size, d, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -280,11 +374,63 @@ impl Trunk {
         }
         let norm = rms_norm(d, cfg.norm_eps, vb.pp("embedding_norm"))?;
         Ok(Self {
-            cfg,
-            embedding,
-            layers,
-            norm,
+            inner: TrunkInner {
+                cfg,
+                embedding,
+                layers,
+                norm,
+            },
         })
+    }
+
+    pub fn rope_tables(&self, length: usize) -> Result<(Tensor, Tensor)> {
+        self.inner.rope_tables(length)
+    }
+    pub fn embed(&self, tokens: &[u32], batch: usize, length: usize) -> Result<Tensor> {
+        self.inner.embed(tokens, batch, length)
+    }
+    pub fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        prefixes: &[usize],
+    ) -> Result<TrunkBatch> {
+        self.inner.prepare_batch(length, lengths, prefixes)
+    }
+    /// The callback sees full GQA-expanded K/V, compact query-segment masks and
+    /// no causality. Tables and metadata retain the shared core validation.
+    pub fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &TrunkBatch,
+        cos: &Tensor,
+        sin: &Tensor,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+    {
+        self.inner
+            .forward_with_attention(hidden, batch, cos, sin, attend)
+    }
+}
+
+impl<P: Module> TrunkInner<P> {
+    fn validate_config(cfg: &ResolvedTextConfig, dtype: DType) -> Result<usize> {
+        let intermediate = cfg.validate(dtype)?;
+        let d = cfg.hidden_size;
+        for bytes in [
+            product(&[cfg.num_hidden_layers, std::mem::size_of::<Layer<P>>()])?,
+            product(&[cfg.vocab_size, d, dtype.size_in_bytes()])?,
+            product(&[d, intermediate, dtype.size_in_bytes()])?,
+            product(&[3, d, d, dtype.size_in_bytes()])?,
+        ] {
+            if bytes > isize::MAX as usize {
+                lloom_tensor::bail!("omni trunk per-allocation capacity exceeds isize")
+            }
+        }
+        // Per-allocation representation only, not aggregate load admission.
+        Ok(intermediate)
     }
 
     /// Prepare default NeoX tables on the trunk's dtype/device through the
@@ -466,6 +612,107 @@ impl Trunk {
             h = (&h + layer.ffn.forward(&layer.ffn_norm.forward(&h)?)?)?;
         }
         self.norm.forward(&h)
+    }
+}
+
+/// Already-resolved official GGUF weights, composed through the same trunk
+/// loop as the dense facade. Factory owns the supplied weight map and Domain;
+/// this component neither opens a checkpoint nor manufactures entitlement.
+#[derive(Debug, Clone)]
+pub(crate) struct QuantizedTrunk {
+    inner: TrunkInner<QuantizedLinear>,
+}
+impl QuantizedTrunk {
+    pub(crate) fn load(
+        cfg: ResolvedTextConfig,
+        vb: crate::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        use crate::quantized_nn::linear_no_bias as qlinear;
+        let intermediate = TrunkInner::<QuantizedLinear>::validate_config(&cfg, DType::F32)?;
+        let d = cfg.hidden_size;
+        let embedding = Embedding::new(
+            vb.get((cfg.vocab_size, d), "token_embd.weight")?
+                .dequantize(vb.device())?,
+            d,
+        );
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for (i, kind) in cfg.layer_types.iter().enumerate() {
+            let layer = vb.pp(format!("blk.{i}"));
+            let mixer = if kind == "full_attention" {
+                Mixer::Attention(Gqa::load_gguf(&cfg, layer.clone())?)
+            } else {
+                Mixer::Conv {
+                    input: qlinear(d, product(&[3, d])?, layer.pp("shortconv.in_proj"))?,
+                    conv: ShortConv::<Centered>::new(
+                        layer
+                            .get((d, 3), "shortconv.conv.weight")?
+                            .dequantize(vb.device())?,
+                    )?,
+                    output: qlinear(d, d, layer.pp("shortconv.out_proj"))?,
+                }
+            };
+            layers.push(Layer {
+                mixer,
+                ffn: SwiGlu::new(
+                    QMatMul::from_arc(layer.get((intermediate, d), "ffn_gate.weight")?)?,
+                    QMatMul::from_arc(layer.get((intermediate, d), "ffn_up.weight")?)?,
+                    QMatMul::from_arc(layer.get((d, intermediate), "ffn_down.weight")?)?,
+                    d,
+                    intermediate,
+                ),
+                operator_norm: RmsNorm::new(
+                    layer.get(d, "attn_norm.weight")?.dequantize(vb.device())?,
+                    cfg.norm_eps,
+                ),
+                ffn_norm: RmsNorm::new(
+                    layer.get(d, "ffn_norm.weight")?.dequantize(vb.device())?,
+                    cfg.norm_eps,
+                ),
+            });
+        }
+        let norm = RmsNorm::new(
+            vb.get(d, "token_embd_norm.weight")?
+                .dequantize(vb.device())?,
+            cfg.norm_eps,
+        );
+        Ok(Self {
+            inner: TrunkInner {
+                cfg,
+                embedding,
+                layers,
+                norm,
+            },
+        })
+    }
+    pub fn rope_tables(&self, length: usize) -> Result<(Tensor, Tensor)> {
+        self.inner.rope_tables(length)
+    }
+    pub fn embed(&self, tokens: &[u32], batch: usize, length: usize) -> Result<Tensor> {
+        self.inner.embed(tokens, batch, length)
+    }
+    pub fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        prefixes: &[usize],
+    ) -> Result<TrunkBatch> {
+        self.inner.prepare_batch(length, lengths, prefixes)
+    }
+    /// The callback sees full GQA-expanded K/V, compact query-segment masks and
+    /// no causality. Tables and metadata retain the shared core validation.
+    pub fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &TrunkBatch,
+        cos: &Tensor,
+        sin: &Tensor,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+    {
+        self.inner
+            .forward_with_attention(hidden, batch, cos, sin, attend)
     }
 }
 

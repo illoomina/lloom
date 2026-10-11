@@ -154,6 +154,11 @@ impl Drop for DomainInner {
 }
 
 impl Domain {
+    /// Identity is stable while a Domain clone is retained; never dereferenced.
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
     pub fn machine_admission(&self) -> Option<MachineAdmission> {
         self.0.machine.as_ref().map(MachineOwner::status)
     }
@@ -301,6 +306,10 @@ impl Drop for Promise {
 pub(crate) struct PhysicalCharge(Arc<ChargeInner>);
 
 impl PhysicalCharge {
+    pub fn domain(&self) -> &Domain {
+        &self.0.domain
+    }
+
     pub fn bytes(&self) -> usize {
         self.0.bytes
     }

@@ -197,9 +197,34 @@ impl ProcessAccount {
     }
 }
 
+/// Opaque quota identity, independent of native device/buffer identity. Keeping
+/// a key retains its domain (including machine holding), but reserves no bytes.
+/// The retained Arc prevents address reuse for as long as this key exists.
+#[derive(Clone)]
+pub struct DomainKey(core::Domain);
+impl PartialEq for DomainKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.identity() == other.0.identity()
+    }
+}
+impl Eq for DomainKey {}
+impl std::hash::Hash for DomainKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.0.identity(), state);
+    }
+}
+impl std::fmt::Debug for DomainKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DomainKey").finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelDomain(core::Domain);
 impl ModelDomain {
+    pub fn key(&self) -> DomainKey {
+        DomainKey(self.0.clone())
+    }
     pub fn snapshot(&self) -> AccountSnapshot {
         self.0.snapshot().into()
     }
@@ -210,11 +235,14 @@ impl ModelDomain {
         let promise = self.0.try_reserve(bytes)?;
         Ok(PassReservation(Arc::new(PassState {
             promise: Mutex::new(Some(promise)),
+            domain: self.0.clone(),
         })))
     }
 }
 struct PassState {
     promise: Mutex<Option<core::Promise>>,
+    // Remains identifiable after cancellation; it cannot reopen issuance.
+    domain: core::Domain,
 }
 
 #[must_use = "dropping a pass cancels unused demand and closes its contexts"]
@@ -234,6 +262,9 @@ impl Drop for PassReservation {
 #[derive(Clone)]
 pub struct AllocationContext(Arc<PassState>);
 impl AllocationContext {
+    pub fn domain_key(&self) -> DomainKey {
+        DomainKey(self.0.domain.clone())
+    }
     pub fn take(&self, upper_bound: usize) -> Result<AllocationTicket> {
         let promise = self
             .0
@@ -292,6 +323,9 @@ impl Drop for AllocationTicket {
 #[derive(Clone)]
 pub struct PhysicalCharge(core::PhysicalCharge);
 impl PhysicalCharge {
+    pub fn domain_key(&self) -> DomainKey {
+        DomainKey(self.0.domain().clone())
+    }
     pub fn bytes(&self) -> usize {
         self.0.bytes()
     }
@@ -301,6 +335,40 @@ impl PhysicalCharge {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn numeric_domain_keys_distinguish_accounts_and_survive_cancellation() {
+        let account = || ProcessAccount {
+            core: core::ProcessAccount::new(Some(16)),
+            cap: Some(16),
+        };
+        let a = account().unadmitted_domain(Some(8)).unwrap();
+        let b = account().unadmitted_domain(Some(8)).unwrap();
+        let key = a.key();
+        assert_ne!(
+            key,
+            b.key(),
+            "both isolated core accounts begin at numeric id0"
+        );
+        let pass = a.reserve(8).unwrap();
+        let context = pass.context();
+        let ticket = context.take(4).unwrap();
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(key.clone());
+        keys.insert(context.domain_key());
+        assert_eq!(keys.len(), 1);
+        drop(pass);
+        assert_eq!(context.domain_key(), key);
+        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        let charge = ticket.commit(4).unwrap();
+        assert_eq!(charge.domain_key(), key);
+        drop(a);
+        assert!(keys.contains(&charge.domain_key()));
+        drop(charge);
+        drop(context);
+        drop(keys);
+        drop(key);
+    }
 
     #[test]
     fn configuration_is_once_and_uses_the_production_cell() {

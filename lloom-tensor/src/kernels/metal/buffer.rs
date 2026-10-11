@@ -1,3 +1,4 @@
+use crate::allocation_owner::{AllocationLease, AllocationOwner};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{MTLBuffer, MTLResource};
@@ -8,7 +9,7 @@ pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct Buffer {
-    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    raw: AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>>,
 
     /// Byte offset this handle addresses within `raw`.
     ///
@@ -49,7 +50,30 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
+    /// Legacy unadmitted native handle. External raw retains are not tracked.
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
+        Self::with_owner(raw, None)
+    }
+
+    /// Additive source-only admitted constructor; callers must provide both
+    /// preallocation admission and native/residency leases before enabling it.
+    pub(crate) fn new_owned(
+        raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+        owner: AllocationOwner,
+    ) -> Buffer {
+        Self::with_owner(raw, Some(owner))
+    }
+
+    pub(crate) fn allocation_lease(
+        &self,
+    ) -> AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.raw.clone()
+    }
+
+    fn with_owner(
+        raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+        owner: Option<AllocationOwner>,
+    ) -> Buffer {
         // Private storage has no documented CPU mapping. The experimental
         // opt-in retains the owned-buffer probe, never the heap-offset value
         // (which can be non-null without being a CPU address).
@@ -57,7 +81,7 @@ impl Buffer {
             || (crate::tuning::tuning().metal.private_cpu_mapping && raw.heap().is_none());
         super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
         Buffer {
-            raw,
+            raw: AllocationLease::new(raw, owner),
             base_offset: 0,
             length: None,
             cpu_visible,
@@ -186,7 +210,7 @@ impl Buffer {
     /// Get the raw pointer to the underlying Metal buffer object.
     /// Used for dependency tracking in the compute encoder.
     pub(crate) fn raw_ptr(&self) -> *const ProtocolObject<dyn MTLBuffer> {
-        Retained::as_ptr(&self.raw)
+        Retained::as_ptr(self.raw.raw())
     }
 
     /// Address of the underlying `MTLBuffer`, as the encoder sees it.
@@ -218,13 +242,16 @@ impl Buffer {
     }
 
     pub fn set_label(&self, label: &str) {
-        self.raw.setLabel(Some(&NSString::from_str(label)))
+        self.raw.raw().setLabel(Some(&NSString::from_str(label)))
     }
 }
 
+/// Borrowed native compatibility view. Independently retaining this raw object
+/// does not retain its Rust accounting lease; admitted native consumers must
+/// retain `allocation_lease()` through actual completion instead.
 impl AsRef<ProtocolObject<dyn MTLBuffer>> for Buffer {
     fn as_ref(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.raw
+        self.raw.raw()
     }
 }
 

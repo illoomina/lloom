@@ -51,6 +51,8 @@
 mod accelerate;
 #[cfg(any(feature = "metal", test))]
 mod allocation_geometry;
+#[cfg(any(feature = "metal", test))]
+mod allocation_owner;
 pub mod arms;
 pub mod autorelease;
 pub mod backend;

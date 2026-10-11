@@ -531,7 +531,22 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
             kv_precision: opts.kv_precision,
+            machine: Some(lloom::nn::memory::MachineLoad {
+                gate: opts.memory.machine_gate(),
+                label: super::common::machine_label("qwen4exp", &opts.first_shard),
+                rows: opts.batch.max(1),
+                kv_tokens: opts.kv_reserve_tokens.unwrap_or(opts.kv_capacity).max(1),
+                prefill_tile: opts.prefill_tile,
+            }),
         };
+        // The ledger's quota, set before the load so the load's own
+        // allocations are admitted against it (§9.5c).
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            let ws = m.device().recommended_max_working_set_size() as f64;
+            m.ledger()
+                .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+        }
         let prefill_mode = match opts.prefill_mode.as_str() {
             "chunk" => PrefillMode::Chunk,
             "replay" => PrefillMode::Replay,
@@ -553,12 +568,6 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                         .context("loading Qwen4-exp (resident experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
-                #[cfg(feature = "metal")]
-                if let Device::Metal(m) = &device {
-                    let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger()
-                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
-                }
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
                 Engine::<P, Resident>::finish(model, device, opts, tier, installed)
             }
@@ -589,12 +598,6 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
-                #[cfg(feature = "metal")]
-                if let Device::Metal(m) = &device {
-                    let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger()
-                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
-                }
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
                     if path.exists() {

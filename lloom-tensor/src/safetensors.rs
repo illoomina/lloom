@@ -266,12 +266,12 @@ impl Tensor {
                             .with_label("safetensors_view")
                             .build()?;
 
-                        let storage = crate::metal_backend::MetalStorage::new(
+                        let storage = crate::metal_backend::MetalStorage::new_allocated(
                             buffer,
                             device.clone(),
                             data.len(),
                             dtype,
-                        );
+                        )?;
                         Storage::Metal(storage)
                     }
                     #[cfg(not(feature = "metal"))]
@@ -370,8 +370,12 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 .with_label("safetensors_load")
                 .build()?;
 
-            let storage =
-                crate::metal_backend::MetalStorage::new(buffer, device.clone(), data.len(), dtype);
+            let storage = crate::metal_backend::MetalStorage::new_allocated(
+                buffer,
+                device.clone(),
+                data.len(),
+                dtype,
+            )?;
             Storage::Metal(storage)
         }
         #[cfg(not(feature = "metal"))]

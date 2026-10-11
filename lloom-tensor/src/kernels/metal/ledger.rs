@@ -3,58 +3,29 @@
 //! it, never the thing a decision is made on (§6.3d: accounting is cheap,
 //! Metal calls are not).
 //!
-//! Two things live here. A [`Reservation`] is bytes a persistent allocation
-//! holds for its lifetime — the slot pools, the arena base, the pass-plan
-//! base, the heap chunks, every unpooled buffer — released when it drops, so
-//! the committed figure cannot drift from what exists. A [`Tenant`] is a
-//! holder that can say what it needs and wants (a [`Claim`]) and what it
-//! holds now; the registry lists them so a report, and later the arbiter
-//! (A5), sees every claim in one place.
+//! Three things live here. A [`Reservation`] is bytes an allocation holds for
+//! its lifetime — every byte through a backing (`backing.rs`), the slot
+//! pools, the arena and pass-plan bases, the heap chunks — released when it
+//! drops, so the committed figure cannot drift from what exists. A [`Tenant`]
+//! is a holder that can say what it needs and wants (a [`Claim`]) and what it
+//! holds now; [`arbitrate`] fits the claims into the quota and
+//! [`Ledger::yield_for`] asks the caches to give back. And the process's
+//! reservations on the machine (`machine.rs`): a pass admitted against the
+//! quota whose bytes would pass what the process reserved at load widens that
+//! reservation first ([`Ledger::admit_machine`]).
 //!
-//! **Accounting only, for now.** `reserve` never refuses and no claim is
-//! granted or shrunk here; the per-pass admission still reads the device
-//! (`Cache::admit_grow`, `prepare_pass_as`). Reservations as the admission
-//! mechanism are A4; the arbiter over the claims is A5. What this commit
-//! buys is the figure beside `currentAllocatedSize` that tells committed from
-//! elastic bytes (§1.1 #3) and the claims written down.
+//! `reserve` never refuses: admission is the pass's
+//! (`MetalDevice::admit_bytes`), never the allocation's.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-/// What a tenant's memory is to the process (§2 principle 5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Class {
-    /// Chosen by the caller (a context, a row count, a tile): refused when
-    /// it does not fit, never silently reduced.
-    Capability,
-    /// Shrinks under pressure and refills later (expert slots, free lists,
-    /// quarantines, staging spares).
-    Cache,
-    /// Per-pass transients.
-    Scratch,
-}
+use crate::machine::Holding;
 
-impl Class {
-    pub fn name(self) -> &'static str {
-        match self {
-            Class::Capability => "capability",
-            Class::Cache => "cache",
-            Class::Scratch => "scratch",
-        }
-    }
-}
-
-/// A tenant's claim on the quota, in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Claim {
-    /// Below this the tenant cannot work; a capability's floor is a refusal.
-    pub floor: usize,
-    /// What it would use if memory were free.
-    pub want: usize,
-    /// It grows and shrinks in these steps.
-    pub unit: usize,
-    pub class: Class,
-}
+pub use crate::memory_arbitration::{
+    arbitrate, Arbitration, BulkYield, Claim, Class, Grant, LedgerSnapshot, TenantId, TenantRow,
+    YieldReport,
+};
 
 /// A holder of memory the ledger can ask about. Reads must be cheap: the
 /// snapshot runs on a report, never on a step, but a tenant's `claim` and
@@ -64,6 +35,11 @@ pub trait Tenant: Send + Sync {
     fn claim(&self) -> Claim;
     /// Bytes held now.
     fn held(&self) -> usize;
+    /// Opt in only when one atomic operation can report an exact pledged delta.
+    /// Default retains the legacy callback-per-unit behavior.
+    fn yield_bulk(&self, _bytes: usize) -> BulkYield {
+        BulkYield::Legacy
+    }
     /// Cold path: grow by refilling, shrink by evict + retire
     /// (`profiles-and-memory-design.md` §4.2). Returns what the tenant
     /// holds after. A fixed tenant (the default) holds what it holds.
@@ -112,10 +88,6 @@ impl Tenant for Gauge {
     }
 }
 
-/// A registered tenant's handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TenantId(pub u32);
-
 /// Bytes committed for the life of the holder: released on drop, so the
 /// ledger's committed figure is a sum of what exists.
 #[must_use = "a reservation released at once accounts for nothing"]
@@ -139,68 +111,6 @@ impl Drop for Reservation {
     }
 }
 
-/// One tenant's row in a snapshot.
-#[derive(Clone, Debug)]
-pub struct TenantRow {
-    pub id: TenantId,
-    pub name: String,
-    pub claim: Claim,
-    pub held: usize,
-}
-
-/// The ledger at one instant.
-#[derive(Clone, Debug, Default)]
-pub struct LedgerSnapshot {
-    /// `fraction × recommendedMaxWorkingSetSize`; 0 until the binary sets it.
-    pub quota: usize,
-    /// Bytes under live reservations.
-    pub committed: usize,
-    /// Pass-level admissions that reclaimed the free lists, and their bytes.
-    pub reclaims: (u32, usize),
-    /// Refusals that waited the queue out for the pending lists (the
-    /// admission's second rung, `MetalDevice::admit_bytes`).
-    pub drains: u32,
-    pub tenants: Vec<TenantRow>,
-}
-
-impl LedgerSnapshot {
-    /// The sum of the tenants' floors and wants.
-    pub fn floors(&self) -> usize {
-        self.tenants.iter().map(|t| t.claim.floor).sum()
-    }
-
-    pub fn wants(&self) -> usize {
-        self.tenants.iter().map(|t| t.claim.want).sum()
-    }
-
-    /// One line for a report: the quota, the committed bytes, then each
-    /// tenant as `name:class floor/want/held` in MiB.
-    pub fn line(&self) -> String {
-        let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-        let mut s = format!(
-            "quota={:.1} MiB committed={:.1} MiB floors={:.1} MiB wants={:.1} MiB reclaims={}/{:.1} MiB drains={}",
-            mib(self.quota),
-            mib(self.committed),
-            mib(self.floors()),
-            mib(self.wants()),
-            self.reclaims.0,
-            mib(self.reclaims.1),
-            self.drains
-        );
-        for t in &self.tenants {
-            s.push_str(&format!(
-                " {}:{} floor={:.1} want={:.1} held={:.1}",
-                t.name,
-                t.claim.class.name(),
-                mib(t.claim.floor),
-                mib(t.claim.want),
-                mib(t.held)
-            ));
-        }
-        s
-    }
-}
-
 /// One per device: the quota, the committed bytes and the tenant registry.
 #[derive(Debug)]
 pub struct Ledger {
@@ -214,6 +124,9 @@ pub struct Ledger {
     drains: AtomicU32,
     next_id: AtomicU32,
     tenants: parking_lot::Mutex<Vec<(TenantId, Weak<dyn Tenant>)>>,
+    /// The process's reservations on the machine, held by the loads that
+    /// made them (`machine::Gate::admit`); a dropped load drops its row.
+    machine: parking_lot::Mutex<Vec<Weak<Holding>>>,
 }
 
 impl Default for Ledger {
@@ -226,6 +139,7 @@ impl Default for Ledger {
             drains: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
             tenants: parking_lot::Mutex::new(Vec::new()),
+            machine: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -279,21 +193,38 @@ impl Ledger {
         (a, resized)
     }
 
-    /// Ask the tenants that yield — `Scratch` first, then `Cache`, never a
-    /// `Capability` — to shrink by units until `bytes` are pledged or none
-    /// can give more. A pledge is what a tenant reports holding less after
-    /// `resize`; a tenant that frees at once (drops reservations) moves
-    /// `committed` here, one whose owner applies the grant later (the
-    /// expert tier reallocating its pools) moves it then. Returns the
-    /// bytes pledged.
+    /// Compatibility scalar: caps an unrepresentable pledge at usize::MAX and
+    /// omits contention. New admission callers must use `yield_for_report`.
     pub fn yield_for(&self, bytes: usize) -> usize {
-        let mut pledged = 0usize;
+        self.yield_for_report(bytes).pledged.min(usize::MAX as u128) as usize
+    }
+
+    /// Ask Scratch, then Cache (never Capability) to yield. Only opt-in tenants
+    /// use bulk; arbitrary third-party resize callbacks still run once per unit.
+    /// Pledge is not credit: committed changes only when physical owners release.
+    pub fn yield_for_report(&self, bytes: usize) -> YieldReport {
+        let mut report = YieldReport::default();
         let tenants = self.live_tenants();
         for class in [Class::Scratch, Class::Cache] {
             for (_, t) in tenants.iter().filter(|(_, t)| t.claim().class == class) {
+                if report.pledged >= bytes as u128 {
+                    return report;
+                }
+                let remaining = (bytes as u128 - report.pledged) as usize;
+                match t.yield_bulk(remaining) {
+                    BulkYield::Pledged { bytes } => {
+                        report.pledged += bytes as u128;
+                        continue;
+                    }
+                    BulkYield::Contended => {
+                        report.contended += 1;
+                        continue;
+                    }
+                    BulkYield::Legacy => {}
+                }
                 loop {
-                    if pledged >= bytes {
-                        return pledged;
+                    if report.pledged >= bytes as u128 {
+                        return report;
                     }
                     let claim = t.claim();
                     let held = t.held();
@@ -306,11 +237,11 @@ impl Ledger {
                     if after >= held {
                         break;
                     }
-                    pledged += held - after;
+                    report.pledged += (held - after) as u128;
                 }
             }
         }
-        pledged
+        report
     }
 
     /// A pass-level admission gave the free lists back: count it.
@@ -338,7 +269,7 @@ impl Ledger {
     }
 
     /// Commit `bytes` for as long as the reservation lives. Never refuses
-    /// here: admission against the quota is the pass's (A4), not the
+    /// here: admission against the quota is the pass's, not the
     /// allocation's.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Reservation {
         self.committed.fetch_add(bytes, Ordering::AcqRel);
@@ -346,6 +277,44 @@ impl Ledger {
             ledger: Arc::clone(self),
             bytes,
         }
+    }
+
+    /// Count `holding` as this process's reservation on the machine for as
+    /// long as its owner keeps it.
+    pub fn attach_machine(&self, holding: &Arc<Holding>) {
+        let mut m = self.machine.lock();
+        m.retain(|w| w.strong_count() > 0);
+        m.push(Arc::downgrade(holding));
+    }
+
+    /// Bytes the process holds reserved on the machine; `None` when no load
+    /// reserved any (a harness, a test, the gate off).
+    pub fn machine_reserved(&self) -> Option<u64> {
+        let m = self.machine.lock();
+        let live: Vec<Arc<Holding>> = m.iter().filter_map(Weak::upgrade).collect();
+        (!live.is_empty()).then(|| live.iter().map(|h| h.reserved()).sum())
+    }
+
+    /// Admit `bytes` on the machine: inside what the process reserved,
+    /// nothing is read; past it, the first reservation is widened by the
+    /// excess through the machine gate's arithmetic (`Holding::grow_to`), or
+    /// the refusal's text is returned. No reservation, nothing to check.
+    pub fn admit_machine(&self, bytes: u64) -> std::result::Result<(), String> {
+        let live: Vec<Arc<Holding>> = {
+            let m = self.machine.lock();
+            m.iter().filter_map(Weak::upgrade).collect()
+        };
+        let Some(first) = live.first() else {
+            return Ok(());
+        };
+        let reserved: u64 = live.iter().map(|h| h.reserved()).sum();
+        if bytes <= reserved {
+            return Ok(());
+        }
+        first
+            .grow_to(first.reserved() + (bytes - reserved))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// List `tenant` until its owner drops it.
@@ -399,177 +368,128 @@ impl Ledger {
 }
 
 /// One tenant's grant from an arbitration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Grant {
-    pub id: TenantId,
-    pub bytes: usize,
-}
-
-/// What the arbiter decided (`profiles-and-memory-design.md` §4.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Arbitration {
-    /// Every tenant's grant: at least its floor, at most its want.
-    Granted(Vec<Grant>),
-    /// The floors alone exceed the quota: the arithmetic, for the refusal's
-    /// message (§9.5g's shape). Only a `Capability` floor can cause this.
-    Refused { floors: usize, quota: usize },
-}
-
-/// The arbiter's arithmetic, over a snapshot of the tenants' claims:
-/// 1. floors first — if Σ floors > quota, refuse with the arithmetic;
-/// 2. if Σ wants ≤ quota, grant every want (nothing shrinks);
-/// 3. else fill upward from the floors, a unit at a time, to the tenant
-///    whose next unit is worth most — by class order (`Capability`, then
-///    `Cache`, then `Scratch`), the tenants of a class in registration
-///    order; a tenant whose next unit would pass its want, or the quota,
-///    is skipped. (`marginal_value` is §14 Q2's later hook.)
-///
-/// Pure: no tenant is resized here; the ledger's [`Ledger::arbitrate`]
-/// applies the grants that moved. Deterministic in the snapshot's order.
-pub fn arbitrate(quota: usize, tenants: &[TenantRow]) -> Arbitration {
-    let floors: usize = tenants.iter().map(|t| t.claim.floor).sum();
-    if floors > quota {
-        return Arbitration::Refused { floors, quota };
-    }
-    let wants: usize = tenants
-        .iter()
-        .map(|t| t.claim.want.max(t.claim.floor))
-        .sum();
-    if wants <= quota {
-        return Arbitration::Granted(
-            tenants
-                .iter()
-                .map(|t| Grant {
-                    id: t.id,
-                    bytes: t.claim.want.max(t.claim.floor),
-                })
-                .collect(),
-        );
-    }
-    let mut grants: Vec<Grant> = tenants
-        .iter()
-        .map(|t| Grant {
-            id: t.id,
-            bytes: t.claim.floor,
-        })
-        .collect();
-    let mut left = quota - floors;
-    // Class order, registration order within a class.
-    let mut order: Vec<usize> = (0..tenants.len()).collect();
-    order.sort_by_key(|&i| match tenants[i].claim.class {
-        Class::Capability => 0u8,
-        Class::Cache => 1,
-        Class::Scratch => 2,
-    });
-    // Each unit to the first tenant in class order with room for it: the
-    // capability fills to its want before the cache takes a unit, the
-    // cache before the scratch.
-    loop {
-        let next = order.iter().copied().find(|&i| {
-            let t = &tenants[i];
-            let unit = t.claim.unit.max(1);
-            let want = t.claim.want.max(t.claim.floor);
-            grants[i].bytes + unit <= want && unit <= left
-        });
-        let Some(i) = next else {
-            break;
-        };
-        let unit = tenants[i].claim.unit.max(1);
-        grants[i].bytes += unit;
-        left -= unit;
-    }
-    Arbitration::Granted(grants)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(id: u32, class: Class, floor: usize, want: usize, unit: usize) -> TenantRow {
-        TenantRow {
-            id: TenantId(id),
-            name: format!("t{id}"),
-            claim: Claim {
-                floor,
-                want,
-                unit,
-                class,
-            },
-            held: 0,
+    struct BulkOnly {
+        held: AtomicUsize,
+        contended: bool,
+        class: Class,
+    }
+    impl Tenant for BulkOnly {
+        fn name(&self) -> String {
+            "bulk-test".into()
+        }
+        fn claim(&self) -> Claim {
+            Claim {
+                floor: 0,
+                want: self.held(),
+                unit: 1,
+                class: self.class,
+            }
+        }
+        fn held(&self) -> usize {
+            self.held.load(Ordering::Relaxed)
+        }
+        fn yield_bulk(&self, _: usize) -> BulkYield {
+            if self.contended {
+                BulkYield::Contended
+            } else {
+                BulkYield::Pledged {
+                    bytes: self.held.swap(0, Ordering::Relaxed),
+                }
+            }
+        }
+        fn resize(&self, _: usize) -> usize {
+            panic!("bulk tenant must not use legacy resize")
         }
     }
 
     #[test]
-    fn the_arbiter_refuses_on_the_floors_grants_every_want_that_fits_and_fills_by_class() {
-        let mib = 1usize << 20;
-        let kv = row(1, Class::Capability, 64 * mib, 136 * mib, 4 * mib);
-        let experts = row(2, Class::Cache, 80 * mib, 400 * mib, 8 * mib);
-        let scratch = row(3, Class::Scratch, 0, 32 * mib, 1 * mib);
-        // 1. The floors alone exceed the quota: refused with the arithmetic.
+    fn numeric_bulk_yield_reports_exact_overshoot_and_contention() {
+        let ledger = Ledger::new();
+        let tenants: Vec<Arc<dyn Tenant>> = vec![
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(1),
+                contended: true,
+                class: Class::Scratch,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(usize::MAX - 1),
+                contended: false,
+                class: Class::Cache,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(usize::MAX),
+                contended: false,
+                class: Class::Cache,
+            }),
+            Arc::new(BulkOnly {
+                held: AtomicUsize::new(1),
+                contended: true,
+                class: Class::Capability,
+            }),
+        ];
+        for t in &tenants {
+            ledger.register(t);
+        }
         assert_eq!(
-            arbitrate(100 * mib, &[kv.clone(), experts.clone()]),
-            Arbitration::Refused {
-                floors: 144 * mib,
-                quota: 100 * mib
+            ledger.yield_for_report(usize::MAX),
+            YieldReport {
+                pledged: 2 * usize::MAX as u128 - 1,
+                contended: 1
             }
         );
-        // 2. Every want fits: every want granted, nothing shrinks.
+        assert_eq!(ledger.committed(), 0, "a pledge is not physical credit");
+        assert_eq!(tenants[3].held(), 1, "capability not visited");
+        assert_eq!(ledger.yield_for_report(0), YieldReport::default());
+    }
+
+    #[test]
+    fn numeric_legacy_yield_keeps_each_callback() {
+        struct Stateful {
+            held: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        impl Tenant for Stateful {
+            fn name(&self) -> String {
+                "legacy-stateful".into()
+            }
+            fn claim(&self) -> Claim {
+                Claim {
+                    floor: 2,
+                    want: 8,
+                    unit: 2,
+                    class: Class::Cache,
+                }
+            }
+            fn held(&self) -> usize {
+                self.held.load(Ordering::Relaxed)
+            }
+            fn resize(&self, grant: usize) -> usize {
+                assert_eq!(grant, self.held() - 2, "one-unit callback contract");
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.held.store(grant, Ordering::Relaxed);
+                grant
+            }
+        }
+        let ledger = Ledger::new();
+        let owner = Arc::new(Stateful {
+            held: AtomicUsize::new(8),
+            calls: AtomicUsize::new(0),
+        });
+        let tenant: Arc<dyn Tenant> = owner.clone();
+        ledger.register(&tenant);
         assert_eq!(
-            arbitrate(1000 * mib, &[kv.clone(), experts.clone(), scratch.clone()]),
-            Arbitration::Granted(vec![
-                Grant {
-                    id: TenantId(1),
-                    bytes: 136 * mib
-                },
-                Grant {
-                    id: TenantId(2),
-                    bytes: 400 * mib
-                },
-                Grant {
-                    id: TenantId(3),
-                    bytes: 32 * mib
-                },
-            ])
+            ledger.yield_for_report(5),
+            YieldReport {
+                pledged: 6,
+                contended: 0
+            }
         );
-        // 3. Between: the floors, then units upward by class — the
-        // capability fills first, the cache next, the scratch last; a
-        // tenant at its want is skipped; the sum never passes the quota.
-        let quota = 144 * mib + 100 * mib;
-        let Arbitration::Granted(g) =
-            arbitrate(quota, &[scratch.clone(), experts.clone(), kv.clone()])
-        else {
-            panic!("fits above the floors")
-        };
-        let by = |id: u32| g.iter().find(|x| x.id == TenantId(id)).unwrap().bytes;
-        assert_eq!(by(1), 136 * mib, "the capability reached its want");
-        assert!(
-            by(2) >= 80 * mib && by(2) < 400 * mib,
-            "the cache got the rest: {}",
-            by(2)
-        );
-        assert!(by(3) < 32 * mib, "the scratch got what was left: {}", by(3));
-        let total: usize = g.iter().map(|x| x.bytes).sum();
-        assert!(
-            total <= quota && total > quota - 8 * mib,
-            "{total} vs {quota}"
-        );
-        assert_eq!(by(1) + by(2) + by(3), total);
-        // Registration order within a class decides between equals.
-        let a = row(4, Class::Cache, 0, 10 * mib, 10 * mib);
-        let b = row(5, Class::Cache, 0, 10 * mib, 10 * mib);
-        assert_eq!(
-            arbitrate(10 * mib, &[a, b]),
-            Arbitration::Granted(vec![
-                Grant {
-                    id: TenantId(4),
-                    bytes: 10 * mib
-                },
-                Grant {
-                    id: TenantId(5),
-                    bytes: 0
-                },
-            ])
-        );
+        assert_eq!(owner.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(ledger.yield_for(1), 0);
     }
 
     /// A tenant that yields: its `resize` drops a unit's reservation at
@@ -758,7 +678,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod device_tests {
     //! The device's persistent paths commit their bytes for the handle's
     //! life (`MetalDevice::new_persistent_*`, `new_unpooled_shared`): the
@@ -792,7 +712,7 @@ mod device_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod admit_tests {
     //! A pass-level admission that would refuse gives the pools' free lists
     //! back first and decides on the figure after (`MetalDevice::admit_bytes`).
@@ -1010,5 +930,151 @@ mod admit_tests {
         drop(raw);
         drop(held);
         assert_eq!(m.ledger().committed(), committed);
+    }
+
+    /// Past what the load reserved on the machine, a pass that fits the
+    /// quota widens the reservation through the machine gate, or is refused
+    /// with the gate's arithmetic; inside it nothing is asked. The
+    /// non-vacuity arm: with no reservation attached, the same pass fits.
+    #[test]
+    fn a_pass_past_the_machine_reservation_widens_it_or_is_refused() {
+        use crate::machine::{Gate, GateConfig, Peak};
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let gb = 1_000_000_000usize;
+        let budget = usize::MAX;
+        assert!(
+            m.admit_bytes(20 * gb, budget).fits,
+            "no reservation attached: the machine is not asked"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "lloom-ledger-machine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // 10 GB available, nothing kept: the room is 10 GB less what this
+        // process has reserved and does not hold yet (its footprint is far
+        // under a gigabyte, so the arms below hold whatever it is).
+        let gate = Gate::new(GateConfig {
+            reserve: Some(0),
+            registry: Some(dir.clone()),
+            available: Some(10 * gb as u64),
+            total: Some(64 * gb as u64),
+            ..Default::default()
+        });
+        let held = gate
+            .admit("ledger test", &Peak::new().with("weights", gb as u64))
+            .unwrap()
+            .holding
+            .unwrap();
+        m.ledger().attach_machine(&held);
+        assert_eq!(m.ledger().machine_reserved(), Some(gb as u64));
+        let committed = m.ledger().committed();
+        // Inside the reservation: admitted, the reservation unmoved.
+        let a = m.admit_bytes(gb / 2 - committed.min(gb / 2), budget);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert_eq!(held.reserved(), gb as u64);
+        // Past it, with room: admitted, the reservation widened to the pass.
+        let a = m.admit_bytes(2 * gb, budget);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert_eq!(held.reserved(), (committed + 2 * gb) as u64);
+        // Past the room: refused with the gate's arithmetic, unmoved.
+        let a = m.admit_bytes(20 * gb, budget);
+        assert!(!a.fits, "{a:?}");
+        let why = a.machine.expect("the machine's refusal");
+        assert!(
+            why.contains("the machine cannot hold this now") && why.contains("of growth"),
+            "{why}"
+        );
+        assert_eq!(held.reserved(), (committed + 2 * gb) as u64);
+        drop(held);
+        assert_eq!(m.ledger().machine_reserved(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pass past the reservation on a machine that cannot widen it gives
+    /// back what the process holds and does not need — buffers its earlier
+    /// passes released — and is admitted inside the reservation, unwidened,
+    /// rather than refused on bytes it would have reused.
+    #[test]
+    fn a_pass_the_machine_refuses_is_asked_again_after_the_reclaim() {
+        use crate::machine::{Gate, GateConfig, Peak};
+        let _knob = DRAIN_KNOB.lock();
+        crate::metal_backend::set_admission_drain(true);
+        let Ok(Device::Metal(m)) = Device::new_metal(0) else {
+            return;
+        };
+        let mib = 1usize << 20;
+        let dir = std::env::temp_dir().join(format!(
+            "lloom-ledger-machine-again-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Reserved: what the process holds now, the pass's 32 MiB and 8 MiB
+        // of slack, on a machine with exactly that available and nothing kept. An injected
+        // reading does not fall as the process allocates, so the room to
+        // widen it stays the reservation itself: smaller than the earlier
+        // pass's buffers below, which the first figure counts.
+        let need = 32 * mib;
+        let committed = m.ledger().committed();
+        let reserved = committed + need + 8 * mib;
+        let released = (reserved + 32 * mib).next_multiple_of(4 * mib);
+        assert!(
+            released <= 256 * mib,
+            "a fresh device commits {committed} bytes: the released buffers would pass the free list's cap"
+        );
+        let gate = Gate::new(GateConfig {
+            reserve: Some(0),
+            registry: Some(dir.clone()),
+            available: Some(reserved as u64),
+            total: Some(reserved as u64),
+            ..Default::default()
+        });
+        let held = gate
+            .admit("ledger test", &Peak::new().with("weights", reserved as u64))
+            .unwrap()
+            .holding
+            .unwrap();
+        m.ledger().attach_machine(&held);
+        // An earlier pass's buffers, released: free once its epoch completes.
+        let bufs: Vec<_> = (0..released / (4 * mib))
+            .map(|_| m.allocate_buffer(4 * mib).unwrap())
+            .collect();
+        drop(bufs);
+        let clock = m.gpu_clock();
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        assert!(m.ledger().committed() >= committed + released);
+        let a = m.admit_bytes(need, usize::MAX);
+        assert!(a.fits && a.machine.is_none(), "{a:?}");
+        assert!(
+            a.reclaimed >= released,
+            "the released buffers went back: {a:?}"
+        );
+        assert!(a.committed + need <= reserved, "{a:?}");
+        assert_eq!(
+            held.reserved(),
+            reserved as u64,
+            "admitted inside it, unwidened"
+        );
+        // Past the reservation with nothing to give back: refused.
+        let a = m.admit_bytes(2 * reserved, usize::MAX);
+        assert!(!a.fits, "{a:?}");
+        assert!(
+            a.machine
+                .as_deref()
+                .is_some_and(|w| w.contains("the machine cannot hold this now")),
+            "{a:?}"
+        );
+        assert_eq!(held.reserved(), reserved as u64);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,6 +22,8 @@ pub mod batched;
 mod batched_spec;
 pub mod blocks;
 pub mod channel_affine;
+#[cfg(any(feature = "metal", test))]
+mod checkout;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;

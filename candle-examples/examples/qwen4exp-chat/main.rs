@@ -784,6 +784,7 @@ fn run<P: QwenShape>(args: Args) -> Result<()> {
             .map(lloom::models::qwen4exp::config::parse_kv_precision)
             .transpose()
             .map_err(anyhow::Error::msg)?,
+        machine: None,
     };
     let mem_check = mem_check_arm(&args)?;
     let prefill_mode = match args.prefill.as_str() {

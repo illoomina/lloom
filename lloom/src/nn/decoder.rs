@@ -69,6 +69,30 @@ pub struct WindowMark {
     pub blocks: usize,
 }
 
+/// Bytes a sequence's state holds, or a pass would add to it, by kind: the
+/// attention layers' KV and the recurrent layers' state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateBytes {
+    pub kv: usize,
+    pub recurrent: usize,
+}
+
+impl StateBytes {
+    pub fn total(&self) -> usize {
+        self.kv + self.recurrent
+    }
+}
+
+impl std::ops::Add for StateBytes {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        Self {
+            kv: self.kv + o.kv,
+            recurrent: self.recurrent + o.recurrent,
+        }
+    }
+}
+
 /// A token mixer the topology can own the state of: how to make a fresh
 /// state for one layer, clear it, walk the mixer's step, and roll the state
 /// back over a speculative window (`sequence-state.md` §10.2a: a KV cache
@@ -76,6 +100,12 @@ pub struct WindowMark {
 pub trait MixerBlock: Mixer + Send + Sync {
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State>;
     fn reset_state(state: &mut Self::State);
+    /// Bytes `state` holds on the device now.
+    fn held_bytes(&self, state: &Self::State) -> StateBytes;
+    /// Bytes a pass of `n` positions would allocate for `state` — a KV slab
+    /// widened, a recurrent state's first write; zero when nothing grows.
+    /// Sized, not performed.
+    fn grow_bytes(&self, state: &Self::State, n: usize) -> StateBytes;
     /// The mixer's decode step as IR, layer `l` (`Visit`, with the layer index
     /// and the capacity a cache-bearing mixer's walk reads).
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId;
@@ -158,6 +188,10 @@ pub trait Layer: Send + Sync {
     type State: Send + Sync;
     fn new_state(&self, dev: &Device, cap: &StateCapacity) -> Result<Self::State>;
     fn reset_state(state: &mut Self::State);
+    /// [`MixerBlock::held_bytes`] over the layer's state.
+    fn held_bytes(&self, state: &Self::State) -> StateBytes;
+    /// [`MixerBlock::grow_bytes`] over the layer's state.
+    fn grow_bytes(&self, state: &Self::State, n: usize) -> StateBytes;
     fn execute(&self, x: &Tensor, state: &mut Self::State) -> Result<Tensor>;
     fn visit_layer(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId;
     fn open_window(state: &mut Self::State) -> Result<WindowMark>;
@@ -327,6 +361,13 @@ where
         M::reset_state(&mut state.mixer);
         F::reset_state(&mut state.ffn);
     }
+    /// The feed-forward holds no per-sequence state on any block here.
+    fn held_bytes(&self, state: &Self::State) -> StateBytes {
+        self.mixer.held_bytes(&state.mixer)
+    }
+    fn grow_bytes(&self, state: &Self::State, n: usize) -> StateBytes {
+        self.mixer.grow_bytes(&state.mixer, n)
+    }
     fn execute(&self, x: &Tensor, state: &mut Self::State) -> Result<Tensor> {
         let h = self.norm_in.execute(x)?;
         let m = self.mixer.execute(&h, &mut state.mixer)?;
@@ -457,6 +498,20 @@ where
             HybridState::B(s) => B::reset_state(s),
         }
     }
+    fn held_bytes(&self, state: &Self::State) -> StateBytes {
+        match (self, state) {
+            (Hybrid::A(m), HybridState::A(s)) => m.held_bytes(s),
+            (Hybrid::B(m), HybridState::B(s)) => m.held_bytes(s),
+            _ => StateBytes::default(),
+        }
+    }
+    fn grow_bytes(&self, state: &Self::State, n: usize) -> StateBytes {
+        match (self, state) {
+            (Hybrid::A(m), HybridState::A(s)) => m.grow_bytes(s, n),
+            (Hybrid::B(m), HybridState::B(s)) => m.grow_bytes(s, n),
+            _ => StateBytes::default(),
+        }
+    }
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId {
         match self {
             Hybrid::A(m) => m.visit_step(w, x, l, cap),
@@ -561,10 +616,61 @@ pub struct DecoderState<L: Layer> {
     nextn: RowLog,
     want_nextn: bool,
     nextn_drops: u64,
+    /// The state's rows on the device's ledger — the KV and the recurrent
+    /// state — kept current at the passes that allocate.
+    #[cfg(feature = "metal")]
+    ledger: Option<StateTenants>,
     /// The turn checkpoints (`sequence-reuse-design.md` §2.3b): the ring
     /// of every layer's [`Layer::checkpoint_elems`] f32s, the KV layers'
     /// lengths in the marks (`nn::turn_checkpoint`).
     ckpt: CheckpointRing,
+}
+
+/// A decoder state's two ledger rows.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct StateTenants {
+    kv: std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>,
+    recurrent: std::sync::Arc<lloom_tensor::kernels::metal::ledger::Gauge>,
+}
+
+#[cfg(feature = "metal")]
+impl StateTenants {
+    /// Register `family`'s two rows on `m`'s ledger: capabilities (the
+    /// caller chose the context), whose floor is what the state holds.
+    fn register(m: &lloom_tensor::MetalDevice, family: &str) -> Self {
+        use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+        let row = |what: &str| {
+            let g = Gauge::new(
+                format!("{family}-{what}"),
+                Claim {
+                    floor: 0,
+                    want: 0,
+                    unit: 1,
+                    class: Class::Capability,
+                },
+                0,
+            );
+            let t: std::sync::Arc<dyn Tenant> = g.clone();
+            m.ledger().register(&t);
+            g
+        };
+        Self {
+            kv: row("kv"),
+            recurrent: row("state"),
+        }
+    }
+
+    fn note(&self, held: StateBytes) {
+        use lloom_tensor::kernels::metal::ledger::Tenant;
+        for (g, b) in [(&self.kv, held.kv), (&self.recurrent, held.recurrent)] {
+            let mut c = g.claim();
+            c.floor = b;
+            c.want = b;
+            g.set_claim(c);
+            g.set_held(b);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -583,6 +689,8 @@ impl<L: Layer> DecoderState<L> {
             nextn: RowLog::default(),
             want_nextn: false,
             nextn_drops: 0,
+            #[cfg(feature = "metal")]
+            ledger: None,
             ckpt: CheckpointRing::none(),
         }
     }
@@ -879,6 +987,16 @@ pub struct Decoder<P: Profile, C, E, L, H> {
     hidden: usize,
     /// The device the weights live on (a zero-row probe is made there).
     device: Device,
+    /// What the load reserved on the machine (`lloom_tensor::machine`),
+    /// released when the model drops.
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    /// What else the load registered for the model's life (a ledger row of
+    /// a block the model owns), dropped with it.
+    keep: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// The bytes a multi-position pass allocates per position, from the
+    /// family's geometry (0: the family says nothing, and a pass's working
+    /// set is not admitted).
+    prefill_bytes_per_position: usize,
 }
 
 /// The chunk a prefill runs through the layers at once.
@@ -918,7 +1036,33 @@ where
             family,
             hidden,
             device: device.clone(),
+            reservation: None,
+            keep: Vec::new(),
+            prefill_bytes_per_position: 0,
         })
+    }
+
+    /// The bytes a multi-position pass allocates per position: what
+    /// `prepare_pass` admits on the machine before a prefill pass runs.
+    pub fn set_prefill_bytes_per_position(&mut self, bytes: usize) {
+        self.prefill_bytes_per_position = bytes;
+    }
+
+    /// Keep the load's machine reservation for the model's life.
+    pub fn hold_reservation(
+        &mut self,
+        reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    ) {
+        self.reservation = reservation;
+    }
+
+    pub fn reservation(&self) -> Option<&std::sync::Arc<lloom_tensor::machine::Holding>> {
+        self.reservation.as_ref()
+    }
+
+    /// Keep `held` for the model's life.
+    pub fn keep_alive(&mut self, held: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.keep.push(held);
     }
 
     pub fn device(&self) -> &Device {
@@ -960,6 +1104,22 @@ where
     }
     pub fn set_prefill_chunk(&mut self, chunk: usize) {
         self.chunk = chunk.max(1);
+    }
+
+    /// Bytes `state` holds on the device, over every layer.
+    pub fn held_bytes(&self, state: &DecoderState<L>) -> StateBytes {
+        self.layers
+            .iter()
+            .zip(&state.layers)
+            .fold(StateBytes::default(), |a, (l, s)| a + l.held_bytes(s))
+    }
+
+    /// Bytes a pass of `n` positions would add to `state`, over every layer.
+    pub fn grow_bytes(&self, state: &DecoderState<L>, n: usize) -> StateBytes {
+        self.layers
+            .iter()
+            .zip(&state.layers)
+            .fold(StateBytes::default(), |a, (l, s)| a + l.grow_bytes(s, n))
     }
 
     /// The bytes a state's turn-checkpoint ring takes at this capacity
@@ -1085,7 +1245,85 @@ where
             .iter()
             .map(|l| l.checkpoint_elems(&self.cap))
             .collect();
-        Ok(DecoderState::new(layers).with_checkpoints(&elems, self.cap.checkpoints))
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut state = DecoderState::new(layers).with_checkpoints(&elems, self.cap.checkpoints);
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = dev {
+            let t = StateTenants::register(m, self.family);
+            t.note(self.held_bytes(&state));
+            state.ledger = Some(t);
+        }
+        Ok(state)
+    }
+
+    /// Admit what the pass allocates before it runs, refused with the
+    /// arithmetic before anything moves: the state's growth (the KV slabs
+    /// widened, the recurrent states' first writes) against the ledger's
+    /// quota and the machine; and a multi-position pass's working set
+    /// against the machine (`MetalDevice::admit_bytes`, `memory.md` §9.10)
+    /// — a pass inside the load's reservation asks nothing. A decode step
+    /// that grows nothing reads nothing.
+    fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        let grow = self.grow_bytes(cache, seq_len);
+        let pass = if seq_len > 1 {
+            seq_len * self.prefill_bytes_per_position
+        } else {
+            0
+        };
+        if grow.total() == 0 && pass == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &self.device {
+            let gb = |b: usize| b as f64 / 1e9;
+            if grow.total() > 0 {
+                let quota = m.ledger().quota();
+                let budget = if quota == 0 { usize::MAX } else { quota };
+                let a = m.admit_bytes(grow.total(), budget);
+                if !a.fits {
+                    if let Some(why) = &a.machine {
+                        lloom_tensor::bail!(
+                            "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
+                             is refused before anything is written: {why}",
+                            self.family,
+                            cache.pos,
+                            gb(grow.total()),
+                            gb(grow.kv),
+                            gb(grow.recurrent)
+                        );
+                    }
+                    lloom_tensor::bail!(
+                        "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
+                         {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
+                         giving back {:.3} GB of free lists; the pass stops here, before anything is \
+                         written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
+                        self.family,
+                        cache.pos,
+                        gb(grow.total()),
+                        gb(grow.kv),
+                        gb(grow.recurrent),
+                        gb(a.committed),
+                        gb(budget),
+                        gb(a.reclaimed),
+                    );
+                }
+                if let Some(t) = &cache.ledger {
+                    t.note(self.held_bytes(cache) + grow);
+                }
+            }
+            if pass > 0 {
+                if let Some(why) = m.admit_bytes(pass, usize::MAX).machine {
+                    lloom_tensor::bail!(
+                        "{}: the {seq_len}-position pass at position {} ({:.2} GB of working set) \
+                         is refused before it runs: {why}",
+                        self.family,
+                        cache.pos,
+                        gb(pass)
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
@@ -1372,6 +1610,23 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::GatedDeltaNet<P> {
         state.s.reset();
         state.conv.reset();
     }
+    fn held_bytes(&self, state: &Self::State) -> StateBytes {
+        StateBytes {
+            kv: 0,
+            recurrent: state.s.bytes_held() + state.conv.bytes_held(),
+        }
+    }
+    /// The first write allocates the whole state (the ring's phases pooled,
+    /// the slab and its spare else); after it nothing grows.
+    fn grow_bytes(&self, state: &Self::State, _n: usize) -> StateBytes {
+        let recurrent = match state.s.pool_slot(0) {
+            Some((pool, _, _, false)) => self.state_bytes(pool.phases()),
+            Some(_) => 0,
+            None if state.s.get(0).is_none() => self.state_bytes(2),
+            None => 0,
+        };
+        StateBytes { kv: 0, recurrent }
+    }
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, _cap: &StateCapacity) -> NodeId {
         self.visit(w, (x, l))
     }
@@ -1506,6 +1761,20 @@ impl<P: Profile> MixerBlock for crate::models::qwen4exp::QsaAttention<P> {
     }
     fn reset_state(state: &mut Self::State) {
         state.reset();
+    }
+    fn held_bytes(&self, state: &Self::State) -> StateBytes {
+        let (nkv, hd) = self.kv_geometry();
+        StateBytes {
+            kv: state.bytes_held(nkv, hd),
+            recurrent: 0,
+        }
+    }
+    fn grow_bytes(&self, state: &Self::State, n: usize) -> StateBytes {
+        let (nkv, hd) = self.kv_geometry();
+        StateBytes {
+            kv: state.grow_bytes_for(n, nkv, hd),
+            recurrent: 0,
+        }
     }
     fn visit_step(&self, w: &mut Walker, x: NodeId, l: usize, cap: &StateCapacity) -> NodeId {
         self.visit(w, (x, l, cap.kv_precision))

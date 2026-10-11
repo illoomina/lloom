@@ -14,6 +14,7 @@
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
 mod load_warnings;
+mod machine_gate;
 mod qwen4exp_served_auto;
 mod tiny_chat_e2e;
 mod tiny_templates;

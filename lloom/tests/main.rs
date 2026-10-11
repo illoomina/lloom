@@ -20,6 +20,7 @@ mod block_traits;
 mod cpu_flash_attn;
 mod cpu_numerics_probe;
 mod decode_driver_tests;
+mod decoder_memory;
 mod decoder_turn_checkpoint;
 mod dspark_decode_identity;
 mod emulated_bf16_load;

@@ -1072,13 +1072,13 @@ pub(crate) fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
 
 /// Whether `device` may hand a later pass the memory an earlier pass's
 /// activation lives in (`MetalDevice::activations_may_be_reused`).
-fn activations_may_be_reused(device: &Device) -> bool {
+fn activations_may_be_reused(device: &Device) -> Result<bool> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
-        return m.activations_may_be_reused();
+        return Ok(m.execution_device()?.activations_may_be_reused());
     }
     let _ = device;
-    false
+    Ok(false)
 }
 
 pub(crate) fn end_pass(device: &Device) -> Result<()> {
@@ -2669,7 +2669,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
     /// declared).
     pub(crate) fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
-        if !activations_may_be_reused(logits.device()) {
+        if !activations_may_be_reused(logits.device())? {
             return Ok(logits);
         }
         let hold = match &self.seq.logits_hold {

@@ -1415,6 +1415,21 @@ pub struct MemoryConfig {
     /// Qwen4-exp `--experts stream`: streamed experts per layer per projection — a count, or `auto` (from the working set at `memory_fraction`).
     #[opt(flag = "slots", parser = "parse_slots", variants = ["auto", "<count>"], path = "weights.experts.slots", status = "stable", cli = "slots", facets = ["buffer"], flows = ["weights-in"])]
     pub slots: String,
+    /// Admit every load against the machine before anything is allocated: its predicted peak against the memory the host has available now, less a reserve for the OS and the UI and what other lloom processes have reserved and not yet taken (memory.md §9.10). False loads unadmitted.
+    #[opt(bool, path = "memory.machine.gate", status = "advanced")]
+    pub machine_gate: bool,
+    /// Load even when the machine gate refuses; the reservation is still recorded, so other lloom processes see it.
+    #[opt(bool, path = "memory.machine.force", status = "stable", cli = "force")]
+    pub force: bool,
+    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, 10 % of the machine's memory).
+    #[opt(path = "memory.machine.reserve_gb", status = "advanced")]
+    pub machine_reserve_gb: Option<f64>,
+    /// The directory of the machine-wide registry of lloom processes' reservations; none = ~/.cache/lloom/memory.
+    #[opt(path = "memory.machine.registry", status = "advanced")]
+    pub machine_registry: Option<std::path::PathBuf>,
+    /// GB the machine gate takes as available instead of reading the host, for tests and dry runs; none = the host's reading.
+    #[opt(path = "memory.machine.available_gb", status = "instrument")]
+    pub machine_available_gb: Option<f64>,
 }
 
 impl Default for MemoryConfig {
@@ -1427,7 +1442,27 @@ impl Default for MemoryConfig {
             free_budget_mb: None,
             kv_reserve_tokens: None,
             slots: "auto".into(),
+            machine_gate: true,
+            force: false,
+            machine_reserve_gb: None,
+            machine_registry: None,
+            machine_available_gb: None,
         }
+    }
+}
+
+impl MemoryConfig {
+    /// The machine gate these options describe (`lloom_tensor::machine`).
+    pub fn machine_gate(&self) -> lloom_tensor::machine::Gate {
+        let bytes = |gb: f64| (gb.max(0.0) * 1e9) as u64;
+        lloom_tensor::machine::Gate::new(lloom_tensor::machine::GateConfig {
+            reserve: self.machine_reserve_gb.map(bytes),
+            registry: self.machine_registry.clone(),
+            available: self.machine_available_gb.map(bytes),
+            total: None,
+            force: self.force,
+            off: !self.machine_gate,
+        })
     }
 }
 

@@ -171,6 +171,31 @@ impl RegionPlan {
         }
     }
 
+    /// Fallible native-allocation route. Preserve tenant ordering and duplicate
+    /// replacement behavior while rejecting unrepresentable offsets/padding.
+    pub fn checked_reserve(reservations: &[(TenantId, usize)]) -> Result<Self, String> {
+        let aligned = |n: usize| {
+            n.checked_add(REGION_ALIGNMENT - 1)
+                .map(|n| n / REGION_ALIGNMENT * REGION_ALIGNMENT)
+                .ok_or_else(|| "session region alignment overflow".to_string())
+        };
+        let mut spans = HashMap::with_capacity(reservations.len());
+        let mut ordered = reservations.to_vec();
+        ordered.sort_unstable_by_key(|&(tenant, _)| tenant);
+        let mut cursor = 0usize;
+        for (tenant, reserved) in ordered {
+            let offset = aligned(cursor)?;
+            cursor = offset
+                .checked_add(reserved)
+                .ok_or_else(|| "session region size overflow".to_string())?;
+            spans.insert(tenant, Span { offset, reserved });
+        }
+        Ok(Self {
+            spans,
+            bytes: aligned(cursor)?,
+        })
+    }
+
     /// Build a plan from explicit `(tenant, offset, reserved)` triples.
     ///
     /// **For tests only, and it exists so `check_disjoint` has an inverted arm.**
@@ -419,5 +444,55 @@ impl std::fmt::Debug for SessionRegion {
             .field("tenants", &self.inner.plan.len())
             .field("bytes", &self.inner.plan.bytes())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod checked_planner_tests {
+    use super::*;
+    #[test]
+    fn checked_planner_region_geometry() {
+        assert_eq!(RegionPlan::checked_reserve(&[]).unwrap().bytes(), 0);
+        let plan = RegionPlan::checked_reserve(&[(2, 1), (0, 0), (1, 128)]).unwrap();
+        assert_eq!(
+            plan.spans[&0],
+            Span {
+                offset: 0,
+                reserved: 0
+            }
+        );
+        assert_eq!(
+            plan.spans[&1],
+            Span {
+                offset: 0,
+                reserved: 128
+            }
+        );
+        assert_eq!(
+            plan.spans[&2],
+            Span {
+                offset: 128,
+                reserved: 1
+            }
+        );
+        assert_eq!(plan.bytes(), 256);
+        let duplicate = RegionPlan::checked_reserve(&[(1, 1), (1, 1)]).unwrap();
+        assert_eq!(
+            duplicate.spans[&1],
+            Span {
+                offset: 128,
+                reserved: 1
+            }
+        );
+        assert_eq!(duplicate.bytes(), 256);
+        assert_eq!(
+            RegionPlan::checked_reserve(&[(0, usize::MAX - 127)])
+                .unwrap()
+                .bytes(),
+            usize::MAX - 127
+        );
+        assert!(RegionPlan::checked_reserve(&[(0, usize::MAX)]).is_err());
+        assert!(RegionPlan::checked_reserve(&[(0, usize::MAX - 127), (1, 128)]).is_err());
+        assert!(RegionPlan::checked_reserve(&[(0, usize::MAX - 126), (1, 0)]).is_err());
     }
 }

@@ -97,8 +97,8 @@ fn main() -> Result<()> {
             }
         }
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        cb.commit()?;
+        cb.wait_until_completed()?;
         Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6)
     };
 

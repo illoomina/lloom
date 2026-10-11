@@ -307,7 +307,8 @@ impl lloom_tensor::CustomOp3 for RotaryEmbI {
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let out = lloom_tensor::MetalStorage::new(output, device.clone(), el, src.dtype());
+        let out =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
         Ok((out, l_src.shape().clone()))
     }
 }
@@ -613,7 +614,8 @@ impl lloom_tensor::CustomOp3 for RotaryEmb {
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let out = lloom_tensor::MetalStorage::new(output, device.clone(), el, src.dtype());
+        let out =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
         Ok((out, l_src.shape().clone()))
     }
 }
@@ -888,7 +890,8 @@ impl lloom_tensor::CustomOp3 for RotaryEmbThd {
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let out = lloom_tensor::MetalStorage::new(output, device.clone(), el, src.dtype());
+        let out =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
         Ok((out, l_src.shape().clone()))
     }
 }

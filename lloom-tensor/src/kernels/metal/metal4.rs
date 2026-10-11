@@ -2,6 +2,7 @@
 //! a logical submission keeps its own completion state so old markers cannot
 //! start observing a later use of the same native object.
 use super::Device;
+use crate::completion_wake::Wake;
 use crate::kernels::MetalKernelError;
 use block2::RcBlock;
 use crossbeam_queue::ArrayQueue;
@@ -12,13 +13,33 @@ use std::{
     collections::HashSet,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
 };
 
 const SLOTS: usize = 8;
 const PAGE_BYTES: usize = 64 * 1024;
+
+// Feedback initialization alone is not readiness: a reader could observe the
+// OnceLock before Error is published and misclassify the failed submission.
+// Both native completion writers initialize feedback before this terminal
+// Release; all data-wait readers acquire this same publication boundary.
+fn publish_terminal_status(status: &AtomicUsize, failed: bool) {
+    status.store(
+        if failed {
+            MTLCommandBufferStatus::Error.0
+        } else {
+            MTLCommandBufferStatus::Completed.0
+        },
+        Ordering::Release,
+    );
+}
+
+fn terminal_data_ready(status: &AtomicUsize) -> bool {
+    let observed = MTLCommandBufferStatus(status.load(Ordering::Acquire));
+    observed == MTLCommandBufferStatus::Completed || observed == MTLCommandBufferStatus::Error
+}
 
 type Callback = Box<dyn Fn(&Feedback) + Send + Sync>;
 
@@ -28,65 +49,16 @@ pub(crate) struct Feedback {
     pub end: f64,
 }
 
-/// A notification sequence, not a mutex shared with the completion thread.
-/// The waiter snapshots BEFORE checking its predicate. Registration plus the
-/// sequence check under parking_lot's queue lock closes check -> park; sequential
-/// consistency prevents the waker missing registration while validation misses
-/// the new sequence. No parking/wake call when nobody needs to block.
-#[derive(Default)]
-struct Wake {
-    epoch: AtomicUsize,
-    waiters: AtomicUsize,
-}
-impl Wake {
-    fn snapshot(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
-    }
-    fn notify(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-        if self.waiters.load(Ordering::SeqCst) != 0 {
-            // SAFETY: this object's own stable address is its parking key.
-            // Every parked caller holds the enclosing Queue/Submission alive.
-            unsafe {
-                parking_lot_core::unpark_all(
-                    self as *const Self as usize,
-                    parking_lot_core::DEFAULT_UNPARK_TOKEN,
-                );
-            }
-        }
-    }
-    fn wait(&self, seen: usize) {
-        self.park(seen, None);
-    }
-    fn park(
-        &self,
-        seen: usize,
-        deadline: Option<std::time::Instant>,
-    ) -> parking_lot_core::ParkResult {
-        self.waiters.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: same owned key as notify; validation only reads an atomic,
-        // cannot panic or reenter parking_lot. The caller keeps self alive.
-        let result = unsafe {
-            parking_lot_core::park(
-                self as *const Self as usize,
-                || self.snapshot() == seen,
-                || {},
-                |_, _| {},
-                parking_lot_core::DEFAULT_PARK_TOKEN,
-                deadline,
-            )
-        };
-        self.waiters.fetch_sub(1, Ordering::SeqCst);
-        result
-    }
-}
-
 pub(crate) struct Queue {
     pub raw: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     device: Device,
     available: ArrayQueue<Slot>,
     allocated: AtomicUsize,
-    ready: Wake,
+    ready: Arc<Wake>,
+    failure: Arc<crate::retirement_owners::FailureSignal>,
+    retirement: super::retirement::Registry,
+    completions: OnceLock<Arc<super::retirement::Metal4Completions>>,
+    commit_order: Mutex<u64>,
     acquire_parks: AtomicUsize,
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
@@ -101,17 +73,60 @@ impl Queue {
             .as_ref()
             .newMTL4CommandQueue()
             .ok_or_else(|| MetalKernelError::FailedToCreateResource("MTL4CommandQueue".into()))?;
-        Ok(Arc::new(Self {
+        let failure = Arc::new(crate::retirement_owners::FailureSignal::default());
+        let ready = Arc::new(Wake::default());
+        let retirement = super::retirement::registry(failure.clone(), ready.clone())
+            .map_err(|_| MetalKernelError::QueueUnavailable("retirement service unavailable"))?;
+        let queue = Arc::new(Self {
             raw,
             device,
             available: ArrayQueue::new(SLOTS),
             allocated: AtomicUsize::new(0),
-            ready: Wake::default(),
+            ready,
+            failure: failure.clone(),
+            retirement,
+            completions: OnceLock::new(),
+            commit_order: Mutex::new(0),
             acquire_parks: AtomicUsize::new(0),
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
-        }))
+        });
+        let core = super::retirement::Metal4Completions::new(
+            Arc::as_ptr(&queue) as usize,
+            failure,
+            queue.ready.clone(),
+        );
+        assert!(queue.completions.set(Arc::new(core)).is_ok());
+        Ok(queue)
+    }
+
+    /// Acquisition and every submission wait use the same Wake. Poison closes
+    /// admission without claiming native completion or releasing any payload.
+    fn check_failure(&self) -> Result<(), MetalKernelError> {
+        if self.failure.get().is_some() {
+            Err(MetalKernelError::QueueUnavailable(
+                "retirement queue failed",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn poison(&self, reason: crate::retirement_owners::Failure) {
+        self.failure.publish(reason, || self.ready.notify());
+    }
+
+    pub(super) fn return_retirement_slot(&self, slot: Slot) -> Result<(), Slot> {
+        self.available.push(slot)?;
+        self.ready.notify();
+        Ok(())
+    }
+
+    pub(super) fn discard_retirement_slot(&self, slot: Slot) {
+        drop(slot);
+        self.allocated.fetch_sub(1, Ordering::AcqRel);
+        self.ready.notify();
     }
 
     pub fn attach_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
@@ -124,6 +139,7 @@ impl Queue {
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
         let mut slot = loop {
             let seen = self.ready.snapshot();
+            self.check_failure()?;
             if let Some(slot) = self.available.pop() {
                 self.reused.fetch_add(1, Ordering::Relaxed);
                 break slot;
@@ -147,6 +163,8 @@ impl Queue {
                     }
                 }
             }
+            crate::completion_scope::before_park(Arc::as_ptr(self) as usize)
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
             self.acquire_parks.fetch_add(1, Ordering::Relaxed);
             self.ready.wait(seen);
         };
@@ -155,10 +173,29 @@ impl Queue {
         slot.reset();
         let front_event = slot.front_event.clone();
         let generation = slot.generation;
+        // Capacity reservation precedes Commands' epoch/callback side effects.
+        // The explicit retained quota permit is an integration prerequisite;
+        // this source draft still has the earlier uncharged growth hook.
+        let retirement = match self.retirement.prepare(
+            super::retirement::Captures(Vec::new()),
+            super::retirement::NativeOwners::vacant(),
+            |_| Ok(()),
+        ) {
+            Ok(record) => record,
+            Err(_rejected) => {
+                self.discard_retirement_slot(slot);
+                return Err(MetalKernelError::QueueUnavailable(
+                    "retirement metadata unavailable",
+                ));
+            }
+        };
         Ok(Arc::new(Submission {
             front_event,
             generation,
             queue: Arc::clone(self),
+            retirement,
+            native_reuse: crate::native_reuse::NativeReuse::new(),
+            committed_signals: OnceLock::new(),
             status: AtomicUsize::new(MTLCommandBufferStatus::NotEnqueued.0),
             state: Mutex::new(State {
                 slot: Some(slot),
@@ -166,7 +203,8 @@ impl Queue {
                 signals: Vec::new(),
             }),
             feedback: OnceLock::new(),
-            done: Wake::default(),
+            callbacks_finished: AtomicBool::new(false),
+            done: self.ready.clone(),
         }))
     }
 }
@@ -182,7 +220,7 @@ impl Drop for Queue {
     }
 }
 
-struct Slot {
+pub(super) struct Slot {
     front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -293,10 +331,14 @@ pub(crate) struct Submission {
     front_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     generation: u64,
     pub queue: Arc<Queue>,
+    retirement: super::retirement::Record,
+    native_reuse: crate::native_reuse::NativeReuse<Slot>,
+    committed_signals: OnceLock<Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>>,
     status: AtomicUsize,
     state: Mutex<State>,
     feedback: OnceLock<Feedback>,
-    done: Wake,
+    callbacks_finished: AtomicBool,
+    done: Arc<Wake>,
 }
 unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
@@ -361,104 +403,391 @@ impl Submission {
             submission: Arc::clone(self),
         }
     }
-    pub fn on_completion(&self, f: impl Fn(&Feedback) + Send + Sync + 'static) {
-        let mut state = self.state.lock();
-        assert!(self.status().0 < MTLCommandBufferStatus::Committed.0);
+    /// Returns rejected captures intact. Error propagation must carry this
+    /// owner beyond any caller's recording locks before its eventual Drop.
+    pub fn on_completion(
+        &self,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        let mut state = match self.recording_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some(f),
+                ))
+            }
+        };
+        if state.callbacks.try_reserve(1).is_err() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                MetalKernelError::QueueUnavailable("callback metadata allocation refused"),
+                Some(f),
+            ));
+        }
         state.callbacks.push(Box::new(f));
+        Ok(())
+    }
+    fn recording_state(&self) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
+        self.queue.check_failure()?;
+        let state = match self.state.try_lock() {
+            Some(state) => state,
+            None => {
+                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+                self.state.lock()
+            }
+        };
+        self.queue.check_failure()?;
+        if self.status().0 >= MTLCommandBufferStatus::Committed.0 || state.slot.is_none() {
+            return Err(MetalKernelError::QueueUnavailable(
+                "submission no longer recording",
+            ));
+        }
+        Ok(state)
     }
     pub fn signal(&self, event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
         let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }.unwrap();
         self.state.lock().signals.push((event, value));
     }
-    pub fn commit(self: &Arc<Self>) {
-        let mut state = self.state.lock();
+    /// Reserve ordering and native handler allocations before engine epoch and
+    /// subscriber registration. Dropping this value consumes no sequence.
+    pub(super) fn prepare_commit(self: &Arc<Self>) -> Result<PreparedCommit<'_>, MetalKernelError> {
+        self.queue.check_failure()?;
+        let order = match self.queue.commit_order.try_lock() {
+            Some(guard) => guard,
+            None => {
+                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+                self.queue.commit_order.lock()
+            }
+        };
+        self.queue.check_failure()?;
         if self.status().0 >= MTLCommandBufferStatus::Committed.0 {
-            return;
+            return Err(MetalKernelError::QueueUnavailable(
+                "submission already committed",
+            ));
         }
-        let slot = state.slot.take().expect("uncommitted slot");
-        slot.residency.commit();
-        slot.cb.endCommandBuffer();
+        let sequence = *order;
+        sequence
+            .checked_add(1)
+            .ok_or(MetalKernelError::QueueUnavailable("sequence exhausted"))?;
         let options = MTL4CommitOptions::new();
-        let mut cb = NonNull::from(slot.cb.as_ref());
-        // Completion owns this payload exclusively. Its mutex is only needed
-        // because Metal's block is Fn, not FnOnce; the encoding thread never
-        // acquires it. In particular feedback never locks recording state.
-        let retired = Mutex::new(Some((slot, std::mem::take(&mut state.callbacks))));
-        let this = Arc::clone(self);
+        let record = self.retirement.clone();
+        let core = self
+            .queue
+            .completions
+            .get()
+            .expect("queue initialized")
+            .clone();
         let block = RcBlock::new(
             move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                let feedback = unsafe { feedback.as_ref() };
-                let info = Feedback {
-                    error: feedback
-                        .error()
-                        .map(|e| e.localizedDescription().to_string()),
-                    start: feedback.GPUStartTime(),
-                    end: feedback.GPUEndTime(),
-                };
-                let (slot, callbacks) = retired.lock().take().expect("completion once");
-                this.finish(info, slot, callbacks);
+                core.native_feedback(sequence, record.clone(), || {
+                    // SAFETY: Metal owns its feedback for this invocation.
+                    let feedback = unsafe { feedback.as_ref() };
+                    Feedback {
+                        error: feedback
+                            .error()
+                            .map(|e| e.localizedDescription().to_string()),
+                        start: feedback.GPUStartTime(),
+                        end: feedback.GPUEndTime(),
+                    }
+                });
             },
         );
-        self.status
-            .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
-        // SAFETY: the array has one live command buffer; Metal retains the
-        // feedback block. the feedback payload retains the slot until feedback arrives.
+        // SAFETY: options copies the handler. It retains only rooted metadata.
         unsafe {
             options.addFeedbackHandler(RcBlock::as_ptr(&block));
-            self.queue.raw.signalEvent_value(
-                ProtocolObject::from_ref(&*self.front_event),
-                self.generation,
-            );
-            self.queue
-                .raw
-                .commit_count_options(NonNull::from(&mut cb), 1, &options);
         }
-        for (event, value) in state.signals.drain(..) {
-            self.queue
-                .raw
-                .signalEvent_value(ProtocolObject::from_ref(&*event), value);
-        }
+        Ok(PreparedCommit {
+            submission: self,
+            order,
+            options,
+            phase: CommitPhase::Unused,
+        })
     }
-    fn finish(&self, feedback: Feedback, slot: Slot, callbacks: Vec<Callback>) {
+
+    /// Public submissions use the same prepared transaction as Commands. There
+    /// is no second legacy path that can bypass ordered retirement/custody.
+    pub fn commit(self: &Arc<Self>) -> Result<(), MetalKernelError> {
+        self.prepare_commit()?.commit()
+    }
+    pub(super) fn publish_retirement_feedback(&self, feedback: &Feedback) {
         let failed = feedback.error.is_some();
-        assert!(self.feedback.set(feedback).is_ok(), "completion once");
-        self.status.store(
-            if failed {
-                MTLCommandBufferStatus::Error.0
-            } else {
-                MTLCommandBufferStatus::Completed.0
-            },
-            Ordering::Release,
-        );
-        self.done.notify();
-        // Preserve callback-before-slot-reuse semantics, including error latches
-        // and epoch retirement. Old markers read the immutable feedback above.
-        let feedback = self.feedback.get().expect("published above");
-        for callback in callbacks {
-            callback(feedback);
-        }
         assert!(
-            self.queue.available.push(slot).is_ok(),
-            "one return per native slot"
+            self.feedback
+                .set(Feedback {
+                    error: feedback.error.clone(),
+                    start: feedback.start,
+                    end: feedback.end,
+                })
+                .is_ok(),
+            "completion once"
         );
-        self.queue.ready.notify();
+        publish_terminal_status(&self.status, failed);
+        // Data/error consumers may continue while this record's arbitrary
+        // callbacks run. They do not claim logical prefix or teardown quiescence.
+        self.done.notify();
     }
-    pub fn wait(&self) {
+
+    /// Native data/error readiness is weaker than logical callback retirement.
+    pub(super) fn check_data_wait(&self) -> Result<(), MetalKernelError> {
+        if terminal_data_ready(&self.status) {
+            return Ok(());
+        }
+        self.queue.check_failure()?;
+        crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+            .map_err(|_| MetalKernelError::CallbackWouldBlock)
+    }
+    pub(super) fn try_wait_data_ready(&self) -> Result<(), MetalKernelError> {
         loop {
             let seen = self.done.snapshot();
-            if self.status().0 >= MTLCommandBufferStatus::Completed.0 {
-                return;
+            if terminal_data_ready(&self.status) {
+                return Ok(());
             }
+            self.check_data_wait()?;
             self.done.wait(seen);
         }
     }
+
+    pub(super) fn install_native_slot(&self, slot: Slot) {
+        if let Err((_error, slot)) = self.native_reuse.install(slot) {
+            // Invariant failure before handoff: preserve rather than release an
+            // owner on an exceptional producer stack. Queue refuses new work.
+            std::mem::forget(slot);
+            self.queue
+                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            panic!("native slot installed twice");
+        }
+    }
+    pub(super) fn publish_native_reuse(&self, side: crate::native_reuse::ReuseSide) {
+        let result = self
+            .native_reuse
+            .publish(side)
+            .and_then(|ready| match ready {
+                Some(ready) => ready.release(|slot| self.queue.return_retirement_slot(slot)),
+                None => Ok(()),
+            });
+        if result.is_err() {
+            self.queue
+                .poison(crate::retirement_owners::Failure::AdapterFailed);
+        }
+    }
+    /// Called only by native-owner host cleanup. If no side published, cleanup
+    /// implies pre-handoff cancellation, never unknown or active native work.
+    pub(super) fn discard_cancelled_native_slot(&self) {
+        // SAFETY: registry does not detach unknown handoff or unfinished native
+        // work. Successful records have both flags and cannot enter this arm.
+        if let Some(slot) = unsafe { self.native_reuse.take_cancelled() } {
+            self.queue.discard_retirement_slot(slot);
+        }
+    }
+
+    pub(super) fn notify_retirement_callbacks_finished(&self) {
+        self.callbacks_finished.store(true, Ordering::Release);
+        self.done.notify();
+    }
+
+    /// Additive fallible wait seam. Native status alone is not evidence that
+    /// logical callbacks returned. Ok reports terminality, not GPU success;
+    /// callers must still inspect native error and the engine failure latch.
+    /// The compatibility wait remains separate
+    /// until queue poison custody and its failure policy are wired together.
+    pub fn try_wait(&self) -> Result<(), MetalKernelError> {
+        loop {
+            let seen = self.done.snapshot();
+            if self.callbacks_finished.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(reason) = self.queue.failure.get() {
+                return Err(MetalKernelError::QueueUnavailable(match reason {
+                    crate::retirement_owners::Failure::UnknownHandoff => "unknown native handoff",
+                    crate::retirement_owners::Failure::CallbackPanic => {
+                        "completion callback panicked"
+                    }
+                    crate::retirement_owners::Failure::WorkerFailed => {
+                        "host retirement worker failed"
+                    }
+                    crate::retirement_owners::Failure::Closing => "queue admission closed",
+                    crate::retirement_owners::Failure::AdapterFailed => "retirement adapter failed",
+                }));
+            }
+            crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+            self.done.wait(seen);
+        }
+    }
+
+    pub fn wait(&self) -> Result<(), MetalKernelError> {
+        self.try_wait()?;
+        if let Some(error) = self.error() {
+            return Err(MetalKernelError::CommandBufferError(error));
+        }
+        Ok(())
+    }
 }
+#[derive(Clone, Copy)]
+enum CommitPhase {
+    Unused,
+    Installed,
+    EnteredNative,
+    Returned,
+}
+
+pub(super) struct PreparedCommit<'a> {
+    submission: &'a Arc<Submission>,
+    order: parking_lot::MutexGuard<'a, u64>,
+    options: Retained<MTL4CommitOptions>,
+    phase: CommitPhase,
+}
+impl PreparedCommit<'_> {
+    pub(super) fn commit(mut self) -> Result<(), MetalKernelError> {
+        let submission = self.submission;
+        let mut state = submission.state.lock();
+        let slot = state.slot.take().expect("prepared recording slot");
+        let cb = slot.cb.clone();
+        let residency = slot.residency.clone();
+        let callbacks = std::mem::take(&mut state.callbacks);
+        let signals = std::mem::take(&mut state.signals);
+        assert!(
+            submission.committed_signals.set(signals).is_ok(),
+            "signals installed once"
+        );
+        // Close recording before releasing state. Native feedback may arrive
+        // during raw commit and reenter public methods; it must never wait on
+        // this producer-held recording mutex.
+        submission
+            .status
+            .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
+        drop(state);
+        let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), None);
+        match submission
+            .retirement
+            .replace_prepared(super::retirement::Captures(callbacks), owners)
+        {
+            Ok(displaced) => drop(displaced), // Empty pre-reserved record only.
+            Err(rejected) => {
+                // An invariant failure must not drop the only physical owner.
+                // Queue closure prevents repeated attempts; retain this payload.
+                std::mem::forget(rejected.value);
+                submission
+                    .queue
+                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+                return Err(MetalKernelError::QueueUnavailable(
+                    "prepared owner installation failed",
+                ));
+            }
+        }
+        self.phase = CommitPhase::Installed;
+        // End/commit of the recording's private residency is not native CB
+        // execution. Any unwind before queue entry cancels via rooted custody.
+        residency.commit();
+        cb.endCommandBuffer();
+        submission.retirement.begin_handoff().map_err(|_| {
+            submission
+                .queue
+                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            MetalKernelError::QueueUnavailable("native handoff refused")
+        })?;
+        *self.order = self
+            .order
+            .checked_add(1)
+            .expect("checked during preparation");
+        self.phase = CommitPhase::EnteredNative;
+        submission
+            .status
+            .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
+        let mut raw = NonNull::from(cb.as_ref());
+        // SAFETY: payload roots CB/allocator/resources through real feedback and
+        // handoff-return; options roots metadata, never final physical owners.
+        unsafe {
+            submission.queue.raw.signalEvent_value(
+                ProtocolObject::from_ref(&*submission.front_event),
+                submission.generation,
+            );
+            submission
+                .queue
+                .raw
+                .commit_count_options(NonNull::from(&mut raw), 1, &self.options);
+        }
+        for (event, value) in submission
+            .committed_signals
+            .get()
+            .expect("closed recording signals")
+        {
+            submission
+                .queue
+                .raw
+                .signalEvent_value(ProtocolObject::from_ref(&**event), *value);
+        }
+        // Reuse publication is independent of cleanup readiness. It happens
+        // only after all native entry calls return; callbacks may precede it.
+        submission.publish_native_reuse(crate::native_reuse::ReuseSide::HandoffReturned);
+        submission.retirement.handoff_returned().map_err(|_| {
+            submission
+                .queue
+                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            MetalKernelError::QueueUnavailable("handoff return publication failed")
+        })?;
+        self.phase = CommitPhase::Returned;
+        Ok(())
+    }
+}
+impl Drop for PreparedCommit<'_> {
+    fn drop(&mut self) {
+        match self.phase {
+            CommitPhase::Unused | CommitPhase::Returned => {}
+            CommitPhase::Installed => {
+                let _ = self.submission.retirement.cancel_before_handoff();
+                self.submission
+                    .queue
+                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+            }
+            CommitPhase::EnteredNative => {
+                let _ = self
+                    .submission
+                    .retirement
+                    .handoff_unknown(|| self.submission.queue.ready.notify());
+                self.submission
+                    .queue
+                    .poison(crate::retirement_owners::Failure::UnknownHandoff);
+            }
+        }
+    }
+}
+
 impl Drop for Submission {
     fn drop(&mut self) {
-        if self.state.get_mut().slot.take().is_some() {
-            // An abandoned, never submitted recording is not reset/reused.
-            self.queue.allocated.fetch_sub(1, Ordering::AcqRel);
-            self.queue.ready.notify();
+        let state = self.state.get_mut();
+        if let Some(slot) = state.slot.take() {
+            let callbacks = std::mem::take(&mut state.callbacks);
+            let signals = std::mem::take(&mut state.signals);
+            let owners = super::retirement::NativeOwners::metal4_abandoned(
+                slot,
+                self.queue.clone(),
+                signals,
+                None,
+            );
+            match self
+                .retirement
+                .replace_prepared(super::retirement::Captures(callbacks), owners)
+            {
+                Ok(displaced) => drop(displaced),
+                Err(rejected) => {
+                    std::mem::forget(rejected.value);
+                    self.queue
+                        .poison(crate::retirement_owners::Failure::AdapterFailed);
+                    return;
+                }
+            }
+            if self.retirement.cancel_before_handoff().is_err() {
+                self.queue
+                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+            }
+        } else {
+            // Legacy public commit still owns its old callback payload. Retire
+            // its unused reservation without assuming it used the new adapter.
+            // A new-path record already detached simply refuses this transition.
+            let _ = self.retirement.cancel_before_handoff();
         }
     }
 }
@@ -569,37 +898,43 @@ impl Encoder {
 mod tests {
     use super::*;
     use objc2_foundation::NSString;
+    // CPU-only: deliberately stop between feedback initialization and terminal
+    // publication, without constructing a native Device or relying on a race.
+    #[test]
+    fn data_readiness_waits_for_terminal_error_publication() {
+        for failed in [false, true] {
+            let status = AtomicUsize::new(MTLCommandBufferStatus::Committed.0);
+            let feedback = OnceLock::new();
+            assert!(!terminal_data_ready(&status));
+            assert!(feedback
+                .set(Feedback {
+                    error: failed.then(|| String::from("injected native error")),
+                    start: 0.0,
+                    end: 1.0,
+                })
+                .is_ok());
+            assert!(feedback.get().is_some());
+            assert!(
+                !terminal_data_ready(&status),
+                "feedback initialization exposed data before terminal status"
+            );
+            publish_terminal_status(&status, failed);
+            assert!(terminal_data_ready(&status));
+            assert_eq!(
+                status.load(Ordering::Acquire),
+                if failed {
+                    MTLCommandBufferStatus::Error.0
+                } else {
+                    MTLCommandBufferStatus::Completed.0
+                }
+            );
+            assert_eq!(feedback.get().unwrap().error.is_some(), failed);
+        }
+    }
+
     #[test]
     fn completion_wake_covers_notify_before_and_during_registration() {
-        use std::time::{Duration, Instant};
-        let wake = Arc::new(Wake::default());
-        let seen = wake.snapshot();
-        wake.notify();
-        assert_eq!(
-            wake.park(seen, Some(Instant::now() + Duration::from_secs(1))),
-            parking_lot_core::ParkResult::Invalid,
-            "notification before registration was lost"
-        );
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        let worker_wake = wake.clone();
-        let worker = std::thread::spawn(move || {
-            for _ in 0..1000 {
-                let seen = worker_wake.snapshot();
-                tx.send(()).unwrap();
-                let result = worker_wake.park(seen, Some(Instant::now() + Duration::from_secs(1)));
-                assert_ne!(
-                    result,
-                    parking_lot_core::ParkResult::TimedOut,
-                    "lost completion wake"
-                );
-            }
-        });
-        for _ in 0..1000 {
-            rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            wake.notify();
-        }
-        worker.join().unwrap();
-        assert_eq!(wake.waiters.load(Ordering::SeqCst), 0);
+        crate::completion_wake::tests::registration_control();
         println!("MTL4_WAKE transitions=1001 lost_wakes=0 waiters=0");
     }
 
@@ -618,7 +953,7 @@ mod tests {
         let submission = queue.acquire().unwrap();
         let encoder = submission.encoder();
         encoder.raw.endEncoding();
-        submission.commit();
+        submission.commit().unwrap();
         let recording = submission.state.lock();
         event.setSignaledValue(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -629,7 +964,7 @@ mod tests {
         }
         let completed_without_lock = submission.status() == MTLCommandBufferStatus::Completed;
         drop(recording); // release even on mutation failure; never strand feedback
-        submission.wait();
+        submission.wait().unwrap();
         assert!(
             completed_without_lock,
             "completion waited for the encoding-side mutex"
@@ -667,9 +1002,11 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let observed = Arc::clone(&submission);
-            submission.on_completion(move |_| {
-                tx.send(observed.status()).unwrap();
-            });
+            submission
+                .on_completion(move |_| {
+                    tx.send(observed.status()).unwrap();
+                })
+                .unwrap();
             let encoder = submission.encoder();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
@@ -689,8 +1026,8 @@ mod tests {
                 },
             );
             encoder.raw.endEncoding();
-            submission.commit();
-            submission.wait();
+            submission.commit().unwrap();
+            submission.wait().unwrap();
             assert_eq!(
                 rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
                 MTLCommandBufferStatus::Completed,
@@ -782,18 +1119,19 @@ mod tests {
             let earlier = heavy.clone();
             tiny.on_completion(move |_| {
                 tx.send(earlier.status()).unwrap();
-            });
-            heavy.commit();
+            })
+            .unwrap();
+            heavy.commit().unwrap();
             pending_at_later_commit +=
                 usize::from(heavy.status() != MTLCommandBufferStatus::Completed);
-            tiny.commit();
-            tiny.wait();
+            tiny.commit().unwrap();
+            tiny.wait().unwrap();
             assert_eq!(
                 rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
                 MTLCommandBufferStatus::Completed,
                 "later feedback preceded earlier retirement"
             );
-            heavy.wait();
+            heavy.wait().unwrap();
             gpu_inversions += usize::from(tiny.gpu_end_time() < heavy.gpu_end_time());
         }
         assert!(
@@ -813,6 +1151,15 @@ mod tests {
         }
         let queue = Queue::new(device.clone()).unwrap();
         let event = device.as_ref().newSharedEvent().unwrap();
+        struct UnblockOnDrop(Retained<ProtocolObject<dyn MTLSharedEvent>>);
+        impl Drop for UnblockOnDrop {
+            fn drop(&mut self) {
+                self.0.setSignaledValue(1);
+            }
+        }
+        // Acquisition and assertion failures must not strand the queue wait.
+        let _unblock = UnblockOnDrop(event.clone());
+
         queue
             .raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
@@ -820,7 +1167,7 @@ mod tests {
         for _ in 0..SLOTS {
             let submission = queue.acquire().unwrap();
             submission.encoder().raw.endEncoding();
-            submission.commit();
+            submission.commit().unwrap();
             submissions.push(submission);
         }
         assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
@@ -844,7 +1191,7 @@ mod tests {
         let slot = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         worker.join().unwrap();
         for submission in submissions {
-            submission.wait();
+            submission.wait().unwrap();
         }
         assert!(
             parked && blocked,
@@ -917,11 +1264,11 @@ mod tests {
                     );
             }
             encoder.raw.endEncoding();
-            submission.commit();
+            submission.commit().unwrap();
             pending.push((submission, buffer, n));
         }
         for (submission, buffer, n) in &pending {
-            submission.wait();
+            submission.wait().unwrap();
             assert_eq!(
                 submission.status(),
                 MTLCommandBufferStatus::Completed,
@@ -1015,10 +1362,10 @@ mod tests {
         let second = record(&b, 2);
         // Submit the consumer first: only the explicit event can order it
         // after the producer on the independent queue.
-        second.commit();
-        first.commit();
-        first.wait();
-        second.wait();
+        second.commit().unwrap();
+        first.commit().unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
         assert_eq!(first.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(second.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(event.signaledValue(), 1);

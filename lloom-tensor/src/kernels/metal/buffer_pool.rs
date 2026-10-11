@@ -1969,6 +1969,35 @@ impl BufferPool {
         }
     }
 
+    /// An empty namespace with this pool's portable reuse policy, not its
+    /// model-specific residual allowance, buffers, counters or observers.
+    /// Snapshot under one source lock, release it before touching the new pool.
+    pub(crate) fn empty_like(&self, clock: Arc<GpuClock>) -> Self {
+        let (free_budget, oversize_bound, eviction_order) = {
+            let state = self.inner.state.lock(Side::Host);
+            (
+                state.free_budget,
+                state.oversize_bound,
+                state.eviction_order,
+            )
+        };
+        let pool = Self::with_clock(clock);
+        {
+            let mut state = pool.inner.state.lock(Side::Host);
+            state.free_budget = free_budget;
+            state.oversize_bound = oversize_bound;
+            state.eviction_order = eviction_order;
+        }
+        #[cfg(feature = "fuzzing")]
+        pool.inner.free_poison.store(
+            self.inner
+                .free_poison
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pool
+    }
+
     /// Installs the observer told when this pool destroys a free buffer.
     ///
     /// Call during device setup, before any allocation: an observer installed
@@ -2055,6 +2084,11 @@ impl BufferPool {
     /// a harness reports the arm the process **took** (§7.1a-i).
     pub fn eviction_order(&self) -> EvictionOrder {
         self.inner.state.lock(Side::Host).eviction_order
+    }
+
+    /// The cap on bytes retained in the free list.
+    pub fn free_budget(&self) -> usize {
+        self.inner.state.lock(Side::Host).free_budget
     }
 
     /// Sets the cap on bytes retained in the free list, evicting immediately if

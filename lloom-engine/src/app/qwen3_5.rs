@@ -247,6 +247,15 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
             anyhow::bail!("speculative.model {}: no such file", p.display());
         }
     }
+    // The ledger's quota: the fraction of the working set every pass-level
+    // admission and the state's growth read against (§9.5c), set before
+    // the load so the load's own allocations are on it.
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = &device {
+        let ws = m.device().recommended_max_working_set_size() as f64;
+        m.ledger()
+            .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+    }
     let mload = ModelLoad {
         kv_capacity: opts.kv_capacity,
         kv_precision: opts.kv_precision,
@@ -255,6 +264,13 @@ fn load_as<P: Profile>(opts: LoadOptions) -> Result<Box<dyn Served>> {
         mtp: opts.mtp,
         // The verify window of `k + 1` positions as one pass over the rings.
         window: if opts.mtp { opts.mtp_k.max(1) + 1 } else { 0 },
+        machine: Some(lloom::nn::memory::MachineLoad {
+            gate: opts.memory.machine_gate(),
+            label: super::common::machine_label(arch, &opts.first_shard),
+            rows: 1,
+            kv_tokens: opts.kv_capacity,
+            prefill_tile: opts.prefill_tile,
+        }),
         checkpoints: lloom::models::qwen3_5::LoadOptions::default().checkpoints,
     };
     let t = Instant::now();

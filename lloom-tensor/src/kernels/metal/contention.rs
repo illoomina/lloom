@@ -129,6 +129,24 @@ impl<T> Censused<parking_lot::RwLock<T>> {
 }
 
 impl<T> Censused<parking_lot::Mutex<T>> {
+    /// Preserve uncontended acquisition; allow an owning queue to reject only
+    /// the blocking branch (for example, same-queue completion reentry).
+    #[inline]
+    pub(crate) fn lock_checked<E>(
+        &self,
+        side: Side,
+        before_block: impl FnOnce() -> Result<(), E>,
+    ) -> Result<parking_lot::MutexGuard<'_, T>, E> {
+        if let Some(guard) = self.lock.try_lock() {
+            return Ok(guard);
+        }
+        before_block()?;
+        let started = Instant::now();
+        let guard = self.lock.lock();
+        self.record(side, Access::Exclusive, started);
+        Ok(guard)
+    }
+
     #[inline]
     pub fn lock(&self, side: Side) -> parking_lot::MutexGuard<'_, T> {
         if let Some(g) = self.lock.try_lock() {
@@ -485,5 +503,30 @@ mod tests {
             "every field's blocked time, the unchanged one contributing none"
         );
         assert!(d.render().contains("map_host_read=2/3.0us"));
+    }
+}
+
+#[cfg(test)]
+mod reentry_tests {
+    use super::*;
+    use crate::completion_scope;
+    #[test]
+    fn checked_lock_keeps_available_capacity_and_refuses_callback_contention() {
+        let lock = Censused::new(parking_lot::Mutex::new(7));
+        completion_scope::with_callback(19, || {
+            let guard = lock
+                .lock_checked(Side::Host, || completion_scope::before_park(19))
+                .unwrap();
+            assert_eq!(*guard, 7);
+            let refused = lock.lock_checked(Side::Host, || completion_scope::before_park(19));
+            assert!(matches!(refused, Err(completion_scope::ReentrantWait)));
+        });
+        assert_eq!(
+            *lock
+                .lock_checked(Side::Host, || completion_scope::before_park(19))
+                .unwrap(),
+            7
+        );
+        assert_eq!(lock.contention(Side::Host, Access::Exclusive).waits, 0);
     }
 }

@@ -27,12 +27,17 @@
 //! has completed (the pool evicts from its FREE list), so no two live
 //! buffers overlap and no returned range is still read.
 
+use super::backing::BackingAdmissionError;
 use super::{Buffer, ResidencySet};
+use crate::allocation_admission::{self, Prediction};
+use crate::allocation_owner::AllocationOwner;
+use crate::heap_ranges::{aligned, reusable_for, Ranges};
 use crate::kernels::MetalKernelError;
+use crate::memory_admission::{AllocationContext, DomainKey};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLDevice as _, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType,
-    MTLResourceOptions, MTLStorageMode,
+    MTLAllocation as _, MTLDevice as _, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
+    MTLHeapType, MTLResourceOptions, MTLStorageMode,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,76 +73,56 @@ pub fn transient_heaps_on() -> bool {
 
 pub const DEFAULT_TRANSIENT_HEAPS: bool = false;
 
-/// One placement chunk: the heap and its free ranges, `(offset, len)`,
-/// sorted by offset and coalesced.
+/// Native heap anchor shared by chunk, sub-buffer and residency owners. It
+/// deliberately contains no Device/Commands/PhysicalContext backedge.
+struct HeapAnchor {
+    raw: Retained<ProtocolObject<dyn MTLHeap>>,
+}
+// SAFETY: same thread-safe Metal heap ownership as HeapChunks. Host allocator
+// metadata remains separately protected by HeapChunks::state.
+unsafe impl Send for HeapAnchor {}
+unsafe impl Sync for HeapAnchor {}
+
+enum NewHeap {
+    Admitted(allocation_admission::StagedAllocation<Retained<ProtocolObject<dyn MTLHeap>>>),
+    Legacy(Retained<ProtocolObject<dyn MTLHeap>>),
+}
+impl NewHeap {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Admitted(staged) => staged.raw().size(),
+            Self::Legacy(raw) => raw.size(),
+        }
+    }
+    fn commit(
+        self,
+    ) -> Result<
+        (
+            Retained<ProtocolObject<dyn MTLHeap>>,
+            Option<AllocationOwner>,
+        ),
+        BackingAdmissionError,
+    > {
+        match self {
+            Self::Admitted(staged) => staged.commit().map(|(raw, owner)| (raw, Some(owner))),
+            Self::Legacy(raw) => Ok((raw, None)),
+        }
+    }
+}
+
 struct Chunk {
-    heap: Retained<ProtocolObject<dyn MTLHeap>>,
-    size: usize,
-    free: Vec<(usize, usize)>,
-    used: usize,
-    /// The chunk's bytes on the ledger, for its life.
+    // Drop native heap reference before the chunk's accounting owner.
+    heap: Arc<HeapAnchor>,
+    owner: Option<AllocationOwner>,
+    ranges: Ranges,
+    ready: bool,
     #[allow(dead_code)]
     reservation: Option<super::ledger::Reservation>,
 }
-
 impl Chunk {
-    /// The smallest free range that fits `size` at `align` (best fit: the
-    /// big holes are kept for the big requests), and its waste after the
-    /// piece is taken.
-    fn fit(&self, size: usize, align: usize) -> Option<(usize, usize)> {
-        let align = align.max(1);
-        let mut best: Option<(usize, usize)> = None;
-        for (i, &(off, len)) in self.free.iter().enumerate() {
-            let start = off.next_multiple_of(align);
-            if start + size <= off + len {
-                let waste = len - size;
-                if best.is_none_or(|(_, w)| waste < w) {
-                    best = Some((i, waste));
-                }
-            }
-        }
-        best
-    }
-
-    /// Take `size` at `align` from free range `i` (from [`Self::fit`]): the
-    /// buffer's offset.
-    fn take_at(&mut self, i: usize, size: usize, align: usize) -> usize {
-        let align = align.max(1);
-        let (off, len) = self.free[i];
-        let start = off.next_multiple_of(align);
-        // What is left of the range before and after the taken piece.
-        let mut rest = Vec::with_capacity(2);
-        if start > off {
-            rest.push((off, start - off));
-        }
-        let end = start + size;
-        if off + len > end {
-            rest.push((end, off + len - end));
-        }
-        self.free.splice(i..i + 1, rest);
-        self.used += size;
-        start
-    }
-
-    fn take(&mut self, size: usize, align: usize) -> Option<usize> {
-        let (i, _) = self.fit(size, align)?;
-        Some(self.take_at(i, size, align))
-    }
-
-    /// Give `(offset, size)` back, coalescing with its neighbours.
-    fn give_back(&mut self, offset: usize, size: usize) {
-        let i = self.free.partition_point(|&(off, _)| off < offset);
-        self.free.insert(i, (offset, size));
-        // Merge with the next, then with the previous.
-        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
-            let next = self.free.remove(i + 1);
-            self.free[i].1 += next.1;
-        }
-        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
-            let cur = self.free.remove(i);
-            self.free[i - 1].1 += cur.1;
-        }
-        self.used = self.used.saturating_sub(size);
+    fn available_to(&self, domain: Option<&DomainKey>) -> bool {
+        let owner_domain = self.owner.as_ref().map(AllocationOwner::domain_key);
+        reusable_for(self.ready, owner_domain.as_ref(), domain)
     }
 }
 
@@ -147,6 +132,12 @@ struct Placement {
     chunk: usize,
     offset: usize,
     size: usize,
+}
+
+struct PendingPlacement {
+    placement: Placement,
+    heap: Arc<HeapAnchor>,
+    owner: Option<AllocationOwner>,
 }
 
 struct State {
@@ -208,101 +199,247 @@ impl HeapChunks {
         }
     }
 
-    /// A buffer of `length` bytes at a free range of some chunk (first fit,
-    /// oldest chunk first), else in a new chunk (of `chunk_bytes`, or the
-    /// request's size rounded up when larger).
+    /// Legacy unadmitted placement route, sharing the checked allocator with
+    /// alloc_in but never borrowing an admitted domain's chunks.
     pub fn alloc(&self, length: usize) -> Result<Buffer, MetalKernelError> {
-        let sa = self
-            .device
-            .as_ref()
-            .heapBufferSizeAndAlignWithLength_options(length.max(1), self.options);
-        let (size, align) = (sa.size, sa.align.max(1));
-        let mut st = self.state.lock();
-        // Best fit across every chunk.
+        self.alloc_impl(length, None).map_err(|error| match error {
+            BackingAdmissionError::Native(error) => error,
+            other => MetalKernelError::InvalidInput(other.to_string()),
+        })
+    }
+
+    pub(crate) fn alloc_in(
+        &self,
+        length: usize,
+        context: &AllocationContext,
+    ) -> Result<Buffer, BackingAdmissionError> {
+        self.alloc_impl(length, Some(context))
+    }
+
+    fn select(
+        st: &mut State,
+        size: usize,
+        align: usize,
+        domain: Option<&DomainKey>,
+    ) -> Result<Option<PendingPlacement>, BackingAdmissionError> {
         let mut best: Option<(usize, usize, usize)> = None;
-        for (ci, c) in st.chunks.iter().enumerate() {
-            if let Some((ri, waste)) = c.fit(size, align) {
-                if best.is_none_or(|(_, _, w)| waste < w) {
+        for (ci, chunk) in st.chunks.iter().enumerate() {
+            if !chunk.available_to(domain) {
+                continue;
+            }
+            if let Some((ri, waste)) = chunk.ranges.fit(size, align) {
+                if best.is_none_or(|(_, _, old)| waste < old) {
                     best = Some((ci, ri, waste));
                 }
             }
         }
-        let placed = best.map(|(ci, ri, _)| {
-            let off = st.chunks[ci].take_at(ri, size, align);
-            (ci, off)
-        });
-        let (chunk, offset) = match placed {
-            Some(p) => p,
-            None => {
-                let chunk_size = self.chunk_bytes.max(size.next_multiple_of(align));
-                let desc = MTLHeapDescriptor::new();
-                desc.setSize(chunk_size);
-                desc.setStorageMode(self.storage);
-                desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
-                desc.setType(MTLHeapType::Placement);
-                let heap = self
-                    .device
-                    .as_ref()
-                    .newHeapWithDescriptor(&desc)
-                    .ok_or_else(|| {
-                        MetalKernelError::FailedToCreateResource(format!(
-                            "placement heap chunk of {chunk_size} bytes"
-                        ))
-                    })?;
-                // Resident with everything it will ever hold: one add, one
-                // commit.
-                self.residency_set.insert_allocation(
-                    unsafe {
-                        &*(&*heap as *const ProtocolObject<dyn MTLHeap>
-                            as *const ProtocolObject<dyn objc2_metal::MTLAllocation>)
-                    },
-                    Retained::as_ptr(&heap) as usize,
-                );
-                let size_actual = heap.size();
-                let reservation = self.ledger.as_ref().map(|l| l.reserve(size_actual));
-                st.chunks.push(Chunk {
-                    heap,
-                    size: size_actual,
-                    free: vec![(0, size_actual)],
-                    used: 0,
-                    reservation,
-                });
-                let i = st.chunks.len() - 1;
-                let off = st.chunks[i].take(size, align).ok_or_else(|| {
-                    MetalKernelError::FailedToCreateResource(format!(
-                        "{size} bytes at align {align} from a fresh {size_actual}-byte chunk"
-                    ))
-                })?;
-                (i, off)
-            }
+        let Some((ci, ri, _)) = best else {
+            return Ok(None);
         };
-        // SAFETY: `[offset, offset + size)` is inside the chunk (the free
-        // list is the chunk's own ranges) and overlaps no live buffer (a
-        // range is handed out once and returns only from `release`).
-        let raw = unsafe {
-            st.chunks[chunk]
-                .heap
-                .newBufferWithLength_options_offset(size, self.options, offset)
-        };
-        let raw = match raw {
-            Some(r) => r,
-            None => {
-                st.chunks[chunk].give_back(offset, size);
-                return Err(MetalKernelError::FailedToCreateResource(format!(
-                    "{size} bytes at offset {offset} of a {}-byte placement chunk",
-                    st.chunks[chunk].size
-                )));
-            }
-        };
-        let buffer = Buffer::new(raw);
-        st.live.insert(
-            buffer.raw_ptr() as usize,
-            Placement {
-                chunk,
+        let chunk = &mut st.chunks[ci];
+        let offset =
+            chunk
+                .ranges
+                .take_at(ri, size, align)
+                .ok_or(BackingAdmissionError::Geometry(
+                    "selected heap range became invalid",
+                ))?;
+        Ok(Some(PendingPlacement {
+            placement: Placement {
+                chunk: ci,
                 offset,
                 size,
             },
-        );
+            heap: chunk.heap.clone(),
+            owner: chunk.owner.clone(),
+        }))
+    }
+
+    fn stage_chunk(
+        &self,
+        size: usize,
+        align: usize,
+        context: Option<&AllocationContext>,
+    ) -> Result<NewHeap, BackingAdmissionError> {
+        let rounded = aligned(size, align).ok_or(BackingAdmissionError::Geometry(
+            "heap chunk rounding overflow",
+        ))?;
+        let chunk_size = self.chunk_bytes.max(rounded);
+        let create = |bytes| {
+            let desc = MTLHeapDescriptor::new();
+            desc.setSize(bytes);
+            desc.setStorageMode(self.storage);
+            desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+            desc.setType(MTLHeapType::Placement);
+            self.device
+                .as_ref()
+                .newHeapWithDescriptor(&desc)
+                .ok_or_else(|| {
+                    MetalKernelError::FailedToCreateResource(format!(
+                        "placement heap chunk of {bytes} bytes"
+                    ))
+                })
+        };
+        if let Some(context) = context {
+            allocation_admission::stage(context, Prediction::heap(chunk_size), create, |raw| {
+                raw.allocatedSize()
+            })
+            .map(NewHeap::Admitted)
+        } else {
+            create(chunk_size)
+                .map(NewHeap::Legacy)
+                .map_err(BackingAdmissionError::Native)
+        }
+    }
+
+    fn commit_chunk(
+        &self,
+        staged: NewHeap,
+        ranges: Ranges,
+    ) -> Result<Chunk, BackingAdmissionError> {
+        let (raw, owner) = staged.commit()?;
+        let capacity = ranges.capacity();
+        let heap = Arc::new(HeapAnchor { raw });
+        let owner = owner.map(|owner| owner.with_anchor(heap.clone()));
+        let reservation = self.ledger.as_ref().map(|ledger| ledger.reserve(capacity));
+        Ok(Chunk {
+            heap,
+            owner,
+            ranges,
+            ready: false,
+            reservation,
+        })
+    }
+
+    fn publish_chunk(&self, heap: &HeapAnchor, owner: Option<&AllocationOwner>) {
+        // SAFETY: MTLHeap implements MTLAllocation; borrowed protocol upcast.
+        let allocation = unsafe {
+            &*(&*heap.raw as *const ProtocolObject<dyn MTLHeap>
+                as *const ProtocolObject<dyn objc2_metal::MTLAllocation>)
+        };
+        let key = Retained::as_ptr(&heap.raw) as usize;
+        if let Some(owner) = owner {
+            self.residency_set
+                .insert_allocation_owned(allocation, key, owner.clone());
+        } else {
+            self.residency_set.insert_allocation(allocation, key);
+        }
+    }
+
+    fn alloc_impl(
+        &self,
+        length: usize,
+        context: Option<&AllocationContext>,
+    ) -> Result<Buffer, BackingAdmissionError> {
+        let length = length.max(1);
+        if length > self.device.as_ref().maxBufferLength() {
+            return Err(BackingAdmissionError::Geometry(
+                "heap buffer exceeds device maxBufferLength",
+            ));
+        }
+        let sa = self
+            .device
+            .as_ref()
+            .heapBufferSizeAndAlignWithLength_options(length, self.options);
+        let (size, align) = (sa.size.max(length), sa.align);
+        if align == 0 {
+            return Err(BackingAdmissionError::Geometry(
+                "zero heap buffer alignment",
+            ));
+        }
+        let domain = context.map(AllocationContext::domain_key);
+        // A context must be open even when reusing an already charged chunk.
+        // The zero ticket validates cancellation without charging reused bytes.
+        let reuse_ticket = context
+            .map(|context| context.take(0))
+            .transpose()
+            .map_err(BackingAdmissionError::Admission)?;
+        let selected = {
+            let mut st = self.state.lock();
+            Self::select(&mut st, size, align, domain.as_ref())?
+        };
+        let pending = if let Some(selected) = selected {
+            selected
+        } else {
+            // Cold demand, native creation and bookkeeping owner allocation are
+            // outside state. A competing grower may make this chunk surplus.
+            let staged = self.stage_chunk(size, align, context)?;
+            let selected = {
+                let mut st = self.state.lock();
+                Self::select(&mut st, size, align, domain.as_ref())?
+            };
+            if let Some(selected) = selected {
+                drop(staged); // Raw before uncommitted ticket: full entitlement returns.
+                selected
+            } else {
+                // Selected growth commits outside state. Another grower can
+                // create spare capacity after our finite recheck; its separate
+                // ticket also bounds that growth. No claim of perfect packing.
+                let mut ranges = Ranges::new(staged.capacity());
+                let offset = match ranges.take(size, align) {
+                    Some(offset) => offset,
+                    None => {
+                        drop(ranges);
+                        drop(staged);
+                        return Err(BackingAdmissionError::Geometry(
+                            "fresh heap capacity cannot fit requested range",
+                        ));
+                    }
+                };
+                let chunk = self.commit_chunk(staged, ranges)?;
+                let mut st = self.state.lock();
+                let ci = st.chunks.len();
+                let pending = PendingPlacement {
+                    placement: Placement {
+                        chunk: ci,
+                        offset,
+                        size,
+                    },
+                    heap: chunk.heap.clone(),
+                    owner: chunk.owner.clone(),
+                };
+                st.chunks.push(chunk); // Not ready: concurrent scans cannot use it.
+                drop(st);
+                self.publish_chunk(&pending.heap, pending.owner.as_ref());
+                self.state.lock().chunks[ci].ready = true;
+                pending
+            }
+        };
+        drop(reuse_ticket);
+        let placement = pending.placement;
+        // SAFETY: checked range reserved under state, unavailable to other
+        // allocators; native parent is independently anchored across this call.
+        let raw = unsafe {
+            pending.heap.raw.newBufferWithLength_options_offset(
+                size,
+                self.options,
+                placement.offset,
+            )
+        };
+        let Some(raw) = raw else {
+            let restored = self.state.lock().chunks[placement.chunk]
+                .ranges
+                .give_back(placement.offset, size);
+            if !restored {
+                return Err(BackingAdmissionError::Geometry(
+                    "failed buffer range restoration",
+                ));
+            }
+            return Err(BackingAdmissionError::Native(
+                MetalKernelError::FailedToCreateResource(format!(
+                    "{size} bytes at offset {} of placement heap",
+                    placement.offset
+                )),
+            ));
+        };
+        let buffer = match pending.owner {
+            Some(owner) => Buffer::new_owned(raw, owner),
+            None => Buffer::new(raw),
+        };
+        self.state
+            .lock()
+            .live
+            .insert(buffer.raw_ptr() as usize, placement);
         Ok(buffer)
     }
 
@@ -311,19 +448,39 @@ impl HeapChunks {
     /// to its own release.
     pub fn release(&self, buf: &Buffer) -> bool {
         let mut st = self.state.lock();
-        let Some(p) = st.live.remove(&(buf.raw_ptr() as usize)) else {
+        let key = buf.raw_ptr() as usize;
+        let Some(p) = st.live.get(&key).copied() else {
             return false;
         };
-        st.chunks[p.chunk].give_back(p.offset, p.size);
+        if !st.chunks[p.chunk].ranges.give_back(p.offset, p.size) {
+            return false;
+        }
+        st.live.remove(&key);
         true
+    }
+
+    pub fn collect_reusable_allocations(
+        &self,
+        domain: Option<&DomainKey>,
+        credit: &mut super::backing::ReuseCredit,
+    ) {
+        let st = self.state.lock();
+        for chunk in st.chunks.iter().filter(|chunk| chunk.available_to(domain)) {
+            // State never removes chunks; the borrowed HeapChunks owns each
+            // Arc<HeapAnchor> throughout collection, so no address reuse occurs.
+            credit.observe(
+                Retained::as_ptr(&chunk.heap.raw) as usize,
+                chunk.ranges.available(),
+            );
+        }
     }
 
     pub fn stats(&self) -> HeapStats {
         let st = self.state.lock();
         HeapStats {
             chunks: st.chunks.len(),
-            size: st.chunks.iter().map(|c| c.size).sum(),
-            used: st.chunks.iter().map(|c| c.used).sum(),
+            size: st.chunks.iter().map(|c| c.ranges.capacity()).sum(),
+            used: st.chunks.iter().map(|c| c.ranges.used()).sum(),
             live: st.live.len(),
         }
     }
@@ -340,75 +497,5 @@ impl std::fmt::Debug for HeapChunks {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// The range arithmetic alone, with no heap behind it.
-    #[derive(Default)]
-    struct Ranges {
-        free: Vec<(usize, usize)>,
-        used: usize,
-    }
-
-    impl Ranges {
-        fn take(&mut self, size: usize, align: usize) -> Option<usize> {
-            let mut pick = None;
-            for (i, &(off, len)) in self.free.iter().enumerate() {
-                let start = off.next_multiple_of(align);
-                if start + size <= off + len {
-                    pick = Some((i, off, len, start));
-                    break;
-                }
-            }
-            let (i, off, len, start) = pick?;
-            let mut rest = Vec::with_capacity(2);
-            if start > off {
-                rest.push((off, start - off));
-            }
-            let end = start + size;
-            if off + len > end {
-                rest.push((end, off + len - end));
-            }
-            self.free.splice(i..i + 1, rest);
-            self.used += size;
-            Some(start)
-        }
-        fn give_back(&mut self, offset: usize, size: usize) {
-            let i = self.free.partition_point(|&(off, _)| off < offset);
-            self.free.insert(i, (offset, size));
-            if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
-                let next = self.free.remove(i + 1);
-                self.free[i].1 += next.1;
-            }
-            if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
-                let cur = self.free.remove(i);
-                self.free[i - 1].1 += cur.1;
-            }
-            self.used = self.used.saturating_sub(size);
-        }
-    }
-
-    /// The same arithmetic as `Chunk::take` / `give_back` (a copy, since a
-    /// `Chunk` holds a heap): split at alignment, coalesce both ways, reuse.
-    #[test]
-    fn ranges_split_align_and_coalesce() {
-        let mut c = Ranges {
-            free: vec![(0, 1 << 20)],
-            used: 0,
-        };
-        let a = c.take(1000, 256).unwrap();
-        let b = c.take(1000, 256).unwrap();
-        let d = c.take(1000, 256).unwrap();
-        assert_eq!((a, b, d), (0, 1024, 2048));
-        assert_eq!(c.used, 3000);
-        c.give_back(b, 1000);
-        assert_eq!(c.free.len(), 2, "{:?}", c.free);
-        c.give_back(a, 1000);
-        c.give_back(d, 1000);
-        assert_eq!(c.free, vec![(0, 1 << 20)]);
-        assert_eq!(c.used, 0);
-        let x = c.take(1000, 256).unwrap();
-        assert_eq!(x, 0);
-        let y = c.take(3000, 4096).unwrap();
-        assert_eq!(y, 4096);
-    }
-}
+// Checked placement tests live in crate::heap_ranges and exercise the exact
+// production implementation without allocating a native heap.

@@ -445,7 +445,7 @@ impl lloom_tensor::CustomOp3 for StepOp {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, f32),
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), elem_count, f32)?,
             Shape::from((h_v, d)),
         ))
     }
@@ -550,7 +550,12 @@ impl lloom_tensor::CustomOp3 for StepRowsOp {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((rows, h_v, d)),
         ))
     }
@@ -655,7 +660,12 @@ impl lloom_tensor::CustomOp3 for StepSeqOp {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((steps, h_v, d)),
         ))
     }

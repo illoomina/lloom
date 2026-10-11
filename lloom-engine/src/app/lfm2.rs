@@ -92,6 +92,9 @@ struct Tower {
     record: LoadRecord,
     load_ms: f64,
     pool_delta: i64,
+    /// The tower's row on the device's ledger, for as long as it is held.
+    #[cfg(feature = "metal")]
+    _tenant: Option<Arc<lloom_tensor::kernels::metal::ledger::Gauge>>,
 }
 
 impl Vision {
@@ -111,11 +114,33 @@ impl Vision {
         let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
             .context("loading the vision tower and projector")?;
         device.synchronize()?;
+        let pool_delta = MemSnapshot::read(device).pool_live as i64 - before;
         let t = Tower {
             encoder: Arc::new(encoder),
             record,
             load_ms: ms(start.elapsed()),
-            pool_delta: MemSnapshot::read(device).pool_live as i64 - before,
+            pool_delta,
+            #[cfg(feature = "metal")]
+            _tenant: match device {
+                Device::Metal(m) => {
+                    use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
+                    let held = pool_delta.max(0) as usize;
+                    let g = Gauge::new(
+                        "lfm2-vision-tower",
+                        Claim {
+                            floor: held,
+                            want: held,
+                            unit: held.max(1),
+                            class: Class::Capability,
+                        },
+                        held,
+                    );
+                    let t: Arc<dyn Tenant> = g.clone();
+                    m.ledger().register(&t);
+                    Some(g)
+                }
+                _ => None,
+            },
         };
         let encoder = Arc::clone(&t.encoder);
         *tower = Some(t);
@@ -266,6 +291,8 @@ pub struct Engine<P: Profile> {
     /// The load's degradations: `load_engine`'s notes, the model's, this
     /// engine's (`Served::load_warnings`).
     load_warnings: Vec<LoadWarning>,
+    /// What the load reserved on the machine, released with the engine.
+    pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
     single: Mutex<Single<P>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -691,6 +718,11 @@ impl<P: Lfm2Shape> Engine<P> {
         // the ledger's; the resident weights are everything but the layers
         // (the embedding, the norms, the conv taps); the slots are what the
         // admission leaves after them and the predicted peak, three at least.
+        // What the weights hold once loaded: every tensor at the dtype the
+        // load converts it to (f32 on the CPU, twice the bf16 file).
+        let loaded_weights = checkpoint_elems(&weight_files(&model_dir)?)? * dtype.size_in_bytes();
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut machine_weights = loaded_weights;
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &device {
             let quota = m.ledger().quota();
@@ -789,8 +821,49 @@ impl<P: Lfm2Shape> Engine<P> {
                 if let Some(b) = config.memory_budget.as_mut() {
                     b.weight_bytes = resident + slots * slot_bytes;
                 }
+                machine_weights =
+                    loaded_weights.saturating_sub(streamed_bytes) + slots * slot_bytes;
             }
         }
+        // The machine (`memory.md` §9.10): what this load holds before the
+        // KV grows past its first bucket, admitted against the host and the
+        // other lloom processes before a weight is read.
+        let kv_floor = opts.memory.kv_bucket.min(opts.kv_capacity).max(1);
+        let longest = match config.memory_budget {
+            Some(b) => b.max_seq_len,
+            None if opts.prefill_tile > 0 => opts.prefill_tile.max(opts.prefill_chunk),
+            None => opts.kv_capacity,
+        };
+        // A prefill of several forwards keeps the pacer's depth of them in
+        // flight, each holding its activations until its command buffer
+        // completes; the prefill's own bound, else decode's, else the floor.
+        let in_flight = [opts.decode.prefill.in_flight, opts.decode.in_flight]
+            .into_iter()
+            .find(|&d| d > 0)
+            .unwrap_or(lloom::nn::decode::IN_FLIGHT_FLOOR);
+        let mut peak = machine_peak::<P>(
+            &config,
+            dtype,
+            machine_weights,
+            opts.batch,
+            kv_floor,
+            longest,
+            in_flight,
+            config.memory_budget.and_then(|b| b.activation_rows),
+        );
+        if let Some(dir) = &dspark_dir {
+            let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
+            peak.push("drafter", drafter);
+        }
+        let machine = lloom::nn::memory::MachineLoad {
+            gate: opts.memory.machine_gate(),
+            label: super::common::machine_label("lfm2", &model_dir),
+            rows: opts.batch.max(1),
+            kv_tokens: kv_floor,
+            prefill_tile: opts.prefill_tile,
+        }
+        .admit(&device, peak)?
+        .holding;
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         load_warnings.splice(0..0, model.load_warnings().iter().cloned());
         let vision = if vl {
@@ -904,6 +977,7 @@ impl<P: Lfm2Shape> Engine<P> {
             installed,
             warm_in_flight: None,
             load_warnings,
+            machine,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -2537,6 +2611,82 @@ fn pipeline_cache_sizes(device: &Device) -> (usize, usize) {
     }
     let _ = device;
     (0, 0)
+}
+
+/// What an LFM2 load holds at its peak before its KV grows past
+/// `kv_floor` positions (`memory.md` §9.10): the weights it will hold, each
+/// row's state floor (`lfm2::state_floor_bytes`), and — on Metal — the
+/// activation class of its longest forward once per forward the pacer keeps
+/// in flight (`in_flight`), the scratch class and the RoPE tables, from the
+/// arithmetic the KV cache is admitted on (§9.5d).
+#[allow(unused_variables)]
+fn machine_peak<P: Profile>(
+    config: &Config,
+    dtype: DType,
+    weights: usize,
+    batch: usize,
+    kv_floor: usize,
+    longest_forward: usize,
+    in_flight: usize,
+    activation_rows: Option<usize>,
+) -> lloom_tensor::machine::Peak {
+    let rows = batch.max(1);
+    let mut peak = lloom_tensor::machine::Peak::new().with("weights", weights as u64);
+    for (name, bytes) in lloom::models::lfm2::state_floor_bytes(config, dtype, kv_floor) {
+        let name = if rows > 1 {
+            format!("{name} x {rows} rows")
+        } else {
+            name.to_string()
+        };
+        peak.push(name, (bytes * rows) as u64);
+    }
+    #[cfg(feature = "metal")]
+    {
+        let mut b = MemoryBudget::new(weights);
+        b.batch = rows;
+        b.max_seq_len = longest_forward;
+        b.activation_rows = activation_rows;
+        let f = State::<P>::admission_budget(config, &b, kv_floor).footprint();
+        let in_flight = in_flight.max(1);
+        peak.push(
+            format!("activations ({longest_forward}-position forward x {in_flight} in flight)"),
+            (f.activations * in_flight) as u64,
+        );
+        peak.push("scratch", f.scratch as u64);
+        peak.push("RoPE tables", State::<P>::rope_table_bytes(config) as u64);
+    }
+    peak
+}
+
+/// Elements of every tensor in `files`, from their safetensors headers
+/// (the header alone is read).
+fn checkpoint_elems(files: &[PathBuf]) -> Result<usize> {
+    use std::io::Read;
+    let mut n = 0usize;
+    for f in files {
+        let mut file =
+            std::fs::File::open(f).with_context(|| format!("opening {}", f.display()))?;
+        let mut len = [0u8; 8];
+        file.read_exact(&mut len)?;
+        let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+        file.read_exact(&mut header)?;
+        let v: Value = serde_json::from_slice(&header)
+            .with_context(|| format!("the safetensors header of {}", f.display()))?;
+        for (name, t) in v.as_object().context("a safetensors header is an object")? {
+            if name == "__metadata__" {
+                continue;
+            }
+            n += t["shape"]
+                .as_array()
+                .map(|s| {
+                    s.iter()
+                        .map(|d| d.as_u64().unwrap_or(0) as usize)
+                        .product::<usize>()
+                })
+                .unwrap_or(0);
+        }
+    }
+    Ok(n)
 }
 
 /// The safetensors shards for a checkpoint: the sharded index if present,

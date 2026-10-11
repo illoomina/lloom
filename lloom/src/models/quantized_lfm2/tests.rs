@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 // D4/H2/KV1/FF6/V8, attention first then conv, context32, F32 GGUF.
 // No checkpoint, Q8 claim, device, or image. Numeric weight payload <4KiB.
-fn fixture() -> Result<Vec<u8>> {
+pub(super) fn fixture() -> Result<Vec<u8>> {
     let mut tensors = Vec::<(String, QTensor)>::new();
     let mut add = |name: String, shape: Vec<usize>, norm: bool| -> Result<()> {
         let n: usize = shape.iter().product();

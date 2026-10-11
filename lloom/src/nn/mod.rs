@@ -39,6 +39,7 @@ pub mod expert_stream;
 pub mod func;
 pub mod fusion;
 pub mod gdn;
+pub(crate) mod gguf_weights;
 pub mod group_norm;
 pub mod group_tenant;
 pub mod init;

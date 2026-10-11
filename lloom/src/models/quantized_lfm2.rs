@@ -7,29 +7,7 @@ use lloom_tensor::{bail, DType, Device, IndexOp, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn get_qtensor<R: std::io::Seek + std::io::Read>(
-    ct: &gguf_file::Content,
-    reader: &mut R,
-    device: &Device,
-    names: &[String],
-) -> Result<lloom_tensor::quantized::QTensor> {
-    for name in names {
-        if ct.tensor_infos.contains_key(name) {
-            // An existing malformed/unreadable alias is not a missing alias.
-            return ct.tensor(reader, name, device);
-        }
-    }
-    bail!("cannot find tensor info for {}", names.join(" | "))
-}
-
-fn get_dequantized<R: std::io::Seek + std::io::Read>(
-    ct: &gguf_file::Content,
-    reader: &mut R,
-    device: &Device,
-    names: &[String],
-) -> Result<Tensor> {
-    get_qtensor(ct, reader, device, names)?.dequantize(device)
-}
+mod weights;
 
 #[derive(Debug, Clone)]
 struct Mlp {
@@ -325,303 +303,109 @@ fn read_usize_list(v: &gguf_file::Value, len: usize) -> Result<Vec<usize>> {
 }
 
 impl Model {
+    /// Additive factory route over the caller's existing load promise. Header
+    /// parsing and complete demand resolution occur inside that supplied scope.
+    /// Host header/plan storage and transfers still need producer enrollment;
+    /// this entry point does not enable the default served family yet.
+    pub fn load_gguf_admitted(
+        path: &std::path::Path,
+        device: &Device,
+        load: crate::nn::memory::LoadContext,
+    ) -> Result<crate::nn::memory::Loaded<Self>> {
+        crate::nn::memory::Loaded::new(device, load, |device, _context| {
+            let mut file = std::fs::File::open(path)?;
+            let content = gguf_file::Content::read(&mut file)?;
+            Self::from_gguf(content, &mut file, device)
+        })
+    }
+
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
-            None => bail!("cannot find {s} in metadata"),
-            Some(v) => Ok(v),
-        };
+        use crate::nn::gguf_weights::WeightPlan;
+        let plan = weights::Lfm2Weights::resolve(&ct)?;
+        plan.validate_headers(&ct)?;
+        ct.validate_payloads(reader)?;
+        Self::from_gguf_plan(plan, &ct, reader, device)
+    }
 
-        let head_count = md_get("lfm2.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv_meta = md_get("lfm2.attention.head_count_kv")?;
-        let embedding_length = md_get("lfm2.embedding_length")?.to_u32()? as usize;
-        let context_length = md_get("lfm2.context_length")?.to_u32()? as usize;
-        let block_count = md_get("lfm2.block_count")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("lfm2.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base = md_get("lfm2.rope.freq_base")
-            .and_then(|m| m.to_f32())
-            .unwrap_or(1_000_000f32);
-        let l_cache = md_get("lfm2.shortconv.l_cache")?.to_u32()? as usize;
-
-        if head_count == 0
-            || embedding_length == 0
-            || block_count == 0
-            || context_length == 0
-            || l_cache == 0
-            || embedding_length % head_count != 0
-            || !rms_norm_eps.is_finite()
-            || rms_norm_eps <= 0.0
-        {
-            bail!("invalid quantized lfm2 geometry or normalization epsilon")
-        }
-        if block_count > ct.tensor_infos.len() {
-            bail!("quantized lfm2 layer count exceeds available tensor headers")
-        }
-        let head_count_kv = read_usize_list(head_count_kv_meta, block_count)?;
-        if head_count_kv
-            .iter()
-            .any(|&kv| kv != 0 && (kv > head_count || head_count % kv != 0))
-        {
-            bail!("invalid quantized lfm2 KV head count")
-        }
-        let head_dim = embedding_length / head_count;
-        let (cos, sin) = precomput_freqs_cis(head_dim, rope_freq_base, context_length, device)?;
+    fn from_gguf_plan<R: std::io::Seek + std::io::Read>(
+        plan: weights::Lfm2Weights,
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        let head_dim = plan.width / plan.heads;
+        let (cos, sin) = precomput_freqs_cis(head_dim, plan.rope_base, plan.context, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
-
-        let tok_embeddings_q = get_qtensor(
-            &ct,
-            reader,
-            device,
-            &[
-                "token_embd.weight",
-                "tok_embeddings.weight",
-                "model.embed_tokens.weight",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
-        )?;
-        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
-        tracing::debug!(
-            tok_embd_shape = ?tok_embeddings.shape().dims(),
-            "loaded lfm2 token embeddings"
-        );
-
-        let norm = RmsNorm::from_qtensor(
-            get_qtensor(
-                &ct,
-                reader,
-                device,
-                &[
-                    "output_norm.weight",
-                    "embedding_norm.weight",
-                    "model.embedding_norm.weight",
-                    "model.embedding_norm",
-                    "token_embd_norm.weight",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            )?,
-            rms_norm_eps,
-        )?;
-        let output_names = [
-            "output.weight",
-            "lm_head.weight",
-            "model.output.weight",
-            "model.lm_head.weight",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-        let output_q = if output_names
-            .iter()
-            .any(|name| ct.tensor_infos.contains_key(name))
-        {
-            get_qtensor(&ct, reader, device, &output_names)?
-        } else {
-            tok_embeddings_q
+        let embedding_q = plan.embedding.read(ct, reader, device)?;
+        let embeddings = embedding_q.dequantize(device)?;
+        tracing::debug!(tok_embd_shape = ?embeddings.shape().dims(), "loaded lfm2 token embeddings");
+        let norm = RmsNorm::from_qtensor(plan.norm.read(ct, reader, device)?, plan.epsilon)?;
+        let output_q = match &plan.output {
+            Some(output) => output.read(ct, reader, device)?,
+            None => embedding_q,
         };
-        tracing::debug!(
-            output_shape = ?output_q.shape().dims(),
-            "loaded lfm2 output weight (using tok_embd if missing)"
-        );
-
-        let mut layers = crate::nn::branch::retained_vec(block_count)?;
-        for layer_idx in 0..block_count {
-            let prefix = format!("blk.{layer_idx}");
-            let is_attention = head_count_kv.get(layer_idx).copied().unwrap_or(head_count) > 0;
-
-            let operator_norm = get_qtensor(
-                &ct,
-                reader,
-                device,
-                &[
-                    format!("{prefix}.attn_norm.weight"),
-                    format!("{prefix}.operator_norm.weight"),
-                    format!("{prefix}.attention_norm.weight"),
-                ],
-            )?;
-            let ffn_norm = get_qtensor(
-                &ct,
-                reader,
-                device,
-                &[
-                    format!("{prefix}.ffn_norm.weight"),
-                    format!("{prefix}.ffn_norm"),
-                ],
-            )?;
-            let mlp = {
-                let w1 = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.ffn_gate.weight"),
-                        format!("{prefix}.feed_forward.w1.weight"),
-                        format!("{prefix}.mlp.gate_proj.weight"),
-                    ],
-                )?;
-                let w2 = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.ffn_down.weight"),
-                        format!("{prefix}.feed_forward.w2.weight"),
-                        format!("{prefix}.mlp.down_proj.weight"),
-                    ],
-                )?;
-                let w3 = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.ffn_up.weight"),
-                        format!("{prefix}.feed_forward.w3.weight"),
-                        format!("{prefix}.mlp.up_proj.weight"),
-                    ],
-                )?;
-                Mlp {
-                    w1: QMatMul::from_qtensor(w1)?,
-                    w2: QMatMul::from_qtensor(w2)?,
-                    w3: QMatMul::from_qtensor(w3)?,
-                }
+        tracing::debug!(output_shape = ?output_q.shape().dims(), "loaded lfm2 output weight (using tok_embd if missing)");
+        let mut layers = crate::nn::branch::retained_vec(plan.layers.len())?;
+        for layer in &plan.layers {
+            let operator_norm =
+                RmsNorm::from_qtensor(layer.operator_norm.read(ct, reader, device)?, plan.epsilon)?;
+            let ffn_norm =
+                RmsNorm::from_qtensor(layer.ffn_norm.read(ct, reader, device)?, plan.epsilon)?;
+            let mlp = Mlp {
+                w1: QMatMul::from_qtensor(layer.gate.read(ct, reader, device)?)?,
+                w2: QMatMul::from_qtensor(layer.down.read(ct, reader, device)?)?,
+                w3: QMatMul::from_qtensor(layer.up.read(ct, reader, device)?)?,
             };
-
-            let kind = if is_attention {
-                let n_kv_head = head_count_kv[layer_idx];
-                let wq = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_q.weight"),
-                        format!("{prefix}.self_attn.q_proj.weight"),
-                    ],
-                )?;
-                let wk = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_k.weight"),
-                        format!("{prefix}.self_attn.k_proj.weight"),
-                    ],
-                )?;
-                let wv = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_v.weight"),
-                        format!("{prefix}.self_attn.v_proj.weight"),
-                    ],
-                )?;
-                let wo = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_output.weight"),
-                        format!("{prefix}.self_attn.out_proj.weight"),
-                    ],
-                )?;
-                let q_norm = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_q_norm.weight"),
-                        format!("{prefix}.self_attn.q_layernorm.weight"),
-                        format!("{prefix}.attention.q_norm.weight"),
-                    ],
-                )?;
-                let k_norm = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.attn_k_norm.weight"),
-                        format!("{prefix}.self_attn.k_layernorm.weight"),
-                        format!("{prefix}.attention.k_norm.weight"),
-                    ],
-                )?;
-
-                LayerKind::Attention(AttentionLayer {
-                    wq: QMatMul::from_qtensor(wq)?,
-                    wk: QMatMul::from_qtensor(wk)?,
-                    wv: QMatMul::from_qtensor(wv)?,
-                    wo: QMatMul::from_qtensor(wo)?,
-                    q_norm: RmsNorm::from_qtensor(q_norm, rms_norm_eps)?,
-                    k_norm: RmsNorm::from_qtensor(k_norm, rms_norm_eps)?,
-                    n_head: head_count,
-                    n_kv_head,
+            let kind = match &layer.mixer {
+                weights::MixerWeights::Attention(a) => LayerKind::Attention(AttentionLayer {
+                    wq: QMatMul::from_qtensor(a.q.read(ct, reader, device)?)?,
+                    wk: QMatMul::from_qtensor(a.k.read(ct, reader, device)?)?,
+                    wv: QMatMul::from_qtensor(a.v.read(ct, reader, device)?)?,
+                    wo: QMatMul::from_qtensor(a.output.read(ct, reader, device)?)?,
+                    q_norm: RmsNorm::from_qtensor(
+                        a.q_norm.read(ct, reader, device)?,
+                        plan.epsilon,
+                    )?,
+                    k_norm: RmsNorm::from_qtensor(
+                        a.k_norm.read(ct, reader, device)?,
+                        plan.epsilon,
+                    )?,
+                    n_head: plan.heads,
+                    n_kv_head: a.kv_heads,
                     head_dim,
                     cos: cos.clone(),
                     sin: sin.clone(),
                     neg_inf: neg_inf.clone(),
                     span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                     span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
-                })
-            } else {
-                let in_proj = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.shortconv.in_proj.weight"),
-                        format!("{prefix}.conv.in_proj.weight"),
-                    ],
-                )?;
-                let out_proj = get_qtensor(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.shortconv.out_proj.weight"),
-                        format!("{prefix}.conv.out_proj.weight"),
-                    ],
-                )?;
-                let conv = get_dequantized(
-                    &ct,
-                    reader,
-                    device,
-                    &[
-                        format!("{prefix}.shortconv.conv.weight"),
-                        format!("{prefix}.conv.conv.weight"),
-                        format!("{prefix}.shortconv.conv"),
-                    ],
-                )?;
-                LayerKind::ShortConv(ShortConvLayer {
-                    in_proj: QMatMul::from_qtensor(in_proj)?,
-                    out_proj: QMatMul::from_qtensor(out_proj)?,
-                    conv,
-                    l_cache,
-                })
+                }),
+                weights::MixerWeights::Conv(c) => LayerKind::ShortConv(ShortConvLayer {
+                    in_proj: QMatMul::from_qtensor(c.input.read(ct, reader, device)?)?,
+                    out_proj: QMatMul::from_qtensor(c.output.read(ct, reader, device)?)?,
+                    conv: c.conv.read(ct, reader, device)?.dequantize(device)?,
+                    l_cache: plan.kernel,
+                }),
             };
-
             layers.push(LayerWeights {
-                operator_norm: RmsNorm::from_qtensor(operator_norm, rms_norm_eps)?,
-                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
+                operator_norm,
+                ffn_norm,
                 mlp,
                 kind,
                 span_mlp: tracing::span!(tracing::Level::TRACE, "ffn"),
             });
         }
-
-        let vocab = tok_embeddings.dim(0)?;
         Ok(Self {
             config: Config {
-                context_length,
-                hidden_size: embedding_length,
-                vocab_size: vocab,
+                context_length: plan.context,
+                hidden_size: plan.width,
+                vocab_size: plan.vocab,
             },
             owner: Arc::new(()),
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings: Embedding::new(embeddings, plan.width),
             layers,
             norm,
             output: QMatMul::from_qtensor(output_q)?,
@@ -875,3 +659,6 @@ impl crate::nn::branch::RetainState for Cache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod weight_plan_tests;

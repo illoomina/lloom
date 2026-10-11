@@ -395,3 +395,6 @@ mod tests;
 
 #[cfg(test)]
 mod request_slot_tests;
+
+#[cfg(test)]
+mod model_stage_tests;

@@ -8,6 +8,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 type ResidencyLease = AllocationLease<Retained<ProtocolObject<dyn MTLAllocation>>>;
 
+/// Custody released by a COMPLETED native residency commit. Keep this value
+/// until all caller locks (including Commands' EntryState) have been released,
+/// or transfer it intact to host retirement. It retains raw allocations before
+/// their accounting owners; dropping it can release a final machine Holding.
+/// This type does not schedule cleanup and does not delay native commit.
+#[must_use = "published custody must leave outer caller locks before destruction"]
+pub(crate) struct PublishedRemovals(Vec<ResidencyLease>);
+impl PublishedRemovals {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+// SAFETY: leases contain only engine-created thread-safe Metal Buffer/Heap
+// allocations and Send+Sync accounting owners, as already held by ResidencySet.
+// No mutable native allocation metadata is accessed through this wrapper.
+unsafe impl Send for PublishedRemovals {}
+unsafe impl Sync for PublishedRemovals {}
+
 /// What the set has done, so the cost model can be checked rather than quoted.
 ///
 /// `DESIGN.md` §6.3d prices eager unregistration at +0.062 ms/token and
@@ -286,12 +304,23 @@ impl ResidencySet {
     ///
     /// Returns true if a commit was issued.
     pub fn commit_pending(&self) -> bool {
+        let (committed, released) = self.commit_pending_extracted();
+        // Compatibility surface: caller must not hold an outer cleanup-sensitive
+        // lock. Commands must use the extracting method and transfer host custody.
+        drop(released);
+        committed
+    }
+
+    /// Publish residency before submit, but return removed leases without
+    /// destroying them under a caller's outer lock. Empty fast path allocates
+    /// nothing. The returned wrapper must follow host cleanup custody.
+    pub(crate) fn commit_pending_extracted(&self) -> (bool, PublishedRemovals) {
         let Some(set) = &self.raw else {
-            return false;
+            return (false, PublishedRemovals(Vec::new()));
         };
         // The steady state — nothing staged — never takes the lock.
         if !self.dirty.load(Ordering::Acquire) {
-            return false;
+            return (false, PublishedRemovals(Vec::new()));
         }
         // Under `members`, as every other `commit` here is: a commit applies
         // the set's pending adds AND removes, and two threads applying the same
@@ -313,8 +342,7 @@ impl ResidencySet {
             Vec::new()
         };
         drop(members);
-        drop(released);
-        committed
+        (committed, PublishedRemovals(released))
     }
 
     /// Adds multiple buffers in a single commit.

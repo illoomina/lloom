@@ -82,19 +82,21 @@ struct Metadata {
     config: Config,
     device: Device,
     capacity: usize,
+    vocab_size: usize,
     decode: DecodeConfig,
     template: Option<Template>,
     seed: Vec<u32>,
     think: Option<ThinkTags>,
     gen_prompts: [[Option<Vec<u32>>; 3]; 3],
-    decisions: bool,
+    capabilities: Capabilities,
 }
 /// No model/tokenizer/quota copy and no borrowed unscoped Loaded escape.
-pub struct Engine<P> {
-    loaded: Loaded<CausalEngine<Model>>,
+pub struct Engine<P, M: CausalLM = Model> {
+    loaded: Loaded<CausalEngine<M>>,
     metadata: Metadata,
     predictor: P,
     warnings: Vec<LoadWarning>,
+    decisions: Option<DecisionDispatch<M>>,
 }
 
 /// Explicit family embedding factory returning a real HTTP/REPL implementor.
@@ -114,90 +116,250 @@ pub fn load_lfm2_gguf<P: Predictor>(
     config: Config,
     predictor: P,
 ) -> Result<Engine<P>> {
+    let serving = Serving {
+        config,
+        decode,
+        capabilities: lfm2_gguf_capabilities(),
+        predictor,
+    };
+    let owner_decode = serving.decode.clone();
+    load_from_factory(
+        device,
+        load,
+        serving,
+        Some(DecisionDispatch::retained()),
+        |device, preflight| {
+            produce_lfm2_gguf_with(
+                files.checkpoint,
+                files.tokenizer,
+                policy,
+                device,
+                owner_decode,
+                |resolved, tokenizer, policy| {
+                    preflight(
+                        FamilyFacts {
+                            vocab_size: resolved.vocab_size,
+                            capacity: resolved.context_length,
+                        },
+                        tokenizer,
+                        policy,
+                    )
+                },
+            )
+            .map(|(engine, ())| engine)
+        },
+    )
+}
+
+/// Request-level function dispatch installs the retained decision operation
+/// without imposing RetainState on generic generation or template rendering.
+/// No model/tokenizer/cache copy; this is not a per-token dispatch mechanism.
+struct DecisionDispatch<M: CausalLM> {
+    prepared: Option<PreparedDecision<M>>,
+    raw: Option<RawDecision<M>>,
+}
+type PreparedDecision<M> =
+    fn(&Loaded<CausalEngine<M>>, usize, &CausalRequest) -> Result<SystemOneResponse>;
+type RawDecision<M> = fn(
+    &Loaded<CausalEngine<M>>,
+    usize,
+    &OrderedJson,
+) -> std::result::Result<SystemOneResponse, SystemOneError>;
+impl<M: CausalLM> DecisionDispatch<M>
+where
+    M::Cache: CacheReset + CacheRewind + RetainState,
+{
+    fn retained() -> Self {
+        Self {
+            prepared: Some(CausalEngine::<M>::decide_admitted),
+            raw: Some(CausalEngine::<M>::systemone_admitted),
+        }
+    }
+}
+
+/// Resolved family facts supplied by the actual typed factory before weights.
+/// No weight schema or byte predictor is reconstructed at the app boundary.
+struct FamilyFacts {
+    vocab_size: usize,
+    capacity: usize,
+}
+struct Serving<P> {
+    config: Config,
+    decode: DecodeConfig,
+    capabilities: Capabilities,
+    predictor: P,
+}
+
+/// Shared supplied-domain factory route. The actual LFM2 GGUF caller above
+/// invokes its typed preflight before materialization; future families must
+/// do the same. This does not register a family or infer complete admission.
+fn load_from_factory<P: Predictor, M: CausalLM>(
+    device: &Device,
+    load: LoadContext,
+    serving: Serving<P>,
+    decisions: Option<DecisionDispatch<M>>,
+    produce: impl FnOnce(
+        &Device,
+        &mut dyn FnMut(FamilyFacts, &Tokenizer, Option<&CausalPolicy>) -> Result<()>,
+    ) -> Result<CausalEngine<M>>,
+) -> Result<Engine<P, M>> {
     let mut metadata = None;
-    let serving_decode = decode.clone();
+    let Serving {
+        config,
+        decode,
+        mut capabilities,
+        predictor,
+    } = serving;
+    // This is a one-sequence text adapter, not a replacement for incumbent
+    // batch/speculation/media family owners. Refuse overclaimed embedding facts.
+    if !capabilities.generation
+        || capabilities.batch
+        || capabilities.prefix_share
+        || !capabilities.speculation.is_empty()
+        || capabilities.vision
+        || capabilities.model_axes
+        || capabilities.executor_arms
+        || capabilities.eos_gate
+    {
+        lloom_tensor::bail!("generic causal adapter requires one-sequence text capabilities without unimplemented family mechanisms")
+    }
+    let mut inputs = Some((config, decode));
     let loaded = Loaded::new(device, load, |device, _context| {
-        let (engine, serving) = produce_lfm2_gguf_with(
-            files.checkpoint,
-            files.tokenizer,
-            policy,
-            device,
-            decode,
-            |resolved, tokenizer, policy| {
-                if config.eos_ids.is_empty()
-                    || config
-                        .eos_ids
-                        .iter()
-                        .chain(config.bos_id.iter())
-                        .any(|&id| id as usize >= resolved.vocab_size)
-                {
-                    lloom_tensor::bail!("serving BOS/EOS ids must fit the loaded vocabulary and EOS must be nonempty")
-                }
-                let template = config
-                    .chat_template
-                    .as_deref()
-                    .map(Template::compile)
-                    .transpose()
-                    .map_err(|e| Error::msg(format!("{e:#}")))?;
-                let seed = tokenizer
-                    .encode(config.seed_text.as_str(), false)
-                    .map_err(|e| Error::msg(e.to_string()))?
-                    .get_ids()
-                    .to_vec();
-                if seed.is_empty() {
-                    lloom_tensor::bail!("serving seed must encode at least one token")
-                }
-                let probe = TextProbe {
+        let mut preflight =
+            |facts: FamilyFacts, tokenizer: &Tokenizer, policy: Option<&CausalPolicy>| {
+                let (config, decode) = inputs
+                    .take()
+                    .ok_or_else(|| Error::msg("serving preflight called more than once"))?;
+                capabilities.decisions =
+                    policy.is_some() && decisions.as_ref().is_some_and(|route| route.raw.is_some());
+                metadata = Some(prepare_metadata(
+                    facts,
                     tokenizer,
-                    template: template.as_ref(),
-                    bos_token: &config.bos_token,
-                };
-                let think = probe.think_tags();
-                let gen_prompts = probe.generation_prompts(think.as_ref());
-                let marker_ids = think.iter().flat_map(|t| {
-                    [Some(t.start), Some(t.end), t.tool_call]
-                        .into_iter()
-                        .flatten()
-                });
-                let prompt_ids = gen_prompts.iter().flatten().flatten().flatten().copied();
-                if marker_ids
-                    .chain(prompt_ids)
-                    .any(|id| id as usize >= resolved.vocab_size)
-                {
-                    lloom_tensor::bail!("serving template probe ids must fit the loaded vocabulary")
-                }
-                Ok(Metadata {
+                    device,
                     config,
-                    device: device.clone(),
-                    capacity: resolved.context_length,
-                    decode: serving_decode,
-                    template,
-                    seed,
-                    think,
-                    gen_prompts,
-                    decisions: policy.is_some(),
-                })
-            },
-        )?;
-        metadata = Some(serving);
+                    decode,
+                    capabilities,
+                )?);
+                Ok(())
+            };
+        let engine = produce(device, &mut preflight)?;
+        if metadata.is_none() {
+            lloom_tensor::bail!("family producer did not run serving preflight")
+        }
+        let facts = metadata.as_ref().expect("checked serving preflight");
+        if engine.capacity != facts.capacity || engine.model.vocab_size() != facts.vocab_size {
+            lloom_tensor::bail!("family materialization differs from serving preflight")
+        }
         Ok(engine)
     })?;
     Ok(Engine {
         loaded,
-        metadata: metadata.expect("successful producer installed serving facts"),
+        metadata: metadata.expect("successful preflight installed serving facts"),
         predictor,
         warnings: Vec::new(),
+        decisions,
     })
 }
 
-impl<P: Predictor> Engine<P> {
+fn prepare_metadata(
+    facts: FamilyFacts,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    config: Config,
+    decode: DecodeConfig,
+    capabilities: Capabilities,
+) -> Result<Metadata> {
+    if facts.capacity == 0
+        || facts.vocab_size == 0
+        || config.eos_ids.is_empty()
+        || config
+            .eos_ids
+            .iter()
+            .chain(config.bos_id.iter())
+            .any(|&id| id as usize >= facts.vocab_size)
+    {
+        lloom_tensor::bail!("serving BOS/EOS ids must fit the loaded vocabulary and EOS/context/vocabulary must be nonempty")
+    }
+    let template = config
+        .chat_template
+        .as_deref()
+        .map(Template::compile)
+        .transpose()
+        .map_err(|e| Error::msg(format!("{e:#}")))?;
+    let seed = tokenizer
+        .encode(config.seed_text.as_str(), false)
+        .map_err(|e| Error::msg(e.to_string()))?
+        .get_ids()
+        .to_vec();
+    if seed.is_empty() || seed.iter().any(|&id| id as usize >= facts.vocab_size) {
+        lloom_tensor::bail!("serving seed must encode valid nonempty vocabulary ids")
+    }
+    let probe = TextProbe {
+        tokenizer,
+        template: template.as_ref(),
+        bos_token: &config.bos_token,
+    };
+    let think = probe.think_tags();
+    let gen_prompts = probe.generation_prompts(think.as_ref());
+    let marker_ids = think.iter().flat_map(|t| {
+        [Some(t.start), Some(t.end), t.tool_call]
+            .into_iter()
+            .flatten()
+    });
+    let prompt_ids = gen_prompts.iter().flatten().flatten().flatten().copied();
+    if marker_ids
+        .chain(prompt_ids)
+        .any(|id| id as usize >= facts.vocab_size)
+    {
+        lloom_tensor::bail!("serving template probe ids must fit the loaded vocabulary")
+    }
+    Ok(Metadata {
+        config,
+        device: device.clone(),
+        capacity: facts.capacity,
+        vocab_size: facts.vocab_size,
+        decode,
+        template,
+        seed,
+        think,
+        gen_prompts,
+        capabilities,
+    })
+}
+
+impl<P: Predictor, M: CausalLM> Engine<P, M>
+where
+    M::Cache: CacheReset + CacheRewind,
+{
+    /// Programmatic generation does not inherit the HTTP Served Send/Sync
+    /// boundary. Every producer still uses the same predicted admitted pass.
+    pub fn encode_admitted(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
+        self.pass(Request::Encode { text, add_special }, |engine| {
+            engine.encode(text, add_special)
+        })
+    }
+    pub fn complete_admitted(
+        &self,
+        prompt: &[u32],
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        self.pass(Request::Generation { prompt, params }, |engine| {
+            engine.complete(prompt, params, &mut on_fragment)
+        })
+    }
     /// Preserve explicit generic prepared decisions when named raw rendering is
     /// absent or uncertified. The adapter never exposes an unscoped inner owner.
     pub fn decide_prepared(&self, request: &CausalRequest) -> Result<SystemOneResponse> {
         let predicted = self
             .predictor
             .predicted_extra(Request::PreparedDecisions(request))?;
-        CausalEngine::decide_admitted(&self.loaded, predicted, request)
+        let execute = self
+            .decisions
+            .as_ref()
+            .and_then(|route| route.prepared)
+            .ok_or_else(|| Error::msg("family supplied no retained decision operation"))?;
+        execute(&self.loaded, predicted, request)
     }
     /// Ordinary generic policy rendering does not require a shared-state
     /// certificate. Its tokens can feed an explicit prepared request; the
@@ -227,7 +389,7 @@ impl<P: Predictor> Engine<P> {
     fn pass<T>(
         &self,
         request: Request<'_>,
-        run: impl FnOnce(&CausalEngine<Model>) -> Result<T>,
+        run: impl FnOnce(&CausalEngine<M>) -> Result<T>,
     ) -> Result<T> {
         let predicted = self.predictor.predicted_extra(request)?;
         self.loaded
@@ -244,14 +406,18 @@ impl<P: Predictor> Engine<P> {
             .map(|i| self.metadata.seed[(i.wrapping_add(row)) % self.metadata.seed.len()])
             .collect()
     }
-    fn benchmark<'a>(&self, engine: &'a CausalEngine<Model>) -> Result<RequestLease<'a, Model>> {
+    fn benchmark<'a>(&self, engine: &'a CausalEngine<M>) -> Result<RequestLease<'a, M>> {
         let mut lease = engine.checkout()?;
         lease.start_decode(&engine.model, &engine.device, engine.decode.clone());
         lease.session().reset();
         Ok(lease)
     }
 }
-impl<P: Predictor> Served for Engine<P> {
+impl<P: Predictor, M: CausalLM + Send + Sync> Served for Engine<P, M>
+where
+    M::Config: Send + Sync,
+    M::Cache: CacheReset + CacheRewind + Send,
+{
     fn device(&self) -> &Device {
         &self.metadata.device
     }
@@ -280,41 +446,12 @@ impl<P: Predictor> Served for Engine<P> {
         json!({"capacity": self.kv_capacity(), "capabilities": self.capabilities().json(), "admission": "caller-supplied coverage; producer enrollment incomplete"})
     }
     fn describe(&self) -> String {
-        format!(
-            "load-once GGUF causal owner; {}",
-            self.capabilities().line()
-        )
+        format!("load-once causal owner; {}", self.capabilities().line())
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            family: "lfm2-gguf",
-            generation: true,
-            decisions: self.metadata.decisions,
-            profiles: lloom::profile::Bound {
-                family: "lfm2-gguf",
-                rewind: &["No"],
-                rows: &["One"],
-                except: &[lloom::profile::CrownExact::KEY],
-            },
-            lookahead_max: 1,
-            ring: "by-name: zero rewind horizon",
-            batch: false,
-            prefix_share: false,
-            speculation: &[],
-            model_axes: false,
-            rewind: "none",
-            executor_arms: false,
-            kv_quant: &[KvQuant::Off],
-            kv_dtype: "f32",
-            kv_dense: &["f32"],
-            kv_quant_missing: "quantized GGUF weights do not install quantized KV stores",
-            vision: false,
-            vision_missing:
-                "this text owner has no media encoder; other family media paths remain available",
-            eos_gate: false,
-            eos_gate_missing: "generic GGUF forward has no gated kernels",
-        }
+        self.metadata.capabilities
     }
+
     fn load_warnings(&self) -> Vec<LoadWarning> {
         self.warnings.clone()
     }
@@ -329,12 +466,17 @@ impl<P: Predictor> Served for Engine<P> {
             .predictor
             .predicted_extra(Request::Decisions(body))
             .map_err(|e| SystemOneError::Execution(e.to_string()))?;
-        CausalEngine::systemone_admitted(&self.loaded, predicted, body)
+        let execute = self
+            .decisions
+            .as_ref()
+            .and_then(|route| route.raw)
+            .ok_or_else(|| {
+                SystemOneError::Unsupported("family supplied no retained decision operation".into())
+            })?;
+        execute(&self.loaded, predicted, body)
     }
     fn encode(&self, text: &str, add_special: bool) -> anyhow::Result<Vec<u32>> {
-        Ok(self.pass(Request::Encode { text, add_special }, |engine| {
-            engine.encode(text, add_special)
-        })?)
+        Ok(self.encode_admitted(text, add_special)?)
     }
     fn token_str(&self, id: u32) -> String {
         self.token_str_checked(id).expect("legacy infallible token display cannot report admission refusal; use token_str_checked")
@@ -422,9 +564,7 @@ impl<P: Predictor> Served for Engine<P> {
         params: &DecodeParams,
         on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> anyhow::Result<Decoded> {
-        Ok(self.pass(Request::Generation { prompt, params }, |engine| {
-            engine.complete(prompt, params, &mut |text| on_fragment(text))
-        })?)
+        Ok(self.complete_admitted(prompt, params, |text| on_fragment(text))?)
     }
     fn prefill_throughput(&self, n: usize, batch: usize) -> anyhow::Result<PrefillTiming> {
         self.check_batch(batch)?;
@@ -536,7 +676,7 @@ impl<P: Predictor> Served for Engine<P> {
                 lloom_tensor::bail!("logprobs requires a valid nonempty prompt and positive k")
             }
             let _lease = engine.checkout()?;
-            let mut cache = engine.model.new_cache()?;
+            let mut cache = engine.model.new_cache(&engine.config, &engine.device)?;
             let ids = Tensor::new(prompt, &engine.device)?.unsqueeze(0)?;
             let logits = engine
                 .model
@@ -560,9 +700,43 @@ impl<P: Predictor> Served for Engine<P> {
     }
     fn check_batch(&self, batch: usize) -> anyhow::Result<()> {
         if batch != 1 {
-            anyhow::bail!("lfm2-gguf text owner serves exactly one sequence, requested {batch}")
+            anyhow::bail!(
+                "{} text owner serves exactly one sequence, requested {batch}",
+                self.metadata.capabilities.family
+            )
         }
         Ok(())
     }
     fn shutdown(&self) {} // No owner worker threads are launched by this adapter.
+}
+
+fn lfm2_gguf_capabilities() -> Capabilities {
+    Capabilities {
+        family: "lfm2-gguf",
+        generation: true,
+        decisions: false,
+        profiles: lloom::profile::Bound {
+            family: "lfm2-gguf",
+            rewind: &["No"],
+            rows: &["One"],
+            except: &[lloom::profile::CrownExact::KEY],
+        },
+        lookahead_max: 1,
+        ring: "by-name: zero rewind horizon",
+        batch: false,
+        prefix_share: false,
+        speculation: &[],
+        model_axes: false,
+        rewind: "none",
+        executor_arms: false,
+        kv_quant: &[KvQuant::Off],
+        kv_dtype: "f32",
+        kv_dense: &["f32"],
+        kv_quant_missing: "quantized GGUF weights do not install quantized KV stores",
+        vision: false,
+        vision_missing:
+            "this text owner has no media encoder; other family media paths remain available",
+        eos_gate: false,
+        eos_gate_missing: "generic GGUF forward has no gated kernels",
+    }
 }

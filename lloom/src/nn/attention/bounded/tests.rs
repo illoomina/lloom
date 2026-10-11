@@ -57,60 +57,62 @@ fn scalar(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, scale: f64) -> Resu
 #[test]
 fn online_tiles_match_scalar_for_all_model_dtypes_gqa_offsets_and_value_strides() -> Result<()> {
     for dtype in [DType::F32, DType::F16, DType::BF16] {
-        // Nonzero start and noncontiguous outer stride; unit channel stride.
-        let q = data((2, 2, 4, 4), 1, dtype)?.narrow(2, 1, 3)?;
-        let k = data((2, 1, 4, 4), 2, dtype)?;
-        // Same shape, deliberately nonunit V channel stride (supported by CPU).
-        let v = data((2, 1, 4, 4), 3, dtype)?.transpose(2, 3)?;
-        let mask = Tensor::from_vec(
-            vec![0f32, -0.75, -3., 0.25, 0., -1., -0.5, -2.],
-            (2, 1, 1, 4),
-            &Device::Cpu,
-        )?
-        .to_dtype(dtype)?;
-        let unmasked = Tensor::zeros((2, 1, 1, 4), dtype, &Device::Cpu)?;
-        for n in [1, 3] {
-            let q = q.narrow(2, 0, n)?;
-            let expected = scalar(&q, &k, &v, &mask, 0.5)?;
-            let ignored = scalar(&q, &k, &v, &unmasked, 0.5)?;
-            assert!(
-                expected
-                    .iter()
-                    .zip(ignored)
-                    .any(|(a, b)| (a - b).abs() > 0.05),
-                "mask discriminator is vacuous"
-            );
-            for tile in [1, 2, 8] {
-                let plan = MaskedAttentionPlan::new(
-                    &q,
-                    &k,
-                    &v,
-                    &mask,
-                    0.5,
-                    NonZeroUsize::new(tile).unwrap(),
-                )?;
-                let mut previous = None;
-                for _ in 0..3 {
-                    let output = plan.execute()?;
-                    assert_eq!(output.dtype(), dtype);
-                    assert_eq!(output.dims(), q.dims());
-                    let actual = flat(&output)?;
-                    let tolerance = match dtype {
-                        DType::F32 => 2e-6,
-                        DType::F16 => 1e-3,
-                        _ => 8e-3,
-                    };
-                    for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
-                        assert!(
+        for (heads, kv_heads) in [(2, 1), (4, 2)] {
+            // Nonzero start and noncontiguous outer stride; unit channel stride.
+            let q = data((2, heads, 4, 4), 1, dtype)?.narrow(2, 1, 3)?;
+            let k = data((2, kv_heads, 4, 4), 2, dtype)?;
+            // Same shape, deliberately nonunit V channel stride (supported by CPU).
+            let v = data((2, kv_heads, 4, 4), 3, dtype)?.transpose(2, 3)?;
+            let mask = Tensor::from_vec(
+                vec![0f32, -0.75, -3., 0.25, 0., -1., -0.5, -2.],
+                (2, 1, 1, 4),
+                &Device::Cpu,
+            )?
+            .to_dtype(dtype)?;
+            let unmasked = Tensor::zeros((2, 1, 1, 4), dtype, &Device::Cpu)?;
+            for n in [1, 3] {
+                let q = q.narrow(2, 0, n)?;
+                let expected = scalar(&q, &k, &v, &mask, 0.5)?;
+                let ignored = scalar(&q, &k, &v, &unmasked, 0.5)?;
+                assert!(
+                    expected
+                        .iter()
+                        .zip(ignored)
+                        .any(|(a, b)| (a - b).abs() > 0.05),
+                    "mask discriminator is vacuous"
+                );
+                for tile in [1, 2, 8] {
+                    let plan = MaskedAttentionPlan::new(
+                        &q,
+                        &k,
+                        &v,
+                        &mask,
+                        0.5,
+                        NonZeroUsize::new(tile).unwrap(),
+                    )?;
+                    let mut previous = None;
+                    for _ in 0..3 {
+                        let output = plan.execute()?;
+                        assert_eq!(output.dtype(), dtype);
+                        assert_eq!(output.dims(), q.dims());
+                        let actual = flat(&output)?;
+                        let tolerance = match dtype {
+                            DType::F32 => 2e-6,
+                            DType::F16 => 1e-3,
+                            _ => 8e-3,
+                        };
+                        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                            assert!(
                             (a - e).abs() < tolerance,
-                            "{dtype:?} q{n} tile{tile} index{i}: {a} != {e}"
+                            "{dtype:?} H{heads}/KV{kv_heads} q{n} tile{tile} index{i}: {a} != {e}"
                         );
+                        }
+                        let bits: Vec<_> = actual.iter().map(|x| x.to_bits()).collect();
+                        if let Some(prior) = &previous {
+                            assert_eq!(&bits, prior);
+                        }
+                        previous = Some(bits);
                     }
-                    let bits: Vec<_> = actual.iter().map(|x| x.to_bits()).collect();
-                    if let Some(prior) = &previous {
-                        assert_eq!(&bits, prior);
-                    }
-                    previous = Some(bits);
                 }
             }
         }

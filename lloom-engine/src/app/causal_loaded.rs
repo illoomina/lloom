@@ -45,18 +45,53 @@ impl CausalPolicy {
             return Err(SystemOneError::Unsupported(
                 "this text causal owner has no installed media encoder; existing media APIs remain separate".into()));
         }
-        let questions = parse_systemone_questions(body, self.max_options, self.noul_aliases)
-            .map_err(invalid)?
-            .into_iter()
-            .map(|(id, question)| (id, question, self.temperature))
-            .collect();
-        CausalRequest::render(
-            &self.template,
+        self.prepare_rendered(
             state.state.as_ref(),
+            self.parse_questions(body)?,
+            capacity,
+            crate::decision::SystemOneMedia::Text,
+            |text| encode(text),
+            |text| encode(text),
+        )
+    }
+
+    /// One ordered question/readout policy for text and family-owned media.
+    /// The family supplies the already filtered state and whole prompt encoder.
+    pub(crate) fn parse_questions(
+        &self,
+        body: &OrderedJson,
+    ) -> std::result::Result<
+        Vec<(String, crate::decision::Question<OrderedJson>, Temperature)>,
+        SystemOneError,
+    > {
+        parse_systemone_questions(body, self.max_options, self.noul_aliases)
+            .map(|questions| {
+                questions
+                    .into_iter()
+                    .map(|(id, question)| (id, question, self.temperature))
+                    .collect()
+            })
+            .map_err(|error| SystemOneError::InvalidRequest(error.to_string()))
+    }
+
+    pub(crate) fn prepare_rendered(
+        &self,
+        state: &OrderedJson,
+        questions: Vec<(String, crate::decision::Question<OrderedJson>, Temperature)>,
+        capacity: usize,
+        media: crate::decision::SystemOneMedia<'_>,
+        encode_label: impl FnMut(&str) -> Result<Vec<u32>>,
+        encode_prompt: impl FnMut(&str) -> Result<Vec<u32>>,
+    ) -> std::result::Result<CausalRequest, SystemOneError> {
+        let invalid = |error: Error| SystemOneError::InvalidRequest(error.to_string());
+        CausalRequest::render_with_media(
+            &self.template,
+            state,
             questions,
             capacity,
-            |label| encode(label),
-            |prompt| encode(prompt),
+            media,
+            encode_label,
+            encode_prompt,
         )
         .map_err(invalid)
     }

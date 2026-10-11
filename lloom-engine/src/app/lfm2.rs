@@ -1801,13 +1801,13 @@ impl<P: Lfm2Shape> Engine<P> {
         let mut rows_placed = 0;
         let run = match features {
             Some(features) => {
-                let lm = ImageRows::new(
+                let lm = ImageRows::try_new(
                     &self.core.model,
                     prompt_ids.to_vec(),
                     image_token,
                     features,
                     first_rank,
-                );
+                )?;
                 let run = lease.with_model(&lm, &device, decode.clone(), |s, _| {
                     if start == 0 {
                         s.reset();
@@ -3198,3 +3198,5 @@ mod tests {
         }
     }
 }
+
+mod decision_media;

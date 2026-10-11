@@ -31,6 +31,7 @@ pub struct Engine<P: Lfm2Shape, Q> {
     owner: Admitted<Q, super::Engine<P>>,
     // Same caller-owned template/calibration, never a model/tokenizer/policy copy.
     policy: Option<Arc<CausalPolicy>>,
+    image_limits: Option<super::super::vision::ImageDecodeLimits>,
 }
 fn metadata<P: Lfm2Shape>(engine: &super::Engine<P>, no_workers: NoWorkerWitness) -> Metadata {
     Metadata {
@@ -63,7 +64,7 @@ pub fn load<P: Lfm2Shape, Q: Predictor>(
     load: LoadContext,
     predictor: Q,
 ) -> Result<Engine<P, Q>> {
-    load_with_optional_policy(opts, device, load, predictor, None)
+    load_with_optional_policy(opts, device, load, predictor, None, None)
 }
 /// Explicit borrowed-at-request raw policy on the same full owner. The Arc keeps
 /// the caller's single compiled template/calibration alive; no default policy or
@@ -75,7 +76,21 @@ pub fn load_with_policy<P: Lfm2Shape, Q: Predictor>(
     predictor: Q,
     policy: Arc<CausalPolicy>,
 ) -> Result<Engine<P, Q>> {
-    load_with_optional_policy(opts, device, load, predictor, Some(policy))
+    load_with_optional_policy(opts, device, load, predictor, Some(policy), None)
+}
+/// Additive image-capable raw policy on the same supplied full owner.
+/// Limits do not certify complete decoder/native allocation enrollment.
+pub fn load_with_image_policy<P: Lfm2Shape, Q: Predictor>(
+    opts: LoadOptions,
+    device: &Device,
+    load: LoadContext,
+    predictor: Q,
+    policy: Arc<CausalPolicy>,
+    limits: super::super::vision::ImageDecodeLimits,
+) -> Result<Engine<P, Q>> {
+    lloom_tensor::memory_admission::begin_model_load();
+    limits.validate()?;
+    load_with_optional_policy(opts, device, load, predictor, Some(policy), Some(limits))
 }
 fn load_with_optional_policy<P: Lfm2Shape, Q: Predictor>(
     opts: LoadOptions,
@@ -83,6 +98,7 @@ fn load_with_optional_policy<P: Lfm2Shape, Q: Predictor>(
     load: LoadContext,
     predictor: Q,
     policy: Option<Arc<CausalPolicy>>,
+    image_limits: Option<super::super::vision::ImageDecodeLimits>,
 ) -> Result<Engine<P, Q>> {
     let (loaded, metadata) = super::Engine::<P>::load_as_admitted_with_preflight(
         opts,
@@ -112,6 +128,7 @@ fn load_with_optional_policy<P: Lfm2Shape, Q: Predictor>(
         warnings: Vec::new(),
         owner: Admitted::new(loaded, predictor),
         policy,
+        image_limits,
     })
 }
 
@@ -163,25 +180,28 @@ impl<P: Lfm2Shape, Q: Predictor> Engine<P, Q> {
         let policy = self.policy.as_deref().ok_or_else(|| {
             SystemOneError::Unsupported("no explicit causal policy installed".into())
         })?;
-        self.owner
-            .pass(Request::PolicyDecisions { body, policy }, |engine| {
-                if !policy.template.has_causal_certificate() {
-                    return Ok(Err(SystemOneError::Unsupported("template has no audited causal certificate; ordinary rendering and prepared decisions remain available".into())));
-                }
-                Ok(policy
-                    .prepare_text(body, engine.kv_capacity, |text| {
-                        engine
-                            .encode(text, false)
-                            .map_err(lloom_tensor::Error::wrap)
-                    })
-                    .and_then(|request| {
-                        engine
-                            .decide_in_scope(&request)
-                            .map_err(|error| SystemOneError::Execution(error.to_string()))
-                    }))
-            })
-            .map_err(|error| SystemOneError::Execution(error.to_string()))?
+        let predicted_request = match self.image_limits {
+            Some(limits) => Request::PolicyImageDecisions {
+                body,
+                policy,
+                limits,
+            },
+            None => Request::PolicyDecisions { body, policy },
+        };
+        self.owner.pass(predicted_request, |engine| {
+            if !policy.template.has_causal_certificate() {
+                return Ok(Err(SystemOneError::Unsupported("template has no audited causal certificate; ordinary rendering and prepared decisions remain available".into())));
+            }
+            if let Some(limits) = self.image_limits {
+                return Ok(engine.systemone_images_in_scope(body, policy, limits));
+            }
+            Ok(policy.prepare_text(body, engine.kv_capacity, |text|
+                engine.encode(text, false).map_err(lloom_tensor::Error::wrap))
+                .and_then(|request| engine.decide_in_scope(&request)
+                    .map_err(|error| SystemOneError::Execution(error.to_string()))))
+        }).map_err(|error| SystemOneError::Execution(error.to_string()))?
     }
+
     pub fn complete_admitted(
         &self,
         prompt: &[u32],

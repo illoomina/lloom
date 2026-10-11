@@ -107,6 +107,25 @@ impl CausalRequest {
     pub fn trunk_tokens(&self) -> &[u32] {
         &self.tasks[0].prompt[..self.trunk]
     }
+    /// Media rows must be consumed entirely by the retained shared trunk.
+    /// Every full task is checked too: no branch may introduce another row.
+    pub(crate) fn validate_shared_token_positions(&self, token: u32, count: usize) -> Result<()> {
+        if self
+            .trunk_tokens()
+            .iter()
+            .filter(|&&id| id == token)
+            .count()
+            != count
+            || self
+                .tasks
+                .iter()
+                .any(|task| task.prompt.iter().filter(|&&id| id == token).count() != count)
+        {
+            lloom_tensor::bail!("causal image positions must all be in the shared trunk");
+        }
+        Ok(())
+    }
+
     pub fn input_tokens(&self) -> u64 {
         self.input_tokens
     }
@@ -118,6 +137,21 @@ impl CausalRequest {
             .map(|task| task.prompt.len())
             .max()
             .unwrap_or(0)
+    }
+
+    /// Validate prompts and selected readout IDs before any family model work.
+    pub(crate) fn validate_tokens(&self, vocab: usize) -> Result<()> {
+        for task in &self.tasks {
+            if task
+                .prompt
+                .iter()
+                .chain(&task.selected)
+                .any(|id| *id as usize >= vocab)
+            {
+                lloom_tensor::bail!("causal request token is outside loaded vocabulary")
+            }
+        }
+        Ok(())
     }
 
     /// Production programmatic executor; no model load, generation or chat-cache
@@ -163,16 +197,7 @@ impl CausalRequest {
         R: ReadbackStrategy,
     {
         let vocab = model.vocab_size();
-        for task in &self.tasks {
-            if task
-                .prompt
-                .iter()
-                .chain(&task.selected)
-                .any(|id| *id as usize >= vocab)
-            {
-                lloom_tensor::bail!("causal request token is outside loaded vocabulary")
-            }
-        }
+        self.validate_tokens(vocab)?;
         std::alloc::Layout::array::<(String, super::Answer<OrderedJson>)>(self.tasks.len())
             .map_err(Error::wrap)?;
         let mut answers = Vec::new();

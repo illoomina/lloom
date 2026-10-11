@@ -52,6 +52,13 @@ pub enum Request<'a> {
         body: &'a OrderedJson,
         policy: &'a CausalPolicy,
     },
+    /// Explicit family image bounds are available before any encoded media
+    /// is copied/decoded. The same body/policy and existing pass cover all work.
+    PolicyImageDecisions {
+        body: &'a OrderedJson,
+        policy: &'a CausalPolicy,
+        limits: super::super::vision::ImageDecodeLimits,
+    },
     PolicyRender {
         policy: &'a CausalPolicy,
         id: &'a str,

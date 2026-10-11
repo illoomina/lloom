@@ -302,6 +302,23 @@ where
     fuzz(cli, name, harness)
 }
 
+/// Every executor invocation changes the same persistent harness, including
+/// comparison tracing. Record before entering it so replay keeps that order.
+fn execute_recorded<H>(record: Record, harness: &RefCell<H>, name: &str, bytes: &[u8]) -> ExitKind
+where
+    H: FnMut(&[u8]) -> Result<(), String>,
+{
+    record.push(bytes);
+    match (harness.borrow_mut())(bytes) {
+        Ok(()) => ExitKind::Ok,
+        Err(message) => {
+            let directory = record.dump(&message);
+            eprintln!("[{name}] oracle failure: {message}\n[{name}] record: {directory:?}");
+            ExitKind::Crash
+        }
+    }
+}
+
 fn fuzz<H>(cli: &Cli, name: &str, harness: Rc<RefCell<H>>) -> anyhow::Result<()>
 where
     H: FnMut(&[u8]) -> Result<(), String> + 'static,
@@ -360,16 +377,7 @@ where
             let h = Rc::clone(&harness);
             let mut exec_harness = |input: &BytesInput| -> ExitKind {
                 let bytes = input.target_bytes();
-                let bytes: &[u8] = &bytes;
-                record.push(bytes);
-                match (h.borrow_mut())(bytes) {
-                    Ok(()) => ExitKind::Ok,
-                    Err(m) => {
-                        let dir = record.dump(&m);
-                        eprintln!("[{name}] oracle failure: {m}\n[{name}] record: {dir:?}");
-                        ExitKind::Crash
-                    }
-                }
+                execute_recorded(record, &h, name, &bytes)
             };
             #[allow(deprecated)]
             let mut executor = InProcessExecutor::with_timeout(
@@ -423,10 +431,7 @@ where
                 let h2 = Rc::clone(&harness);
                 let mut trace_harness = |input: &BytesInput| -> ExitKind {
                     let bytes = input.target_bytes();
-                    match (h2.borrow_mut())(&bytes) {
-                        Ok(()) => ExitKind::Ok,
-                        Err(_) => ExitKind::Crash,
-                    }
+                    execute_recorded(record, &h2, name, &bytes)
                 };
                 #[allow(deprecated)]
                 let tracer = InProcessExecutor::with_timeout(

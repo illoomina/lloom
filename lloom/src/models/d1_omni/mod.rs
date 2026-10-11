@@ -8,3 +8,6 @@ pub use head::{DecisionHead, DecisionHeadBatch};
 
 mod trunk;
 pub use trunk::{QuerySegment, TextConfig, Trunk, TrunkBatch};
+
+mod core;
+pub use core::{DecisionCore, DecisionCoreConfig, DecisionRow, PreparedRows};

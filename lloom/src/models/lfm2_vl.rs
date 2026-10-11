@@ -1442,3 +1442,6 @@ mod tests {
         trait_bounds_hold::<VisionEncoder>();
     }
 }
+
+#[cfg(test)]
+mod decision_reuse_tests;

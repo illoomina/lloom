@@ -8,6 +8,7 @@ mod omni;
 mod omni_readout;
 mod question;
 mod readout;
+mod request;
 mod temperature;
 
 pub use json::OrderedJson;
@@ -15,6 +16,7 @@ pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
 pub use omni_readout::OmniReadout;
 pub use question::{Answer, Question};
 pub use readout::{CausalReadout, PreparedQuestion};
+pub use request::{parse_systemone_questions, NoulAliases};
 
 pub use temperature::Temperature;
 

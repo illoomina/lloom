@@ -5233,6 +5233,8 @@ impl<P: Profile> State<P> {
         self.conv_phase_prev = 0;
         self.conv_history = 0;
         self.conv_compact = false;
+        self.speculative = false;
+        self.taps.iter_mut().for_each(|tap| *tap = None);
         // The checkpoints describe the sequence that was just discarded; the
         // slots' buffers stay as scratch for the next one.
         self.turn_checkpoints
@@ -5612,9 +5614,9 @@ impl<P: Profile> State<P> {
     /// cover both halves of the state: the KV length and the conv phase are
     /// both read here, before either is moved.
     ///
-    /// Between this call and its [`Cache::resolve`], reads see all `len + k`
-    /// positions, and **no second `advance` is permitted** — enforced by
-    /// `SpecToken` not being `Copy`, so the caller cannot hold two.
+    /// The move-only receipt prevents consuming the same value twice, but does
+    /// not borrow this cache or prevent overlapping windows. Callers keep window
+    /// order; reset discards the sequence without certifying old receipts.
     pub fn advance(&mut self, k: usize) -> Result<SpecToken> {
         if k == 0 {
             lloom_tensor::bail!(
@@ -5856,11 +5858,9 @@ impl<P: Profile<Rows = crate::profile::Paged>> State<P> {
 
 /// The receipt for an open speculative window — `DESIGN.md` §10.2a.
 ///
-/// **`#[must_use]` and not `Copy`, and both are load-bearing.** A caller who
-/// advances and forgets to resolve gets a compile warning; one who resolves
-/// twice gets a move error. `Cache` is the only place that can mint one, which
-/// is what makes "no second `advance` before a `resolve`" a property of the
-/// type rather than of anyone's discipline.
+/// `#[must_use]` warns about an ignored receipt, and a move prevents consuming
+/// the same value twice. Neither prevents overlapping advances nor binds the
+/// receipt to a cache/reset generation; that identity contract is not enforced.
 ///
 /// It carries the pre-advance state rather than only the width, so `resolve`
 /// checks that the window ran the passes it was opened for instead of trusting
@@ -11864,6 +11864,10 @@ pub mod kv_slot_fuzz {
         v
     }
 }
+
+#[cfg(test)]
+#[path = "lfm2/reset_recovery_tests.rs"]
+mod reset_recovery_tests;
 
 #[cfg(test)]
 mod tests {

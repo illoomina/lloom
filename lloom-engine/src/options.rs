@@ -1548,6 +1548,14 @@ pub struct LoadConfig {
         cli = "tokenizer"
     )]
     pub tokenizer: Option<std::path::PathBuf>,
+    /// Explicit GGUF media companion (d1-omni vision/audio). No sidecar variant is guessed. Safetensors checkpoints keep media in their checkpoint and do not consume this option.
+    #[opt(
+        flag = "mmproj",
+        path = "model.mmproj",
+        status = "advanced",
+        cli = "mmproj"
+    )]
+    pub mmproj: Option<std::path::PathBuf>,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]
     pub warmup: bool,
@@ -1599,6 +1607,7 @@ impl Default for LoadConfig {
             model: None,
             model_name: None,
             tokenizer: None,
+            mmproj: None,
             warmup: true,
             device: "auto".into(),
             experts: "stream".into(),

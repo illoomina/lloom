@@ -882,6 +882,26 @@ mod model_group_tests {
     }
 
     #[test]
+    fn explicit_mmproj_uses_existing_option_layers_and_roundtrips() {
+        assert!(crate::LoadConfig::default().mmproj.is_none());
+        for args in [
+            vec!["--mmproj", "/one/mmproj.gguf"],
+            vec!["--set", "model.mmproj=/one/mmproj.gguf"],
+            vec!["--model-config", r#"{"mmproj":"/one/mmproj.gguf"}"#],
+        ] {
+            let options = resolve_options_uninstalled(&common(&args), &no_front).unwrap();
+            assert_eq!(
+                options.load.mmproj.as_deref(),
+                Some(std::path::Path::new("/one/mmproj.gguf"))
+            );
+            let dump = serde_json::to_value(&options).unwrap();
+            let mut restored = crate::EngineOptions::default();
+            restored.merge_json(&dump).unwrap();
+            assert_eq!(restored, options);
+        }
+    }
+
+    #[test]
     fn the_axes_reach_the_config_by_flag_key_and_json() {
         let o = resolve_options_uninstalled(
             &common(&[

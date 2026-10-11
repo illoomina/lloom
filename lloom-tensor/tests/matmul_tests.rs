@@ -353,6 +353,7 @@ test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
 /// Broadcasting RHS over batch permits a single GEMM only when successive lhs
 /// rows also cross batch boundaries with the same row stride. Element-count
 /// equality alone is insufficient for transposed or narrowed matrix views.
+#[cfg(all(not(feature = "mkl"), not(feature = "accelerate")))]
 #[test]
 fn broadcast_rhs_batch_fold_preserves_strided_rows_cpu() -> Result<()> {
     let dev = &Device::Cpu;

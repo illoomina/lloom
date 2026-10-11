@@ -478,3 +478,6 @@ fn begin_work<'a, R: Recovery>(
 #[cfg(test)]
 #[path = "omni_tests.rs"]
 mod tests;
+
+mod endpoint;
+pub use endpoint::Endpoint;

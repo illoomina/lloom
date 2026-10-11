@@ -10,6 +10,7 @@ pub mod budgets;
 pub mod causal_loaded;
 pub mod chat;
 pub mod common;
+pub mod decision_endpoint;
 pub mod family;
 pub mod lfm2;
 pub mod modes;

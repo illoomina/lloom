@@ -42,7 +42,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -266,6 +266,106 @@ fn run_owner(
     Ok(())
 }
 
+/// Serve a decision-only owner using the SAME ordered dispatcher/status mapper.
+/// This loop spawns no request worker threads and invents no generation/KV/seed API.
+/// Only host/port are honored from options. max_body_bytes bounds the bytes
+/// retained by this application reader, NOT dependency header/body allocations,
+/// unread-body Drop draining, read time, or complete model prediction. tiny_http
+/// owns listener/connection threads and may drain unread Content-Length with a
+/// remaining-body-sized allocation; this is not a hostile-input transport bound.
+/// Socket/parsing/serialization/metadata buffers remain enrollment obligations.
+/// Default family registration is unchanged; encoded-media capability is the
+/// installed endpoint's actual contract, not inferred from its model name.
+pub fn run_decisions_loaded(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+) -> Result<()> {
+    let read_bound = max_body_bytes
+        .checked_add(1)
+        .filter(|_| max_body_bytes != 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("decision transport body bound must be finite and nonzero")
+        })?;
+    let host = options.server.host;
+    let server = Server::http((host.as_str(), options.server.port))
+        .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(addr) => addr.port(),
+        #[allow(unreachable_patterns)]
+        _ => options.server.port,
+    };
+    println!(
+        "{}",
+        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true})
+    );
+    std::io::stdout().flush()?;
+    loop {
+        let mut request = match server.recv() {
+            Ok(request) => request,
+            Err(_) => break,
+        };
+        let path = request.url().split('?').next().unwrap_or("").to_owned();
+        match (request.method().clone(), path.as_str()) {
+            (Method::Get, "/health") => {
+                let _ = respond_metadata(request, endpoint.health_checked());
+            }
+            (Method::Get, "/v1/models") => {
+                // Caller provenance label; outer metadata formatting is not
+                // silently claimed paid by the model's inner request pass.
+                let body = json!({"object":"list","data":[{"id":endpoint.model_name(),"object":"model","generation":false,"decisions":true}]});
+                let _ = respond_json(request, 200, &body);
+            }
+            (Method::Post, "/shutdown") => {
+                let _ = respond_json(request, 200, &json!({}));
+                break;
+            }
+            (Method::Post, "/v1/systemone") => {
+                let mut body = Vec::new();
+                let read = request
+                    .as_reader()
+                    .take(read_bound as u64)
+                    .read_to_end(&mut body);
+                match read {
+                    Err(error) => {
+                        let _ =
+                            respond_error(request, 400, &format!("reading request body: {error}"));
+                    }
+                    Ok(_) if body.len() > max_body_bytes => {
+                        let _ = respond_error(
+                            request,
+                            413,
+                            "decision request body exceeds supplied byte limit",
+                        );
+                    }
+                    Ok(_) => {
+                        let result =
+                            dispatch_systemone_with(&path, &body, |body| endpoint.systemone(body))
+                                .expect("SystemOne route selected above");
+                        let _ = respond_systemone(request, result);
+                    }
+                }
+            }
+            (Method::Post, "/v1/completions" | "/v1/chat/completions") => {
+                let _ = respond_error(
+                    request,
+                    501,
+                    "this decision-only owner does not generate tokens",
+                );
+            }
+            _ => {
+                let _ = respond_error(request, 404, &format!("unknown decision endpoint: {path}"));
+            }
+        }
+    }
+    // Our loop spawned no request threads and its last synchronous call returned.
+    // tiny_http owns separate listener/connection machinery; this does NOT
+    // establish its thread/drain/socket shutdown closure.
+    // Worker-stop only: no native DATA/callback/retirement certificate.
+    endpoint.shutdown();
+    Ok(())
+}
+
 // ---- routing ---------------------------------------------------------------
 
 fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Result<()> {
@@ -277,18 +377,7 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
     if let Some(result) = dispatch_systemone(shared.engine.as_ref(), path, body.as_bytes()) {
-        return match result {
-            Ok(text) => respond_json_text(request, 200, text),
-            Err(crate::decision::SystemOneError::InvalidRequest(message)) => {
-                respond_error(request, 400, &message)
-            }
-            Err(crate::decision::SystemOneError::Unsupported(message)) => {
-                respond_error(request, 501, &message)
-            }
-            Err(crate::decision::SystemOneError::Execution(message)) => {
-                respond_error(request, 500, &message)
-            }
-        };
+        return respond_systemone(request, result);
     }
     let value: Value = if body.trim().is_empty() {
         json!({})
@@ -328,6 +417,33 @@ fn dispatch_systemone(
     path: &str,
     body: &[u8],
 ) -> Option<std::result::Result<String, crate::decision::SystemOneError>> {
+    dispatch_systemone_with(path, body, |body| engine.systemone(body))
+}
+
+fn respond_systemone(
+    request: Request,
+    result: std::result::Result<String, crate::decision::SystemOneError>,
+) -> Result<()> {
+    use crate::decision::SystemOneError;
+    match result {
+        Ok(text) => respond_json_text(request, 200, text),
+        Err(SystemOneError::InvalidRequest(message)) => respond_error(request, 400, &message),
+        Err(SystemOneError::Unsupported(message)) => respond_error(request, 501, &message),
+        Err(SystemOneError::Execution(message)) => respond_error(request, 500, &message),
+    }
+}
+
+/// Shared actual ordered parser/invocation/serializer for both installed shapes.
+fn dispatch_systemone_with(
+    path: &str,
+    body: &[u8],
+    execute: impl FnOnce(
+        &crate::decision::OrderedJson,
+    ) -> std::result::Result<
+        crate::decision::SystemOneResponse,
+        crate::decision::SystemOneError,
+    >,
+) -> Option<std::result::Result<String, crate::decision::SystemOneError>> {
     use crate::decision::{OrderedJson, SystemOneError};
     if path != "/v1/systemone" {
         return None;
@@ -336,7 +452,7 @@ fn dispatch_systemone(
         let ordered = OrderedJson::from_slice(body).map_err(|e| {
             SystemOneError::InvalidRequest(format!("request body is not JSON: {e}"))
         })?;
-        let response = engine.systemone(&ordered)?;
+        let response = execute(&ordered)?;
         serde_json::to_string(&response).map_err(|e| SystemOneError::Execution(e.to_string()))
     })())
 }
@@ -2921,6 +3037,47 @@ mod systemone_dispatch_tests {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         SystemOneResponse::new(answers, 123)
+    }
+
+    #[test]
+    fn actual_narrow_dispatch_keeps_incumbent_bytes_and_refusal_classification() {
+        use super::dispatch_systemone_with;
+        let engine = NoVision::new(Some(answer));
+        let body=br#"{"state":{"z":"\u96ea\n","a":false},"questions":{"z":{"type":"score","instructions":"rate","criteria":[{"z":null,"a":false},17]},"a":{"type":"choice","instructions":"pick","criteria":{"Z":null,"A":true}}}}"#;
+        let incumbent = dispatch_systemone(&engine, "/v1/systemone", body)
+            .unwrap()
+            .unwrap();
+        let mut calls = 0;
+        let narrow = dispatch_systemone_with("/v1/systemone", body, |body| {
+            calls += 1;
+            answer(body)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(narrow, incumbent);
+        assert_eq!(calls, 1);
+        assert!(
+            narrow.contains(r#""legend":{"0":{"z":null,"a":false},"1":17}},"a":{"type":"choice""#)
+        );
+        assert!(narrow.ends_with(r#""usage":{"input_tokens":123,"output_tokens":0}}"#));
+        assert!(
+            dispatch_systemone_with("/v1/chat/completions", b"not json", |_| panic!(
+                "unrelated route called endpoint"
+            ))
+            .is_none()
+        );
+        assert!(matches!(
+            dispatch_systemone_with("/v1/systemone", b"not json", |_| panic!(
+                "invalid JSON called endpoint"
+            )),
+            Some(Err(SystemOneError::InvalidRequest(_)))
+        ));
+        assert!(
+            matches!(dispatch_systemone_with("/v1/systemone",b"{}",|_|Err(SystemOneError::Unsupported("not installed".into()))),Some(Err(SystemOneError::Unsupported(message))) if message=="not installed")
+        );
+        assert!(
+            matches!(dispatch_systemone_with("/v1/systemone",b"{}",|_|Err(SystemOneError::Execution("refused admission".into()))),Some(Err(SystemOneError::Execution(message))) if message=="refused admission")
+        );
     }
 
     #[test]

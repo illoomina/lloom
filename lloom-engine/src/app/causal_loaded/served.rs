@@ -68,6 +68,9 @@ pub enum Request<'a> {
     },
     /// Same resolved omni owner. Inputs are borrowed BEFORE ordered parsing,
     /// rendering, media encoding, bidirectional rows and returned readout work.
+    OmniHealth {
+        model_name: &'a str,
+    },
     OmniRender {
         id: &'a str,
         state: &'a OrderedJson,

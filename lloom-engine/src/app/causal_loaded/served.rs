@@ -46,6 +46,19 @@ pub enum Request<'a> {
     /// both measured/reference arms. No zero or generic default prediction.
     Mode(&'a super::super::modes::ModeSpec),
     Decisions(&'a OrderedJson),
+    /// The same caller-owned policy, borrowed before ordered parsing/rendering,
+    /// token preparation, cache/readout or executor work allocates.
+    PolicyDecisions {
+        body: &'a OrderedJson,
+        policy: &'a CausalPolicy,
+    },
+    PolicyRender {
+        policy: &'a CausalPolicy,
+        id: &'a str,
+        state: &'a OrderedJson,
+        question: &'a crate::decision::Question<OrderedJson>,
+        labels: &'a [String],
+    },
     PreparedDecisions(&'a CausalRequest),
     SystemOneRender {
         id: &'a str,

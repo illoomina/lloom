@@ -602,6 +602,16 @@ impl<P: Lfm2Shape> Engine<P> {
         load: lloom::nn::memory::LoadContext,
         capture: impl FnOnce(&Self, NoWorkerWitness) -> T,
     ) -> Result<(lloom::nn::memory::Loaded<Self>, T)> {
+        Self::load_as_admitted_with_preflight(opts, device, load, |_, _| Ok(()), capture)
+    }
+
+    fn load_as_admitted_with_preflight<T>(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+        preflight: impl FnOnce(&Config, &Text) -> Result<()>,
+        capture: impl FnOnce(&Self, NoWorkerWitness) -> T,
+    ) -> Result<(lloom::nn::memory::Loaded<Self>, T)> {
         lloom_tensor::memory_admission::begin_model_load();
         if opts.cpu != device.is_cpu() {
             anyhow::bail!("supplied LFM2 device disagrees with load options");
@@ -611,8 +621,13 @@ impl<P: Lfm2Shape> Engine<P> {
         }
         let mut metadata = None;
         let loaded = lloom::nn::memory::Loaded::new(device, load, |resolved, _context| {
-            let engine = Self::load_on(opts, resolved.clone(), LoadAdmission::CallerScoped)
-                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+            let engine = Self::load_on_with_preflight(
+                opts,
+                resolved.clone(),
+                LoadAdmission::CallerScoped,
+                preflight,
+            )
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
             // The single-sequence branch returns before spawn_batch. Check the
             // actual owner too, so a future constructor cannot invalidate the
             // wrapper's narrowed shutdown without a refusal here.
@@ -661,36 +676,51 @@ impl<P: Lfm2Shape> Engine<P> {
         request: &crate::decision::CausalRequest,
     ) -> Result<crate::decision::SystemOneResponse> {
         Ok(loaded.with_pass(predicted_extra, |engine, _context| {
-            engine
-                .check_fits(request.max_prompt_tokens(), 0)
-                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
-            let mut lease = engine
-                .checkout_single()
-                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
-            // Fresh decision caches still touch the same model scratch. Keep
-            // Held exclusion and mark recovery on Err/unwind before any work.
-            lease.start_external_work();
-            let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
-            let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &engine.core.device)?;
-            let result = request.execute_with_cache_factory(
-                &engine.core.model,
-                &mut readback,
-                &options,
-                |_model, device| {
-                    engine
-                        .private_cache
-                        .create::<P>(&engine.config, engine.dtype, device)
-                        .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
-                },
-            );
-            if result.is_ok() {
-                lease.mark_complete();
-            }
-            result
+            engine.decide_in_scope(request)
         })?)
     }
 
+    // Both prepared and raw callers enter exactly one existing Loaded pass.
+    fn decide_in_scope(
+        &self,
+        request: &crate::decision::CausalRequest,
+    ) -> lloom_tensor::Result<crate::decision::SystemOneResponse> {
+        self.check_fits(request.max_prompt_tokens(), 0)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        let mut lease = self
+            .checkout_single()
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        // Fresh decision caches still touch the same model scratch. Keep
+        // Held exclusion and mark recovery on Err/unwind before any work.
+        lease.start_external_work();
+        let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
+        let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.core.device)?;
+        let result = request.execute_with_cache_factory(
+            &self.core.model,
+            &mut readback,
+            &options,
+            |_model, device| {
+                self.private_cache
+                    .create::<P>(&self.config, self.dtype, device)
+                    .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+            },
+        );
+        if result.is_ok() {
+            lease.mark_complete();
+        }
+        result
+    }
+
     fn load_on(opts: LoadOptions, device: Device, admission: LoadAdmission) -> Result<Self> {
+        Self::load_on_with_preflight(opts, device, admission, |_, _| Ok(()))
+    }
+
+    fn load_on_with_preflight(
+        opts: LoadOptions,
+        device: Device,
+        admission: LoadAdmission,
+        preflight: impl FnOnce(&Config, &Text) -> Result<()>,
+    ) -> Result<Self> {
         let model_dir = opts.model_dir.clone();
         let dtype = if device.is_cpu() {
             DType::F32
@@ -802,6 +832,49 @@ impl<P: Lfm2Shape> Engine<P> {
                 opts.reuse_prefix,
             );
         let axes_line = config.axes_line();
+        // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
+        // turn end).
+        let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
+        if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
+            if !eos_ids.contains(&id) {
+                eos_ids.push(id);
+            }
+        }
+        let bos_id = tokenizer.token_to_id("<|startoftext|>");
+        let bos_token = bos_id
+            .and_then(|id| tokenizer.id_to_token(id))
+            .unwrap_or_default();
+
+        let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+            Ok(src) => Some(Template::compile(&src)?),
+            Err(_) => None,
+        };
+
+        let seed_tokens = tokenizer
+            .encode(opts.seed_text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
+            .get_ids()
+            .to_vec();
+        if seed_tokens.is_empty() {
+            anyhow::bail!("the prompt seed tokenized to nothing");
+        }
+
+        // Prepare the SAME Text once, before weight mapping/model/cache creation.
+        // Executor/device setup above and host metadata remain cold producers;
+        // this ordering is not a complete constructor/error-custody certificate.
+        let text = Arc::new(Text {
+            tokenizer,
+            template,
+            bos_token,
+            bos_id,
+            eos_ids,
+            seed_tokens,
+            think: Default::default(),
+            gen_prompts: Default::default(),
+        });
+        text.prime();
+        preflight(&config, &text)?;
+
         // Admission (§9.5d): predict the peak at the configured ceiling and
         // refuse at load rather than find the limit by dying. The activation
         // term is a function of the LONGEST forward this process will run
@@ -1042,33 +1115,6 @@ impl<P: Lfm2Shape> Engine<P> {
         let make_cache = |device: &Device| private_cache.create::<P>(&config, dtype, device);
         let cache = make_cache(&device)?;
 
-        // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
-        // turn end).
-        let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
-        if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
-            if !eos_ids.contains(&id) {
-                eos_ids.push(id);
-            }
-        }
-        let bos_id = tokenizer.token_to_id("<|startoftext|>");
-        let bos_token = bos_id
-            .and_then(|id| tokenizer.id_to_token(id))
-            .unwrap_or_default();
-
-        let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-            Ok(src) => Some(Template::compile(&src)?),
-            Err(_) => None,
-        };
-
-        let seed_tokens = tokenizer
-            .encode(opts.seed_text.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
-            .get_ids()
-            .to_vec();
-        if seed_tokens.is_empty() {
-            anyhow::bail!("the prompt seed tokenized to nothing");
-        }
-
         let model_name = opts
             .model_name
             .unwrap_or_else(|| model_name_from_dir(&model_dir));
@@ -1076,16 +1122,7 @@ impl<P: Lfm2Shape> Engine<P> {
         let core = Arc::new(Core { model, device });
         let mut engine = Engine {
             core: Arc::clone(&core),
-            text: Arc::new(Text {
-                tokenizer,
-                template,
-                bos_token,
-                bos_id,
-                eos_ids,
-                seed_tokens,
-                think: Default::default(),
-                gen_prompts: Default::default(),
-            }),
+            text,
             model_name,
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
@@ -1139,7 +1176,6 @@ impl<P: Lfm2Shape> Engine<P> {
             sched: None,
             sched_thread: Mutex::new(None),
         };
-        engine.text.prime();
 
         if opts.warmup {
             let ((libs, pipes), measured) =

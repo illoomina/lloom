@@ -3,8 +3,12 @@
 //! Legacy infallible metadata refusal policy and default registration stay open.
 use super::*;
 use crate::app::causal_loaded::served::{Admitted, MetadataRequest, Predictor, Request};
+use crate::app::causal_loaded::CausalPolicy;
 use crate::app::served::Served;
-use crate::decision::{CausalRequest, SystemOneResponse};
+use crate::decision::{
+    CausalRequest, OrderedJson, SystemOneError, SystemOneMedia, SystemOneResponse,
+    SystemOneTemplateKind,
+};
 use lloom::nn::memory::LoadContext;
 
 struct Metadata {
@@ -25,6 +29,8 @@ pub struct Engine<P: Lfm2Shape, Q> {
     metadata: Metadata,
     warnings: Vec<LoadWarning>,
     owner: Admitted<Q, super::Engine<P>>,
+    // Same caller-owned template/calibration, never a model/tokenizer/policy copy.
+    policy: Option<Arc<CausalPolicy>>,
 }
 fn metadata<P: Lfm2Shape>(engine: &super::Engine<P>, no_workers: NoWorkerWitness) -> Metadata {
     Metadata {
@@ -57,14 +63,58 @@ pub fn load<P: Lfm2Shape, Q: Predictor>(
     load: LoadContext,
     predictor: Q,
 ) -> Result<Engine<P, Q>> {
-    let (loaded, metadata) =
-        super::Engine::<P>::load_as_admitted_with(opts, device, load, metadata::<P>)?;
+    load_with_optional_policy(opts, device, load, predictor, None)
+}
+/// Explicit borrowed-at-request raw policy on the same full owner. The Arc keeps
+/// the caller's single compiled template/calibration alive; no default policy or
+/// template certificate is invented. Prepared decisions remain available.
+pub fn load_with_policy<P: Lfm2Shape, Q: Predictor>(
+    opts: LoadOptions,
+    device: &Device,
+    load: LoadContext,
+    predictor: Q,
+    policy: Arc<CausalPolicy>,
+) -> Result<Engine<P, Q>> {
+    load_with_optional_policy(opts, device, load, predictor, Some(policy))
+}
+fn load_with_optional_policy<P: Lfm2Shape, Q: Predictor>(
+    opts: LoadOptions,
+    device: &Device,
+    load: LoadContext,
+    predictor: Q,
+    policy: Option<Arc<CausalPolicy>>,
+) -> Result<Engine<P, Q>> {
+    let (loaded, metadata) = super::Engine::<P>::load_as_admitted_with_preflight(
+        opts,
+        device,
+        load,
+        |config, text| {
+            if let Some(policy) = policy.as_deref() {
+                if policy.template.kind() != SystemOneTemplateKind::D1Causal {
+                    anyhow::bail!("full LFM causal policy needs a causal template kind");
+                }
+                // Include sparse/added ids, not just a vocabulary count.
+                if text
+                    .tokenizer
+                    .get_vocab(true)
+                    .values()
+                    .any(|&id| id as usize >= config.vocab_size)
+                {
+                    anyhow::bail!("tokenizer id is outside resolved LFM vocabulary");
+                }
+            }
+            Ok(())
+        },
+        metadata::<P>,
+    )?;
     Ok(Engine {
         metadata,
         warnings: Vec::new(),
         owner: Admitted::new(loaded, predictor),
+        policy,
     })
 }
+
 impl<P: Lfm2Shape, Q: Predictor> Engine<P, Q> {
     fn pass<T>(
         &self,
@@ -77,6 +127,60 @@ impl<P: Lfm2Shape, Q: Predictor> Engine<P, Q> {
     pub fn decide_prepared(&self, request: &CausalRequest) -> Result<SystemOneResponse> {
         let predicted = self.owner.predict(Request::PreparedDecisions(request))?;
         super::Engine::<P>::decide_admitted(&self.owner.loaded, predicted, request)
+    }
+    /// Ordinary caller template rendering remains usable without a state-prefix
+    /// certificate; predictor sees the actual borrowed policy and request inputs.
+    pub fn render_systemone(
+        &self,
+        id: &str,
+        state: &OrderedJson,
+        question: &crate::decision::Question<OrderedJson>,
+        labels: &[String],
+    ) -> Result<String> {
+        let policy = self
+            .policy
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no explicit causal policy installed"))?;
+        Ok(self.owner.pass(
+            Request::PolicyRender {
+                policy,
+                id,
+                state,
+                question,
+                labels,
+            },
+            |_| {
+                Ok(policy
+                    .template
+                    .render(id, state, question, labels, SystemOneMedia::Text)?)
+            },
+        )?)
+    }
+    pub fn systemone_admitted(
+        &self,
+        body: &OrderedJson,
+    ) -> std::result::Result<SystemOneResponse, SystemOneError> {
+        let policy = self.policy.as_deref().ok_or_else(|| {
+            SystemOneError::Unsupported("no explicit causal policy installed".into())
+        })?;
+        self.owner
+            .pass(Request::PolicyDecisions { body, policy }, |engine| {
+                if !policy.template.has_causal_certificate() {
+                    return Ok(Err(SystemOneError::Unsupported("template has no audited causal certificate; ordinary rendering and prepared decisions remain available".into())));
+                }
+                Ok(policy
+                    .prepare_text(body, engine.kv_capacity, |text| {
+                        engine
+                            .encode(text, false)
+                            .map_err(lloom_tensor::Error::wrap)
+                    })
+                    .and_then(|request| {
+                        engine
+                            .decide_in_scope(&request)
+                            .map_err(|error| SystemOneError::Execution(error.to_string()))
+                    }))
+            })
+            .map_err(|error| SystemOneError::Execution(error.to_string()))?
     }
     pub fn complete_admitted(
         &self,
@@ -172,8 +276,18 @@ impl<P: Lfm2Shape, Q: Predictor> Served for Engine<P, Q> {
         super::super::family::Capabilities {
             batch: false,
             prefix_share: false,
+            decisions: self
+                .policy
+                .as_deref()
+                .is_some_and(|policy| policy.template.has_causal_certificate()),
             ..super::super::family::LFM2_CAPABILITIES
         }
+    }
+    fn systemone(
+        &self,
+        body: &OrderedJson,
+    ) -> std::result::Result<SystemOneResponse, SystemOneError> {
+        self.systemone_admitted(body)
     }
     fn load_warnings(&self) -> Vec<LoadWarning> {
         self.load_warnings_checked().expect(

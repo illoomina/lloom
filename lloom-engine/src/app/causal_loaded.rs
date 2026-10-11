@@ -30,6 +30,37 @@ pub struct CausalPolicy {
     pub noul_aliases: NoulAliases,
     pub state_nullability: StateNullability,
 }
+impl CausalPolicy {
+    /// Shared ordered text preparation. Media execution remains a distinct family
+    /// integration; no encoded payload is decoded or silently replaced here.
+    pub(crate) fn prepare_text(
+        &self,
+        body: &OrderedJson,
+        capacity: usize,
+        encode: impl Fn(&str) -> Result<Vec<u32>>,
+    ) -> std::result::Result<CausalRequest, SystemOneError> {
+        let invalid = |error: Error| SystemOneError::InvalidRequest(error.to_string());
+        let state = parse_systemone_state(body, self.state_nullability).map_err(invalid)?;
+        if !state.media.is_empty() {
+            return Err(SystemOneError::Unsupported(
+                "this text causal owner has no installed media encoder; existing media APIs remain separate".into()));
+        }
+        let questions = parse_systemone_questions(body, self.max_options, self.noul_aliases)
+            .map_err(invalid)?
+            .into_iter()
+            .map(|(id, question)| (id, question, self.temperature))
+            .collect();
+        CausalRequest::render(
+            &self.template,
+            state.state.as_ref(),
+            questions,
+            capacity,
+            |label| encode(label),
+            |prompt| encode(prompt),
+        )
+        .map_err(invalid)
+    }
+}
 /// Calibration/limits remain explicit even for a named checkpoint template.
 /// Selecting a named source never invents its option temperature or API policy.
 pub enum CausalPolicySource {
@@ -241,26 +272,7 @@ where
                 "no named or explicit causal systemone policy was installed".into(),
             )
         })?;
-        let invalid = |error: Error| SystemOneError::InvalidRequest(error.to_string());
-        let state = parse_systemone_state(body, policy.state_nullability).map_err(invalid)?;
-        if !state.media.is_empty() {
-            return Err(SystemOneError::Unsupported(
-                "this text causal owner has no installed media encoder; existing media APIs remain separate".into()));
-        }
-        let questions = parse_systemone_questions(body, policy.max_options, policy.noul_aliases)
-            .map_err(invalid)?
-            .into_iter()
-            .map(|(id, question)| (id, question, policy.temperature))
-            .collect();
-        let request = CausalRequest::render(
-            &policy.template,
-            state.state.as_ref(),
-            questions,
-            self.capacity,
-            |label| self.encode(label, false),
-            |prompt| self.encode(prompt, false),
-        )
-        .map_err(invalid)?;
+        let request = policy.prepare_text(body, self.capacity, |text| self.encode(text, false))?;
         self.decide(&request)
             .map_err(|error| SystemOneError::Execution(error.to_string()))
     }
@@ -399,3 +411,6 @@ mod request_slot_tests;
 
 #[cfg(test)]
 mod model_stage_tests;
+
+#[cfg(test)]
+mod raw_policy_tests;

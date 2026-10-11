@@ -56,8 +56,14 @@ struct Context<'a> {
 }
 
 impl SystemOneTemplate {
-    pub(super) fn kind(&self) -> SystemOneTemplateKind {
+    pub fn kind(&self) -> SystemOneTemplateKind {
         self.kind
+    }
+
+    /// Exact source-audited certificate availability, not a heuristic render probe.
+    /// A false result does not disable ordinary generic template rendering.
+    pub fn has_causal_certificate(&self) -> bool {
+        self.causal_prefix.is_some()
     }
 
     /// Compile the checkpoint's named systemone source once. No fetch, guessed

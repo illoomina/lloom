@@ -402,3 +402,7 @@ mod tests {
         assert!(validate_crop(32, 32 * 1025).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "vision/composition_tests.rs"]
+mod composition_tests;

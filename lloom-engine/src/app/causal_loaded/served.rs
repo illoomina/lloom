@@ -33,6 +33,18 @@ pub enum Request<'a> {
         prompt: &'a [u32],
         params: &'a DecodeParams,
     },
+
+    /// The borrowed decoded pixels keep their caller origin. Prediction covers
+    /// placeholder preparation, not decoding bytes that occurred before entry.
+    ImagePlaceholder(&'a super::super::vision::DecodedImage),
+    Images {
+        prompt: &'a [u32],
+        images: &'a [super::super::vision::DecodedImage],
+        params: &'a DecodeParams,
+    },
+    /// Full incumbent mode inputs, including sequences/rows/speculation and
+    /// both measured/reference arms. No zero or generic default prediction.
+    Mode(&'a super::super::modes::ModeSpec),
     Decisions(&'a OrderedJson),
     PreparedDecisions(&'a CausalRequest),
     SystemOneRender {
@@ -73,6 +85,9 @@ pub trait Predictor: Send + Sync {
 pub enum MetadataRequest<'a> {
     Health,
     Describe,
+    GenerationConfig,
+    VisionReport,
+    Diagnostics,
     LoadWarnings,
     NoteLoadWarnings(&'a [LoadWarning]),
 }

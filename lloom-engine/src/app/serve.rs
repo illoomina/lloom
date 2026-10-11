@@ -162,7 +162,7 @@ fn run_owner(
 ) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
-    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
@@ -784,7 +784,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
         "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
     });
-    attach_vision(shared, &mut body);
+    attach_vision(shared, &mut body)?;
     Ok(Reply::Json(body))
 }
 
@@ -1067,7 +1067,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             },
         )
     };
-    let (mut w, write_err) = sw.finish()?;
+    let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}");
@@ -1097,10 +1097,24 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         }),
     };
     let mut last = last;
-    if let StreamKind::Chat = run.kind {
-        attach_vision(shared, &mut last);
-    }
-    w.event(&last)?;
+    write_stream_trailer(w, &mut last, |body| {
+        if let StreamKind::Chat = run.kind {
+            attach_vision(shared, body)?;
+        }
+        Ok(())
+    })
+}
+
+/// Post-header completion: checked metadata refusal propagates as a stream
+/// error; neither a successful final event nor [DONE] is written. The status
+/// already sent by ChunkedWriter::start cannot become a retroactive HTTP 500.
+fn write_stream_trailer(
+    mut w: ChunkedWriter,
+    last: &mut Value,
+    prepare: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<()> {
+    prepare(last)?;
+    w.event(last)?;
     w.raw("data: [DONE]\n\n")?;
     w.finish()
 }
@@ -1889,12 +1903,13 @@ fn short_id() -> String {
 /// The per-request vision report (`Served::vision_report`: the model's
 /// tensors, whether the tower is loaded, the image census) as a `vision`
 /// field beside `timings`, and on stderr. Nothing for a family without vision.
-fn attach_vision(shared: &Shared, body: &mut Value) {
-    let report = shared.engine.vision_report();
+fn attach_vision(shared: &Shared, body: &mut Value) -> Result<()> {
+    let report = shared.engine.vision_report_checked()?;
     if !report.is_null() {
         eprintln!("[vision: {report}]");
         body["vision"] = report;
     }
+    Ok(())
 }
 
 fn finish_reason(stop: Stop) -> &'static str {
@@ -2316,7 +2331,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
-    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
@@ -3007,5 +3022,84 @@ mod metadata_consumer_tests {
             "actual model card must read current warnings, not a cold snapshot"
         );
         assert_eq!(engine.metadata_calls.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+#[path = "serve_loaded_tests.rs"]
+mod loaded_owner_tests;
+
+#[cfg(test)]
+mod checked_trailer_tests {
+    use super::{write_stream_trailer, ChunkedWriter};
+    use crate::app::served::{tests::NoVision, Served};
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Mem(Arc<Mutex<Vec<u8>>>);
+    impl Write for Mem {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The actual post-decode trailer helper, with an in-memory writer, not a
+    // socket/HTTP dispatch or Loaded-owner admission control. Headers are
+    // already sent: refusal returns Err, not a retroactive HTTP 500.
+    #[test]
+    fn checked_vision_refusal_after_headers_emits_no_success_trailer() {
+        let engine = NoVision::refusing_metadata();
+        let mem = Mem::default();
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        mem.0.lock().extend_from_slice(headers);
+        let mut writer = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        writer.raw("data: prior-fragment\n\n").unwrap();
+        let before = mem.0.lock().clone();
+        let mut last = serde_json::json!({"choices":[{"finish_reason":"stop"}]});
+        let error = write_stream_trailer(writer, &mut last, |body| {
+            let report = engine.vision_report_checked()?;
+            body["vision"] = report;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "bounded metadata vision refusal");
+        assert_eq!(
+            *mem.0.lock(),
+            before,
+            "refused metadata wrote a success event or [DONE]"
+        );
+        assert!(
+            last.get("vision").is_none(),
+            "refusal fabricated vision metadata"
+        );
+    }
+
+    #[test]
+    fn successful_checked_trailer_preserves_event_done_and_chunk_termination() {
+        let mem = Mem::default();
+        let writer = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let mut last = serde_json::json!({"ok":true});
+        write_stream_trailer(writer, &mut last, |_| Ok(())).unwrap();
+        let bytes = mem.0.lock().clone();
+        let text = String::from_utf8(bytes).unwrap();
+        let event = text
+            .find("data: {\"ok\":true}\n\n")
+            .expect("success lost final event");
+        let done = text.find("data: [DONE]\n\n").expect("success lost [DONE]");
+        assert!(event < done, "trailer event reordered after [DONE]");
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "success lost chunk termination"
+        );
     }
 }

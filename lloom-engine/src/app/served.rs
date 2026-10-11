@@ -71,6 +71,9 @@ pub trait Served: Send + Sync {
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
         None
     }
+    fn generation_config_checked(&self) -> Result<Option<lloom::hub::GenerationConfig>> {
+        Ok(self.generation_config())
+    }
 
     /// Decide without generating tokens, using this already-loaded model.
     /// Raw ordered state/questions reach the shared decision frontend; families
@@ -197,6 +200,9 @@ pub trait Served: Send + Sync {
     fn vision_report(&self) -> Value {
         Value::Null
     }
+    fn vision_report_checked(&self) -> Result<Value> {
+        Ok(self.vision_report())
+    }
 
     /// The refusal a family without vision gives, by the family's own reason.
     fn no_vision(&self) -> anyhow::Error {
@@ -219,6 +225,9 @@ pub trait Served: Send + Sync {
     /// pacer's depth against what warmup measured).
     fn diagnostics(&self) -> Vec<String> {
         Vec::new()
+    }
+    fn diagnostics_checked(&self) -> Result<Vec<String>> {
+        Ok(self.diagnostics())
     }
 
     /// The multi-sequence measurement modes (`lloom bench --mode reuse |
@@ -380,6 +389,21 @@ pub(crate) mod tests {
                 lloom::load_warning::LoadWarningKind::EmulatedType,
                 format!("bounded dynamic warning epoch {epoch}"),
             )])
+        }
+        fn vision_report(&self) -> Value {
+            assert_eq!(
+                self.metadata_mode, 0,
+                "legacy vision metadata fallback reached"
+            );
+            Value::Null
+        }
+        fn vision_report_checked(&self) -> Result<Value> {
+            if self.metadata_mode == 0 {
+                return Ok(self.vision_report());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("bounded metadata vision refusal")
         }
         fn note_load_warnings(&mut self, _: Vec<LoadWarning>) {}
         fn encode(&self, _: &str, _: bool) -> Result<Vec<u32>> {

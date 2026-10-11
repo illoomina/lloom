@@ -269,7 +269,7 @@ impl PrivateCachePolicy {
 
 pub struct Engine<P: Profile> {
     pub core: Arc<Core<P>>,
-    pub text: Text,
+    pub text: Arc<Text>,
     pub model_name: String,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
@@ -553,6 +553,15 @@ enum LoadAdmission {
     CallerScoped,
 }
 
+/// Checked cold witness for the incumbent shutdown's worker-stop semantics.
+/// It certifies neither native DATA nor callback/retirement quiescence.
+struct NoWorkerWitness(());
+impl NoWorkerWitness {
+    fn shutdown(&self) {} // No batch worker was constructed; no fresh budget gate.
+}
+
+pub mod admitted;
+
 impl<P: Lfm2Shape> Engine<P> {
     /// The engine at the shape `P` names; `load` picks `P` from the
     /// resolved config (`shape_key`) and dispatches here.
@@ -583,6 +592,16 @@ impl<P: Lfm2Shape> Engine<P> {
         device: &Device,
         load: lloom::nn::memory::LoadContext,
     ) -> Result<lloom::nn::memory::Loaded<Self>> {
+        Self::load_as_admitted_with(opts, device, load, |_, _| ()).map(|(loaded, ())| loaded)
+    }
+
+    // Private load-time capture only: no unscoped getter or owner extraction.
+    fn load_as_admitted_with<T>(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+        capture: impl FnOnce(&Self, NoWorkerWitness) -> T,
+    ) -> Result<(lloom::nn::memory::Loaded<Self>, T)> {
         lloom_tensor::memory_admission::begin_model_load();
         if opts.cpu != device.is_cpu() {
             anyhow::bail!("supplied LFM2 device disagrees with load options");
@@ -590,14 +609,25 @@ impl<P: Lfm2Shape> Engine<P> {
         if opts.batch != 1 {
             anyhow::bail!("admitted LFM2 batch scheduler pass propagation is pending");
         }
-        Ok(lloom::nn::memory::Loaded::new(
-            device,
-            load,
-            |resolved, _context| {
-                Self::load_on(opts, resolved.clone(), LoadAdmission::CallerScoped)
-                    .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
-            },
-        )?)
+        let mut metadata = None;
+        let loaded = lloom::nn::memory::Loaded::new(device, load, |resolved, _context| {
+            let engine = Self::load_on(opts, resolved.clone(), LoadAdmission::CallerScoped)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+            // The single-sequence branch returns before spawn_batch. Check the
+            // actual owner too, so a future constructor cannot invalidate the
+            // wrapper's narrowed shutdown without a refusal here.
+            if engine.sched.is_some() || lock(&engine.sched_thread).is_some() {
+                return Err(lloom_tensor::Error::msg(
+                    "admitted LFM2 worker shutdown custody is not installed",
+                ));
+            }
+            metadata = Some(capture(&engine, NoWorkerWitness(())));
+            Ok(engine)
+        })?;
+        Ok((
+            loaded,
+            metadata.expect("successful admitted load ran metadata capture"),
+        ))
     }
 
     /// Chat on the admitted loaded owner, using the incumbent decode loop and
@@ -634,10 +664,15 @@ impl<P: Lfm2Shape> Engine<P> {
             engine
                 .check_fits(request.max_prompt_tokens(), 0)
                 .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
-            let lease = RequestLease::<Model<P>, _>::checkout(&engine.single, true)?;
+            let mut lease = engine
+                .checkout_single()
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+            // Fresh decision caches still touch the same model scratch. Keep
+            // Held exclusion and mark recovery on Err/unwind before any work.
+            lease.start_external_work();
             let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
             let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &engine.core.device)?;
-            request.execute_with_cache_factory(
+            let result = request.execute_with_cache_factory(
                 &engine.core.model,
                 &mut readback,
                 &options,
@@ -647,7 +682,11 @@ impl<P: Lfm2Shape> Engine<P> {
                         .create::<P>(&engine.config, engine.dtype, device)
                         .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
                 },
-            )
+            );
+            if result.is_ok() {
+                lease.mark_complete();
+            }
+            result
         })?)
     }
 
@@ -1037,7 +1076,7 @@ impl<P: Lfm2Shape> Engine<P> {
         let core = Arc::new(Core { model, device });
         let mut engine = Engine {
             core: Arc::clone(&core),
-            text: Text {
+            text: Arc::new(Text {
                 tokenizer,
                 template,
                 bos_token,
@@ -1046,7 +1085,7 @@ impl<P: Lfm2Shape> Engine<P> {
                 seed_tokens,
                 think: Default::default(),
                 gen_prompts: Default::default(),
-            },
+            }),
             model_name,
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
@@ -2445,6 +2484,18 @@ impl<P: Lfm2Shape> Engine<P> {
                 self.config.kv_append
             );
         }
+        let mut lease = self.checkout_single()?;
+        lease.start_external_work();
+        let out = self.run_mode_body(spec, pooled);
+        if out.is_ok() {
+            lease.mark_complete();
+        }
+        out
+    }
+
+    // Only reached while the same model's request lease is held. The modes
+    // retain all incumbent fresh/reference/batched/speculative cache paths.
+    fn run_mode_body(&self, spec: &super::modes::ModeSpec, pooled: bool) -> Result<()> {
         let pool = if pooled {
             let p = BatchPool::new(
                 &self.config,

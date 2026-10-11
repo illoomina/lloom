@@ -143,6 +143,18 @@ where
         stage.complete = result.is_ok();
         result
     }
+    /// Guard work using the same model but its own temporary caches. Retain the
+    /// held sequence/rings/extra unchanged; no second cache checkout or reset.
+    /// Failure marks recovery for the next model user. This is exclusion/marker
+    /// custody, NOT retirement of the temporary work's native allocations.
+    pub(super) fn start_external_work(&mut self) {
+        assert!(
+            matches!(self.state, Some(LeaseState::Held(_))),
+            "external model work retains held request custody"
+        );
+        self.started = true;
+        self.complete = false;
+    }
     pub fn start_decode(&mut self, model: &'m M, device: &Device, decode: DecodeConfig) {
         // Clone before moving held custody; no backend handle cloning follows it.
         let device = device.clone();

@@ -269,7 +269,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         lloom::load_warning::LoadWarning::line(&engine.load_warnings_checked()?),
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
-    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
@@ -578,7 +578,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                     bytes as f64 / 1e9
                 );
             }
-            for line in engine.diagnostics() {
+            for line in engine.diagnostics_checked()? {
                 eprintln!("{line}");
             }
         }
@@ -601,7 +601,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 run_ahead: options.decode.readback.run_ahead,
             },
         );
-        let report = engine.vision_report();
+        let report = engine.vision_report_checked()?;
         if !report.is_null() {
             eprintln!("[vision: {report}]");
         }

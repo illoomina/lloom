@@ -346,3 +346,163 @@ mod recovery_fence_tests {
         Ok(())
     }
 }
+
+/// The actual model-work marker used by full LFM modes. Inert CPU ownership
+/// controls, not execution of a benchmark mode or native temporary-cache cleanup.
+#[cfg(test)]
+mod external_work_tests {
+    use super::*;
+
+    #[test]
+    fn completed_held_work_excludes_reentry_and_preserves_all_custody() -> Result<()> {
+        let slot = slot(false);
+        let (tokens, ring, aborts) = {
+            let mut guard = slot.lock();
+            let state = guard.as_mut().unwrap();
+            let rings = state.rings.as_mut().unwrap();
+            assert!(rings.prepare(&[7], &Device::Cpu, lloom::generation::EosRead::Blocking)?);
+            (
+                state.sequence.as_ref().unwrap().tokens().as_ptr(),
+                rings.ring(&[7], &Device::Cpu, lloom::generation::EosRead::Blocking)? as *const _,
+                state.extra.aborts.clone(),
+            )
+        };
+        let mut lease = Lease::<Tiny, _>::checkout(&slot, true)?;
+        lease.start_external_work();
+        assert!(
+            Lease::<Tiny, _>::checkout(&slot, true).is_err(),
+            "external work allowed same-model reentry"
+        );
+        assert_eq!(lease.sequence().tokens().as_ptr(), tokens);
+        assert!(Arc::ptr_eq(&lease.extra().aborts, &aborts));
+        lease.mark_complete();
+        drop(lease);
+        let mut guard = slot.lock();
+        let state = guard
+            .as_mut()
+            .expect("completed external work lost Held custody");
+        assert!(
+            !state.needs_recovery,
+            "completed external work marked recovery"
+        );
+        assert_eq!(state.sequence.as_ref().unwrap().tokens(), &[2, 3]);
+        assert_eq!(state.sequence.as_ref().unwrap().tokens().as_ptr(), tokens);
+        assert_eq!(state.sequence.as_ref().unwrap().cache().pos, 2);
+        assert_eq!(state.extra.partial, 2);
+        assert!(Arc::ptr_eq(&state.extra.aborts, &aborts));
+        let rings = state.rings.as_mut().expect("completed work lost RingPool");
+        assert!(!rings.prepare(&[7], &Device::Cpu, lloom::generation::EosRead::Blocking)?);
+        assert_eq!(
+            rings.ring(&[7], &Device::Cpu, lloom::generation::EosRead::Blocking)? as *const _,
+            ring,
+            "external work replaced retained Ring entry"
+        );
+        assert_eq!(aborts.load(Ordering::Relaxed), 0, "Held success ran reset");
+        Ok(())
+    }
+
+    #[test]
+    fn held_error_and_unwind_mark_recovery_before_retry_reset() -> Result<()> {
+        let owner = engine()?;
+        // Independent fresh fixtures: a prior error marker must not mask a
+        // missing unwind marker. Each has two positions and no prepared ring.
+        for unwind in [false, true] {
+            let slot = slot(false);
+            let (tokens, aborts) = {
+                let guard = slot.lock();
+                let state = guard.as_ref().unwrap();
+                (
+                    state.sequence.as_ref().unwrap().tokens().as_ptr(),
+                    state.extra.aborts.clone(),
+                )
+            };
+            if unwind {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                        let mut lease = Lease::<Tiny, _>::checkout(&slot, true)?;
+                        lease.start_external_work();
+                        panic!("intentional bounded external work unwind");
+                    }));
+                let payload = result.expect_err("external unwind was not propagated");
+                assert_eq!(
+                    payload.downcast_ref::<&str>().copied(),
+                    Some("intentional bounded external work unwind")
+                );
+            } else {
+                let refused = (|| -> Result<()> {
+                    let mut lease = Lease::<Tiny, _>::checkout(&slot, true)?;
+                    lease.start_external_work();
+                    lloom_tensor::bail!("intentional bounded external work refusal")
+                })();
+                assert_eq!(
+                    refused.unwrap_err().to_string(),
+                    "intentional bounded external work refusal"
+                );
+            }
+            {
+                let guard = slot.lock();
+                let state = guard.as_ref().expect("external failure lost custody");
+                assert!(state.needs_recovery, "external failure lost marker");
+                assert_eq!(state.sequence.as_ref().unwrap().tokens().as_ptr(), tokens);
+                assert_eq!(state.sequence.as_ref().unwrap().tokens(), &[2, 3]);
+                assert_eq!(state.sequence.as_ref().unwrap().cache().pos, 2);
+                assert!(state.rings.is_some(), "external failure lost RingPool");
+                assert!(Arc::ptr_eq(&state.extra.aborts, &aborts));
+                assert_eq!(state.extra.partial, 2);
+            }
+            assert_eq!(aborts.load(Ordering::Relaxed), 0, "external Drop ran reset");
+            let fences = AtomicUsize::new(0);
+            let mut lease = Lease::<Tiny, _>::checkout(&slot, true)?;
+            lease.before_recovery(|| -> Result<()> {
+                fences.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    aborts.load(Ordering::Relaxed),
+                    0,
+                    "reset preceded external-work recovery fence"
+                );
+                assert_eq!(lease.sequence().tokens().as_ptr(), tokens);
+                assert!(Lease::<Tiny, _>::checkout(&slot, true).is_err());
+                Ok(())
+            })?;
+            assert!(lease.needs_recovery(), "fence erased pending reset");
+            start(&mut lease, &owner);
+            assert_eq!(fences.load(Ordering::Relaxed), 1);
+            assert_eq!(aborts.load(Ordering::Relaxed), 1);
+            assert_eq!(lease.session().cache_mut().pos, 0);
+            assert!(lease.session().tokens().is_empty());
+            assert_eq!(lease.extra().partial, 0);
+            lease.mark_complete();
+            drop(lease);
+            assert!(!slot.lock().as_ref().unwrap().needs_recovery);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn held_success_preserves_prior_marker_and_recovery_opt_out() -> Result<()> {
+        for (prior_marker, recover, complete, expected) in
+            [(true, true, true, true), (false, false, false, false)]
+        {
+            let slot = slot(false);
+            slot.lock().as_mut().unwrap().needs_recovery = prior_marker;
+            let aborts = slot.lock().as_ref().unwrap().extra.aborts.clone();
+            let mut lease = Lease::<Tiny, _>::checkout(&slot, recover)?;
+            lease.start_external_work();
+            if complete {
+                lease.mark_complete();
+            }
+            drop(lease);
+            let guard = slot.lock();
+            let state = guard.as_ref().unwrap();
+            assert_eq!(
+                state.needs_recovery, expected,
+                "Held external work changed preexisting recovery policy"
+            );
+            assert_eq!(state.sequence.as_ref().unwrap().tokens(), &[2, 3]);
+            assert_eq!(state.sequence.as_ref().unwrap().cache().pos, 2);
+            assert_eq!(state.extra.partial, 2);
+            assert_eq!(aborts.load(Ordering::Relaxed), 0);
+        }
+        Ok(())
+    }
+}

@@ -114,6 +114,7 @@ pub mod options;
 pub mod pickle;
 pub mod quantized;
 pub mod retire;
+mod retirement_owners;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;

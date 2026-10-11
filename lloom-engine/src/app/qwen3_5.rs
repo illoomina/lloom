@@ -315,6 +315,11 @@ fn load_on<P: Profile>(
     device: Device,
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
+    let window = if opts.mtp {
+        lloom::nn::speculator::checked_window_width(opts.mtp_k.max(1), 1)?
+    } else {
+        0
+    };
     let shards = lloom::hub::gguf_shards(&opts.first_shard);
     let mut f = std::fs::File::open(&opts.first_shard)
         .with_context(|| format!("opening {}", opts.first_shard.display()))?;
@@ -350,7 +355,7 @@ fn load_on<P: Profile>(
         dense_f32: false,
         mtp: opts.mtp,
         // The verify window of `k + 1` positions as one pass over the rings.
-        window: if opts.mtp { opts.mtp_k.max(1) + 1 } else { 0 },
+        window,
         machine: match admission {
             LoadAdmission::Legacy => Some(lloom::nn::memory::MachineLoad {
                 gate: opts.memory.machine_gate(),

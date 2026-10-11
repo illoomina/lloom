@@ -5076,7 +5076,7 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, One> {
         dev: &lloom_tensor::Device,
         k: usize,
     ) -> Result<State<Self>> {
-        let pools = model.spec_pools(1, k.max(1), dev);
+        let pools = model.try_spec_pools(1, k.max(1), dev)?;
         let mut cache = State::<Self>::in_ring(model.config(), &pools)?;
         model.arm_turn_checkpoints(&mut cache);
         Ok(cache)
@@ -5122,7 +5122,8 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, Paged> {
         dev: &lloom_tensor::Device,
         k: usize,
     ) -> Result<State<Self>> {
-        let pools = model.row_pools(1, k.max(1) + 2, dev);
+        let phases = crate::nn::speculator::checked_window_width(k.max(1), 2)?;
+        let pools = model.row_pools(1, phases, dev);
         State::<Self>::in_pools(model.config(), &pools)
     }
     fn rows<R: ExpertResidency>(
@@ -5131,7 +5132,8 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, Paged> {
         rows: usize,
         k: usize,
     ) -> Result<(StatePools, Vec<State<Self>>)> {
-        let pools = model.row_pools(rows, k.max(1) + 2, dev);
+        let phases = crate::nn::speculator::checked_window_width(k.max(1), 2)?;
+        let pools = model.row_pools(rows, phases, dev);
         let states = (0..rows)
             .map(|_| State::<Self>::in_pools(model.config(), &pools))
             .collect::<Result<Vec<_>>>()?;
@@ -5584,6 +5586,21 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// a phase.
     pub fn spec_pools(&self, rows: usize, k: usize, dev: &lloom_tensor::Device) -> StatePools {
         self.state_pools_with(rows, k + 2, dev)
+    }
+
+    /// Fallible speculative-pool construction: reject width overflow before
+    /// creating pool metadata. Like [`Self::spec_pools`], raw `k = 0` means
+    /// two phases; shape/app callers resolve their minimum draft count first.
+    /// Tensor products, allocator failure and model-domain admission are
+    /// separate obligations, not guaranteed by this addition check.
+    pub fn try_spec_pools(
+        &self,
+        rows: usize,
+        k: usize,
+        dev: &lloom_tensor::Device,
+    ) -> Result<StatePools> {
+        let phases = crate::nn::speculator::checked_window_width(k, 2)?;
+        Ok(self.state_pools_with(rows, phases, dev))
     }
 
     /// The pools for `rows` rows of the `Paged` shapes: the recurrent

@@ -25,6 +25,42 @@
 use crate::nn::model::{CacheReset, CacheRewind, CacheShare, CausalLM};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
+/// Checked positions/phases for a speculative window, before creating its pools.
+///
+/// `drafts` is already resolved by the caller: this helper does not normalize
+/// zero or clamp a configured limit. `extra` names the anchor/retained phases.
+/// This checks addition only, not the window's tensor products or admission.
+pub fn checked_window_width(drafts: usize, extra: usize) -> Result<usize> {
+    drafts.checked_add(extra).ok_or_else(|| {
+        lloom_tensor::Error::msg(format!(
+            "speculative window width overflow: {drafts} drafts + {extra} extra positions"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod window_width_tests {
+    #[test]
+    fn checked_width_preserves_zero_and_rejects_overflow_without_allocating_pools() {
+        use super::checked_window_width;
+        for (drafts, extra, expected) in [
+            (0, 0, 0),
+            (0, 2, 2),
+            (0_usize.max(1), 1, 2),
+            (0_usize.max(1), 2, 3),
+            (usize::MAX - 2, 2, usize::MAX),
+        ] {
+            assert_eq!(checked_window_width(drafts, extra).unwrap(), expected);
+        }
+        for (drafts, extra) in [(usize::MAX, 1), (usize::MAX, 2), (usize::MAX - 1, 2)] {
+            assert!(checked_window_width(drafts, extra)
+                .unwrap_err()
+                .to_string()
+                .contains("speculative window width overflow"));
+        }
+    }
+}
+
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
 /// fixed number of these (server slots), and per-seq state lives *inside* the
 /// impl keyed by this id — never on the public surface.

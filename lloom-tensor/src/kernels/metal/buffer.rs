@@ -105,16 +105,21 @@ impl Buffer {
     /// a write to any other. That is conservative rather than unsound: Metal
     /// barriers are resource-granular anyway (§3.5), so a finer key could not
     /// have expressed a narrower edge.
+    ///
+    /// # Panics
+    /// Invalid or overflowing ranges are rejected in every build before native
+    /// handle cloning. The return type is preserved; this is not quota refusal.
     pub fn view(&self, base_offset: usize, length: usize) -> Buffer {
-        debug_assert!(
-            base_offset + length <= self.length(),
-            "arena view {base_offset}..{} runs past its {} byte parent",
-            base_offset + length,
-            self.length()
-        );
+        let absolute = crate::allocation_geometry::checked_view_offset(
+            self.base_offset,
+            self.length(),
+            base_offset,
+            length,
+        )
+        .expect("invalid Buffer::view range");
         Buffer {
             raw: self.raw.clone(),
-            base_offset: self.base_offset + base_offset,
+            base_offset: absolute,
             length: Some(length),
             cpu_visible: self.cpu_visible,
         }
@@ -206,8 +211,8 @@ impl Buffer {
             return base;
         }
         // SAFETY: `base_offset` is within the parent allocation by construction
-        // -- `view` is only called by the arena, with an offset and length that
-        // the plan has already fitted inside the arena buffer.
+        // -- public `view` checks relative and absolute ranges in every build
+        // before constructing metadata; nested views preserve that invariant.
         unsafe { base.add(self.base_offset) }
     }
 

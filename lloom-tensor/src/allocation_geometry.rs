@@ -29,6 +29,29 @@ pub(crate) fn aligned_nonzero_bytes(size: usize, alignment: usize) -> Result<usi
     })
 }
 
+/// Validate a view before cloning a raw handle or forming a pointer. Zero-size
+/// views at the parent end remain valid. Absolute metadata cannot wrap either.
+pub(crate) fn checked_view_offset(
+    base: usize,
+    parent_len: usize,
+    offset: usize,
+    length: usize,
+) -> Result<usize> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| Error::Msg("buffer view relative range overflow".into()))?;
+    if end > parent_len {
+        crate::bail!("buffer view {offset}..{end} exceeds parent length {parent_len}");
+    }
+    let absolute = base
+        .checked_add(offset)
+        .ok_or_else(|| Error::Msg("buffer view absolute offset overflow".into()))?;
+    absolute
+        .checked_add(length)
+        .ok_or_else(|| Error::Msg("buffer view absolute end overflow".into()))?;
+    Ok(absolute)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +108,23 @@ mod tests {
         assert_eq!(aligned_nonzero_bytes(0, 128).unwrap(), 128);
         assert_eq!(aligned_nonzero_bytes(4104, 128).unwrap(), 4224);
         assert_eq!(aligned_nonzero_bytes(usize::MAX, 1).unwrap(), usize::MAX);
+    }
+    #[test]
+    fn numeric_view_range_checks_apply_in_release() {
+        assert_eq!(checked_view_offset(0, 0, 0, 0).unwrap(), 0);
+        assert_eq!(checked_view_offset(128, 256, 256, 0).unwrap(), 384);
+        assert_eq!(checked_view_offset(128, 256, 127, 129).unwrap(), 255);
+        assert_eq!(
+            checked_view_offset(0, usize::MAX, usize::MAX, 0).unwrap(),
+            usize::MAX
+        );
+        assert!(checked_view_offset(0, 0, 1, 0).is_err());
+        assert!(checked_view_offset(0, 8, 7, 2).is_err());
+        assert!(checked_view_offset(0, usize::MAX, usize::MAX, 1).is_err());
+        assert!(checked_view_offset(usize::MAX, 1, 1, 0).is_err());
+        assert!(checked_view_offset(usize::MAX, 1, 0, 1).is_err());
+        // Nested valid views preserve exact origin, not only their relative span.
+        let first = checked_view_offset(0, 1024, 256, 512).unwrap();
+        assert_eq!(checked_view_offset(first, 512, 128, 256).unwrap(), 384);
     }
 }

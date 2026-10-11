@@ -41,6 +41,7 @@
 
 mod archive;
 mod inputs;
+mod signals;
 
 use inputs::InputRing;
 pub use inputs::RecordError;
@@ -115,10 +116,13 @@ impl Record {
     }
 
     /// The panic hook and signal handlers. Install AFTER the fuzzer's executor
-    /// exists (see [`Record::install`]); idempotent.
-    pub fn install_crash_dump() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
+    /// exists (see [`Record::install`]); idempotent. Query/install failures are
+    /// returned before target execution; partial installs attempt rollback.
+    /// Disposition replacement must remain serialized with process setup.
+    pub fn install_crash_dump() -> std::io::Result<()> {
+        signals::install(on_signal).map_err(std::io::Error::other)?;
+        static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+        PANIC_HOOK.call_once(|| {
             let prev = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 if let Some(r) = RING.get() {
@@ -127,48 +131,9 @@ impl Record {
                 }
                 prev(info);
             }));
-            // SAFETY: the sigaction structs are initialized for the C ABI.
-            // Known separate defect: on_signal still performs allocating I/O;
-            // these handlers are not yet an async-signal-safe dump facility.
-            unsafe {
-                for sig in [
-                    libc::SIGSEGV,
-                    libc::SIGBUS,
-                    libc::SIGABRT,
-                    libc::SIGILL,
-                    libc::SIGFPE,
-                ] {
-                    let mut sa: libc::sigaction = std::mem::zeroed();
-                    let mut prev: libc::sigaction = std::mem::zeroed();
-                    sa.sa_sigaction = on_signal as *const () as usize;
-                    sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
-                    libc::sigemptyset(&mut sa.sa_mask);
-                    if libc::sigaction(sig, &sa, &mut prev) == 0 {
-                        PREV_HANDLERS[sig_index(sig)].store(prev.sa_sigaction, Ordering::Release);
-                    }
-                }
-            }
         });
+        Ok(())
     }
-}
-
-const SIGNALS: [libc::c_int; 5] = [
-    libc::SIGSEGV,
-    libc::SIGBUS,
-    libc::SIGABRT,
-    libc::SIGILL,
-    libc::SIGFPE,
-];
-static PREV_HANDLERS: [AtomicUsize; 5] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-
-fn sig_index(sig: libc::c_int) -> usize {
-    SIGNALS.iter().position(|&s| s == sig).unwrap_or(0)
 }
 
 extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
@@ -210,21 +175,10 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
             }
         }
     }
-    // Chain to whatever was installed before us (LibAFL's handler, or the
-    // default), so the fuzzer still sees the crash.
-    let prev = PREV_HANDLERS[sig_index(sig)].load(Ordering::Acquire);
-    // SAFETY: `prev` is what `sigaction` reported, and it is invoked with the
-    // signature it was registered under; the default disposition re-raises.
-    unsafe {
-        if prev == libc::SIG_DFL || prev == 0 {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        } else if prev != libc::SIG_IGN {
-            let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
-                std::mem::transmute(prev);
-            f(sig, info, ctx);
-        }
-    }
+    // SAFETY: forward the original kernel delivery to the ABI and policy
+    // retained from the predecessor. Allocating dump/backtrace I/O above is
+    // still a separate async-signal-safety defect, not repaired by this chain.
+    unsafe { signals::chain(sig, info, ctx) };
 }
 
 /// Write a coherent ring snapshot. This still allocates and is NOT yet an

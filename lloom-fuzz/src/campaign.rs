@@ -270,7 +270,7 @@ where
     let harness = Rc::new(RefCell::new(harness));
 
     if cli.once.is_some() || cli.replay.is_some() {
-        Record::install_crash_dump();
+        Record::install_crash_dump()?;
     }
     if let Some(path) = &cli.once {
         let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
@@ -411,7 +411,7 @@ where
             let mut executor = executor;
             // The recorder wraps the final executor-installed panic/signal hooks
             // before the first target invocation, including corpus seeding.
-            Record::install_crash_dump();
+            Record::install_crash_dump()?;
 
             if state.must_load_initial_inputs() {
                 match &cli.seeds {

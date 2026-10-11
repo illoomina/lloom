@@ -94,6 +94,8 @@ path = "src/bin/fuzz_kv_slot.rs"
 [[bin]]
 name = "fuzz_kv_pages"
 path = "src/bin/fuzz_kv_pages.rs"
+# Host-only execution still uses the Metal-feature pool and clock types.
+required-features = ["metal"]
 
 [[bin]]
 name = "fuzz_buffer_pool"

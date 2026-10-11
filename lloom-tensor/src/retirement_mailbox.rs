@@ -73,6 +73,13 @@ pub(crate) enum FeedbackPublicationError<F> {
     ObserverPanicked,
 }
 
+/// Before phase acquisition, return the caller's unregistered input unchanged.
+/// After an internal editor panic, existing registered owners/panic stay rooted.
+pub(crate) enum PreparedEditError<V> {
+    Rejected(Rejected<V>),
+    Panicked { input: Option<V> },
+}
+
 /// Generic protocol retains its terminal-feedback cleanup capability. Native
 /// adapters that also require host call-return choose the stricter policy.
 #[derive(Clone, Copy)]
@@ -187,6 +194,56 @@ impl<T, F> OwnerMailbox<T, F> {
         self.transition(ticket, Phase::Preparing, Phase::Prepared, 0)
             .expect("exclusive prepared replacement retains its phase");
         Ok(previous)
+    }
+
+    /// Host-only trusted recording edit. Preparing excludes native handoff,
+    /// cancellation and every other payload borrow; this never runs a user's
+    /// callback. Input stays outside catch_unwind until trusted editor takes it
+    /// after fallible preparation. The editor must not panic after taking input
+    /// and before installing it in owner. Every unconsumed input is returned,
+    /// including panic, for caller disposal outside recording/commit locks.
+    pub(crate) fn edit_prepared<V, R>(
+        &self,
+        ticket: Ticket,
+        input: V,
+        edit: impl FnOnce(&mut T, &mut Option<V>) -> R,
+        wake_all: impl FnOnce(),
+    ) -> Result<(R, Option<V>), PreparedEditError<V>> {
+        if let Err(error) = self.transition(ticket, Phase::Prepared, Phase::Preparing, 0) {
+            return Err(PreparedEditError::Rejected(Rejected {
+                error,
+                value: input,
+            }));
+        }
+        let mut input = Some(input);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: this edit exclusively owns Preparing and its reference
+            // cannot escape the closure. Input has not entered native custody.
+            edit(
+                unsafe { (*self.owner.get()).as_mut().expect("prepared owner") },
+                &mut input,
+            )
+        }));
+        match result {
+            Ok(value) => {
+                self.transition(ticket, Phase::Preparing, Phase::Prepared, 0)
+                    .expect("exclusive recording edit retains phase");
+                Ok((value, input))
+            }
+            Err(payload) => {
+                // SAFETY: editor unwound, exclusive phase retains owner.
+                unsafe {
+                    *self.panic.get() = Some(payload);
+                }
+                self.transition(ticket, Phase::Preparing, Phase::CallbackFailed, 0)
+                    .expect("failed recording edit retains phase");
+                self.failure.publish(Failure::CallbackPanic, || {
+                    self.wake.notify();
+                    wake_all();
+                });
+                Err(PreparedEditError::Panicked { input })
+            }
+        }
     }
 
     fn state_for(&self, ticket: Ticket) -> Result<u64, MailboxError> {
@@ -510,7 +567,7 @@ impl<T, F> OwnerMailbox<T, F> {
 
     /// Initial acquisition is phase-claimed; cloning can start only from an
     /// existing live reader. A native block must use Ticket, not keep this pin.
-    pub fn pin(&self, ticket: Ticket) -> Result<MetadataPin<'_, T, F>, MailboxError> {
+    pub(crate) fn acquire_pin(&self, ticket: Ticket) -> Result<PinPermit, MailboxError> {
         loop {
             let state = self.state_for(ticket)?;
             let phase = state & PHASE_MASK;
@@ -536,38 +593,80 @@ impl<T, F> OwnerMailbox<T, F> {
             if incremented.is_err() {
                 return Err(MailboxError::Busy);
             }
-            return Ok(MetadataPin {
-                mailbox: self,
-                ticket,
-            });
+            return Ok(PinPermit { ticket });
         }
     }
+
+    pub(crate) fn metadata_reusable(&self) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        matches!(state & PHASE_MASK, x if x == Phase::Empty as u64 || x == Phase::Detached as u64)
+            && state & PINNING == 0
+            && self.readers.load(Ordering::Acquire) == 0
+    }
+
+    pub(crate) fn clone_pin(&self, permit: &PinPermit) -> Result<PinPermit, MailboxError> {
+        self.state_for(permit.ticket)?;
+        self.readers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n == 0 {
+                    None
+                } else {
+                    n.checked_add(1)
+                }
+            })
+            .map_err(|_| MailboxError::Busy)?;
+        Ok(PinPermit {
+            ticket: permit.ticket,
+        })
+    }
+
+    pub(crate) fn release_pin(&self, permit: PinPermit) {
+        self.state_for(permit.ticket)
+            .expect("a live permit prevents generation reuse");
+        let previous = self.readers.fetch_sub(1, Ordering::Release);
+        assert!(previous > 0, "one release per opaque pin permit");
+        if previous == 1 {
+            self.wake.notify();
+        }
+    }
+
+    pub fn pin(&self, ticket: Ticket) -> Result<MetadataPin<'_, T, F>, MailboxError> {
+        Ok(MetadataPin {
+            mailbox: self,
+            permit: Some(self.acquire_pin(ticket)?),
+        })
+    }
+}
+
+/// Counted metadata claim, never a resource borrow. The fields are private and
+/// the token cannot be copied. Dropping without release leaks reuse credit,
+/// never releases another reader's claim or permits premature reuse.
+pub(crate) struct PinPermit {
+    ticket: Ticket,
 }
 
 pub(crate) struct MetadataPin<'a, T, F> {
     mailbox: &'a OwnerMailbox<T, F>,
-    ticket: Ticket,
+    permit: Option<PinPermit>,
 }
 impl<T, F> MetadataPin<'_, T, F> {
     pub fn ticket(&self) -> Ticket {
-        self.ticket
+        self.permit.as_ref().expect("live pin").ticket
     }
     pub fn try_clone(&self) -> Result<Self, MailboxError> {
-        self.mailbox
-            .readers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-            .map_err(|_| MailboxError::Busy)?;
         Ok(Self {
             mailbox: self.mailbox,
-            ticket: self.ticket,
+            permit: Some(
+                self.mailbox
+                    .clone_pin(self.permit.as_ref().expect("live pin"))?,
+            ),
         })
     }
 }
 impl<T, F> Drop for MetadataPin<'_, T, F> {
     fn drop(&mut self) {
-        if self.mailbox.readers.fetch_sub(1, Ordering::Release) == 1 {
-            self.mailbox.wake.notify();
-        }
+        self.mailbox
+            .release_pin(self.permit.take().expect("one pin release"));
     }
 }
 
@@ -595,6 +694,91 @@ mod tests {
     }
     fn not_timeout(result: parking_lot_core::ParkResult, message: &str) {
         assert_ne!(result, parking_lot_core::ParkResult::TimedOut, "{message}");
+    }
+
+    #[test]
+    fn prepared_editor_panic_returns_unconsumed_input_without_drop() {
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let input_drops = Arc::new(AtomicUsize::new(0));
+        let panic_drops = Arc::new(AtomicUsize::new(0));
+        let cell = cell::<Counted, ()>();
+        let ticket = cell.prepare(Counted(owner_drops.clone())).unwrap();
+        let result = cell.edit_prepared(
+            ticket,
+            Counted(input_drops.clone()),
+            |_, input| -> () {
+                assert!(input.is_some());
+                std::panic::panic_any(Counted(panic_drops.clone()));
+            },
+            || {},
+        );
+        let Err(PreparedEditError::Panicked { input: Some(input) }) = result else {
+            panic!("editor panic failed to return unconsumed input");
+        };
+        assert_eq!(
+            input_drops.load(Ordering::SeqCst),
+            0,
+            "input destructed under editor/caller lock"
+        );
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(cell.failure.get(), Some(Failure::CallbackPanic));
+        assert!(matches!(
+            cell.cancel_prepared(ticket),
+            Err(MailboxError::WrongPhase)
+        ));
+        drop(input);
+        assert_eq!(input_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
+        // Fake fixture lifetime ends explicitly; not a native quarantine release.
+        drop(cell);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepared_editor_transfers_after_reserve_and_returns_phase_refusal() {
+        let accepted_drops = Arc::new(AtomicUsize::new(0));
+        let refused_drops = Arc::new(AtomicUsize::new(0));
+        let cell = cell::<Vec<Counted>, ()>();
+        let ticket = cell.prepare(Vec::new()).unwrap();
+        let result = cell.edit_prepared(
+            ticket,
+            Counted(accepted_drops.clone()),
+            |owner, input| {
+                owner.try_reserve(1).unwrap();
+                owner.push(input.take().unwrap());
+                owner.len()
+            },
+            || {},
+        );
+        assert!(matches!(result, Ok((1, None))));
+        cell.begin_handoff(ticket).unwrap();
+        let result = cell.edit_prepared(
+            ticket,
+            Counted(refused_drops.clone()),
+            |_, _| panic!("refused editor ran"),
+            || {},
+        );
+        let Err(PreparedEditError::Rejected(Rejected {
+            error: MailboxError::WrongPhase,
+            value,
+        })) = result
+        else {
+            panic!("phase refusal lost caller input");
+        };
+        assert_eq!(accepted_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(refused_drops.load(Ordering::SeqCst), 0);
+        drop(value);
+        assert_eq!(refused_drops.load(Ordering::SeqCst), 1);
+        cell.handoff_returned(ticket).unwrap();
+        finish(&cell, ticket, ());
+        let detached = cell.try_detach_cleanup(ticket).unwrap();
+        assert_eq!(detached.owner.len(), 1);
+        assert_eq!(accepted_drops.load(Ordering::SeqCst), 0);
+        drop(detached);
+        assert_eq!(accepted_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

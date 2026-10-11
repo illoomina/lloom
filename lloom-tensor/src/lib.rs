@@ -103,6 +103,8 @@ pub mod metal_backend;
 /// The GEMV's tile selection as plain arithmetic, for the dispatcher and for
 /// a reader with no device (the optimizer's legality facts).
 pub mod gemv_tile;
+#[cfg(any(feature = "metal", test))]
+mod host_anchor;
 #[cfg(feature = "metal")]
 pub mod kernels;
 /// The paged-KV page allocator (§10.3c–h): pure host bookkeeping — a free
@@ -117,6 +119,8 @@ pub mod nditer;
 pub mod npy;
 pub mod op;
 pub mod options;
+#[cfg(any(feature = "metal", test))]
+mod ordered_metadata;
 pub mod pickle;
 pub mod quantized;
 pub mod retire;

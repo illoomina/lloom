@@ -93,6 +93,7 @@ pub mod in_flight;
 mod in_flight_gpu_tests;
 pub mod io_queue;
 pub mod ledger;
+mod metal3_retirement;
 mod metal4;
 mod raw_encoder;
 mod retirement;

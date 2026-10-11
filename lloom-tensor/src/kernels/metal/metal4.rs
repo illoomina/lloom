@@ -403,10 +403,47 @@ impl Submission {
             submission: Arc::clone(self),
         }
     }
-    pub fn on_completion(&self, f: impl Fn(&Feedback) + Send + Sync + 'static) {
-        let mut state = self.state.lock();
-        assert!(self.status().0 < MTLCommandBufferStatus::Committed.0);
+    /// Returns rejected captures intact. Error propagation must carry this
+    /// owner beyond any caller's recording locks before its eventual Drop.
+    pub fn on_completion(
+        &self,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        let mut state = match self.recording_state() {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some(f),
+                ))
+            }
+        };
+        if state.callbacks.try_reserve(1).is_err() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                MetalKernelError::QueueUnavailable("callback metadata allocation refused"),
+                Some(f),
+            ));
+        }
         state.callbacks.push(Box::new(f));
+        Ok(())
+    }
+    fn recording_state(&self) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
+        self.queue.check_failure()?;
+        let state = match self.state.try_lock() {
+            Some(state) => state,
+            None => {
+                crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+                self.state.lock()
+            }
+        };
+        self.queue.check_failure()?;
+        if self.status().0 >= MTLCommandBufferStatus::Committed.0 || state.slot.is_none() {
+            return Err(MetalKernelError::QueueUnavailable(
+                "submission no longer recording",
+            ));
+        }
+        Ok(state)
     }
     pub fn signal(&self, event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
         let event = unsafe { Retained::retain(std::ptr::from_ref(event).cast_mut()) }.unwrap();
@@ -469,72 +506,10 @@ impl Submission {
         })
     }
 
-    pub fn commit(self: &Arc<Self>) {
-        let mut state = self.state.lock();
-        if self.status().0 >= MTLCommandBufferStatus::Committed.0 {
-            return;
-        }
-        let slot = state.slot.take().expect("uncommitted slot");
-        slot.residency.commit();
-        slot.cb.endCommandBuffer();
-        let options = MTL4CommitOptions::new();
-        let mut cb = NonNull::from(slot.cb.as_ref());
-        // Completion owns this payload exclusively. Its mutex is only needed
-        // because Metal's block is Fn, not FnOnce; the encoding thread never
-        // acquires it. In particular feedback never locks recording state.
-        let retired = Mutex::new(Some((slot, std::mem::take(&mut state.callbacks))));
-        let this = Arc::clone(self);
-        let block = RcBlock::new(
-            move |feedback: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                let feedback = unsafe { feedback.as_ref() };
-                let info = Feedback {
-                    error: feedback
-                        .error()
-                        .map(|e| e.localizedDescription().to_string()),
-                    start: feedback.GPUStartTime(),
-                    end: feedback.GPUEndTime(),
-                };
-                let (slot, callbacks) = retired.lock().take().expect("completion once");
-                this.finish(info, slot, callbacks);
-            },
-        );
-        self.status
-            .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
-        // SAFETY: the array has one live command buffer; Metal retains the
-        // feedback block. the feedback payload retains the slot until feedback arrives.
-        unsafe {
-            options.addFeedbackHandler(RcBlock::as_ptr(&block));
-            self.queue.raw.signalEvent_value(
-                ProtocolObject::from_ref(&*self.front_event),
-                self.generation,
-            );
-            self.queue
-                .raw
-                .commit_count_options(NonNull::from(&mut cb), 1, &options);
-        }
-        for (event, value) in state.signals.drain(..) {
-            self.queue
-                .raw
-                .signalEvent_value(ProtocolObject::from_ref(&*event), value);
-        }
-    }
-    fn finish(&self, feedback: Feedback, slot: Slot, callbacks: Vec<Callback>) {
-        let failed = feedback.error.is_some();
-        assert!(self.feedback.set(feedback).is_ok(), "completion once");
-        publish_terminal_status(&self.status, failed);
-        self.done.notify();
-        // Preserve callback-before-slot-reuse semantics, including error latches
-        // and epoch retirement. Old markers read the immutable feedback above.
-        let feedback = self.feedback.get().expect("published above");
-        for callback in callbacks {
-            callback(feedback);
-        }
-        assert!(
-            self.queue.available.push(slot).is_ok(),
-            "one return per native slot"
-        );
-        self.queue.ready.notify();
-        self.notify_retirement_callbacks_finished();
+    /// Public submissions use the same prepared transaction as Commands. There
+    /// is no second legacy path that can bypass ordered retirement/custody.
+    pub fn commit(self: &Arc<Self>) -> Result<(), MetalKernelError> {
+        self.prepare_commit()?.commit()
     }
     pub(super) fn publish_retirement_feedback(&self, feedback: &Feedback) {
         let failed = feedback.error.is_some();
@@ -642,14 +617,12 @@ impl Submission {
         }
     }
 
-    pub fn wait(&self) {
-        loop {
-            let seen = self.done.snapshot();
-            if self.status().0 >= MTLCommandBufferStatus::Completed.0 {
-                return;
-            }
-            self.done.wait(seen);
+    pub fn wait(&self) -> Result<(), MetalKernelError> {
+        self.try_wait()?;
+        if let Some(error) = self.error() {
+            return Err(MetalKernelError::CommandBufferError(error));
         }
+        Ok(())
     }
 }
 #[derive(Clone, Copy)]
@@ -980,7 +953,7 @@ mod tests {
         let submission = queue.acquire().unwrap();
         let encoder = submission.encoder();
         encoder.raw.endEncoding();
-        submission.commit();
+        submission.commit().unwrap();
         let recording = submission.state.lock();
         event.setSignaledValue(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -991,7 +964,7 @@ mod tests {
         }
         let completed_without_lock = submission.status() == MTLCommandBufferStatus::Completed;
         drop(recording); // release even on mutation failure; never strand feedback
-        submission.wait();
+        submission.wait().unwrap();
         assert!(
             completed_without_lock,
             "completion waited for the encoding-side mutex"
@@ -1029,9 +1002,11 @@ mod tests {
             let submission = queue.acquire().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
             let observed = Arc::clone(&submission);
-            submission.on_completion(move |_| {
-                tx.send(observed.status()).unwrap();
-            });
+            submission
+                .on_completion(move |_| {
+                    tx.send(observed.status()).unwrap();
+                })
+                .unwrap();
             let encoder = submission.encoder();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
@@ -1051,8 +1026,8 @@ mod tests {
                 },
             );
             encoder.raw.endEncoding();
-            submission.commit();
-            submission.wait();
+            submission.commit().unwrap();
+            submission.wait().unwrap();
             assert_eq!(
                 rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
                 MTLCommandBufferStatus::Completed,
@@ -1144,18 +1119,19 @@ mod tests {
             let earlier = heavy.clone();
             tiny.on_completion(move |_| {
                 tx.send(earlier.status()).unwrap();
-            });
-            heavy.commit();
+            })
+            .unwrap();
+            heavy.commit().unwrap();
             pending_at_later_commit +=
                 usize::from(heavy.status() != MTLCommandBufferStatus::Completed);
-            tiny.commit();
-            tiny.wait();
+            tiny.commit().unwrap();
+            tiny.wait().unwrap();
             assert_eq!(
                 rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
                 MTLCommandBufferStatus::Completed,
                 "later feedback preceded earlier retirement"
             );
-            heavy.wait();
+            heavy.wait().unwrap();
             gpu_inversions += usize::from(tiny.gpu_end_time() < heavy.gpu_end_time());
         }
         assert!(
@@ -1191,7 +1167,7 @@ mod tests {
         for _ in 0..SLOTS {
             let submission = queue.acquire().unwrap();
             submission.encoder().raw.endEncoding();
-            submission.commit();
+            submission.commit().unwrap();
             submissions.push(submission);
         }
         assert_eq!(queue.created.load(Ordering::Relaxed), SLOTS);
@@ -1215,7 +1191,7 @@ mod tests {
         let slot = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         worker.join().unwrap();
         for submission in submissions {
-            submission.wait();
+            submission.wait().unwrap();
         }
         assert!(
             parked && blocked,
@@ -1288,11 +1264,11 @@ mod tests {
                     );
             }
             encoder.raw.endEncoding();
-            submission.commit();
+            submission.commit().unwrap();
             pending.push((submission, buffer, n));
         }
         for (submission, buffer, n) in &pending {
-            submission.wait();
+            submission.wait().unwrap();
             assert_eq!(
                 submission.status(),
                 MTLCommandBufferStatus::Completed,
@@ -1386,10 +1362,10 @@ mod tests {
         let second = record(&b, 2);
         // Submit the consumer first: only the explicit event can order it
         // after the producer on the independent queue.
-        second.commit();
-        first.commit();
-        first.wait();
-        second.wait();
+        second.commit().unwrap();
+        first.commit().unwrap();
+        first.wait().unwrap();
+        second.wait().unwrap();
         assert_eq!(first.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(second.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(event.signaledValue(), 1);

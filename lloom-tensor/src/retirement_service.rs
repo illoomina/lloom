@@ -3,7 +3,8 @@
 //! Logical callbacks run on native feedback. This worker only destroys payloads
 //! after an inbox has detached them and returned its cleanup credit. The static
 //! registry, not a native block or the worker stack, is the custody root.
-//! Private draft: no native adapter calls `shared`/`register` yet.
+//! Engine queue-associated adapters register payloads here. Their physical/IO
+//! custody integration and native runtime validation remain separate obligations.
 
 use crate::{
     completion_wake::Wake,

@@ -113,8 +113,8 @@ fn main() -> Result<()> {
             )?;
         }
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        cb.commit()?;
+        cb.wait_until_completed()?;
         Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6 / a.n as f64)
     };
 
@@ -140,8 +140,8 @@ fn main() -> Result<()> {
             reg,
         )?;
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        cb.commit()?;
+        cb.wait_until_completed()?;
         let bytes = |b: &Buffer, n: usize| unsafe {
             std::slice::from_raw_parts(b.contents() as *const u8, n).to_vec()
         };

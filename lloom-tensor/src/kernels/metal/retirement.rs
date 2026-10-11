@@ -33,13 +33,25 @@ impl Captures {
 
 /// No arbitrary callback boxes here. Declaration order keeps native resources
 /// and submission state alive before releasing the physical aggregate.
+pub(super) type Metal3Anchor = crate::host_anchor::HostAnchorPermit<(), Metal3RawOwners>;
+
+/// The registry, never a callback or final wrapper stack, destroys these owners.
+/// Raw native lifetime ends before its corresponding physical accounting owner.
+pub(super) struct Metal3RawOwners {
+    pub raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    pub physical: Option<Arc<dyn Send + Sync>>,
+}
+// SAFETY: same cross-thread retain/release contract as CommandBuffer.
+unsafe impl Send for Metal3RawOwners {}
+unsafe impl Sync for Metal3RawOwners {}
+
 pub(super) struct NativeOwners {
     backend: NativeBackend,
     physical: Option<Arc<dyn Send + Sync>>,
 }
 enum NativeBackend {
     Vacant,
-    Metal3(Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal3(Metal3Anchor),
     Metal4 {
         slot: Option<metal4::Slot>,
         queue: Arc<metal4::Queue>,
@@ -61,13 +73,10 @@ impl NativeOwners {
         }
     }
 
-    pub fn metal3(
-        raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        physical: Option<Arc<dyn Send + Sync>>,
-    ) -> Self {
+    pub fn metal3(anchor: Metal3Anchor) -> Self {
         Self {
-            backend: NativeBackend::Metal3(raw),
-            physical,
+            backend: NativeBackend::Metal3(anchor),
+            physical: None,
         }
     }
     pub fn metal4(

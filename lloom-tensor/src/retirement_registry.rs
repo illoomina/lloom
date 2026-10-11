@@ -53,6 +53,7 @@ struct Producer<C, A, F> {
 
 struct Slab<C, A, F> {
     cells: Vec<OwnerMailbox<Owner<C, A>, F>>,
+    ordered: Vec<crate::ordered_metadata::OrderedMetadata<PinnedRegistration<C, A, F>>>,
     free: AtomicU64,
     occupied: AtomicUsize,
     producer_alive: AtomicBool,
@@ -96,6 +97,19 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
     #[cfg(test)]
     pub(crate) fn manual(failure: Arc<FailureSignal>, service: Arc<HostRetirementService>) -> Self {
         Self::from_service(failure, service)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_with_waiters(
+        failure: Arc<FailureSignal>,
+        service: Arc<HostRetirementService>,
+        waiters: Arc<Wake>,
+        cleanup_policy: CleanupPolicy,
+    ) -> Self {
+        let mut registry = Self::from_service(failure, service);
+        registry.waiters = waiters;
+        registry.cleanup_policy = cleanup_policy;
+        registry
     }
 
     pub(crate) fn new_with_waiters(
@@ -192,11 +206,16 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         let slab = &producer.slabs[slab_index];
         slab.occupied.fetch_add(1, Ordering::AcqRel);
         match slab.cells[cell_index].prepare(owner) {
-            Ok(ticket) => Ok(Registration {
-                slab: slab.clone(),
-                index: cell_index,
-                ticket,
-            }),
+            Ok(ticket) => {
+                // SAFETY: prepare advanced generation only after previous
+                // readers/PINNING ended. No new Registration has escaped yet.
+                unsafe { slab.ordered[cell_index].reset_generation() };
+                Ok(Registration {
+                    slab: slab.clone(),
+                    index: cell_index,
+                    ticket,
+                })
+            }
             Err(rejected) => {
                 slab.occupied.fetch_sub(1, Ordering::AcqRel);
                 // An exhausted generation stays unavailable. No wrap/reuse.
@@ -236,8 +255,14 @@ impl<C, A, F> Slab<C, A, F> {
                 OwnerMailbox::new(failure.clone(), wake.clone()).map_err(RegistryError::Mailbox)?,
             );
         }
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(CELLS)
+            .map_err(|_| RegistryError::MetadataAllocation)?;
+        ordered.resize_with(CELLS, crate::ordered_metadata::OrderedMetadata::new);
         Ok(Self {
             cells,
+            ordered,
             free: AtomicU64::new(ALL_FREE),
             occupied: AtomicUsize::new(0),
             producer_alive: AtomicBool::new(true),
@@ -249,22 +274,123 @@ impl<C, A, F> Slab<C, A, F> {
         })
     }
     fn reserve(&self) -> Option<usize> {
+        // Payload credit can precede the final old marker. Leave pinned free
+        // bits intact and choose another cell or grow instead of false Busy.
+        let mut selected = None;
         self.free
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bits| {
-                (bits != 0).then(|| bits & (bits - 1))
+                selected = None;
+                let mut candidates = bits;
+                while candidates != 0 {
+                    let index = candidates.trailing_zeros() as usize;
+                    candidates &= candidates - 1;
+                    if self.cells[index].metadata_reusable() {
+                        selected = Some(index);
+                        return Some(bits & !(1u64 << index));
+                    }
+                }
+                None
             })
-            .ok()
-            .map(|bits| bits.trailing_zeros() as usize)
+            .ok()?;
+        selected
+    }
+}
+
+/// Owned metadata-only marker. Slab custody keeps the mailbox address valid;
+/// the opaque permit prevents generation reuse even after payload cleanup.
+/// Neither a self-referential borrow nor a new per-marker allocation is needed.
+pub(crate) struct PinnedRegistration<C, A, F> {
+    record: Registration<C, A, F>,
+    permit: Option<crate::retirement_mailbox::PinPermit>,
+}
+impl<C, A, F> PinnedRegistration<C, A, F> {
+    pub(crate) fn add_wrapper_handle(&self) -> Result<(), ()> {
+        self.ordered().add_wrapper_handle()
+    }
+    pub(crate) fn release_wrapper_handle(&self) -> bool {
+        self.ordered().release_wrapper_handle()
+    }
+    pub(crate) fn record(&self) -> &Registration<C, A, F> {
+        &self.record
+    }
+    fn ordered(&self) -> &crate::ordered_metadata::OrderedMetadata<Self> {
+        &self.record.slab.ordered[self.record.index]
+    }
+    pub(crate) fn append_successor(&self, next: Self) -> Result<(), Self> {
+        self.ordered().append(next)
+    }
+    pub(crate) fn take_successor(&self) -> Option<Self> {
+        self.ordered().take_successor()
+    }
+    pub(crate) fn publish_native_ready(&self) {
+        self.ordered().publish_native_ready();
+    }
+    pub(crate) fn native_ready(&self) -> bool {
+        self.ordered().native_ready()
+    }
+    pub(crate) fn publish_ordered_ready(&self) {
+        self.ordered().publish_ordered_ready();
+    }
+    pub(crate) fn ordered_ready(&self) -> bool {
+        self.ordered().ordered_ready()
+    }
+    pub(crate) fn publish_callbacks_finished(&self) {
+        self.ordered().publish_callbacks_finished();
+    }
+    pub(crate) fn callbacks_finished(&self) -> bool {
+        self.ordered().callbacks_finished()
+    }
+    pub(crate) fn try_clone(&self) -> Result<Self, MailboxError> {
+        let cell = &self.record.slab.cells[self.record.index];
+        let permit = cell.clone_pin(self.permit.as_ref().expect("live metadata pin"))?;
+        Ok(Self {
+            record: self.record.clone(),
+            permit: Some(permit),
+        })
+    }
+}
+impl<C, A, F> Drop for PinnedRegistration<C, A, F> {
+    fn drop(&mut self) {
+        self.record.slab.cells[self.record.index]
+            .release_pin(self.permit.take().expect("one metadata release"));
     }
 }
 
 impl<C, A, F> Registration<C, A, F> {
+    pub(crate) fn pin(&self) -> Result<PinnedRegistration<C, A, F>, MailboxError> {
+        let permit = self.slab.cells[self.index].acquire_pin(self.ticket)?;
+        Ok(PinnedRegistration {
+            record: self.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    pub(crate) fn edit_prepared<V, R>(
+        &self,
+        input: V,
+        edit: impl FnOnce(&mut C, &mut A, &mut Option<V>) -> R,
+    ) -> Result<(R, Option<V>), crate::retirement_mailbox::PreparedEditError<V>> {
+        self.slab.cells[self.index].edit_prepared(
+            self.ticket,
+            input,
+            |owner, input| edit(&mut owner.0, &mut owner.1, input),
+            || self.slab.waiters.notify(),
+        )
+    }
+
     pub(crate) fn replace_prepared(
         &self,
         captures: C,
         anchors: A,
     ) -> Result<(C, A), crate::retirement_mailbox::Rejected<(C, A)>> {
         self.slab.cells[self.index].replace_prepared(self.ticket, (captures, anchors))
+    }
+
+    pub(crate) fn report_failure(&self, reason: Failure) {
+        self.slab.failure.publish(reason, || {
+            self.slab.wake.notify();
+            self.slab.waiters.notify();
+        });
     }
 
     pub(crate) fn cancel_before_handoff(&self) -> Result<(), MailboxError> {
@@ -755,5 +881,80 @@ mod tests {
         for count in [&captures, &anchors, &feedbacks, &panics] {
             assert_eq!(count.load(Ordering::SeqCst), 1);
         }
+    }
+    #[test]
+    fn old_owned_marker_keeps_generation_while_cleanup_credit_can_grow() {
+        let (service, registry) = setup();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = prepare(&registry, OnDrop(None), &drops);
+        let pin = first.pin().unwrap();
+        let old_ticket = first.ticket;
+        let fillers: Vec<_> = (1..CELLS)
+            .map(|_| prepare(&registry, OnDrop(None), &drops))
+            .collect();
+        first.cancel_before_handoff().unwrap();
+        assert!(service.manual_pass());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        // The record payload is gone, but existing old markers can still clone.
+        let cloned_pin = pin.try_clone().unwrap();
+        assert!(!first.slab.cells[first.index].metadata_reusable());
+        let growths = AtomicUsize::new(0);
+        let successor = registry
+            .prepare(OnDrop(None), Anchor(drops.clone()), |_| {
+                growths.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_or_else(|_| panic!("pinned free cell caused false Busy instead of growth"));
+        assert_eq!(growths.load(Ordering::SeqCst), 1);
+        assert!(!Arc::ptr_eq(&first.slab, &successor.slab));
+        assert_eq!(first.ticket, old_ticket);
+        drop(pin);
+        assert!(!first.slab.cells[first.index].metadata_reusable());
+        drop(cloned_pin);
+        assert!(first.slab.cells[first.index].metadata_reusable());
+        // Force the producer to inspect the original slab; its only free cell
+        // must now be reusable with a distinct generation, never the old ticket.
+        registry.producer.lock().current = 0;
+        let reused = prepare(&registry, OnDrop(None), &drops);
+        assert!(Arc::ptr_eq(&first.slab, &reused.slab));
+        assert_eq!(first.index, reused.index);
+        assert_ne!(first.ticket, reused.ticket);
+        assert_eq!(first.cancel_before_handoff(), Err(MailboxError::Stale));
+        for record in fillers.iter().chain([&successor, &reused]) {
+            record.cancel_before_handoff().unwrap();
+        }
+        drain(&service, &drops, CELLS + 2);
+    }
+
+    #[test]
+    fn pinned_metadata_growth_refusal_keeps_caller_owner_and_old_marker() {
+        let (service, registry) = setup();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = prepare(&registry, OnDrop(None), &drops);
+        let pin = first.pin().unwrap();
+        let fillers: Vec<_> = (1..CELLS)
+            .map(|_| prepare(&registry, OnDrop(None), &drops))
+            .collect();
+        first.cancel_before_handoff().unwrap();
+        assert!(service.manual_pass());
+        let rejected = match registry.prepare(OnDrop(None), Anchor(drops.clone()), |_| {
+            Err(RegistryError::GrowthRefused)
+        }) {
+            Ok(_) => panic!("growth refusal admitted a pinned generation"),
+            Err(rejected) => rejected,
+        };
+        assert!(
+            matches!(rejected.error, RegistryError::GrowthRefused),
+            "pinned free cell hid the explicit growth refusal"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.producer.lock().slabs.len(), 1);
+        drop(rejected);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        drop(pin);
+        for record in &fillers {
+            record.cancel_before_handoff().unwrap();
+        }
+        drain(&service, &drops, CELLS + 1);
     }
 }

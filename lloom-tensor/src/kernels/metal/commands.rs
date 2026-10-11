@@ -228,6 +228,7 @@ pub struct Commands {
     replacement_pending: CachePadded<AtomicBool>,
     command_queue: CommandQueue,
     modern_queue: Option<Arc<super::metal4::Queue>>,
+    legacy_completions: Option<Arc<super::metal3_retirement::Completions>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: AtomicUsize,
@@ -601,11 +602,22 @@ impl Commands {
             "metal4" | "auto" if supported => Some(super::metal4::Queue::new(device.clone())?),
             _ => None,
         };
+        let legacy_completions = if modern_queue.is_none() {
+            Some(super::metal3_retirement::Completions::new()?)
+        } else {
+            None
+        };
         let cb = if let Some(queue) = &modern_queue {
             eprintln!("[metal] command_api=metal4 reusable_native_buffers=true");
             CommandBuffer::from_metal4(queue.acquire()?)
         } else {
-            cb
+            cb.associate_metal3(
+                legacy_completions
+                    .as_ref()
+                    .expect("M3 core constructed")
+                    .clone(),
+                None,
+            )?
         };
 
         let pipelined_compute_per_buffer =
@@ -619,6 +631,7 @@ impl Commands {
             replacement_pending: CachePadded::new(AtomicBool::new(false)),
             command_queue,
             modern_queue,
+            legacy_completions,
             compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
             pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
             cut_policy,
@@ -912,6 +925,10 @@ impl Commands {
                 crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
             }
+            if let Some(core) = &self.legacy_completions {
+                crate::completion_scope::before_park(core.identity())
+                    .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
+            }
             Ok(())
         })
     }
@@ -930,7 +947,7 @@ impl Commands {
         // so each encoder's interval is one kernel's (`profile::encoder_per_dispatch`).
         if crate::kernels::metal::profile::encoder_per_dispatch() {
             if let Some(enc) = state_guard.current_encoder.take() {
-                self.end_encoding(enc);
+                self.end_encoding(enc)?;
             }
         }
 
@@ -1005,7 +1022,7 @@ impl Commands {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc);
+            self.end_encoding(enc)?;
         }
         if self.modern_queue.is_some() {
             // Queue the signal as part of this commit, before acquiring a
@@ -1037,7 +1054,7 @@ impl Commands {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc);
+            self.end_encoding(enc)?;
         }
         if self.modern_queue.is_some() {
             self.commit_swap_locked(&mut state, 0)?;
@@ -1062,7 +1079,7 @@ impl Commands {
 
         // End compute encoder before starting blit.
         if let Some(enc) = state_guard.current_encoder.take() {
-            self.end_encoding(enc);
+            self.end_encoding(enc)?;
         }
 
         let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
@@ -1350,7 +1367,13 @@ impl Commands {
     fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
         match &self.modern_queue {
             Some(queue) => Ok(CommandBuffer::from_metal4(queue.acquire()?)),
-            None => create_command_buffer(&self.command_queue, self.kind),
+            None => create_command_buffer(&self.command_queue, self.kind)?.associate_metal3(
+                self.legacy_completions
+                    .as_ref()
+                    .expect("M3 core constructed")
+                    .clone(),
+                None,
+            ),
         }
     }
 
@@ -1381,7 +1404,7 @@ impl Commands {
     ) -> Result<Option<u64>, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc);
+            self.end_encoding(enc)?;
         }
         let t_end_enc = timed.map(|t| t.elapsed());
         let receipt = *state
@@ -1422,8 +1445,8 @@ impl Commands {
                     for f in &subs {
                         f();
                     }
-                });
-                cb.record_gpu_time_on_completion();
+                })?;
+                cb.record_gpu_time_on_completion()?;
                 prepared.commit()?;
                 if let (Some(a), Some(b), Some(c)) =
                     (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
@@ -1520,7 +1543,7 @@ impl Commands {
                 // the fail-safe direction: a poll for a value nothing will
                 // publish is a hang.
                 let prepared = cb.prepare_commit()?;
-                cb.record_gpu_time_on_completion();
+                cb.record_gpu_time_on_completion()?;
                 prepared.commit()?;
                 cb.try_wait_data_ready()?;
             }
@@ -1623,7 +1646,7 @@ impl Commands {
         self.failure.check()
     }
 
-    fn end_encoding(&self, encoder: ComputeCommandEncoder) {
+    fn end_encoding(&self, encoder: ComputeCommandEncoder) -> Result<(), MetalKernelError> {
         // The encoder is consumed here, so its output set is moved out rather
         // than cloned: a `HashSet` cloned per encoder close is 14 clones a
         // token (`CONTRIBUTING.md` §3.3a), and the capacity dies with the
@@ -1678,14 +1701,22 @@ impl Commands {
 
         encoder.raw.updateFence(encoder.fence.raw());
 
-        if retires {
+        let registration = if retires {
             let completed = encoder.fence.completion_flag();
-            encoder.command_buffer.on_completion(move || {
-                completed.store(true, Ordering::Release);
-            });
-        }
-
+            encoder
+                .command_buffer
+                .on_completion(move || {
+                    completed.store(true, Ordering::Release);
+                })
+                .map_err(MetalKernelError::from)
+        } else {
+            Ok(())
+        };
+        // Close the native encoder even when registration refused. The error
+        // carries its rejected capture out through the caller's EntryState guard;
+        // it is not formatted/dropped under that guard.
         encoder.raw.endEncoding();
+        registration
     }
 }
 

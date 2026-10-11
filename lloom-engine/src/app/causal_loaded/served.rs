@@ -66,6 +66,24 @@ pub enum Request<'a> {
         question: &'a crate::decision::Question<OrderedJson>,
         labels: &'a [String],
     },
+    /// Same resolved omni owner. Inputs are borrowed BEFORE ordered parsing,
+    /// rendering, media encoding, bidirectional rows and returned readout work.
+    OmniRender {
+        id: &'a str,
+        state: &'a OrderedJson,
+        question: &'a crate::decision::Question<OrderedJson>,
+        policy: &'a super::super::omni::Policy,
+    },
+    OmniRawDecisions {
+        body: &'a OrderedJson,
+        policy: &'a super::super::omni::Policy,
+    },
+    OmniDecisions {
+        state: &'a OrderedJson,
+        questions: &'a [(String, crate::decision::Question<OrderedJson>)],
+        media: super::super::omni::Media<'a>,
+        policy: &'a super::super::omni::Policy,
+    },
     PreparedDecisions(&'a CausalRequest),
     SystemOneRender {
         id: &'a str,

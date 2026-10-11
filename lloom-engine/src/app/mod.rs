@@ -13,6 +13,7 @@ pub mod common;
 pub mod family;
 pub mod lfm2;
 pub mod modes;
+pub mod omni;
 pub mod qwen3_5;
 pub mod qwen4exp;
 pub mod report;

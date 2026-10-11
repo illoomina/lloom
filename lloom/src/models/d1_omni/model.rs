@@ -76,7 +76,7 @@ fn validate_outer(
     }
     Ok(())
 }
-fn text_allowance(
+pub(super) fn text_allowance(
     max_length: usize,
     prefix_tokens: usize,
     configured_limit: usize,
@@ -144,8 +144,9 @@ pub struct OmniImage<'a> {
 
 /// One loaded non-generating family: core, vision and audio share one checkpoint.
 /// Component revision guards are NOT domain identities or allocation promises.
-/// The public engine factory is intentionally absent until actual shared
-/// Domain and load/pass-context wiring can cover host and device producers.
+/// LoadedOmni supplies the shared load/pass ownership boundary for the explicit
+/// engine factory. Complete host/device producer charging, native error custody
+/// and default registration remain unfinished acceptance work.
 #[derive(Debug)]
 pub struct OmniModel {
     cfg: OmniConfig,

@@ -26,6 +26,7 @@ mod model;
 pub use model::{OmniConfig, OmniImage, OmniModel};
 
 mod loaded;
+pub use loaded::{LoadedOmni, OmniMetadata, OmniPass};
 
 mod gguf;
 

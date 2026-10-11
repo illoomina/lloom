@@ -45,6 +45,36 @@ impl OmniReadout {
         })
     }
 
+    /// Endpoint readout keeps raw JSON payloads and admits singleton choices.
+    /// The Python-reference prepare helper above retains its >=2 contract.
+    /// Checkpoint values are borrowed, not copied into a second calibration map.
+    pub fn prepare_systemone<T>(
+        question: &Question<T>,
+        media: OmniMedia,
+        temperatures: &BTreeMap<String, f64>,
+    ) -> Result<Self> {
+        question.validate()?;
+        let kind = match question {
+            Question::Choice { .. } => "choice",
+            Question::Score { .. } => "score",
+            Question::Noul { .. } => "noul",
+        };
+        let temperature = if media == OmniMedia::Text {
+            temperatures
+                .get(&question.temperature_key())
+                .or_else(|| temperatures.get(kind))
+                .copied()
+        } else {
+            None
+        }
+        .unwrap_or(1.);
+        Ok(Self {
+            options: question.option_count(),
+            reverse: matches!(question, Question::Noul { .. }),
+            temperature: Temperature::try_from(temperature)?,
+        })
+    }
+
     /// Only the real options are normalized. Trailing padded marker slots are
     /// ignored even when their sentinel is not finite. No generated tokens or
     /// whole-vocabulary readback are needed for this head.

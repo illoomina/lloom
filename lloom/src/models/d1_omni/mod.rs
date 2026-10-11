@@ -14,3 +14,6 @@ pub use core::{DecisionCore, DecisionCoreConfig, DecisionRow, PreparedRows};
 
 mod vision;
 pub use vision::{PreparedVisionImage, Vision, VisionImagePlan};
+
+mod audio;
+pub use audio::{RelativeAttentionPlan, RelativeInputs, RelativeScratch};

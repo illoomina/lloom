@@ -201,6 +201,10 @@ impl EntryState {
 }
 
 pub struct Commands {
+    core: Arc<CommandsCore>,
+}
+
+struct CommandsCore {
     /// The encoder state, and `compute_count` beside it, are on **different
     /// cache lines** (issue #442).
     ///
@@ -454,6 +458,10 @@ struct LiveFence {
 unsafe impl Send for Commands {}
 unsafe impl Sync for Commands {}
 
+// SAFETY: CommandsCore preserves Commands native recording exclusion.
+unsafe impl Send for CommandsCore {}
+unsafe impl Sync for CommandsCore {}
+
 impl Commands {
     pub fn new(
         command_queue: CommandQueue,
@@ -626,47 +634,51 @@ impl Commands {
         let hold = (kind == CommandBufferKind::Unretained)
             .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
         Ok(Self {
-            state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
-            compute_count: CachePadded::new(AtomicUsize::new(0)),
-            replacement_pending: CachePadded::new(AtomicBool::new(false)),
-            command_queue,
-            modern_queue,
-            legacy_completions,
-            compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
-            pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
-            cut_policy,
-            node_cut_pending: AtomicBool::new(false),
-            device,
-            eos_gate: Arc::new(DispatchGate::new()),
-            prev_ce_outputs: Arc::new(Censused::new(parking_lot::RwLock::new(HashMap::new()))),
-            live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
-            residency_set,
-            clock,
-            census: Arc::default(),
-            trace: Arc::default(),
-            on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
-            completion_wait,
-            completion_event,
-            completion_polls: AtomicU64::new(0),
-            completion_signals: AtomicU64::new(0),
-            completion_fires: AtomicU64::new(0),
-            completion_already_complete: AtomicU64::new(0),
-            kind,
-            hold,
-            failure: Arc::default(),
+            core: Arc::new(CommandsCore {
+                state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(
+                    cb,
+                )))),
+                compute_count: CachePadded::new(AtomicUsize::new(0)),
+                replacement_pending: CachePadded::new(AtomicBool::new(false)),
+                command_queue,
+                modern_queue,
+                legacy_completions,
+                compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
+                pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
+                cut_policy,
+                node_cut_pending: AtomicBool::new(false),
+                device,
+                eos_gate: Arc::new(DispatchGate::new()),
+                prev_ce_outputs: Arc::new(Censused::new(parking_lot::RwLock::new(HashMap::new()))),
+                live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
+                residency_set,
+                clock,
+                census: Arc::default(),
+                trace: Arc::default(),
+                on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
+                completion_wait,
+                completion_event,
+                completion_polls: AtomicU64::new(0),
+                completion_signals: AtomicU64::new(0),
+                completion_fires: AtomicU64::new(0),
+                completion_already_complete: AtomicU64::new(0),
+                kind,
+                hold,
+                failure: Arc::default(),
+            }),
         })
     }
 
     /// The command-buffer kind this queue creates.
     pub fn kind(&self) -> CommandBufferKind {
-        self.kind
+        self.core.kind
     }
 
     /// The hold for objects an unretained command buffer may still name after
     /// their last host handle; `None` on the retaining kind.
     pub fn in_flight_hold(&self) -> Option<&Arc<InFlightHold>> {
-        self.hold.as_ref()
+        self.core.hold.as_ref()
     }
 
     /// The completion-wait arm in force (`DESIGN.md` §11.5o).
@@ -678,7 +690,7 @@ impl Commands {
     /// compares equal to every run of that arm, where an absent one compares
     /// equal to nothing.
     pub fn completion_wait(&self) -> CompletionWait {
-        self.completion_wait
+        self.core.completion_wait
     }
 
     /// Whether an event was actually allocated for the selected arm.
@@ -689,7 +701,7 @@ impl Commands {
     /// the arm the operator asked for. Reporting it is what stops that becoming
     /// a silent null (§2.4).
     pub fn completion_event_present(&self) -> bool {
-        self.completion_event.is_some()
+        self.core.completion_event.is_some()
     }
 
     /// `(signals encoded, polls performed)` since construction.
@@ -700,8 +712,8 @@ impl Commands {
     /// without a counter.
     pub fn completion_counts(&self) -> (u64, u64) {
         (
-            self.completion_signals.load(Ordering::Relaxed),
-            self.completion_polls.load(Ordering::Relaxed),
+            self.core.completion_signals.load(Ordering::Relaxed),
+            self.core.completion_polls.load(Ordering::Relaxed),
         )
     }
 
@@ -715,7 +727,7 @@ impl Commands {
     /// which is §7.1a-i's wrong-arm shape in the one place no existing counter
     /// could see it.
     pub fn completion_fires(&self) -> u64 {
-        self.completion_fires.load(Ordering::Relaxed)
+        self.core.completion_fires.load(Ordering::Relaxed)
     }
 
     /// Waits that found the buffer already complete, so no arm ran (#583).
@@ -724,19 +736,28 @@ impl Commands {
     /// which it is the denominator for: an async arm engages only on the waits
     /// that actually had to wait.
     pub fn completion_already_complete(&self) -> u64 {
-        self.completion_already_complete.load(Ordering::Relaxed)
+        self.core
+            .completion_already_complete
+            .load(Ordering::Relaxed)
     }
 
     /// Acquisitions of this queue's submission locks that had to wait, since
     /// construction (`DESIGN.md` §6.4d). Difference two reads for a window.
     pub fn submission_contention(&self) -> SubmissionContention {
         SubmissionContention {
-            map_host_read: self.prev_ce_outputs.contention(Side::Host, Access::Shared),
+            map_host_read: self
+                .core
+                .prev_ce_outputs
+                .contention(Side::Host, Access::Shared),
             map_host_write: self
+                .core
                 .prev_ce_outputs
                 .contention(Side::Host, Access::Exclusive),
-            live_fences_host: self.live_fences.contention(Side::Host, Access::Exclusive),
-            state_host: self.state.contention(Side::Host, Access::Exclusive),
+            live_fences_host: self
+                .core
+                .live_fences
+                .contention(Side::Host, Access::Exclusive),
+            state_host: self.core.state.contention(Side::Host, Access::Exclusive),
         }
     }
 
@@ -744,7 +765,7 @@ impl Commands {
     /// test can make an encoding thread wait on it.
     #[cfg(test)]
     pub(crate) fn while_state_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _g = self.state.lock(Side::Host);
+        let _g = self.core.state.lock(Side::Host);
         f()
     }
 
@@ -753,8 +774,8 @@ impl Commands {
     /// them.
     #[cfg(test)]
     pub(crate) fn while_fence_locks_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _map = self.prev_ce_outputs.write(Side::Host);
-        let _book = self.live_fences.lock(Side::Host);
+        let _map = self.core.prev_ce_outputs.write(Side::Host);
+        let _book = self.core.live_fences.lock(Side::Host);
         f()
     }
 
@@ -765,27 +786,27 @@ impl Commands {
     /// encoder holds its slot from creation so that the per-dispatch path never
     /// has to take this lock. Call before encoding the work being measured.
     pub fn set_executor(&self, executor: Arc<ExecutorSlot>) {
-        ExecutorSlot::replace_installed(&self.executor, executor);
+        ExecutorSlot::replace_installed(&self.core.executor, executor);
     }
 
     /// The executor currently installed.
     pub fn executor(&self) -> Arc<ExecutorSlot> {
-        Arc::clone(&self.executor.lock())
+        Arc::clone(&self.core.executor.lock())
     }
 
     /// The EOS gate every encoder of this `Commands` binds while it is armed
     /// (lloom #735 step 4).
     pub fn eos_gate(&self) -> &Arc<DispatchGate> {
-        &self.eos_gate
+        &self.core.eos_gate
     }
 
     /// Bind the armed gate's flag on the encoder that is already open, if
     /// any — `begin` may arm the gate mid-encoder (after a prefill).
     pub fn bind_eos_gate_current(&self) {
-        let Some(flag) = self.eos_gate.armed_flag() else {
+        let Some(flag) = self.core.eos_gate.armed_flag() else {
             return;
         };
-        let state = self.state.lock(Side::Host);
+        let state = self.core.state.lock(Side::Host);
         if let Some(enc) = &state.current_encoder {
             enc.set_input_buffer(
                 crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
@@ -797,19 +818,19 @@ impl Commands {
 
     /// The clock the buffer pools decide reuse against.
     pub fn clock(&self) -> Arc<GpuClock> {
-        Arc::clone(&self.clock)
+        Arc::clone(&self.core.clock)
     }
 
     /// The dispatch census of this queue alone, for a window that must not
     /// count another device's work (`profile::DeviceCensus`).
     pub fn dispatch_census(&self) -> &Arc<crate::kernels::metal::profile::DeviceCensus> {
-        &self.census
+        &self.core.census
     }
 
     /// The dispatch trace of this queue alone, for a window that must not
     /// record another device's work (`trace::DeviceTrace`).
     pub fn dispatch_trace(&self) -> &Arc<crate::kernels::metal::trace::DeviceTrace> {
-        &self.trace
+        &self.core.trace
     }
 
     /// Registers `f` to run after every command buffer completes.
@@ -826,7 +847,7 @@ impl Commands {
     /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
     /// on the host, as the buffer pools do.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.on_complete.lock().push(Arc::new(f));
+        self.core.on_complete.lock().push(Arc::new(f));
     }
 
     /// The cut policy in force (`DESIGN.md` §13.5m).
@@ -836,7 +857,7 @@ impl Commands {
     /// conditional, so an arm is read back from the mechanism that decides it
     /// rather than from the flag that was passed.
     pub fn cut_policy(&self) -> CutPolicy {
-        self.cut_policy
+        self.core.cut_policy
     }
 
     /// The dispatch period the counter cut uses, whether or not it is in force.
@@ -845,13 +866,13 @@ impl Commands {
     /// default and an arm that is inert are different facts, which is the
     /// distinction §7.1a-i's `ScratchSizing` note draws.
     pub fn compute_per_buffer(&self) -> usize {
-        self.compute_per_buffer.load(Ordering::Relaxed)
+        self.core.compute_per_buffer.load(Ordering::Relaxed)
     }
 
     /// The period a pipelined decode loop raises the cut to (see the defaults
     /// above).
     pub fn pipelined_compute_per_buffer(&self) -> usize {
-        self.pipelined_compute_per_buffer
+        self.core.pipelined_compute_per_buffer
     }
 
     /// Change the counter cut's period. A relaxed store, read by the next
@@ -860,7 +881,8 @@ impl Commands {
     /// A pipelined decode loop raises the period for its steps through this
     /// and restores the default after (`Device::pipelined_cut_period`).
     pub fn set_compute_per_buffer(&self, period: usize) {
-        self.compute_per_buffer
+        self.core
+            .compute_per_buffer
             .store(period.max(1), Ordering::Relaxed);
     }
 
@@ -890,12 +912,13 @@ impl Commands {
     /// restatement of it beside the one that runs (§15.2 #12b's shape).
     #[inline]
     pub fn mark_graph_node(&self, index: usize) {
-        let since_cut = self.compute_count.load(Ordering::Relaxed);
+        let since_cut = self.core.compute_count.load(Ordering::Relaxed);
         if self
+            .core
             .cut_policy
             .cuts_at_node(index, since_cut, self.compute_per_buffer())
         {
-            self.node_cut_pending.store(true, Ordering::Relaxed);
+            self.core.node_cut_pending.store(true, Ordering::Relaxed);
         }
     }
 
@@ -912,19 +935,22 @@ impl Commands {
     /// `compute_count` is still incremented on both paths, so the counter stays
     /// a faithful dispatch count for anything else reading it.
     fn should_cut(&self, count: usize) -> bool {
-        self.cut_policy
-            .take_cut(count, self.compute_per_buffer(), &self.node_cut_pending)
+        self.core.cut_policy.take_cut(
+            count,
+            self.compute_per_buffer(),
+            &self.core.node_cut_pending,
+        )
     }
 
     /// Native feedback can arrive before commit_swap_locked releases EntryState.
     /// Refuse only actual same-queue blocking; available state remains usable.
     fn lock_state(&self) -> Result<parking_lot::MutexGuard<'_, EntryState>, MetalKernelError> {
-        self.state.lock_checked(Side::Host, || {
-            if let Some(queue) = &self.modern_queue {
+        self.core.state.lock_checked(Side::Host, || {
+            if let Some(queue) = &self.core.modern_queue {
                 crate::completion_scope::before_park(Arc::as_ptr(queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
             }
-            if let Some(core) = &self.legacy_completions {
+            if let Some(core) = &self.core.legacy_completions {
                 crate::completion_scope::before_park(core.identity())
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
             }
@@ -935,7 +961,7 @@ impl Commands {
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.lock_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
-        let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        let count = self.core.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
         if flush {
@@ -946,13 +972,13 @@ impl Commands {
         // so each encoder's interval is one kernel's (`profile::encoder_per_dispatch`).
         if crate::kernels::metal::profile::encoder_per_dispatch() {
             if let Some(enc) = state_guard.current_encoder.take() {
-                self.end_encoding(enc)?;
+                self.core.end_encoding(enc)?;
             }
         }
 
         if state_guard.current_encoder.is_none() {
             let executor = self.executor();
-            if self.hold.is_some() && !executor.is_classical() {
+            if self.core.hold.is_some() && !executor.is_classical() {
                 // An executor's indirect command buffers and the buffers
                 // their ranges keep resident are its own, replaced as it
                 // records; nothing holds them for a command buffer that does
@@ -964,7 +990,7 @@ impl Commands {
                         .to_string(),
                 ));
             }
-            let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
+            let fence = Arc::new(Fence::held_by(&self.core.device, self.core.hold.clone()));
             // No blanket wait here. HazardTrackingModeUntracked means Metal does
             // not flush GPU caches at encoder boundaries, so ordering is ours to
             // enforce -- but the encoder already records every buffer it binds,
@@ -975,15 +1001,19 @@ impl Commands {
                 .current
                 .recording()
                 .expect("recording recovered above")
-                .compute_command_encoder_with_executor(&fence, &self.prev_ce_outputs, &executor)
-                .with_clock(Arc::clone(&self.clock));
+                .compute_command_encoder_with_executor(
+                    &fence,
+                    &self.core.prev_ce_outputs,
+                    &executor,
+                )
+                .with_clock(Arc::clone(&self.core.clock));
             if crate::kernels::metal::profile::enabled() {
-                enc = enc.with_census(Arc::clone(&self.census));
+                enc = enc.with_census(Arc::clone(&self.core.census));
             }
             if crate::kernels::metal::trace::trace_requested() {
-                enc = enc.with_trace(Arc::clone(&self.trace));
+                enc = enc.with_trace(Arc::clone(&self.core.trace));
             }
-            if let Some(flag) = self.eos_gate.armed_flag() {
+            if let Some(flag) = self.core.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
                 enc.set_input_buffer(
@@ -1021,9 +1051,9 @@ impl Commands {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc)?;
+            self.core.end_encoding(enc)?;
         }
-        if self.modern_queue.is_some() {
+        if self.core.modern_queue.is_some() {
             // Queue the signal as part of this commit, before acquiring a
             // replacement slot can apply backpressure.
             state
@@ -1053,9 +1083,9 @@ impl Commands {
         let mut state = self.lock_state()?;
         self.ensure_recording_locked(&mut state)?;
         if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc)?;
+            self.core.end_encoding(enc)?;
         }
-        if self.modern_queue.is_some() {
+        if self.core.modern_queue.is_some() {
             self.commit_swap_locked(&mut state, 0)?;
         }
         state
@@ -1069,7 +1099,7 @@ impl Commands {
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.lock_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
-        let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
+        let count = self.core.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
         if flush {
@@ -1078,15 +1108,15 @@ impl Commands {
 
         // End compute encoder before starting blit.
         if let Some(enc) = state_guard.current_encoder.take() {
-            self.end_encoding(enc)?;
+            self.core.end_encoding(enc)?;
         }
 
-        let fence = Arc::new(Fence::held_by(&self.device, self.hold.clone()));
+        let fence = Arc::new(Fence::held_by(&self.core.device, self.core.hold.clone()));
         let encoder = state_guard
             .current
             .recording()
             .expect("recording recovered above")
-            .blit_command_encoder(&fence, &self.prev_ce_outputs);
+            .blit_command_encoder(&fence, &self.core.prev_ce_outputs);
 
         // Wait for all prior encoder fences before any blit commands execute.
         // Required for HazardTrackingModeUntracked: GPU caches are not auto-flushed.
@@ -1098,7 +1128,7 @@ impl Commands {
         // why the per-buffer waits in `copy_from_buffer` / `fill_buffer` are not
         // redundant with this one.
         {
-            let book = self.live_fences.lock(Side::Host);
+            let book = self.core.live_fences.lock(Side::Host);
             for live in book.live.iter().filter(|l| !l.fence.is_completed()) {
                 encoder.wait_for_fence(&live.fence);
             }
@@ -1118,7 +1148,7 @@ impl Commands {
         let (to_wait, retained_current, commit_error) = {
             let mut state = self.lock_state()?;
             let commit_error = if state.current.submitted().is_none()
-                && self.compute_count.load(Ordering::Acquire) > 0
+                && self.core.compute_count.load(Ordering::Acquire) > 0
             {
                 self.commit_swap_locked(&mut state, 0).err()
             } else {
@@ -1135,18 +1165,21 @@ impl Commands {
         // Check earlier CBs for errors (no need to block — they're already done).
         for cb in &to_wait {
             if cb.status() == MTLCommandBufferStatus::Error {
-                self.failure.record(cb_error_message(cb));
+                self.core.failure.record(cb_error_message(cb));
             }
         }
-        self.failure.check()?;
+        self.core.failure.check()?;
 
         // Drop only what has completed. The state lock was released before the
         // wait, so another thread sharing this queue may have ended sessions
         // since, and those may still be running: their entries are the only
         // thing ordering a later encoder's reads of what they wrote (§6.4f).
         {
-            let mut prev_ce_outputs = self.prev_ce_outputs.write(Side::Host);
-            self.live_fences.lock(Side::Host).reap(&mut prev_ce_outputs);
+            let mut prev_ce_outputs = self.core.prev_ce_outputs.write(Side::Host);
+            self.core
+                .live_fences
+                .lock(Side::Host)
+                .reap(&mut prev_ce_outputs);
         }
 
         if let Some(error) = commit_error {
@@ -1182,15 +1215,18 @@ impl Commands {
             // as a failure (§3.5).
             let outcome = Self::ensure_completed_via(
                 &cb,
-                self.completion_wait,
-                self.completion_event.as_ref(),
+                self.core.completion_wait,
+                self.core.completion_event.as_ref(),
                 signalled,
             )?;
-            self.completion_polls
+            self.core
+                .completion_polls
                 .fetch_add(outcome.polls, Ordering::Relaxed);
-            self.completion_fires
+            self.core
+                .completion_fires
                 .fetch_add(outcome.fired, Ordering::Relaxed);
-            self.completion_already_complete
+            self.core
+                .completion_already_complete
                 .fetch_add(outcome.already_complete, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
             let mut state = self.lock_state()?;
@@ -1230,14 +1266,14 @@ impl Commands {
     /// `None` when there is nothing encoded or more than one committed buffer
     /// is still incomplete; the marker otherwise.
     pub fn flush_marker_if_started(&self) -> Result<Option<CommandMarker>, MetalKernelError> {
-        if self.compute_count.load(Ordering::Acquire) == 0
-            && !self.replacement_pending.load(Ordering::Acquire)
+        if self.core.compute_count.load(Ordering::Acquire) == 0
+            && !self.core.replacement_pending.load(Ordering::Acquire)
         {
             return Ok(None);
         }
         let mut state = self.lock_state()?;
         let recovering = state.current.submitted().is_some();
-        if !recovering && self.compute_count.load(Ordering::Acquire) == 0 {
+        if !recovering && self.core.compute_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
         }
         let incomplete = state
@@ -1273,15 +1309,18 @@ impl Commands {
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<(), MetalKernelError> {
         let outcome = Self::ensure_completed_via(
             &marker.cb,
-            self.completion_wait,
-            self.completion_event.as_ref(),
+            self.core.completion_wait,
+            self.core.completion_event.as_ref(),
             marker.signalled,
         )?;
-        self.completion_polls
+        self.core
+            .completion_polls
             .fetch_add(outcome.polls, Ordering::Relaxed);
-        self.completion_fires
+        self.core
+            .completion_fires
             .fetch_add(outcome.fired, Ordering::Relaxed);
-        self.completion_already_complete
+        self.core
+            .completion_already_complete
             .fetch_add(outcome.already_complete, Ordering::Relaxed);
         let mut state = self.lock_state()?;
         self.prune_in_flight(&mut state, Some(&marker.cb))
@@ -1289,7 +1328,9 @@ impl Commands {
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
         let mut state = self.lock_state()?;
-        if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
+        if state.current.submitted().is_some()
+            || self.core.compute_count.load(Ordering::Acquire) > 0
+        {
             self.commit_swap_locked(&mut state, 0)?;
         }
         Ok(())
@@ -1324,7 +1365,9 @@ impl Commands {
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         let mut state = self.lock_state()?;
-        if state.current.submitted().is_some() || self.compute_count.load(Ordering::Acquire) > 0 {
+        if state.current.submitted().is_some()
+            || self.core.compute_count.load(Ordering::Acquire) > 0
+        {
             self.commit_swap_locked(&mut state, 0)?;
         }
         // Errors are surfaced here rather than swallowed: without a blocking
@@ -1364,15 +1407,17 @@ impl Commands {
     }
 
     fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
-        match &self.modern_queue {
+        match &self.core.modern_queue {
             Some(queue) => Ok(CommandBuffer::from_metal4(queue.acquire()?)),
-            None => create_command_buffer(&self.command_queue, self.kind)?.associate_metal3(
-                self.legacy_completions
-                    .as_ref()
-                    .expect("M3 core constructed")
-                    .clone(),
-                None,
-            ),
+            None => create_command_buffer(&self.core.command_queue, self.core.kind)?
+                .associate_metal3(
+                    self.core
+                        .legacy_completions
+                        .as_ref()
+                        .expect("M3 core constructed")
+                        .clone(),
+                    None,
+                ),
         }
     }
 
@@ -1381,76 +1426,13 @@ impl Commands {
         state.current.recover_recording(
             || self.create_replacement(),
             &mut state.in_flight,
-            &self.compute_count,
-            &self.replacement_pending,
+            &self.core.compute_count,
+            &self.core.replacement_pending,
             0,
         )?;
         // A consumed node cut belongs to the already submitted CB; do not
         // re-arm it for the dispatch whose encoder was never returned.
         Ok(())
-    }
-
-    /// Submit once and retain the original receipt on retry. Replacement is a
-    /// separate operation: draining already recorded work must not require
-    /// acquiring another native slot.
-    fn commit_current_locked(
-        &self,
-        state: &mut EntryState,
-        timed: Option<std::time::Instant>,
-    ) -> Result<CommitReceipt, MetalKernelError> {
-        if let Some(enc) = state.current_encoder.take() {
-            self.end_encoding(enc)?;
-        }
-        let t_end_enc = timed.map(|t| t.elapsed());
-        state
-            .current
-            .submit_marked(&self.replacement_pending, |cb| {
-                self.failure.check()?;
-                if !matches!(
-                    cb.status(),
-                    MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued
-                ) {
-                    return Err(MetalKernelError::CommandBufferError(
-                        "recording command buffer was already submitted outside Commands".into(),
-                    ));
-                }
-                // Reserve queue order and native handler allocation before
-                // epoch/signal/subscriber side effects. An unused preparation
-                // consumes no ordered completion sequence.
-                let prepared = cb.prepare_commit()?;
-                self.residency_set.commit_pending();
-                let t_residency = timed.map(|t| t.elapsed());
-                let signalled = self
-                    .completion_wait
-                    .encode_signal(cb, self.completion_event.as_ref());
-                if signalled.is_some() {
-                    self.completion_signals.fetch_add(1, Ordering::Relaxed);
-                }
-                crate::kernels::metal::trace::note_command_buffer();
-                let epoch = self.clock.commit_epoch();
-                let clock = Arc::clone(&self.clock);
-                let subs: Vec<_> = self.on_complete.lock().clone();
-                let failure = Arc::clone(&self.failure);
-                cb.on_completion_of(move |error| {
-                    if let Some(error) = error {
-                        failure.record(error);
-                    }
-                    // Subscribers consume the completed epoch published here.
-                    clock.mark_completed(epoch);
-                    for f in &subs {
-                        f();
-                    }
-                })?;
-                cb.record_gpu_time_on_completion()?;
-                prepared.commit()?;
-                if let (Some(a), Some(b), Some(c)) =
-                    (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
-                {
-                    crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
-                }
-                Ok(CommitReceipt { epoch, signalled })
-            })
-            .copied()
     }
 
     /// Commit the current buffer, swap in a fresh one, and return the value the
@@ -1465,8 +1447,8 @@ impl Commands {
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
-        let receipt = self.commit_current_locked(state, timed)?;
-        if let Some(hold) = &self.hold {
+        let receipt = self.core.commit_current_locked(state, timed)?;
+        if let Some(hold) = &self.core.hold {
             hold.release_completed();
         }
         let created = timed.map(|_| std::time::Instant::now());
@@ -1475,8 +1457,8 @@ impl Commands {
             .recover_recording(
                 || self.create_replacement(),
                 &mut state.in_flight,
-                &self.compute_count,
-                &self.replacement_pending,
+                &self.core.compute_count,
+                &self.core.replacement_pending,
                 reset_to,
             )?
             .expect("submit_marked retained its receipt");
@@ -1522,7 +1504,8 @@ impl Commands {
     /// makes every wait take the blocking fallback -- correct, and not the arm
     /// the operator asked for.
     pub fn completion_listener_present(&self) -> bool {
-        self.completion_event
+        self.core
+            .completion_event
             .as_ref()
             .is_some_and(|e| e.has_listener())
     }
@@ -1640,21 +1623,86 @@ impl Commands {
             _ => true,
         });
         if let Some(msg) = failed {
-            self.failure.record(msg);
+            self.core.failure.record(msg);
         }
-        self.failure.check()
+        self.core.failure.check()
     }
 
     /// Device setup attaches the existing memory ledger before any encoding.
     pub(crate) fn attach_command_ledger(&self, ledger: Arc<super::ledger::Ledger>) {
-        if let Some(queue) = &self.modern_queue {
+        if let Some(queue) = &self.core.modern_queue {
             queue.attach_ledger(ledger);
         }
     }
 
     /// The first command buffer of this queue that ended in error, if any.
     pub fn check_failed(&self) -> Result<(), MetalKernelError> {
-        self.failure.check()
+        self.core.failure.check()
+    }
+}
+
+impl CommandsCore {
+    /// Submit once and retain the original receipt on retry. Replacement is a
+    /// separate operation: draining already recorded work must not require
+    /// acquiring another native slot.
+    fn commit_current_locked(
+        &self,
+        state: &mut EntryState,
+        timed: Option<std::time::Instant>,
+    ) -> Result<CommitReceipt, MetalKernelError> {
+        if let Some(enc) = state.current_encoder.take() {
+            self.end_encoding(enc)?;
+        }
+        let t_end_enc = timed.map(|t| t.elapsed());
+        state
+            .current
+            .submit_marked(&self.replacement_pending, |cb| {
+                self.failure.check()?;
+                if !matches!(
+                    cb.status(),
+                    MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued
+                ) {
+                    return Err(MetalKernelError::CommandBufferError(
+                        "recording command buffer was already submitted outside Commands".into(),
+                    ));
+                }
+                // Reserve queue order and native handler allocation before
+                // epoch/signal/subscriber side effects. An unused preparation
+                // consumes no ordered completion sequence.
+                let prepared = cb.prepare_commit()?;
+                self.residency_set.commit_pending();
+                let t_residency = timed.map(|t| t.elapsed());
+                let signalled = self
+                    .completion_wait
+                    .encode_signal(cb, self.completion_event.as_ref());
+                if signalled.is_some() {
+                    self.completion_signals.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::kernels::metal::trace::note_command_buffer();
+                let epoch = self.clock.commit_epoch();
+                let clock = Arc::clone(&self.clock);
+                let subs: Vec<_> = self.on_complete.lock().clone();
+                let failure = Arc::clone(&self.failure);
+                cb.on_completion_of(move |error| {
+                    if let Some(error) = error {
+                        failure.record(error);
+                    }
+                    // Subscribers consume the completed epoch published here.
+                    clock.mark_completed(epoch);
+                    for f in &subs {
+                        f();
+                    }
+                })?;
+                cb.record_gpu_time_on_completion()?;
+                prepared.commit()?;
+                if let (Some(a), Some(b), Some(c)) =
+                    (t_end_enc, t_residency, timed.map(|t| t.elapsed()))
+                {
+                    crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
+                }
+                Ok(CommitReceipt { epoch, signalled })
+            })
+            .copied()
     }
 
     fn end_encoding(&self, encoder: ComputeCommandEncoder) -> Result<(), MetalKernelError> {
@@ -1751,6 +1799,7 @@ fn release_fence(fences: &mut Vec<LiveFence>, ptr: usize) {
 impl Drop for Commands {
     fn drop(&mut self) {
         let retained = self
+            .core
             .state
             .lock(Side::Host)
             .current
@@ -1765,13 +1814,14 @@ impl Drop for Commands {
         // A normal flush may itself fail after submission; retain that tail
         // as well as the unretained arm's ordinary in-flight owners.
         let last = {
-            let state = self.state.lock(Side::Host);
+            let state = self.core.state.lock(Side::Host);
             state
                 .current
                 .submitted()
                 .map(|(cb, _)| cb.clone())
                 .or_else(|| {
-                    self.hold
+                    self.core
+                        .hold
                         .as_ref()
                         .and_then(|_| state.in_flight.last().cloned())
                 })

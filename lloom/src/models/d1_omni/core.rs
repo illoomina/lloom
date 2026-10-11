@@ -76,14 +76,27 @@ fn checked_product(dims: &[usize]) -> Result<usize> {
 }
 
 impl DecisionCore {
-    /// `vb` is rooted at the omni checkpoint: namespaces `encoder` and `head`.
-    /// Caller supplies the admitted origin device/domain. Tables are retained
-    /// once, at the OUTER maximum length, not text_config's larger position cap.
-    pub fn load(cfg: DecisionCoreConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn validate_config(cfg: &DecisionCoreConfig, dtype: DType) -> Result<()> {
         cfg.text_config.validated_intermediate()?;
         if cfg.max_length == 0 || cfg.max_length > cfg.text_config.max_position_embeddings {
             lloom_tensor::bail!("omni outer maximum must fit positive text position limit")
         }
+        Trunk::validate_config(&cfg.text_config, dtype)?;
+        DecisionHead::validate_config(cfg.text_config.hidden_size, cfg.head_layers, dtype)?;
+        crate::nn::rotary_emb::validate_default_rope_tables(
+            cfg.text_config.hidden_size / cfg.text_config.num_attention_heads,
+            cfg.text_config.rope_theta as f32,
+            cfg.max_length,
+            dtype,
+        )?;
+        Ok(())
+    }
+
+    /// `vb` is rooted at the omni checkpoint: namespaces `encoder` and `head`.
+    /// Caller supplies the admitted origin device/domain. Tables are retained
+    /// once, at the OUTER maximum length, not text_config's larger position cap.
+    pub fn load(cfg: DecisionCoreConfig, vb: VarBuilder) -> Result<Self> {
+        Self::validate_config(&cfg, vb.dtype())?;
         let dtype = vb.dtype();
         let device = vb.device().clone();
         let trunk = Trunk::load(cfg.text_config.clone(), vb.pp("encoder"))?;

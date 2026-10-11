@@ -20,3 +20,6 @@ pub use audio::{
     AudioConfig, AudioEncoder, FrontendScratch, MelFeatures, MelFrontend, RelativeAttentionPlan,
     RelativeInputs, RelativeScratch,
 };
+
+mod model;
+pub use model::{OmniConfig, OmniImage, OmniModel};

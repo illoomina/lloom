@@ -234,17 +234,20 @@ pub struct Trunk {
 }
 
 impl Trunk {
-    pub fn load(cfg: TextConfig, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn validate_config(cfg: &TextConfig, dtype: DType) -> Result<usize> {
         let intermediate = cfg.validated_intermediate()?;
-        if !matches!(
-            vb.dtype(),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64
-        ) {
+        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
             lloom_tensor::bail!("omni trunk requires floating-point weights")
         }
         let d = cfg.hidden_size;
-        product(&[cfg.vocab_size, d, vb.dtype().size_in_bytes()])?;
-        product(&[d, intermediate, vb.dtype().size_in_bytes()])?;
+        product(&[cfg.vocab_size, d, dtype.size_in_bytes()])?;
+        product(&[d, intermediate, dtype.size_in_bytes()])?;
+        Ok(intermediate)
+    }
+
+    pub fn load(cfg: TextConfig, vb: VarBuilder) -> Result<Self> {
+        let intermediate = Self::validate_config(&cfg, vb.dtype())?;
+        let d = cfg.hidden_size;
         let embedding = embedding(cfg.vocab_size, d, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for (i, kind) in cfg.layer_types.iter().enumerate() {

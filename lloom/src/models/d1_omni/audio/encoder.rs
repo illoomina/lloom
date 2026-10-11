@@ -33,7 +33,7 @@ fn ceil_half(n: usize) -> usize {
     n / 2 + n % 2
 }
 impl AudioConfig {
-    fn validate(&self, out: usize, dtype: DType) -> Result<()> {
+    pub(crate) fn validate(&self, out: usize, dtype: DType) -> Result<()> {
         let d = self.d_model;
         let c = self.subsampling_conv_channels;
         if [

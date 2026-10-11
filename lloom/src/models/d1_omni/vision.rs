@@ -165,16 +165,12 @@ pub struct Vision {
     device: Device,
 }
 impl Vision {
-    /// `vb` is rooted at the checkpoint's `vision` namespace. The caller selects
-    /// safetensors/GGUF and establishes the shared load/allocation context.
-    /// Device identity alone is not model-domain identity.
-    /// Checkpoint tensor names remain separately verified at family loader time.
-    pub fn load(
+    pub(crate) fn validate_config(
         cfg: &VisionConfig,
         projector_hidden: usize,
         out: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+        dtype: DType,
+    ) -> Result<()> {
         if cfg.num_channels != 3
             || cfg.patch_size != PATCH
             || cfg.hidden_size == 0
@@ -187,7 +183,7 @@ impl Vision {
             || out == 0
             || !cfg.layer_norm_eps.is_finite()
             || cfg.layer_norm_eps <= 0.
-            || !matches!(vb.dtype(), DType::F16 | DType::BF16 | DType::F32)
+            || !matches!(dtype, DType::F16 | DType::BF16 | DType::F32)
         {
             lloom_tensor::bail!("omni vision needs supported floating dtype and positive compatible reference geometry")
         }
@@ -203,8 +199,22 @@ impl Vision {
             &[projector_hidden, cfg.hidden_size, 4][..],
             &[projector_hidden, out][..],
         ] {
-            product(&[product(factors)?, vb.dtype().size_in_bytes()])?;
+            product(&[product(factors)?, dtype.size_in_bytes()])?;
         }
+        Ok(())
+    }
+
+    /// `vb` is rooted at the checkpoint's `vision` namespace. The caller selects
+    /// safetensors/GGUF and establishes the shared load/allocation context.
+    /// Device identity alone is not model-domain identity.
+    /// Checkpoint tensor names remain separately verified at family loader time.
+    pub fn load(
+        cfg: &VisionConfig,
+        projector_hidden: usize,
+        out: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::validate_config(cfg, projector_hidden, out, vb.dtype())?;
         // rename uses the existing backend. Start from root so an incoming
         // prefix is not applied a second time by the inner VarBuilder.
         let prefix = vb.prefix();

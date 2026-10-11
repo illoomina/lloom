@@ -32,15 +32,16 @@ pub struct DecisionHead {
 }
 
 impl DecisionHead {
-    pub fn load(width: usize, layers: usize, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn validate_config(
+        width: usize,
+        layers: usize,
+        dtype: DType,
+    ) -> Result<(usize, usize, usize)> {
         let heads = width / 64;
         if heads == 0 || width % heads != 0 {
             lloom_tensor::bail!("decision head width must be divisible by its width/64 heads")
         }
-        if !matches!(
-            vb.dtype(),
-            DType::F16 | DType::BF16 | DType::F32 | DType::F64
-        ) {
+        if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
             lloom_tensor::bail!("decision head requires floating-point weights")
         }
         let packed = width
@@ -49,6 +50,30 @@ impl DecisionHead {
         let intermediate = width
             .checked_mul(4)
             .ok_or_else(|| lloom_tensor::Error::Msg("decision head width overflow".into()))?;
+        // Representability of actual weight arrays and layer metadata, not
+        // a weight-load/pass reservation or physical memory-fit claim.
+        let checked = |dims: &[usize]| -> Result<()> {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .filter(|&n| n <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("decision head shape/byte overflow".into())
+                })?;
+            Ok(())
+        };
+        let e = dtype.size_in_bytes();
+        checked(&[3, width, e])?;
+        checked(&[width, width, e])?; // scorer exists even with zero layers
+        checked(&[layers, std::mem::size_of::<EncoderLayer>()])?;
+        if layers != 0 {
+            checked(&[packed, width, e])?;
+            checked(&[intermediate, width, e])?;
+        }
+        Ok((heads, packed, intermediate))
+    }
+
+    pub fn load(width: usize, layers: usize, vb: VarBuilder) -> Result<Self> {
+        let (heads, packed, intermediate) = Self::validate_config(width, layers, vb.dtype())?;
         let type_embedding = embedding(3, width, vb.pp("type_emb"))?;
         let mut stack = Vec::with_capacity(layers);
         for i in 0..layers {

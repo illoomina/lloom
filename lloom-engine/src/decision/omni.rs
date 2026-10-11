@@ -111,7 +111,7 @@ impl OmniPreparedQuestion {
 
 /// Exactly the reference ASCII name class `<|[A-Za-z0-9_]+|>`, not arbitrary
 /// angle-bracket syntax or Unicode names. Replacements are literal caller text.
-fn escape(text: &str) -> String {
+pub(super) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<|") {

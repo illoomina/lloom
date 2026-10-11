@@ -12,6 +12,8 @@ mod request;
 mod response;
 mod state;
 mod temperature;
+#[cfg(feature = "serve")]
+mod template;
 
 pub use json::OrderedJson;
 pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
@@ -23,6 +25,8 @@ pub use response::{SystemOneError, SystemOneResponse};
 pub use state::{parse_systemone_state, MediaSource, ParsedState, StateNullability};
 
 pub use temperature::Temperature;
+#[cfg(feature = "serve")]
+pub use template::{SystemOneMedia, SystemOneTemplate, SystemOneTemplateKind};
 
 #[cfg(test)]
 mod contract_tests;

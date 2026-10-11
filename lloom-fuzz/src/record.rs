@@ -34,33 +34,25 @@
 //!
 //! The ring lives in a global because the signal path cannot take a lock or
 //! allocate: the slot buffers are pre-allocated at [`Record::install`] and a
-//! push is a `memcpy` plus two atomics.
+//! push is a `memcpy` under a nonblocking atomic permit. Contention refuses
+//! recording rather than racing the payload. Signal-safe I/O and handler
+//! composition remain separate obligations: the current dump still allocates.
 
-use std::cell::UnsafeCell;
+mod inputs;
+
+use inputs::InputRing;
+pub use inputs::RecordError;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// The largest input the ring keeps whole; longer inputs are truncated in the
-/// record (and the harnesses cap their inputs below this anyway).
+/// The largest input the ring accepts. Larger inputs return an explicit error;
+/// the campaign must not execute bytes it failed to record.
 pub const MAX_INPUT: usize = 64 * 1024;
 
-struct Slot {
-    len: AtomicUsize,
-    bytes: UnsafeCell<Box<[u8]>>,
-}
-
-// SAFETY: a slot is written only by the fuzz thread (`push`) and read by the
-// same thread's dump path or by a signal handler interrupting that thread; the
-// handler reads `len` first, and a torn read of a slot being written can only
-// mis-record the *dying* input, which the fuzzer's own crash file also holds.
-unsafe impl Sync for Slot {}
-
 struct Ring {
-    slots: Vec<Slot>,
-    /// Total pushes so far; `head % slots.len()` is the next slot to write.
-    pushes: AtomicUsize,
+    inputs: InputRing,
     dir: PathBuf,
     dumps: AtomicUsize,
     dumping: AtomicBool,
@@ -86,13 +78,7 @@ impl Record {
         RING.get_or_init(|| {
             fs::create_dir_all(dir).ok();
             Ring {
-                slots: (0..n)
-                    .map(|_| Slot {
-                        len: AtomicUsize::new(usize::MAX),
-                        bytes: UnsafeCell::new(vec![0u8; MAX_INPUT].into_boxed_slice()),
-                    })
-                    .collect(),
-                pushes: AtomicUsize::new(0),
+                inputs: InputRing::new(n, MAX_INPUT),
                 dir: dir.to_path_buf(),
                 dumps: AtomicUsize::new(0),
                 dumping: AtomicBool::new(false),
@@ -103,28 +89,21 @@ impl Record {
 
     /// How many slots the ring holds.
     pub fn capacity(self) -> usize {
-        RING.get().map_or(0, |r| r.slots.len())
+        RING.get().map_or(0, |r| r.inputs.capacity())
     }
 
     /// Record `input` as the next execution. Call BEFORE running it.
-    pub fn push(self, input: &[u8]) {
-        let Some(r) = RING.get() else { return };
-        let i = r.pushes.fetch_add(1, Ordering::AcqRel) % r.slots.len();
-        let slot = &r.slots[i];
-        // Mark the slot as being written so a handler interrupting the copy
-        // does not read a half-old, half-new input as a whole one.
-        slot.len.store(usize::MAX, Ordering::Release);
-        let n = input.len().min(MAX_INPUT);
-        // SAFETY: the fuzz thread is the only writer (see `Slot`).
-        let buf: &mut Box<[u8]> = unsafe { &mut *slot.bytes.get() };
-        buf[..n].copy_from_slice(&input[..n]);
-        slot.len.store(n, Ordering::Release);
+    /// A refusal leaves history unchanged; callers must not execute that input.
+    pub fn push(self, input: &[u8]) -> Result<(), RecordError> {
+        let r = RING.get().ok_or(RecordError::NotInstalled)?;
+        r.inputs.push(input)
     }
 
     /// Write the ring, oldest first, and the reason. Returns the directory.
     ///
-    /// Safe to call from the harness (allocates, formats). The signal path uses
-    /// [`dump_raw`] instead.
+    /// Allocates and formats. Returns no directory if a writer or another dump
+    /// owns the history. The signal path currently shares this allocating I/O;
+    /// async-signal safety is not claimed by the payload ownership repair.
     pub fn dump(self, reason: &str) -> Option<PathBuf> {
         let r = RING.get()?;
         let dir = dump_raw(r, reason.as_bytes())?;
@@ -144,9 +123,9 @@ impl Record {
                 }
                 prev(info);
             }));
-            // SAFETY: installing async-signal handlers that only call
-            // async-signal-safe functions (`open`, `write`, `close`, `mkdir`,
-            // atomics) and then re-raise with the default disposition.
+            // SAFETY: the sigaction structs are initialized for the C ABI.
+            // Known separate defect: on_signal still performs allocating I/O;
+            // these handlers are not yet an async-signal-safe dump facility.
             unsafe {
                 for sig in [
                     libc::SIGSEGV,
@@ -244,44 +223,38 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     }
 }
 
-/// Write the ring with nothing but `open`/`write`/`close`/`mkdir` — the
-/// signal-safe subset. Returns the directory written.
+/// Write a coherent ring snapshot. This still allocates and is NOT yet an
+/// async-signal-safe I/O implementation. Busy snapshots return no directory.
 fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
     if r.dumping.swap(true, Ordering::AcqRel) {
         return None; // re-entrant (a crash inside a dump): leave the first one
     }
-    if r.pushes.load(Ordering::Acquire) == 0 {
-        // Nothing was executed in this process (the broker, or a client that
-        // died before its first input): a record of nothing is noise.
-        r.dumping.store(false, Ordering::Release);
+    // Release the reentrancy latch on every return, including filesystem errors.
+    struct DumpGuard<'a>(&'a AtomicBool);
+    impl Drop for DumpGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _dump_guard = DumpGuard(&r.dumping);
+    // The hook can interrupt a writer or another thread can be recording.
+    // Never read racing bytes or block waiting for the interrupted thread.
+    let snapshot = r.inputs.snapshot().ok()?;
+    if snapshot.inputs().next().is_none() {
         return None;
     }
     let seq = r.dumps.fetch_add(1, Ordering::AcqRel);
     let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));
     fs::create_dir_all(&dir).ok()?;
-    let total = r.pushes.load(Ordering::Acquire);
-    let n = r.slots.len();
-    let oldest = total.saturating_sub(n);
-    let mut k = 0usize;
-    for p in oldest..total {
-        let slot = &r.slots[p % n];
-        let len = slot.len.load(Ordering::Acquire);
-        if len == usize::MAX {
-            continue; // never written, or mid-copy
-        }
-        // SAFETY: read-only view of a slot whose `len` was published.
-        let buf: &Box<[u8]> = unsafe { &*slot.bytes.get() };
-        let bytes = &buf[..len];
+    for (k, bytes) in snapshot.inputs().enumerate() {
         if let Ok(mut f) = fs::File::create(dir.join(format!("{k:04}.bin"))) {
             let _ = f.write_all(bytes);
         }
-        k += 1;
     }
     if let Ok(mut f) = fs::File::create(dir.join("reason.txt")) {
         let _ = f.write_all(reason);
         let _ = f.write_all(b"\n");
     }
-    r.dumping.store(false, Ordering::Release);
     Some(dir)
 }
 

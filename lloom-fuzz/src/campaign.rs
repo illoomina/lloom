@@ -240,6 +240,13 @@ pub fn run<H>(cli: &Cli, name: &str, harness: H) -> anyhow::Result<()>
 where
     H: FnMut(&[u8]) -> Result<(), String> + 'static,
 {
+    if cli.max_len > crate::record::MAX_INPUT {
+        return Err(anyhow!(
+            "--max-len {} exceeds persistent record capacity {}",
+            cli.max_len,
+            crate::record::MAX_INPUT
+        ));
+    }
     let record = Record::install(&cli.record_dir, cli.record);
     banner(name)?;
     let (guards, map) = instrumentation();
@@ -267,7 +274,7 @@ where
     }
     if let Some(path) = &cli.once {
         let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
-        record.push(&bytes);
+        record.push(&bytes)?;
         return match (harness.borrow_mut())(&bytes) {
             Ok(()) => {
                 println!("ok: {} ({} bytes)", path.display(), bytes.len());
@@ -285,7 +292,9 @@ where
     if let Some(path) = &cli.replay {
         let h = Rc::clone(&harness);
         return match replay(path, move |bytes| {
-            record.push(bytes);
+            record
+                .push(bytes)
+                .map_err(|e| format!("recorder failure: {e}"))?;
             (h.borrow_mut())(bytes)
         }) {
             Ok(n) => {
@@ -308,7 +317,10 @@ fn execute_recorded<H>(record: Record, harness: &RefCell<H>, name: &str, bytes: 
 where
     H: FnMut(&[u8]) -> Result<(), String>,
 {
-    record.push(bytes);
+    if let Err(error) = record.push(bytes) {
+        eprintln!("[{name}] recorder failure (harness not executed): {error}");
+        return ExitKind::Crash;
+    }
     match (harness.borrow_mut())(bytes) {
         Ok(()) => ExitKind::Ok,
         Err(message) => {

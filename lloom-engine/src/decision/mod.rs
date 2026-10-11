@@ -3,6 +3,7 @@
 //! Option order is part of the model input. Constructors take ordered vectors;
 //! adapters must not round-trip request objects through an unordered map.
 
+mod causal;
 mod json;
 mod omni;
 mod omni_readout;
@@ -15,6 +16,7 @@ mod temperature;
 #[cfg(feature = "serve")]
 mod template;
 
+pub use causal::{CausalRequest, CausalTask};
 pub use json::OrderedJson;
 pub use omni::{OmniMedia, OmniPreparedQuestion, OmniSpecialTokens};
 pub use omni_readout::OmniReadout;

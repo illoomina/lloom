@@ -676,6 +676,67 @@ pub struct State<P: Profile> {
     pub provisional_redos: u64,
 }
 
+/// Request-owned recurrent copies and append-only KV marks.
+pub struct RetainedState {
+    s: crate::nn::recurrent::RecurrentRetained,
+    conv: crate::nn::recurrent::RecurrentRetained,
+    ple: crate::nn::recurrent::RecurrentRetained,
+    kv: Vec<WindowMark>,
+    ngram: Vec<Option<u32>>,
+    pos: usize,
+}
+
+impl<P: Profile> crate::nn::branch::RetainState for State<P> {
+    type Retained = RetainedState;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.settle_standing()?;
+        if self.window.is_some() || self.held.is_some() || self.host.run.is_some() {
+            lloom_tensor::bail!("qwen retention requires settled windows and no host-fill run")
+        }
+        let mut kv = crate::nn::branch::retained_vec(self.kv.len())?;
+        for layer in &mut self.kv {
+            kv.push(layer.retain_state()?);
+        }
+        Ok(RetainedState {
+            s: self.s_state.retain_state()?,
+            conv: self.conv_state.retain_state()?,
+            ple: self.ple_conv.retain_state()?,
+            ngram: self.ngram.retain_state()?,
+            kv,
+            pos: self.pos,
+        })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.settle_standing()?;
+        if self.window.is_some()
+            || self.held.is_some()
+            || self.host.run.is_some()
+            || saved.pos > self.pos
+            || saved.kv.len() != self.kv.len()
+        {
+            lloom_tensor::bail!("qwen retention: invalid window, host fill, position or layers")
+        }
+        for (layer, mark) in self.kv.iter_mut().zip(&saved.kv) {
+            layer.restore_retained(mark)?;
+        }
+        self.s_state.restore_retained(&saved.s)?;
+        self.conv_state.restore_retained(&saved.conv)?;
+        self.ple_conv.restore_retained(&saved.ple)?;
+        self.ngram.restore_retained(&saved.ngram)?;
+        self.pos = saved.pos;
+        self.nextn.clear();
+        for t in &mut self.taps {
+            t.clear();
+        }
+        self.pending_tokens.clear();
+        self.pending_noted = false;
+        self.prepared = None;
+        self.ckpt_pass = None;
+        self.ckpt.forget_past(saved.pos);
+        Ok(())
+    }
+}
+
 /// A sequence's PLE host fill: the run in progress, if a decode loop armed
 /// one — a single-position forward with no noted id then waits on the GPU for
 /// rows a producer fills, and `State::<P>::ngram` stays at the run's first decode

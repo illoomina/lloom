@@ -26,6 +26,9 @@ pub enum SystemOneMedia<'a> {
 pub struct SystemOneTemplate {
     compiled: ChatTemplate,
     kind: SystemOneTemplateKind,
+    /// Only source-audited state-first templates receive a branch certificate.
+    /// Arbitrary templates remain renderable via the incumbent render method.
+    causal_prefix: Option<ChatTemplate>,
 }
 
 const OMNI_MARKER: &str = "<<d1omni:";
@@ -53,13 +56,47 @@ struct Context<'a> {
 }
 
 impl SystemOneTemplate {
+    pub(super) fn kind(&self) -> SystemOneTemplateKind {
+        self.kind
+    }
+
     /// Compile the checkpoint's named systemone source once. No fetch, guessed
     /// template or fallback is performed. Existing chat templates are unchanged.
     pub fn compile(source: &str, kind: SystemOneTemplateKind) -> Result<Self> {
         Ok(Self {
             compiled: ChatTemplate::from_str(source).map_err(Error::wrap)?,
             kind,
+            causal_prefix: if kind == SystemOneTemplateKind::D1Causal
+                && source == include_str!("fixtures/d1-systemone.jinja")
+            {
+                // Audited pinned source: every state read is before this unique
+                // expression, and no question/id/options read precedes it. Do not
+                // infer this property from a sentinel render or token LCP.
+                let (prefix, _) = source.split_once("{{ instructions ").ok_or_else(|| {
+                    Error::Msg("audited causal template lost its state boundary".into())
+                })?;
+                Some(ChatTemplate::from_str(prefix).map_err(Error::wrap)?)
+            } else {
+                None
+            },
         })
+    }
+
+    /// Complete state-bearing rendered prefix for the audited causal template.
+    /// Prefix rendering reuses the same HF renderer/ordered value semantics;
+    /// callers must additionally verify token nesting against EVERY full prompt.
+    /// This certificate does not authorize unknown templates by heuristic.
+    pub(super) fn causal_state_prefix(&self, state: &OrderedJson) -> Result<String> {
+        #[derive(Serialize)]
+        struct Prefix<'a> {
+            state: &'a OrderedJson,
+            images: [(); 0],
+        }
+        let prefix = self.causal_prefix.as_ref().ok_or_else(|| Error::Msg(
+            "systemone template has no audited state-prefix certificate; ordinary rendering remains supported".into()))?;
+        prefix
+            .render_context(&Prefix { state, images: [] })
+            .map_err(Error::wrap)
     }
 
     /// Preserve raw JSON descriptions and state through ordered serialization.

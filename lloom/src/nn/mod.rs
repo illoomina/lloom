@@ -18,6 +18,7 @@
 pub mod activation;
 pub mod attention;
 pub mod batch_norm;
+pub mod branch;
 pub mod batched;
 mod batched_spec;
 pub mod blocks;

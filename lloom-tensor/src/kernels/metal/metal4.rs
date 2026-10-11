@@ -392,6 +392,15 @@ impl Submission {
     pub(super) fn notify_lifecycle(&self) {
         self.retirement.notify_lifecycle();
     }
+    pub(super) fn check_lifecycle_failure(&self) -> Result<(), MetalKernelError> {
+        self.queue.check_failure()
+    }
+    pub(super) fn fail_lifecycle(&self) {
+        self.queue
+            .poison(crate::retirement_owners::Failure::AdapterFailed);
+        self.notify_lifecycle();
+    }
+
     pub fn enqueue(&self) -> Result<(), MetalKernelError> {
         let _state = self.recording_state()?;
         // Commands has one open recording and commits it in producer order.
@@ -480,6 +489,12 @@ impl Submission {
                 ))
             }
         };
+        Self::append_callback(&mut state, f)
+    }
+    fn append_callback(
+        state: &mut State,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
         if state.callbacks.try_reserve(1).is_err() {
             return Err(crate::kernels::err::CompletionRegistrationError::new(
                 MetalKernelError::QueueUnavailable("callback metadata allocation refused"),
@@ -490,10 +505,22 @@ impl Submission {
         Ok(())
     }
     fn recording_state(&self) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
+        self.recording_state_mode(false)
+    }
+    fn recording_state_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<parking_lot::MutexGuard<'_, State>, MetalKernelError> {
         self.queue.check_failure()?;
         let state = match self.state.try_lock() {
             Some(state) => state,
             None => {
+                if nonblocking {
+                    return Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ));
+                }
+
                 crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
                 self.state.lock()
@@ -516,12 +543,11 @@ impl Submission {
     }
     /// Prepared commit may append terminal engine signals, but cannot encode
     /// later work. Keep them after the frozen final segment without splitting.
-    pub(super) fn signal_tail(
-        &self,
+    fn append_tail(
+        state: &mut State,
         event: &ProtocolObject<dyn MTLSharedEvent>,
         value: u64,
     ) -> Result<(), MetalKernelError> {
-        let mut state = self.recording_state()?;
         state
             .events
             .try_reserve(1)
@@ -573,10 +599,22 @@ impl Submission {
     /// Reserve ordering and native handler allocations before engine epoch and
     /// subscriber registration. Dropping this value consumes no sequence.
     pub(super) fn prepare_commit(self: &Arc<Self>) -> Result<PreparedCommit<'_>, MetalKernelError> {
+        self.prepare_commit_mode(false)
+    }
+    pub(super) fn prepare_commit_mode(
+        self: &Arc<Self>,
+        nonblocking: bool,
+    ) -> Result<PreparedCommit<'_>, MetalKernelError> {
         self.queue.check_failure()?;
         let order = match self.queue.commit_order.try_lock() {
             Some(guard) => guard,
             None => {
+                if nonblocking {
+                    return Err(MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ));
+                }
+
                 crate::completion_scope::before_park(Arc::as_ptr(&self.queue) as usize)
                     .map_err(|_| MetalKernelError::CallbackWouldBlock)?;
                 self.queue.commit_order.lock()
@@ -592,7 +630,7 @@ impl Submission {
         sequence
             .checked_add(1)
             .ok_or(MetalKernelError::QueueUnavailable("sequence exhausted"))?;
-        let state = self.recording_state()?;
+        let state = self.recording_state_mode(nonblocking)?;
         let slot = state.slot.as_ref().expect("checked recording");
         let count = slot
             .segment
@@ -606,7 +644,8 @@ impl Submission {
             MetalKernelError::QueueUnavailable("segment dispatch storage exhausted")
         })?;
         extra.extend(slot.extra_cbs[..count - 1].iter().cloned());
-        drop(state);
+        // Keep recording exclusion through registration/tail signals and owner
+        // extraction. It is released before the first native queue entry.
         // No extra feedback join or options Vec on the one-segment fast path.
         let join = if count == 1 {
             None
@@ -683,6 +722,7 @@ impl Submission {
         Ok(PreparedCommit {
             submission: self,
             order,
+            state: std::cell::RefCell::new(Some(state)),
             options,
             first,
             extra,
@@ -856,15 +896,50 @@ impl CommitOptions {
 pub(super) struct PreparedCommit<'a> {
     submission: &'a Arc<Submission>,
     order: parking_lot::MutexGuard<'a, u64>,
+    state: std::cell::RefCell<Option<parking_lot::MutexGuard<'a, State>>>,
     options: CommitOptions,
     first: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     extra: Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
     phase: CommitPhase,
 }
 impl PreparedCommit<'_> {
+    pub(super) fn on_completion(
+        &self,
+        f: impl Fn(&Feedback) + Send + Sync + 'static,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        if let Err(error) = self.submission.queue.check_failure() {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                error,
+                Some(f),
+            ));
+        }
+        Submission::append_callback(
+            self.state
+                .borrow_mut()
+                .as_mut()
+                .expect("prepared recording"),
+            f,
+        )
+    }
+    pub(super) fn signal_tail(
+        &self,
+        event: &ProtocolObject<dyn MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        self.submission.queue.check_failure()?;
+        Submission::append_tail(
+            self.state
+                .borrow_mut()
+                .as_mut()
+                .expect("prepared recording"),
+            event,
+            value,
+        )
+    }
     pub(super) fn commit(mut self) -> Result<(), MetalKernelError> {
         let submission = self.submission;
-        let mut state = submission.state.lock();
+        submission.queue.check_failure()?;
+        let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);

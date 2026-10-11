@@ -578,6 +578,7 @@ impl EncoderState {
 pub(crate) struct SharedEncoderState {
     state: parking_lot::Mutex<EncoderState>,
     external: std::sync::atomic::AtomicUsize,
+    domain: std::sync::OnceLock<Arc<EncoderDomain>>,
     wake: std::sync::OnceLock<Arc<crate::completion_wake::Wake>>,
 }
 impl std::ops::Deref for SharedEncoderState {
@@ -587,27 +588,66 @@ impl std::ops::Deref for SharedEncoderState {
     }
 }
 
+/// All escaped encoders created by one Commands, including older recordings.
+/// Only atomics and Wake are owned here: no Core, native resource or user capture
+/// can be finally destroyed by a foreign permit releasing this metadata.
+pub(super) struct EncoderDomain {
+    external: std::sync::atomic::AtomicUsize,
+    wake: Arc<crate::completion_wake::Wake>,
+}
+impl EncoderDomain {
+    pub(super) fn new(wake: Arc<crate::completion_wake::Wake>) -> Arc<Self> {
+        Arc::new(Self {
+            external: std::sync::atomic::AtomicUsize::new(0),
+            wake,
+        })
+    }
+    pub(super) fn has_external_handles(&self) -> bool {
+        self.external.load(Ordering::Acquire) != 0
+    }
+}
+struct DomainEncoderHandle(Arc<EncoderDomain>);
+impl DomainEncoderHandle {
+    fn acquire(domain: &Arc<EncoderDomain>) -> Self {
+        let domain = Arc::clone(domain);
+        // Each counted permit owns this Arc before increment and through release.
+        domain.external.fetch_add(1, Ordering::Relaxed);
+        Self(domain)
+    }
+}
+impl Drop for DomainEncoderHandle {
+    fn drop(&mut self) {
+        if self.0.external.fetch_sub(1, Ordering::Release) == 1 {
+            self.0.wake.notify();
+        }
+    }
+}
 /// Declared LAST in the wrapper: release follows every other field destructor.
 /// This retains shared encoder state, including its recording parent until
 /// final capture extraction takes it. Count zero proves external operation
 /// exclusion, not final metadata/physical destruction. It also rolls back a
 /// partly constructed Clone after earlier cloned fields unwind.
-struct ExternalEncoderHandle(Arc<SharedEncoderState>);
+struct ExternalEncoderHandle {
+    state: Arc<SharedEncoderState>,
+    // LAST: shared-state custody is released before aggregate capability.
+    _domain: Option<DomainEncoderHandle>,
+}
 impl ExternalEncoderHandle {
     fn acquire(state: &Arc<SharedEncoderState>) -> Self {
-        // Acquire the Arc before increasing the count. Every counted handle owns
-        // one such strong reference until AFTER decrementing. Thus external is
-        // bounded by the live strong count, including during partial cloning;
-        // it cannot overflow independently of Arc's existing ownership bound.
+        // The state Arc is retained before counting, and released after decrement.
         let state = Arc::clone(state);
+        let domain = state.domain.get().map(DomainEncoderHandle::acquire);
         state.external.fetch_add(1, Ordering::Relaxed);
-        Self(state)
+        Self {
+            state,
+            _domain: domain,
+        }
     }
 }
 impl Drop for ExternalEncoderHandle {
     fn drop(&mut self) {
-        if self.0.external.fetch_sub(1, Ordering::Release) == 1 {
-            if let Some(wake) = self.0.wake.get() {
+        if self.state.external.fetch_sub(1, Ordering::Release) == 1 {
+            if let Some(wake) = self.state.wake.get() {
                 wake.notify();
             }
         }
@@ -757,6 +797,7 @@ impl ComputeCommandEncoder {
         let state = Arc::new(SharedEncoderState {
             state: parking_lot::Mutex::new(EncoderState::with_hazard_key(hazard_key())),
             external: std::sync::atomic::AtomicUsize::new(0),
+            domain: std::sync::OnceLock::new(),
             wake: std::sync::OnceLock::new(),
         });
         let external = Some(ExternalEncoderHandle::acquire(&state));
@@ -780,8 +821,9 @@ impl ComputeCommandEncoder {
     /// Commands alone converts a freshly constructed, never-published wrapper
     /// into its canonical EntryState owner under EntryState. Borrowed guards do
     /// not increment the count; cloning through one always does.
-    pub(super) fn into_canonical(mut self, wake: Arc<crate::completion_wake::Wake>) -> Self {
-        let _ = self.state.wake.set(wake);
+    pub(super) fn into_canonical(mut self, domain: Arc<EncoderDomain>) -> Self {
+        let _ = self.state.wake.set(domain.wake.clone());
+        let _ = self.state.domain.set(domain);
         self.external.take();
         self
     }
@@ -1675,6 +1717,21 @@ impl BlitCommandEncoder {
     }
 
     pub fn end_encoding(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.end_encoding_mode(false)
+    }
+    pub(super) fn try_end_encoding(&mut self) -> Result<bool, crate::kernels::MetalKernelError> {
+        match self.end_encoding_mode(true) {
+            Ok(()) => Ok(true),
+            Err(crate::kernels::MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            )) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    fn end_encoding_mode(
+        &mut self,
+        nonblocking: bool,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
         let Self {
             raw,
             recording,
@@ -1694,21 +1751,32 @@ impl BlitCommandEncoder {
                 "blit encoder already ended",
             ));
         }
-        let close = || {
+        let prepare = || {
+            if nonblocking {
+                prev_ce_outputs.try_write().ok_or(
+                    crate::kernels::MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ),
+                )
+            } else {
+                Ok(prev_ce_outputs.write(Side::Host))
+            }
+        };
+        let close = |mut map: parking_lot::RwLockWriteGuard<'_, HashMap<usize, Arc<Fence>>>| {
             raw.updateFence(fence.raw());
             raw.endEncoding();
-            let mut map = prev_ce_outputs.write(Side::Host);
             for &out in tracked_outputs.iter() {
                 map.insert(out, Arc::clone(fence));
             }
             Ok(())
         };
         let result = if let Some(admission) = recording.as_mut() {
-            admission.end(ended, true, |_| close())
+            admission.end_prepared(ended, true, prepare, |_, map| close(map))
         } else {
             // Raw constructor compatibility has no engine recording lease.
+            let map = prepare()?;
             *ended = true;
-            close()
+            close(map)
         };
         if result.is_ok() {
             *close_succeeded = true;
@@ -2255,12 +2323,54 @@ mod tests {
 
 #[cfg(test)]
 mod external_handle_tests {
+    #[test]
+    fn older_recording_keeps_domain_open_after_current_handle_releases() {
+        let wake = Arc::new(crate::completion_wake::Wake::default());
+        let domain = EncoderDomain::new(wake.clone());
+        let older = shared();
+        let current = shared();
+        for state in [&older, &current] {
+            assert!(state.domain.set(domain.clone()).is_ok());
+            assert!(state.wake.set(wake.clone()).is_ok());
+        }
+        let old_handle = ExternalEncoderHandle::acquire(&older);
+        let current_handle = ExternalEncoderHandle::acquire(&current);
+        assert_eq!(domain.external.load(Ordering::Acquire), 2);
+        drop(current_handle);
+        assert_eq!(current.external.load(Ordering::Acquire), 0);
+        assert!(
+            domain.has_external_handles(),
+            "older shared-map holder was ignored"
+        );
+        let seen = wake.snapshot();
+        let refused_clone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _rollback = ExternalEncoderHandle::acquire(&older);
+            assert_eq!(domain.external.load(Ordering::Acquire), 2);
+            panic!("later clone field refused");
+        }));
+        assert!(refused_clone.is_err());
+        assert_eq!(domain.external.load(Ordering::Acquire), 1);
+        assert_eq!(
+            wake.snapshot(),
+            seen,
+            "rollback released another live domain handle"
+        );
+        drop(old_handle);
+        assert!(!domain.has_external_handles());
+        assert_ne!(
+            wake.snapshot(),
+            seen,
+            "aggregate last release did not notify"
+        );
+    }
+
     use super::*;
 
     fn shared() -> Arc<SharedEncoderState> {
         Arc::new(SharedEncoderState {
             state: parking_lot::Mutex::new(EncoderState::new()),
             external: std::sync::atomic::AtomicUsize::new(0),
+            domain: std::sync::OnceLock::new(),
             wake: std::sync::OnceLock::new(),
         })
     }

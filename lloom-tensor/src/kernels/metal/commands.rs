@@ -256,6 +256,7 @@ struct CommandsCore {
     // Shared service Wake reserved for final teardown (inbox wiring pending).
     // External encoder release publishes here after its wrapper fields drop.
     retirement_wake: Arc<crate::completion_wake::Wake>,
+    encoder_domain: Arc<super::encoder::EncoderDomain>,
     /// The encoder state, and `compute_count` beside it, are on **different
     /// cache lines** (issue #442).
     ///
@@ -693,9 +694,11 @@ impl Commands {
         let retirement_wake = crate::retirement_service::HostRetirementService::shared()
             .map_err(|_| MetalKernelError::QueueUnavailable("host teardown service unavailable"))?
             .wake();
+        let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
         Ok(Self {
             core: Arc::new(CommandsCore {
                 retirement_wake,
+                encoder_domain,
                 state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(
                     cb,
                 )))),
@@ -1104,7 +1107,7 @@ impl Commands {
             // This wrapper has never escaped; public guards borrow it under this
             // EntryState guard, and any explicit clone is counted as external.
             state_guard.current_encoder =
-                Some(enc.into_canonical(self.core.retirement_wake.clone()));
+                Some(enc.into_canonical(self.core.encoder_domain.clone()));
         }
 
         Ok(CommandsGuard { guard: state_guard })

@@ -27,6 +27,7 @@ struct Standalone {
     raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     lifecycle: crate::command_lifecycle::CommandLifecycle,
     wake: crate::completion_wake::Wake,
+    failure: crate::retirement_owners::FailureSignal,
 }
 impl std::ops::Deref for Standalone {
     type Target = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
@@ -53,6 +54,7 @@ struct RecordingAdmission<'a> {
     entered: bool,
     editing: bool,
     released: bool,
+    notify_unused: bool,
 }
 fn lifecycle_error(
     reason: crate::command_lifecycle::LifecycleError,
@@ -85,14 +87,20 @@ impl Drop for RecordingAdmission<'_> {
         }
         // Exact phase/serial ownership prevents a stale guard closing a later
         // encoder. Unknown commit exit is not reset to a reusable recording.
-        let _ = if self.entered || std::thread::panicking() {
+        let transition = if self.entered || std::thread::panicking() {
             self.buffer.lifecycle().abandon(&mut self.ticket)
         } else if self.editing {
             self.buffer.lifecycle().finish_edit(&mut self.ticket)
         } else {
             self.buffer.lifecycle().cancel_prepared(&mut self.ticket)
         };
-        self.buffer.notify_lifecycle();
+        if transition.is_err() {
+            // Refusal is not native terminality and must not be hidden by the
+            // private retry's no-self-wake optimization. Custody remains owned.
+            self.buffer.fail_lifecycle();
+        } else if self.notify_unused || self.entered || self.editing || std::thread::panicking() {
+            self.buffer.notify_lifecycle();
+        }
     }
 }
 impl PreparedCommandCommit<'_> {
@@ -103,24 +111,37 @@ impl PreparedCommandCommit<'_> {
     where
         F: Fn(Option<String>) + Send + Sync + 'static,
     {
-        self.admission
-            .buffer
-            .on_feedback(move |feedback| f(feedback.error.clone()))
+        self.on_feedback(move |feedback| f(feedback.error.clone()))
     }
     pub(super) fn record_gpu_time_on_completion(
         &self,
     ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
-        self.admission.buffer.record_gpu_time_unchecked()
+        if let Some(callback) = self.admission.buffer.gpu_time_callback() {
+            self.on_feedback(callback)?;
+        }
+        Ok(())
     }
     pub(super) fn signal_event(
         &self,
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), crate::kernels::MetalKernelError> {
-        if let Backend::Metal4(submission) = &self.admission.buffer.backend {
-            return submission.signal_tail(event, value);
+        if let Some(PreparedNative::Metal4(prepared)) = &self.native {
+            return prepared.signal_tail(event, value);
         }
         self.admission.buffer.signal_event_unchecked(event, value)
+    }
+    fn on_feedback<F>(
+        &self,
+        callback: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError>
+    where
+        F: Fn(&super::metal4::Feedback) + Send + Sync + 'static,
+    {
+        if let Some(PreparedNative::Metal4(prepared)) = &self.native {
+            return prepared.on_completion(callback);
+        }
+        self.admission.buffer.on_feedback(callback)
     }
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.admission.enter_commit()?;
@@ -166,6 +187,7 @@ impl EncoderAdmission {
         self.buffer.notify_lifecycle();
     }
     fn begin(buffer: &CommandBuffer) -> Result<Self, crate::kernels::MetalKernelError> {
+        buffer.check_lifecycle_failure()?;
         let buffer = buffer.clone();
         let ticket = buffer
             .lifecycle()
@@ -196,17 +218,40 @@ impl EncoderAdmission {
         notify_after_close: bool,
         close: impl FnOnce(EndingEncoder<'_>) -> Result<(), crate::kernels::MetalKernelError>,
     ) -> Result<(), crate::kernels::MetalKernelError> {
-        let _wake = notify_after_close.then(|| EncoderEndWake::armed(&self.buffer));
+        self.end_prepared(
+            ended,
+            notify_after_close,
+            || Ok(()),
+            |scope, ()| close(scope),
+        )
+    }
+    /// Acquire fallible close prerequisites before ENDING. The prepared guard
+    /// moves into close (or is dropped on refusal) before the phase Wake fires.
+    pub(super) fn end_prepared<P>(
+        &mut self,
+        ended: &mut bool,
+        notify_after_close: bool,
+        prepare: impl FnOnce() -> Result<P, crate::kernels::MetalKernelError>,
+        close: impl FnOnce(EndingEncoder<'_>, P) -> Result<(), crate::kernels::MetalKernelError>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let mut wake = EncoderEndWake::pending(&self.buffer);
         let ticket = self.ticket.as_mut().ok_or_else(|| {
             crate::kernels::MetalKernelError::QueueUnavailable("encoder already closed")
         })?;
+        let prepared = prepare()?;
         let result = self
             .buffer
             .lifecycle()
             .end_encoder_with(ticket, ended, || {
-                close(EndingEncoder {
-                    buffer: &self.buffer,
-                })
+                if notify_after_close {
+                    wake.arm();
+                }
+                close(
+                    EndingEncoder {
+                        buffer: &self.buffer,
+                    },
+                    prepared,
+                )
             })
             .map_err(lifecycle_error)?;
         self.ticket = None;
@@ -216,8 +261,13 @@ impl EncoderAdmission {
 impl Drop for EncoderAdmission {
     fn drop(&mut self) {
         if let Some(ticket) = &mut self.ticket {
-            let _ = self.buffer.lifecycle().abandon(ticket);
-            self.buffer.notify_lifecycle();
+            if self.buffer.lifecycle().abandon(ticket).is_err() {
+                // A refused owner transition cannot be hidden by a wake: it
+                // neither closes admission nor proves native completion.
+                self.buffer.fail_lifecycle();
+            } else {
+                self.buffer.notify_lifecycle();
+            }
         }
     }
 }
@@ -273,6 +323,29 @@ impl CommandBuffer {
             Backend::Metal4(submission) => &submission.command_lifecycle,
         }
     }
+    fn check_lifecycle_failure(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) if raw.failure.get().is_some() => {
+                Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "standalone recording lifecycle failed",
+                ))
+            }
+            Backend::Metal3(_) => Ok(()),
+            Backend::Metal3Associated(buffer) => buffer.check_lifecycle_failure(),
+            Backend::Metal4(submission) => submission.check_lifecycle_failure(),
+        }
+    }
+    fn fail_lifecycle(&self) {
+        match &self.backend {
+            Backend::Metal3(raw) => raw
+                .failure
+                .publish(crate::retirement_owners::Failure::AdapterFailed, || {
+                    raw.wake.notify()
+                }),
+            Backend::Metal3Associated(buffer) => buffer.fail_lifecycle(),
+            Backend::Metal4(submission) => submission.fail_lifecycle(),
+        }
+    }
     pub(super) fn notify_lifecycle(&self) {
         match &self.backend {
             Backend::Metal3(standalone) => standalone.wake.notify(),
@@ -282,34 +355,57 @@ impl CommandBuffer {
     }
 
     fn edit_recording(&self) -> Result<RecordingAdmission<'_>, crate::kernels::MetalKernelError> {
+        self.check_lifecycle_failure()?;
         Ok(RecordingAdmission {
             buffer: self,
             ticket: self.lifecycle().begin_edit().map_err(lifecycle_error)?,
             entered: false,
             editing: true,
             released: false,
+            notify_unused: true,
         })
     }
 
     fn edit_boundary(&self) -> Result<RecordingAdmission<'_>, crate::kernels::MetalKernelError> {
+        self.check_lifecycle_failure()?;
         Ok(RecordingAdmission {
             buffer: self,
             ticket: self.lifecycle().begin_boundary().map_err(lifecycle_error)?,
             entered: false,
             editing: true,
             released: false,
+            notify_unused: true,
         })
     }
 
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        self.prepare_commit_mode(false)
+    }
+
+    /// Sole host-retirement worker: an unused preparation restores recording
+    /// without waking itself. Normal producers wait on native-order mutexes;
+    /// unsubmitted logical waits refuse rather than parking on PREPARED.
+    /// Native return, error unwind and all public admissions retain notification.
+    pub(super) fn try_prepare_commit(
+        &self,
+    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        self.prepare_commit_mode(true)
+    }
+
+    fn prepare_commit_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        self.check_lifecycle_failure()?;
         let admission = RecordingAdmission {
             buffer: self,
             ticket: self.lifecycle().prepare().map_err(lifecycle_error)?,
             entered: false,
             editing: false,
             released: false,
+            notify_unused: !nonblocking,
         };
         let native = match &self.backend {
             Backend::Metal3(raw) => {
@@ -321,9 +417,11 @@ impl CommandBuffer {
                 PreparedNative::Metal3(raw)
             }
             Backend::Metal3Associated(buffer) => {
-                PreparedNative::Metal3Associated(buffer.prepare_commit()?)
+                PreparedNative::Metal3Associated(buffer.prepare_commit_mode(nonblocking)?)
             }
-            Backend::Metal4(submission) => PreparedNative::Metal4(submission.prepare_commit()?),
+            Backend::Metal4(submission) => {
+                PreparedNative::Metal4(submission.prepare_commit_mode(nonblocking)?)
+            }
         };
         Ok(PreparedCommandCommit {
             native: Some(native),
@@ -337,6 +435,7 @@ impl CommandBuffer {
                 raw,
                 lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
                 wake: crate::completion_wake::Wake::default(),
+                failure: crate::retirement_owners::FailureSignal::default(),
             })),
         }
     }
@@ -632,6 +731,7 @@ impl CommandBuffer {
         }
     }
     fn check_wait_admission(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.check_lifecycle_failure()?;
         match &self.backend {
             Backend::Metal3(raw) => {
                 let imported = matches!(
@@ -648,8 +748,9 @@ impl CommandBuffer {
         .map_err(lifecycle_error)
     }
     pub(super) fn check_data_wait(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.check_lifecycle_failure()?;
         match &self.backend {
-            Backend::Metal3(_) => Ok(()), // Standalone raw wrappers have no engine queue poison.
+            Backend::Metal3(_) => Ok(()), // Wrapper-family failure was checked above.
             Backend::Metal3Associated(buffer) => buffer.check_data_wait(),
             Backend::Metal4(submission) => submission.check_data_wait(),
         }?;
@@ -889,14 +990,23 @@ impl CommandBuffer {
     fn record_gpu_time_unchecked(
         &self,
     ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        if let Some(callback) = self.gpu_time_callback() {
+            self.on_feedback(callback)?;
+        }
+        Ok(())
+    }
+
+    fn gpu_time_callback(
+        &self,
+    ) -> Option<impl Fn(&super::metal4::Feedback) + Send + Sync + 'static> {
         use crate::kernels::metal::profile;
         if !profile::enabled() {
-            return Ok(());
+            return None;
         }
         let committed = profile::now_s();
         let step = profile::current_step();
         let native_key = (!self.is_metal4()).then(|| self.identity());
-        self.on_feedback(move |feedback| {
+        Some(move |feedback: &super::metal4::Feedback| {
             profile::record_command_buffer(feedback.start, feedback.end, committed, step);
             if let Some(key) = native_key {
                 profile::resolve_encoder_samples(key, feedback.start, feedback.end);

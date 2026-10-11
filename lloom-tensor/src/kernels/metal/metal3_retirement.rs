@@ -151,9 +151,20 @@ impl Completions {
     pub(super) fn prepare_order(
         &self,
     ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
+        self.prepare_order_mode(false)
+    }
+    fn prepare_order_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<MutexGuard<'_, Marker>, crate::kernels::MetalKernelError> {
         self.check()?;
         if let Some(guard) = self.tail.try_lock() {
             return Ok(guard);
+        }
+        if nonblocking {
+            return Err(crate::kernels::MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            ));
         }
         crate::completion_scope::before_park(self.identity())
             .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)?;
@@ -308,8 +319,9 @@ impl Completions {
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
         >,
         marker: &'a Marker,
+        nonblocking: bool,
     ) -> Result<PreparedCommit<'a>, crate::kernels::MetalKernelError> {
-        let order = self.prepare_order()?;
+        let order = self.prepare_order_mode(nonblocking)?;
         if !matches!(
             raw.status(),
             objc2_metal::MTLCommandBufferStatus::NotEnqueued
@@ -445,6 +457,15 @@ impl AssociatedBuffer {
     pub(super) fn notify_lifecycle(&self) {
         self.marker.record().notify_lifecycle();
     }
+    pub(super) fn check_lifecycle_failure(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.core.check()
+    }
+    pub(super) fn fail_lifecycle(&self) {
+        self.core
+            .failure
+            .publish(Failure::AdapterFailed, || self.notify_lifecycle());
+    }
+
     pub(super) fn new(
         raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
         core: Arc<Completions>,
@@ -534,7 +555,14 @@ impl AssociatedBuffer {
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
-        self.core.prepare_commit(&self.raw, &self.marker)
+        self.prepare_commit_mode(false)
+    }
+    pub(super) fn prepare_commit_mode(
+        &self,
+        nonblocking: bool,
+    ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
+        self.core
+            .prepare_commit(&self.raw, &self.marker, nonblocking)
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()

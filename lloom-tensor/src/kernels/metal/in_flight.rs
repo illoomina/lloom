@@ -78,8 +78,7 @@ impl InFlightHold {
             Held::Fence(_) => self.fences.fetch_add(1, Ordering::Relaxed),
             Held::Buffer(_) => self.buffers.fetch_add(1, Ordering::Relaxed),
         };
-        let epoch = self.clock.current_epoch();
-        self.held.lock().retire(epoch, item);
+        retire_at_current(&self.held, || self.clock.current_epoch(), item);
     }
 
     /// Release everything whose epoch has completed. A prefix walk that stops
@@ -107,6 +106,18 @@ impl InFlightHold {
             pending: self.held.lock().held(),
         }
     }
+}
+
+/// Serialize stamp acquisition with insertion: reading a monotone clock before
+/// taking this mutex would let a delayed older stamp follow a newer queue entry.
+/// The production closure is one atomic clock load; no new lock or queue scan.
+fn retire_at_current<I>(
+    held: &parking_lot::Mutex<Retire<I>>,
+    current_epoch: impl FnOnce() -> crate::retire::Epoch,
+    item: I,
+) {
+    let mut queue = held.lock();
+    queue.retire(current_epoch(), item);
 }
 
 /// Snapshot-bearing borrowed cleanup. No Arc clone, allocation or extra
@@ -158,5 +169,36 @@ pub fn hold_buffer(hold: Option<&Arc<InFlightHold>>, buffer: &Buffer) {
 impl std::fmt::Debug for InFlightHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "InFlightHold {:?}", self.counts())
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::retire::Epoch;
+
+    #[test]
+    fn retirement_stamp_is_sampled_under_the_insertion_lock() {
+        let clock = GpuClock::new();
+        let held = parking_lot::Mutex::new(Retire::new());
+        let sample = || {
+            assert!(
+                held.try_lock().is_none(),
+                "retirement epoch sampled before insertion lock"
+            );
+            clock.current_epoch()
+        };
+        retire_at_current(&held, sample, 10u8);
+        assert_eq!(clock.commit_epoch(), Epoch(0));
+        retire_at_current(&held, sample, 20u8);
+        clock.mark_completed(Epoch(0));
+        let mut queue = held.lock();
+        assert_eq!(
+            queue.pop_ready(|e| clock.completed_count().covers(e)),
+            Some(10)
+        );
+        assert_eq!(queue.head_epoch(), Some(Epoch(1)));
+        assert_eq!(queue.pop_ready(|e| clock.completed_count().covers(e)), None);
+        assert_eq!(queue.held(), 1);
     }
 }

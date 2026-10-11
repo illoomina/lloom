@@ -108,6 +108,16 @@ pub trait Served: Send + Sync {
     fn generation_prompt(&self, _kwarg: Option<bool>, _want: Option<bool>) -> Option<Vec<u32>> {
         None
     }
+    /// Fallible prompt-copy seam for admitted adapters. None denotes actual
+    /// absent/unreadable metadata, never an admission refusal. Existing families
+    /// retain their incumbent load-time cache through this default.
+    fn generation_prompt_checked(
+        &self,
+        kwarg: Option<bool>,
+        want: Option<bool>,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(self.generation_prompt(kwarg, want))
+    }
     /// The renders the chat template has run, for a per-turn count.
     fn template_renders(&self) -> u64 {
         0

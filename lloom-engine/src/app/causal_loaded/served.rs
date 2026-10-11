@@ -2,10 +2,10 @@
 //! Prediction is an explicit caller coverage contract, not verified admission.
 //! Default registration, enrolled host metadata and worker custody remain open.
 use super::*;
-use crate::app::common::{DecodeTiming, MemGauge, PrefillTiming};
+use crate::app::common::{thinking_mode, DecodeTiming, MemGauge, PrefillTiming, TextProbe};
 use crate::app::family::Capabilities;
 use crate::app::served::Served;
-use crate::app::template::{Rendered, Template};
+use crate::app::template::{Rendered, Template, ThinkTags};
 use lloom::load_warning::LoadWarning;
 use lloom::nn::ops::KvQuant;
 use lloom::profile::Profile;
@@ -35,6 +35,18 @@ pub enum Request<'a> {
     },
     Decisions(&'a OrderedJson),
     PreparedDecisions(&'a CausalRequest),
+    SystemOneRender {
+        id: &'a str,
+        state: &'a OrderedJson,
+        question: &'a crate::decision::Question<OrderedJson>,
+        labels: &'a [String],
+    },
+    GenerationPrompt {
+        kwarg: Option<bool>,
+        want: Option<bool>,
+        /// Load-time suffix available to bound the returned token vector copy.
+        ids: Option<&'a [u32]>,
+    },
     Seed {
         positions: usize,
         row: usize,
@@ -73,6 +85,8 @@ struct Metadata {
     decode: DecodeConfig,
     template: Option<Template>,
     seed: Vec<u32>,
+    think: Option<ThinkTags>,
+    gen_prompts: [[Option<Vec<u32>>; 3]; 3],
     decisions: bool,
 }
 /// No model/tokenizer/quota copy and no borrowed unscoped Loaded escape.
@@ -133,6 +147,25 @@ pub fn load_lfm2_gguf<P: Predictor>(
                 if seed.is_empty() {
                     lloom_tensor::bail!("serving seed must encode at least one token")
                 }
+                let probe = TextProbe {
+                    tokenizer,
+                    template: template.as_ref(),
+                    bos_token: &config.bos_token,
+                };
+                let think = probe.think_tags();
+                let gen_prompts = probe.generation_prompts(think.as_ref());
+                let marker_ids = think.iter().flat_map(|t| {
+                    [Some(t.start), Some(t.end), t.tool_call]
+                        .into_iter()
+                        .flatten()
+                });
+                let prompt_ids = gen_prompts.iter().flatten().flatten().flatten().copied();
+                if marker_ids
+                    .chain(prompt_ids)
+                    .any(|id| id as usize >= resolved.vocab_size)
+                {
+                    lloom_tensor::bail!("serving template probe ids must fit the loaded vocabulary")
+                }
                 Ok(Metadata {
                     config,
                     device: device.clone(),
@@ -140,6 +173,8 @@ pub fn load_lfm2_gguf<P: Predictor>(
                     decode: serving_decode,
                     template,
                     seed,
+                    think,
+                    gen_prompts,
                     decisions: policy.is_some(),
                 })
             },
@@ -163,6 +198,31 @@ impl<P: Predictor> Engine<P> {
             .predictor
             .predicted_extra(Request::PreparedDecisions(request))?;
         CausalEngine::decide_admitted(&self.loaded, predicted, request)
+    }
+    /// Ordinary generic policy rendering does not require a shared-state
+    /// certificate. Its tokens can feed an explicit prepared request; the
+    /// adapter does not invent certification or replay a shared trunk.
+    pub fn render_systemone(
+        &self,
+        id: &str,
+        state: &OrderedJson,
+        question: &crate::decision::Question<OrderedJson>,
+        labels: &[String],
+    ) -> Result<String> {
+        let predicted = self.predictor.predicted_extra(Request::SystemOneRender {
+            id,
+            state,
+            question,
+            labels,
+        })?;
+        CausalEngine::render_systemone_admitted(
+            &self.loaded,
+            predicted,
+            id,
+            state,
+            question,
+            labels,
+        )
     }
     fn pass<T>(
         &self,
@@ -322,6 +382,27 @@ impl<P: Predictor> Served for Engine<P> {
     }
     fn template_reads(&self, name: &str) -> Option<bool> {
         self.metadata.template.as_ref()?.reads(name)
+    }
+    fn think_tags(&self) -> Option<ThinkTags> {
+        // Scalar-only metadata: no request allocation or tokenizer escape.
+        self.metadata.think.clone()
+    }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.generation_prompt_checked(kwarg, want).expect(
+            "legacy infallible prompt metadata cannot report admission refusal; use generation_prompt_checked",
+        )
+    }
+    fn generation_prompt_checked(
+        &self,
+        kwarg: Option<bool>,
+        want: Option<bool>,
+    ) -> anyhow::Result<Option<Vec<u32>>> {
+        let ids = self.metadata.gen_prompts[thinking_mode(kwarg)][thinking_mode(want)].as_deref();
+        Ok(
+            self.pass(Request::GenerationPrompt { kwarg, want, ids }, |_| {
+                Ok(ids.map(<[u32]>::to_vec))
+            })?,
+        )
     }
     fn template_renders(&self) -> u64 {
         self.metadata.template.as_ref().map_or(0, Template::renders)

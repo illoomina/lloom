@@ -87,6 +87,21 @@ pub fn checkpoint_tail(
         .map_or(0, |g| g.len())
 }
 
+/// Checked counterpart used by HTTP/REPL request producers: an admission
+/// refusal remains an error, not a missing checkpoint hint.
+pub fn checkpoint_tail_checked(
+    engine: &dyn Served,
+    kwargs: &Map<String, Value>,
+    want: Option<bool>,
+    ids: &[u32],
+) -> anyhow::Result<usize> {
+    let kwarg = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
+    Ok(engine
+        .generation_prompt_checked(kwarg, want)?
+        .filter(|g| !g.is_empty() && ids.ends_with(g))
+        .map_or(0, |g| g.len()))
+}
+
 /// Apply `want` to a rendered and encoded prompt: off closes a block the
 /// prompt leaves open (the end marker appended), on requires one open. `Err`
 /// says why thinking on cannot apply.

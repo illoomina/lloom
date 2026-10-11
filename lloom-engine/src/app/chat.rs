@@ -435,7 +435,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         params.logits_digest = options.decode.logits_digest;
         if !args.raw {
-            params.turn_tail = thinking::checkpoint_tail(&*engine, &kwargs, want, &ids);
+            params.turn_tail = thinking::checkpoint_tail_checked(&*engine, &kwargs, want, &ids)?;
         }
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();

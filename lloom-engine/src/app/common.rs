@@ -105,53 +105,208 @@ impl Text {
     /// the engine appends. `None` without a template, or where the renders
     /// do not nest.
     pub fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<&[u32]> {
-        let modes = [None, Some(true), Some(false)];
         let all = self
             .gen_prompts
-            .get_or_init(|| modes.map(|k| modes.map(|w| self.read_generation_prompt(k, w))));
-        let at = |m: Option<bool>| match m {
-            None => 0,
-            Some(true) => 1,
-            Some(false) => 2,
-        };
-        all[at(kwarg)][at(want)].as_deref()
+            .get_or_init(|| self.probe().generation_prompts(self.think_tags()));
+        all[thinking_mode(kwarg)][thinking_mode(want)].as_deref()
     }
 
-    fn read_generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
-        let template = self.template.as_ref()?;
+    fn probe(&self) -> TextProbe<'_> {
+        TextProbe {
+            tokenizer: &self.tokenizer,
+            template: self.template.as_ref(),
+            bos_token: &self.bos_token,
+        }
+    }
+
+    /// The family's reasoning tags, read through the same borrowed probe used
+    /// by load-once owners. No tokenizer or template is copied.
+    pub fn think_tags(&self) -> Option<&ThinkTags> {
+        self.think
+            .get_or_init(|| self.probe().think_tags())
+            .as_ref()
+    }
+}
+
+/// Shared load-time analysis over the caller's one tokenizer and template.
+/// Incumbent Text keeps its OnceLocks; admitted owners prepare these values
+/// inside their load producer, before materializing model tensors.
+pub(super) struct TextProbe<'a> {
+    pub tokenizer: &'a Tokenizer,
+    pub template: Option<&'a Template>,
+    pub bos_token: &'a str,
+}
+
+pub(super) fn thinking_mode(mode: Option<bool>) -> usize {
+    match mode {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    }
+}
+
+impl TextProbe<'_> {
+    pub fn generation_prompts(&self, tags: Option<&ThinkTags>) -> [[Option<Vec<u32>>; 3]; 3] {
+        let modes = [None, Some(true), Some(false)];
+        modes.map(|k| modes.map(|w| self.read_generation_prompt(k, w, tags)))
+    }
+
+    fn read_generation_prompt(
+        &self,
+        kwarg: Option<bool>,
+        want: Option<bool>,
+        tags: Option<&ThinkTags>,
+    ) -> Option<Vec<u32>> {
+        let template = self.template?;
         let mut kwargs = serde_json::Map::new();
         if let Some(k) = kwarg {
             kwargs.insert(super::template::ENABLE_THINKING.into(), Value::Bool(k));
         }
-        let (mut with, without) = template.generation_prompt(&self.bos_token, &kwargs, |s| {
+        let (mut with, without) = template.generation_prompt(self.bos_token, &kwargs, |s| {
             self.tokenizer
                 .encode(s, false)
                 .map(|e| e.get_ids().to_vec())
                 .map_err(|e| anyhow::anyhow!("encoding a probe render: {e}"))
         })?;
-        super::thinking::apply(want, self.think_tags(), &mut with).ok()?;
+        super::thinking::apply(want, tags, &mut with).ok()?;
         Some(with[without.len()..].to_vec())
     }
 
-    /// The family's reasoning tags ([`Template::think_tags`]): markers are
-    /// the tokenizer's added tokens. `None` without a template, or when it
-    /// writes no thinking block.
-    pub fn think_tags(&self) -> Option<&ThinkTags> {
-        self.think
-            .get_or_init(|| {
-                let added = self.tokenizer.get_added_tokens_decoder();
-                self.template.as_ref()?.think_tags(
-                    &self.bos_token,
-                    |s| {
-                        self.tokenizer
-                            .encode(s, false)
-                            .map(|e| e.get_ids().to_vec())
-                            .map_err(|e| anyhow::anyhow!("encoding a probe render: {e}"))
-                    },
-                    |id| added.contains_key(&id),
-                )
-            })
-            .as_ref()
+    pub fn think_tags(&self) -> Option<ThinkTags> {
+        let added = self.tokenizer.get_added_tokens_decoder();
+        self.template?.think_tags(
+            self.bos_token,
+            |s| {
+                self.tokenizer
+                    .encode(s, false)
+                    .map(|e| e.get_ids().to_vec())
+                    .map_err(|e| anyhow::anyhow!("encoding a probe render: {e}"))
+            },
+            |id| added.contains_key(&id),
+        )
+    }
+}
+
+#[cfg(test)]
+mod text_probe_tests {
+    use super::*;
+    use lloom::testing::tiny::TinyTokenizer;
+    use serde_json::Map;
+
+    fn tokenizer(tiny: &TinyTokenizer) -> Tokenizer {
+        let json = lloom::testing::tiny::tokenizer::tokenizer_json(&tiny.added);
+        Tokenizer::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    // Pure bounded token/template controls: three existing byte vocabularies,
+    // nine modes each; no tensors, model weights, files, native or admission.
+    #[test]
+    fn shared_probes_preserve_family_tags_and_all_nine_cached_prompt_modes() {
+        for tiny in [
+            TinyTokenizer::qwen3_5(),
+            TinyTokenizer::qwen4exp(),
+            TinyTokenizer::lfm2(),
+        ] {
+            let text = Text {
+                tokenizer: tokenizer(&tiny),
+                template: Some(Template::compile(tiny.chat_template).unwrap()),
+                bos_token: String::new(),
+                bos_id: None,
+                eos_ids: Vec::new(),
+                seed_tokens: Vec::new(),
+                think: std::sync::OnceLock::new(),
+                gen_prompts: std::sync::OnceLock::new(),
+            };
+            text.prime();
+            let tags = text
+                .think_tags()
+                .expect("existing tiny family writes thinking tags");
+            assert_eq!(tags.start, tiny.id("<think>").unwrap());
+            assert_eq!(tags.end, tiny.id("</think>").unwrap());
+            assert_eq!(
+                tags.tool_call,
+                tiny.id("<tool_call>")
+                    .or_else(|| tiny.id("<|tool_call_start|>"))
+            );
+            let template = text.template.as_ref().unwrap();
+            let encode = |s: &str| text.tokenizer.encode(s, false).unwrap().get_ids().to_vec();
+            for kwarg in [None, Some(true), Some(false)] {
+                let mut kwargs = Map::new();
+                if let Some(value) = kwarg {
+                    kwargs.insert(
+                        super::super::template::ENABLE_THINKING.into(),
+                        Value::Bool(value),
+                    );
+                }
+                // Independent direct template render, not TextProbe's table.
+                let messages = json!([{ "role": "user", "content": "bounded parity user" }]);
+                let without = encode(&template.render_with(&messages, "", &kwargs, false).unwrap());
+                let with = encode(&template.render_with(&messages, "", &kwargs, true).unwrap());
+                assert!(with.starts_with(&without));
+                for want in [None, Some(true), Some(false)] {
+                    let mut expected = with.clone();
+                    let expected = super::super::thinking::apply(want, Some(tags), &mut expected)
+                        .ok()
+                        .map(|_| expected[without.len()..].to_vec());
+                    assert_eq!(
+                        text.generation_prompt(kwarg, want),
+                        expected.as_deref(),
+                        "kwarg={kwarg:?} want={want:?}"
+                    );
+                }
+            }
+            let rendered = template.renders();
+            for _ in 0..2 {
+                let _ = text.think_tags();
+                for kwarg in [None, Some(true), Some(false)] {
+                    for want in [None, Some(true), Some(false)] {
+                        let _ = text.generation_prompt(kwarg, want);
+                    }
+                }
+            }
+            assert_eq!(
+                template.renders(),
+                rendered,
+                "cached metadata rendered request-time probes"
+            );
+        }
+        println!("SHARED_TEXT_PROBE_FAMILIES=3 MODES_PER_FAMILY=9 CACHE_RENDERS=0");
+    }
+
+    #[test]
+    fn missing_or_plain_template_does_not_fabricate_thinking_metadata() {
+        let tiny = TinyTokenizer::qwen3_5();
+        let tokenizer = tokenizer(&tiny);
+        let absent = TextProbe {
+            tokenizer: &tokenizer,
+            template: None,
+            bos_token: "",
+        };
+        assert_eq!(absent.think_tags(), None);
+        assert!(absent
+            .generation_prompts(None)
+            .iter()
+            .flatten()
+            .all(Option::is_none));
+        let plain = Template::compile("{%- for m in messages -%}{{ m.role }}:{{ m.content }};{%- endfor -%}{%- if add_generation_prompt -%}assistant:{%- endif -%}").unwrap();
+        let probe = TextProbe {
+            tokenizer: &tokenizer,
+            template: Some(&plain),
+            bos_token: "",
+        };
+        assert_eq!(probe.think_tags(), None);
+        let all = probe.generation_prompts(None);
+        let expected = tokenizer
+            .encode("assistant:", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        for row in all {
+            assert_eq!(row[0].as_ref(), Some(&expected));
+            assert_eq!(row[1], None, "plain template cannot open thinking");
+            assert_eq!(row[2].as_ref(), Some(&expected));
+        }
+        println!("SHARED_TEXT_PROBE_ABSENT_NONE=9 PLAIN_REFUSED_ON=3");
     }
 }
 

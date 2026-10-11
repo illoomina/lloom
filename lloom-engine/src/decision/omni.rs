@@ -9,6 +9,27 @@
 use super::Question;
 use lloom_tensor::{bail, Result};
 
+pub(super) const OMNI_SEPARATOR: &str = "<<d1omni:sep>>";
+pub(super) const OMNI_STATE: &str = "<<d1omni:state>>";
+pub(super) const OMNI_QUESTION: &str = "<<d1omni:question>>";
+pub(super) const OMNI_OPTION: &str = "<<d1omni:option>>";
+
+fn option_budget(n: usize, max_len: usize) -> Result<(usize, usize)> {
+    if n == 0 {
+        bail!("d1-omni needs at least one option")
+    }
+    let option_budget = n
+        .checked_mul(24)
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| lloom_tensor::Error::msg("d1-omni option budget overflow"))?;
+    let framing = n
+        .checked_mul(3)
+        .ok_or_else(|| lloom_tensor::Error::msg("d1-omni option framing overflow"))?;
+    let budget = 96.max(option_budget.min(max_len / 2));
+    let per = 2.max(budget.saturating_sub(framing) / n);
+    Ok((16.max(budget), per))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OmniMedia {
     Text,
@@ -37,6 +58,89 @@ pub struct OmniPreparedQuestion {
 }
 
 impl OmniPreparedQuestion {
+    /// Tokenize the marked pieces emitted by a named systemone template.
+    /// `encode` parses its explicit special tokens and adds no automatic BOS/EOS.
+    /// Caller supplies the media-adjusted text allowance and exact repeated media
+    /// marker string; no media tensor is read or created here. Returned markers
+    /// are relative to TEXT, as DecisionCore's head requires (not media+text).
+    ///
+    /// Raw endpoint singleton choices are supported; the existing Python
+    /// preparation below deliberately retains its >=2 option contract.
+    /// Request/token-vector allocation admission remains the caller's duty.
+    pub fn from_systemone_rendered<T>(
+        rendered: &str,
+        question: &Question<T>,
+        expected_media_markers: &str,
+        marker: u32,
+        max_len: usize,
+        mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
+    ) -> Result<Self> {
+        question.validate()?;
+        let n = question.option_count();
+        let (question_budget, per) = option_budget(n, max_len)?;
+        let mut pieces = rendered.split(OMNI_SEPARATOR);
+        if pieces.next() != Some(expected_media_markers) {
+            bail!("unexpected layout of the decision prompt: media prefix")
+        }
+        let mut head = Vec::new();
+        let mut state = None;
+        let mut tail = Vec::new();
+        for piece in pieces {
+            if let Some(piece) = piece.strip_prefix(OMNI_STATE) {
+                if state.is_some() {
+                    bail!("unexpected layout of the decision prompt: repeated state")
+                }
+                state = Some(encode(piece)?);
+                continue;
+            }
+            let (piece, budget) = if let Some(piece) = piece.strip_prefix(OMNI_QUESTION) {
+                (piece, Some(question_budget))
+            } else if let Some(piece) = piece.strip_prefix(OMNI_OPTION) {
+                (piece, Some(per))
+            } else {
+                (piece, None)
+            };
+            let mut ids = encode(piece)?;
+            if let Some(budget) = budget {
+                ids.truncate(budget);
+            }
+            if state.is_some() {
+                tail.extend(ids);
+            } else {
+                head.extend(ids);
+            }
+        }
+        let Some(mut state) = state else {
+            bail!("unexpected layout of the decision prompt: missing state")
+        };
+        let framing = head
+            .len()
+            .checked_add(tail.len())
+            .ok_or_else(|| lloom_tensor::Error::msg("d1-omni text framing overflow"))?;
+        state.truncate(max_len.saturating_sub(framing));
+        head.extend(state);
+        head.extend(tail);
+        head.truncate(max_len);
+        let markers: Vec<usize> = head
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| (id == marker).then_some(i))
+            .collect();
+        if markers.len() != n {
+            bail!("the options do not fit in the context")
+        }
+        let question_type = match question {
+            Question::Choice { .. } => 0,
+            Question::Score { .. } => 1,
+            Question::Noul { .. } => 2,
+        };
+        Ok(Self {
+            ids: head,
+            markers,
+            question_type,
+        })
+    }
+
     /// `state_text` is already serialized by the model-specific frontend:
     /// strings stay literal, JSON uses the omni reference's compact-spaced
     /// representation, not d1-3B's pretty JSON renderer. `max_len` is the
@@ -64,18 +168,10 @@ impl OmniPreparedQuestion {
         };
         let options = render_options(question, media);
         let n = options.len();
-        let option_budget = n
-            .checked_mul(24)
-            .and_then(|v| v.checked_add(32))
-            .ok_or_else(|| lloom_tensor::Error::msg("d1-omni option budget overflow"))?;
-        let framing = n
-            .checked_mul(3)
-            .ok_or_else(|| lloom_tensor::Error::msg("d1-omni option framing overflow"))?;
-        let budget = 96.max(option_budget.min(max_len / 2));
-        let per = 2.max(budget.saturating_sub(framing) / n);
+        let (question_budget, per) = option_budget(n, max_len)?;
         let mut suffix = vec![tokens.question];
         suffix.extend(encode(&escape(instructions))?);
-        suffix.truncate(16.max(budget));
+        suffix.truncate(question_budget);
         let mut markers = Vec::with_capacity(n);
         for option in options {
             markers.push(suffix.len() + 1);
@@ -181,6 +277,115 @@ fn render_options(q: &Question, media: OmniMedia) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decision::OrderedJson as OrderedJsonForTest;
+
+    #[test]
+    fn systemone_piece_budget_and_text_relative_markers_follow_reference() -> Result<()> {
+        let q = Question::Choice {
+            instructions: OrderedJsonForTest::Null,
+            criteria: vec![("A".into(), None), ("B".into(), None)],
+        };
+        // Tiny stand-in tokenizer: explicit special pieces are individual ids;
+        // ordinary bytes are unchanged. No model/tokenizer file is loaded.
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(text
+                .bytes()
+                .map(|b| match b {
+                    b'@' => 1000,
+                    b'#' => 1001,
+                    b'?' => 1002,
+                    b'!' => 1003,
+                    _ => u32::from(b),
+                })
+                .collect())
+        };
+        let render = format!("MM{OMNI_SEPARATOR}@#{OMNI_SEPARATOR}{OMNI_STATE}abcdefghijklmnopqrst{OMNI_SEPARATOR}{OMNI_QUESTION}?q{OMNI_SEPARATOR}!{OMNI_SEPARATOR}{OMNI_OPTION} A{OMNI_SEPARATOR}!{OMNI_SEPARATOR}{OMNI_OPTION} B");
+        let got =
+            OmniPreparedQuestion::from_systemone_rendered(&render, &q, "MM", 1003, 16, encode)?;
+        assert_eq!(
+            got.ids,
+            [1000, 1001, 97, 98, 99, 100, 101, 102, 1002, 113, 1003, 32, 65, 1003, 32, 66]
+        );
+        assert_eq!(got.markers, [10, 13]);
+        assert_eq!(got.question_type, 0);
+        // Exact pinned budget: n2/max256 =>96 question,45 per option.
+        let long = format!("{OMNI_SEPARATOR}@#{OMNI_SEPARATOR}{OMNI_STATE}s{OMNI_SEPARATOR}{OMNI_QUESTION}{}{OMNI_SEPARATOR}!{OMNI_SEPARATOR}{OMNI_OPTION}{}{OMNI_SEPARATOR}!{OMNI_SEPARATOR}{OMNI_OPTION}{}", "q".repeat(120),"a".repeat(60),"b".repeat(60));
+        let got = OmniPreparedQuestion::from_systemone_rendered(&long, &q, "", 1003, 256, encode)?;
+        assert_eq!(got.ids.len(), 191);
+        assert_eq!(got.markers, [99, 145]);
+        assert_eq!(
+            got.ids.iter().filter(|&&v| v == u32::from(b'q')).count(),
+            96
+        );
+        assert_eq!(
+            got.ids.iter().filter(|&&v| v == u32::from(b'a')).count(),
+            45
+        );
+        assert_eq!(
+            got.ids.iter().filter(|&&v| v == u32::from(b'b')).count(),
+            45
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn systemone_layout_and_marker_cardinality_refuse_without_model_work() {
+        let q: Question<OrderedJsonForTest> = Question::Choice {
+            instructions: OrderedJsonForTest::Null,
+            criteria: vec![("A".into(), None)],
+        };
+        let encode = |s: &str| Ok(s.bytes().map(u32::from).collect());
+        for (prompt, media, limit, expected) in [
+            (
+                format!("wrong{OMNI_SEPARATOR}{OMNI_STATE}!"),
+                "",
+                8,
+                "media prefix",
+            ),
+            (format!("{OMNI_SEPARATOR}!"), "", 8, "missing state"),
+            (
+                format!("{OMNI_SEPARATOR}{OMNI_STATE}!{OMNI_SEPARATOR}{OMNI_STATE}!"),
+                "",
+                8,
+                "repeated state",
+            ),
+            (
+                format!("{OMNI_SEPARATOR}{OMNI_STATE}s{OMNI_SEPARATOR}!"),
+                "",
+                0,
+                "options do not fit",
+            ),
+            (
+                format!("{OMNI_SEPARATOR}{OMNI_STATE}s{OMNI_SEPARATOR}!!"),
+                "",
+                8,
+                "options do not fit",
+            ),
+        ] {
+            let error = OmniPreparedQuestion::from_systemone_rendered(
+                &prompt,
+                &q,
+                media,
+                u32::from(b'!'),
+                limit,
+                encode,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let prompt = format!("{OMNI_SEPARATOR}{OMNI_STATE}s{OMNI_SEPARATOR}!");
+        let one = OmniPreparedQuestion::from_systemone_rendered(
+            &prompt,
+            &q,
+            "",
+            u32::from(b'!'),
+            8,
+            encode,
+        )
+        .unwrap();
+        assert_eq!(one.ids, [u32::from(b's'), u32::from(b'!')]);
+        assert_eq!(one.markers, [1]);
+    }
 
     #[test]
     fn escape_only_reference_special_names_including_nested_matches() {

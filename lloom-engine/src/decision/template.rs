@@ -1,5 +1,6 @@
 //! Named systemone templates over the incumbent compiled Jinja renderer.
 //! This is rendering, not tokenization, media decoding or model execution.
+use super::omni::{OMNI_OPTION, OMNI_QUESTION, OMNI_SEPARATOR, OMNI_STATE};
 use super::{OmniMedia, OrderedJson, Question};
 use hf_chat_template::ChatTemplate;
 use lloom_tensor::{bail, Error, Result};
@@ -27,10 +28,6 @@ pub struct SystemOneTemplate {
     kind: SystemOneTemplateKind,
 }
 
-pub(crate) const OMNI_SEPARATOR: &str = "<<d1omni:sep>>";
-pub(crate) const OMNI_STATE: &str = "<<d1omni:state>>";
-pub(crate) const OMNI_QUESTION: &str = "<<d1omni:question>>";
-pub(crate) const OMNI_OPTION: &str = "<<d1omni:option>>";
 const OMNI_MARKER: &str = "<<d1omni:";
 
 #[derive(Serialize)]

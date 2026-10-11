@@ -15,7 +15,27 @@ pub struct CommandBuffer {
 #[derive(Clone)]
 enum Backend {
     Metal3(Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal3Associated(super::metal3_retirement::AssociatedBuffer),
     Metal4(Arc<super::metal4::Submission>),
+}
+
+/// Prepared transaction shared by public submission and engine callers.
+pub(super) enum PreparedCommandCommit<'a> {
+    Metal3(&'a Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal3Associated(super::metal3_retirement::PreparedCommit<'a>),
+    Metal4(super::metal4::PreparedCommit<'a>),
+}
+impl PreparedCommandCommit<'_> {
+    pub(super) fn commit(self) -> Result<(), crate::kernels::MetalKernelError> {
+        match self {
+            Self::Metal3(raw) => {
+                raw.commit();
+                Ok(())
+            }
+            Self::Metal3Associated(prepared) => prepared.commit(),
+            Self::Metal4(prepared) => prepared.commit(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CommandBuffer {
@@ -31,9 +51,58 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    pub(super) fn prepare_commit(
+        &self,
+    ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => {
+                if raw.status().0 >= MTLCommandBufferStatus::Committed.0 {
+                    return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                        "standalone buffer already committed",
+                    ));
+                }
+                Ok(PreparedCommandCommit::Metal3(raw))
+            }
+            Backend::Metal3Associated(buffer) => buffer
+                .prepare_commit()
+                .map(PreparedCommandCommit::Metal3Associated),
+            Backend::Metal4(submission) => submission
+                .prepare_commit()
+                .map(PreparedCommandCommit::Metal4),
+        }
+    }
+
     pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
         Self {
             backend: Backend::Metal3(raw),
+        }
+    }
+
+    pub(super) fn from_metal3_associated(
+        buffer: super::metal3_retirement::AssociatedBuffer,
+    ) -> Self {
+        Self {
+            backend: Backend::Metal3Associated(buffer),
+        }
+    }
+
+    pub(super) fn associate_metal3(
+        self,
+        core: Arc<super::metal3_retirement::Completions>,
+        physical: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Self, crate::kernels::MetalKernelError> {
+        match self.backend {
+            Backend::Metal3(raw) => {
+                super::metal3_retirement::AssociatedBuffer::new(raw, core, physical)
+                    .map(Self::from_metal3_associated)
+            }
+            backend => Err(crate::kernels::err::CompletionRegistrationError::new(
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "buffer already queue-associated",
+                ),
+                Some(Self { backend }),
+            )
+            .into()),
         }
     }
 
@@ -45,6 +114,7 @@ impl CommandBuffer {
     fn raw(&self) -> &Retained<ProtocolObject<dyn MTLCommandBuffer>> {
         match &self.backend {
             Backend::Metal3(raw) => raw,
+            Backend::Metal3Associated(buffer) => buffer.raw(),
             Backend::Metal4(_) => unreachable!("Metal 3-only helper"),
         }
     }
@@ -54,12 +124,14 @@ impl CommandBuffer {
     pub(crate) fn identity(&self) -> usize {
         match &self.backend {
             Backend::Metal3(raw) => Retained::as_ptr(raw) as usize,
+            Backend::Metal3Associated(buffer) => Retained::as_ptr(buffer.raw()) as usize,
             Backend::Metal4(s) => Arc::as_ptr(s) as usize,
         }
     }
     pub(crate) fn device(&self) -> Device {
         match &self.backend {
             Backend::Metal3(raw) => Device::new(raw.device()),
+            Backend::Metal3Associated(buffer) => Device::new(buffer.raw().device()),
             Backend::Metal4(s) => s.device().clone(),
         }
     }
@@ -163,16 +235,14 @@ impl CommandBuffer {
             .unwrap()
     }
 
-    pub fn commit(&self) {
-        match &self.backend {
-            Backend::Metal3(raw) => raw.commit(),
-            Backend::Metal4(s) => s.commit(),
-        }
+    pub fn commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.prepare_commit()?.commit()
     }
 
     pub fn enqueue(&self) {
         match &self.backend {
             Backend::Metal3(raw) => raw.enqueue(),
+            Backend::Metal3Associated(buffer) => buffer.raw().enqueue(),
             Backend::Metal4(s) => s.enqueue(),
         }
     }
@@ -180,6 +250,9 @@ impl CommandBuffer {
     pub fn set_label(&self, label: &str) {
         match &self.backend {
             Backend::Metal3(raw) => raw.setLabel(Some(&NSString::from_str(label))),
+            Backend::Metal3Associated(buffer) => {
+                buffer.raw().setLabel(Some(&NSString::from_str(label)))
+            }
             Backend::Metal4(s) => s.set_label(label),
         }
     }
@@ -187,6 +260,7 @@ impl CommandBuffer {
     pub fn status(&self) -> MTLCommandBufferStatus {
         match &self.backend {
             Backend::Metal3(raw) => raw.status(),
+            Backend::Metal3Associated(buffer) => buffer.raw().status(),
             Backend::Metal4(s) => s.status(),
         }
     }
@@ -194,6 +268,10 @@ impl CommandBuffer {
     pub fn error(&self) -> Option<Cow<'_, str>> {
         match &self.backend {
             Backend::Metal3(raw) => raw
+                .error()
+                .map(|e| Cow::Owned(e.localizedDescription().to_string())),
+            Backend::Metal3Associated(buffer) => buffer
+                .raw()
                 .error()
                 .map(|e| Cow::Owned(e.localizedDescription().to_string())),
             Backend::Metal4(s) => s.error().map(Cow::Owned),
@@ -204,6 +282,7 @@ impl CommandBuffer {
     pub fn gpu_start_time(&self) -> f64 {
         match &self.backend {
             Backend::Metal3(raw) => raw.GPUStartTime(),
+            Backend::Metal3Associated(buffer) => buffer.raw().GPUStartTime(),
             Backend::Metal4(s) => s.gpu_start_time(),
         }
     }
@@ -212,15 +291,63 @@ impl CommandBuffer {
     pub fn gpu_end_time(&self) -> f64 {
         match &self.backend {
             Backend::Metal3(raw) => raw.GPUEndTime(),
+            Backend::Metal3Associated(buffer) => buffer.raw().GPUEndTime(),
             Backend::Metal4(s) => s.gpu_end_time(),
         }
     }
 
-    pub fn wait_until_completed(&self) {
+    pub(super) fn data_ready(&self) -> bool {
+        self.status().0 >= MTLCommandBufferStatus::Completed.0
+    }
+
+    /// Internal data/error boundary: does not promise own callback return.
+    /// Engine-owned payload custody remains registered independently.
+    pub(super) fn try_wait_data_ready(&self) -> Result<(), crate::kernels::MetalKernelError> {
         match &self.backend {
-            Backend::Metal3(raw) => raw.waitUntilCompleted(),
-            Backend::Metal4(s) => s.wait(),
+            Backend::Metal3(raw) => {
+                if raw.status().0 < MTLCommandBufferStatus::Completed.0 {
+                    raw.waitUntilCompleted();
+                }
+                Ok(())
+            }
+            Backend::Metal3Associated(buffer) => buffer.try_wait(false),
+            Backend::Metal4(submission) => submission.try_wait_data_ready(),
         }
+    }
+    pub(super) fn check_data_wait(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(_) => Ok(()), // Standalone raw wrappers have no engine queue poison.
+            Backend::Metal3Associated(buffer) => buffer.check_data_wait(),
+            Backend::Metal4(submission) => submission.check_data_wait(),
+        }
+    }
+
+    /// Wait for own logical completion, returning native or adapter failures.
+    /// Queue-associated wrappers additionally preserve engine prefix ordering.
+    /// Standalone M3 retains the native handler-join contract, not a cross-buffer
+    /// logical prefix. Error never establishes teardown quiescence.
+    pub fn wait_until_completed(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3(raw) => {
+                let queue = raw.commandQueue();
+                crate::completion_scope::before_park(Retained::as_ptr(&queue) as usize)
+                    .map_err(|_| crate::kernels::MetalKernelError::CallbackWouldBlock)?;
+                raw.waitUntilCompleted();
+            }
+            Backend::Metal3Associated(buffer) => buffer.try_wait(true)?,
+            Backend::Metal4(submission) => submission.wait()?,
+        }
+        if self.status() == MTLCommandBufferStatus::Error {
+            return Err(crate::kernels::MetalKernelError::CommandBufferError(
+                self.error()
+                    .map(|error| error.into_owned())
+                    .unwrap_or_else(|| "unknown error".into()),
+            ));
+        }
+        Ok(())
+    }
+    pub fn try_wait_until_completed(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.wait_until_completed()
     }
 
     /// Encode a signal of `event` to `value` once every command encoded so far
@@ -256,90 +383,109 @@ impl CommandBuffer {
             .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);
     }
 
-    /// Run `f` once this command buffer has completed on the GPU.
-    ///
-    /// Must be called before `commit`: Metal rejects handlers added to a buffer
-    /// that has already been committed.
-    pub fn on_completion<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        if let Backend::Metal4(s) = &self.backend {
-            s.on_completion(move |_| f());
-            return;
+    /// Register before commit; rejected captures remain owned by the returned
+    /// error. Propagate that error beyond recording locks before dropping it.
+    pub fn on_completion<F: Fn() + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        if let Backend::Metal3(raw) = &self.backend {
+            if raw.status().0 >= MTLCommandBufferStatus::Committed.0 {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    crate::kernels::MetalKernelError::QueueUnavailable(
+                        "standalone buffer already committed",
+                    ),
+                    Some(f),
+                ));
+            }
+            let queue = raw.commandQueue();
+            let identity = Retained::as_ptr(&queue) as usize;
+            // Preserve the no-feedback standalone spelling: no new native
+            // error/timestamp reads merely to run a zero-argument callback.
+            let block = block2::RcBlock::new(
+                move |_cb: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    crate::completion_scope::with_callback(identity, &f);
+                },
+            );
+            // SAFETY: native API copies this owned block before return.
+            unsafe {
+                raw.addCompletedHandler(block2::RcBlock::as_ptr(&block));
+            }
+            return Ok(());
         }
-        use block2::RcBlock;
-        use std::ptr::NonNull;
-
-        let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| f());
-        // SAFETY: `addCompletedHandler` copies the block, and `RcBlock` keeps it
-        // alive until Metal releases it. The block captures only owned state.
-        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
+        self.on_feedback(move |_| f())
     }
-
-    /// As [`Self::on_completion`], handing `f` the final error, if any,
-    /// independently of the native command API.
-    pub fn on_completion_of<F>(&self, f: F)
+    pub fn on_completion_of<F>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError>
     where
         F: Fn(Option<String>) + Send + Sync + 'static,
     {
-        if let Backend::Metal4(s) = &self.backend {
-            s.on_completion(move |feedback| f(feedback.error.clone()));
-            return;
+        self.on_feedback(move |feedback| f(feedback.error.clone()))
+    }
+    fn on_feedback<F>(&self, f: F) -> Result<(), crate::kernels::err::CompletionRegistrationError>
+    where
+        F: Fn(&super::metal4::Feedback) + Send + Sync + 'static,
+    {
+        use crate::kernels::{err::CompletionRegistrationError, MetalKernelError};
+        match &self.backend {
+            Backend::Metal4(submission) => return submission.on_completion(f),
+            Backend::Metal3Associated(buffer) => {
+                return buffer.try_on_completion(Box::new(f)).map_err(|rejected| {
+                    CompletionRegistrationError::new(rejected.error, rejected.callback)
+                });
+            }
+            Backend::Metal3(raw) => {
+                if raw.status().0 >= MTLCommandBufferStatus::Committed.0 {
+                    return Err(CompletionRegistrationError::new(
+                        MetalKernelError::QueueUnavailable("standalone buffer already committed"),
+                        Some(f),
+                    ));
+                }
+                let queue = raw.commandQueue();
+                let identity = Retained::as_ptr(&queue) as usize;
+                let block = block2::RcBlock::new(
+                    move |cb: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        // SAFETY: Metal supplies the completed CB for this invocation.
+                        let cb = unsafe { cb.as_ref() };
+                        let feedback = super::metal4::Feedback {
+                            error: (cb.status() == MTLCommandBufferStatus::Error).then(|| {
+                                cb.error()
+                                    .map(|error| error.localizedDescription().to_string())
+                                    .unwrap_or_else(|| "unknown error".into())
+                            }),
+                            start: cb.GPUStartTime(),
+                            end: cb.GPUEndTime(),
+                        };
+                        crate::completion_scope::with_callback(identity, || f(&feedback));
+                    },
+                );
+                // SAFETY: native API copies the block. Standalone wrappers keep
+                // native custody semantics; they do not join engine registry.
+                unsafe {
+                    raw.addCompletedHandler(block2::RcBlock::as_ptr(&block));
+                }
+            }
         }
-        use block2::RcBlock;
-        use std::ptr::NonNull;
-
-        let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            // SAFETY: Metal passes its handler the buffer that completed,
-            // valid for the duration of the call.
-            let cb = unsafe { cb.as_ref() };
-            f((cb.status() == MTLCommandBufferStatus::Error).then(|| {
-                cb.error()
-                    .map(|e| e.localizedDescription().to_string())
-                    .unwrap_or_else(|| "unknown error".into())
-            }))
-        });
-        // SAFETY: as `on_completion`.
-        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
+        Ok(())
     }
 
-    /// Register a completion handler that records this buffer's GPU execution
-    /// interval, when profiling is enabled.
-    ///
-    /// Must be called before `commit`: Metal rejects handlers added to a buffer
-    /// that has already been committed. `GPUStartTime`/`GPUEndTime` are only
-    /// meaningful once the buffer has completed, which is what makes a handler
-    /// the only place to read them.
-    pub fn record_gpu_time_on_completion(&self) {
-        use block2::RcBlock;
-        use std::ptr::NonNull;
-
+    pub fn record_gpu_time_on_completion(
+        &self,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
         use crate::kernels::metal::profile;
         if !profile::enabled() {
-            return;
+            return Ok(());
         }
-        // The commit stamp and the step are taken HERE, on the committing
-        // thread and in commit order -- the handler runs later, on Metal's
-        // thread, when neither is knowable. Registration immediately precedes
-        // the `commit` at both call sites, so the stamp reads a few
-        // microseconds early (issue #702: the bias is toward "seam").
         let committed = profile::now_s();
         let step = profile::current_step();
-        if let Backend::Metal4(s) = &self.backend {
-            s.on_completion(move |feedback| {
-                profile::record_command_buffer(feedback.start, feedback.end, committed, step);
-            });
-            return;
-        }
-        let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            // SAFETY: Metal hands the completed command buffer to its own
-            // completion handler, so the pointer is valid and non-null for the
-            // duration of the call. Only the two timing properties are read,
-            // and both are plain scalars valid in the completed state.
-            let key = cb.as_ptr() as *const () as usize;
-            let cb = unsafe { cb.as_ref() };
-            let (start, end) = (cb.GPUStartTime(), cb.GPUEndTime());
-            profile::record_command_buffer(start, end, committed, step);
-            profile::resolve_encoder_samples(key, start, end);
-        });
-        unsafe { self.raw().addCompletedHandler(RcBlock::as_ptr(&block)) };
+        let native_key = (!self.is_metal4()).then(|| self.identity());
+        self.on_feedback(move |feedback| {
+            profile::record_command_buffer(feedback.start, feedback.end, committed, step);
+            if let Some(key) = native_key {
+                profile::resolve_encoder_samples(key, feedback.start, feedback.end);
+            }
+        })
     }
 }

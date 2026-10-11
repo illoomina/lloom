@@ -76,9 +76,11 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
         let handlers = Arc::new(AtomicU32::new(0));
         {
             let h = Arc::clone(&handlers);
-            heavy.on_completion(move || {
-                h.fetch_add(1, Ordering::AcqRel);
-            });
+            heavy
+                .on_completion(move || {
+                    h.fetch_add(1, Ordering::AcqRel);
+                })
+                .unwrap();
         }
         {
             let (h, seen, heavy) = (
@@ -92,13 +94,14 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
                     Ordering::Release,
                 );
                 h.fetch_add(1, Ordering::AcqRel);
-            });
+            })
+            .unwrap();
         }
-        heavy.commit();
-        tiny.commit();
-        tiny.wait_until_completed();
+        heavy.commit().unwrap();
+        tiny.commit().unwrap();
+        tiny.wait_until_completed().unwrap();
         let heavy_status_at_tiny_wait = heavy.status();
-        heavy.wait_until_completed();
+        heavy.wait_until_completed().unwrap();
         while handlers.load(Ordering::Acquire) < 2 {
             std::hint::spin_loop();
         }

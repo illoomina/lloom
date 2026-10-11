@@ -62,6 +62,23 @@ pub enum CutPolicy {
 }
 
 impl CutPolicy {
+    /// Consume a pending node cut at its dispatch boundary.
+    pub(crate) fn take_cut(
+        &self,
+        count: usize,
+        period: usize,
+        pending: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        match self {
+            CutPolicy::DispatchCounter => count >= period,
+            CutPolicy::NodeIndex { .. } => pending.swap(false, Ordering::Relaxed),
+            CutPolicy::NodeAligned => {
+                pending.swap(false, Ordering::Relaxed) || self.cuts_at_dispatch(count, period)
+            }
+        }
+    }
+
     /// Whether reaching graph node `index` should arm a cut.
     ///
     /// A free function of the policy and the index so the partition arithmetic

@@ -27,6 +27,7 @@ pub use allocation_scope::{
     AllocationRequest, AllocationWorker, ExecutionScope, MetalAllocationDomain,
 };
 mod device;
+mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,

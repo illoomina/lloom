@@ -62,12 +62,18 @@ pub mod backprop;
 #[doc(hidden)]
 pub mod checkout;
 mod command_policy;
+mod completion_frontier;
+#[cfg(any(feature = "metal", test))]
+mod completion_scope;
+#[cfg(any(feature = "metal", test))]
+mod completion_wake;
 pub mod conv;
 mod convert;
 pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+mod current_command;
 mod custom_op;
 mod device;
 pub mod display;
@@ -91,6 +97,8 @@ pub mod memory_arbitration;
 #[cfg(all(test, not(feature = "metal")))]
 #[path = "kernels/metal/ledger.rs"]
 mod memory_ledger_cpu_tests;
+#[cfg(any(feature = "metal", test))]
+mod native_reuse;
 pub use autorelease::AutoreleaseScope;
 /// Declares the allocations made while it is alive as outliving their
 /// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).
@@ -115,6 +123,8 @@ pub mod metal_backend;
 /// The GEMV's tile selection as plain arithmetic, for the dispatcher and for
 /// a reader with no device (the optimizer's legality facts).
 pub mod gemv_tile;
+#[cfg(any(feature = "metal", test))]
+mod host_anchor;
 #[cfg(feature = "metal")]
 pub mod kernels;
 /// The paged-KV page allocator (§10.3c–h): pure host bookkeeping — a free
@@ -129,6 +139,8 @@ pub mod nditer;
 pub mod npy;
 pub mod op;
 pub mod options;
+#[cfg(any(feature = "metal", test))]
+mod ordered_metadata;
 pub mod pickle;
 #[cfg(any(feature = "metal", test))]
 mod planner_transaction;
@@ -136,6 +148,13 @@ pub mod quantized;
 #[cfg(any(feature = "metal", test))]
 mod residency_ownership;
 pub mod retire;
+#[cfg(any(feature = "metal", test))]
+mod retirement_mailbox;
+mod retirement_owners;
+#[cfg(any(feature = "metal", test))]
+mod retirement_registry;
+#[cfg(any(feature = "metal", test))]
+mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;

@@ -152,7 +152,7 @@ mod tests {
         )
     }
     fn same(a: &Lease, b: &Lease) -> bool {
-        a.owner().unwrap().same_allocation(b.owner().unwrap())
+        a.owner().unwrap().same_custody(b.owner().unwrap())
     }
 
     #[test]
@@ -181,6 +181,35 @@ mod tests {
         assert_eq!(domain.snapshot().committed, 16);
         drop(released_after_native_commit);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(domain.snapshot().committed, 0);
+    }
+
+    #[test]
+    fn numeric_same_charge_distinct_anchors_are_not_discarded() {
+        let (domain, pass, drops) = fixture();
+        let charge = pass.context().take(8).unwrap().commit(8).unwrap();
+        let base = AllocationOwner::new(charge);
+        let raw = || {
+            Arc::new(RawOracle {
+                domain: domain.clone(),
+                drops: drops.clone(),
+            })
+        };
+        let a = AllocationLease::new(raw(), Some(base.clone().with_anchor(raw())));
+        let b = AllocationLease::new(raw(), Some(base.with_anchor(raw())));
+        assert!(!same(&a, &b));
+        let mut state = ResidencyOwners::default();
+        assert!(state.insert(7, Some(a), same).0);
+        let (added, redundant) = state.insert(7, Some(b), same);
+        assert!(!added);
+        assert!(
+            redundant.is_none(),
+            "distinct native anchor must remain in custody"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(domain.snapshot().committed, 8);
+        drop(state.cleared());
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
         assert_eq!(domain.snapshot().committed, 0);
     }
 

@@ -74,6 +74,8 @@ pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
 mod dummy_metal_backend;
 pub mod error;
+#[cfg(any(feature = "metal", test))]
+mod heap_ranges;
 mod indexer;
 pub mod isolation;
 pub mod layout;

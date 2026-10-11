@@ -659,6 +659,10 @@ pub struct State<P: Profile> {
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+    /// Retained admission-planner scratch, never an authoritative cached total.
+    /// Growth/State clone can allocate host metadata; steady collection reuses it.
+    #[cfg(feature = "metal")]
+    heap_credit: lloom_tensor::kernels::metal::backing::ReuseCredit,
     /// A driver owns the settles of this cache's device-planned decode steps
     /// (`CausalLM::provisional`): a step returns its logits unsettled, and
     /// the driver settles it once it has read them back
@@ -954,6 +958,8 @@ impl<P: Profile> State<P> {
             window_draft_loads: false,
             window_real_loads_ema: 0.0,
             prepared: None,
+            #[cfg(feature = "metal")]
+            heap_credit: Default::default(),
         }
     }
 
@@ -2626,9 +2632,15 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             // The transients come from the heap chunks first (§6.3k), whose
             // whole size the allocated figure already counts: what the chunks
             // have free is transient the pass will NOT allocate.
-            let (hs, hp) = m.heap_stats();
-            let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
-            let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
+            // Legacy planner cannot spend foreign admitted-domain or not-yet-
+            // published capacity. Admitted callers must pass their domain key.
+            let heap_free = m.heap_reusable_bytes(None, &mut cache.heap_credit)?;
+            let need = plan
+                .kv_grow
+                .checked_add(plan.transient.saturating_sub(heap_free))
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("pass demand exceeds usize after heap credit".into())
+                })?;
             // Read with the free lists given back first when the first
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.

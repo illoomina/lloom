@@ -12,6 +12,8 @@ pub enum PredictionBasis {
     /// bytes, rounded with checked arithmetic. For standalone buffers this is
     /// an estimator, NOT Apple's guarantee for heap suballocations.
     HeapSizeAndAlignEstimate,
+    /// Checked placement chunk request; actual heap allocation may differ.
+    HeapDescriptorSizeEstimate,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,13 @@ pub(crate) struct Prediction {
     pub basis: PredictionBasis,
 }
 impl Prediction {
+    pub(crate) fn heap(bytes: usize) -> Self {
+        Self {
+            requested: bytes,
+            bytes,
+            basis: PredictionBasis::HeapDescriptorSizeEstimate,
+        }
+    }
     pub(crate) fn standalone<E>(
         requested: usize,
         heap_size: usize,
@@ -82,14 +91,28 @@ impl Prediction {
     }
 }
 
-/// A single ticket is issued before native creation. Return raw before owner in
-/// tuple drop order until the caller installs its persistent AllocationLease.
-pub(crate) fn allocate<R, E>(
+/// Uncommitted native allocation. Drop order is raw first, ticket second: an
+/// unused speculative allocation returns the full entitlement to its parent.
+pub(crate) struct StagedAllocation<R> {
+    raw: R,
+    ticket: AllocationTicket,
+    actual: usize,
+}
+impl<R> StagedAllocation<R> {
+    pub(crate) fn raw(&self) -> &R {
+        &self.raw
+    }
+    pub(crate) fn commit<E>(self) -> Result<(R, AllocationOwner), AllocationError<E>> {
+        commit_raw(self.raw, self.ticket, self.actual)
+    }
+}
+
+pub(crate) fn stage<R, E>(
     context: &AllocationContext,
     prediction: Prediction,
     create: impl FnOnce(usize) -> Result<R, E>,
     actual_size: impl FnOnce(&R) -> usize,
-) -> Result<(R, AllocationOwner), AllocationError<E>> {
+) -> Result<StagedAllocation<R>, AllocationError<E>> {
     let ticket = context
         .take(prediction.bytes)
         .map_err(AllocationError::Admission)?;
@@ -104,7 +127,22 @@ pub(crate) fn allocate<R, E>(
             basis: prediction.basis,
         });
     }
-    commit_raw(raw, ticket, actual)
+    Ok(StagedAllocation {
+        raw,
+        ticket,
+        actual,
+    })
+}
+
+/// A single ticket is issued before native creation. Return raw before owner in
+/// tuple drop order until the caller installs its persistent AllocationLease.
+pub(crate) fn allocate<R, E>(
+    context: &AllocationContext,
+    prediction: Prediction,
+    create: impl FnOnce(usize) -> Result<R, E>,
+    actual_size: impl FnOnce(&R) -> usize,
+) -> Result<(R, AllocationOwner), AllocationError<E>> {
+    stage(context, prediction, create, actual_size)?.commit()
 }
 
 fn commit_raw<R, E>(
@@ -327,6 +365,79 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
+    #[test]
+    fn numeric_unused_staged_native_returns_full_parent_entitlement() {
+        let domain = process_account().unadmitted_domain(Some(16)).unwrap();
+        let pass = domain.reserve(16).unwrap();
+        let context = pass.context();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let staged = stage(
+            &context,
+            predicted(16),
+            |_| {
+                Ok::<_, &str>(RawOracle {
+                    domain: domain.clone(),
+                    expected: AccountSnapshot {
+                        pending: 16,
+                        committed: 0,
+                    },
+                    drops: drops.clone(),
+                })
+            },
+            |_| 8,
+        )
+        .unwrap();
+        assert_eq!(domain.snapshot().committed, 0);
+        assert!(matches!(
+            context.take(1),
+            Err(AdmissionError::PromiseTooSmall { .. })
+        ));
+        drop(staged);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let fully_returned = context.take(16).unwrap();
+        drop(pass);
+        assert_eq!(domain.snapshot().pending, 16);
+        drop(fully_returned);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn numeric_impossible_staged_capacity_returns_full_entitlement() {
+        let domain = process_account().unadmitted_domain(Some(16)).unwrap();
+        let pass = domain.reserve(16).unwrap();
+        let context = pass.context();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let staged = stage(
+            &context,
+            predicted(16),
+            |_| {
+                Ok::<_, &str>((
+                    RawOracle {
+                        domain: domain.clone(),
+                        expected: AccountSnapshot {
+                            pending: 16,
+                            committed: 0,
+                        },
+                        drops: drops.clone(),
+                    },
+                    4usize,
+                ))
+            },
+            |raw| raw.1,
+        )
+        .unwrap();
+        let mut ranges = crate::heap_ranges::Ranges::new(staged.raw().1);
+        assert_eq!(ranges.take(8, 4), None);
+        drop(ranges);
+        drop(staged);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let returned = context.take(16).unwrap();
+        drop(pass);
+        assert_eq!(domain.snapshot().pending, 16);
+        drop(returned);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
     #[test]
     fn numeric_fallback_is_explicit_and_never_retries_admission_errors() {
         assert!(AllocationError::Native(true).permits_fallback(|refused| *refused));

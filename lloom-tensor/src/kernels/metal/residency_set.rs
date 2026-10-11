@@ -579,7 +579,7 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
 
 fn same_charge(a: &ResidencyLease, b: &ResidencyLease) -> bool {
     match (a.owner(), b.owner()) {
-        (Some(a), Some(b)) => a.same_allocation(b),
+        (Some(a), Some(b)) => a.same_custody(b),
         _ => false,
     }
 }

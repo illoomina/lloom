@@ -1094,6 +1094,26 @@ impl MetalDevice {
         )
     }
 
+    /// Advisory ready, same-domain free capacity. Caller-owned scratch retains
+    /// capacity across plans; duplicate physical sources count only once even
+    /// through nested/aliased Fallback backings. It does not prove aligned fit.
+    pub fn heap_reusable_bytes(
+        &self,
+        domain: Option<&crate::memory_admission::DomainKey>,
+        scratch: &mut crate::kernels::metal::backing::ReuseCredit,
+    ) -> Result<usize> {
+        scratch.clear();
+        self.backings
+            .transient_shared
+            .collect_reusable_allocations(domain, scratch);
+        self.backings
+            .transient_private
+            .collect_reusable_allocations(domain, scratch);
+        scratch
+            .checked_total()
+            .ok_or_else(|| crate::Error::Msg("reusable heap capacity exceeds usize".into()))
+    }
+
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
         let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
         Ok(command_encoder)

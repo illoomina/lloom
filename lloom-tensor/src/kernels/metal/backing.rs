@@ -38,8 +38,9 @@ use super::ledger::{Ledger, Reservation};
 use super::{Buffer, Device, ResidencySet};
 pub use crate::allocation_admission::PredictionBasis;
 use crate::allocation_admission::{self, Prediction};
+pub use crate::heap_ranges::ReuseCredit;
 use crate::kernels::MetalKernelError;
-use crate::memory_admission::AllocationContext;
+use crate::memory_admission::{AllocationContext, DomainKey};
 pub type BackingAdmissionError = crate::allocation_admission::AllocationError<MetalKernelError>;
 use objc2_metal::{MTLDevice as _, MTLResource as _, MTLResourceOptions};
 use std::sync::Arc;
@@ -70,7 +71,7 @@ pub trait Backing: Send + Sync + std::fmt::Debug {
     /// `bytes` resident bytes of this backing's storage mode.
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError>;
     /// Explicit admitted route. Unsupported implementations MUST NOT silently
-    /// fall back to legacy unadmitted allocation. Heap enrollment remains pending.
+    /// fall back to legacy unadmitted allocation. Each implementation opts in.
     fn alloc_in(
         &self,
         _bytes: usize,
@@ -86,6 +87,12 @@ pub trait Backing: Send + Sync + std::fmt::Debug {
     /// holder's to remove).
     fn reclaim(&self, buffer: &Buffer) -> bool;
     fn stats(&self) -> BackingStats;
+    /// Enumerate ready free capacity already charged to this domain. Source
+    /// identity must remain retained for the whole collection; delegating
+    /// wrappers preserve identities so aliases are counted once. None means
+    /// legacy/unadmitted capacity. This is advisory capacity, not fit proof.
+    fn collect_reusable_allocations(&self, _domain: Option<&DomainKey>, _credit: &mut ReuseCredit) {
+    }
 }
 
 /// When a [`DeviceBuffer`]'s residency entry is committed.
@@ -211,6 +218,19 @@ impl Backing for DeviceBuffer {
 pub type Heap = HeapChunks;
 
 impl Backing for HeapChunks {
+    fn collect_reusable_allocations(&self, domain: Option<&DomainKey>, credit: &mut ReuseCredit) {
+        HeapChunks::collect_reusable_allocations(self, domain, credit)
+    }
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        Ok(Allocation {
+            buffer: HeapChunks::alloc_in(self, bytes, context)?,
+            reservation: None,
+        })
+    }
     /// The chunk holds the reservation; the sub-buffer carries none.
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         Ok(Allocation {
@@ -291,6 +311,10 @@ pub struct Fallback<A, B> {
 }
 
 impl<A: Backing, B: Backing> Backing for Fallback<A, B> {
+    fn collect_reusable_allocations(&self, domain: Option<&DomainKey>, credit: &mut ReuseCredit) {
+        self.first.collect_reusable_allocations(domain, credit);
+        self.then.collect_reusable_allocations(domain, credit);
+    }
     fn alloc_in(
         &self,
         bytes: usize,

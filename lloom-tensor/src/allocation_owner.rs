@@ -7,14 +7,41 @@ use crate::memory_admission::{DomainKey, PhysicalCharge};
 /// Clones retain ONE charge. Heap suballocations must share the chunk's owner.
 #[derive(Clone)]
 pub(crate) struct AllocationOwner {
+    // Drop retained native parents before this owner's charge retain. Anchors
+    // contain no Context/Commands backedge and are finalized on host custody.
+    anchor: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     charge: PhysicalCharge,
 }
 impl AllocationOwner {
-    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+    pub(crate) fn same_custody(&self, other: &Self) -> bool {
         self.charge.same_allocation(&other.charge)
+            && match (&self.anchor, &other.anchor) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
     pub(crate) fn new(charge: PhysicalCharge) -> Self {
-        Self { charge }
+        Self {
+            anchor: None,
+            charge,
+        }
+    }
+    /// Keep native allocation parents alive through every owner clone. Never
+    /// discard an existing anchor when extending custody. Parent anchors must
+    /// not reference this owner or a context containing it (no ownership cycle).
+    pub(crate) fn with_anchor<A: std::any::Any + Send + Sync>(
+        self,
+        anchor: std::sync::Arc<A>,
+    ) -> Self {
+        let anchor: std::sync::Arc<dyn std::any::Any + Send + Sync> = match self.anchor {
+            Some(previous) => std::sync::Arc::new((anchor, previous)),
+            None => anchor,
+        };
+        Self {
+            anchor: Some(anchor),
+            charge: self.charge,
+        }
     }
     pub(crate) fn domain_key(&self) -> DomainKey {
         self.charge.domain_key()
@@ -113,6 +140,33 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(native_submission);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn numeric_native_anchors_compose_and_outlive_original_owner() {
+        let domain = process_account().unadmitted_domain(Some(8)).unwrap();
+        let pass = domain.reserve(8).unwrap();
+        let charge = pass.context().take(8).unwrap().commit(8).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(RawOracle {
+            domain: domain.clone(),
+            drops: drops.clone(),
+        });
+        let second = Arc::new(RawOracle {
+            domain: domain.clone(),
+            drops: drops.clone(),
+        });
+        let owner = AllocationOwner::new(charge)
+            .with_anchor(first)
+            .with_anchor(second);
+        let escaped_subbuffer = owner.clone();
+        drop(pass);
+        drop(owner);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(domain.snapshot().committed, 8);
+        drop(escaped_subbuffer);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
 

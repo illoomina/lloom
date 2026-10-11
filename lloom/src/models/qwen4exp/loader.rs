@@ -431,19 +431,49 @@ pub const DEFAULT_KV_RESERVE_TOKENS: usize = 4096;
 /// (scale, bias) planes counted — §10.7a's 0.531× argument, at this
 /// geometry), plus the indexer's two f32 caches: the raw key per position
 /// and the compressed key per `indexer_compress_ratio` positions.
-pub fn kv_bytes_per_token(cfg: &Config) -> usize {
+pub fn kv_bytes_per_token(cfg: &Config) -> Result<usize> {
     let full = cfg
         .layer_types
         .iter()
         .filter(|k| matches!(k, LayerKind::Full))
         .count();
-    let f32 = std::mem::size_of::<f32>();
-    let kv =
-        cfg.kv_precision
-            .bytes_per_token(cfg.n_kv_heads, cfg.head_dim, lloom_tensor::DType::F32);
-    let indexer = cfg.indexer_head_dim * f32;
-    let blocks = (indexer).div_ceil(cfg.indexer_compress_ratio.max(1));
-    full * (kv + indexer + blocks)
+    // No full-attention layers means no KV predictor demand, regardless of
+    // fields belonging to absent attention geometry. Config validation is separate.
+    if full == 0 {
+        return Ok(0);
+    }
+    let fail = || lloom_tensor::Error::Msg("Qwen KV bytes per token exceed usize".into());
+    let kv = cfg.kv_precision.checked_bytes_per_token(
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        lloom_tensor::DType::F32,
+    )?;
+    let indexer = cfg
+        .indexer_head_dim
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(fail)?;
+    let blocks = indexer.div_ceil(cfg.indexer_compress_ratio.max(1));
+    kv.checked_add(indexer)
+        .and_then(|v| v.checked_add(blocks))
+        .and_then(|v| v.checked_mul(full))
+        .ok_or_else(fail)
+}
+
+pub(crate) fn kv_slab_bytes(cfg: &Config) -> Result<usize> {
+    kv_bytes_per_token(cfg)?
+        .checked_mul(super::qsa::KV_SLAB_TOKENS)
+        .ok_or_else(|| lloom_tensor::Error::Msg("Qwen KV slab unit exceeds usize".into()))
+}
+
+// Exact multiply before divide: saturating the product before /2 undercounts.
+fn prefill_transient_bytes(tile: usize, tiles: usize) -> Result<(usize, usize)> {
+    let fail = || lloom_tensor::Error::Msg("Qwen prefill transient exceeds usize".into());
+    let tile_bytes = tile
+        .checked_mul(super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN)
+        .ok_or_else(fail)?;
+    let further = (tile_bytes as u128) * (tiles.saturating_sub(2) as u128) / 2;
+    let total = (tile_bytes as u128).checked_add(further).ok_or_else(fail)?;
+    Ok((tile_bytes, usize::try_from(total).map_err(|_| fail())?))
 }
 
 /// The session's claims beside the expert pool, for the load-time
@@ -462,30 +492,33 @@ pub fn session_claims(
     prefill_tile: usize,
     loader: &StreamLoader,
     prefetch: bool,
-) -> Vec<SessionClaim> {
+) -> Result<Vec<SessionClaim>> {
     let tile = if prefill_tile == 0 {
         super::model::PREFILL_CHUNK
     } else {
         prefill_tile
     };
-    let tile_bytes = tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
     let tiles = if super::model::prefill_pair_on() {
         super::model::prefill_tiles()
     } else {
         2
     };
-    let further = tile_bytes.saturating_mul(tiles.saturating_sub(2)) / 2;
-    let per = kv_bytes_per_token(cfg);
-    vec![
+    let (tile_bytes, transient) = prefill_transient_bytes(tile, tiles)?;
+    let per = kv_bytes_per_token(cfg)?;
+    let kv = per
+        .checked_mul(kv_tokens)
+        .and_then(|v| v.checked_mul(rows.max(1)))
+        .ok_or_else(|| lloom_tensor::Error::Msg("Qwen session KV exceeds usize".into()))?;
+    Ok(vec![
         SessionClaim {
             name: "qwen4exp-kv",
-            bytes: rows.max(1) * kv_tokens * per,
+            bytes: kv,
             unit: per,
             capability: true,
         },
         SessionClaim {
             name: "qwen4exp-transient",
-            bytes: tile_bytes + further,
+            bytes: transient,
             unit: tile_bytes,
             capability: false,
         },
@@ -495,7 +528,7 @@ pub fn session_claims(
             unit: 1 << 20,
             capability: true,
         },
-    ]
+    ])
 }
 
 /// One of the session's fixed claims (`floor == want`): a capability
@@ -509,8 +542,11 @@ pub struct SessionClaim {
 }
 
 /// The session's claims summed: what the plan leaves out of the pool.
-pub fn session_floor_bytes(claims: &[SessionClaim]) -> usize {
-    claims.iter().map(|c| c.bytes).sum()
+pub fn session_floor_bytes(claims: &[SessionClaim]) -> Result<usize> {
+    claims.iter().try_fold(0usize, |sum, c| {
+        sum.checked_add(c.bytes)
+            .ok_or_else(|| lloom_tensor::Error::Msg("Qwen session claim sum exceeds usize".into()))
+    })
 }
 
 /// The staging ring's cap on the `pread` arm: `staging::DEFAULT_CAP_BYTES`
@@ -695,6 +731,20 @@ pub(crate) fn working_set_of(device: &Device) -> usize {
     0
 }
 
+fn checked_expert_slot_floor(cfg: &Config) -> Result<usize> {
+    let floor = cfg
+        .n_experts_per_tok
+        .checked_add(1)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor overflows usize".into()))?;
+    if floor > cfg.n_experts {
+        lloom_tensor::bail!(
+            "expert slot floor {floor} exceeds expert count {}",
+            cfg.n_experts
+        )
+    }
+    Ok(floor)
+}
+
 /// The slot pool `SlotBudget::Auto` resolves to: the expert pool's grant
 /// from the arbiter (`ledger::arbitrate`, §4.2) over the budget, with the
 /// resident tier and the session's claims as the other tenants — the
@@ -712,7 +762,8 @@ fn plan_slots<Rd: Read + Seek>(
 ) -> Result<SlotPlan> {
     let plan = plan_load_holding(gg, device, fraction, None, held)?;
     let per_slot = plan.expert_bytes_per_slot.max(1);
-    let reserve_bytes = session_floor_bytes(claims);
+    let reserve_bytes = session_floor_bytes(claims)?;
+    let min_slots = checked_expert_slot_floor(cfg)?;
     #[cfg(not(feature = "metal"))]
     let slots = {
         let _ = (per_slot, reserve_bytes);
@@ -720,7 +771,7 @@ fn plan_slots<Rd: Read + Seek>(
     };
     #[cfg(feature = "metal")]
     let slots = arbitrate_slots(&plan, cfg, fraction, claims, reserve_bytes)?;
-    let slots = slots.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
+    let slots = slots.clamp(min_slots, cfg.n_experts);
     Ok(SlotPlan {
         slots,
         working_set: plan.working_set,
@@ -744,10 +795,7 @@ fn arbitrate_slots(
         arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
     };
     let per_slot = plan.expert_bytes_per_slot.max(1);
-    let min_slots = cfg
-        .n_experts_per_tok
-        .checked_add(1)
-        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor overflows usize".into()))?;
+    let min_slots = checked_expert_slot_floor(cfg)?;
     let expert_floor = min_slots
         .checked_mul(per_slot)
         .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor bytes overflow usize".into()))?;
@@ -1026,7 +1074,7 @@ fn admit_machine<Rd: Read + Seek>(
             m.prefill_tile,
             &st.loader,
             st.prefetch,
-        ),
+        )?,
         None => session_claims(
             &cfg,
             m.rows,
@@ -1034,7 +1082,7 @@ fn admit_machine<Rd: Read + Seek>(
             m.prefill_tile,
             &StreamLoader::Pread,
             false,
-        )
+        )?
         .into_iter()
         .filter(|c| c.name != "qwen4exp-staging")
         .collect(),
@@ -1293,7 +1341,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     prefill_tile,
                     &stream.loader,
                     stream.prefetch,
-                );
+                )?;
                 if stream.drafter_bytes > 0 {
                     claims.push(SessionClaim {
                         name: "qwen4exp-drafter",
@@ -1712,6 +1760,68 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_session_predictors_refuse_overflow_and_preserve_zero_attention() {
+        use crate::nn::ops::{KvPrecision, KvQuant};
+        use lloom_tensor::DType;
+        let mut cfg = Config::tiny();
+        assert!(kv_bytes_per_token(&cfg).unwrap() > 0);
+        cfg.n_kv_heads = usize::MAX;
+        assert!(kv_bytes_per_token(&cfg).is_err());
+        assert!(kv_slab_bytes(&cfg).is_err());
+        cfg.layer_types.clear();
+        cfg.head_dim = usize::MAX;
+        cfg.indexer_head_dim = usize::MAX;
+        cfg.kv_precision = KvPrecision::quantized(KvQuant::Int4).unwrap();
+        assert_eq!(kv_bytes_per_token(&cfg).unwrap(), 0);
+        assert_eq!(kv_slab_bytes(&cfg).unwrap(), 0);
+        let claims =
+            session_claims(&cfg, usize::MAX, usize::MAX, 1, &StreamLoader::Io, false).unwrap();
+        assert_eq!(claims[0].bytes, 0);
+        let cfg = Config::tiny();
+        assert!(session_claims(&cfg, usize::MAX, 1, 1, &StreamLoader::Io, false).is_err());
+        assert!(session_claims(&cfg, 1, usize::MAX, 1, &StreamLoader::Io, false).is_err());
+        for precision in [
+            KvPrecision::dense(DType::F32),
+            KvPrecision::quantized(KvQuant::Int8).unwrap(),
+            KvPrecision::quantized(KvQuant::Int4).unwrap(),
+        ] {
+            assert!(precision
+                .checked_bytes_per_token(usize::MAX, 4, DType::F32)
+                .is_err());
+        }
+        let int4 = KvPrecision::quantized(KvQuant::Int4).unwrap();
+        assert!(int4.checked_bytes_per_token(1, 3, DType::F32).is_err());
+        assert_eq!(int4.checked_bytes_per_token(0, 3, DType::F32).unwrap(), 0);
+        assert_eq!(int4.checked_bytes_per_token(2, 4, DType::F32).unwrap(), 40);
+    }
+
+    #[test]
+    fn numeric_transient_and_claim_sum_are_exact_or_refused() {
+        let per = super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
+        let tile = usize::MAX / 3 / per;
+        let (unit, bytes) = prefill_transient_bytes(tile, 6).unwrap();
+        assert_eq!(bytes as u128, unit as u128 * 3);
+        assert!(unit as u128 * 4 > usize::MAX as u128);
+        assert!(prefill_transient_bytes(usize::MAX, 2).is_err());
+        assert!(prefill_transient_bytes(1, usize::MAX).is_err());
+        let c = |bytes| SessionClaim {
+            name: "numeric",
+            bytes,
+            unit: 1,
+            capability: true,
+        };
+        assert_eq!(session_floor_bytes(&[c(2), c(3)]).unwrap(), 5);
+        assert!(session_floor_bytes(&[c(usize::MAX), c(1)]).is_err());
+        let mut cfg = Config::tiny();
+        cfg.n_experts_per_tok = usize::MAX;
+        assert!(checked_expert_slot_floor(&cfg).is_err());
+        cfg.n_experts_per_tok = cfg.n_experts;
+        assert!(checked_expert_slot_floor(&cfg).is_err());
+        cfg.n_experts_per_tok = 0;
+        assert_eq!(checked_expert_slot_floor(&cfg).unwrap(), 1);
+    }
+
     fn header(dtype: GgmlDType, dims: &[usize]) -> TensorInfo {
         TensorInfo {
             ggml_dtype: dtype,
@@ -2041,7 +2151,7 @@ mod tests {
     #[test]
     fn the_auto_plan_leaves_the_session_reserve() {
         let cfg = Config::tiny();
-        let per = kv_bytes_per_token(&cfg);
+        let per = kv_bytes_per_token(&cfg).unwrap();
         let full = cfg
             .layer_types
             .iter()
@@ -2053,14 +2163,10 @@ mod tests {
                 + cfg.indexer_head_dim)
         );
         let claims = |rows, tile| {
-            session_floor_bytes(&session_claims(
-                &cfg,
-                rows,
-                4096,
-                tile,
-                &StreamLoader::Io,
-                false,
-            ))
+            session_floor_bytes(
+                &session_claims(&cfg, rows, 4096, tile, &StreamLoader::Io, false).unwrap(),
+            )
+            .unwrap()
         };
         let r1 = claims(1, 512);
         let r4 = claims(4, 512);
@@ -2089,7 +2195,7 @@ mod tests {
         use lloom_tensor::DType;
         let mut cfg = Config::flash_next();
         let indexer = 128 * 4 + 128;
-        let per = |cfg: &Config| kv_bytes_per_token(cfg);
+        let per = |cfg: &Config| kv_bytes_per_token(cfg).unwrap();
         assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 4 + indexer));
         cfg.kv_precision = KvPrecision::dense(DType::F16);
         assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 2 + indexer));

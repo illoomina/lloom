@@ -2710,6 +2710,35 @@ impl KvPrecision {
         }
     }
 
+    /// Checked predictor for admission callers. The legacy `bytes_per_token`
+    /// remains for callers not yet migrated; this does not validate a model.
+    pub fn checked_bytes_per_token(
+        self,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale_dtype: DType,
+    ) -> Result<usize> {
+        if n_kv_heads == 0 {
+            return Ok(0);
+        }
+        if self.quant == KvQuant::Int4 && head_dim % 2 != 0 {
+            lloom_tensor::bail!("int4 KV head dimension {head_dim} must be even")
+        }
+        let fail = || lloom_tensor::Error::Msg("KV bytes per token exceed usize".into());
+        let per_head = match self.quant.code_bytes(head_dim) {
+            None => head_dim
+                .checked_mul(self.dense.size_in_bytes())
+                .ok_or_else(fail)?,
+            Some(codes) => codes
+                .checked_add(2 * scale_dtype.size_in_bytes())
+                .ok_or_else(fail)?,
+        };
+        per_head
+            .checked_mul(n_kv_heads)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(fail)
+    }
+
     /// Bytes one token's K and V take in one layer of `n_kv_heads` heads of
     /// `head_dim`: the dense elements, or the codes plus one (scale, bias)
     /// pair per head vector at `scale_dtype` — the term that makes int8 more

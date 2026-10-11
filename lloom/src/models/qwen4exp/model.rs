@@ -5081,6 +5081,8 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     /// driver holds (`State::in_ring` over `spec_pools`, `State::in_pools`
     /// over `state_pools`), so here it is refused by name.
     fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
+        // Validate the unit before state construction, not after its allocations.
+        let _slab_unit = super::loader::kv_slab_bytes(cfg)?;
         let mut cache = State::<P>::own(cfg)?;
         self.arm_turn_checkpoints(&mut cache);
         #[cfg(feature = "metal")]
@@ -5094,7 +5096,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
                 Claim {
                     floor: 0,
                     want: 0,
-                    unit: super::qsa::KV_SLAB_TOKENS * super::loader::kv_bytes_per_token(cfg),
+                    unit: _slab_unit,
                     class: Class::Capability,
                 },
                 0,

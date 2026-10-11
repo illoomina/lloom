@@ -2,12 +2,16 @@
 //! shared host retirement service; token Drop publishes only metadata. Native
 //! submission adapters still have to retain the token through terminality.
 //!
-//! Host metadata growth is presently explicit, but not yet charged to a model.
-//! This source tranche does not enable family admission or claim free Drop.
+//! Accounted namespaces admit and retain logical slab layout in their existing
+//! ModelDomain. Per-origin group nodes also retain managed-layout charges.
+//! Token/control headers, member vectors and registry setup remain
+//! separate uncharged metadata obligations; this is not a malloc/RSS cap.
 use super::{Buffer, ResidencySet};
 use crate::allocation_owner::AllocationLease;
 use crate::completion_wake::Wake;
 use crate::host_anchor::{AnchorError, HostAnchorPermit, HostAnchorRegistry};
+use crate::membership_groups::{Groups, MembershipSource, SelectError};
+use crate::memory_admission::{AllocationOrigin, ModelDomain};
 use crate::retirement_owners::FailureSignal;
 use crate::retirement_registry::RegistryError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -113,21 +117,37 @@ impl std::fmt::Debug for Membership {
 }
 
 /// Namespace-local retention group, never a namespace/Commands backedge. Legacy
-/// backing constructors get an independent group with the same policy; an
-/// AllocationNamespace shares one group across all its backings.
+/// backing constructors retain immutable groups per committed-owner origin; an
+/// AllocationNamespace fixes its payer and shares that group across backings.
 pub(crate) struct MembershipDomain {
     residency: Arc<ResidencySet>,
     retain: bool,
+    source: MembershipSource,
     registry: Mutex<Option<Arc<Registry>>>,
-    group: Mutex<Option<Membership>>,
+    groups: Groups<Membership>,
 }
 impl MembershipDomain {
     pub(crate) fn new(residency: Arc<ResidencySet>, retain: bool) -> Arc<Self> {
+        Self::with_source(residency, retain, MembershipSource::Standalone)
+    }
+    pub(crate) fn new_in(
+        residency: Arc<ResidencySet>,
+        retain: bool,
+        domain: Option<ModelDomain>,
+    ) -> Arc<Self> {
+        Self::with_source(residency, retain, MembershipSource::Namespace(domain))
+    }
+    fn with_source(
+        residency: Arc<ResidencySet>,
+        retain: bool,
+        source: MembershipSource,
+    ) -> Arc<Self> {
         Arc::new(Self {
             residency,
             retain,
+            source,
             registry: Mutex::new(None),
-            group: Mutex::new(None),
+            groups: Groups::new(),
         })
     }
     fn registry(&self) -> Result<Arc<Registry>, MembershipError> {
@@ -150,18 +170,25 @@ impl MembershipDomain {
         drop(candidate);
         Ok(selected)
     }
-    fn empty_token(&self) -> Result<Membership, MembershipError> {
+    fn empty_token(&self, origin: &AllocationOrigin) -> Result<Membership, MembershipError> {
         let registry = self.registry()?;
-        // TODO #952: retain a typed admitted host metadata permit in each slab.
-        // This is NOT model memory admission; allocation charges remain separate.
-        match registry.reserve(
-            Cleanup {
-                residency: self.residency.clone(),
-                keys: Members::Empty,
-            },
-            Anchors(Members::Empty),
-            |_| Ok(()),
-        ) {
+        let cleanup = Cleanup {
+            residency: self.residency.clone(),
+            keys: Members::Empty,
+        };
+        let anchors = Anchors(Members::Empty);
+        let reserved = match origin {
+            AllocationOrigin::Domain(key) => {
+                let domain = key.model_domain();
+                registry.reserve_admitted(key.clone(), cleanup, anchors, |bytes| {
+                    let pass = domain.reserve(bytes).map_err(RegistryError::Admission)?;
+                    // Issued ticket remains valid after this short pass closes.
+                    pass.context().take(bytes).map_err(RegistryError::Admission)
+                })
+            }
+            AllocationOrigin::Legacy => registry.reserve(cleanup, anchors, |_| Ok(())),
+        };
+        match reserved {
             Ok(permit) => Ok(Membership(Arc::new(Token { permit }))),
             Err(rejected) => {
                 // Empty C cannot unregister anything; raw owners have not moved.
@@ -170,20 +197,19 @@ impl MembershipDomain {
             }
         }
     }
-    fn token(&self) -> Result<Membership, MembershipError> {
+    fn token(&self, origin: AllocationOrigin) -> Result<Membership, MembershipError> {
         if !self.retain {
-            return self.empty_token();
+            return self.empty_token(&origin);
         }
-        if let Some(group) = self.group.lock().as_ref() {
-            return Ok(group.clone());
-        }
-        let candidate = self.empty_token()?;
-        let selected = {
-            let mut slot = self.group.lock();
-            slot.get_or_insert_with(|| candidate.clone()).clone()
-        };
-        drop(candidate); // Empty losing record retires outside namespace lock.
-        Ok(selected)
+        let payer = origin.clone();
+        self.groups
+            .select(origin, || self.empty_token(&payer))
+            .map_err(|error| match error {
+                SelectError::Create(error) => error,
+                SelectError::Registry(error) => MembershipError::Registry(error),
+                SelectError::Anchor(error) => MembershipError::Anchor(error),
+                SelectError::ChargeEdit => MembershipError::Edit,
+            })
     }
     pub(crate) fn for_buffer(&self, buffer: &Buffer) -> Result<Membership, MembershipError> {
         // SAFETY: MTLBuffer implements MTLAllocation; protocol upcast only.
@@ -198,7 +224,11 @@ impl MembershipDomain {
         allocation: &ProtocolObject<dyn MTLAllocation>,
         owner: Option<crate::allocation_owner::AllocationOwner>,
     ) -> Result<Membership, MembershipError> {
-        let token = self.token()?;
+        let origin = self
+            .source
+            .resolve(owner.as_ref().map(|owner| owner.domain_key()))
+            .map_err(|error| MembershipError::Registry(RegistryError::Admission(error)))?;
+        let token = self.token(origin)?;
         // Both protocol retains exist before entering the prepared record edit.
         let raw: Raw = unsafe { Retained::retain(allocation as *const _ as *mut _) }
             .expect("borrowed live native allocation");

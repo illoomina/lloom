@@ -67,9 +67,10 @@ impl AllocationNamespace {
         // else from one `MTLBuffer` per miss with its residency committed at
         // the next cut; a persistent allocation takes from a resident
         // backing, wired when it is Shared.
-        let membership = crate::kernels::metal::membership::MembershipDomain::new(
+        let membership = crate::kernels::metal::membership::MembershipDomain::new_in(
             residency_set.clone(),
             super::device::retain_evicted_allocations(),
+            domain.clone(),
         );
         let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
             if transient_heaps_on() {

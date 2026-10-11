@@ -44,6 +44,14 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
     fn drop_captures(&self);
     fn finish_retire(&self);
     fn can_unregister(&self) -> bool;
+    /// Opt-in final metadata destruction on the service thread. Safety requires
+    /// no Weak/raw-Arc acquisition path: every external clone must start from
+    /// an already counted Arc. Service snapshots acquire under registry lock.
+    /// Every foreign final release must drop its Arc BEFORE notifying Wake.
+    /// Non-opt-in lifecycle adapters retain their existing unregister policy.
+    fn worker_final_metadata_drop(&self) -> bool {
+        false
+    }
     fn fail(&self, reason: Failure);
 }
 
@@ -51,6 +59,19 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
 pub(crate) enum ServiceError {
     StartFailed,
     Failed(Failure),
+}
+
+// Release snapshot references before waking the worker, including on unwind.
+// Otherwise the worker can observe the old count then park without a new wake.
+struct InboxSnapshot {
+    entries: Vec<Arc<dyn CleanupInbox>>,
+    wake: Arc<Wake>,
+}
+impl Drop for InboxSnapshot {
+    fn drop(&mut self) {
+        self.entries.clear();
+        self.wake.notify();
+    }
 }
 
 pub(crate) struct HostRetirementService {
@@ -105,6 +126,15 @@ impl HostRetirementService {
         self.pass()
     }
 
+    #[cfg(test)]
+    pub(crate) fn manual_with_snapshot(&self, run: impl FnOnce()) {
+        let _snapshot = InboxSnapshot {
+            entries: self.registry.lock().clone(),
+            wake: self.wake.clone(),
+        };
+        run();
+    }
+
     pub(crate) fn wake(&self) -> Arc<Wake> {
         self.wake.clone()
     }
@@ -138,8 +168,11 @@ impl HostRetirementService {
         // Rare failure/shutdown path: snapshot under the host registry lock so
         // concurrent worker removal cannot skip an entry by shifting indices.
         // Admission was closed before this call, so no new entry can be missed.
-        let entries = self.registry.lock().clone();
-        for entry in entries {
+        let snapshot = InboxSnapshot {
+            entries: self.registry.lock().clone(),
+            wake: self.wake.clone(),
+        };
+        for entry in &snapshot.entries {
             // An arbitrary adapter failure must not unwind past the worker and
             // lose the remaining wakeups. A bad adapter stays rooted, too.
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| entry.fail(reason))) {
@@ -163,21 +196,32 @@ impl HostRetirementService {
                 entry.finish_retire();
                 progressed = true;
             }
-            if entry.can_unregister() {
+            let removed = if entry.can_unregister() {
                 let mut registry = self.registry.lock();
-                // This worker is the only remover; registration only appends.
-                if registry
-                    .get(index)
-                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
-                {
-                    registry.swap_remove(index);
+                // The census and every service snapshot acquisition share this
+                // mutex. count2 is the registry root plus this pass handle;
+                // any foreign clone needs an already counted owner. Opt-in
+                // forbids Weak/raw acquisition after the last foreign release.
+                if registry.get(index).is_some_and(|current| {
+                    Arc::ptr_eq(current, &entry)
+                        && (!entry.worker_final_metadata_drop() || Arc::strong_count(current) == 2)
+                }) {
+                    Some(registry.swap_remove(index))
+                } else {
+                    None
                 }
-                drop(registry);
-                // entry is the last local handle only AFTER unlocking. Its
-                // contract guarantees no physical/panic owner remains inside.
             } else {
+                None
+            };
+            if removed.is_none() {
+                // Empty payload does not imply foreign metadata quiescence.
+                // Move on rather than spin while can_unregister stays true.
                 index += 1;
             }
+            // Both root disposal and final local metadata release occur only
+            // after registry unlock. The pass Arc roots the removed inbox.
+            drop(removed);
+            drop(entry);
         }
     }
 

@@ -6,6 +6,9 @@
 
 use crate::{
     completion_wake::Wake,
+    memory_admission::{
+        AdmissionError, AllocationOrigin, AllocationTicket, DomainKey, PhysicalCharge,
+    },
     retirement_mailbox::{CleanupPolicy, Detached, MailboxError, OwnerMailbox, Ticket},
     retirement_owners::{Failure, FailureSignal},
     retirement_service::{ActiveRetirement, CleanupInbox, HostRetirementService, ServiceError},
@@ -27,6 +30,7 @@ pub(crate) enum RegistryError {
     Service(ServiceError),
     MetadataAllocation,
     GrowthRefused,
+    Admission(AdmissionError),
 }
 pub(crate) struct Rejected<C, A> {
     pub error: RegistryError,
@@ -62,6 +66,10 @@ struct Slab<C, A, F> {
     waiters: Arc<Wake>,
     cleanup_policy: CleanupPolicy,
     active: Active<C, A, F>,
+    origin: AllocationOrigin,
+    // Rust drops fields in declaration order: metadata/payload storage first,
+    // retained logical-layout charge last. Arc/control headers are not covered.
+    metadata_charge: Option<PhysicalCharge>,
 }
 
 /// A native block retains this metadata handle, not an independently owned
@@ -70,10 +78,49 @@ struct Slab<C, A, F> {
 /// mailbox identity and generation. Logical marker data lives outside this
 /// handle (M4 Submission); M3 marker pins must be added before its integration.
 pub(crate) struct Registration<C, A, F> {
-    slab: Arc<Slab<C, A, F>>,
+    slab: SlabHandle<C, A, F>,
     index: usize,
     ticket: Ticket,
 }
+// No Weak or raw Arc acquisition is permitted for this module-private Slab.
+// A handle can clone only while it owns an already counted Arc. Release before
+// wake is essential to the service's worker-final metadata census.
+pub(crate) trait MetadataWake {
+    fn metadata_wake(&self) -> &Arc<Wake>;
+}
+pub(crate) struct HostMetadataHandle<T: MetadataWake>(Option<Arc<T>>);
+impl<T: MetadataWake> HostMetadataHandle<T> {
+    pub(crate) fn new(value: Arc<T>) -> Self {
+        Self(Some(value))
+    }
+}
+type SlabHandle<C, A, F> = HostMetadataHandle<Slab<C, A, F>>;
+impl<C, A, F> MetadataWake for Slab<C, A, F> {
+    fn metadata_wake(&self) -> &Arc<Wake> {
+        &self.wake
+    }
+}
+impl<T: MetadataWake> std::ops::Deref for HostMetadataHandle<T> {
+    type Target = Arc<T>;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("live slab handle")
+    }
+}
+impl<T: MetadataWake> Clone for HostMetadataHandle<T> {
+    fn clone(&self) -> Self {
+        Self(Some((**self).clone()))
+    }
+}
+impl<T: MetadataWake> Drop for HostMetadataHandle<T> {
+    fn drop(&mut self) {
+        if let Some(slab) = self.0.take() {
+            let wake = slab.metadata_wake().clone();
+            drop(slab);
+            wake.notify();
+        }
+    }
+}
+
 impl<C, A, F> Clone for Registration<C, A, F> {
     fn clone(&self) -> Self {
         Self {
@@ -143,86 +190,187 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         anchors: A,
         admit_growth: impl FnOnce(usize) -> Result<(), RegistryError>,
     ) -> Result<Registration<C, A, F>, Rejected<C, A>> {
-        let reject = |error, (captures, anchors)| Rejected {
-            error,
-            captures,
-            anchors,
-        };
+        // Explicit legacy origin; preserve its cells-based callback contract.
+        self.prepare_with(captures, anchors, &AllocationOrigin::Legacy, || {
+            admit_growth(CELLS)?;
+            self.new_slab(AllocationOrigin::Legacy, None)
+        })
+    }
+
+    pub(crate) fn prepare_admitted(
+        &self,
+        payer: DomainKey,
+        captures: C,
+        anchors: A,
+        admit_growth: impl FnOnce(usize) -> Result<AllocationTicket, RegistryError>,
+    ) -> Result<Registration<C, A, F>, Rejected<C, A>> {
+        let origin = AllocationOrigin::Domain(payer);
+        self.prepare_with(captures, anchors, &origin, || {
+            let bytes = Slab::<C, A, F>::layout_bytes(CELLS, CELLS)?;
+            let ticket = admit_growth(bytes)?;
+            let actual_origin = AllocationOrigin::Domain(ticket.domain_key());
+            origin
+                .validate_reuse(&actual_origin)
+                .map_err(RegistryError::Admission)?;
+            self.new_slab(actual_origin, Some(ticket))
+        })
+    }
+
+    fn new_slab(
+        &self,
+        origin: AllocationOrigin,
+        mut ticket: Option<AllocationTicket>,
+    ) -> Result<Arc<Slab<C, A, F>>, RegistryError> {
+        let mut slab = Slab::new(
+            self.failure.clone(),
+            self.wake.clone(),
+            self.waiters.clone(),
+            self.cleanup_policy,
+            origin,
+        )?;
+        if let Some(ticket) = ticket.as_mut() {
+            // Reconcile actual vector capacities, not just the requested length.
+            let actual =
+                match Slab::<C, A, F>::layout_bytes(slab.cells.capacity(), slab.ordered.capacity())
+                {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        drop(slab);
+                        return Err(error);
+                    }
+                };
+            match ticket.try_commit(actual) {
+                Ok(charge) => slab.metadata_charge = Some(charge),
+                Err(error) => {
+                    // Unpublished allocation dies while its promise still lives.
+                    drop(slab);
+                    return Err(RegistryError::Admission(error));
+                }
+            }
+        }
+        Ok(Arc::new(slab))
+    }
+
+    fn prepare_with(
+        &self,
+        captures: C,
+        anchors: A,
+        origin: &AllocationOrigin,
+        grow: impl FnOnce() -> Result<Arc<Slab<C, A, F>>, RegistryError>,
+    ) -> Result<Registration<C, A, F>, Rejected<C, A>> {
         let owner = (captures, anchors);
+        let mut producer = self.producer.lock();
         if let Some(reason) = self.failure.get() {
-            return Err(reject(
+            drop(producer);
+            return Err(Self::reject(
                 RegistryError::Mailbox(MailboxError::Failed(reason)),
                 owner,
             ));
         }
+        if let Some(found) = Self::find_cell(&producer, origin) {
+            return Self::prepare_cell(&mut producer, found, owner);
+        }
+        drop(producer);
+        // Cold admission/machine IO/allocation/finalizers never hold producer.
+        let candidate = grow();
         let mut producer = self.producer.lock();
+        if let Some(reason) = self.failure.get() {
+            drop(producer);
+            drop(candidate);
+            return Err(Self::reject(
+                RegistryError::Mailbox(MailboxError::Failed(reason)),
+                owner,
+            ));
+        }
+        // Cleanup or a competing cold candidate may have supplied capacity,
+        // even if our cold admission refused. Reuse needs no new demand.
+        if let Some(found) = Self::find_cell(&producer, origin) {
+            let result = Self::prepare_cell(&mut producer, found, owner);
+            drop(producer);
+            drop(candidate);
+            return result;
+        }
+        let slab = match candidate {
+            Ok(slab) => slab,
+            Err(error) => {
+                drop(producer);
+                return Err(Self::reject(error, owner));
+            }
+        };
+        if producer.slabs.try_reserve(1).is_err() {
+            drop(producer);
+            drop(slab);
+            return Err(Self::reject(RegistryError::MetadataAllocation, owner));
+        }
+        let inbox: Arc<dyn CleanupInbox> = slab.clone();
+        if let Err(error) = self.service.register(&inbox) {
+            drop(producer);
+            drop(inbox);
+            drop(slab);
+            return Err(Self::reject(RegistryError::Service(error), owner));
+        }
+        let index = producer.slabs.len();
+        producer.slabs.push(slab);
+        let cell = producer.slabs[index]
+            .reserve()
+            .expect("new slab has free cells");
+        let result = Self::prepare_cell(&mut producer, (index, cell), owner);
+        drop(producer);
+        drop(inbox);
+        result
+    }
+
+    fn find_cell(
+        producer: &Producer<C, A, F>,
+        origin: &AllocationOrigin,
+    ) -> Option<(usize, usize)> {
         let current = producer.current;
-        let found = producer
+        producer
             .slabs
             .get(current)
+            .filter(|slab| slab.origin.validate_reuse(origin).is_ok())
             .and_then(|slab| slab.reserve().map(|cell| (current, cell)))
             .or_else(|| {
                 producer.slabs.iter().enumerate().find_map(|(index, slab)| {
-                    if index == current {
+                    if index == current || slab.origin.validate_reuse(origin).is_err() {
                         None
                     } else {
                         slab.reserve().map(|cell| (index, cell))
                     }
                 })
-            });
-        let (slab_index, cell_index) = match found {
-            Some(found) => found,
-            None => {
-                // Cold growth is explicit and fallible; never park the cleanup
-                // worker waiting for metadata it would have to release itself.
-                if let Err(error) = admit_growth(CELLS) {
-                    return Err(reject(error, owner));
-                }
-                if producer.slabs.try_reserve(1).is_err() {
-                    return Err(reject(RegistryError::MetadataAllocation, owner));
-                }
-                let slab = match Slab::new(
-                    self.failure.clone(),
-                    self.wake.clone(),
-                    self.waiters.clone(),
-                    self.cleanup_policy,
-                ) {
-                    Ok(slab) => Arc::new(slab),
-                    Err(error) => return Err(reject(error, owner)),
-                };
-                let inbox: Arc<dyn CleanupInbox> = slab.clone();
-                if let Err(error) = self.service.register(&inbox) {
-                    return Err(reject(RegistryError::Service(error), owner));
-                }
-                let index = producer.slabs.len();
-                producer.slabs.push(slab);
-                let cell = producer.slabs[index]
-                    .reserve()
-                    .expect("new slab has free cells");
-                (index, cell)
-            }
-        };
+            })
+    }
+    fn reject(error: RegistryError, (captures, anchors): Owner<C, A>) -> Rejected<C, A> {
+        Rejected {
+            error,
+            captures,
+            anchors,
+        }
+    }
+    fn prepare_cell(
+        producer: &mut Producer<C, A, F>,
+        (slab_index, cell_index): (usize, usize),
+        owner: Owner<C, A>,
+    ) -> Result<Registration<C, A, F>, Rejected<C, A>> {
         producer.current = slab_index;
         let slab = &producer.slabs[slab_index];
         slab.occupied.fetch_add(1, Ordering::AcqRel);
         match slab.cells[cell_index].prepare(owner) {
             Ok(ticket) => {
-                // SAFETY: prepare advanced generation only after previous
-                // readers/PINNING ended. No new Registration has escaped yet.
+                // SAFETY: prior readers/pins ended; no new handle escaped yet.
                 unsafe { slab.ordered[cell_index].reset_generation() };
                 Ok(Registration {
-                    slab: slab.clone(),
+                    slab: SlabHandle::new(slab.clone()),
                     index: cell_index,
                     ticket,
                 })
             }
             Err(rejected) => {
                 slab.occupied.fetch_sub(1, Ordering::AcqRel);
-                // An exhausted generation stays unavailable. No wrap/reuse.
                 if rejected.error != MailboxError::GenerationExhausted {
                     slab.free.fetch_or(1u64 << cell_index, Ordering::Release);
                 }
-                Err(reject(
+                Err(Self::reject(
                     RegistryError::Mailbox(rejected.error),
                     rejected.value,
                 ))
@@ -230,21 +378,39 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync + 'stati
         }
     }
 }
+
 impl<C, A, F> Drop for OwnerRegistry<C, A, F> {
     fn drop(&mut self) {
-        for slab in &self.producer.get_mut().slabs {
+        let slabs = std::mem::take(&mut self.producer.get_mut().slabs);
+        for slab in &slabs {
             slab.producer_alive.store(false, Ordering::Release);
         }
+        drop(slabs);
         self.wake.notify();
     }
 }
 
 impl<C, A, F> Slab<C, A, F> {
+    fn layout_bytes(cells: usize, ordered: usize) -> Result<usize, RegistryError> {
+        let bytes = cells
+            .checked_mul(std::mem::size_of::<OwnerMailbox<Owner<C, A>, F>>())
+            .and_then(|cells| {
+                ordered
+                    .checked_mul(std::mem::size_of::<
+                        crate::ordered_metadata::OrderedMetadata<PinnedRegistration<C, A, F>>,
+                    >())
+                    .and_then(|ordered| cells.checked_add(ordered))
+            })
+            .and_then(|vectors| std::mem::size_of::<Self>().checked_add(vectors));
+        bytes.ok_or(RegistryError::Admission(AdmissionError::Overflow))
+    }
+
     fn new(
         failure: Arc<FailureSignal>,
         wake: Arc<Wake>,
         waiters: Arc<Wake>,
         cleanup_policy: CleanupPolicy,
+        origin: AllocationOrigin,
     ) -> Result<Self, RegistryError> {
         let mut cells = Vec::new();
         cells
@@ -271,6 +437,8 @@ impl<C, A, F> Slab<C, A, F> {
             waiters,
             cleanup_policy,
             active: ActiveRetirement::new(),
+            origin,
+            metadata_charge: None,
         })
     }
     fn reserve(&self) -> Option<usize> {
@@ -499,6 +667,9 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, F: Send + Sync +
         !self.producer_alive.load(Ordering::Acquire)
             && self.occupied.load(Ordering::Acquire) == 0
             && self.active.is_empty()
+    }
+    fn worker_final_metadata_drop(&self) -> bool {
+        true
     }
     fn fail(&self, reason: Failure) {
         self.failure.publish(reason, || {
@@ -956,5 +1127,316 @@ mod tests {
             record.cancel_before_handoff().unwrap();
         }
         drain(&service, &drops, CELLS + 1);
+    }
+}
+
+#[cfg(test)]
+mod metadata_admission_tests {
+    use super::*;
+    use crate::memory_admission::{AccountSnapshot, ModelDomain};
+
+    type Registry = OwnerRegistry<usize, usize, ()>;
+    type Record = Registration<usize, usize, ()>;
+    const FIXTURE_CAP: usize = 1 << 20;
+    fn setup() -> (Arc<HostRetirementService>, Registry, ModelDomain) {
+        let service = HostRetirementService::manual();
+        let registry = Registry::manual(Arc::new(FailureSignal::default()), service.clone());
+        (
+            service,
+            registry,
+            ModelDomain::isolated_numeric_fixture(FIXTURE_CAP),
+        )
+    }
+    fn ticket(domain: &ModelDomain, bytes: usize) -> Result<AllocationTicket, RegistryError> {
+        assert!(
+            bytes <= FIXTURE_CAP / 2,
+            "fixture slab exceeds bounded budget"
+        );
+        let pass = domain.reserve(bytes).map_err(RegistryError::Admission)?;
+        pass.context().take(bytes).map_err(RegistryError::Admission)
+    }
+    fn admitted(registry: &Registry, domain: &ModelDomain) -> Record {
+        registry
+            .prepare_admitted(domain.key(), 1, 2, |bytes| ticket(domain, bytes))
+            .unwrap_or_else(|_| panic!("fixture admitted prepare"))
+    }
+    fn cancel(service: &HostRetirementService, record: &Record) {
+        record.cancel_before_handoff().unwrap();
+        assert!(service.manual_pass(), "prepared cancellation not retired");
+    }
+
+    #[test]
+    fn charge_survives_payload_and_same_domain_warm_reuse() {
+        let (service, registry, domain) = setup();
+        let first = admitted(&registry, &domain);
+        let bytes = first.slab.metadata_charge.as_ref().unwrap().bytes();
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: bytes
+            }
+        );
+        cancel(&service, &first);
+        let reused = registry
+            .prepare_admitted(domain.key(), 3, 4, |_| panic!("warm growth"))
+            .unwrap_or_else(|_| panic!("warm reuse refused"));
+        assert!(Arc::ptr_eq(&first.slab, &reused.slab));
+        assert_eq!(first.index, reused.index);
+        cancel(&service, &reused);
+        drop(registry);
+        assert!(
+            !service.manual_pass(),
+            "empty foreign handles must not spin or retire payload"
+        );
+        assert_eq!(domain.snapshot().committed, bytes);
+        drop(first);
+        drop(reused);
+        // Foreign handle Drop only wakes; final charge belongs to the host pass.
+        assert_eq!(domain.snapshot().committed, bytes);
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn plain_and_pinned_foreign_release_precede_wake() {
+        let (service, registry, domain) = setup();
+        let record = admitted(&registry, &domain);
+        let pin = record.pin().unwrap();
+        cancel(&service, &record);
+        drop(registry);
+        drop(record);
+        service.manual_pass();
+        assert!(
+            domain.snapshot().committed > 0,
+            "foreign pin lost metadata custody"
+        );
+        let seen = service.wake().snapshot();
+        drop(pin);
+        assert_ne!(
+            seen,
+            service.wake().snapshot(),
+            "final handle failed to notify"
+        );
+        assert!(
+            domain.snapshot().committed > 0,
+            "foreign final Drop returned charge"
+        );
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn closing_snapshot_releases_before_wake_and_final_host_pass() {
+        let (service, registry, domain) = setup();
+        let record = admitted(&registry, &domain);
+        cancel(&service, &record);
+        drop(record);
+        drop(registry);
+        let mut seen = None;
+        service.manual_with_snapshot(|| {
+            service.close_admission();
+            service.manual_pass();
+            assert!(
+                domain.snapshot().committed > 0,
+                "snapshot metadata was unregistered"
+            );
+            seen = Some(service.wake().snapshot());
+        });
+        assert_ne!(
+            seen.unwrap(),
+            service.wake().snapshot(),
+            "snapshot release lost wake"
+        );
+        assert!(domain.snapshot().committed > 0);
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn refused_growth_and_foreign_ticket_preserve_inputs_and_cancel_pending() {
+        let (_service, registry, domain) = setup();
+        let rejected = registry
+            .prepare_admitted(domain.key(), 7, 9, |_| Err(RegistryError::GrowthRefused))
+            .err()
+            .expect("refusal ignored");
+        assert!(matches!(rejected.error, RegistryError::GrowthRefused));
+        assert_eq!((rejected.captures, rejected.anchors), (7, 9));
+        let foreign = ModelDomain::isolated_numeric_fixture(FIXTURE_CAP);
+        let rejected = registry
+            .prepare_admitted(domain.key(), 11, 13, |bytes| ticket(&foreign, bytes))
+            .err()
+            .expect("foreign ticket accepted");
+        assert!(matches!(
+            rejected.error,
+            RegistryError::Admission(AdmissionError::ReuseDomainMismatch { .. })
+        ));
+        assert_eq!((rejected.captures, rejected.anchors), (11, 13));
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+        assert_eq!(foreign.snapshot(), AccountSnapshot::default());
+        assert!(
+            registry.producer.lock().slabs.is_empty(),
+            "foreign ticket allocated/published slab"
+        );
+    }
+
+    #[test]
+    fn legacy_and_admitted_reuse_do_not_cross_origin() {
+        let (service, registry, domain) = setup();
+        let legacy = registry
+            .prepare(0, 0, |_| Ok(()))
+            .unwrap_or_else(|_| panic!("legacy"));
+        cancel(&service, &legacy);
+        let accounted = admitted(&registry, &domain);
+        assert!(
+            !Arc::ptr_eq(&legacy.slab, &accounted.slab),
+            "admitted reused uncharged legacy slab"
+        );
+        cancel(&service, &accounted);
+        let legacy_again = registry
+            .prepare(0, 0, |_| panic!("legacy warm growth"))
+            .unwrap_or_else(|_| panic!("legacy reuse"));
+        assert!(Arc::ptr_eq(&legacy.slab, &legacy_again.slab));
+        assert!(!Arc::ptr_eq(&accounted.slab, &legacy_again.slab));
+        cancel(&service, &legacy_again);
+        drop((legacy, accounted, legacy_again, registry));
+        service.manual_pass();
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn foreign_domain_warm_slab_is_not_reused() {
+        let (service, registry, domain) = setup();
+        let record = admitted(&registry, &domain);
+        cancel(&service, &record);
+        let foreign = ModelDomain::isolated_numeric_fixture(FIXTURE_CAP);
+        let rejected = registry
+            .prepare_admitted(foreign.key(), 23, 29, |_| Err(RegistryError::GrowthRefused))
+            .err()
+            .expect("foreign warm reuse bypassed admission");
+        assert!(matches!(rejected.error, RegistryError::GrowthRefused));
+        assert_eq!((rejected.captures, rejected.anchors), (23, 29));
+        assert_eq!(foreign.snapshot(), AccountSnapshot::default());
+        drop((record, registry));
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn undersized_ticket_rolls_back_unpublished_storage_and_pending() {
+        let (_service, registry, domain) = setup();
+        let rejected = registry
+            .prepare_admitted(domain.key(), 31, 37, |bytes| ticket(&domain, bytes - 1))
+            .err()
+            .expect("under-bound ticket accepted");
+        assert!(matches!(
+            rejected.error,
+            RegistryError::Admission(AdmissionError::PromiseTooSmall { .. })
+        ));
+        assert_eq!((rejected.captures, rejected.anchors), (31, 37));
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+        assert!(registry.producer.lock().slabs.is_empty());
+    }
+
+    #[test]
+    fn cold_refusal_rechecks_newly_returned_same_domain_credit() {
+        let (service, registry, domain) = setup();
+        let records: Vec<_> = (0..CELLS).map(|_| admitted(&registry, &domain)).collect();
+        let bytes = domain.snapshot().committed;
+        let reused = registry
+            .prepare_admitted(domain.key(), 41, 43, |_| {
+                assert!(registry.producer.try_lock().is_some());
+                cancel(&service, &records[0]);
+                Err(RegistryError::GrowthRefused)
+            })
+            .unwrap_or_else(|_| panic!("returned same-domain credit not rechecked"));
+        assert!(Arc::ptr_eq(&records[0].slab, &reused.slab));
+        assert_eq!(records[0].index, reused.index);
+        assert_eq!(domain.snapshot().committed, bytes);
+        cancel(&service, &reused);
+        for record in &records[1..] {
+            cancel(&service, record);
+        }
+        drop((records, reused, registry));
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn losing_cold_candidate_is_released_unlocked_and_credit_is_reused() {
+        let (service, registry, domain) = setup();
+        let mut winner = None;
+        let outer = registry
+            .prepare_admitted(domain.key(), 1, 2, |bytes| {
+                assert!(
+                    registry.producer.try_lock().is_some(),
+                    "cold callback held producer lock"
+                );
+                let record = admitted(&registry, &domain); // bounded simulated competing producer
+                cancel(&service, &record);
+                winner = Some(record);
+                ticket(&domain, bytes)
+            })
+            .unwrap_or_else(|_| panic!("outer prepare"));
+        let winner = winner.unwrap();
+        assert!(Arc::ptr_eq(&winner.slab, &outer.slab));
+        assert_eq!(registry.producer.lock().slabs.len(), 1);
+        assert_eq!(domain.snapshot().pending, 0);
+        assert_eq!(
+            domain.snapshot().committed,
+            outer.slab.metadata_charge.as_ref().unwrap().bytes()
+        );
+        cancel(&service, &outer);
+        drop((winner, outer, registry));
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn failure_on_cold_reacquisition_rolls_back_unpublished_charge() {
+        let (_service, registry, domain) = setup();
+        let rejected = registry
+            .prepare_admitted(domain.key(), 17, 19, |bytes| {
+                registry
+                    .failure
+                    .publish(Failure::Closing, || registry.wake.notify());
+                ticket(&domain, bytes)
+            })
+            .err()
+            .expect("closing accepted new candidate");
+        assert!(matches!(
+            rejected.error,
+            RegistryError::Mailbox(MailboxError::Failed(Failure::Closing))
+        ));
+        assert_eq!((rejected.captures, rejected.anchors), (17, 19));
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+        assert!(registry.producer.lock().slabs.is_empty());
+    }
+
+    #[test]
+    fn ordered_successor_pin_conservatively_retains_metadata() {
+        let (service, registry, domain) = setup();
+        let first = admitted(&registry, &domain);
+        let second = admitted(&registry, &domain);
+        let first_pin = first.pin().unwrap();
+        first_pin
+            .append_successor(second.pin().unwrap())
+            .unwrap_or_else(|_| panic!("successor"));
+        cancel(&service, &first);
+        cancel(&service, &second);
+        drop((first, second, registry));
+        service.manual_pass();
+        assert!(domain.snapshot().committed > 0);
+        let successor = first_pin.take_successor().expect("retained successor");
+        drop(first_pin);
+        service.manual_pass();
+        assert!(
+            domain.snapshot().committed > 0,
+            "successor pin disappeared from census"
+        );
+        drop(successor);
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
 }

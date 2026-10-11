@@ -4,6 +4,7 @@
 //! select dense attention or allocate a sequence-squared attention mask.
 
 mod head;
+mod host;
 pub use head::{DecisionHead, DecisionHeadBatch};
 
 mod trunk;

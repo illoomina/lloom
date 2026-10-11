@@ -1,6 +1,9 @@
 //! The pinned `modeling_d1.py::_forward` composition. Media encoders supply a
 //! shared prefix; request rendering/readout remain in the engine. This is not
 //! an independent allocator/admission policy or a complete family loader.
+use super::head::QuantizedDecisionHead;
+use super::host::{checked_host_capacity, prepared_vec};
+use super::trunk::{QuantizedTrunk, ResolvedTextConfig};
 use super::{DecisionHead, DecisionHeadBatch, TextConfig, Trunk, TrunkBatch};
 use crate::nn::VarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -58,10 +61,22 @@ impl PreparedRows {
 /// selection join this through the complete family owner, not a second model.
 #[derive(Debug, Clone)]
 pub struct DecisionCore {
+    inner: CoreInner<Trunk, DecisionHead>,
+}
+
+#[derive(Debug, Clone)]
+struct CoreGeometry {
+    vocab_size: usize,
+    width: usize,
+    max_length: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CoreInner<T, H> {
     owner: Arc<()>,
-    cfg: DecisionCoreConfig,
-    trunk: Trunk,
-    head: DecisionHead,
+    cfg: CoreGeometry,
+    trunk: T,
+    head: H,
     cos: Tensor,
     sin: Tensor,
     dtype: DType,
@@ -103,17 +118,141 @@ impl DecisionCore {
         let head = DecisionHead::load(cfg.text_config.hidden_size, cfg.head_layers, vb.pp("head"))?;
         let (cos, sin) = trunk.rope_tables(cfg.max_length)?;
         Ok(Self {
-            owner: Arc::new(()),
-            cfg,
-            trunk,
-            head,
-            cos,
-            sin,
-            dtype,
-            device,
+            inner: CoreInner {
+                owner: Arc::new(()),
+                cfg: CoreGeometry {
+                    vocab_size: cfg.text_config.vocab_size,
+                    width: cfg.text_config.hidden_size,
+                    max_length: cfg.max_length,
+                },
+                trunk,
+                head,
+                cos,
+                sin,
+                dtype,
+                device,
+            },
         })
     }
 
+    pub fn prepare_rows(&self, rows: &[DecisionRow<'_>]) -> Result<PreparedRows> {
+        self.inner.prepare_rows(rows)
+    }
+    pub fn forward_with_attention<T, H>(
+        &self,
+        rows: &PreparedRows,
+        trunk_attend: &mut T,
+        head_attend: &mut H,
+    ) -> Result<Tensor>
+    where
+        T: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+        H: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner
+            .forward_with_attention(rows, trunk_attend, head_attend)
+    }
+}
+
+// The two formats share request ownership/preparation and one forward body.
+// Capabilities stay private and statically dispatched; no per-layer dyn calls.
+trait TrunkExecution {
+    fn embed(&self, tokens: &[u32], batch: usize, length: usize) -> Result<Tensor>;
+    fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        prefixes: &[usize],
+    ) -> Result<TrunkBatch>;
+    fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &TrunkBatch,
+        cos: &Tensor,
+        sin: &Tensor,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>;
+}
+trait HeadExecution {
+    fn prepare_batch(
+        &self,
+        length: usize,
+        lengths: &[usize],
+        markers: &[&[usize]],
+        qtypes: &[u32],
+    ) -> Result<DecisionHeadBatch>;
+    fn forward_with_attention<F>(
+        &self,
+        hidden: &Tensor,
+        batch: &DecisionHeadBatch,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>;
+}
+macro_rules! trunk_execution {
+    ($ty:ty) => {
+        impl TrunkExecution for $ty {
+            fn embed(&self, tokens: &[u32], batch: usize, length: usize) -> Result<Tensor> {
+                <$ty>::embed(self, tokens, batch, length)
+            }
+            fn prepare_batch(
+                &self,
+                length: usize,
+                lengths: &[usize],
+                prefixes: &[usize],
+            ) -> Result<TrunkBatch> {
+                <$ty>::prepare_batch(self, length, lengths, prefixes)
+            }
+            fn forward_with_attention<F>(
+                &self,
+                hidden: &Tensor,
+                batch: &TrunkBatch,
+                cos: &Tensor,
+                sin: &Tensor,
+                attend: &mut F,
+            ) -> Result<Tensor>
+            where
+                F: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+            {
+                <$ty>::forward_with_attention(self, hidden, batch, cos, sin, attend)
+            }
+        }
+    };
+}
+macro_rules! head_execution {
+    ($ty:ty) => {
+        impl HeadExecution for $ty {
+            fn prepare_batch(
+                &self,
+                length: usize,
+                lengths: &[usize],
+                markers: &[&[usize]],
+                qtypes: &[u32],
+            ) -> Result<DecisionHeadBatch> {
+                <$ty>::prepare_batch(self, length, lengths, markers, qtypes)
+            }
+            fn forward_with_attention<F>(
+                &self,
+                hidden: &Tensor,
+                batch: &DecisionHeadBatch,
+                attend: &mut F,
+            ) -> Result<Tensor>
+            where
+                F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+            {
+                <$ty>::forward_with_attention(self, hidden, batch, attend)
+            }
+        }
+    };
+}
+trunk_execution!(Trunk);
+trunk_execution!(QuantizedTrunk);
+head_execution!(DecisionHead);
+head_execution!(QuantizedDecisionHead);
+
+impl<T: TrunkExecution, H: HeadExecution> CoreInner<T, H> {
     /// Validate host metadata and all prefix geometries before creating any
     /// Tensor. Prefix values are not read back for validation. Input usage counts
     /// the repeated prefix per question, matching the reference's batched API.
@@ -121,10 +260,15 @@ impl DecisionCore {
         if rows.is_empty() {
             lloom_tensor::bail!("omni decision batch is empty")
         }
-        let width = self.cfg.text_config.hidden_size;
-        let mut lengths = Vec::with_capacity(rows.len());
-        let mut prefixes = Vec::with_capacity(rows.len());
-        let mut totals = Vec::with_capacity(rows.len());
+        let width = self.cfg.width;
+        // Preflight every per-row host backing before the first reservation.
+        checked_host_capacity::<usize>(rows.len())?;
+        checked_host_capacity::<Tensor>(rows.len())?;
+        checked_host_capacity::<&[usize]>(rows.len())?;
+        checked_host_capacity::<u32>(rows.len())?;
+        let mut lengths = prepared_vec(rows.len())?;
+        let mut prefixes = prepared_vec(rows.len())?;
+        let mut totals = prepared_vec(rows.len())?;
         let mut input_tokens = 0usize;
         for row in rows {
             let n = row.tokens.len();
@@ -135,7 +279,7 @@ impl DecisionCore {
                 || row
                     .tokens
                     .iter()
-                    .any(|&t| t as usize >= self.cfg.text_config.vocab_size)
+                    .any(|&t| t as usize >= self.cfg.vocab_size)
             {
                 lloom_tensor::bail!(
                     "omni decision row has invalid tokens, markers or question type"
@@ -184,7 +328,7 @@ impl DecisionCore {
         }
         let max_options = rows.iter().map(|r| r.markers.len()).max().unwrap();
         checked_product(&[rows.len(), max_options, std::mem::size_of::<u32>()])?;
-        let mut embedded = Vec::with_capacity(rows.len());
+        let mut embedded = prepared_vec(rows.len())?;
         for (row, &total) in rows.iter().zip(&totals) {
             let text = self.trunk.embed(row.tokens, 1, row.tokens.len())?;
             let h = match row.prefix {
@@ -197,8 +341,12 @@ impl DecisionCore {
         }
         let hidden = Tensor::cat(&embedded, 0)?;
         let trunk = self.trunk.prepare_batch(longest, &totals, &prefixes)?;
-        let markers: Vec<&[usize]> = rows.iter().map(|r| r.markers).collect();
-        let qtypes: Vec<u32> = rows.iter().map(|r| r.question_type).collect();
+        let mut markers = prepared_vec(rows.len())?;
+        markers.extend(rows.iter().map(|r| r.markers));
+        let mut qtypes = prepared_vec(rows.len())?;
+        qtypes.extend(rows.iter().map(|r| r.question_type));
+        let mut option_counts = prepared_vec(rows.len())?;
+        option_counts.extend(rows.iter().map(|r| r.markers.len()));
         let head = self
             .head
             .prepare_batch(max_text, &lengths, &markers, &qtypes)?;
@@ -209,14 +357,14 @@ impl DecisionCore {
             head,
             text_lengths: lengths,
             prefix_lengths: prefixes,
-            option_counts: rows.iter().map(|r| r.markers.len()).collect(),
+            option_counts,
             max_text,
             input_tokens,
         })
     }
 
     fn text_rows(&self, hidden: &Tensor, rows: &PreparedRows) -> Result<Tensor> {
-        let mut text = Vec::with_capacity(rows.text_lengths.len());
+        let mut text = prepared_vec(rows.text_lengths.len())?;
         for (row, (&prefix, &length)) in rows
             .prefix_lengths
             .iter()
@@ -239,15 +387,15 @@ impl DecisionCore {
     /// F32 [B,max_options]; use option_counts to discard missing marker slots.
     /// Both policies are explicit and monomorphized; neither selects a hidden
     /// dense fallback, changes causality, or materializes an L² mask here.
-    pub fn forward_with_attention<T, H>(
+    pub fn forward_with_attention<TA, HA>(
         &self,
         rows: &PreparedRows,
-        trunk_attend: &mut T,
-        head_attend: &mut H,
+        trunk_attend: &mut TA,
+        head_attend: &mut HA,
     ) -> Result<Tensor>
     where
-        T: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
-        H: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+        TA: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+        HA: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
     {
         if !Arc::ptr_eq(&self.owner, &rows.owner) {
             lloom_tensor::bail!("omni prepared rows belong to another loaded core")
@@ -262,6 +410,90 @@ impl DecisionCore {
         )?;
         self.head
             .forward_with_attention(&self.text_rows(&hidden, rows)?, &rows.head, head_attend)
+    }
+}
+
+/// Format metadata is resolved before weight payload loading by the factory.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedDecisionCoreConfig {
+    pub(crate) text: ResolvedTextConfig,
+    pub(crate) head_layers: usize,
+    pub(crate) max_length: usize,
+}
+impl ResolvedDecisionCoreConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        QuantizedTrunk::validate_config(&self.text)?;
+        QuantizedDecisionHead::validate_config(self.text.hidden_size, self.head_layers)?;
+        self.text
+            .num_hidden_layers
+            .checked_add(self.head_layers)
+            .ok_or_else(|| lloom_tensor::Error::Msg("GGUF head layer index overflow".into()))?;
+        if self.max_length == 0 || self.max_length > self.text.max_position_embeddings {
+            lloom_tensor::bail!("omni GGUF outer maximum must fit positive text position limit")
+        }
+        crate::nn::rotary_emb::validate_default_rope_tables(
+            self.text.hidden_size / self.text.num_attention_heads,
+            self.text.rope_theta as f32,
+            self.max_length,
+            DType::F32,
+        )?;
+        Ok(())
+    }
+}
+
+/// GGUF is a static format axis of the same request core, not another model
+/// domain. The factory must admit the supplied map and retained RoPE tables.
+#[derive(Debug, Clone)]
+pub(crate) struct QuantizedDecisionCore {
+    inner: CoreInner<QuantizedTrunk, QuantizedDecisionHead>,
+}
+impl QuantizedDecisionCore {
+    pub(crate) fn load(
+        cfg: ResolvedDecisionCoreConfig,
+        vb: crate::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let geometry = CoreGeometry {
+            vocab_size: cfg.text.vocab_size,
+            width: cfg.text.hidden_size,
+            max_length: cfg.max_length,
+        };
+        let head = QuantizedDecisionHead::load(
+            cfg.text.hidden_size,
+            cfg.head_layers,
+            cfg.text.num_hidden_layers,
+            vb.clone(),
+        )?;
+        let trunk = QuantizedTrunk::load(cfg.text, vb.clone())?;
+        let (cos, sin) = trunk.rope_tables(cfg.max_length)?;
+        Ok(Self {
+            inner: CoreInner {
+                owner: Arc::new(()),
+                cfg: geometry,
+                trunk,
+                head,
+                cos,
+                sin,
+                dtype: DType::F32,
+                device: vb.device().clone(),
+            },
+        })
+    }
+    pub(crate) fn prepare_rows(&self, rows: &[DecisionRow<'_>]) -> Result<PreparedRows> {
+        self.inner.prepare_rows(rows)
+    }
+    pub(crate) fn forward_with_attention<T, H>(
+        &self,
+        rows: &PreparedRows,
+        trunk_attend: &mut T,
+        head_attend: &mut H,
+    ) -> Result<Tensor>
+    where
+        T: FnMut(&Tensor, &Tensor, &Tensor, &TrunkBatch, f64) -> Result<Tensor>,
+        H: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        self.inner
+            .forward_with_attention(rows, trunk_attend, head_attend)
     }
 }
 

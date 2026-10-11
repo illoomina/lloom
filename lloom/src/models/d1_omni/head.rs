@@ -277,6 +277,13 @@ pub(crate) struct QuantizedDecisionHead {
     inner: HeadInner<QuantizedLinear, PackedQkv<QuantizedLinear>>,
 }
 impl QuantizedDecisionHead {
+    pub(crate) fn validate_config(width: usize, layers: usize) -> Result<(usize, usize, usize)> {
+        HeadInner::<QuantizedLinear, PackedQkv<QuantizedLinear>>::validate_config(
+            width,
+            layers,
+            DType::F32,
+        )
+    }
     pub(crate) fn load(
         width: usize,
         layers: usize,
@@ -284,12 +291,7 @@ impl QuantizedDecisionHead {
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         use crate::quantized_nn as qnn;
-        let (heads, packed, intermediate) =
-            HeadInner::<QuantizedLinear, PackedQkv<QuantizedLinear>>::validate_config(
-                width,
-                layers,
-                DType::F32,
-            )?;
+        let (heads, packed, intermediate) = Self::validate_config(width, layers)?;
         trunk_layers
             .checked_add(layers)
             .ok_or_else(|| lloom_tensor::Error::Msg("GGUF head layer index overflow".into()))?;

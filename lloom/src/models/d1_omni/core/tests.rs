@@ -153,7 +153,7 @@ fn trunk_attention(
 // Does NOT call DecisionCore prepare/forward/text_rows, and has no padding.
 fn per_row(core: &DecisionCore, row: &DecisionRow<'_>) -> Result<Vec<f32>> {
     let n = row.tokens.len();
-    let text = core.trunk.embed(row.tokens, 1, n)?;
+    let text = core.inner.trunk.embed(row.tokens, 1, n)?;
     let (hidden, p) = if let Some(prefix) = row.prefix {
         (
             Tensor::cat(&[prefix.to_dtype(DType::F32)?, text], 1)?,
@@ -163,19 +163,21 @@ fn per_row(core: &DecisionCore, row: &DecisionRow<'_>) -> Result<Vec<f32>> {
         (text, 0)
     };
     let total = n + p;
-    let trunk = core.trunk.prepare_batch(total, &[total], &[p])?;
-    let output = core.trunk.forward_with_attention(
+    let trunk = core.inner.trunk.prepare_batch(total, &[total], &[p])?;
+    let output = core.inner.trunk.forward_with_attention(
         &hidden,
         &trunk,
-        &core.cos.narrow(0, 0, total)?,
-        &core.sin.narrow(0, 0, total)?,
+        &core.inner.cos.narrow(0, 0, total)?,
+        &core.inner.sin.narrow(0, 0, total)?,
         &mut trunk_attention,
     )?;
     let text = output.narrow(1, p, n)?;
     let head = core
+        .inner
         .head
         .prepare_batch(n, &[n], &[row.markers], &[row.question_type])?;
     Ok(core
+        .inner
         .head
         .forward_with_attention(&text, &head, &mut head_attention)?
         .to_vec2::<f32>()?
@@ -204,12 +206,12 @@ fn batching_matches_independent_rows_and_discards_nonzero_trunk_padding() -> Res
     assert_eq!(prepared.dimensions(), (2, 4, 3));
     assert_eq!(prepared.option_counts(), [3, 2]);
     assert_eq!(prepared.input_tokens(), 6);
-    assert_eq!(core.cos.dims(), [8, 32]); // outer max8, NOT text max32
-    let hidden = core.trunk.forward_with_attention(
+    assert_eq!(core.inner.cos.dims(), [8, 32]); // outer max8, NOT text max32
+    let hidden = core.inner.trunk.forward_with_attention(
         &prepared.hidden,
         &prepared.trunk,
-        &core.cos.narrow(0, 0, 4)?,
-        &core.sin.narrow(0, 0, 4)?,
+        &core.inner.cos.narrow(0, 0, 4)?,
+        &core.inner.sin.narrow(0, 0, 4)?,
         &mut trunk_attention,
     )?;
     let computed_padding = hidden
@@ -221,7 +223,7 @@ fn batching_matches_independent_rows_and_discards_nonzero_trunk_padding() -> Res
         computed_padding.iter().any(|x| x.abs() > 1e-3),
         "padding negative control is vacuous"
     );
-    let text = core.text_rows(&hidden, &prepared)?;
+    let text = core.inner.text_rows(&hidden, &prepared)?;
     assert!(
         text.narrow(0, 1, 1)?
             .narrow(1, 2, 1)?
@@ -301,7 +303,7 @@ fn invalid_rows_and_foreign_prepared_embeddings_are_rejected() -> Result<()> {
         prefix: None,
     }])?;
     let mut foreign = core.clone();
-    foreign.owner = Arc::new(());
+    foreign.inner.owner = Arc::new(());
     assert!(foreign
         .forward_with_attention(&prepared, &mut trunk_attention, &mut head_attention)
         .is_err());

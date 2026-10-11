@@ -643,3 +643,34 @@ fn gguf_q8_trunk_multirow_gqa_rope_matches_scalar_projection_reference() -> Resu
     close(&actual, &expected, "Q8 trunk residual output");
     Ok(())
 }
+
+#[test]
+fn public_prepare_rejects_host_capacity_before_any_large_reservation() -> Result<()> {
+    // D2/F32 makes the logical hidden and key byte counts exceed isize while
+    // still fitting usize on both32- and64-bit hosts. Only tiny weights exist.
+    let length = (isize::MAX as usize) / 8 + 1;
+    let mut cfg = config();
+    cfg.vocab_size = 1;
+    cfg.hidden_size = 2;
+    cfg.num_attention_heads = 1;
+    cfg.num_key_value_heads = 1;
+    cfg.num_hidden_layers = 1;
+    cfg.layer_types = vec!["conv".into()];
+    cfg.max_position_embeddings = length;
+    let trunk = Trunk::load(cfg, VarBuilder::zeros(DType::F32, &Device::Cpu))?;
+    let error = trunk.prepare_batch(length, &[1], &[0]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("host capacity exceeds layout limits"),
+        "{error}"
+    );
+    assert!(checked_host_capacity::<QuerySegment>(
+        (isize::MAX as usize) / std::mem::size_of::<QuerySegment>() + 1
+    )
+    .is_err());
+    assert_eq!(checked_host_capacity::<f32>(8)?, 8);
+    let small = prepared_vec::<f32>(8)?;
+    assert!(small.is_empty() && small.capacity() >= 8);
+    Ok(())
+}

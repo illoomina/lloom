@@ -1,6 +1,7 @@
 //! Bidirectional LFM2 encoder composition, following LiquidAI/d1-omni-600M
 //! encoder.py at 02b55d7076f15129e59ab3f94783f32c4b088674.
 //! Backend attention and request admission are supplied by the loaded owner.
+use super::host::{checked_host_capacity, prepared_vec};
 use crate::nn::blocks::{Neox, Rope, SwiGlu};
 use crate::nn::short_conv::{Centered, ShortConv};
 use crate::nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
@@ -492,23 +493,25 @@ impl<P: Module> TrunkInner<P> {
         }
         let weights = self.embedding.embeddings();
         let n = product(&[b, length])?;
-        product(&[
+        let n = checked_host_capacity::<f32>(n)?;
+        let keys_capacity = checked_host_capacity::<f32>(product(&[n, 2])?)?;
+        let mask_rows = checked_host_capacity::<QuerySegment>(product(&[b, 2])?)?;
+        let hidden_bytes = product(&[
             b,
             length,
             self.cfg.hidden_size,
             weights.dtype().size_in_bytes(),
         ])?;
-        product(&[n, 2, std::mem::size_of::<f32>()])?;
-        let mask_rows = product(&[b, 2])?;
+        checked_host_capacity::<u8>(hidden_bytes)?;
         let neg = if weights.dtype() == DType::F16 {
             -65504f32
         } else {
             -1e9f32
         };
-        let mut pad = Vec::with_capacity(n);
-        let mut right = Vec::with_capacity(n);
-        let mut keys = Vec::with_capacity(n * 2);
-        let mut segments = Vec::with_capacity(mask_rows);
+        let mut pad = prepared_vec(n)?;
+        let mut right = prepared_vec(n)?;
+        let mut keys = prepared_vec(keys_capacity)?;
+        let mut segments = prepared_vec(mask_rows)?;
         for (row, (&real, &prefix)) in lengths.iter().zip(prefixes).enumerate() {
             pad.extend((0..length).map(|p| if p < real { 1f32 } else { 0. }));
             right.extend((0..length).map(|p| {
@@ -623,12 +626,15 @@ pub(crate) struct QuantizedTrunk {
     inner: TrunkInner<QuantizedLinear>,
 }
 impl QuantizedTrunk {
+    pub(crate) fn validate_config(cfg: &ResolvedTextConfig) -> Result<usize> {
+        TrunkInner::<QuantizedLinear>::validate_config(cfg, DType::F32)
+    }
     pub(crate) fn load(
         cfg: ResolvedTextConfig,
         vb: crate::quantized_var_builder::VarBuilder,
     ) -> Result<Self> {
         use crate::quantized_nn::linear_no_bias as qlinear;
-        let intermediate = TrunkInner::<QuantizedLinear>::validate_config(&cfg, DType::F32)?;
+        let intermediate = Self::validate_config(&cfg)?;
         let d = cfg.hidden_size;
         let embedding = Embedding::new(
             vb.get((cfg.vocab_size, d), "token_embd.weight")?

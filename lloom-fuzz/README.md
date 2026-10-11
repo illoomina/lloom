@@ -58,8 +58,20 @@ target/aarch64-apple-darwin/fuzz-thin/fuzz_kv_pages --cores 1 --port 1337 --brok
 the cmplog build `--target-dir target-cmplog`. `--client-log FILE` captures the
 clients' stdout/stderr, which the launcher otherwise silences.)
 
-Run campaigns under `lloom-arb share` so they never silently perturb a
-measurement (`CONTRIBUTING.md` §3.2b).
+Campaigns and sanitizer runs are heavy workloads: use an exclusive
+`lloom-arb measure -- timeout <bound> <reviewed-campaign-driver>` lease, with
+explicit worker and memory bounds. A build lease permits concurrent builds and
+is not a memory quota. Do not use `lloom-arb share` for these runs.
+
+The main/secondary examples above remain supported, but run the entire bounded
+process group under **one** lease, not independent terminal jobs outside it.
+Retain a supervisor until its children are stopped and reaped; a timeout of the
+launcher alone does not prove that clients or the broker exited. On the shared
+NAS, acquire the NAS-local shared resource **outside** the container, wrapping
+the complete invocation. See issue #958's shared-machine contract and
+`CONTRIBUTING.md` §3.2b. New campaigns, sanitizer arms and native/checkpoint
+workloads still require the coordinator's bounded execution-plan review;
+these examples are not permission to start them concurrently.
 
 ## The ASan arm
 

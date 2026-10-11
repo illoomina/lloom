@@ -325,6 +325,19 @@ impl<C, A> ActiveRetirement<C, A> {
         Ok(())
     }
 
+    /// Trusted custody transfer into an already rooted, staged C. The editor
+    /// borrows C: it must move source owners directly into C and must not run
+    /// arbitrary user code or return an owned capture tuple. If it unwinds,
+    /// every completed transfer remains in this registered active record with A.
+    pub(crate) fn edit_staged<R>(&self, edit: impl FnOnce(&mut C) -> R) -> Result<R, ActiveError> {
+        let mut slot = self.record.lock();
+        let record = slot.as_mut().ok_or(ActiveError::Empty)?;
+        if record.state != ActivePhase::Staged {
+            return Err(ActiveError::WrongPhase);
+        }
+        Ok(edit(record.captures.as_mut().expect("staged captures")))
+    }
+
     pub(crate) fn drop_captures(&self) -> Result<(), ActiveError> {
         let captures = {
             let mut slot = self.record.lock();

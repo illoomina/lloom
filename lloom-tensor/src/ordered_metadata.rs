@@ -20,6 +20,7 @@ pub(crate) struct OrderedMetadata<P> {
     ordered_ready: AtomicBool,
     callbacks_finished: AtomicBool,
     wrapper_handles: AtomicUsize,
+    command_lifecycle: crate::command_lifecycle::CommandLifecycle,
 }
 // SAFETY: publication owns WRITING, extraction owns TAKEN after winning the
 // PUBLISHED CAS. No shared reference to P is exposed. Reset requires exclusive
@@ -35,6 +36,7 @@ impl<P> OrderedMetadata<P> {
             ordered_ready: AtomicBool::new(false),
             callbacks_finished: AtomicBool::new(false),
             wrapper_handles: AtomicUsize::new(0),
+            command_lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
         }
     }
     /// Caller owns a newly prepared mailbox generation, before returning its
@@ -53,6 +55,10 @@ impl<P> OrderedMetadata<P> {
         );
         // SAFETY: required generation exclusion; consumed/unused link is None.
         debug_assert!(unsafe { (&*self.successor.get()).is_none() });
+        // SAFETY: the same exclusive generation/pin boundary protects lifecycle tickets.
+        unsafe {
+            self.command_lifecycle.reset_generation();
+        }
         self.native_ready.store(false, Ordering::Relaxed);
         self.ordered_ready.store(false, Ordering::Relaxed);
         self.callbacks_finished.store(false, Ordering::Relaxed);
@@ -111,6 +117,9 @@ impl<P> OrderedMetadata<P> {
     }
     pub(crate) fn publish_callbacks_finished(&self) {
         self.callbacks_finished.store(true, Ordering::Release);
+    }
+    pub(crate) fn command_lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
+        &self.command_lifecycle
     }
     pub(crate) fn callbacks_finished(&self) -> bool {
         self.callbacks_finished.load(Ordering::Acquire)

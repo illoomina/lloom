@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     // One command buffer of `n` dispatches at `len` elements; its GPU interval in µs.
     let run = |len: usize, n: usize, dependent: bool| -> Result<f64> {
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
-        let enc = cb.compute_command_encoder_no_fence();
+        let enc = cb.compute_command_encoder_no_fence()?;
         for k in 0..n {
             if dependent {
                 let (a, b) = if k % 2 == 0 {
@@ -96,7 +96,7 @@ fn main() -> Result<()> {
                 cos(&enc, len, &src, &outs[k])?;
             }
         }
-        enc.end_encoding();
+        enc.end_encoding()?;
         cb.commit()?;
         cb.wait_until_completed()?;
         Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6)

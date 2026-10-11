@@ -1,7 +1,11 @@
 use crate::kernels::kernels::sdpa::SdpaDType;
 
+pub use crate::command_lifecycle::LifecycleError as CommandLifecycleError;
+
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
+    #[error("command buffer recording admission refused: {0}")]
+    RecordingAdmission(#[from] CommandLifecycleError),
     #[error("completion registration refused: {0}")]
     CompletionRegistration(#[from] CompletionRegistrationError),
     #[error("a completion callback cannot block on its own queue")]

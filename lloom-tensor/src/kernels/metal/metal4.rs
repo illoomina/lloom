@@ -195,6 +195,7 @@ impl Queue {
             queue: Arc::clone(self),
             retirement,
             native_reuse: crate::native_reuse::NativeReuse::new(),
+            command_lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
             committed_signals: OnceLock::new(),
             status: AtomicUsize::new(MTLCommandBufferStatus::NotEnqueued.0),
             state: Mutex::new(State {
@@ -333,6 +334,7 @@ pub(crate) struct Submission {
     pub queue: Arc<Queue>,
     retirement: super::retirement::Record,
     native_reuse: crate::native_reuse::NativeReuse<Slot>,
+    pub(super) command_lifecycle: crate::command_lifecycle::CommandLifecycle,
     committed_signals: OnceLock<Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>>,
     status: AtomicUsize,
     state: Mutex<State>,
@@ -344,6 +346,9 @@ unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
 
 impl Submission {
+    pub(super) fn notify_lifecycle(&self) {
+        self.retirement.notify_lifecycle();
+    }
     pub fn enqueue(&self) {
         // Commands has one open recording and commits it in producer order.
         // MTL4 has no native enqueue; this is logical state, not a queue reservation.
@@ -390,18 +395,22 @@ impl Submission {
     pub fn device(&self) -> &Device {
         &self.queue.device
     }
-    pub fn encoder(self: &Arc<Self>) -> Encoder {
-        let state = self.state.lock();
-        let slot = state.slot.as_ref().expect("uncommitted submission");
-        let raw = slot
-            .cb
-            .computeCommandEncoder()
-            .expect("MTL4 compute encoder");
+    pub fn encoder(self: &Arc<Self>) -> Result<Encoder, MetalKernelError> {
+        let state = self.recording_state()?;
+        let slot = state
+            .slot
+            .as_ref()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "submission no longer recording",
+            ))?;
+        let raw = slot.cb.computeCommandEncoder().ok_or_else(|| {
+            MetalKernelError::FailedToCreateResource("MTL4 compute encoder".into())
+        })?;
         raw.setArgumentTable(Some(&slot.table));
-        Encoder {
+        Ok(Encoder {
             raw,
             submission: Arc::clone(self),
-        }
+        })
     }
     /// Returns rejected captures intact. Error propagation must carry this
     /// owner beyond any caller's recording locks before its eventual Drop.
@@ -951,7 +960,7 @@ mod tests {
             .raw
             .waitForEvent_value(ProtocolObject::from_ref(&*event), 1);
         let submission = queue.acquire().unwrap();
-        let encoder = submission.encoder();
+        let encoder = submission.encoder().unwrap();
         encoder.raw.endEncoding();
         submission.commit().unwrap();
         let recording = submission.state.lock();
@@ -1007,7 +1016,7 @@ mod tests {
                     tx.send(observed.status()).unwrap();
                 })
                 .unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             unsafe {
@@ -1089,7 +1098,7 @@ mod tests {
                 unsafe {
                     *buffer.contents().as_ptr().cast::<f32>() = 0.;
                 }
-                let encoder = submission.encoder();
+                let encoder = submission.encoder().unwrap();
                 encoder.pipeline(&pipeline);
                 encoder.buffer(0, Some(&buffer), 0);
                 for _ in 0..count {
@@ -1166,7 +1175,7 @@ mod tests {
         let mut submissions = Vec::new();
         for _ in 0..SLOTS {
             let submission = queue.acquire().unwrap();
-            submission.encoder().raw.endEncoding();
+            submission.encoder().unwrap().raw.endEncoding();
             submission.commit().unwrap();
             submissions.push(submission);
         }
@@ -1229,7 +1238,7 @@ mod tests {
                 .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
                 .unwrap();
             let submission = queue.acquire().unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             // Each recording crosses the regular page boundary and also uses
@@ -1334,7 +1343,7 @@ mod tests {
         }
         let record = |queue: &Arc<Queue>, n: u32| {
             let submission = queue.acquire().unwrap();
-            let encoder = submission.encoder();
+            let encoder = submission.encoder().unwrap();
             encoder.pipeline(&pipeline);
             encoder.buffer(0, Some(&buffer), 0);
             unsafe {

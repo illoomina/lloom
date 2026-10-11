@@ -53,6 +53,7 @@ pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
+mod command_lifecycle;
 mod command_policy;
 mod completion_frontier;
 #[cfg(any(feature = "metal", test))]

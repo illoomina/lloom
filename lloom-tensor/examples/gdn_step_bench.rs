@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     // One command buffer of `n` steps in form `reg`; its GPU time per step.
     let run = |chain: bool, reg: bool| -> Result<f64> {
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
-        let enc = cb.compute_command_encoder_no_fence();
+        let enc = cb.compute_command_encoder_no_fence()?;
         for k in 0..a.n {
             let (src, dst, o) = if chain {
                 if k % 2 == 0 {
@@ -112,7 +112,7 @@ fn main() -> Result<()> {
                 reg,
             )?;
         }
-        enc.end_encoding();
+        enc.end_encoding()?;
         cb.commit()?;
         cb.wait_until_completed()?;
         Ok((cb.gpu_end_time() - cb.gpu_start_time()) * 1e6 / a.n as f64)
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
     // the read-out and the new state compared byte for byte.
     let one = |reg: bool, out: &Buffer, o: &Buffer| -> Result<(Vec<u8>, Vec<u8>)> {
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
-        let enc = cb.compute_command_encoder_no_fence();
+        let enc = cb.compute_command_encoder_no_fence()?;
         call_gdn_step(
             &dev,
             &enc,
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
             off(out),
             reg,
         )?;
-        enc.end_encoding();
+        enc.end_encoding()?;
         cb.commit()?;
         cb.wait_until_completed()?;
         let bytes = |b: &Buffer, n: usize| unsafe {

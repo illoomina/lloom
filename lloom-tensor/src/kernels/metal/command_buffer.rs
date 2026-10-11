@@ -14,27 +14,217 @@ pub struct CommandBuffer {
 
 #[derive(Clone)]
 enum Backend {
-    Metal3(Retained<ProtocolObject<dyn MTLCommandBuffer>>),
+    Metal3(Arc<Standalone>),
     Metal3Associated(super::metal3_retirement::AssociatedBuffer),
     Metal4(Arc<super::metal4::Submission>),
 }
 
-/// Prepared transaction shared by public submission and engine callers.
-pub(super) enum PreparedCommandCommit<'a> {
+/// Cold raw-interop wrapper state shared by public clones. Engine-associated
+/// M3 construction bypasses this Arc and uses its reusable metadata cell.
+/// Independently rewrapping/committing an escaped raw ObjC object remains an
+/// explicit raw-interop boundary, not covered by a wrapper-family gate.
+struct Standalone {
+    raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    lifecycle: crate::command_lifecycle::CommandLifecycle,
+    wake: crate::completion_wake::Wake,
+}
+impl std::ops::Deref for Standalone {
+    type Target = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+/// Prepared native ordering is released before the lifecycle waiter is woken.
+/// A returned error after commit entry closes recording admission; it does not
+/// establish native terminality or release registry-owned resources.
+pub(super) struct PreparedCommandCommit<'a> {
+    native: Option<PreparedNative<'a>>,
+    admission: RecordingAdmission<'a>,
+}
+enum PreparedNative<'a> {
     Metal3(&'a Retained<ProtocolObject<dyn MTLCommandBuffer>>),
     Metal3Associated(super::metal3_retirement::PreparedCommit<'a>),
     Metal4(super::metal4::PreparedCommit<'a>),
 }
+struct RecordingAdmission<'a> {
+    buffer: &'a CommandBuffer,
+    ticket: crate::command_lifecycle::Ticket,
+    entered: bool,
+    editing: bool,
+    released: bool,
+}
+fn lifecycle_error(
+    reason: crate::command_lifecycle::LifecycleError,
+) -> crate::kernels::MetalKernelError {
+    crate::kernels::MetalKernelError::RecordingAdmission(reason)
+}
+impl RecordingAdmission<'_> {
+    fn enter_commit(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.buffer
+            .lifecycle()
+            .entered_native(&mut self.ticket)
+            .map_err(lifecycle_error)?;
+        self.entered = true;
+        Ok(())
+    }
+    fn returned(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.buffer
+            .lifecycle()
+            .handoff_returned(&mut self.ticket)
+            .map_err(lifecycle_error)?;
+        self.released = true;
+        self.buffer.notify_lifecycle();
+        Ok(())
+    }
+}
+impl Drop for RecordingAdmission<'_> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        // Exact phase/serial ownership prevents a stale guard closing a later
+        // encoder. Unknown commit exit is not reset to a reusable recording.
+        let _ = if self.entered || std::thread::panicking() {
+            self.buffer.lifecycle().abandon(&mut self.ticket)
+        } else if self.editing {
+            self.buffer.lifecycle().finish_edit(&mut self.ticket)
+        } else {
+            self.buffer.lifecycle().cancel_prepared(&mut self.ticket)
+        };
+        self.buffer.notify_lifecycle();
+    }
+}
 impl PreparedCommandCommit<'_> {
-    pub(super) fn commit(self) -> Result<(), crate::kernels::MetalKernelError> {
-        match self {
-            Self::Metal3(raw) => {
+    pub(super) fn on_completion_of<F>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError>
+    where
+        F: Fn(Option<String>) + Send + Sync + 'static,
+    {
+        self.admission
+            .buffer
+            .on_feedback(move |feedback| f(feedback.error.clone()))
+    }
+    pub(super) fn record_gpu_time_on_completion(
+        &self,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        self.admission.buffer.record_gpu_time_unchecked()
+    }
+    pub(super) fn signal_event(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) {
+        self.admission.buffer.signal_event_unchecked(event, value);
+    }
+    pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.admission.enter_commit()?;
+        let result = match self.native.take().expect("prepared native transaction") {
+            PreparedNative::Metal3(raw) => {
                 raw.commit();
                 Ok(())
             }
-            Self::Metal3Associated(prepared) => prepared.commit(),
-            Self::Metal4(prepared) => prepared.commit(),
+            PreparedNative::Metal3Associated(prepared) => prepared.commit(),
+            PreparedNative::Metal4(prepared) => prepared.commit(),
+        };
+        // Consuming the native transaction released its ordering guard before
+        // either this notification or the admission guard's error notification.
+        result?;
+        self.admission.returned()
+    }
+}
+
+/// One encoder lifetime, shared through the existing EncoderState for compute.
+/// The parent wrapper pins lifecycle metadata and native physical custody.
+pub(super) struct EncoderAdmission {
+    buffer: CommandBuffer,
+    ticket: Option<crate::command_lifecycle::Ticket>,
+}
+/// Trusted registration capability borrowed only while closing an encoder.
+/// It avoids reacquiring public EDIT admission while ENDING owns the buffer.
+pub(super) struct EndingEncoder<'a> {
+    buffer: &'a CommandBuffer,
+}
+impl<'a> EndingEncoder<'a> {
+    pub(super) fn raw_compat(buffer: &'a CommandBuffer) -> Self {
+        Self { buffer }
+    }
+    pub(super) fn on_completion<F: Fn() + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        self.buffer.on_completion_unchecked(f)
+    }
+}
+impl EncoderAdmission {
+    pub(super) fn notify_lifecycle(&self) {
+        self.buffer.notify_lifecycle();
+    }
+    fn begin(buffer: &CommandBuffer) -> Result<Self, crate::kernels::MetalKernelError> {
+        let buffer = buffer.clone();
+        let ticket = buffer
+            .lifecycle()
+            .begin_encoder()
+            .map_err(lifecycle_error)?;
+        Ok(Self {
+            buffer,
+            ticket: Some(ticket),
+        })
+    }
+    fn cancel_creation(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        let ticket = self.ticket.as_mut().ok_or_else(|| {
+            crate::kernels::MetalKernelError::QueueUnavailable("encoder already closed")
+        })?;
+        self.buffer
+            .lifecycle()
+            .cancel_encoder_creation(ticket)
+            .map_err(lifecycle_error)?;
+        self.ticket = None;
+        self.buffer.notify_lifecycle();
+        Ok(())
+    }
+    /// The caller releases shared encoder state BEFORE notify_lifecycle. The
+    /// close callback contains native endEncoding even on registration refusal.
+    pub(super) fn end(
+        &mut self,
+        ended: &mut bool,
+        notify_after_close: bool,
+        close: impl FnOnce(EndingEncoder<'_>) -> Result<(), crate::kernels::MetalKernelError>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let _wake = notify_after_close.then(|| EncoderEndWake(&self.buffer));
+        let ticket = self.ticket.as_mut().ok_or_else(|| {
+            crate::kernels::MetalKernelError::QueueUnavailable("encoder already closed")
+        })?;
+        let result = self
+            .buffer
+            .lifecycle()
+            .end_encoder_with(ticket, ended, || {
+                close(EndingEncoder {
+                    buffer: &self.buffer,
+                })
+            })
+            .map_err(lifecycle_error)?;
+        self.ticket = None;
+        result
+    }
+}
+impl Drop for EncoderAdmission {
+    fn drop(&mut self) {
+        if let Some(ticket) = &mut self.ticket {
+            let _ = self.buffer.lifecycle().abandon(ticket);
+            self.buffer.notify_lifecycle();
         }
+    }
+}
+
+/// Declare before acquiring EncoderState so even unwind releases that lock
+/// before waking a host lifecycle poller.
+pub(super) struct EncoderEndWake<'a>(pub(super) &'a CommandBuffer);
+impl Drop for EncoderEndWake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_lifecycle();
     }
 }
 
@@ -51,30 +241,68 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    fn lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
+        match &self.backend {
+            Backend::Metal3(standalone) => &standalone.lifecycle,
+            Backend::Metal3Associated(buffer) => buffer.command_lifecycle(),
+            Backend::Metal4(submission) => &submission.command_lifecycle,
+        }
+    }
+    pub(super) fn notify_lifecycle(&self) {
+        match &self.backend {
+            Backend::Metal3(standalone) => standalone.wake.notify(),
+            Backend::Metal3Associated(buffer) => buffer.notify_lifecycle(),
+            Backend::Metal4(submission) => submission.notify_lifecycle(),
+        }
+    }
+
+    fn edit_recording(&self) -> Result<RecordingAdmission<'_>, crate::kernels::MetalKernelError> {
+        Ok(RecordingAdmission {
+            buffer: self,
+            ticket: self.lifecycle().begin_edit().map_err(lifecycle_error)?,
+            entered: false,
+            editing: true,
+            released: false,
+        })
+    }
+
     pub(super) fn prepare_commit(
         &self,
     ) -> Result<PreparedCommandCommit<'_>, crate::kernels::MetalKernelError> {
-        match &self.backend {
+        let admission = RecordingAdmission {
+            buffer: self,
+            ticket: self.lifecycle().prepare().map_err(lifecycle_error)?,
+            entered: false,
+            editing: false,
+            released: false,
+        };
+        let native = match &self.backend {
             Backend::Metal3(raw) => {
                 if raw.status().0 >= MTLCommandBufferStatus::Committed.0 {
                     return Err(crate::kernels::MetalKernelError::QueueUnavailable(
                         "standalone buffer already committed",
                     ));
                 }
-                Ok(PreparedCommandCommit::Metal3(raw))
+                PreparedNative::Metal3(raw)
             }
-            Backend::Metal3Associated(buffer) => buffer
-                .prepare_commit()
-                .map(PreparedCommandCommit::Metal3Associated),
-            Backend::Metal4(submission) => submission
-                .prepare_commit()
-                .map(PreparedCommandCommit::Metal4),
-        }
+            Backend::Metal3Associated(buffer) => {
+                PreparedNative::Metal3Associated(buffer.prepare_commit()?)
+            }
+            Backend::Metal4(submission) => PreparedNative::Metal4(submission.prepare_commit()?),
+        };
+        Ok(PreparedCommandCommit {
+            native: Some(native),
+            admission,
+        })
     }
 
     pub fn new(raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Self {
         Self {
-            backend: Backend::Metal3(raw),
+            backend: Backend::Metal3(Arc::new(Standalone {
+                raw,
+                lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
+                wake: crate::completion_wake::Wake::default(),
+            })),
         }
     }
 
@@ -92,15 +320,29 @@ impl CommandBuffer {
         physical: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         match self.backend {
-            Backend::Metal3(raw) => {
-                super::metal3_retirement::AssociatedBuffer::new(raw, core, physical)
-                    .map(Self::from_metal3_associated)
-            }
+            Backend::Metal3(shared) => match Arc::try_unwrap(shared) {
+                Ok(standalone) => {
+                    super::metal3_retirement::AssociatedBuffer::new(standalone.raw, core, physical)
+                        .map(Self::from_metal3_associated)
+                }
+                Err(shared) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                    crate::kernels::MetalKernelError::QueueUnavailable(
+                        "cannot re-associate shared standalone wrapper",
+                    ),
+                    Some((
+                        Self {
+                            backend: Backend::Metal3(shared),
+                        },
+                        physical,
+                    )),
+                )
+                .into()),
+            },
             backend => Err(crate::kernels::err::CompletionRegistrationError::new(
                 crate::kernels::MetalKernelError::QueueUnavailable(
                     "buffer already queue-associated",
                 ),
-                Some(Self { backend }),
+                Some((Self { backend }, physical)),
             )
             .into()),
         }
@@ -141,7 +383,7 @@ impl CommandBuffer {
         &self,
         fence: &Arc<Fence>,
         prev_ce_outputs: &PrevCeOutputs,
-    ) -> ComputeCommandEncoder {
+    ) -> Result<ComputeCommandEncoder, crate::kernels::MetalKernelError> {
         self.compute_command_encoder_with_executor(
             fence,
             prev_ce_outputs,
@@ -156,15 +398,24 @@ impl CommandBuffer {
         fence: &Arc<Fence>,
         prev_ce_outputs: &PrevCeOutputs,
         executor: &Arc<ExecutorSlot>,
-    ) -> ComputeCommandEncoder {
+    ) -> Result<ComputeCommandEncoder, crate::kernels::MetalKernelError> {
+        let mut admission = EncoderAdmission::begin(self)?;
         if let Backend::Metal4(s) = &self.backend {
-            return ComputeCommandEncoder::with_backend(
-                super::raw_encoder::Compute::Metal4(s.encoder()),
+            let raw = match s.encoder() {
+                Ok(raw) => raw,
+                Err(error) => {
+                    admission.cancel_creation()?;
+                    return Err(error);
+                }
+            };
+            return Ok(ComputeCommandEncoder::with_backend(
+                super::raw_encoder::Compute::Metal4(raw),
                 self.clone(),
                 Arc::clone(fence),
                 Arc::clone(prev_ce_outputs),
                 Arc::clone(executor),
-            );
+            )
+            .with_recording(admission));
         }
         let raw = match crate::kernels::metal::profile::sample_encoder(self.raw()) {
             Some((samples, index)) => self.sampled_encoder(&samples, index),
@@ -172,16 +423,20 @@ impl CommandBuffer {
                 .raw()
                 .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent),
         };
-        raw.map(|raw| {
-            ComputeCommandEncoder::with_backend(
-                super::raw_encoder::Compute::Metal3(raw),
-                self.clone(),
-                Arc::clone(fence),
-                Arc::clone(prev_ce_outputs),
-                Arc::clone(executor),
-            )
-        })
-        .unwrap()
+        let Some(raw) = raw else {
+            admission.cancel_creation()?;
+            return Err(crate::kernels::MetalKernelError::FailedToCreateResource(
+                "compute encoder".into(),
+            ));
+        };
+        Ok(ComputeCommandEncoder::with_backend(
+            super::raw_encoder::Compute::Metal3(raw),
+            self.clone(),
+            Arc::clone(fence),
+            Arc::clone(prev_ce_outputs),
+            Arc::clone(executor),
+        )
+        .with_recording(admission))
     }
 
     /// A concurrent compute encoder whose stage start and end write timestamps
@@ -207,7 +462,9 @@ impl CommandBuffer {
 
     /// Create a compute command encoder with freshly allocated fence and a standalone output map.
     /// Used by tests and `EncoderProvider` implementations that don't share a global fence map.
-    pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
+    pub fn compute_command_encoder_no_fence(
+        &self,
+    ) -> Result<ComputeCommandEncoder, crate::kernels::MetalKernelError> {
         let fence = Arc::new(Fence::new(&self.device()));
         self.compute_command_encoder(
             &fence,
@@ -221,18 +478,33 @@ impl CommandBuffer {
         &self,
         fence: &Arc<Fence>,
         prev_ce_outputs: &PrevCeOutputs,
-    ) -> BlitCommandEncoder {
+    ) -> Result<BlitCommandEncoder, crate::kernels::MetalKernelError> {
+        let mut admission = EncoderAdmission::begin(self)?;
         if let Backend::Metal4(s) = &self.backend {
-            return BlitCommandEncoder::with_backend(
-                super::raw_encoder::Blit::Metal4(s.encoder()),
+            let raw = match s.encoder() {
+                Ok(raw) => raw,
+                Err(error) => {
+                    admission.cancel_creation()?;
+                    return Err(error);
+                }
+            };
+            return Ok(BlitCommandEncoder::with_backend(
+                super::raw_encoder::Blit::Metal4(raw),
                 Arc::clone(fence),
                 Arc::clone(prev_ce_outputs),
-            );
+            )
+            .with_recording(admission));
         }
-        self.raw()
-            .blitCommandEncoder()
-            .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)))
-            .unwrap()
+        let Some(raw) = self.raw().blitCommandEncoder() else {
+            admission.cancel_creation()?;
+            return Err(crate::kernels::MetalKernelError::FailedToCreateResource(
+                "blit encoder".into(),
+            ));
+        };
+        Ok(
+            BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs))
+                .with_recording(admission),
+        )
     }
 
     pub fn commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
@@ -358,6 +630,13 @@ impl CommandBuffer {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) {
+        self.signal_event_unchecked(event, value)
+    }
+    fn signal_event_unchecked(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) {
         if let Backend::Metal4(s) = &self.backend {
             s.signal(event, value);
             return;
@@ -386,6 +665,22 @@ impl CommandBuffer {
     /// Register before commit; rejected captures remain owned by the returned
     /// error. Propagate that error beyond recording locks before dropping it.
     pub fn on_completion<F: Fn() + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        let _admission = match self.edit_recording() {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some(f),
+                ))
+            }
+        };
+        self.on_completion_unchecked(f)
+    }
+
+    fn on_completion_unchecked<F: Fn() + Send + Sync + 'static>(
         &self,
         f: F,
     ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
@@ -422,6 +717,15 @@ impl CommandBuffer {
     where
         F: Fn(Option<String>) + Send + Sync + 'static,
     {
+        let _admission = match self.edit_recording() {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some(f),
+                ))
+            }
+        };
         self.on_feedback(move |feedback| f(feedback.error.clone()))
     }
     fn on_feedback<F>(&self, f: F) -> Result<(), crate::kernels::err::CompletionRegistrationError>
@@ -472,6 +776,15 @@ impl CommandBuffer {
     }
 
     pub fn record_gpu_time_on_completion(
+        &self,
+    ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
+        let _admission = self.edit_recording().map_err(|error| {
+            crate::kernels::err::CompletionRegistrationError::new(error, None::<()>)
+        })?;
+        self.record_gpu_time_unchecked()
+    }
+
+    fn record_gpu_time_unchecked(
         &self,
     ) -> Result<(), crate::kernels::err::CompletionRegistrationError> {
         use crate::kernels::metal::profile;

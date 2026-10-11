@@ -304,6 +304,9 @@ pub(crate) struct PinnedRegistration<C, A, F> {
     permit: Option<crate::retirement_mailbox::PinPermit>,
 }
 impl<C, A, F> PinnedRegistration<C, A, F> {
+    pub(crate) fn command_lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
+        self.ordered().command_lifecycle()
+    }
     pub(crate) fn add_wrapper_handle(&self) -> Result<(), ()> {
         self.ordered().add_wrapper_handle()
     }
@@ -384,6 +387,14 @@ impl<C, A, F> Registration<C, A, F> {
         anchors: A,
     ) -> Result<(C, A), crate::retirement_mailbox::Rejected<(C, A)>> {
         self.slab.cells[self.index].replace_prepared(self.ticket, (captures, anchors))
+    }
+
+    /// Notify after a lifecycle predicate has been published or a producer guard released.
+    pub(crate) fn notify_lifecycle(&self) {
+        self.slab.wake.notify();
+        if !Arc::ptr_eq(&self.slab.wake, &self.slab.waiters) {
+            self.slab.waiters.notify();
+        }
     }
 
     pub(crate) fn report_failure(&self, reason: Failure) {

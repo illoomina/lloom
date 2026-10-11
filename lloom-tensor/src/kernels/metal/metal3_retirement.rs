@@ -238,7 +238,7 @@ impl Completions {
                 || self.wake.notify(),
             )?;
             next.publish_callbacks_finished();
-            self.wake.notify();
+            next.record().notify_lifecycle();
             let previous = {
                 let mut drain = self.drain.lock();
                 let retired = drain.next.take().expect("elected successor remains owned");
@@ -439,6 +439,12 @@ pub(super) struct CallbackRejected {
     pub callback: Option<super::retirement::Callback>,
 }
 impl AssociatedBuffer {
+    pub(super) fn command_lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
+        self.marker.command_lifecycle()
+    }
+    pub(super) fn notify_lifecycle(&self) {
+        self.marker.record().notify_lifecycle();
+    }
     pub(super) fn new(
         raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
         core: Arc<Completions>,

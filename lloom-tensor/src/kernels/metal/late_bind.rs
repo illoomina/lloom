@@ -140,7 +140,7 @@ mod tests {
 
         let queue = dev.new_command_queue().expect("queue");
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
-        let enc = cb.compute_command_encoder_no_fence();
+        let enc = cb.compute_command_encoder_no_fence().unwrap();
         let before_stale = report().late;
         enc.set_input_buffer(0, Some(&stale), 0);
         let after_stale = report().late;
@@ -156,7 +156,7 @@ mod tests {
         let after_live = report().late;
         // Ended before asserting: an encoder dropped open aborts the process
         // and hides which assertion failed.
-        enc.end_encoding();
+        enc.end_encoding().unwrap();
 
         assert_eq!(
             after_stale,

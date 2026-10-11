@@ -458,6 +458,9 @@ impl BoundSet {
 /// Barrier tracking state for one encoder session.
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
 pub struct EncoderState {
+    recording: Option<super::command_buffer::EncoderAdmission>,
+    ended: bool,
+    close_succeeded: bool,
     /// How hazards are keyed this session.
     pub hazard_key: HazardKey,
     /// Bindings written since last barrier (RAW/WAW detection).
@@ -548,6 +551,9 @@ impl EncoderState {
 
     pub fn with_hazard_key(hazard_key: HazardKey) -> Self {
         EncoderState {
+            recording: None,
+            ended: false,
+            close_succeeded: false,
             hazard_key,
             prev_outputs: BoundSet::default(),
             next_outputs: BoundSet::default(),
@@ -569,6 +575,7 @@ impl EncoderState {
 
 #[derive(Clone)]
 pub struct ComputeCommandEncoder {
+    finalizer: Option<Arc<super::commands::EncoderFinalizer>>,
     pub(crate) raw: super::raw_encoder::Compute,
     /// Retained so we can register completion handlers on this CB.
     pub(crate) command_buffer: super::CommandBuffer,
@@ -683,6 +690,7 @@ impl ComputeCommandEncoder {
         executor: Arc<ExecutorSlot>,
     ) -> ComputeCommandEncoder {
         ComputeCommandEncoder {
+            finalizer: None,
             raw,
             command_buffer,
             fence,
@@ -697,6 +705,61 @@ impl ComputeCommandEncoder {
             census: None,
             trace: None,
         }
+    }
+
+    pub(super) fn with_finalizer(
+        mut self,
+        finalizer: Arc<super::commands::EncoderFinalizer>,
+    ) -> Self {
+        self.finalizer = Some(finalizer);
+        self
+    }
+
+    pub(super) fn with_recording(self, admission: super::command_buffer::EncoderAdmission) -> Self {
+        self.state.lock().recording = Some(admission);
+        self
+    }
+
+    pub(super) fn end_encoding_with(
+        &self,
+        close: impl FnOnce(
+            super::command_buffer::EndingEncoder<'_>,
+            &mut EncoderState,
+        ) -> Result<(), crate::kernels::MetalKernelError>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let _wake = super::command_buffer::EncoderEndWake(&self.command_buffer);
+        let mut state = self.state.lock();
+        if state.close_succeeded {
+            return Ok(());
+        }
+        if state.ended {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "encoder already ended",
+            ));
+        }
+        // self.command_buffer remains a live parent anchor even if unwind
+        // drops this nonfinal lease before the state guard. The wake guard was
+        // declared first and notifies only after the state lock is released.
+        let mut recording = state.recording.take();
+        let mut ended = false;
+        let result = match recording.as_mut() {
+            Some(admission) => admission.end(&mut ended, false, |scope| {
+                state.ended = true;
+                close(scope, &mut state)
+            }),
+            None => {
+                state.ended = true;
+                close(
+                    super::command_buffer::EndingEncoder::raw_compat(&self.command_buffer),
+                    &mut state,
+                )
+            }
+        };
+        state.recording = recording;
+        if result.is_ok() {
+            state.close_succeeded = true;
+        }
+        result
     }
 
     /// The GPU clock of the queue this encoder's command buffer is committed on.
@@ -1385,9 +1448,15 @@ impl ComputeCommandEncoder {
         self.raw.updateFence(fence.raw());
     }
 
-    pub fn end_encoding(&self) {
-        self.raw.updateFence(self.fence.raw());
-        self.raw.endEncoding();
+    pub fn end_encoding(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        if let Some(finalizer) = &self.finalizer {
+            return finalizer.end_encoding(self);
+        }
+        self.end_encoding_with(|_, _| {
+            self.raw.updateFence(self.fence.raw());
+            self.raw.endEncoding();
+            Ok(())
+        })
     }
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
@@ -1431,6 +1500,9 @@ impl ComputeCommandEncoder {
 
 pub struct BlitCommandEncoder {
     pub(crate) raw: super::raw_encoder::Blit,
+    recording: Option<super::command_buffer::EncoderAdmission>,
+    ended: bool,
+    close_succeeded: bool,
     /// Per-encoder fence, updated at end_encoding.
     fence: Arc<Fence>,
     /// Shared global cross-encoder output map.
@@ -1464,6 +1536,9 @@ impl BlitCommandEncoder {
     ) -> BlitCommandEncoder {
         BlitCommandEncoder {
             raw,
+            recording: None,
+            ended: false,
+            close_succeeded: false,
             fence,
             prev_ce_outputs,
             tracked_outputs: Vec::new(),
@@ -1480,19 +1555,54 @@ impl BlitCommandEncoder {
         self.raw.updateFence(fence.raw());
     }
 
-    pub fn end_encoding(&self) {
-        // Signal this blit encoder's fence after all blit commands complete
-        self.update_fence(&self.fence);
-        self.raw.endEncoding();
+    pub(super) fn with_recording(
+        mut self,
+        admission: super::command_buffer::EncoderAdmission,
+    ) -> Self {
+        self.recording = Some(admission);
+        self
+    }
 
-        // Register outputs so subsequent encoders can wait. A write, taken once
-        // per encoder close -- rare against the per-bind reads above.
-        {
-            let mut map = self.prev_ce_outputs.write(Side::Host);
-            for &out in &self.tracked_outputs {
-                map.insert(out, Arc::clone(&self.fence));
-            }
+    pub fn end_encoding(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        let Self {
+            raw,
+            recording,
+            ended,
+            close_succeeded,
+            fence,
+            prev_ce_outputs,
+            tracked_outputs,
+        } = self;
+        // A confirmed close is idempotent for explicit end followed by guard
+        // Drop. An unknown native exit is not a successful close.
+        if *close_succeeded {
+            return Ok(());
         }
+        if *ended {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "blit encoder already ended",
+            ));
+        }
+        let close = || {
+            raw.updateFence(fence.raw());
+            raw.endEncoding();
+            let mut map = prev_ce_outputs.write(Side::Host);
+            for &out in tracked_outputs.iter() {
+                map.insert(out, Arc::clone(fence));
+            }
+            Ok(())
+        };
+        let result = if let Some(admission) = recording.as_mut() {
+            admission.end(ended, true, |_| close())
+        } else {
+            // Raw constructor compatibility has no engine recording lease.
+            *ended = true;
+            close()
+        };
+        if result.is_ok() {
+            *close_succeeded = true;
+        }
+        result
     }
 
     pub fn set_label(&self, label: &str) {

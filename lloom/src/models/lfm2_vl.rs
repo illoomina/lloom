@@ -227,6 +227,22 @@ impl super::siglip::TransformerConfig for VisionConfig {
 /// (`utils::antialias_bilinear_taps`) so the two cannot drift.
 use crate::utils::resize_pos_embed_antialias;
 
+/// Position values on padded patch rows. The original unpadded/legacy entry
+/// keeps its arithmetic; SigLIP2's full padded intermediate repeats row zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionPositionPadding {
+    Omit,
+    RepeatFirst,
+}
+
+fn checked_vision_product(values: &[usize]) -> Result<usize> {
+    values
+        .iter()
+        .try_fold(1usize, |n, &v| n.checked_mul(v))
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| lloom_tensor::Error::Msg("vision geometry/byte product overflow".into()))
+}
+
 #[derive(Debug, Clone)]
 struct VisionEmbeddings {
     patch_embedding: Linear,
@@ -267,8 +283,50 @@ impl VisionEmbeddings {
 
     /// `patches` is `[b, n, C*P*P]`; `(rows, cols)` is that image's patch grid,
     /// so `rows * cols` is the number of *real* patches and anything beyond it
-    /// in `n` is padding whose position embedding does not matter.
+    /// in `n` is padding, whose policy is explicit at the additive entry.
     fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+        self.forward_with_padding(patches, rows, cols, VisionPositionPadding::Omit)
+    }
+
+    fn forward_with_padding(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+        padding: VisionPositionPadding,
+    ) -> Result<Tensor> {
+        let (batch, n, patch_width) = patches.dims3()?;
+        let (hidden, expected_width) = self.patch_embedding.weight().dims2()?;
+        if [batch, n, rows, cols, self.pos_side, hidden].contains(&0)
+            || hidden != self.hidden
+            || patch_width != expected_width
+        {
+            lloom_tensor::bail!(
+                "vision embeddings require positive compatible patch/grid dimensions"
+            )
+        }
+        let n_real = checked_vision_product(&[rows, cols])?;
+        if n_real > n {
+            lloom_tensor::bail!("vision real patch grid {n_real} exceeds padded length {n}")
+        }
+        if checked_vision_product(&[self.pos_side, self.pos_side, hidden])? != self.pos_table.len()
+        {
+            lloom_tensor::bail!("vision position table must be a complete square grid")
+        }
+        // Validate all numeric allocations before patch projection/resampling.
+        // These are representability checks, not permission to consume memory.
+        for factors in [
+            &[batch, n, patch_width, patches.dtype().size_in_bytes()][..],
+            &[batch, n, hidden, patches.dtype().size_in_bytes()][..],
+            &[rows, self.pos_side, hidden, 4][..],
+            &[n_real, hidden, 4][..],
+            &[rows, self.pos_side, 8][..],
+            &[cols, self.pos_side, 8][..],
+            &[rows, std::mem::size_of::<(usize, Vec<f32>)>()][..],
+            &[cols, std::mem::size_of::<(usize, Vec<f32>)>()][..],
+        ] {
+            checked_vision_product(factors)?;
+        }
         let embeddings = patches.apply(&self.patch_embedding)?;
         let device = embeddings.device();
 
@@ -281,11 +339,9 @@ impl VisionEmbeddings {
         } else {
             resize_pos_embed_antialias(&self.pos_table, self.pos_side, self.hidden, rows, cols)
         };
-        let pos = Tensor::from_vec(pos, (1, rows * cols, self.hidden), device)?
+        let pos = Tensor::from_vec(pos, (1, n_real, self.hidden), device)?
             .to_dtype(embeddings.dtype())?;
 
-        let n_real = rows * cols;
-        let (_, n, _) = embeddings.dims3()?;
         if n == n_real {
             embeddings.broadcast_add(&pos)
         } else {
@@ -296,6 +352,10 @@ impl VisionEmbeddings {
             // softmax into every real position.
             let real = embeddings.narrow(1, 0, n_real)?.broadcast_add(&pos)?;
             let tail = embeddings.narrow(1, n_real, n - n_real)?;
+            let tail = match padding {
+                VisionPositionPadding::Omit => tail,
+                VisionPositionPadding::RepeatFirst => tail.broadcast_add(&pos.narrow(1, 0, 1)?)?,
+            };
             Tensor::cat(&[real, tail], 1)
         }
     }
@@ -336,6 +396,42 @@ impl VisionTower {
     /// Patch projection plus position embeddings, before the encoder.
     pub fn embeddings_only(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
         self.embeddings.forward(patches, rows, cols)
+    }
+
+    /// Full padded embedding intermediate, including the chosen position tail.
+    pub fn embeddings_with_padding(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+        padding: VisionPositionPadding,
+    ) -> Result<Tensor> {
+        self.embeddings
+            .forward_with_padding(patches, rows, cols, padding)
+    }
+
+    /// Additive policy entry. Existing `forward` remains the unpadded dense path.
+    /// Mask is passed unchanged to the monomorphized callback; caller owns its
+    /// numerical semantics, compact representation and whole-pass admission.
+    pub fn forward_with_attention<F>(
+        &self,
+        patches: &Tensor,
+        rows: usize,
+        cols: usize,
+        padding: VisionPositionPadding,
+        attention_mask: Option<&Tensor>,
+        attend: &mut F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Tensor, &Tensor, &Tensor, Option<&Tensor>, f64) -> Result<Tensor>,
+    {
+        let xs = self
+            .embeddings
+            .forward_with_padding(patches, rows, cols, padding)?;
+        let xs = self
+            .encoder
+            .forward_with_attention(&xs, attention_mask, attend)?;
+        xs.apply(&self.post_layernorm)
     }
 
     /// Encode one image's patches to `[1, rows*cols, hidden]`.
@@ -707,6 +803,15 @@ fn round_by_factor(number: usize, factor: usize) -> usize {
     (number as f64 / factor as f64).round_ties_even() as usize * factor
 }
 
+/// Preserve checkpoint-specific floating operation order in one patch loop.
+#[derive(Debug, Clone, Copy)]
+pub enum RgbNormalization {
+    /// `(byte / 255 - mean) / std`, the incumbent LFM2-VL path.
+    UnitRange { mean: [f32; 3], std: [f32; 3] },
+    /// `(byte - mean) / std`, used by d1-omni with mean/std127.5.
+    ByteRange { mean: [f32; 3], std: [f32; 3] },
+}
+
 impl ImageProcessor {
     /// `LiquidAI/LFM2.5-VL-3B`'s `processor_config.json`.
     pub fn lfm2_vl_3b() -> Self {
@@ -1062,10 +1167,56 @@ impl ImageProcessor {
         device: &Device,
         dtype: DType,
     ) -> Result<ProcessedImage> {
+        self.patchify_rgb8_with_normalization(
+            rgb,
+            rows,
+            cols,
+            device,
+            dtype,
+            RgbNormalization::UnitRange {
+                mean: self.image_mean,
+                std: self.image_std,
+            },
+        )
+    }
+
+    /// Checked RGB patch geometry and explicit normalisation arithmetic.
+    /// Does not validate/reserve earlier layout or resizer work; callers must
+    /// establish those bounds before entering `tiles_rgb8` independently.
+    pub fn patchify_rgb8_with_normalization(
+        &self,
+        rgb: &[u8],
+        rows: usize,
+        cols: usize,
+        device: &Device,
+        dtype: DType,
+        normalization: RgbNormalization,
+    ) -> Result<ProcessedImage> {
         let c = self.num_channels;
         let p = self.patch_size;
-        let (h, w) = (rows * p, cols * p);
-        let expected = h * w * c;
+        if c != 3 || [p, rows, cols].contains(&0) {
+            lloom_tensor::bail!(
+                "patchify requires three channels and positive patch/grid dimensions"
+            )
+        }
+        let (mean, std) = match normalization {
+            RgbNormalization::UnitRange { mean, std }
+            | RgbNormalization::ByteRange { mean, std } => (mean, std),
+        };
+        if mean.iter().any(|x| !x.is_finite()) || std.iter().any(|x| !x.is_finite() || *x <= 0.) {
+            lloom_tensor::bail!(
+                "patchify normalization needs finite mean and positive finite divisors"
+            )
+        }
+        let (h, w) = (
+            checked_vision_product(&[rows, p])?,
+            checked_vision_product(&[cols, p])?,
+        );
+        let expected = checked_vision_product(&[h, w, c])?;
+        checked_vision_product(&[expected, 4])?;
+        checked_vision_product(&[expected, dtype.size_in_bytes()])?;
+        let n = checked_vision_product(&[rows, cols])?;
+        let patch_width = checked_vision_product(&[c, p, p])?;
         if rgb.len() != expected {
             lloom_tensor::bail!(
                 "rgb buffer is {} bytes, expected {expected} for a {h}x{w} image \
@@ -1074,7 +1225,7 @@ impl ImageProcessor {
             );
         }
 
-        let mut data = vec![0f32; rows * cols * c * p * p];
+        let mut data = vec![0f32; expected];
         for pr in 0..rows {
             for pc in 0..cols {
                 let base = (pr * cols + pc) * c * p * p;
@@ -1084,16 +1235,18 @@ impl ImageProcessor {
                         let src = (src_row + pc * p + x) * c;
                         let dst = base + (y * p + x) * c;
                         for ch in 0..c {
-                            let v = rgb[src + ch] as f32 / 255.0;
-                            data[dst + ch] = (v - self.image_mean[ch]) / self.image_std[ch];
+                            let v = match normalization {
+                                RgbNormalization::UnitRange { .. } => rgb[src + ch] as f32 / 255.0,
+                                RgbNormalization::ByteRange { .. } => rgb[src + ch] as f32,
+                            };
+                            data[dst + ch] = (v - mean[ch]) / std[ch];
                         }
                     }
                 }
             }
         }
 
-        let patches =
-            Tensor::from_vec(data, (1, rows * cols, c * p * p), device)?.to_dtype(dtype)?;
+        let patches = Tensor::from_vec(data, (1, n, patch_width), device)?.to_dtype(dtype)?;
         Ok(ProcessedImage {
             patches,
             rows,

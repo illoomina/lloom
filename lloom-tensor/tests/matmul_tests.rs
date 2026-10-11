@@ -349,3 +349,45 @@ test_device!(
 );
 test_device!(squeeze_mm, squeeze_mm_cpu, squeeze_mm_gpu, squeeze_mm_metal);
 test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
+
+/// Broadcasting RHS over batch permits a single GEMM only when successive lhs
+/// rows also cross batch boundaries with the same row stride. Element-count
+/// equality alone is insufficient for transposed or narrowed matrix views.
+#[test]
+fn broadcast_rhs_batch_fold_preserves_strided_rows_cpu() -> Result<()> {
+    let dev = &Device::Cpu;
+    let rhs = Tensor::new(&[[1f32, -2.], [10., 3.]], dev)?;
+    let contiguous = Tensor::arange(0f32, 12f32, dev)?.reshape((2, 3, 2))?;
+    let transposed = Tensor::arange(0f32, 12f32, dev)?
+        .reshape((2, 2, 3))?
+        .transpose(1, 2)?;
+    let narrowed = Tensor::arange(0f32, 24f32, dev)?
+        .reshape((2, 3, 4))?
+        .narrow(2, 1, 2)?;
+    let column_strided = Tensor::arange(0f32, 18f32, dev)?
+        .reshape((2, 3, 3))?
+        .transpose(1, 2)?
+        .narrow(2, 1, 2)?;
+    for (name, lhs) in [
+        ("contiguous", contiguous),
+        ("transposed", transposed),
+        ("narrowed", narrowed),
+        ("column-strided", column_strided),
+    ] {
+        let values = lhs.to_vec3::<f32>()?;
+        let want = values
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|row| vec![row[0] + 10. * row[1], -2. * row[0] + 3. * row[1]])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            let actual = lhs.matmul(&rhs.broadcast_left(2)?)?.to_vec3::<f32>()?;
+            assert_eq!(actual, want, "broadcast rhs layout {name}");
+        }
+    }
+    Ok(())
+}

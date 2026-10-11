@@ -355,6 +355,7 @@ pub fn install_executor(
         let Device::Metal(dev) = device else {
             return Ok(super::report::Installed::default());
         };
+        let dev = dev.execution_device()?;
         let mut installed = super::report::Installed {
             pass_widths: "lru",
             ..Default::default()

@@ -124,6 +124,32 @@ pub struct DeviceBuffer {
     ledger: Option<Arc<Ledger>>,
 }
 
+type RawBuffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
+
+/// A cold candidate not yet published into residency or planner state. The
+/// admitted arm retains its uncommitted ticket, raw-first, through selection.
+pub(crate) struct StagedDeviceBuffer<'a> {
+    backing: &'a DeviceBuffer,
+    native: StagedNativeBuffer,
+    requested: usize,
+}
+enum StagedNativeBuffer {
+    Legacy(Buffer),
+    Accounted(allocation_admission::StagedAllocation<RawBuffer>),
+}
+impl StagedDeviceBuffer<'_> {
+    pub(crate) fn commit(self) -> Result<Allocation, BackingAdmissionError> {
+        let buffer = match self.native {
+            StagedNativeBuffer::Legacy(buffer) => buffer,
+            StagedNativeBuffer::Accounted(staged) => {
+                let (raw, owner) = staged.commit()?;
+                Buffer::new_owned(raw, owner)
+            }
+        };
+        Ok(self.backing.publish(buffer, self.requested))
+    }
+}
+
 impl DeviceBuffer {
     pub fn new(
         device: &Device,
@@ -138,6 +164,121 @@ impl DeviceBuffer {
             options,
             commit,
             ledger,
+        }
+    }
+    /// The admitted upload preserves native newBufferWithBytes; only the
+    /// requested input length reaches the native creator, never padded demand.
+    pub(crate) fn alloc_data_in<T>(
+        &self,
+        data: &[T],
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Err(BackingAdmissionError::Geometry(
+                "empty upload uses pooled minimum allocation",
+            ));
+        }
+        let pointer = std::ptr::NonNull::new(data.as_ptr().cast_mut().cast::<std::ffi::c_void>())
+            .expect("nonempty slice pointer");
+        self.alloc_native_in(bytes, context, |length| {
+            debug_assert_eq!(length, bytes);
+            // SAFETY: synchronous native copy of exactly this borrowed slice's
+            // object representation. No predicted alignment padding is read.
+            unsafe {
+                self.device.as_ref().newBufferWithBytes_length_options(
+                    pointer,
+                    length,
+                    self.options,
+                )
+            }
+            .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+        })
+    }
+
+    fn alloc_native_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+        create: impl FnOnce(
+            usize,
+        ) -> Result<
+            objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+            MetalKernelError,
+        >,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        self.stage_native_in(bytes, context, create)?.commit()
+    }
+
+    /// Selection-capable cold allocation. No residency entry exists until commit.
+    pub(crate) fn stage(
+        &self,
+        bytes: usize,
+        context: Option<&AllocationContext>,
+    ) -> Result<StagedDeviceBuffer<'_>, BackingAdmissionError> {
+        match context {
+            Some(context) => self.stage_native_in(bytes, context, |length| {
+                self.device
+                    .as_ref()
+                    .newBufferWithLength_options(length, self.options)
+                    .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+            }),
+            None => Ok(StagedDeviceBuffer {
+                backing: self,
+                native: StagedNativeBuffer::Legacy(
+                    self.device
+                        .new_buffer(bytes.max(1), self.options)
+                        .map_err(BackingAdmissionError::Native)?,
+                ),
+                requested: bytes.max(1),
+            }),
+        }
+    }
+
+    fn stage_native_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+        create: impl FnOnce(usize) -> Result<RawBuffer, MetalKernelError>,
+    ) -> Result<StagedDeviceBuffer<'_>, BackingAdmissionError> {
+        let requested = bytes.max(1);
+        if requested > self.device.as_ref().maxBufferLength() {
+            return Err(BackingAdmissionError::Geometry(
+                "request exceeds device maxBufferLength",
+            ));
+        }
+        let estimate = self
+            .device
+            .as_ref()
+            .heapBufferSizeAndAlignWithLength_options(requested, self.options);
+        let prediction = Prediction::standalone(requested, estimate.size, estimate.align)?;
+        let native =
+            allocation_admission::stage(context, prediction, create, |raw| raw.allocatedSize())?;
+        Ok(StagedDeviceBuffer {
+            backing: self,
+            native: StagedNativeBuffer::Accounted(native),
+            requested,
+        })
+    }
+
+    /// A selected candidate invalidated after commit. Remove its published
+    /// residency ownership while its raw Buffer still exists, outside planner
+    /// locks; then raw release precedes physical owner/legacy reservation Drop.
+    pub(crate) fn discard_selected(&self, allocation: Allocation) {
+        self.residency.remove(&allocation.buffer);
+        drop(allocation);
+    }
+
+    fn publish(&self, buffer: Buffer, requested: usize) -> Allocation {
+        match self.commit {
+            Commit::Deferred => self.residency.add(&buffer),
+            Commit::Now => self.residency.insert(&buffer),
+        };
+        // Parallel legacy diagnostics; physical owner remains on every Buffer alias.
+        let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
+        Allocation {
+            buffer,
+            reservation,
         }
     }
 }
@@ -157,38 +298,11 @@ impl Backing for DeviceBuffer {
         bytes: usize,
         context: &AllocationContext,
     ) -> Result<Allocation, BackingAdmissionError> {
-        let requested = bytes.max(1);
-        if requested > self.device.as_ref().maxBufferLength() {
-            return Err(BackingAdmissionError::Geometry(
-                "request exceeds device maxBufferLength",
-            ));
-        }
-        let estimate = self
-            .device
-            .as_ref()
-            .heapBufferSizeAndAlignWithLength_options(requested, self.options);
-        let prediction = Prediction::standalone(requested, estimate.size, estimate.align)?;
-        let (raw, owner) = allocation_admission::allocate(
-            context,
-            prediction,
-            |length| {
-                self.device
-                    .as_ref()
-                    .newBufferWithLength_options(length, self.options)
-                    .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
-            },
-            |raw| raw.allocatedSize(),
-        )?;
-        let buffer = Buffer::new_owned(raw, owner);
-        match self.commit {
-            Commit::Deferred => self.residency.add(&buffer),
-            Commit::Now => self.residency.insert(&buffer),
-        };
-        // Parallel legacy grant/pacer diagnostics, not another process charge.
-        let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
-        Ok(Allocation {
-            buffer,
-            reservation,
+        self.alloc_native_in(bytes, context, |length| {
+            self.device
+                .as_ref()
+                .newBufferWithLength_options(length, self.options)
+                .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
         })
     }
 

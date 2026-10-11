@@ -59,6 +59,8 @@ pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
+#[doc(hidden)]
+pub mod checkout;
 mod command_policy;
 pub mod conv;
 mod convert;
@@ -128,6 +130,8 @@ pub mod npy;
 pub mod op;
 pub mod options;
 pub mod pickle;
+#[cfg(any(feature = "metal", test))]
+mod planner_transaction;
 pub mod quantized;
 #[cfg(any(feature = "metal", test))]
 mod residency_ownership;

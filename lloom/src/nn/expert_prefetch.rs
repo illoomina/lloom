@@ -102,6 +102,9 @@ enum Part {
 }
 
 struct Req {
+    // Existing pass scope, not PassReservation. Shared retains the namespace
+    // and Commands independently; request Drop cannot be their final owner.
+    context: Option<lloom_tensor::metal_backend::AllocationRequest>,
     key: usize,
     generation: u64,
     expert: u32,
@@ -224,7 +227,7 @@ struct Shared {
     state: parking_lot::Mutex<State>,
     cv: parking_lot::Condvar,
     ring: SharedStagingRing,
-    device: MetalDevice,
+    allocation: lloom_tensor::metal_backend::AllocationWorker,
     counters: PrefetchCounters,
     max_staged_bytes: usize,
     stop: AtomicBool,
@@ -340,6 +343,32 @@ impl Prefetcher {
         max_staged_bytes: usize,
         split: usize,
     ) -> Self {
+        let allocation = lloom_tensor::metal_backend::AllocationWorker::legacy(device);
+        Self::with_allocation(allocation, ring, max_staged_bytes, split)
+    }
+
+    /// Fallible production constructor binds the worker to the active payer.
+    pub fn try_with_cap(
+        device: &MetalDevice,
+        ring: SharedStagingRing,
+        max_staged_bytes: usize,
+    ) -> Result<Self> {
+        let allocation = lloom_tensor::metal_backend::AllocationWorker::capture(device)?;
+        Ok(Self::with_allocation(
+            allocation,
+            ring,
+            max_staged_bytes,
+            default_split(),
+        ))
+    }
+
+    fn with_allocation(
+        allocation: lloom_tensor::metal_backend::AllocationWorker,
+        ring: SharedStagingRing,
+        max_staged_bytes: usize,
+        split: usize,
+    ) -> Self {
+        let clock = allocation.device().gpu_clock();
         let shared = Arc::new(Shared {
             state: parking_lot::Mutex::new(State {
                 direct_batches: 0,
@@ -356,11 +385,11 @@ impl Prefetcher {
             }),
             cv: parking_lot::Condvar::new(),
             ring,
-            device: device.clone(),
+            allocation,
             counters: PrefetchCounters::default(),
             max_staged_bytes,
             stop: AtomicBool::new(false),
-            clock: device.gpu_clock(),
+            clock,
             split,
         });
         let workers = (0..threads())
@@ -391,10 +420,12 @@ impl Prefetcher {
         now: bool,
         direct: Option<(u64, [DirectDst; 3], Epoch)>,
         out: &mut Vec<Req>,
+        context: Option<&lloom_tensor::metal_backend::AllocationRequest>,
     ) {
         let split = self.shared.split;
         if split == 0 {
             out.push(Req {
+                context: context.cloned(),
                 key,
                 generation,
                 expert,
@@ -414,6 +445,7 @@ impl Prefetcher {
         for (i, src) in planes.iter().enumerate() {
             for (lo, hi) in cut(src.plane_bytes, split) {
                 out.push(Req {
+                    context: context.cloned(),
                     key,
                     generation,
                     expert,
@@ -445,7 +477,28 @@ impl Prefetcher {
     /// down). Supersedes the tier's pending requests and hands back what it
     /// had staged and not taken (a hint is per pass: what the last pass left
     /// is stale).
+    /// Legacy-only compatibility API; scoped callers use try_request.
     pub fn request(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) {
+        self.shared.allocation.assert_legacy_request();
+        self.request_with(key, experts, planes, None)
+    }
+    pub fn try_request(
+        &self,
+        key: usize,
+        experts: &[u32],
+        planes: &[PlaneSource; 3],
+    ) -> Result<()> {
+        let context = self.shared.allocation.capture_request()?;
+        self.request_with(key, experts, planes, context.as_ref());
+        Ok(())
+    }
+    fn request_with(
+        &self,
+        key: usize,
+        experts: &[u32],
+        planes: &[PlaneSource; 3],
+        context: Option<&lloom_tensor::metal_backend::AllocationRequest>,
+    ) {
         let (leftovers, finished) = {
             let mut g = self.shared.state.lock();
             let gen = g.generation.entry(key).or_insert(0);
@@ -458,7 +511,7 @@ impl Prefetcher {
             }
             let mut reqs = Vec::with_capacity(experts.len());
             for &e in experts {
-                self.reqs_for(&mut g, key, gen, e, planes, false, None, &mut reqs);
+                self.reqs_for(&mut g, key, gen, e, planes, false, None, &mut reqs, context);
             }
             g.reqs.extend(reqs);
             (left, finished)
@@ -506,6 +559,7 @@ impl Prefetcher {
                     true,
                     Some((batch, j.dsts, j.epoch)),
                     &mut reqs,
+                    None, // Direct jobs write existing slots, not staging allocations.
                 );
             }
             g.direct_pending.insert(batch, reqs.len());
@@ -547,8 +601,15 @@ impl Prefetcher {
     /// group took it. The pass has reached the tier, so its requests still
     /// pending are cancelled (`stale`): the threads move on to the next
     /// layer's.
+    /// Legacy-only compatibility API; scoped callers use try_take_needed.
     pub fn take_needed(&self, key: usize, needed: &[u32]) -> Vec<Staged> {
+        self.shared.allocation.assert_legacy_request();
         self.take_needed_with(key, needed, true)
+    }
+
+    pub fn try_take_needed(&self, key: usize, needed: &[u32]) -> Result<Vec<Staged>> {
+        let _request = self.shared.allocation.capture_request()?;
+        Ok(self.take_needed_with(key, needed, true))
     }
 
     /// Read `experts` of tier `key` NOW through the reader threads — the
@@ -568,7 +629,27 @@ impl Prefetcher {
     /// Several layers' submissions then read concurrently
     /// (`Streamed::settle_batch`); each ticket is waited for with
     /// [`Self::wait_now`].
+    /// Legacy-only compatibility API; scoped callers use try_submit_now.
     pub fn submit_now(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) -> NowTicket {
+        self.shared.allocation.assert_legacy_request();
+        self.submit_now_with(key, experts, planes, None)
+    }
+    pub fn try_submit_now(
+        &self,
+        key: usize,
+        experts: &[u32],
+        planes: &[PlaneSource; 3],
+    ) -> Result<NowTicket> {
+        let context = self.shared.allocation.capture_request()?;
+        Ok(self.submit_now_with(key, experts, planes, context.as_ref()))
+    }
+    fn submit_now_with(
+        &self,
+        key: usize,
+        experts: &[u32],
+        planes: &[PlaneSource; 3],
+        context: Option<&lloom_tensor::metal_backend::AllocationRequest>,
+    ) -> NowTicket {
         let have = self.take_needed_with(key, experts, false);
         let missing: Vec<u32> = experts
             .iter()
@@ -588,7 +669,7 @@ impl Prefetcher {
             let gen = *g.generation.entry(key).or_insert(0);
             let mut reqs = Vec::with_capacity(missing.len());
             for &e in &missing {
-                self.reqs_for(&mut g, key, gen, e, planes, true, None, &mut reqs);
+                self.reqs_for(&mut g, key, gen, e, planes, true, None, &mut reqs, context);
             }
             Self::push_now(&mut g, reqs);
             gen
@@ -732,7 +813,7 @@ impl Prefetcher {
                 .flat_map(|v| v.iter().map(|s| s.expert))
                 .collect()
         };
-        self.take_needed(key, &all)
+        self.take_needed_with(key, &all, true)
     }
 
     /// A taken expert the layer landed (counted; its ring entries were
@@ -896,7 +977,7 @@ fn acquire_three(
     let mut ring = w.ring.lock();
     let mut got: Vec<(Option<usize>, BufferHandle)> = Vec::with_capacity(3);
     for src in planes {
-        match ring.acquire(&w.device, src.plane_bytes) {
+        match ring.acquire(w.allocation.device(), src.plane_bytes) {
             Ok((entry, buf)) if !buf.contents().is_null() => got.push((entry, buf)),
             other => {
                 if let Ok((entry, buf)) = &other {
@@ -1001,7 +1082,10 @@ fn worker(w: Arc<Shared>) {
                             w.counters.stale.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        match acquire_three(&w, &req.planes) {
+                        match w
+                            .allocation
+                            .run(req.context.as_ref(), || acquire_three(&w, &req.planes))
+                        {
                             Ok(bufs) => {
                                 let a = Assembly {
                                     key: req.key,
@@ -1151,7 +1235,7 @@ fn piece_landed(w: &Shared, asm: u64, failed: bool) {
 /// A whole-expert request: its three planes read one after another into
 /// ring entries, then staged (or handed back if superseded meanwhile).
 fn stage_whole(w: &Shared, req: &Req) {
-    match stage(w, req) {
+    match w.allocation.run(req.context.as_ref(), || stage(w, req)) {
         Ok(staged) => {
             let bytes = staged.bytes() as u64;
             let mut g = w.state.lock();
@@ -1196,27 +1280,27 @@ fn stage_whole(w: &Shared, req: &Req) {
 
 /// Read the three planes of `req.expert` into ring buffers.
 fn stage(w: &Shared, req: &Req) -> Result<Staged> {
-    let mut planes: Vec<(Option<usize>, BufferHandle)> = Vec::with_capacity(3);
+    // Declared outside every ring lock. Acquisition/read refusal drops this
+    // guard only after the inner lock guard is gone; each unused entry returns
+    // to the ring before its handle drops. Success moves all three to Staged.
+    let mut planes = super::checkout::Checkout::new(|(entry, buf)| {
+        w.ring.lock().release(entry, &buf);
+    });
     for src in &req.planes {
-        let (entry, buf) = {
-            let mut ring = w.ring.lock();
-            ring.acquire(&w.device, src.plane_bytes)?
-        };
+        let (_, buf) = planes.acquire(|| {
+            w.ring
+                .lock()
+                .acquire(w.allocation.device(), src.plane_bytes)
+        })?;
         let ptr = buf.contents();
         if ptr.is_null() {
-            let mut ring = w.ring.lock();
-            ring.release(entry, &buf);
-            for (e, b) in &planes {
-                ring.release(*e, b);
-            }
             lloom_tensor::bail!(
                 "the staging buffer has no CPU mapping ({} bytes)",
                 src.plane_bytes
             )
         }
-        // SAFETY: a Shared buffer of at least `plane_bytes` bytes acquired
-        // from the ring — its last copy complete, or fresh — mapped at
-        // `ptr`; nothing else references it until it is staged.
+        // SAFETY: a mapped entry acquired for this request alone; no native
+        // reader exists until the successful Staged result is later published.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, src.plane_bytes) };
         let t_read = std::time::Instant::now();
         let r = src.read(req.expert, dst);
@@ -1226,24 +1310,11 @@ fn stage(w: &Shared, req: &Req) -> Result<Staged> {
         w.counters
             .stage_read_bytes
             .fetch_add(src.plane_bytes as u64, Ordering::Relaxed);
-        if let Err(e) = r {
-            let mut ring = w.ring.lock();
-            ring.release(entry, &buf);
-            for (e, b) in &planes {
-                ring.release(*e, b);
-            }
-            return Err(lloom_tensor::Error::wrap(e));
-        }
-        planes.push((entry, buf));
+        r.map_err(lloom_tensor::Error::wrap)?;
     }
-    let mut it = planes.into_iter();
     Ok(Staged {
         expert: req.expert,
-        planes: [
-            it.next().expect("three"),
-            it.next().expect("three"),
-            it.next().expect("three"),
-        ],
+        planes: planes.into_array(),
     })
 }
 
@@ -1258,6 +1329,7 @@ mod tests {
             plane_bytes: 16,
         };
         Req {
+            context: None,
             key,
             generation: 0,
             expert: 1,

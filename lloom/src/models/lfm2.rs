@@ -9007,7 +9007,7 @@ impl<P: Profile> DecoderLayer<P> {
         #[cfg(feature = "metal")]
         if moved {
             if let Device::Metal(m) = mlp.gate.weight().device() {
-                m.drop_pass_plans();
+                m.execution_device()?.drop_pass_plans();
             }
         }
         #[cfg(not(feature = "metal"))]

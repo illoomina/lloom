@@ -1578,6 +1578,7 @@ impl<P: Profile> State<P> {
 fn declared_copy(t: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if let Ok(m) = t.device().as_metal_device() {
+        let m = m.execution_device()?;
         if m.activations_may_be_reused() {
             let _declared = lloom_tensor::EscapeGuard::new();
             return crate::nn::recurrent::own_copy(t);
@@ -2261,6 +2262,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if !m.pass_plans_enabled() || m.pass_open() {
                 return Ok(false);
             }
@@ -2600,6 +2602,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if seq > 1 {
             if let Ok(m) = self.device().as_metal_device() {
+                let m = m.execution_device()?;
                 if m.pass_plans_enabled() {
                     let opener = if own && !m.pass_open() {
                         PassOpener::Model
@@ -3322,12 +3325,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 if buf.contents().is_null() {
                     return Ok(None);
                 }
-                let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
-                    buf.clone(),
-                    m.clone(),
-                    n,
-                    lloom_tensor::DType::F32,
-                ));
+                let storage =
+                    lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
+                        buf.clone(),
+                        m.clone(),
+                        n,
+                        lloom_tensor::DType::F32,
+                    )?);
                 let t =
                     Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
                 *g = Some((buf, t, None));
@@ -3928,7 +3932,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             let bound = self.layers.len().max(1);
             let mut h = h.clone();
             for _ in 0..bound {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 cache.device_replays += 1;
@@ -3955,7 +3959,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             cache.replay_fallbacks += 1;
         }
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
@@ -4185,6 +4189,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn replay_input_owned(&self, h: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if let Ok(m) = h.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.activations_may_be_reused() {
                 let clock = m.gpu_clock();
                 let mut g = self.replay_h.lock();
@@ -4247,16 +4252,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The pass in progress replays: its recording holds the replay, which
     /// a pass that settles clean never runs, so it must not become its key's
     /// plan (`MetalDevice::pass_diverged`).
-    fn note_replay(&self) {
+    fn note_replay(&self) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
-            m.pass_diverged();
+            m.execution_device()?.pass_diverged();
         }
         // The tiers: the replay's resolves must not count the settled
         // token's experts into the hotlist again (#899's finding).
         for layer in &self.layers {
             layer.moe().experts().note_replay();
         }
+        Ok(())
     }
 
     /// Whether the fetch arm (`QWEN4EXP_FETCH=inside`) can run on this
@@ -4649,7 +4655,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let bound = self.layers.len().max(1);
         for attempt in 0..bound {
             if replay || attempt > 0 {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 if attempt > 0 {
@@ -4691,7 +4697,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             cache.settle_after_first += after_first;
         }
         cache.replay_fallbacks += 1;
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.open_window()?;
@@ -5125,6 +5131,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.pass_plans_enabled() {
                 let variant = if seq_len == 1 {
                     let planned = self.device_plan && plan_on_device() && !cache.window_open();
@@ -5423,7 +5430,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             return Ok(logits);
         }
         let t0 = std::time::Instant::now();
-        self.note_replay();
+        self.note_replay()?;
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
@@ -5816,7 +5823,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 .collect();
             R::settle_window(&parts, 0)?;
             let t1 = std::time::Instant::now();
-            self.note_replay();
+            self.note_replay()?;
             cache.accept_window(0)?;
             cache.redos += 1;
             cache.window_redos += 1;

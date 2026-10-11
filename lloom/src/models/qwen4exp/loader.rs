@@ -1392,10 +1392,10 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         #[cfg(feature = "metal")]
         let staging = match (device, &arm) {
             (Device::Metal(d), LoaderArm::Pread) => Some(
-                lloom_tensor::kernels::metal::staging::StagingRing::shared_with_cap(
+                lloom_tensor::kernels::metal::staging::StagingRing::try_shared_with_cap(
                     d,
                     staging_ring_bytes(&stream.loader, stream.prefetch),
-                ),
+                )?,
             ),
             _ => None,
         };
@@ -1404,13 +1404,13 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // One prefetcher for the tier, over the same ring.
         #[cfg(feature = "metal")]
         let prefetcher = match (device, &staging, stream.prefetch) {
-            (Device::Metal(d), Some(ring), true) => {
-                Some(Arc::new(crate::nn::expert_prefetch::Prefetcher::with_cap(
+            (Device::Metal(d), Some(ring), true) => Some(Arc::new(
+                crate::nn::expert_prefetch::Prefetcher::try_with_cap(
                     d,
                     Arc::clone(ring),
                     PREFETCH_STAGED_BYTES,
-                )))
-            }
+                )?,
+            )),
             _ => None,
         };
         let mut model = build(&mut gg, device, opts, |gg, l| {

@@ -203,7 +203,8 @@ impl lloom_tensor::CustomOp1 for Sigmoid {
             .map_err(MetalError::from)?;
         }
 
-        let new_storage = lloom_tensor::MetalStorage::new(buffer, device.clone(), el_count, dtype);
+        let new_storage =
+            lloom_tensor::MetalStorage::new_allocated(buffer, device.clone(), el_count, dtype)?;
         Ok((new_storage, layout.shape().clone()))
     }
 
@@ -436,13 +437,23 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
                         storage.dtype()
                     )
                 }
-                os.buffer_handle().clone()
+                lloom_tensor::MetalStorage::new(
+                    os.buffer_handle().clone(),
+                    os.device().clone(),
+                    elem_count,
+                    storage.dtype(),
+                )
             }
-            None => device
-                .new_buffer_builder()
-                .with_size_for(elem_count, storage.dtype())
-                .with_label("softmax")
-                .build()?,
+            None => lloom_tensor::MetalStorage::new_allocated(
+                device
+                    .new_buffer_builder()
+                    .with_size_for(elem_count, storage.dtype())
+                    .with_label("softmax")
+                    .build()?,
+                device.clone(),
+                elem_count,
+                storage.dtype(),
+            )?,
         };
         lloom_tensor::kernels::call_last_softmax(
             device.metal_device(),
@@ -453,12 +464,10 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
             last_dim,
             storage.buffer(),
             layout.start_offset() * storage.dtype().size_in_bytes(),
-            &output,
+            output.buffer(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
-        Ok((newstorage, layout.shape().clone()))
+        Ok((output, layout.shape().clone()))
     }
 }
 
@@ -639,7 +648,8 @@ impl lloom_tensor::CustomOp3 for Conv1dDepthwiseScaled {
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
-        let storage = lloom_tensor::MetalStorage::new(output, device.clone(), out_el, dtype);
+        let storage =
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), out_el, dtype)?;
         Ok((storage, out_shape))
     }
 }
@@ -832,7 +842,8 @@ fn shortconv_step_impl(
 
         let _ = elem_sz;
         use lloom_tensor::op::BackpropOp;
-        let out_storage = lloom_tensor::MetalStorage::new(dst, device.clone(), dst_numel, dtype);
+        let out_storage =
+            lloom_tensor::MetalStorage::new_allocated(dst, device.clone(), dst_numel, dtype)?;
         let out = Tensor::from_storage(
             lloom_tensor::Storage::Metal(out_storage),
             (b_sz, hidden, 1usize),
@@ -843,12 +854,12 @@ fn shortconv_step_impl(
             let n = next.expect("no fresh state means next was given");
             return Ok((out, n.clone()));
         };
-        let state_storage = lloom_tensor::MetalStorage::new(
+        let state_storage = lloom_tensor::MetalStorage::new_allocated(
             state_out,
             device.clone(),
             b_sz * hidden * k_size,
             dtype,
-        );
+        )?;
         let new_state = Tensor::from_storage(
             lloom_tensor::Storage::Metal(state_storage),
             (b_sz, hidden, k_size),
@@ -1068,7 +1079,8 @@ fn shortconv_ring_impl(
         .map_err(lloom_tensor::Error::wrap)?;
 
         use lloom_tensor::op::BackpropOp;
-        let out_storage = lloom_tensor::MetalStorage::new(dst, device.clone(), out_numel, dtype);
+        let out_storage =
+            lloom_tensor::MetalStorage::new_allocated(dst, device.clone(), out_numel, dtype)?;
         let out = Tensor::from_storage(
             lloom_tensor::Storage::Metal(out_storage),
             (b_sz, seq_len, hidden),
@@ -1326,8 +1338,12 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
             )
             .map_err(lloom_tensor::Error::wrap)?;
         }
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            s1.dtype(),
+        )?;
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -1429,8 +1445,12 @@ impl lloom_tensor::CustomOp2 for RmsNormRope {
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            s1.dtype(),
+        )?;
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -1757,8 +1777,12 @@ impl lloom_tensor::CustomOp3 for LayerNorm {
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            s1.dtype(),
+        )?;
         Ok((newstorage, l1.shape().clone()))
     }
 }
@@ -2319,8 +2343,12 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             lloom_tensor::bail!("must be vector or full sdpa kernel");
         }
 
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            q.dtype(),
+        )?;
         Ok((newstorage, out_shape))
     }
 }
@@ -2967,8 +2995,12 @@ impl lloom_tensor::CustomOp1 for DequantizeKv {
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
-        let storage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, self.dtype);
+        let storage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            self.dtype,
+        )?;
         Ok((
             storage,
             Shape::from_dims(&[self.b_sz, self.n_heads, self.n_tokens, self.head_dim]),
@@ -3176,8 +3208,12 @@ impl lloom_tensor::CustomOp1 for SdpaQuant {
         }
         .map_err(lloom_tensor::Error::wrap)?;
 
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            q.dtype(),
+        )?;
         Ok((newstorage, Shape::from_dims(&out_dims)))
     }
 }
@@ -3917,8 +3953,12 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            q.dtype(),
+        )?;
         Ok((newstorage, out_layout.shape().clone()))
     }
 }
@@ -4389,7 +4429,8 @@ fn gemv_fused_metal(
     )
     .map_err(lloom_tensor::Error::wrap)?;
 
-    let newstorage = lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, x.dtype());
+    let newstorage =
+        lloom_tensor::MetalStorage::new_allocated(output, device.clone(), elem_count, x.dtype())?;
     Ok((newstorage, out_shape))
 }
 
@@ -4582,8 +4623,12 @@ impl lloom_tensor::CustomOp3 for GemvNorm {
             gate,
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        let newstorage =
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, x.dtype());
+        let newstorage = lloom_tensor::MetalStorage::new_allocated(
+            output,
+            device.clone(),
+            elem_count,
+            x.dtype(),
+        )?;
         Ok((newstorage, out_shape))
     }
 }

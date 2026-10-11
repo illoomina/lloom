@@ -265,6 +265,7 @@ impl PassAdmission {
 
 #[derive(Clone)]
 pub struct MetalDevice {
+    pub(crate) allocation_namespace: Arc<super::allocation_namespace::AllocationNamespace>,
     /// Argument blocks and small tables keyed by their bytes, so a value a
     /// kernel is handed every step — a params block, a chunk table, a live
     /// count — is uploaded once and bound by the same buffer until it
@@ -431,6 +432,7 @@ pub struct MetalDevice {
 /// so every address the recorder keys on is a pool buffer's — an arena slot's
 /// `raw_addr` is its base's and would not attribute.
 pub struct PassPlans {
+    state: crate::planner_transaction::PlannerState<PassState, PassKey>,
     layout: ArenaLayout,
     plans: HashMap<PassKey, StepPlan>,
     /// Arenas built over the current base, per key; rebuilt lazily after a
@@ -439,12 +441,7 @@ pub struct PassPlans {
     base: Option<Buffer>,
     /// The base's bytes on the ledger, replaced with the base.
     base_reservation: Option<crate::kernels::metal::ledger::Reservation>,
-    base_generation: u64,
     arena_generation: HashMap<PassKey, u64>,
-    /// A key recorded on its first sight, whose plan awaits the next pass.
-    pending: Option<PassKey>,
-    /// What the pass in progress is doing.
-    current: Option<PassState>,
     /// The pass in progress took a data-dependent branch its key does not
     /// name (`MetalDevice::pass_diverged`).
     diverged: bool,
@@ -466,18 +463,88 @@ pub struct PassPlans {
     admit_fraction: f64,
 }
 
+#[derive(Debug)]
+struct PlannerInvalidated(&'static str);
+impl std::fmt::Display for PlannerInvalidated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "planner transaction invalidated: {}; retry requires a new reservation",
+            self.0
+        )
+    }
+}
+impl std::error::Error for PlannerInvalidated {}
+
+struct ClosingPlan {
+    identity: crate::planner_transaction::ClosingIdentity<
+        super::allocation_namespace::AllocationNamespace,
+        Mutex<ArenaRecorder>,
+    >,
+    have: usize,
+    fraction: f64,
+    closes: PassKey,
+    state: PassState,
+    plan: Option<StepPlan>,
+    needed: Option<usize>,
+}
+impl ClosingPlan {
+    fn validate(
+        &self,
+        pp: Option<&PassPlans>,
+        namespace: &Arc<super::allocation_namespace::AllocationNamespace>,
+        session: &Arc<()>,
+        recorder: Option<&Arc<Mutex<ArenaRecorder>>>,
+    ) -> Result<()> {
+        if self
+            .identity
+            .validates(pp.map(|p| &p.state), namespace, session, recorder)
+        {
+            Ok(())
+        } else {
+            Err(crate::Error::wrap(PlannerInvalidated(
+                "cache, base, session, namespace or recorder generation changed",
+            )))
+        }
+    }
+}
+struct ClosingGuard<'a> {
+    device: &'a MetalDevice,
+    cache: Arc<()>,
+    token: Arc<()>,
+    armed: bool,
+}
+impl Drop for ClosingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut g = self.device.pass_plans.lock();
+        if let Some(pp) = g.as_mut() {
+            if pp.state.abort_close(&self.cache, &self.token) {
+                self.device
+                    .pass_state
+                    .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// The pass-plan cache set aside by [`MetalDevice::pause_pass_plans`];
 /// dropping it puts the cache back.
 #[must_use = "the cache is back as soon as the guard drops"]
 pub struct PassPlansPaused<'a> {
-    device: &'a MetalDevice,
+    device: std::borrow::Cow<'a, MetalDevice>,
     saved: Option<PassPlans>,
 }
 
 impl Drop for PassPlansPaused<'_> {
     fn drop(&mut self) {
         if let Some(pp) = self.saved.take() {
-            *self.device.pass_plans.lock() = Some(pp);
+            let displaced = self.device.pass_plans.lock().replace(pp);
+            // A displaced cache may own native bases/charges. Never destroy it
+            // while holding the planner lock (e.g. a reentrant paused restore).
+            drop(displaced);
             self.device
                 .pass_state
                 .fetch_or(0b01, std::sync::atomic::Ordering::Relaxed);
@@ -614,15 +681,13 @@ enum PassState {
 impl PassPlans {
     fn new(layout: ArenaLayout) -> Self {
         Self {
+            state: crate::planner_transaction::PlannerState::new(),
             layout,
             plans: HashMap::new(),
             arenas: HashMap::new(),
             base: None,
             base_reservation: None,
-            base_generation: 0,
             arena_generation: HashMap::new(),
-            pending: None,
-            current: None,
             diverged: false,
             counters: PassPlanCounters::default(),
             escapes: HashMap::new(),
@@ -780,6 +845,101 @@ impl MetalDevice {
             .new_compute_pipeline_state_with_function(&func)
             .map_err(MetalError::from)?;
         Ok(pl)
+    }
+
+    fn allocate_backing(
+        backing: &dyn Backing,
+        bytes: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<crate::kernels::metal::backing::Allocation> {
+        match context {
+            Some(context) => backing
+                .alloc_in(bytes, context)
+                .map_err(|e| crate::Error::Msg(e.to_string())),
+            None => backing.alloc(bytes).map_err(|e| MetalError::from(e).into()),
+        }
+    }
+
+    /// Source-only domain view constructor. Not exposed to model loaders until
+    /// generation-anchor and independent IO custody are wired and reviewed.
+    pub(crate) fn allocation_view(&self, domain: crate::memory_admission::ModelDomain) -> Self {
+        let namespace = super::allocation_namespace::AllocationNamespace::new(
+            &self.device,
+            self.commands.clock(),
+            &self.residency_set,
+            &self.ledger,
+            Some(domain),
+            Some((&self.buffers, &self.private_buffers)),
+        );
+        let mut view = self.clone();
+        view.constants = namespace.constants.clone();
+        view.buffers = namespace.buffers.clone();
+        view.private_buffers = namespace.private_buffers.clone();
+        view.backings = namespace.backings.clone();
+        view.arena_reservation = namespace.arena_reservation.clone();
+        view.arena = namespace.arena.clone();
+        view.arena_recorder = namespace.arena_recorder.clone();
+        view.arena_auto = namespace.arena_auto.clone();
+        view.arena_auto_report = namespace.arena_auto_report.clone();
+        view.arena_rerecord = namespace.arena_rerecord.clone();
+        view.arena_rerecordings = namespace.arena_rerecordings.clone();
+        view.session_region = namespace.session_region.clone();
+        view.pass_plans = namespace.pass_plans.clone();
+        view.base_mode = namespace.base_mode.clone();
+        view.pass_state = namespace.pass_state.clone();
+        view.served_pass_pool_requests = namespace.served_pass_pool_requests.clone();
+        view.next_pass_variant = namespace.next_pass_variant.clone();
+        view.allocation_namespace = namespace;
+        view
+    }
+
+    /// Namespace-only lifetime anchor for the current generation. Resolve before
+    /// EntryState, then attach after any cut under the same generation guard.
+    /// Never capture ExecutionScope here: it owns Commands and would cycle.
+    /// Legacy has an explicit namespace too; missing/cancelled accounted scope
+    /// is rejected by active(), never replaced by a different payer.
+    pub(crate) fn allocation_namespace_anchor(&self) -> Result<Arc<dyn Send + Sync>> {
+        let namespace = match super::allocation_scope::active(self)? {
+            Some(scope) => scope.view.allocation_namespace.clone(),
+            None => self.allocation_namespace.clone(),
+        };
+        Ok(namespace)
+    }
+
+    /// Stamp a newly allocated output with its actual payer namespace. Aliases
+    /// retain their original device instead of using this allocation-only route.
+    pub(crate) fn allocated_output_device(&self, buffer: &Buffer) -> Result<Self> {
+        let view = match super::allocation_scope::active(self)? {
+            Some(scope) => scope.view.clone(),
+            None => self.clone(),
+        };
+        let origin = buffer
+            .allocation_owner()
+            .map_or(crate::memory_admission::AllocationOrigin::Legacy, |owner| {
+                crate::memory_admission::AllocationOrigin::Domain(owner.domain_key())
+            });
+        view.declared_allocation_origin()
+            .validate_reuse(&origin)
+            .map_err(crate::Error::wrap)?;
+        Ok(view)
+    }
+
+    /// Active output payer, not an input buffer's origin. Original-device and
+    /// other-domain operands on the same queue route to the execution scope.
+    pub fn allocation_origin(&self) -> Result<crate::memory_admission::AllocationOrigin> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return Ok(scope.view.declared_allocation_origin());
+        }
+        Ok(crate::memory_admission::AllocationOrigin::Legacy)
+    }
+
+    /// Binding for explicit non-scoped constructors. Does not infer a first-use
+    /// payer; an admitted original-device caller uses the scoped constructor.
+    pub(crate) fn declared_allocation_origin(&self) -> crate::memory_admission::AllocationOrigin {
+        self.allocation_namespace.domain.as_ref().map_or(
+            crate::memory_admission::AllocationOrigin::Legacy,
+            |domain| crate::memory_admission::AllocationOrigin::Domain(domain.key()),
+        )
     }
 
     pub fn id(&self) -> DeviceId {
@@ -1676,25 +1836,32 @@ impl MetalDevice {
     /// *"residency is a CPU-side fact established once"*: the whole point is
     /// that the per-token path stops inserting.
     pub fn install_session_region(&self, reservations: &[(usize, usize)]) -> Result<usize> {
-        let plan = RegionPlan::reserve(reservations);
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .install_session_region_in(reservations, Some(&scope.context));
+        }
+        self.install_session_region_in(reservations, None)
+    }
+
+    fn install_session_region_in(
+        &self,
+        reservations: &[(usize, usize)],
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<usize> {
+        let plan = RegionPlan::checked_reserve(reservations).map_err(MetalError::Message)?;
         let bytes = plan.bytes().max(1);
-        let base = self
-            .backings
-            .resident_private
-            .alloc(bytes)
-            .map_err(MetalError::from)?;
+        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
         let region = SessionRegion::new(base.buffer, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
-        {
+        let previous = {
             let mut slot = self.session_region.write();
-            // Unregister the region being replaced while it still owns its base
-            // — #489's ordering argument, which applies here for the same reason
-            // it applies to the arena.
-            if let Some(previous) = slot.as_ref() {
-                self.residency_set.remove(previous.base());
-                self.hold_in_flight(previous.base());
-            }
-            *slot = Some(region);
+            *self.allocation_namespace.session_generation.lock() = Arc::new(());
+            slot.replace(region)
+        };
+        if let Some(previous) = previous {
+            self.residency_set.remove(previous.base());
+            self.hold_in_flight(previous.base());
         }
         Ok(bytes)
     }
@@ -1705,12 +1872,15 @@ impl MetalDevice {
     /// **while the region still owns it**, so `removeAllocation` names an object
     /// that provably still exists (§6.3c, #489).
     pub fn clear_session_region(&self) {
-        let mut slot = self.session_region.write();
-        if let Some(region) = slot.as_ref() {
+        let previous = {
+            let mut slot = self.session_region.write();
+            *self.allocation_namespace.session_generation.lock() = Arc::new(());
+            slot.take()
+        };
+        if let Some(region) = previous {
             self.residency_set.remove(region.base());
             self.hold_in_flight(region.base());
         }
-        *slot = None;
     }
 
     /// The session region's counters, if one is installed.
@@ -1755,6 +1925,21 @@ impl MetalDevice {
     }
 
     pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .install_arena_in(plan, layout, Some(&scope.context));
+        }
+        self.install_arena_in(plan, layout, None)
+    }
+
+    fn install_arena_in(
+        &self,
+        plan: StepPlan,
+        layout: ArenaLayout,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<()> {
+        let bytes = plan.checked_base_bytes().map_err(MetalError::Message)?;
         self.set_base_mode(true);
         // The arena is one pointer for every activation, so the hazard tracker
         // must key on ranges to see only true edges (§9.2e/§9.2f, route (a)).
@@ -1771,29 +1956,17 @@ impl MetalDevice {
         // offset source serve every ordinal; sizing to the smaller one makes the
         // GPU path decline an ordinal that fits the plan perfectly, which is a
         // silent loss of coverage rather than an error.
-        let bytes = plan.bump_capacity().max(plan.arena_bytes()).max(1);
-        let base = self
-            .backings
-            .resident_private
-            .alloc(bytes)
-            .map_err(MetalError::from)?;
-        *self.arena_reservation.lock() = base.reservation;
+        let base = Self::allocate_backing(&self.backings.resident_private, bytes, context)?;
         let arena = Arena::new(base.buffer, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
-        {
-            let mut slot = self.arena.write();
-            // Unregister the arena being *replaced*, on the same argument as
-            // `clear_arena` and while it still owns its base (issue #489). This
-            // is latent today because nothing in the shipping engine replaces an
-            // arena -- one is installed and lives for the process -- but under
-            // #483's ring or any per-phase arena (§9.2's sizing discussion) the
-            // leak would be per replacement rather than one-off.
-            if let Some(previous) = slot.as_ref() {
-                self.residency_set.remove(previous.base());
-                self.hold_in_flight(previous.base());
-            }
-            *slot = Some(arena);
+        let previous = self.arena.write().replace(arena);
+        let previous_reservation =
+            std::mem::replace(&mut *self.arena_reservation.lock(), base.reservation);
+        if let Some(previous) = previous {
+            self.residency_set.remove(previous.base());
+            self.hold_in_flight(previous.base());
         }
+        drop(previous_reservation);
         Ok(())
     }
 
@@ -2071,6 +2244,16 @@ impl MetalDevice {
         }
     }
 
+    /// Resolve the checked active payer for receiver-bound planner queries and
+    /// configuration. Same-device input origins do not select the output payer.
+    /// Outside a scope a legacy receiver is unchanged; accounted receivers refuse
+    /// missing/cancelled scopes. Retain this view across related query/config calls.
+    pub fn execution_device(&self) -> Result<Self> {
+        Ok(super::allocation_scope::active(self)?
+            .map_or_else(|| self.clone(), |scope| scope.view.clone()))
+    }
+
+    /// Receiver-bound query. Scoped callers first resolve `execution_device`.
     pub fn pass_plans_enabled(&self) -> bool {
         self.pass_plans.lock().is_some()
     }
@@ -2086,8 +2269,12 @@ impl MetalDevice {
     /// dropped and it records again on its next sight. Refused while a pass
     /// is open.
     pub fn pause_pass_plans(&self) -> Result<PassPlansPaused<'_>> {
-        let mut g = self.pass_plans.lock();
-        if g.as_ref().is_some_and(|pp| pp.current.is_some()) {
+        let device = match super::allocation_scope::active(self)? {
+            Some(scope) => std::borrow::Cow::Owned(scope.view.clone()),
+            None => std::borrow::Cow::Borrowed(self),
+        };
+        let mut g = device.pass_plans.lock();
+        if g.as_ref().is_some_and(|pp| pp.state.current.is_some()) {
             return Err(MetalError::Message(
                 "pause_pass_plans: a pass is open (finish_pass was not called)".to_string(),
             )
@@ -2096,16 +2283,14 @@ impl MetalDevice {
         let mut saved = g.take();
         drop(g);
         if let Some(pp) = saved.as_mut() {
-            if pp.pending.take().is_some() {
-                let _ = self.finish_arena_recording(pp.layout);
+            if pp.state.pending.take().is_some() {
+                let _ = device.finish_arena_recording(pp.layout);
             }
-            self.pass_state
+            device
+                .pass_state
                 .fetch_and(!0b01, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(PassPlansPaused {
-            device: self,
-            saved,
-        })
+        Ok(PassPlansPaused { device, saved })
     }
 
     /// Whether a plan for `key` is cached: the pass will be served from the
@@ -2121,7 +2306,7 @@ impl MetalDevice {
         let Some(pp) = g.as_mut() else {
             return 0;
         };
-        if pp.current.is_some() {
+        if pp.state.current.is_some() {
             return 0;
         }
         let n = pp.plans.len();
@@ -2130,8 +2315,8 @@ impl MetalDevice {
         pp.arena_generation.clear();
         pp.escapes.clear();
         pp.ragged_order.clear();
-        pp.pending = None;
-        pp.base_generation += 1;
+        pp.state.pending = None;
+        pp.state.base_generation += 1;
         pp.counters.evicted += n as u64;
         n
     }
@@ -2255,7 +2440,7 @@ impl MetalDevice {
     /// open or the cache is off.
     pub fn pass_diverged(&self) {
         if let Some(pp) = self.pass_plans.lock().as_mut() {
-            if pp.current.is_some() && !pp.diverged {
+            if pp.state.current.is_some() && !pp.diverged {
                 pp.diverged = true;
                 pp.counters.diverged += 1;
             }
@@ -2266,19 +2451,22 @@ impl MetalDevice {
     /// (`PassOpener::Model`): the model reads some of its values after it
     /// closes the pass (a settle after the pass body), so those must be
     /// declared escapes; under a driver's pass the same reads are inside it.
-    /// One relaxed load.
+    /// One relaxed load. This is body-open, not transaction-open: Closing
+    /// clears these bits while `pass_open` remains true until cleanup finishes.
+    /// Receiver-bound; scoped callers first resolve `execution_device`.
     pub fn model_pass_open(&self) -> bool {
         self.pass_state.load(std::sync::atomic::Ordering::Relaxed) & 0b1010 == 0b1010
     }
 
     /// Whether a planned pass is open (`begin_pass` without its
     /// `finish_pass`): a model that brackets its own passes skips the
-    /// bracket when a driver already holds one.
+    /// bracket when a driver already holds one. Includes the Closing transaction
+    /// after body completion; receiver-bound as are the other planner queries.
     pub fn pass_open(&self) -> bool {
         self.pass_plans
             .lock()
             .as_ref()
-            .is_some_and(|pp| pp.current.is_some())
+            .is_some_and(|pp| pp.state.current.is_some())
     }
 
     /// Name the allocation sequence the next pass runs, for a model whose
@@ -2299,6 +2487,13 @@ impl MetalDevice {
     /// it, the pass runs on the pool under the recorder. Falls back to
     /// [`Self::begin_decode_step`] when the cache is off.
     pub fn begin_pass(&self, key: PassKey) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.begin_pass_in(key);
+        }
+        self.begin_pass_in(key)
+    }
+
+    fn begin_pass_in(&self, key: PassKey) -> Result<()> {
         let variant = self
             .next_pass_variant
             .swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -2315,7 +2510,7 @@ impl MetalDevice {
             self.begin_decode_step();
             return Ok(());
         };
-        if pp.current.is_some() {
+        if pp.state.current.is_some() {
             return Err(MetalError::Message(
                 "begin_pass: a pass is already open (finish_pass was not called)".to_string(),
             )
@@ -2331,7 +2526,7 @@ impl MetalDevice {
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
-        let state = match (pp.pending, pp.plans.contains_key(&key)) {
+        let state = match (pp.state.pending, pp.plans.contains_key(&key)) {
             (Some(closes), cached) => {
                 // The recorder still holds the pending key's pass as its
                 // current step; this pass becomes the step that says what
@@ -2348,7 +2543,7 @@ impl MetalDevice {
                 }
             }
             (None, true) => {
-                let generation = pp.base_generation;
+                let generation = pp.state.base_generation;
                 let stale = pp.arena_generation.get(&key) != Some(&generation);
                 if stale || !pp.arenas.contains_key(&key) {
                     let plan = pp.plans.get(&key).expect("cached").clone();
@@ -2378,7 +2573,7 @@ impl MetalDevice {
                 PassState::Recording { key, closes: None }
             }
         };
-        pp.current = Some(state);
+        pp.state.current = Some(state);
         Ok(())
     }
 
@@ -2387,6 +2582,16 @@ impl MetalDevice {
     /// key as pending if it was recorded. Falls back to
     /// [`Self::finish_decode_step`] when the cache is off.
     pub fn finish_pass(&self) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.finish_pass_in(Some(&scope.context));
+        }
+        self.finish_pass_in(None)
+    }
+
+    fn finish_pass_in(
+        &self,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<()> {
         self.next_pass_variant
             .store(0, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.pass_plans.lock();
@@ -2394,150 +2599,281 @@ impl MetalDevice {
             drop(g);
             return self.finish_decode_step();
         };
-        let Some(state) = pp.current.take() else {
-            return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
-        };
+        if pp.state.closing.is_some() {
+            return Err(crate::Error::wrap(PlannerInvalidated(
+                "finish already closing",
+            )));
+        }
+        let state = pp
+            .state
+            .current
+            .take()
+            .ok_or_else(|| MetalError::Message("finish_pass: no pass is open".into()))?;
         self.pass_state
             .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
-        // A plan closed this pass: the recording pass's transients sit in
-        // the pool's free list while the base now holds the pass's shape —
-        // trimmed after the lock, or a budget that admitted one copy of the
-        // transient carries two (measured: the served second prefill
-        // refused at 36.62 GB against 36.18, #749 P28).
-        let mut closed_a_plan = false;
+        let closes = match state {
+            PassState::Recording { closes, .. } => closes,
+            PassState::Observing { closes } => Some(closes),
+            PassState::Served(_) => None,
+        };
+        if let Some(closes) = closes {
+            let (plan, undeclared, recorder) = {
+                let g = self.arena_recorder.lock();
+                let rec = g.as_ref().ok_or_else(|| {
+                    MetalError::Message("finish_pass: no recorder while a key was pending".into())
+                })?;
+                let r = rec.lock();
+                (
+                    r.plan_previous(pp.layout),
+                    r.previous_undeclared_ordinals(),
+                    rec.clone(),
+                )
+            };
+            // Preserve historical diagnostics before a candidate failure; these
+            // are not publication of a cached plan.
+            pp.counters.escapes += undeclared.len() as u64;
+            pp.escapes.insert(closes, undeclared);
+            let needed = plan
+                .as_ref()
+                .map(StepPlan::checked_base_bytes)
+                .transpose()
+                .map_err(MetalError::Message)?;
+            let token = Arc::new(());
+            let session = self.session_region.read();
+            let session_generation = self.allocation_namespace.session_generation.lock().clone();
+            drop(session);
+            let transaction = ClosingPlan {
+                identity: crate::planner_transaction::ClosingIdentity {
+                    cache: pp.state.identity.clone(),
+                    token: token.clone(),
+                    namespace: self.allocation_namespace.clone(),
+                    session: session_generation,
+                    base_generation: pp.state.base_generation,
+                    recorder,
+                },
+                have: pp.base.as_ref().map_or(0, Buffer::length),
+                fraction: pp.admit_fraction,
+                closes,
+                state,
+                plan,
+                needed,
+            };
+            pp.state.current = Some(state);
+            pp.state.closing = Some(token);
+            drop(g);
+            return self.complete_closing(transaction, context);
+        }
+
+        pp.state.current = None;
+        self.pass_state
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+        let mut discarded = None;
         match state {
             PassState::Served(key) => {
                 self.end_decode_step();
                 if let Some(arena) = self.arena_slot() {
                     if arena.take_drifted() {
-                        // The sequence moved under this key: the plan is wrong
-                        // about it. Drop it; the next sight re-records.
                         pp.plans.remove(&key);
-                        pp.arenas.remove(&key);
+                        discarded = pp.arenas.remove(&key);
                         pp.counters.evicted += 1;
                     }
                 }
                 self.clear_arena_keep_base();
             }
-            PassState::Recording { key, closes } => {
-                if let Some(closes) = closes {
-                    Self::close_pending(self, pp, closes)?;
-                    closed_a_plan = true;
-                }
+            PassState::Recording { key, closes: None } => {
                 if pp.plans.contains_key(&key) || pp.diverged {
-                    // The key it closed was its own (two sightings back to
-                    // back): planned now, nothing left to observe. Or this
-                    // pass diverged, and its recording is no key's plan.
-                    pp.pending = None;
+                    pp.state.pending = None;
                     self.finish_arena_recording(pp.layout);
                 } else {
-                    // This pass's allocations are the recorder's current
-                    // step; the next pass says which of them escape.
-                    pp.pending = Some(key);
+                    pp.state.pending = Some(key);
                 }
             }
-            PassState::Observing { closes } => {
-                Self::close_pending(self, pp, closes)?;
-                closed_a_plan = true;
-                pp.pending = None;
-                self.finish_arena_recording(pp.layout);
-            }
+            _ => unreachable!("closing paths dispatched above"),
         }
         drop(g);
-        if closed_a_plan {
-            self.trim_unused_buffers();
+        drop(discarded);
+        Ok(())
+    }
+
+    fn check_closing_scope(&self) -> Result<()> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            if !Arc::ptr_eq(&scope.view.allocation_namespace, &self.allocation_namespace) {
+                return Err(crate::Error::wrap(PlannerInvalidated(
+                    "active allocation namespace changed",
+                )));
+            }
         }
         Ok(())
     }
 
-    /// Build `closes`'s plan from the recorder's previous step (its first
-    /// sight) and this step's binds against it, and cache it.
-    fn close_pending(&self, pp: &mut PassPlans, closes: PassKey) -> Result<()> {
-        let (plan, undeclared) = {
-            let g = self.arena_recorder.lock();
-            let rec = g.as_ref().ok_or_else(|| {
-                MetalError::Message("finish_pass: no recorder while a key was pending".to_string())
-            })?;
-            let r = rec.lock();
-            (r.plan_previous(pp.layout), r.previous_undeclared_ordinals())
+    fn complete_closing(
+        &self,
+        mut transaction: ClosingPlan,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<()> {
+        let mut closing = ClosingGuard {
+            device: self,
+            cache: transaction.identity.cache.clone(),
+            token: transaction.identity.token.clone(),
+            armed: true,
         };
-        pp.counters.escapes += undeclared.len() as u64;
-        pp.escapes.insert(closes, undeclared);
-        let Some(plan) = plan else {
-            // The previous pass allocated nothing worth planning; forget it.
-            return Ok(());
-        };
-        let needed = plan.bump_capacity().max(plan.arena_bytes()).max(1);
-        let have = pp.base.as_ref().map_or(0, |b| b.length());
-        if needed > have {
-            // Admitted before it is allocated (`DESIGN.md` §9.5): the base is
-            // held for the run, so a grow the machine cannot take must stop
-            // the run here rather than after the allocation. The OLD base is
-            // still held at this point and is released just below, so the
-            // grow charged is the difference — what the process's footprint
-            // actually rises by.
-            if pp.admit_fraction > 0.0 {
-                let grow = needed.saturating_sub(have);
+        let grow = transaction
+            .needed
+            .filter(|&needed| needed > transaction.have);
+        let staged = if let Some(needed) = grow {
+            // Compatibility diagnostic remains net growth. The authoritative
+            // ticket below reserves the FULL candidate while old bases survive.
+            if transaction.fraction > 0.0 {
                 let working_set = self.device.recommended_max_working_set_size();
-                let budget = (working_set as f64 * pp.admit_fraction) as usize;
-                let a = self.admit_bytes(grow, budget);
-                if let Some(why) = &a.machine {
-                    return Err(MetalError::Message(format!(
-                        "pass plan base grow refused for {:?}: {why}",
-                        closes.kind
-                    ))
-                    .into());
+                let budget = (working_set as f64 * transaction.fraction) as usize;
+                let a = self.admit_bytes(needed.saturating_sub(transaction.have), budget);
+                if let Some(why) = a.machine {
+                    return Err(
+                        MetalError::Message(format!("pass plan base grow refused: {why}")).into(),
+                    );
                 }
                 if !a.fits {
-                    let gb = |b: usize| b as f64 / 1e9;
-                    return Err(MetalError::Message(format!(
-                        "pass plan base grow refused for {:?}: it needs {:.3} GB more, and the \
-                         ledger already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
-                         recommendedMaxWorkingSetSize {:.2} GB) after giving back {:.3} GB of \
-                         free lists. Nothing was allocated and no \
-                         plan was cached; the pass runs on the pool as it did before \
-                         (DESIGN.md 9.5, 3.5). Raise the fraction, narrow the pass (a smaller \
-                         prefill tile), or bound the run.",
-                        closes.kind,
-                        gb(grow),
-                        gb(a.committed),
-                        gb(budget),
-                        pp.admit_fraction,
-                        gb(working_set),
-                        gb(a.reclaimed),
-                    ))
-                    .into());
+                    return Err(MetalError::Message(format!("pass plan base grow refused: {} B committed, {} B budget, {} B net grow; no plan cached", a.committed, budget, needed.saturating_sub(transaction.have))).into());
                 }
             }
-            let base = self
-                .backings
-                .resident_private
-                .alloc(needed)
-                .map_err(MetalError::from)?;
-            if let Some(previous) = pp.base.take() {
-                self.residency_set.remove(&previous);
-                self.hold_in_flight(&previous);
+            Some(
+                self.backings
+                    .resident_private
+                    .stage(needed, context)
+                    .map_err(crate::Error::wrap)?,
+            )
+        } else {
+            None
+        };
+
+        // A never-selected loser drops raw before its uncommitted ticket. All
+        // guards here end BEFORE the local staged candidate can be destroyed.
+        self.check_closing_scope()?;
+        {
+            let g = self.pass_plans.lock();
+            let session = self.session_region.read();
+            let version = self.allocation_namespace.session_generation.lock();
+            let recorder = self.arena_recorder.lock();
+            transaction.validate(
+                g.as_ref(),
+                &self.allocation_namespace,
+                &version,
+                recorder.as_ref(),
+            )?;
+            drop(recorder);
+            drop(version);
+            drop(session);
+        }
+        let mut candidate = match staged {
+            Some(staged) => Some(staged.commit().map_err(crate::Error::wrap)?),
+            None => None,
+        };
+
+        // Commit ran outside planner locks. If a void/Drop mutator replaced
+        // state meanwhile, this is a committed loser: release physical charge,
+        // but NEVER resurrect consumed pass demand. Caller needs a new reserve.
+        let checked = self.check_closing_scope();
+        let mut g = self.pass_plans.lock();
+        let session = self.session_region.read();
+        let version = self.allocation_namespace.session_generation.lock();
+        let recorder = self.arena_recorder.lock();
+        let checked = checked.and_then(|_| {
+            transaction.validate(
+                g.as_ref(),
+                &self.allocation_namespace,
+                &version,
+                recorder.as_ref(),
+            )
+        });
+        if let Err(error) = checked {
+            drop(recorder);
+            drop(version);
+            drop(session);
+            drop(g);
+            if let Some(candidate) = candidate {
+                self.backings.resident_private.discard_selected(candidate);
             }
-            pp.base = Some(base.buffer);
-            pp.base_reservation = base.reservation;
-            pp.base_generation += 1;
-            pp.arenas.clear();
+            return Err(error);
+        }
+        let pp = g.as_mut().expect("validated cache");
+        let mut old_base = None;
+        let mut old_reservation = None;
+        let mut old_arenas = HashMap::new();
+        if let Some(candidate) = candidate.take() {
+            old_base = pp.base.replace(candidate.buffer);
+            old_reservation = std::mem::replace(&mut pp.base_reservation, candidate.reservation);
+            old_arenas = std::mem::take(&mut pp.arenas);
+            pp.state.base_generation += 1;
             pp.counters.base_grows += 1;
         }
-        pp.plans.insert(closes, plan);
-        pp.counters.plans += 1;
-        if matches!(closes.kind, PassKind::Ragged { .. }) {
-            pp.ragged_order.push_back(closes);
-            while pp.ragged_order.len() > pp.ragged_cap {
-                if let Some(old) = pp.ragged_order.pop_front() {
-                    if pp.plans.remove(&old).is_some() {
-                        pp.arenas.remove(&old);
-                        pp.escapes.remove(&old);
-                        pp.counters.capped += 1;
+        let mut evicted_arenas = Vec::new();
+        if let Some(plan) = transaction.plan.take() {
+            pp.plans.insert(transaction.closes, plan);
+            pp.counters.plans += 1;
+            if matches!(transaction.closes.kind, PassKind::Ragged { .. }) {
+                pp.ragged_order.push_back(transaction.closes);
+                while pp.ragged_order.len() > pp.ragged_cap {
+                    if let Some(old) = pp.ragged_order.pop_front() {
+                        if pp.plans.remove(&old).is_some() {
+                            if let Some(arena) = pp.arenas.remove(&old) {
+                                evicted_arenas.push(arena);
+                            }
+                            pp.escapes.remove(&old);
+                            pp.counters.capped += 1;
+                        }
                     }
                 }
             }
         }
+        let finish_recording = match transaction.state {
+            PassState::Recording { key, .. } if !pp.plans.contains_key(&key) && !pp.diverged => {
+                pp.state.pending = Some(key);
+                false
+            }
+            _ => {
+                pp.state.pending = None;
+                true
+            }
+        };
+        let layout = pp.layout;
+        // Body bits are closed, but current/closing keep the transaction open.
+        // Legacy Drop/raw recorder mutators can still replace state; cleanup
+        // below is identity-conditional, never a blind clear of its successor.
+        drop(recorder);
+        drop(version);
+        drop(session);
+        drop(g);
+        if let Some(previous) = old_base {
+            self.residency_set.remove(&previous);
+            self.hold_in_flight(&previous);
+        }
+        drop(old_arenas);
+        drop(evicted_arenas);
+        drop(old_reservation);
+        if finish_recording {
+            self.finish_arena_recording_if(layout, &transaction.identity.recorder)?;
+        }
+        self.trim_unused_buffers();
+        let mut g = self.pass_plans.lock();
+        let valid = g.as_ref().is_some_and(|pp| {
+            Arc::ptr_eq(&pp.state.identity, &transaction.identity.cache)
+                && pp
+                    .state
+                    .closing
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(token, &transaction.identity.token))
+        });
+        if !valid {
+            return Err(crate::Error::wrap(PlannerInvalidated(
+                "cache replaced during closing cleanup",
+            )));
+        }
+        let pp = g.as_mut().expect("validated cache");
+        pp.state.current = None;
+        pp.state.closing = None;
+        self.pass_state
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
+        closing.armed = false;
         Ok(())
     }
 
@@ -2594,13 +2930,14 @@ impl MetalDevice {
     pub fn begin_arena_recording(&self) {
         self.set_base_mode(true);
         let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
-        // The encoder observes binds, which is where an interval ends, so it
-        // needs the same recorder this device is filling.
-        crate::kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
-        {
+        // Namespace recorder then global observer: begin and conditional finish
+        // use the same lock order, so cleanup cannot clear a newer recording.
+        let previous = {
             let mut g = self.arena_recorder.lock();
-            *g = Some(rec);
-        }
+            crate::kernels::metal::arena::set_bind_observer(Some(rec.clone()));
+            g.replace(rec)
+        };
+        drop(previous);
     }
 
     /// Close the decode step being recorded and begin recording another.
@@ -2674,14 +3011,41 @@ impl MetalDevice {
     /// distinguishing from an empty plan -- it means recording was never begun
     /// or the step allocated nothing.
     pub fn finish_arena_recording(&self, layout: ArenaLayout) -> Option<StepPlan> {
-        crate::kernels::metal::arena::set_bind_observer(None);
-        let mut g = self.arena_recorder.lock();
-        let rec = g.take()?;
+        let rec = {
+            let mut g = self.arena_recorder.lock();
+            let rec = g.take()?;
+            crate::kernels::metal::arena::clear_bind_observer_if(&rec);
+            rec
+        };
         let r = rec.lock();
         if r.is_empty() {
-            return None;
+            None
+        } else {
+            Some(r.plan(layout))
         }
-        Some(r.plan(layout))
+    }
+
+    fn finish_arena_recording_if(
+        &self,
+        layout: ArenaLayout,
+        expected: &Arc<Mutex<ArenaRecorder>>,
+    ) -> Result<Option<StepPlan>> {
+        let rec = {
+            let mut g = self.arena_recorder.lock();
+            if !g.as_ref().is_some_and(|r| Arc::ptr_eq(r, expected)) {
+                return Err(crate::Error::wrap(PlannerInvalidated(
+                    "recorder replaced during cleanup",
+                )));
+            }
+            crate::kernels::metal::arena::clear_bind_observer_if(expected);
+            g.take().expect("identity checked")
+        };
+        let r = rec.lock();
+        Ok(if r.is_empty() {
+            None
+        } else {
+            Some(r.plan(layout))
+        })
     }
 
     /// Record one decode step and install the resulting arena.
@@ -2717,6 +3081,21 @@ impl MetalDevice {
         element_count: usize,
         dtype: DType,
         _name: &str,
+    ) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .new_buffer_in(element_count, dtype, _name, Some(&scope.context));
+        }
+        self.new_buffer_in(element_count, dtype, _name, None)
+    }
+
+    fn new_buffer_in(
+        &self,
+        element_count: usize,
+        dtype: DType,
+        _name: &str,
+        context: Option<&crate::memory_admission::AllocationContext>,
     ) -> Result<BufferHandle> {
         // An op's result buffer: writing it at a type this GPU only emulates
         // is that type's arithmetic, admitted only by the opt-in (§15.2a).
@@ -2781,11 +3160,11 @@ impl MetalDevice {
                 self.private_buffers
                     .check_residual(alloc)
                     .map_err(|e| MetalError::Message(e.to_string()))?;
-                let new_buffer = self
-                    .backings
-                    .transient_private
-                    .alloc(alloc)
-                    .map_err(MetalError::from)?;
+                let new_buffer = Self::allocate_backing(
+                    self.backings.transient_private.as_ref(),
+                    alloc,
+                    context,
+                )?;
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -2851,12 +3230,26 @@ impl MetalDevice {
         dtype: DType,
         _name: &str,
     ) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.new_private_buffer_in(
+                element_count,
+                dtype,
+                _name,
+                Some(&scope.context),
+            );
+        }
+        self.new_private_buffer_in(element_count, dtype, _name, None)
+    }
+
+    fn new_private_buffer_in(
+        &self,
+        element_count: usize,
+        dtype: DType,
+        _name: &str,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
         let size = crate::allocation_geometry::typed_bytes(element_count, dtype)?;
-        let a = self
-            .backings
-            .resident_private
-            .alloc(size)
-            .map_err(MetalError::from)?;
+        let a = Self::allocate_backing(&self.backings.resident_private, size, context)?;
         // Deliberately not pooled: this exists for persistent buffers, so it
         // returns a handle with no pool behind it. Dropping it frees the buffer
         // outright rather than offering it for reuse.
@@ -2877,8 +3270,19 @@ impl MetalDevice {
     /// costs a hash and a lock, a new one a pooled upload. Larger than
     /// `CONSTANT_MAX_BYTES` falls back to an upload.
     pub fn constant_buffer(&self, bytes: &[u8]) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.constant_buffer_in(bytes, Some(&scope.context));
+        }
+        self.constant_buffer_in(bytes, None)
+    }
+
+    fn constant_buffer_in(
+        &self,
+        bytes: &[u8],
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
         if bytes.len() > CONSTANT_MAX_BYTES {
-            return self.new_buffer_with_data(bytes);
+            return self.new_buffer_with_data_in(bytes, context);
         }
         {
             let mut g = self.constants.inner.lock();
@@ -2888,7 +3292,7 @@ impl MetalDevice {
                 return Ok(b);
             }
         }
-        let buf = self.new_buffer_with_data(bytes)?;
+        let buf = self.new_buffer_with_data_in(bytes, context)?;
         let mut g = self.constants.inner.lock();
         g.misses += 1;
         if g.map.len() >= CONSTANT_ENTRIES {
@@ -2923,11 +3327,20 @@ impl MetalDevice {
     /// (lloom #748 / PR #754, which records it as `docs/invariants.md` §15.1m) — a recycled Shared buffer
     /// written by the host while a still-running command buffer reads it.
     pub fn new_unpooled_shared(&self, size: usize) -> Result<BufferHandle> {
-        let a = self
-            .backings
-            .resident_shared
-            .alloc(size)
-            .map_err(MetalError::from)?;
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .new_unpooled_shared_in(size, Some(&scope.context));
+        }
+        self.new_unpooled_shared_in(size, None)
+    }
+
+    fn new_unpooled_shared_in(
+        &self,
+        size: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
+        let a = Self::allocate_backing(&self.backings.resident_shared, size, context)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
                 .with_reservation(a.reservation)
@@ -2943,16 +3356,25 @@ impl MetalDevice {
     /// CPU writes into place (the streamed tier's slot pools under the
     /// direct read, `DESIGN.md` §20.4a).
     pub fn new_persistent_shared(&self, size: usize) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .new_persistent_shared_in(size, Some(&scope.context));
+        }
+        self.new_persistent_shared_in(size, None)
+    }
+
+    fn new_persistent_shared_in(
+        &self,
+        size: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
         // A Shared buffer's pages are the process's, and under memory
         // pressure the kernel compresses them whatever the residency set
         // says (measured: 28 GB of Shared slot pools un-wired and 7.5 GB
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
         // not. The `Mapped` backing pins them.
-        let a = self
-            .backings
-            .mapped_shared
-            .alloc(size)
-            .map_err(MetalError::from)?;
+        let a = Self::allocate_backing(&self.backings.mapped_shared, size, context)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
                 .with_reservation(a.reservation)
@@ -2960,12 +3382,55 @@ impl MetalDevice {
         ))
     }
 
+    /// Reuse one scratch per allocation namespace. Growth is admitted outside
+    /// the cache lock; concurrent candidates remain charged until discarded.
+    pub(crate) fn dequant_scratch(&self, bytes: usize) -> Result<BufferHandle> {
+        match super::allocation_scope::active(self)? {
+            Some(scope) => scope.view.dequant_scratch_in(bytes, Some(&scope.context)),
+            None => self.dequant_scratch_in(bytes, None),
+        }
+    }
+
+    fn dequant_scratch_in(
+        &self,
+        bytes: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
+        {
+            let slot = self.allocation_namespace.dequant_scratch.lock();
+            if let Some(buffer) = slot.as_ref().filter(|b| b.size() >= bytes) {
+                return Ok(buffer.clone());
+            }
+        }
+        let candidate = self.new_persistent_private_in(bytes, context)?;
+        let (result, discarded) = {
+            let mut slot = self.allocation_namespace.dequant_scratch.lock();
+            if let Some(buffer) = slot.as_ref().filter(|b| b.size() >= bytes) {
+                (buffer.clone(), Some(candidate))
+            } else {
+                let result = candidate.clone();
+                (result, slot.replace(candidate))
+            }
+        };
+        drop(discarded);
+        Ok(result)
+    }
+
     pub fn new_persistent_private(&self, size: usize) -> Result<BufferHandle> {
-        let a = self
-            .backings
-            .resident_private
-            .alloc(size)
-            .map_err(MetalError::from)?;
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .new_persistent_private_in(size, Some(&scope.context));
+        }
+        self.new_persistent_private_in(size, None)
+    }
+
+    fn new_persistent_private_in(
+        &self,
+        size: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
+        let a = Self::allocate_backing(&self.backings.resident_private, size, context)?;
         Ok(BufferHandle::new(
             PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
                 .with_reservation(a.reservation)
@@ -2982,13 +3447,26 @@ impl MetalDevice {
     }
 
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .new_buffer_with_data_in(data, Some(&scope.context));
+        }
+        self.new_buffer_with_data_in(data, None)
+    }
+
+    fn new_buffer_with_data_in<T>(
+        &self,
+        data: &[T],
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
         // Metal refuses a zero-length `newBufferWithBytes`, and an empty tensor
         // is legal: it gets the pool's minimum allocation, as `allocate_buffer`
         // gives any empty request (`buf_size`), with nothing to copy.
         if size == 0 {
-            return self.allocate_buffer(0);
+            return self.allocate_buffer_in(0, context);
         }
         // A small upload is served from the buffer pool and filled on the host:
         // an acquired buffer has no GPU reader (reuse waits for completion,
@@ -3001,7 +3479,7 @@ impl MetalDevice {
         // lock and a hash (§3.3a). The large uploads below (weight staging,
         // whole prompts) keep the unpooled path for the reason it records.
         if size > 0 && size <= SMALL_UPLOAD_BYTES && !unpooled_uploads() {
-            let buffer = self.allocate_buffer(size)?;
+            let buffer = self.allocate_buffer_in(size, context)?;
             // SAFETY: the pool handed out a buffer at least `size` bytes long
             // whose last GPU reader has completed, and `data` is `size` bytes.
             unsafe {
@@ -3011,6 +3489,18 @@ impl MetalDevice {
                 std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size)
             });
             return Ok(buffer);
+        }
+        if let Some(context) = context {
+            let a = self
+                .backings
+                .resident_shared
+                .alloc_data_in(data, context)
+                .map_err(|e| crate::Error::Msg(e.to_string()))?;
+            return Ok(BufferHandle::new(
+                PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
+                    .with_reservation(a.reservation)
+                    .held_in_flight(self.commands.in_flight_hold()),
+            ));
         }
         let new_buffer = self
             .device
@@ -3050,7 +3540,20 @@ impl MetalDevice {
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<BufferHandle> {
-        let buffer = self.allocate_buffer(size_in_bytes)?;
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope
+                .view
+                .allocate_zeros_in(size_in_bytes, Some(&scope.context));
+        }
+        self.allocate_zeros_in(size_in_bytes, None)
+    }
+
+    fn allocate_zeros_in(
+        &self,
+        size_in_bytes: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
+        let buffer = self.allocate_buffer_in(size_in_bytes, context)?;
         if self.base_mode() {
             // A compute fill, inside the barrier chain (see `base_mode`).
             if size_in_bytes > 0 {
@@ -3076,6 +3579,17 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<BufferHandle> {
+        if let Some(scope) = super::allocation_scope::active(self)? {
+            return scope.view.allocate_buffer_in(size, Some(&scope.context));
+        }
+        self.allocate_buffer_in(size, None)
+    }
+
+    fn allocate_buffer_in(
+        &self,
+        size: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
         let allocated = buf_size(size)?;
         self.note_pool_request(0);
         let miss = match self.buffers.acquire_for_allocation(size) {
@@ -3092,11 +3606,8 @@ impl MetalDevice {
         self.buffers
             .check_residual(size)
             .map_err(|e| MetalError::Message(e.to_string()))?;
-        let new_buffer = self
-            .backings
-            .transient_shared
-            .alloc(size)
-            .map_err(MetalError::from)?;
+        let new_buffer =
+            Self::allocate_backing(self.backings.transient_shared.as_ref(), size, context)?;
         Ok(self.buffers.adopt_after_miss(new_buffer, size, miss))
     }
 

@@ -544,7 +544,7 @@ fn open<R: Read + Seek>(
     admit(gg, opts.fraction())?;
     let reservation = match &opts.machine {
         Some(m) => {
-            let plans = pass_plans_on(&gg.device);
+            let plans = pass_plans_on(&gg.device)?;
             let peak = machine_peak(&cfg, header_bytes(gg), opts, m.prefill_tile, phases, plans);
             let per_tile_position = prefill_bytes_per_position(&cfg) * (1 + usize::from(plans));
             match m.admit(&gg.device, peak.clone()) {
@@ -649,13 +649,13 @@ fn mtp_tenant<R: Read + Seek>(
 
 /// Whether recorded pass plans serve the passes on `device` (each planned
 /// pass shape then holds a base the size of its working set).
-fn pass_plans_on(device: &Device) -> bool {
+fn pass_plans_on(device: &Device) -> Result<bool> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
-        return m.pass_plans_enabled();
+        return Ok(m.execution_device()?.pass_plans_enabled());
     }
     let _ = device;
-    false
+    Ok(false)
 }
 
 /// Buffers a recurrent channel takes at profile `P`: the ring's phases when

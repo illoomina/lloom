@@ -241,7 +241,7 @@ impl crate::CustomOp1 for GemvMixed {
         let mut shape = dims.to_vec();
         *shape.last_mut().unwrap() = n_out + extra;
         Ok((
-            crate::MetalStorage::new(output, device.clone(), elem_count, DType::F32),
+            crate::MetalStorage::new_allocated(output, device.clone(), elem_count, DType::F32)?,
             Shape::from(shape),
         ))
     }

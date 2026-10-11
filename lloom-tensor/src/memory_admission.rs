@@ -14,7 +14,10 @@ use crate::machine::{Admitted, Verdict};
 use crate::memory_accounting as core;
 use crate::memory_accounting_machine::{MachineAdmission, MachineOwner};
 use parking_lot::Mutex;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock, Weak,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccountSnapshot {
@@ -41,6 +44,12 @@ pub enum LimitScope {
 pub enum AdmissionError {
     Overflow,
     DifferentDomain,
+    DifferentAllocationDevice,
+    UnboundAllocationDevice,
+    ReuseDomainMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
     Machine(String),
     Limit {
         scope: LimitScope,
@@ -62,6 +71,9 @@ impl std::fmt::Display for AdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Overflow => write!(f, "memory admission arithmetic exceeds usize"),
+            Self::DifferentAllocationDevice => write!(f, "reusable allocation container and operation target different native devices"),
+            Self::UnboundAllocationDevice => write!(f, "clock-only allocation container has no native device binding"),
+            Self::ReuseDomainMismatch { expected, actual } => write!(f, "reusable allocation domain mismatch: container={expected}, active payer={actual}; accounted domains require identical origin"),
             Self::DifferentDomain => write!(f, "cannot return a promise to a different model domain"),
             Self::Machine(why) => write!(f, "machine admission: {why}"),
             Self::Limit { scope, limit, requested_total } => write!(f, "{scope:?} memory demand {requested_total} exceeds limit {limit}"),
@@ -219,6 +231,62 @@ impl std::fmt::Debug for DomainKey {
     }
 }
 
+/// Immutable allocation namespace of a reusable container. Legacy is explicit;
+/// a missing context is never permission to consume an admitted container.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AllocationOrigin {
+    Legacy,
+    Domain(DomainKey),
+}
+impl AllocationOrigin {
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy/unadmitted",
+            Self::Domain(_) => "accounted domain",
+        }
+    }
+    pub fn validate_reuse(&self, active: &Self) -> Result<()> {
+        if self == active {
+            Ok(())
+        } else {
+            Err(AdmissionError::ReuseDomainMismatch {
+                expected: self.category(),
+                actual: active.category(),
+            })
+        }
+    }
+}
+
+/// Immutable backing/clock affinity plus quota origin. Generic identity lets
+/// CPU controls exercise the exact policy without constructing a native device.
+#[derive(Clone, Debug)]
+pub struct AllocationAffinity<D> {
+    origin: AllocationOrigin,
+    device: Option<D>,
+}
+impl<D: PartialEq> AllocationAffinity<D> {
+    pub fn bound(device: D, origin: AllocationOrigin) -> Self {
+        Self {
+            origin,
+            device: Some(device),
+        }
+    }
+    /// Numeric clock-only fixtures cannot acquire native buffers or bind later.
+    pub fn clock_only() -> Self {
+        Self {
+            origin: AllocationOrigin::Legacy,
+            device: None,
+        }
+    }
+    pub fn validate_reuse(&self, device: &D, payer: &AllocationOrigin) -> Result<()> {
+        match &self.device {
+            None => Err(AdmissionError::UnboundAllocationDevice),
+            Some(bound) if bound != device => Err(AdmissionError::DifferentAllocationDevice),
+            Some(_) => self.origin.validate_reuse(payer),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ModelDomain(core::Domain);
 impl ModelDomain {
@@ -235,11 +303,15 @@ impl ModelDomain {
         let promise = self.0.try_reserve(bytes)?;
         Ok(PassReservation(Arc::new(PassState {
             promise: Mutex::new(Some(promise)),
+            closed: AtomicBool::new(false),
             domain: self.0.clone(),
         })))
     }
 }
 struct PassState {
+    // Monotonic cancellation observation for warm paths; issuance still uses
+    // the authoritative promise mutex. No context can reopen this pass.
+    closed: AtomicBool,
     promise: Mutex<Option<core::Promise>>,
     // Remains identifiable after cancellation; it cannot reopen issuance.
     domain: core::Domain,
@@ -254,7 +326,13 @@ impl PassReservation {
 }
 impl Drop for PassReservation {
     fn drop(&mut self) {
-        let unused = self.0.promise.lock().take();
+        let unused = {
+            let mut promise = self.0.promise.lock();
+            // Cancellation linearizes under the same mutex as take(): tickets
+            // issued before this point remain valid; later issuance refuses.
+            self.0.closed.store(true, Ordering::Release);
+            promise.take()
+        };
         drop(unused); // Account/machine finalizers run after the context unlock.
     }
 }
@@ -264,6 +342,16 @@ pub struct AllocationContext(Arc<PassState>);
 impl AllocationContext {
     pub fn domain_key(&self) -> DomainKey {
         DomainKey(self.0.domain.clone())
+    }
+    /// Observe cancellation without taking the promise mutex on warm reuse.
+    /// This is not an execution lease: cancellation may follow the observation.
+    /// `take` remains the authoritative serialized issuance boundary on misses.
+    pub(crate) fn check_open(&self) -> Result<()> {
+        if self.0.closed.load(Ordering::Acquire) {
+            Err(AdmissionError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
     pub fn take(&self, upper_bound: usize) -> Result<AllocationTicket> {
         let promise = self
@@ -344,6 +432,113 @@ impl PhysicalCharge {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn reusable_origin_checks_actual_domain_identity_and_explicit_legacy() {
+        let account = ProcessAccount {
+            core: core::ProcessAccount::new(Some(16)),
+            cap: Some(16),
+        };
+        let a = account.unadmitted_domain(Some(8)).unwrap();
+        let b = account.unadmitted_domain(Some(8)).unwrap();
+        let origin = AllocationOrigin::Domain(a.key());
+        let same = AllocationOrigin::Domain(a.key());
+        let foreign = AllocationOrigin::Domain(b.key());
+        let legacy = AllocationOrigin::Legacy;
+        assert!(origin.validate_reuse(&same).is_ok());
+        assert!(legacy.validate_reuse(&legacy).is_ok());
+        for (container, payer) in [(&origin, &foreign), (&origin, &legacy), (&legacy, &origin)] {
+            assert_eq!(
+                container.validate_reuse(payer),
+                Err(AdmissionError::ReuseDomainMismatch {
+                    expected: container.category(),
+                    actual: payer.category(),
+                })
+            );
+        }
+        assert_eq!(account.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn reusable_affinity_checks_device_before_domain_and_rejects_unbound() {
+        let account = ProcessAccount {
+            core: core::ProcessAccount::new(Some(16)),
+            cap: Some(16),
+        };
+        let domain = account.unadmitted_domain(Some(8)).unwrap();
+        let payer = AllocationOrigin::Domain(domain.key());
+        let ring = AllocationAffinity::bound(7u32, payer.clone());
+        assert!(ring.validate_reuse(&7, &payer).is_ok());
+        assert_eq!(
+            ring.validate_reuse(&8, &payer),
+            Err(AdmissionError::DifferentAllocationDevice)
+        );
+        assert!(matches!(
+            ring.validate_reuse(&7, &AllocationOrigin::Legacy),
+            Err(AdmissionError::ReuseDomainMismatch { .. })
+        ));
+        let legacy = AllocationAffinity::bound(7u32, AllocationOrigin::Legacy);
+        assert!(legacy.validate_reuse(&7, &AllocationOrigin::Legacy).is_ok());
+        assert_eq!(
+            AllocationAffinity::<u32>::clock_only().validate_reuse(&7, &AllocationOrigin::Legacy),
+            Err(AdmissionError::UnboundAllocationDevice)
+        );
+        assert_eq!(account.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn cancellation_flag_and_racing_issuance_preserve_owned_ticket() {
+        let account = ProcessAccount {
+            core: core::ProcessAccount::new(Some(16)),
+            cap: Some(16),
+        };
+        let domain = account.unadmitted_domain(Some(16)).unwrap();
+        let pass = domain.reserve(8).unwrap();
+        let context = pass.context();
+        assert!(context.check_open().is_ok());
+        // An issued ticket is independent of cancellation; the racing request
+        // may issue before Drop or refuse after it. Both conserve the same sum.
+        let issued = context.take(4).unwrap();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let context = context.clone();
+            let worker = scope.spawn(move || {
+                start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                result_tx.send(context.take(4)).unwrap();
+            });
+            start_tx.send(()).unwrap();
+            drop(pass);
+            let raced = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            match raced {
+                Ok(ticket) => {
+                    assert_eq!(domain.snapshot().pending, 8);
+                    drop(ticket);
+                }
+                Err(e) => assert_eq!(e, AdmissionError::Cancelled),
+            }
+            worker.join().unwrap();
+        });
+        assert_eq!(context.check_open(), Err(AdmissionError::Cancelled));
+        assert!(matches!(context.take(0), Err(AdmissionError::Cancelled)));
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 4,
+                committed: 0
+            }
+        );
+        let charge = issued.commit(4).unwrap();
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 4
+            }
+        );
+        drop(charge);
+        assert_eq!(account.snapshot(), AccountSnapshot::default());
+    }
 
     #[test]
     fn numeric_domain_keys_distinguish_accounts_and_survive_cancellation() {

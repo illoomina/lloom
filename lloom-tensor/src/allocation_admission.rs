@@ -205,6 +205,36 @@ mod tests {
         ));
     }
     #[test]
+    fn numeric_padded_upload_demand_copies_only_native_length() {
+        let input = [1u8, 2, 3, 4, 5];
+        let domain = process_account().unadmitted_domain(Some(16)).unwrap();
+        let pass = domain.reserve(16).unwrap();
+        let prediction = Prediction::standalone::<&str>(input.len(), 9, 8).unwrap();
+        let (copied, owner) = allocate(
+            &pass.context(),
+            prediction,
+            |length| {
+                assert_eq!(length, 5, "creator must never read padded 16-byte demand");
+                Ok::<_, &str>(input[..length].to_vec())
+            },
+            |_| 8,
+        )
+        .unwrap();
+        assert_eq!(copied, input);
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 8,
+                committed: 8
+            }
+        );
+        drop(copied);
+        drop(owner);
+        drop(pass);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
     fn numeric_admission_and_cancel_refuse_before_native_call() {
         let domain = process_account().unadmitted_domain(Some(8)).unwrap();
         let pass = domain.reserve(8).unwrap();

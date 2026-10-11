@@ -306,6 +306,10 @@ impl Drop for Promise {
 pub(crate) struct PhysicalCharge(Arc<ChargeInner>);
 
 impl PhysicalCharge {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn domain(&self) -> &Domain {
         &self.0.domain
     }

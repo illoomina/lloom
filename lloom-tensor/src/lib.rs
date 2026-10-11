@@ -125,6 +125,8 @@ pub mod op;
 pub mod options;
 pub mod pickle;
 pub mod quantized;
+#[cfg(any(feature = "metal", test))]
+mod residency_ownership;
 pub mod retire;
 pub mod safetensors;
 pub mod scalar;

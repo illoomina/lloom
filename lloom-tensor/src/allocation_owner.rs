@@ -10,6 +10,9 @@ pub(crate) struct AllocationOwner {
     charge: PhysicalCharge,
 }
 impl AllocationOwner {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.charge.same_allocation(&other.charge)
+    }
     pub(crate) fn new(charge: PhysicalCharge) -> Self {
         Self { charge }
     }

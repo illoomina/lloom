@@ -64,6 +64,10 @@ impl Buffer {
         Self::with_owner(raw, Some(owner))
     }
 
+    pub(crate) fn allocation_owner(&self) -> Option<&AllocationOwner> {
+        self.raw.owner()
+    }
+
     pub(crate) fn allocation_lease(
         &self,
     ) -> AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>> {

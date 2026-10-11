@@ -1,9 +1,12 @@
 use super::{Buffer, Device};
+use crate::allocation_owner::{AllocationLease, AllocationOwner};
+use crate::residency_ownership::ResidencyOwners;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
 use parking_lot::Mutex;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+type ResidencyLease = AllocationLease<Retained<ProtocolObject<dyn MTLAllocation>>>;
 
 /// What the set has done, so the cost model can be checked rather than quoted.
 ///
@@ -73,13 +76,13 @@ pub struct ResidencyCounters {
 ///
 /// # Cost
 ///
-/// One `HashSet` operation per **allocation** and per eviction, and one
+/// One keyed-map operation per **allocation** and per eviction, and one
 /// `removeAllAllocations` at teardown. Nothing here is reached per dispatch or
 /// per bind: §11.2's non-GPU budget is 6.1 % of a decode token, so a per-bind
 /// membership test would be a real regression where a per-allocation one is
 /// free.
 ///
-/// **The `HashSet` is not the cost; the Metal call is** -- measured (#167's
+/// **The membership map is not the cost; the Metal call is** -- measured (#167's
 /// ablation, §6.3d), and it is why [`Self::retire_batch`] exists at all.
 ///
 /// **What that measurement did not price is the retention, and it is 48 GB**
@@ -93,7 +96,9 @@ pub struct ResidencyCounters {
 pub struct ResidencySet {
     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
 
-    /// `MTLBuffer` object addresses currently in the set.
+    /// Native allocation addresses plus their accounting custody. Removed
+    /// leases survive until native commit; retired leases survive until clear.
+    /// Legacy membership does not add a Rust native retain.
     ///
     /// `Mutex` rather than a lock-free structure because this is an
     /// allocation-path structure, not a per-dispatch one, and because the
@@ -102,7 +107,7 @@ pub struct ResidencySet {
     /// atomic against a concurrent remove of the same buffer. That pair is
     /// precisely the double-unregister #165's audit found reachable in
     /// principle.
-    members: Mutex<HashSet<usize>>,
+    members: Mutex<ResidencyOwners<ResidencyLease>>,
 
     /// See [`ResidencyCounters`]. Atomics rather than fields inside `members`
     /// so a reader never contends with an allocation for the lock, and
@@ -139,7 +144,7 @@ impl ResidencySet {
             .inspect(|set| set.requestResidency());
         ResidencySet {
             raw,
-            members: Mutex::new(HashSet::new()),
+            members: Mutex::new(ResidencyOwners::default()),
             commits: AtomicU64::new(0),
             added: AtomicU64::new(0),
             removed: AtomicU64::new(0),
@@ -204,14 +209,16 @@ impl ResidencySet {
             return 0;
         };
         let mut members = self.members.lock();
-        if members.insert(allocation_key(buf)) {
+        let (added, redundant) =
+            members.insert(allocation_key(buf), buffer_lease(buf), same_charge);
+        if added {
             set.addAllocation(as_allocation(buf));
             self.added.fetch_add(1, Ordering::Relaxed);
             self.dirty.store(true, Ordering::Relaxed);
-            1
-        } else {
-            0
         }
+        drop(members);
+        drop(redundant);
+        usize::from(added)
     }
 
     /// Add an allocation that is not a buffer of ours — a heap chunk
@@ -219,18 +226,55 @@ impl ResidencySet {
     /// few times a process and everything it will hold rides on this one
     /// commit. Returns whether it was newly added.
     pub fn insert_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>, key: usize) -> bool {
+        self.insert_allocation_with_owner(alloc, key, None)
+    }
+
+    /// Heap chunks use one shared owner for the chunk and all its sub-buffers.
+    pub(crate) fn insert_allocation_owned(
+        &self,
+        alloc: &ProtocolObject<dyn MTLAllocation>,
+        key: usize,
+        owner: AllocationOwner,
+    ) -> bool {
+        self.insert_allocation_with_owner(alloc, key, Some(owner))
+    }
+
+    fn insert_allocation_with_owner(
+        &self,
+        alloc: &ProtocolObject<dyn MTLAllocation>,
+        key: usize,
+        owner: Option<AllocationOwner>,
+    ) -> bool {
         let Some(set) = &self.raw else {
             return false;
         };
+        let lease = owner.map(|owner| retained_lease(alloc, owner));
         let mut members = self.members.lock();
-        if !members.insert(key) {
-            return false;
-        }
-        set.addAllocation(alloc);
+        let (added, redundant) = members.insert(key, lease, same_charge);
+        let released = if added {
+            set.addAllocation(alloc);
+            self.added.fetch_add(1, Ordering::Relaxed);
+            self.publish(set, &mut members)
+        } else {
+            Vec::new()
+        };
+        drop(members);
+        drop(redundant);
+        drop(released);
+        added
+    }
+
+    /// A native commit publishes ALL pending removals, irrespective of which
+    /// path triggered it. Return their leases so destruction happens unlocked.
+    fn publish(
+        &self,
+        set: &ProtocolObject<dyn MTLResidencySet>,
+        members: &mut ResidencyOwners<ResidencyLease>,
+    ) -> Vec<ResidencyLease> {
         set.commit();
-        self.added.fetch_add(1, Ordering::Relaxed);
         self.commits.fetch_add(1, Ordering::Relaxed);
-        true
+        self.dirty.store(false, Ordering::Release);
+        members.published_removals()
     }
 
     /// Commit the residency set iff [`Self::add`] has staged an allocation since
@@ -259,17 +303,18 @@ impl ResidencySet {
         // (§10.7's shape), and under `NSZombieEnabled` the extra release was
         // this `commit` sending `release` to a freed `MTLBuffer`
         // (`batched-decode-design.md` §12.10).
-        let _members = self.members.lock();
-        // `swap` so a concurrent `add` between the load and the commit re-dirties
-        // rather than being lost: if it set `dirty` after this `swap` read false
-        // it stays true for the next cut; if before, we commit its allocation now.
-        if self.dirty.swap(false, Ordering::AcqRel) {
-            set.commit();
-            self.commits.fetch_add(1, Ordering::Relaxed);
-            true
+        let mut members = self.members.lock();
+        // All dirty writers take `members`; a writer after this commit
+        // re-dirties under the same mutex, so its update cannot be lost.
+        let committed = self.dirty.load(Ordering::Relaxed);
+        let released = if committed {
+            self.publish(set, &mut members)
         } else {
-            false
-        }
+            Vec::new()
+        };
+        drop(members);
+        drop(released);
+        committed
     }
 
     /// Adds multiple buffers in a single commit.
@@ -284,7 +329,7 @@ impl ResidencySet {
     /// **The count is returned because nothing else can observe the skip.**
     /// `addAllocation` is idempotent on Metal's side, so `allocationCount()`
     /// reads the same whether or not a duplicate was forwarded, and a
-    /// `HashSet` holding one key has the same length either way. A test
+    /// membership map holding one key has the same length either way. A test
     /// asserting on either quantity **passes** under a mutation that re-adds
     /// unconditionally -- measured while mutation-testing this change, which is
     /// why this returns a count rather than `()`.
@@ -295,17 +340,25 @@ impl ResidencySet {
         self.insert_batches.fetch_add(1, Ordering::Relaxed);
         let mut members = self.members.lock();
         let mut added = 0usize;
+        let mut redundant = Vec::new();
         for buf in bufs {
-            if members.insert(allocation_key(buf)) {
+            let (inserted, duplicate) =
+                members.insert(allocation_key(buf), buffer_lease(buf), same_charge);
+            redundant.extend(duplicate);
+            if inserted {
                 set.addAllocation(as_allocation(buf));
                 added += 1;
             }
         }
-        if added > 0 {
-            set.commit();
-            self.commits.fetch_add(1, Ordering::Relaxed);
+        let released = if added > 0 {
             self.added.fetch_add(added as u64, Ordering::Relaxed);
-        }
+            self.publish(set, &mut members)
+        } else {
+            Vec::new()
+        };
+        drop(members);
+        drop(redundant);
+        drop(released);
         added
     }
 
@@ -328,16 +381,19 @@ impl ResidencySet {
         let mut members = self.members.lock();
         let mut removed = 0usize;
         for buf in bufs {
-            if members.remove(&allocation_key(buf)) {
+            if members.remove(allocation_key(buf)) {
                 set.removeAllocation(as_allocation(buf));
                 removed += 1;
             }
         }
-        if removed > 0 {
-            set.commit();
-            self.commits.fetch_add(1, Ordering::Relaxed);
+        let released = if removed > 0 {
             self.removed.fetch_add(removed as u64, Ordering::Relaxed);
-        }
+            self.publish(set, &mut members)
+        } else {
+            Vec::new()
+        };
+        drop(members);
+        drop(released);
         removed
     }
 
@@ -358,7 +414,7 @@ impl ResidencySet {
         let mut members = self.members.lock();
         let mut removed = 0usize;
         for buf in bufs {
-            if members.remove(&allocation_key(buf)) {
+            if members.remove(allocation_key(buf)) {
                 set.removeAllocation(as_allocation(buf));
                 removed += 1;
             }
@@ -381,7 +437,7 @@ impl ResidencySet {
             return 0;
         };
         let mut members = self.members.lock();
-        if members.remove(&allocation_key(buf)) {
+        if members.remove(allocation_key(buf)) {
             set.removeAllocation(as_allocation(buf));
             self.removed.fetch_add(1, Ordering::Relaxed);
             self.dirty.store(true, Ordering::Relaxed);
@@ -434,7 +490,7 @@ impl ResidencySet {
         let mut members = self.members.lock();
         let n = bufs
             .into_iter()
-            .filter(|buf| members.remove(&allocation_key(buf)))
+            .filter(|buf| members.retire(allocation_key(buf)))
             .count();
         self.retired.fetch_add(n as u64, Ordering::Relaxed);
         n
@@ -455,7 +511,7 @@ impl ResidencySet {
 
     /// Whether this buffer's allocation is currently in the set.
     pub fn contains(&self, buf: &Buffer) -> bool {
-        self.members.lock().contains(&allocation_key(buf))
+        self.members.lock().contains(allocation_key(buf))
     }
 
     /// Empties the set, in one commit.
@@ -490,9 +546,11 @@ impl ResidencySet {
         let mut members = self.members.lock();
         let n = members.len();
         set.removeAllAllocations();
-        set.commit();
-        self.commits.fetch_add(1, Ordering::Relaxed);
-        members.clear();
+        let pending = self.publish(set, &mut members);
+        let all = members.cleared();
+        drop(members);
+        drop(pending);
+        drop(all);
         n
     }
 }
@@ -517,4 +575,27 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
         &*(buf.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
             as *const ProtocolObject<dyn MTLAllocation>)
     }
+}
+
+fn same_charge(a: &ResidencyLease, b: &ResidencyLease) -> bool {
+    match (a.owner(), b.owner()) {
+        (Some(a), Some(b)) => a.same_allocation(b),
+        _ => false,
+    }
+}
+
+fn buffer_lease(buf: &Buffer) -> Option<ResidencyLease> {
+    buf.allocation_owner()
+        .map(|owner| retained_lease(as_allocation(buf), owner.clone()))
+}
+
+fn retained_lease(
+    alloc: &ProtocolObject<dyn MTLAllocation>,
+    owner: AllocationOwner,
+) -> ResidencyLease {
+    // SAFETY: alloc is a live, non-null borrowed ObjC allocation. This retain
+    // is paired with the charge in raw-first field order; no protocol change.
+    let raw = unsafe { Retained::retain(alloc as *const _ as *mut _) }
+        .expect("live allocation is non-null");
+    AllocationLease::new(raw, Some(owner))
 }

@@ -323,6 +323,9 @@ impl Drop for AllocationTicket {
 #[derive(Clone)]
 pub struct PhysicalCharge(core::PhysicalCharge);
 impl PhysicalCharge {
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.0.same_allocation(&other.0)
+    }
     pub fn domain_key(&self) -> DomainKey {
         DomainKey(self.0.domain().clone())
     }

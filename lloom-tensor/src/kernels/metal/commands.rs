@@ -3,6 +3,8 @@ mod entry_guard;
 #[path = "commands_lifecycle.rs"]
 mod lifecycle;
 
+use super::in_flight::{CompletedRelease, Held};
+use super::residency_set::PublishedRemovals;
 use entry_guard::{DeferredGuard, DeferredSlots};
 
 use crate::current_command::Current;
@@ -247,12 +249,17 @@ struct EntryState {
 // One acquisition can close one compute encoder and construct one replacement.
 // A blit guard additionally closes one pending predecessor and its own encoder.
 #[derive(Default)]
-struct ClosedEncoders {
+struct ClosedEncoders<'a> {
     compute: DeferredSlots<ComputeCommandEncoder, 1>,
     blit: DeferredSlots<PendingBlit, 2>,
     executor: DeferredSlots<Arc<ExecutorSlot>, 1>,
+    removals: DeferredSlots<PublishedRemovals, 1>,
+    // Last: closed wrappers can hand their fields to this same hold before
+    // its existing completed-prefix drain runs. No release occurs under state.
+    completed_hold: Option<CompletedRelease<'a, Held>>,
 }
-type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders>;
+
+type EntryGuard<'a> = DeferredGuard<parking_lot::MutexGuard<'a, EntryState>, ClosedEncoders<'a>>;
 
 impl EntryState {
     pub fn new(cb: CommandBuffer) -> EntryState {
@@ -270,9 +277,10 @@ pub struct Commands {
 }
 
 struct CommandsCore {
-    // Shared service Wake reserved for final teardown (inbox wiring pending).
-    // External encoder release publishes here after its wrapper fields drop.
-    retirement_wake: Arc<crate::completion_wake::Wake>,
+    // Retain service notification custody independently of installed state and
+    // encoder-domain observers. Notifications flow through those observers;
+    // this field is an owner, not a notification call site.
+    _retirement_wake: Arc<crate::completion_wake::Wake>,
     encoder_domain: Arc<super::encoder::EncoderDomain>,
     /// The encoder state, and `compute_count` beside it, are on **different
     /// cache lines** (issue #442).
@@ -333,7 +341,7 @@ struct CommandsCore {
     encoder_finalizer: Arc<EncoderFinalizer>,
     /// The queue's residency set, shared with the device that stages allocations
     /// into it. Held so a command-buffer cut can publish deferred allocations:
-    /// `commit_swap_locked` calls [`ResidencySet::commit_pending`] before it
+    /// `commit_swap_locked` calls [`ResidencySet::commit_pending_extracted`] before it
     /// commits, so a pool MISS's `add` (`DESIGN.md` §6.3b) is made resident
     /// before the command buffer that binds it executes, one commit per cut
     /// rather than one per missed buffer.
@@ -713,7 +721,7 @@ impl Commands {
             .wake();
         let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
         let core = Arc::new(CommandsCore {
-            retirement_wake,
+            _retirement_wake: retirement_wake,
             encoder_domain,
             state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
@@ -1559,15 +1567,18 @@ impl Commands {
     /// The return is what makes the async arms possible without a second commit
     /// site: the signal has to be encoded on *this* buffer, between closing its
     /// encoder and committing it, and only this function is at that point.
-    fn commit_swap_locked(
-        &self,
-        state: &mut EntryGuard<'_>,
+    fn commit_swap_locked<'a>(
+        &'a self,
+        state: &mut EntryGuard<'a>,
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         let receipt = self.core.commit_current_locked(state, timed)?;
         if let Some(hold) = &self.core.hold {
-            hold.release_completed();
+            // Preserve one drain per successful receipt and its original
+            // completion snapshot, including replacement error/unwind. The
+            // guard unlocks before this borrowed finalizer runs.
+            state.parts_mut().1.completed_hold = Some(hold.defer_release_completed());
         }
         let created = timed.map(|_| std::time::Instant::now());
         let state = &mut **state;
@@ -1838,6 +1849,7 @@ impl CommandsCore {
         self.close_pending_blit(state)?;
         self.close_compute(state)?;
         let t_end_enc = timed.map(|t| t.elapsed());
+        let (state, custody) = state.parts_mut();
         state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
@@ -1846,8 +1858,16 @@ impl CommandsCore {
                 // Reserve queue order and native handler allocation before
                 // epoch/signal/subscriber side effects. An unused preparation
                 // consumes no ordered completion sequence.
+                let destination =
+                    custody
+                        .removals
+                        .reserve()
+                        .ok_or(MetalKernelError::QueueUnavailable(
+                            "published residency custody bound (1) exhausted",
+                        ))?;
                 let prepared = cb.prepare_commit()?;
-                self.residency_set.commit_pending();
+                let (_, removed) = self.residency_set.commit_pending_extracted();
+                *destination = Some(removed);
                 let t_residency = timed.map(|t| t.elapsed());
                 let subs = self.on_complete.lock().clone();
                 self.submit_prepared(prepared, subs, timed, t_end_enc, t_residency)
@@ -2362,5 +2382,126 @@ mod entry_unwind_tests {
             .try_lock()
             .expect("setup unwind retained EntryState lock")
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod entry_release_tests {
+    use super::{CompletedRelease, DeferredGuard};
+    use crate::retire::{Completed, Epoch, Retire};
+    use std::cell::RefCell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::rc::{Rc, Weak};
+
+    struct Payload<'a> {
+        entry: &'a parking_lot::Mutex<()>,
+        held: Weak<parking_lot::Mutex<Retire<Payload<'a>>>>,
+        drops: Rc<RefCell<Vec<&'static str>>>,
+        name: &'static str,
+    }
+    impl Drop for Payload<'_> {
+        fn drop(&mut self) {
+            assert!(
+                self.entry.try_lock().is_some(),
+                "held payload destructor ran under EntryState lock"
+            );
+            if let Some(held) = self.held.upgrade() {
+                assert!(
+                    held.try_lock().is_some(),
+                    "hold payload destructor ran under hold lock"
+                );
+            }
+            self.drops.borrow_mut().push(self.name);
+        }
+    }
+
+    fn queue<'a>(
+        entry: &'a parking_lot::Mutex<()>,
+        drops: &Rc<RefCell<Vec<&'static str>>>,
+    ) -> Rc<parking_lot::Mutex<Retire<Payload<'a>>>> {
+        let held = Rc::new(parking_lot::Mutex::new(Retire::new()));
+        held.lock().retire(
+            Epoch(3),
+            Payload {
+                entry,
+                held: Rc::downgrade(&held),
+                drops: Rc::clone(drops),
+                name: "eligible",
+            },
+        );
+        held
+    }
+
+    #[test]
+    fn completed_release_runs_after_normal_entry_unlock() {
+        let entry = parking_lot::Mutex::new(());
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let held = queue(&entry, &drops);
+        let guard = DeferredGuard::new(entry.lock(), CompletedRelease::new(&held, Completed(4)));
+        assert!(drops.borrow().is_empty());
+        drop(guard);
+        assert_eq!(*drops.borrow(), ["eligible"]);
+        assert!(held.lock().is_empty());
+    }
+
+    #[test]
+    fn completed_release_survives_replacement_error() {
+        let entry = parking_lot::Mutex::new(());
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let held = queue(&entry, &drops);
+        let replacement = || -> Result<(), &'static str> {
+            let _guard =
+                DeferredGuard::new(entry.lock(), CompletedRelease::new(&held, Completed(4)));
+            Err("replacement refused")
+        };
+        assert_eq!(replacement(), Err("replacement refused"));
+        assert_eq!(*drops.borrow(), ["eligible"]);
+        assert!(held.lock().is_empty());
+    }
+
+    #[test]
+    fn completed_release_survives_replacement_unwind() {
+        let entry = parking_lot::Mutex::new(());
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let held = queue(&entry, &drops);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _guard =
+                DeferredGuard::new(entry.lock(), CompletedRelease::new(&held, Completed(4)));
+            panic!("controlled replacement unwind");
+        }))
+        .is_err());
+        assert_eq!(*drops.borrow(), ["eligible"]);
+        assert!(held.lock().is_empty());
+    }
+
+    #[test]
+    fn completed_release_keeps_captured_cutoff_and_unready_head() {
+        let entry = parking_lot::Mutex::new(());
+        let drops = Rc::new(RefCell::new(Vec::new()));
+        let held = queue(&entry, &drops);
+        for (epoch, name) in [(Epoch(5), "later"), (Epoch(6), "last")] {
+            held.lock().retire(
+                epoch,
+                Payload {
+                    entry: &entry,
+                    held: Rc::downgrade(&held),
+                    drops: Rc::clone(&drops),
+                    name,
+                },
+            );
+        }
+        let clock = super::GpuClock::new();
+        clock.mark_completed(Epoch(3));
+        let guard = DeferredGuard::new(
+            entry.lock(),
+            CompletedRelease::new(&held, clock.completed_count()),
+        );
+        clock.mark_completed(Epoch(6));
+        drop(guard);
+        assert_eq!(*drops.borrow(), ["eligible"], "captured cutoff was widened");
+        assert_eq!(held.lock().held(), 2);
+        drop(CompletedRelease::new(&held, clock.completed_count()));
+        assert_eq!(*drops.borrow(), ["eligible", "later", "last"]);
+        assert!(held.lock().is_empty());
     }
 }

@@ -16,7 +16,7 @@
 //! every drop is the plain release it always was.
 
 use super::{Buffer, GpuClock};
-use crate::retire::Retire;
+use crate::retire::{Completed, Retire};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLFence;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,18 +86,18 @@ impl InFlightHold {
     /// at the first entry still outstanding; the releases happen outside the
     /// lock.
     pub fn release_completed(&self) -> usize {
-        let completed = self.clock.completed_count();
-        let mut n = 0;
-        loop {
-            let item = self.held.lock().pop_ready(|e| completed.covers(e));
-            match item {
-                Some(item) => {
-                    drop(item);
-                    n += 1;
-                }
-                None => return n,
-            }
-        }
+        self.release_completed_up_to(self.clock.completed_count())
+    }
+
+    /// The same completed-prefix drain with a caller's earlier snapshot.
+    fn release_completed_up_to(&self, completed: Completed) -> usize {
+        release_completed_prefix(&self.held, completed)
+    }
+
+    /// Borrowed cleanup for Commands' off-EntryState custody. Captures the
+    /// cutoff now, but takes no hold lock until the cleanup itself is dropped.
+    pub(super) fn defer_release_completed(&self) -> CompletedRelease<'_, Held> {
+        CompletedRelease::new(&self.held, self.clock.completed_count())
     }
 
     pub fn counts(&self) -> HoldCounts {
@@ -105,6 +105,42 @@ impl InFlightHold {
             fences: self.fences.load(Ordering::Relaxed),
             buffers: self.buffers.load(Ordering::Relaxed),
             pending: self.held.lock().held(),
+        }
+    }
+}
+
+/// Snapshot-bearing borrowed cleanup. No Arc clone, allocation or extra
+/// producer lock: the caller keeps its hold alive and drops this after its
+/// outer state guard. Generic only so host controls exercise the actual loop
+/// and cleanup with nonempty fake payloads, not a second implementation.
+pub(super) struct CompletedRelease<'a, I> {
+    held: &'a parking_lot::Mutex<Retire<I>>,
+    completed: Completed,
+}
+impl<'a, I> CompletedRelease<'a, I> {
+    pub(super) fn new(held: &'a parking_lot::Mutex<Retire<I>>, completed: Completed) -> Self {
+        Self { held, completed }
+    }
+}
+impl<I> Drop for CompletedRelease<'_, I> {
+    fn drop(&mut self) {
+        release_completed_prefix(self.held, self.completed);
+    }
+}
+
+fn release_completed_prefix<I>(
+    held: &parking_lot::Mutex<Retire<I>>,
+    completed: Completed,
+) -> usize {
+    let mut n = 0;
+    loop {
+        let item = held.lock().pop_ready(|e| completed.covers(e));
+        match item {
+            Some(item) => {
+                drop(item);
+                n += 1;
+            }
+            None => return n,
         }
     }
 }

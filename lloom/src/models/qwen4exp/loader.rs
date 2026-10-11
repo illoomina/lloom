@@ -27,7 +27,7 @@ use super::qsa::{Indexer, QsaAttention};
 use crate::nn::expert_stream::{ExpertSource, LoaderArm};
 use crate::nn::RmsNorm;
 use crate::profile::Profile;
-use lloom_tensor::quantized::gguf_file::{Content, Value};
+use lloom_tensor::quantized::gguf_file::{Content, TensorInfo, Value};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
 use std::collections::HashMap;
@@ -591,8 +591,70 @@ fn plan_load<Rd: Read + Seek>(
     device: &Device,
     fraction: f64,
     slots: Option<usize>,
-) -> LoadPlan {
+) -> Result<LoadPlan> {
     plan_load_holding(gg, device, fraction, slots, None)
+}
+
+// A transaction over header-derived device-weight terms, not an allocation or
+// a bound on opaque native objects. PLE is excluded because this term omits the
+// mmap tier; its mapping/page residency is not physically free.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HeaderTotals {
+    resident: usize,
+    per_slot: usize,
+    total: usize,
+}
+
+impl HeaderTotals {
+    fn add(&mut self, name: &str, info: &TensorInfo, held_prefix: Option<&str>) -> Result<()> {
+        if name == "per_layer_token_embd.weight" {
+            return Ok(());
+        }
+        let overflow =
+            |term| lloom_tensor::Error::Msg(format!("tensor `{name}`: {term} overflows usize"));
+        // A zero dimension makes the exact product zero, even if a preceding
+        // partial product would overflow. An empty shape is one scalar.
+        let dims = info.shape.dims();
+        let elements = if dims.contains(&0) {
+            0
+        } else {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| overflow("dimension product"))?
+        };
+        let block = info.ggml_dtype.block_size();
+        if !elements.is_multiple_of(block) {
+            lloom_tensor::bail!(
+                "tensor `{name}`: {elements} elements are not divisible by block size {block}"
+            )
+        }
+        let bytes = (elements / block)
+            .checked_mul(info.ggml_dtype.type_size())
+            .ok_or_else(|| overflow("packed bytes"))?;
+        let mut next = *self;
+        let held = held_prefix.is_some_and(|prefix| name.starts_with(prefix));
+        if name.ends_with("_exps.weight") && !held {
+            // Preserve the existing plane division. ExpertSource::from_gguf
+            // additionally validates dims3 and k/block for actual streamed IO;
+            // this header aggregate does not replace that reader's validation.
+            let experts = dims.first().copied().unwrap_or(1).max(1);
+            next.per_slot = next
+                .per_slot
+                .checked_add(bytes / experts)
+                .ok_or_else(|| overflow("per-slot sum"))?;
+            next.total = next
+                .total
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("expert total"))?;
+        } else {
+            next.resident = next
+                .resident
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("resident sum"))?;
+        }
+        *self = next;
+        Ok(())
+    }
 }
 
 /// [`plan_load`] with layer `held`'s routed experts counted as resident
@@ -605,37 +667,22 @@ fn plan_load_holding<Rd: Read + Seek>(
     fraction: f64,
     slots: Option<usize>,
     held: Option<usize>,
-) -> LoadPlan {
+) -> Result<LoadPlan> {
     let held_prefix = held.map(|l| format!("blk.{l}."));
-    let mut resident = 0usize;
-    let mut per_slot = 0usize;
-    let mut total = 0usize;
+    let mut totals = HeaderTotals::default();
     for sh in &gg.shards {
         for (name, info) in &sh.content.tensor_infos {
-            let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
-                * info.ggml_dtype.type_size();
-            if name == "per_layer_token_embd.weight" {
-                continue; // memory-mapped, not resident
-            }
-            let held_layer = held_prefix.as_deref().is_some_and(|p| name.starts_with(p));
-            if name.ends_with("_exps.weight") && !held_layer {
-                // [n_experts, n, k]: one plane per slot
-                let n_experts = info.shape.dims().first().copied().unwrap_or(1).max(1);
-                per_slot += bytes / n_experts;
-                total += bytes;
-            } else {
-                resident += bytes;
-            }
+            totals.add(name, info, held_prefix.as_deref())?;
         }
     }
-    LoadPlan {
-        resident_bytes: resident,
-        expert_bytes_per_slot: per_slot,
-        expert_bytes_total: total,
+    Ok(LoadPlan {
+        resident_bytes: totals.resident,
+        expert_bytes_per_slot: totals.per_slot,
+        expert_bytes_total: totals.total,
         slots,
         working_set: working_set_of(device),
         fraction,
-    }
+    })
 }
 
 /// `recommendedMaxWorkingSetSize` of a Metal device; 0 elsewhere.
@@ -663,7 +710,7 @@ fn plan_slots<Rd: Read + Seek>(
     claims: &[SessionClaim],
     held: Option<usize>,
 ) -> Result<SlotPlan> {
-    let plan = plan_load_holding(gg, device, fraction, None, held);
+    let plan = plan_load_holding(gg, device, fraction, None, held)?;
     let per_slot = plan.expert_bytes_per_slot.max(1);
     let reserve_bytes = session_floor_bytes(claims);
     #[cfg(not(feature = "metal"))]
@@ -872,7 +919,9 @@ impl LoadPlan {
     /// set (not Metal) or nonpositive fraction bypasses ONLY the quota.
     /// An unrepresentable physical demand is refused before either bypass.
     pub fn fits(&self) -> bool {
-        let Ok(predicted) = usize::try_from(self.predicted()) else { return false; };
+        let Ok(predicted) = usize::try_from(self.predicted()) else {
+            return false;
+        };
         self.working_set == 0 || self.fraction <= 0.0 || predicted <= self.budget()
     }
     /// The slots a streamed pool could hold under this budget (at least
@@ -960,7 +1009,8 @@ fn admit_machine<Rd: Read + Seek>(
 ) -> Result<Reservation> {
     let physical = plan.physical_bytes()?;
     let resident = u64::try_from(plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
-    let experts = u64::try_from(physical - plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
+    let experts =
+        u64::try_from(physical - plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
     let Some(m) = &opts.machine else {
         return Ok(None);
     };
@@ -1055,7 +1105,7 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             }],
             device,
         )?;
-        let plan = plan_load(&gg, device, opts.fraction(), None);
+        let plan = plan_load(&gg, device, opts.fraction(), None)?;
         admit_load(&plan)?;
         let reservation = admit_machine(&gg, opts, &plan, None)?;
         let mut model = build(&mut gg, device, opts, |gg, l| {
@@ -1089,7 +1139,7 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
         )?;
         gg.dense_f32 = true;
         let opts = LoadOptions::default();
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
+        admit_load(&plan_load(&gg, device, opts.fraction(), None)?)?;
         build(&mut gg, device, &opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
@@ -1118,7 +1168,7 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
-        let plan = plan_load(&gg, device, opts.fraction(), None);
+        let plan = plan_load(&gg, device, opts.fraction(), None)?;
         admit_load(&plan)?;
         let reservation = admit_machine(&gg, opts, &plan, None)?;
         let mut model = build(&mut gg, device, opts, |gg, l| {
@@ -1268,7 +1318,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // A fixed count is admitted like any load; `Auto` sized itself to
         // the budget and passes by construction (or sits at the pool's
         // `topk + 1` floor, which is then refused with the arithmetic).
-        let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held);
+        let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held)?;
         admit_load(&plan)?;
         let reservation = admit_machine(&gg, opts, &plan, Some(stream))?;
         let arm = match stream.loader {
@@ -1365,7 +1415,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     0 => IO_INFLIGHT_RESERVE_BYTES,
                     b => b,
                 };
-                let per_expert = (plan_load_holding(&gg, device, opts.fraction(), None, None)
+                let per_expert = (plan_load_holding(&gg, device, opts.fraction(), None, None)?
                     .expert_bytes_total
                     - plan.expert_bytes_total)
                     / cfg0.n_experts.max(1);
@@ -1662,12 +1712,128 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    fn header(dtype: GgmlDType, dims: &[usize]) -> TensorInfo {
+        TensorInfo {
+            ggml_dtype: dtype,
+            shape: dims.into(),
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn numeric_header_totals_preserve_tiers_scalar_quantized_and_zero() -> Result<()> {
+        let mut totals = HeaderTotals::default();
+        totals.add("scalar", &header(GgmlDType::F32, &[]), None)?;
+        assert_eq!(totals.resident, 4);
+        totals.add(
+            "blk.0.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 32]),
+            None,
+        )?;
+        assert_eq!((totals.per_slot, totals.total), (18, 36));
+        totals.add(
+            "blk.1.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 32]),
+            Some("blk.1."),
+        )?;
+        assert_eq!(
+            totals,
+            HeaderTotals {
+                resident: 40,
+                per_slot: 18,
+                total: 36
+            }
+        );
+        let before = totals;
+        totals.add("empty", &header(GgmlDType::F32, &[usize::MAX, 2, 0]), None)?;
+        // Mmap PLE remains outside this device-weight term, not an admitted or
+        // physically free allocation; its invalid/huge shape is not read here.
+        totals.add(
+            "per_layer_token_embd.weight",
+            &header(GgmlDType::F32, &[usize::MAX, 2]),
+            None,
+        )?;
+        assert_eq!(totals, before);
+        // Preserve bytes/experts truncation for a header rejected later by the
+        // streamed reader's stricter k/block validation (2*16 is one Q4 block).
+        let mut aggregate = HeaderTotals::default();
+        aggregate.add(
+            "blk.0.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 16]),
+            None,
+        )?;
+        assert_eq!((aggregate.per_slot, aggregate.total), (9, 18));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_header_totals_refuse_overflow_without_partial_updates() {
+        let ordinary = HeaderTotals {
+            resident: 4,
+            per_slot: 18,
+            total: 36,
+        };
+        for (info, expected) in [
+            (
+                header(GgmlDType::F32, &[usize::MAX, 2]),
+                "dimension product",
+            ),
+            (header(GgmlDType::F32, &[usize::MAX]), "packed bytes"),
+            (header(GgmlDType::Q4_0, &[31]), "not divisible"),
+        ] {
+            let mut totals = ordinary;
+            let err = totals.add("bad", &info, None).unwrap_err().to_string();
+            assert!(err.contains("`bad`") && err.contains(expected), "{err}");
+            assert_eq!(totals, ordinary);
+        }
+        for (before, name, expected) in [
+            (
+                HeaderTotals {
+                    resident: usize::MAX - 3,
+                    ..ordinary
+                },
+                "scalar",
+                "resident sum",
+            ),
+            (
+                HeaderTotals {
+                    per_slot: usize::MAX - 3,
+                    ..ordinary
+                },
+                "ffn_exps.weight",
+                "per-slot sum",
+            ),
+            // The per-slot update succeeds in the local copy before total
+            // fails: neither field may be published by this failed add.
+            (
+                HeaderTotals {
+                    total: usize::MAX - 3,
+                    ..ordinary
+                },
+                "ffn_exps.weight",
+                "expert total",
+            ),
+        ] {
+            let mut totals = before;
+            let err = totals
+                .add(name, &header(GgmlDType::F32, &[1]), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+            assert_eq!(totals, before);
+        }
+    }
+
     #[test]
     fn numeric_load_plan_extremes_refuse_before_quota_bypasses() {
         let max = usize::MAX;
         let mut plan = LoadPlan {
-            resident_bytes: max, expert_bytes_per_slot: 1, expert_bytes_total: 0,
-            slots: None, working_set: max, fraction: 1.0,
+            resident_bytes: max,
+            expert_bytes_per_slot: 1,
+            expert_bytes_total: 0,
+            slots: None,
+            working_set: max,
+            fraction: 1.0,
         };
         assert_eq!(plan.predicted(), max as u128);
         assert!(plan.fits());
@@ -1680,7 +1846,10 @@ mod tests {
                 plan.fraction = fraction;
                 assert!(!plan.fits());
                 let err = admit_load(&plan).unwrap_err().to_string();
-                assert!(err.contains("unrepresentable physical memory demand"), "{err}");
+                assert!(
+                    err.contains("unrepresentable physical memory demand"),
+                    "{err}"
+                );
                 assert!(err.contains(&(max as u128 + 1).to_string()), "{err}");
                 assert!(!err.contains("budget OK"));
                 assert!(!err.contains("--memory-fraction"));
@@ -1697,8 +1866,12 @@ mod tests {
     #[test]
     fn numeric_load_plan_fraction_compatibility_is_not_new_policy_validation() {
         let mut plan = LoadPlan {
-            resident_bytes: 1, expert_bytes_per_slot: 0, expert_bytes_total: 0,
-            slots: None, working_set: 10, fraction: -1.0,
+            resident_bytes: 1,
+            expert_bytes_per_slot: 0,
+            expert_bytes_total: 0,
+            slots: None,
+            working_set: 10,
+            fraction: -1.0,
         };
         // Existing policy, not a new recommendation: <=0 bypasses quota,
         // infinity casts its budget to MAX; NaN casts to zero.
@@ -1797,8 +1970,8 @@ mod tests {
             }],
             &dev,
         )?;
-        let all = plan_load(&gg, &dev, 0.65, Some(4));
-        let mtp = plan_load_holding(&gg, &dev, 0.65, Some(4), Some(held));
+        let all = plan_load(&gg, &dev, 0.65, Some(4))?;
+        let mtp = plan_load_holding(&gg, &dev, 0.65, Some(4), Some(held))?;
         std::fs::remove_file(&path).ok();
         assert!(held_bytes > 0);
         assert_eq!(mtp.resident_bytes, all.resident_bytes + held_bytes);

@@ -57,6 +57,21 @@ pub trait Served: Send + Sync {
         None
     }
 
+    /// Decide without generating tokens, using this already-loaded model.
+    /// Raw ordered state/questions reach the shared decision frontend; families
+    /// supply execution, not copies of rendering/readout. The default refusal is
+    /// transitional until every causal family implements retained-trunk execution.
+    fn systemone(
+        &self,
+        _body: &crate::decision::OrderedJson,
+    ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+    {
+        Err(crate::decision::SystemOneError::Unsupported(format!(
+            "{} has no installed decision executor",
+            self.model_name()
+        )))
+    }
+
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;
     /// Render `messages` through the checkpoint's own chat template with the
@@ -199,17 +214,60 @@ pub trait Served: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::app::family::QWEN4EXP_CAPABILITIES;
 
     /// A family with no vision, reached only through the seam: every method
     /// the image path could call past the refusal panics.
-    struct NoVision(Device);
+    pub(crate) struct NoVision {
+        device: Device,
+        pub(crate) calls: std::sync::atomic::AtomicUsize,
+        handler: Option<
+            fn(
+                &crate::decision::OrderedJson,
+            ) -> std::result::Result<
+                crate::decision::SystemOneResponse,
+                crate::decision::SystemOneError,
+            >,
+        >,
+    }
+    impl NoVision {
+        pub(crate) fn new(
+            handler: Option<
+                fn(
+                    &crate::decision::OrderedJson,
+                ) -> std::result::Result<
+                    crate::decision::SystemOneResponse,
+                    crate::decision::SystemOneError,
+                >,
+            >,
+        ) -> Self {
+            Self {
+                device: Device::Cpu,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                handler,
+            }
+        }
+    }
 
     impl Served for NoVision {
+        fn systemone(
+            &self,
+            body: &crate::decision::OrderedJson,
+        ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.handler {
+                Some(handler) => handler(body),
+                None => Err(crate::decision::SystemOneError::Unsupported(
+                    "stub has no installed decision executor".into(),
+                )),
+            }
+        }
         fn device(&self) -> &Device {
-            &self.0
+            &self.device
         }
         fn model_name(&self) -> &str {
             "stub"
@@ -292,7 +350,7 @@ mod tests {
     /// reason, before anything is rendered or decoded.
     #[test]
     fn a_family_without_vision_refuses_an_image_by_name() {
-        let engine = NoVision(Device::Cpu);
+        let engine = NoVision::new(None);
         let image = DecodedImage::from_rgb8(1, 1, vec![0, 0, 0]);
         let want = "qwen4exp does not take image input: no vision tower is built for Qwen4-exp";
         let err = engine.image_placeholder(&image).unwrap_err().to_string();

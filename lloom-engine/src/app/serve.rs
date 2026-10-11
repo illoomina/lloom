@@ -251,6 +251,22 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         .as_reader()
         .read_to_string(&mut body)
         .context("reading the request body")?;
+    // This branch consumes the original bytes exactly once. Parsing through
+    // Value first would reorder question/options/legend objects.
+    if let Some(result) = dispatch_systemone(shared.engine.as_ref(), path, body.as_bytes()) {
+        return match result {
+            Ok(text) => respond_json_text(request, 200, text),
+            Err(crate::decision::SystemOneError::InvalidRequest(message)) => {
+                respond_error(request, 400, &message)
+            }
+            Err(crate::decision::SystemOneError::Unsupported(message)) => {
+                respond_error(request, 501, &message)
+            }
+            Err(crate::decision::SystemOneError::Execution(message)) => {
+                respond_error(request, 500, &message)
+            }
+        };
+    }
     let value: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -281,6 +297,25 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
         Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
     }
+}
+
+/// The actual ordered route: return None without parsing other endpoints.
+fn dispatch_systemone(
+    engine: &dyn Served,
+    path: &str,
+    body: &[u8],
+) -> Option<std::result::Result<String, crate::decision::SystemOneError>> {
+    use crate::decision::{OrderedJson, SystemOneError};
+    if path != "/v1/systemone" {
+        return None;
+    }
+    Some((|| {
+        let ordered = OrderedJson::from_slice(body).map_err(|e| {
+            SystemOneError::InvalidRequest(format!("request body is not JSON: {e}"))
+        })?;
+        let response = engine.systemone(&ordered)?;
+        serde_json::to_string(&response).map_err(|e| SystemOneError::Execution(e.to_string()))
+    })())
 }
 
 enum Reply {
@@ -1572,7 +1607,10 @@ fn handle_abort(shared: &Shared, mut request: Request) -> Result<()> {
 // ---- responses ---------------------------------------------------------------
 
 fn respond_json(request: Request, status: u16, body: &Value) -> Result<()> {
-    let text = body.to_string();
+    respond_json_text(request, status, body.to_string())
+}
+
+fn respond_json_text(request: Request, status: u16, text: String) -> Result<()> {
     let response = Response::from_string(text)
         .with_status_code(StatusCode(status))
         .with_header(header("Content-Type", "application/json"));
@@ -2782,5 +2820,88 @@ mod stream_writer_tests {
             .map(|(_, s)| s)
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod systemone_dispatch_tests {
+    use super::dispatch_systemone;
+    use crate::app::served::tests::NoVision;
+    use crate::decision::{
+        parse_systemone_questions, NoulAliases, OrderedJson, SystemOneError, SystemOneResponse,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn answer(body: &OrderedJson) -> std::result::Result<SystemOneResponse, SystemOneError> {
+        assert_eq!(
+            serde_json::to_string(body.get("state").unwrap()).unwrap(),
+            r#"{"z":"雪\n","a":false}"#
+        );
+        let questions = parse_systemone_questions(body, 255, NoulAliases::TrueFalseOnly)
+            .map_err(|e| SystemOneError::InvalidRequest(e.to_string()))?;
+        let answers = questions
+            .into_iter()
+            .map(|(id, question)| {
+                question
+                    .systemone_answer(&[0.25, 0.75])
+                    .map(|answer| (id, answer))
+                    .map_err(|e| SystemOneError::Execution(e.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        SystemOneResponse::new(answers, 123)
+    }
+
+    #[test]
+    fn actual_ordered_route_calls_loaded_executor_once_and_serializes_without_value() {
+        let engine = NoVision::new(Some(answer));
+        let body = br#"{"state":{"z":"\u96ea\n","a":false},"questions":{"z":{"type":"score","instructions":"rate","criteria":[{"z":null,"a":false},17]},"a":{"type":"choice","instructions":"pick","criteria":{"Z":null,"A":true}}}}"#;
+        let text = dispatch_systemone(&engine, "/v1/systemone", body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            text.starts_with(r#"{"answers":{"z":{"type":"score""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""legend":{"0":{"z":null,"a":false},"1":17}},"a":{"type":"choice""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""probabilities":{"Z":0.25,"A":0.75}"#),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(r#""usage":{"input_tokens":123,"output_tokens":0}}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unrelated_routes_and_invalid_json_do_not_enter_executor() {
+        let engine = NoVision::new(Some(answer));
+        assert!(dispatch_systemone(&engine, "/v1/chat/completions", b"not json").is_none());
+        assert!(matches!(
+            dispatch_systemone(&engine, "/v1/systemone", b"not json"),
+            Some(Err(SystemOneError::InvalidRequest(_)))
+        ));
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn missing_executor_stays_explicit_and_duplicate_answers_are_refused() {
+        let engine = NoVision::new(None);
+        assert!(matches!(
+            dispatch_systemone(&engine, "/v1/systemone", b"{}"),
+            Some(Err(SystemOneError::Unsupported(_)))
+        ));
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 1);
+        let answer = crate::decision::Answer::Noul { probability: 0.5 };
+        assert!(SystemOneResponse::new(vec![], 0).is_err());
+        assert!(SystemOneResponse::new(
+            vec![("q".into(), answer.clone()), ("q".into(), answer)],
+            0
+        )
+        .is_err());
     }
 }

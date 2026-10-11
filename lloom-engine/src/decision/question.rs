@@ -216,7 +216,7 @@ impl<Content: Serialize> Answer<Content> {
 }
 
 /// Serialize ordered pairs as an object without a sorted-map intermediary.
-struct Pairs<'a, T>(&'a [(String, T)]);
+pub(super) struct Pairs<'a, T>(pub(super) &'a [(String, T)]);
 impl<T: Serialize> Serialize for Pairs<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.0.len()))?;

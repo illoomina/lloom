@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub family: &'static str,
+    /// Token-generation support (distinct from non-generating decisions).
+    pub generation: bool,
+    /// An installed decision executor, not merely an HTTP route.
+    pub decisions: bool,
     /// The profiles the family ships, as a bound over the eight
     /// (`lloom::profile`, design §3: "a bound, not a list"; #892 B1). The
     /// boundary (§7.4) matches `(--profile, rewind, rows)` against it.
@@ -72,6 +76,8 @@ impl Capabilities {
     pub fn json(&self) -> Value {
         json!({
             "family": self.family,
+            "generation": self.generation,
+            "decisions": self.decisions,
             "lookahead_max": self.lookahead_max,
             "ring": self.ring,
             "batch": self.batch,
@@ -89,7 +95,9 @@ impl Capabilities {
 
     pub fn line(&self) -> String {
         format!(
-            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
+            "generation={} decisions={} lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
+            self.generation,
+            self.decisions,
             self.lookahead_max,
             self.ring,
             self.batch,
@@ -152,6 +160,8 @@ pub struct Qwen3_5Family;
 
 pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::LFM2,
     lookahead_max: 1,
     ring: "full",
@@ -173,6 +183,8 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen4exp",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN4EXP,
     lookahead_max: 1,
     ring: "full: the PLE fed by the driver's host fill where the arm stamps each token (Metal); the fed id read back on a deferred read at the fixed cadence",
@@ -196,6 +208,8 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
 
 pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen3_5",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN3_5,
     lookahead_max: 1,
     ring: "by-name: the decoder keeps no standing window, so a forward past an unlearned EOS is not undone",

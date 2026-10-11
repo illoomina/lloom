@@ -40,6 +40,7 @@
 //! composition remain separate obligations: the current dump still allocates.
 
 mod archive;
+pub(crate) use archive::read_single;
 mod inputs;
 mod signals;
 

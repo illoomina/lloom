@@ -273,7 +273,8 @@ where
         Record::install_crash_dump()?;
     }
     if let Some(path) = &cli.once {
-        let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
+        let bytes = crate::record::read_single(path, crate::record::MAX_INPUT)
+            .with_context(|| path.display().to_string())?;
         record.push(&bytes)?;
         return match (harness.borrow_mut())(&bytes) {
             Ok(()) => {

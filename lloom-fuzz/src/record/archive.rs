@@ -125,14 +125,7 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
     };
     let mut lengths = Vec::with_capacity(paths.len());
     for path in &paths {
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_file() || metadata.len() > maximum as u64 {
-            return Err(invalid(format!(
-                "input is not a regular file within the {maximum}-byte bound: {}",
-                path.display()
-            )));
-        }
-        lengths.push(metadata.len());
+        lengths.push(input_length(path, maximum)?);
     }
     if let Some(manifest) = manifest {
         let mut lines = manifest.lines();
@@ -170,13 +163,35 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
     })
 }
 
+fn input_length(path: &Path, maximum: usize) -> io::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > maximum as u64 {
+        return Err(invalid(format!(
+            "input is not a regular file within the {maximum}-byte bound: {}",
+            path.display()
+        )));
+    }
+    Ok(metadata.len())
+}
+
+/// Single-input execution shares replay's bound before allocating input bytes.
+/// The streaming limit still applies if a file grows after the metadata check.
+pub(crate) fn read_single(path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
+    read(path, input_length(path, maximum)?, maximum)
+}
+
 /// Bound allocation even if a file grows after preflight. Recheck size rather
 /// than interpreting changed-length bytes as the recorded execution.
 pub(super) fn read(path: &Path, expected: u64, maximum: usize) -> io::Result<Vec<u8>> {
+    read_bounded(fs::File::open(path)?, expected, maximum)
+}
+
+fn read_bounded(reader: impl Read, expected: u64, maximum: usize) -> io::Result<Vec<u8>> {
+    let limit = (maximum as u64)
+        .checked_add(1)
+        .ok_or_else(|| invalid("input bound overflows u64"))?;
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    reader.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() as u64 != expected || bytes.len() > maximum {
         return Err(invalid("input length changed after replay preflight"));
     }
@@ -314,5 +329,35 @@ mod tests {
         let replay = prepare(&dir, 4).unwrap();
         fs::write(&replay.paths[0], b"12345").unwrap();
         assert!(read(&replay.paths[0], replay.lengths[0], 4).is_err());
+    }
+
+    #[test]
+    fn single_input_accepts_empty_and_exact_limit_but_refuses_oversize() {
+        let tmp = Temp::new();
+        let input = tmp.0.join("input.bin");
+        for bytes in [b"".as_slice(), b"1234"] {
+            fs::write(&input, bytes).unwrap();
+            assert_eq!(read_single(&input, 4).unwrap(), bytes);
+        }
+        fs::write(&input, b"12345").unwrap();
+        assert!(read_single(&input, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("4-byte bound"));
+        assert!(read_single(&tmp.0, 4).is_err());
+    }
+
+    #[test]
+    fn streaming_limit_precedes_size_validation() {
+        // A finite growing-file stand-in: count bytes consumed by the SAME
+        // reader used for File, not just the eventual size-error verdict.
+        let mut input = io::Cursor::new([0u8; 64]);
+        let error = read_bounded(&mut input, 4, 4).unwrap_err();
+        assert!(error.to_string().contains("input length changed"));
+        assert_eq!(
+            input.position(),
+            5,
+            "oversized input read before validation"
+        );
     }
 }

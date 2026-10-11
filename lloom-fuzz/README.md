@@ -118,6 +118,11 @@ fuzz_cb_liveness --cb unretained --replay out/records/record-12345-0
 fuzz_cb_liveness --cb unretained --once  out/solutions/<id>          # the crashing input alone
 ```
 
+`--once` and replay share the 64 KiB input-byte limit. Single-input execution
+checks the file size before reading and keeps a streaming limit if the file grows;
+oversized inputs are refused before recording or target execution. This is not a
+process-memory cap or verification of build/schedule identity.
+
 A failure that reproduces from the record and not from the single input is a
 state-carryover failure — the class the record exists for. `record_selftest`
 is the mechanism's validation target: a *planted* dependency (an input whose

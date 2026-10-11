@@ -2705,7 +2705,10 @@ impl MetalDevice {
                 .admit(feature, || format!("a `{feature}` op"))
                 .map_err(MetalError::from)?;
         }
-        let size = element_count * dtype.size_in_bytes();
+        let size = crate::allocation_geometry::typed_bytes(element_count, dtype)?;
+        // Validate miss geometry before arena ordinals or pool drain/reuse can
+        // change state. Reuse still takes the original requested byte count.
+        let alloc = buf_size(size)?;
         // Layer 3 (`DESIGN.md` §9.2a). The arena is offered the allocation
         // first; it serves it only inside a decode step, only while the plan
         // still has an ordinal, and only when the size matches what that ordinal
@@ -2749,7 +2752,6 @@ impl MetalDevice {
         let buffer = match self.private_buffers.acquire_for_allocation(size) {
             Ok(b) => b,
             Err(miss) => {
-                let alloc = buf_size(size);
                 // `DESIGN.md` §9.5k's one branch, on the derived residual. It
                 // sits on the pool MISS, after `acquire` has declined, because
                 // a hit allocates nothing and there is nothing to bound; and
@@ -2829,7 +2831,7 @@ impl MetalDevice {
         dtype: DType,
         _name: &str,
     ) -> Result<BufferHandle> {
-        let size = element_count * dtype.size_in_bytes();
+        let size = crate::allocation_geometry::typed_bytes(element_count, dtype)?;
         let a = self
             .backings
             .resident_private
@@ -3054,6 +3056,7 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<BufferHandle> {
+        let allocated = buf_size(size)?;
         self.note_pool_request(0);
         let miss = match self.buffers.acquire_for_allocation(size) {
             Ok(b) => return Ok(b),
@@ -3061,7 +3064,7 @@ impl MetalDevice {
         };
         // `miss` retains the requested size before rounding, so adoption can
         // account for the overhang (§9.2, #47).
-        let size = buf_size(size);
+        let size = allocated;
         // §9.5k's branch, on the pool miss and before the allocation -- see
         // `new_buffer` above. This is the pool the KV reserve is served from
         // (`KvSlot::append` -> `Tensor::zeros` -> here), which is why the
@@ -3164,10 +3167,8 @@ fn buffer_alignment() -> usize {
 /// size the memory controller likes) without the waste. Reuse is unaffected:
 /// `find_available_buffer` accepts any pooled buffer at least as large as the
 /// request, so a slightly larger buffer still satisfies a smaller one.
-fn buf_size(size: usize) -> usize {
-    // Never return 0: Metal rejects zero-length buffers, and callers may ask
-    // for an empty tensor.
-    size.max(1).next_multiple_of(buffer_alignment())
+fn buf_size(size: usize) -> Result<usize> {
+    crate::allocation_geometry::aligned_nonzero_bytes(size, buffer_alignment())
 }
 
 /// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
@@ -3290,7 +3291,7 @@ mod tests {
     fn test_buf_size_is_aligned() {
         let alignment = buffer_alignment();
         for size in [1usize, 2, 3, 127, 128, 129, 1000, 4096, 21504, 299008] {
-            let got = buf_size(size);
+            let got = buf_size(size).unwrap();
             assert!(got >= size, "buf_size({size}) = {got} is too small");
             assert_eq!(
                 got % alignment,
@@ -3307,7 +3308,7 @@ mod tests {
     #[test]
     fn test_buf_size_never_zero() {
         // Metal rejects zero-length buffers, and an empty tensor asks for one.
-        assert_eq!(buf_size(0), buffer_alignment());
+        assert_eq!(buf_size(0).unwrap(), buffer_alignment());
     }
 
     #[test]
@@ -3318,15 +3319,15 @@ mod tests {
         // the default -- which is the arithmetic §9.2l relies on when it says
         // padding is free at tensor granularity "by arithmetic rather than by
         // luck".
-        assert_eq!(buf_size(299008), 299008); // was 524288, 75% waste
-        assert_eq!(buf_size(21504), 21504); // was 32768, 52% waste
+        assert_eq!(buf_size(299008).unwrap(), 299008); // was 524288, 75% waste
+        assert_eq!(buf_size(21504).unwrap(), 21504); // was 32768, 52% waste
     }
 
     #[test]
     fn test_buf_size_bf16_f16_scalar() {
         // BF16 and F16 are 2 bytes per element; a scalar tensor requests a
         // 2-byte buffer. It must not be rounded down.
-        assert!(buf_size(2) >= 2);
+        assert!(buf_size(2).unwrap() >= 2);
     }
 
     #[test]
@@ -3337,7 +3338,7 @@ mod tests {
         let alignment = buffer_alignment();
         for size in [1usize, 2, 127, 128, 129, 21504, 299008] {
             assert_eq!(
-                buf_size(size),
+                buf_size(size).unwrap(),
                 round_to(size, alignment),
                 "the mirror and buf_size disagree at {size} (alignment {alignment})"
             );

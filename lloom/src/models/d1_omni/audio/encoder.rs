@@ -757,13 +757,17 @@ pub(crate) struct QuantizedAudioEncoder {
     inner: AudioInner<QuantizedLinear, ChannelAffine>,
 }
 impl QuantizedAudioEncoder {
-    pub(crate) fn load(cfg: AudioConfig, out: usize, vb: QuantizedVarBuilder) -> Result<Self> {
-        use crate::quantized_nn::layer_norm as norm;
+    pub(crate) fn validate_config(cfg: &AudioConfig, out: usize) -> Result<()> {
         cfg.validate(out, DType::F32)?;
         product(&[
             cfg.n_layers,
             std::mem::size_of::<ConformerLayer<QuantizedLinear, ChannelAffine>>(),
         ])?;
+        Ok(())
+    }
+    pub(crate) fn load(cfg: AudioConfig, out: usize, vb: QuantizedVarBuilder) -> Result<Self> {
+        use crate::quantized_nn::layer_norm as norm;
+        Self::validate_config(&cfg, out)?;
         let d = cfg.d_model;
         let subsample = Subsampling::<QuantizedLinear>::load_gguf(&cfg, vb.clone())?;
         let layers = (0..cfg.n_layers)

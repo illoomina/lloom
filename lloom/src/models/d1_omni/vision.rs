@@ -282,6 +282,17 @@ impl Vision {
 }
 
 impl QuantizedVision {
+    pub(crate) fn validate_config(
+        cfg: &VisionConfig,
+        projector_hidden: usize,
+        out: usize,
+    ) -> Result<()> {
+        Vision::validate_config(cfg, projector_hidden, out, DType::F32)?;
+        super::host::checked_host_capacity::<EncoderLayer<QuantizedProjection>>(
+            cfg.num_hidden_layers,
+        )?;
+        Ok(())
+    }
     /// Official mmproj names. The eager VarBuilder must already belong to the
     /// enclosing load promise; retained tables/copies require the same domain.
     pub(crate) fn load(
@@ -290,10 +301,7 @@ impl QuantizedVision {
         out: usize,
         vb: QuantizedVarBuilder,
     ) -> Result<Self> {
-        Vision::validate_config(cfg, projector_hidden, out, DType::F32)?;
-        super::host::checked_host_capacity::<EncoderLayer<QuantizedProjection>>(
-            cfg.num_hidden_layers,
-        )?;
+        Self::validate_config(cfg, projector_hidden, out)?;
         let hidden = cfg.hidden_size;
         let patch = vb.get((hidden, 3, PATCH, PATCH), "v.patch_embd.weight")?;
         if !matches!(

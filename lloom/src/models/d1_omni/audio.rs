@@ -6,6 +6,7 @@ pub use relative::{RelativeAttentionPlan, RelativeInputs, RelativeScratch};
 mod relative_tests;
 
 mod encoder;
+pub(crate) use encoder::QuantizedAudioEncoder;
 pub use encoder::{AudioConfig, AudioEncoder};
 
 mod frontend;

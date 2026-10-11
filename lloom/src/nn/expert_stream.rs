@@ -957,6 +957,38 @@ impl ResidencyMap {
         self.cache.set_inflight(SlotId(slot as u32), value)
     }
 
+    /// Retire dependency marks only after the compute wait is accepted. `slots`
+    /// selects a resolved group; None covers a device plan's whole map. A split
+    /// resolve may have released Inner's lock since collecting `value`, so do
+    /// not clear newer stamps. The existing IO lane-prefix contract is still
+    /// required; this transaction does not prove native completion or submission.
+    #[cfg(any(feature = "metal", test))]
+    fn order_inflight(
+        &mut self,
+        value: u64,
+        slots: Option<&[usize]>,
+        order: impl FnOnce() -> Result<()>,
+    ) -> Result<u64> {
+        if value == 0 {
+            return Ok(0);
+        }
+        // Refusal or unwind preserves every mark. No rollback vector or
+        // speculative mutation; the existing Pending owns the slot list.
+        order()?;
+        let Some(slots) = slots else {
+            return Ok(self.settle_inflight(value));
+        };
+        let mut retired = 0;
+        for &slot in slots {
+            let stamp = self.inflight(slot);
+            if stamp != 0 && stamp <= value {
+                self.set_inflight(slot, 0);
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
     /// The largest in-flight value over the slots (0: none in flight).
     fn inflight_max(&self) -> u64 {
         self.cache.inflight_max()
@@ -990,6 +1022,72 @@ impl ResidencyMap {
     /// [`SlotCache::free_slots`]).
     pub fn free_slots(&self) -> usize {
         self.cache.free_slots()
+    }
+}
+
+#[cfg(test)]
+mod wait_transaction_tests {
+    use super::*;
+
+    fn pending() -> ResidencyMap {
+        let mut map = ResidencyMap::new(8, 4);
+        for s in 0..4 {
+            map.install(s, s);
+            map.set_inflight(s, 7 + s as u64);
+        }
+        map
+    }
+
+    #[test]
+    fn refused_wait_preserves_marks_then_retry_retires_only_selected() -> Result<()> {
+        let mut map = pending();
+        let before = format!("{map:?}");
+        let err = map
+            .order_inflight(9, Some(&[0, 1, 1]), || {
+                lloom_tensor::bail!("injected wait admission refusal")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("injected wait admission refusal"));
+        assert_eq!(format!("{map:?}"), before, "refused wait erased dependency");
+        assert_eq!(map.order_inflight(9, Some(&[0, 1, 1]), || Ok(()))?, 2);
+        assert_eq!((map.inflight(0), map.inflight(1)), (0, 0));
+        assert_eq!(map.inflight(2), 9, "unselected stamp changed");
+        assert_eq!(map.inflight(3), 10, "newer stamp changed");
+        Ok(())
+    }
+
+    #[test]
+    fn wait_unwind_preserves_marks_and_plan_clears_only_covered_prefix() -> Result<()> {
+        let mut map = pending();
+        let before = format!("{map:?}");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.order_inflight(9, None, || panic!("injected wait unwind"))
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(format!("{map:?}"), before, "wait unwind erased dependency");
+        assert_eq!(map.order_inflight(9, None, || Ok(()))?, 3);
+        assert_eq!(map.inflight(3), 10);
+        assert_eq!(map.inflight_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn split_resolve_preserves_newer_stamp_and_zero_never_encodes() -> Result<()> {
+        let mut map = pending();
+        let collected = 8;
+        // Inner's lock can be released between begin and finish. A newer load
+        // assigned to a selected slot is not covered by the collected wait.
+        map.set_inflight(0, 12);
+        assert_eq!(map.order_inflight(collected, Some(&[0, 1]), || Ok(()))?, 1);
+        assert_eq!(map.inflight(0), 12);
+        assert_eq!(map.inflight(1), 0);
+        let before = format!("{map:?}");
+        assert_eq!(
+            map.order_inflight(0, None, || panic!("empty wait encoded"))?,
+            0
+        );
+        assert_eq!(format!("{map:?}"), before);
+        Ok(())
     }
 }
 
@@ -2394,7 +2492,7 @@ impl Streamed {
                     #[cfg(feature = "metal")]
                     if inner.map.inflight(s) != 0 {
                         wait_value = wait_value.max(inner.map.inflight(s));
-                        inner.map.set_inflight(s, 0);
+                        // Keep the dependency until resolve_finish accepts its wait.
                         self.counters
                             .io_inflight_hits
                             .fetch_add(1, Ordering::Relaxed);
@@ -2677,7 +2775,7 @@ impl Streamed {
                 inner.table_stale = true;
             }
             if wait_value != 0 {
-                self.await_inflight(inner, wait_value)?;
+                self.await_inflight(inner, wait_value, Some(&slots))?;
             }
         }
         if !misses.is_empty() {
@@ -2718,7 +2816,12 @@ impl Streamed {
     /// Make the compute stream wait for the `io` arm's loads up to `value`
     /// (the in-flight entries a group uses), once per group.
     #[cfg(feature = "metal")]
-    fn await_inflight(&self, inner: &mut Inner, value: u64) -> Result<()> {
+    fn await_inflight(
+        &self,
+        inner: &mut Inner,
+        value: u64,
+        slots: Option<&[usize]>,
+    ) -> Result<u64> {
         let queue = match &inner.loader {
             LoaderArm::Io(q) => q,
             LoaderArm::Pread => {
@@ -2729,9 +2832,11 @@ impl Streamed {
             Device::Metal(d) => d.commands().clone(),
             _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
         };
-        queue
-            .await_value(&commands, value)
-            .map_err(lloom_tensor::Error::wrap)
+        inner.map.order_inflight(value, slots, || {
+            queue
+                .await_value(&commands, value)
+                .map_err(lloom_tensor::Error::wrap)
+        })
     }
 
     /// The `io` arm's hint: give each of `experts` (missing, in the order
@@ -2874,8 +2979,7 @@ impl Streamed {
         if pending == 0 {
             return Ok(());
         }
-        self.await_inflight(inner, pending)?;
-        let n = inner.map.settle_inflight(pending);
+        let n = self.await_inflight(inner, pending, None)?;
         self.counters
             .io_inflight_planned
             .fetch_add(n, Ordering::Relaxed);

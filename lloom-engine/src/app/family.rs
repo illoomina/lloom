@@ -737,7 +737,7 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
         .resolve(&req)
         .map_err(|e| anyhow::anyhow!("{} cannot serve this shape: {e}", family.name()))?;
     let mut engine = family.load(checkpoint.clone(), req)?;
-    engine.note_load_warnings(
+    engine.note_load_warnings_checked(
         clamp
             .into_iter()
             .map(|n| {
@@ -747,7 +747,7 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
                 )
             })
             .collect(),
-    );
+    )?;
     Ok((engine, checkpoint))
 }
 

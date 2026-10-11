@@ -265,8 +265,8 @@ pub fn run(args: ChatArgs) -> Result<()> {
         engine.device(),
         engine.readback().name(),
         reuse_prefix,
-        engine.describe(),
-        lloom::load_warning::LoadWarning::line(&engine.load_warnings()),
+        engine.describe_checked()?,
+        lloom::load_warning::LoadWarning::line(&engine.load_warnings_checked()?),
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     sampling.apply_checkpoint(engine.generation_config().as_ref());

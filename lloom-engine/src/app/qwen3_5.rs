@@ -136,7 +136,7 @@ pub struct Engine<M: Qwen3_5Model, X: Layer> {
     mtp: Option<NextnHead<X>>,
     mtp_k: usize,
     device: Device,
-    text: Text,
+    text: Arc<Text>,
     model_name: String,
     kv_capacity: usize,
     readback: ReadbackArm,
@@ -217,17 +217,30 @@ pub fn load_admitted_as<P: Profile>(
     device: &Device,
     load: lloom::nn::memory::LoadContext,
 ) -> Result<lloom::nn::memory::Loaded<Engines<P>>> {
+    Ok(load_admitted_with::<P, _>(opts, device, load, |_| Ok(()))?.0)
+}
+
+fn load_admitted_with<P: Profile, T>(
+    opts: LoadOptions,
+    device: &Device,
+    load: lloom::nn::memory::LoadContext,
+    capture: impl FnOnce(&Engines<P>) -> Result<T>,
+) -> Result<(lloom::nn::memory::Loaded<Engines<P>>, T)> {
     if opts.cpu != device.is_cpu() {
         anyhow::bail!("supplied Qwen3.5 device disagrees with load options");
     }
-    Ok(lloom::nn::memory::Loaded::new(
-        device,
-        load,
-        |resolved, _context| {
-            load_on::<P>(opts, resolved.clone(), LoadAdmission::CallerScoped)
-                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
-        },
-    )?)
+    let mut metadata = None;
+    let loaded = lloom::nn::memory::Loaded::new(device, load, |resolved, _context| {
+        let engine = load_on::<P>(opts, resolved.clone(), LoadAdmission::CallerScoped)
+            .map_err(|error| lloom_tensor::Error::msg(format!("{error:#}")))?;
+        metadata =
+            Some(capture(&engine).map_err(|error| lloom_tensor::Error::msg(format!("{error:#}")))?);
+        Ok(engine)
+    })?;
+    Ok((
+        loaded,
+        metadata.expect("successful admitted load ran metadata capture"),
+    ))
 }
 
 /// The GGUF's `general.architecture`, when it is this family's.
@@ -300,7 +313,7 @@ fn resolve_text(
 /// The same owned tokenizer/template/seed moves from cheap preparation to the
 /// full engine; no model load precedes these configuration refusals.
 struct PreparedText {
-    text: Text,
+    text: Arc<Text>,
     model_name: String,
     source: String,
 }
@@ -392,7 +405,7 @@ fn prepare_text(opts: &mut LoadOptions, content: &Content, arch: &str) -> Result
     };
     text.prime();
     Ok(PreparedText {
-        text,
+        text: Arc::new(text),
         model_name,
         source,
     })
@@ -786,6 +799,15 @@ where
             .decode(&[id], false)
             .unwrap_or_else(|_| format!("<{id}>"))
     }
+    fn token_str_checked(&self, id: u32) -> Result<String> {
+        if id as usize >= self.model.vocab_size() {
+            anyhow::bail!("token display id outside loaded vocabulary")
+        }
+        self.text
+            .tokenizer
+            .decode(&[id], false)
+            .map_err(|error| anyhow::anyhow!("decoding token: {error}"))
+    }
     fn render_checked(
         &self,
         messages: &Value,
@@ -1076,3 +1098,7 @@ where
     }
     fn shutdown(&self) {}
 }
+
+/// Supplied-domain owning Served route over the full Qwen/MTP owner.
+/// No default registration until complete built-in prediction/enrollment.
+pub mod admitted;

@@ -121,7 +121,7 @@ pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Serve
         notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
     let (mut engine, path) = family::load(load, shape)?;
-    engine.note_load_warnings(notes);
+    engine.note_load_warnings_checked(notes)?;
     Ok((engine, path))
 }
 

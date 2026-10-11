@@ -58,6 +58,7 @@ pub enum Request<'a> {
         prompt: usize,
         generated: usize,
     },
+    Metadata(MetadataRequest<'a>),
     Logprobs {
         prompt: &'a [u32],
         k: usize,
@@ -65,6 +66,39 @@ pub enum Request<'a> {
 }
 pub trait Predictor: Send + Sync {
     fn predicted_extra(&self, request: Request<'_>) -> Result<usize>;
+}
+
+/// Allocating metadata producers are request work too. Inputs are borrowed;
+/// caller prediction/enrollment and legacy infallible API policy remain explicit.
+pub enum MetadataRequest<'a> {
+    Health,
+    Describe,
+    LoadWarnings,
+    NoteLoadWarnings(&'a [LoadWarning]),
+}
+
+/// Shared owning admission seam; E need not implement the HTTP Served boundary.
+/// One existing Loaded namespace and one supplied predictor, no new quota.
+pub(crate) struct Admitted<P, E> {
+    pub(crate) loaded: Loaded<E>,
+    predictor: P,
+}
+impl<P: Predictor, E> Admitted<P, E> {
+    pub(crate) fn new(loaded: Loaded<E>, predictor: P) -> Self {
+        Self { loaded, predictor }
+    }
+    pub(crate) fn predict(&self, request: Request<'_>) -> Result<usize> {
+        self.predictor.predicted_extra(request)
+    }
+    pub(crate) fn pass<T>(
+        &self,
+        request: Request<'_>,
+        run: impl FnOnce(&E) -> Result<T>,
+    ) -> Result<T> {
+        let predicted = self.predict(request)?;
+        self.loaded
+            .with_pass(predicted, |engine, _context| run(engine))
+    }
 }
 
 /// Serving facts are explicit checkpoint/caller inputs, not guessed siblings.
@@ -92,11 +126,10 @@ struct Metadata {
 }
 /// No model/tokenizer/quota copy and no borrowed unscoped Loaded escape.
 pub struct Engine<P, M: CausalLM = Model> {
-    loaded: Loaded<CausalEngine<M>>,
     metadata: Metadata,
-    predictor: P,
     warnings: Vec<LoadWarning>,
     decisions: Option<DecisionDispatch<M>>,
+    owner: Admitted<P, CausalEngine<M>>,
 }
 
 /// Explicit family embedding factory returning a real HTTP/REPL implementor.
@@ -253,9 +286,8 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         Ok(engine)
     })?;
     Ok(Engine {
-        loaded,
+        owner: Admitted::new(loaded, predictor),
         metadata: metadata.expect("successful preflight installed serving facts"),
-        predictor,
         warnings: Vec::new(),
         decisions,
     })
@@ -351,15 +383,13 @@ where
     /// Preserve explicit generic prepared decisions when named raw rendering is
     /// absent or uncertified. The adapter never exposes an unscoped inner owner.
     pub fn decide_prepared(&self, request: &CausalRequest) -> Result<SystemOneResponse> {
-        let predicted = self
-            .predictor
-            .predicted_extra(Request::PreparedDecisions(request))?;
+        let predicted = self.owner.predict(Request::PreparedDecisions(request))?;
         let execute = self
             .decisions
             .as_ref()
             .and_then(|route| route.prepared)
             .ok_or_else(|| Error::msg("family supplied no retained decision operation"))?;
-        execute(&self.loaded, predicted, request)
+        execute(&self.owner.loaded, predicted, request)
     }
     /// Ordinary generic policy rendering does not require a shared-state
     /// certificate. Its tokens can feed an explicit prepared request; the
@@ -371,14 +401,14 @@ where
         question: &crate::decision::Question<OrderedJson>,
         labels: &[String],
     ) -> Result<String> {
-        let predicted = self.predictor.predicted_extra(Request::SystemOneRender {
+        let predicted = self.owner.predict(Request::SystemOneRender {
             id,
             state,
             question,
             labels,
         })?;
         CausalEngine::render_systemone_admitted(
-            &self.loaded,
+            &self.owner.loaded,
             predicted,
             id,
             state,
@@ -391,14 +421,41 @@ where
         request: Request<'_>,
         run: impl FnOnce(&CausalEngine<M>) -> Result<T>,
     ) -> Result<T> {
-        let predicted = self.predictor.predicted_extra(request)?;
-        self.loaded
-            .with_pass(predicted, |engine, _context| run(engine))
+        self.owner.pass(request, run)
     }
     pub fn seed_prompt_row_checked(&self, n: usize, row: usize) -> Result<Vec<u32>> {
         check_context_capacity(self.metadata.capacity, n, 0, 0).map_err(Error::wrap)?;
         self.pass(Request::Seed { positions: n, row }, |_| {
             Ok(self.seed(n, row))
+        })
+    }
+    pub fn health_checked(&self) -> Result<Value> {
+        self.pass(Request::Metadata(MetadataRequest::Health), |_| {
+            Ok(json!({"capacity": self.metadata.capacity, "capabilities": self.metadata.capabilities.json(), "admission": "caller-supplied coverage; producer enrollment incomplete"}))
+        })
+    }
+    pub fn describe_checked(&self) -> Result<String> {
+        self.pass(Request::Metadata(MetadataRequest::Describe), |_| {
+            Ok(format!(
+                "load-once causal owner; {}",
+                self.metadata.capabilities.line()
+            ))
+        })
+    }
+    pub fn load_warnings_checked(&self) -> Result<Vec<LoadWarning>> {
+        self.pass(Request::Metadata(MetadataRequest::LoadWarnings), |_| {
+            Ok(self.warnings.clone())
+        })
+    }
+    pub fn note_load_warnings_checked(&mut self, warnings: Vec<LoadWarning>) -> Result<()> {
+        let predicted =
+            self.owner
+                .predict(Request::Metadata(MetadataRequest::NoteLoadWarnings(
+                    &warnings,
+                )))?;
+        self.owner.loaded.with_pass(predicted, |_, _context| {
+            self.warnings.splice(0..0, warnings);
+            Ok(())
         })
     }
     fn seed(&self, n: usize, row: usize) -> Vec<u32> {
@@ -442,29 +499,46 @@ where
     fn bos_id(&self) -> Option<u32> {
         self.metadata.config.bos_id
     }
+    fn health_checked(&self) -> anyhow::Result<Value> {
+        Ok(Engine::health_checked(self)?)
+    }
+    fn describe_checked(&self) -> anyhow::Result<String> {
+        Ok(Engine::describe_checked(self)?)
+    }
+    fn load_warnings_checked(&self) -> anyhow::Result<Vec<LoadWarning>> {
+        Ok(Engine::load_warnings_checked(self)?)
+    }
+    fn note_load_warnings_checked(&mut self, warnings: Vec<LoadWarning>) -> anyhow::Result<()> {
+        Ok(Engine::note_load_warnings_checked(self, warnings)?)
+    }
     fn health(&self) -> Value {
-        json!({"capacity": self.kv_capacity(), "capabilities": self.capabilities().json(), "admission": "caller-supplied coverage; producer enrollment incomplete"})
+        self.health_checked()
+            .expect("legacy infallible health cannot report admission refusal; use health_checked")
     }
     fn describe(&self) -> String {
-        format!("load-once causal owner; {}", self.capabilities().line())
+        self.describe_checked().expect(
+            "legacy infallible description cannot report admission refusal; use describe_checked",
+        )
     }
     fn capabilities(&self) -> Capabilities {
         self.metadata.capabilities
     }
 
     fn load_warnings(&self) -> Vec<LoadWarning> {
-        self.warnings.clone()
+        self.load_warnings_checked().expect(
+            "legacy infallible warnings cannot report admission refusal; use load_warnings_checked",
+        )
     }
     fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>) {
-        self.warnings.splice(0..0, warnings);
+        self.note_load_warnings_checked(warnings).expect("legacy infallible warning insertion cannot report admission refusal; use note_load_warnings_checked");
     }
     fn systemone(
         &self,
         body: &OrderedJson,
     ) -> std::result::Result<SystemOneResponse, SystemOneError> {
         let predicted = self
-            .predictor
-            .predicted_extra(Request::Decisions(body))
+            .owner
+            .predict(Request::Decisions(body))
             .map_err(|e| SystemOneError::Execution(e.to_string()))?;
         let execute = self
             .decisions
@@ -473,7 +547,7 @@ where
             .ok_or_else(|| {
                 SystemOneError::Unsupported("family supplied no retained decision operation".into())
             })?;
-        execute(&self.loaded, predicted, body)
+        execute(&self.owner.loaded, predicted, body)
     }
     fn encode(&self, text: &str, add_special: bool) -> anyhow::Result<Vec<u32>> {
         Ok(self.encode_admitted(text, add_special)?)

@@ -39,8 +39,16 @@ pub trait Served: Send + Sync {
     /// The family-specific half of `/health` (tile, chunk, rows, the pool,
     /// the streamed tier's counters …).
     fn health(&self) -> Value;
+    /// Fallible allocating metadata seam. Incumbent families retain their
+    /// behavior; admitted adapters override before any request producer.
+    fn health_checked(&self) -> Result<Value> {
+        Ok(self.health())
+    }
     /// The family-specific tail of the `[loaded …]` line.
     fn describe(&self) -> String;
+    fn describe_checked(&self) -> Result<String> {
+        Ok(self.describe())
+    }
     /// What the family can do (`family.rs`): the loaded line and `/health` say it.
     fn capabilities(&self) -> super::family::Capabilities;
     /// Every load-time degradation, in the order found: the notes recorded
@@ -48,9 +56,16 @@ pub trait Served: Send + Sync {
     /// the device has admitted (`lloom::load_warning`). The loaded line,
     /// `/health` and the model card render it.
     fn load_warnings(&self) -> Vec<LoadWarning>;
+    fn load_warnings_checked(&self) -> Result<Vec<LoadWarning>> {
+        Ok(self.load_warnings())
+    }
     /// Record the warnings found before the family loaded (the readback
     /// clamps `load_engine` applies), ahead of the family's own.
     fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>);
+    fn note_load_warnings_checked(&mut self, warnings: Vec<LoadWarning>) -> Result<()> {
+        self.note_load_warnings(warnings);
+        Ok(())
+    }
     /// The checkpoint's `generation_config.json`, when it carries one (the
     /// sampling defaults under `--sampling-defaults checkpoint`).
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
@@ -241,6 +256,9 @@ pub(crate) mod tests {
     /// the image path could call past the refusal panics.
     pub(crate) struct NoVision {
         device: Device,
+        metadata_mode: u8,
+        pub(crate) warning_epoch: std::sync::atomic::AtomicUsize,
+        pub(crate) metadata_calls: std::sync::atomic::AtomicUsize,
         pub(crate) calls: std::sync::atomic::AtomicUsize,
         handler: Option<
             fn(
@@ -264,9 +282,24 @@ pub(crate) mod tests {
         ) -> Self {
             Self {
                 device: Device::Cpu,
+                metadata_mode: 0,
+                warning_epoch: std::sync::atomic::AtomicUsize::new(0),
+                metadata_calls: std::sync::atomic::AtomicUsize::new(0),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 handler,
             }
+        }
+        /// Same inert fixture; nonzero modes make any legacy metadata call
+        /// fail so the actual consumer must select the fallible seam.
+        pub(crate) fn refusing_metadata() -> Self {
+            let mut engine = Self::new(None);
+            engine.metadata_mode = 1;
+            engine
+        }
+        pub(crate) fn dynamic_metadata() -> Self {
+            let mut engine = Self::new(None);
+            engine.metadata_mode = 2;
+            engine
         }
     }
 
@@ -310,7 +343,16 @@ pub(crate) mod tests {
             None
         }
         fn health(&self) -> Value {
+            assert_eq!(self.metadata_mode, 0, "legacy health fallback reached");
             Value::Null
+        }
+        fn health_checked(&self) -> Result<Value> {
+            if self.metadata_mode == 0 {
+                return Ok(self.health());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("bounded metadata health refusal")
         }
         fn describe(&self) -> String {
             String::new()
@@ -319,7 +361,25 @@ pub(crate) mod tests {
             QWEN4EXP_CAPABILITIES
         }
         fn load_warnings(&self) -> Vec<LoadWarning> {
+            assert_eq!(self.metadata_mode, 0, "legacy warning fallback reached");
             Vec::new()
+        }
+        fn load_warnings_checked(&self) -> Result<Vec<LoadWarning>> {
+            if self.metadata_mode == 0 {
+                return Ok(self.load_warnings());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.metadata_mode == 1 {
+                anyhow::bail!("bounded metadata warning refusal");
+            }
+            let epoch = self
+                .warning_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![LoadWarning::new(
+                lloom::load_warning::LoadWarningKind::EmulatedType,
+                format!("bounded dynamic warning epoch {epoch}"),
+            )])
         }
         fn note_load_warnings(&mut self, _: Vec<LoadWarning>) {}
         fn encode(&self, _: &str, _: bool) -> Result<Vec<u32>> {

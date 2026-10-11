@@ -143,7 +143,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         engine.kv_capacity(),
         engine.readback().name(),
         reuse_prefix,
-        engine.describe(),
+        engine.describe_checked()?,
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
@@ -180,44 +180,12 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let method = request.method().clone();
         match (method, path.as_str()) {
             (Method::Get, "/health") => {
-                // The memory gauges, read once: what the process holds now,
-                // beside the family's own state.
-                let mut body = shared.engine.health();
-                body["mem"] = MemSnapshot::read(shared.engine.device()).json();
-                body["capabilities"] = shared.engine.capabilities().json();
-                body["load_warnings"] = load_warnings_json(shared.engine.as_ref());
-                body["chat_template_reads"] = ENGINE_KWARGS
-                    .iter()
-                    .map(|&k| (k.to_string(), json!(shared.engine.template_reads(k))))
-                    .collect::<Map<String, Value>>()
-                    .into();
-                // The thinking budget's markers, as the template writes them.
-                let engine = shared.engine.as_ref();
-                let tags: Result<Value> = (|| {
-                    Ok(match engine.think_tags() {
-                        Some(t) => json!({
-                            "start": engine.token_str_checked(t.start)?,
-                            "end": engine.token_str_checked(t.end)?,
-                            "tool_call": t.tool_call.map(|id| engine.token_str_checked(id)).transpose()?,
-                        }),
-                        None => Value::Null,
-                    })
-                })();
-                match tags {
-                    Ok(tags) => body["reasoning_tags"] = tags,
-                    Err(error) => {
-                        let _ = respond_error(request, 500, &format!("{error:#}"));
-                        continue;
-                    }
-                }
-                let _ = respond_json(request, 200, &body);
+                let result = health_body(shared.engine.as_ref());
+                let _ = respond_metadata(request, result);
             }
             (Method::Get, "/v1/models") => {
-                let _ = respond_json(
-                    request,
-                    200,
-                    &models_body(&shared.model_name, shared.engine.as_ref()),
-                );
+                let result = models_body(&shared.model_name, shared.engine.as_ref());
+                let _ = respond_metadata(request, result);
             }
             (Method::Post, "/eval/abort") => {
                 let _ = handle_abort(&shared, request);
@@ -2131,26 +2099,56 @@ fn apply_thinking(
     })
 }
 
-fn models_body(model_name: &str, engine: &dyn Served) -> Value {
-    json!({
+/// Propagate admitted metadata refusal as an HTTP error, never successful
+/// empty metadata. Outer response assembly/serialization enrollment stays open.
+fn respond_metadata(request: Request, result: Result<Value>) -> Result<()> {
+    match result {
+        Ok(body) => respond_json(request, 200, &body),
+        Err(error) => respond_error(request, 500, &format!("{error:#}")),
+    }
+}
+
+fn health_body(engine: &dyn Served) -> Result<Value> {
+    let mut body = engine.health_checked()?;
+    body["mem"] = MemSnapshot::read(engine.device()).json();
+    body["capabilities"] = engine.capabilities().json();
+    body["load_warnings"] = load_warnings_json(engine)?;
+    body["chat_template_reads"] = ENGINE_KWARGS
+        .iter()
+        .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
+        .collect::<Map<String, Value>>()
+        .into();
+    body["reasoning_tags"] = match engine.think_tags() {
+        Some(t) => json!({
+            "start": engine.token_str_checked(t.start)?,
+            "end": engine.token_str_checked(t.end)?,
+            "tool_call": t.tool_call.map(|id| engine.token_str_checked(id)).transpose()?,
+        }),
+        None => Value::Null,
+    };
+    Ok(body)
+}
+
+fn models_body(model_name: &str, engine: &dyn Served) -> Result<Value> {
+    Ok(json!({
         "object": "list",
         "data": [{
             "id": model_name,
             "object": "model",
             "created": now(),
             "owned_by": "lloom",
-            "load_warnings": load_warnings_json(engine),
+            "load_warnings": load_warnings_json(engine)?,
         }],
-    })
+    }))
 }
 
 /// The load's degradations as `[{kind, message}]` (`Served::load_warnings`).
-fn load_warnings_json(engine: &dyn Served) -> Value {
-    engine
-        .load_warnings()
+fn load_warnings_json(engine: &dyn Served) -> Result<Value> {
+    Ok(engine
+        .load_warnings_checked()?
         .iter()
         .map(|w| json!({ "kind": w.kind.name(), "message": w.message }))
-        .collect()
+        .collect())
 }
 
 // ---- `lloom bench` ---------------------------------------------------------------
@@ -2285,7 +2283,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         engine.device(),
         engine.kv_capacity(),
         engine.readback().name(),
-        engine.describe(),
+        engine.describe_checked()?,
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     // The cells are the server's handlers; they read the engine through
@@ -2361,7 +2359,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         model_name,
         shared.engine.readback().name(),
         batch,
-        shared.engine.describe(),
+        shared.engine.describe_checked()?,
         shared.engine.capabilities().line(),
     );
     shared.engine.shutdown();
@@ -2391,7 +2389,7 @@ fn bench_mode(
         model_path.display(),
         load_start.elapsed().as_secs_f64(),
         engine.device(),
-        engine.describe(),
+        engine.describe_checked()?,
     );
     let gauge = super::common::MemGauge::start(engine.device(), mem_sample);
     let out = engine.run_mode(&spec);
@@ -2917,5 +2915,52 @@ mod systemone_dispatch_tests {
             0
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_consumer_tests {
+    use super::{health_body, models_body};
+    use crate::app::served::tests::NoVision;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn actual_metadata_bodies_propagate_refusal_without_legacy_fallback() {
+        let engine = NoVision::refusing_metadata();
+        assert_eq!(
+            health_body(&engine).unwrap_err().to_string(),
+            "bounded metadata health refusal",
+            "actual health body must propagate refusal, not successful metadata",
+        );
+        assert_eq!(
+            models_body("bounded", &engine).unwrap_err().to_string(),
+            "bounded metadata warning refusal",
+            "actual model card must propagate warning refusal, not an empty list",
+        );
+        assert_eq!(engine.metadata_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn actual_model_card_reads_current_warnings_on_each_request() {
+        let engine = NoVision::dynamic_metadata();
+        engine.warning_epoch.store(1, Ordering::Relaxed);
+        let first = models_body("bounded", &engine).unwrap();
+        engine.warning_epoch.store(2, Ordering::Relaxed);
+        let second = models_body("bounded", &engine).unwrap();
+        let warnings =
+            |body: &serde_json::Value| body["data"][0]["load_warnings"].as_array().unwrap().clone();
+        assert_eq!(warnings(&first).len(), 1);
+        assert_eq!(warnings(&second).len(), 1);
+        assert_eq!(warnings(&first)[0]["kind"], "emulated_type");
+        assert_eq!(
+            warnings(&first)[0]["message"],
+            "bounded dynamic warning epoch 1"
+        );
+        assert_eq!(
+            warnings(&second)[0]["message"],
+            "bounded dynamic warning epoch 2",
+            "actual model card must read current warnings, not a cold snapshot"
+        );
+        assert_eq!(engine.metadata_calls.load(Ordering::Relaxed), 2);
     }
 }

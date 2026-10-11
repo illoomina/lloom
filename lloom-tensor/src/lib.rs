@@ -55,6 +55,8 @@ pub mod backend;
 pub mod backprop;
 mod command_policy;
 mod completion_frontier;
+#[cfg(any(feature = "metal", test))]
+mod completion_wake;
 pub mod conv;
 mod convert;
 pub mod cpu;

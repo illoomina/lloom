@@ -90,6 +90,7 @@ name = "metal_cb_failure_tests"
 path = "tests/metal_cb_failure_tests.rs"
 
 [dev-dependencies]
+parking_lot_core = "0.9.12"
 anyhow = { workspace = true }
 clap = { workspace = true }
 criterion = { workspace = true }

@@ -400,8 +400,30 @@ where
                 &mut mgr,
                 timeout,
             )?;
-            // After the executor: LibAFL has installed its crash handlers and its
-            // panic hook, and ours must run first and chain to them.
+            // All executors install process-wide handlers at construction.
+            // Construct tracing before the outer recorder hook and before seeds,
+            // so later tracing cannot replace the recorder's signal handler.
+            #[cfg(feature = "cmplog")]
+            let cmplog_observer = libafl_targets::CmpLogObserver::new("cmplog", true);
+            #[cfg(feature = "cmplog")]
+            let h2 = Rc::clone(&harness);
+            #[cfg(feature = "cmplog")]
+            let mut trace_harness = |input: &BytesInput| -> ExitKind {
+                let bytes = input.target_bytes();
+                execute_recorded(record, &h2, name, &bytes)
+            };
+            #[cfg(feature = "cmplog")]
+            #[allow(deprecated)]
+            let tracer = InProcessExecutor::with_timeout(
+                &mut trace_harness,
+                tuple_list!(cmplog_observer),
+                &mut fuzzer,
+                &mut state,
+                &mut mgr,
+                timeout,
+            )?;
+            // The recorder wraps the final executor-installed panic/signal hooks
+            // before the first target invocation, including corpus seeding.
             Record::install_crash_dump();
 
             if state.must_load_initial_inputs() {
@@ -437,23 +459,7 @@ where
             {
                 use libafl::mutators::token_mutations::I2SRandReplace;
                 use libafl::stages::TracingStage;
-                use libafl_targets::CmpLogObserver;
 
-                let cmplog_observer = CmpLogObserver::new("cmplog", true);
-                let h2 = Rc::clone(&harness);
-                let mut trace_harness = |input: &BytesInput| -> ExitKind {
-                    let bytes = input.target_bytes();
-                    execute_recorded(record, &h2, name, &bytes)
-                };
-                #[allow(deprecated)]
-                let tracer = InProcessExecutor::with_timeout(
-                    &mut trace_harness,
-                    tuple_list!(cmplog_observer),
-                    &mut fuzzer,
-                    &mut state,
-                    &mut mgr,
-                    timeout,
-                )?;
                 let tracing = TracingStage::new(tracer);
                 let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
                     I2SRandReplace::new()

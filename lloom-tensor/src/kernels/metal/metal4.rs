@@ -63,6 +63,8 @@ pub(crate) struct Queue {
     ledger: OnceLock<Arc<super::ledger::Ledger>>,
     pub created: AtomicUsize,
     pub reused: AtomicUsize,
+    // LAST: raw/available slots disappear before final capability publication.
+    physical: crate::retirement_service::PhysicalAnchor,
 }
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
@@ -91,6 +93,7 @@ impl Queue {
             ledger: OnceLock::new(),
             created: AtomicUsize::new(0),
             reused: AtomicUsize::new(0),
+            physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = super::retirement::Metal4Completions::new(
             Arc::as_ptr(&queue) as usize,
@@ -99,6 +102,19 @@ impl Queue {
         );
         assert!(queue.completions.set(Arc::new(core)).is_ok());
         Ok(queue)
+    }
+
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), MetalKernelError> {
+        self.physical.install(owner).map_err(|owner| {
+            crate::kernels::err::CompletionRegistrationError::new(
+                MetalKernelError::QueueUnavailable("M4 physical owner already installed"),
+                Some(owner),
+            )
+            .into()
+        })
     }
 
     /// Acquisition and every submission wait use the same Wake. Poison closes
@@ -241,6 +257,8 @@ pub(super) struct Slot {
     page_reservations: Vec<super::ledger::Reservation>,
     page: usize,
     offset: usize,
+    // LAST: release native resources/allocator/table before root publication.
+    namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 unsafe impl Send for Slot {}
 
@@ -285,6 +303,7 @@ impl Slot {
             page_reservations: Vec::new(),
             page: 0,
             offset: 0,
+            namespaces: Vec::new(),
         })
     }
 
@@ -309,6 +328,9 @@ impl Slot {
         self.allocator.reset();
         self.segment = 0;
         self.cb.beginCommandBufferWithAllocator(&self.allocator);
+        // Native cached references of the prior generation were cleared/reset.
+        // Persistent scratch pages retain their own native reservation owners.
+        self.namespaces.clear();
     }
 
     fn command_buffer(&self, index: usize) -> &ProtocolObject<dyn MTL4CommandBuffer> {
@@ -389,6 +411,35 @@ unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
 
 impl Submission {
+    pub(super) fn retain_namespace(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        let mut input = Some(owner);
+        let result = (|| {
+            let mut state = self.recording_state()?;
+            let slot = state.slot.as_mut().expect("checked recording");
+            let incoming = input.as_ref().expect("prepared namespace input");
+            if slot.namespaces.iter().any(|old| old.same(incoming)) {
+                return Ok(());
+            }
+            slot.namespaces.try_reserve(1).map_err(|_| {
+                MetalKernelError::QueueUnavailable("M4 namespace storage exhausted")
+            })?;
+            // Capacity prepared before taking input; no allocation after take.
+            slot.namespaces
+                .push(input.take().expect("prepared namespace input"));
+            Ok(())
+        })();
+        // Existing recording_state guard is gone before input/error destruction.
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(crate::kernels::err::CompletionRegistrationError::new(error, input).into())
+            }
+        }
+    }
+
     pub(super) fn notify_lifecycle(&self) {
         self.retirement.notify_lifecycle();
     }
@@ -955,7 +1006,11 @@ impl PreparedCommit<'_> {
             .status
             .store(MTLCommandBufferStatus::Committed.0, Ordering::Release);
         drop(state);
-        let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), None);
+        let owners = super::retirement::NativeOwners::metal4(
+            slot,
+            submission.clone(),
+            submission.queue.physical.owner(),
+        );
         match submission
             .retirement
             .replace_prepared(super::retirement::Captures(callbacks), owners)
@@ -1082,7 +1137,7 @@ impl Drop for Submission {
                 slot,
                 self.queue.clone(),
                 events,
-                None,
+                self.queue.physical.owner(),
             );
             match self
                 .retirement

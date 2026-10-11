@@ -40,6 +40,8 @@ pub(super) type Metal3Anchor = crate::host_anchor::HostAnchorPermit<(), Metal3Ra
 pub(super) struct Metal3RawOwners {
     pub raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     pub physical: Option<Arc<dyn Send + Sync>>,
+    // LAST: original raw retain releases before metadata capability publication.
+    pub namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
 }
 // SAFETY: same cross-thread retain/release contract as CommandBuffer.
 unsafe impl Send for Metal3RawOwners {}

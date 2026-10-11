@@ -19,6 +19,7 @@ use std::sync::Arc;
 /// Arc/container metadata here is host overhead, not a physical-buffer charge.
 pub(crate) struct AllocationNamespace {
     pub(super) domain: Option<ModelDomain>,
+    pub(super) membership: Arc<crate::kernels::metal::membership::MembershipDomain>,
     pub(super) constants: Arc<ConstantsByValue>,
     pub(super) dequant_scratch: Mutex<Option<BufferHandle>>,
     pub(super) buffers: BufferPool,
@@ -147,11 +148,12 @@ impl AllocationNamespace {
 
         Arc::new(Self {
             domain,
+            membership,
             constants: Arc::new(ConstantsByValue::new()),
             dequant_scratch: Mutex::new(None),
-            buffers: buffers,
-            private_buffers: private_buffers,
-            backings: backings,
+            buffers,
+            private_buffers,
+            backings,
             arena_reservation: Arc::new(Mutex::new(None)),
             arena: Arc::new(RwLock::new(None)),
             arena_recorder: Arc::new(Mutex::new(None)),

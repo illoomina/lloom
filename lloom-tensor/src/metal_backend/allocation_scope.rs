@@ -25,7 +25,7 @@ impl MetalAllocationDomain {
         // A same-device active payer supplies policy, not ownership of the new domain.
         let source = active(device)?.map_or_else(|| device.clone(), |scope| scope.view.clone());
         Ok(Self {
-            view: source.allocation_view(domain),
+            view: source.allocation_view(domain)?,
         })
     }
 

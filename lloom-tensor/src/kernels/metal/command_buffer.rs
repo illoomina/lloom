@@ -440,6 +440,40 @@ impl CommandBuffer {
         }
     }
 
+    pub(crate) fn retain_namespace(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.retain_namespace(owner),
+            Backend::Metal4(submission) => submission.retain_namespace(owner),
+            Backend::Metal3(_) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "standalone namespace attachment refused",
+                ),
+                Some(owner),
+            )
+            .into()),
+        }
+    }
+
+    pub(crate) fn attach_physical_owner(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match &self.backend {
+            Backend::Metal3Associated(buffer) => buffer.attach_physical_owner(owner),
+            Backend::Metal4(submission) => submission.queue.attach_physical_owner(owner),
+            Backend::Metal3(_) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "standalone physical attachment refused",
+                ),
+                Some(owner),
+            )
+            .into()),
+        }
+    }
+
     pub(super) fn from_metal3_associated(
         buffer: super::metal3_retirement::AssociatedBuffer,
     ) -> Self {

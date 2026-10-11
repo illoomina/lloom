@@ -111,6 +111,24 @@ impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
 }
 
 impl CommandsGuard<'_> {
+    pub(crate) fn retain_namespace(
+        &mut self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        if owner.already_recorded(&self.guard.namespace) {
+            return Ok(());
+        }
+        self.guard
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "namespace attachment requires recording generation",
+            ))?
+            .retain_namespace(owner.clone())?;
+        owner.remember(&mut self.guard.namespace);
+        Ok(())
+    }
+
     pub fn set_label(&self, label: &str) {
         self.as_ref().set_label(label);
     }
@@ -146,6 +164,24 @@ impl<'a> AsMut<BlitCommandEncoder> for BlitCommandsGuard<'a> {
 }
 
 impl BlitCommandsGuard<'_> {
+    pub(crate) fn retain_namespace(
+        &mut self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), MetalKernelError> {
+        if owner.already_recorded(&self._guard.namespace) {
+            return Ok(());
+        }
+        self._guard
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "namespace attachment requires recording generation",
+            ))?
+            .retain_namespace(owner.clone())?;
+        owner.remember(&mut self._guard.namespace);
+        Ok(())
+    }
+
     /// Explicit completion returns refusal; unfinished native custody remains in
     /// Commands for retry or failed-queue quarantine, including unwind.
     pub fn finish(mut self) -> Result<(), MetalKernelError> {
@@ -244,6 +280,7 @@ struct EntryState {
     current: Current<CommandBuffer, CommitReceipt>,
     in_flight: Vec<CommandBuffer>,
     current_encoder: Option<ComputeCommandEncoder>,
+    namespace: crate::metal_backend::device_retirement::NamespaceMemo,
 }
 
 // One acquisition can close one compute encoder and construct one replacement.
@@ -268,6 +305,7 @@ impl EntryState {
             current: Current::new(cb),
             in_flight: vec![],
             current_encoder: None,
+            namespace: Default::default(),
         }
     }
 }
@@ -433,6 +471,8 @@ struct CommandsCore {
     /// The first command buffer that ended in error, latched by its completion
     /// handler so every later commit and wait reports it.
     failure: Arc<CommandBufferFailure>,
+    // LAST: native wrapper fields release before this submit-capability pin.
+    physical: crate::retirement_service::PhysicalAnchor,
 }
 
 /// A command buffer of this queue ended in error.
@@ -751,9 +791,33 @@ impl Commands {
             kind,
             hold,
             failure,
+            physical: crate::retirement_service::PhysicalAnchor::default(),
         });
         let core = lifecycle::register(core)?;
         Ok(Self { core })
+    }
+
+    /// Cold attachment before a MetalDevice or encoder can escape. The
+    /// independently registered owner must not retain Commands/modern Queue.
+    pub(crate) fn attach_physical_owner(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), MetalKernelError> {
+        let state = self.lock_state()?;
+        state
+            .current
+            .recording()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "physical attachment requires pristine recording",
+            ))?
+            .attach_physical_owner(owner.clone())?;
+        self.core.physical.install(owner).map_err(|owner| {
+            crate::kernels::err::CompletionRegistrationError::new(
+                MetalKernelError::QueueUnavailable("physical owner already installed"),
+                Some(owner),
+            )
+            .into()
+        })
     }
 
     /// The command-buffer kind this queue creates.
@@ -1539,7 +1603,7 @@ impl Commands {
                     .as_ref()
                     .expect("M3 core constructed")
                     .clone(),
-                None,
+                self.core.physical.owner(),
             )
             .map(CommandBuffer::from_metal3_associated),
         }
@@ -1549,13 +1613,19 @@ impl Commands {
     fn ensure_recording_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         self.core.close_pending_blit(state)?;
         let state = &mut **state;
-        state.current.recover_recording(
-            || self.create_replacement(),
-            &mut state.in_flight,
-            &self.core.compute_count,
-            &self.core.replacement_pending,
-            0,
-        )?;
+        if state
+            .current
+            .recover_recording(
+                || self.create_replacement(),
+                &mut state.in_flight,
+                &self.core.compute_count,
+                &self.core.replacement_pending,
+                0,
+            )?
+            .is_some()
+        {
+            state.namespace.reset();
+        }
         // A consumed node cut belongs to the already submitted CB; do not
         // re-arm it for the dispatch whose encoder was never returned.
         Ok(())
@@ -1592,6 +1662,7 @@ impl Commands {
                 reset_to,
             )?
             .expect("submit_marked retained its receipt");
+        state.namespace.reset();
         debug_assert_eq!(receipt.epoch, recovered.epoch);
         if let Some(t) = created {
             crate::kernels::metal::profile::record_create_cb(t.elapsed());

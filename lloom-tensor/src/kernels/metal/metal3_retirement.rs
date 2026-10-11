@@ -473,7 +473,15 @@ impl AssociatedBuffer {
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         let anchor = core
             .raw_owners
-            .reserve((), Metal3RawOwners { raw, physical }, |_| Ok(()))
+            .reserve(
+                (),
+                Metal3RawOwners {
+                    raw,
+                    physical,
+                    namespaces: Vec::new(),
+                },
+                |_| Ok(()),
+            )
             .map_err(|rejected| {
                 crate::kernels::err::CompletionRegistrationError::new(
                     unavailable("M3 raw owner registration refused"),
@@ -501,6 +509,7 @@ impl AssociatedBuffer {
                         Metal3RawOwners {
                             raw,
                             physical: None,
+                            namespaces: Vec::new(),
                         },
                         anchor,
                     )),
@@ -517,6 +526,7 @@ impl AssociatedBuffer {
                         Metal3RawOwners {
                             raw,
                             physical: None,
+                            namespaces: Vec::new(),
                         },
                         anchor,
                         rejected.rejected,
@@ -533,6 +543,7 @@ impl AssociatedBuffer {
                     Metal3RawOwners {
                         raw,
                         physical: None,
+                        namespaces: Vec::new(),
                     },
                     anchor,
                 )),
@@ -546,6 +557,62 @@ impl AssociatedBuffer {
             anchor,
         })
     }
+    pub(super) fn retain_namespace(
+        &self,
+        owner: crate::metal_backend::device_retirement::NamespaceOwner,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match self.anchor.edit(owner, |_, roots, input| {
+            let owner = input.as_ref().expect("prepared namespace input");
+            if roots.namespaces.iter().any(|old| old.same(owner)) {
+                return Ok(());
+            }
+            roots.namespaces.try_reserve(1).map_err(|_| ())?;
+            roots
+                .namespaces
+                .push(input.take().expect("prepared namespace input"));
+            Ok(())
+        }) {
+            Ok((Ok(()), _)) => Ok(()),
+            Ok((Err(()), input)) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 namespace storage exhausted"),
+                input,
+            )
+            .into()),
+            Err(error) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 namespace attachment refused"),
+                Some(error),
+            )
+            .into()),
+        }
+    }
+
+    /// Constructor-only: install in the original registered raw-owner record,
+    /// not just the wrapper, before any recording capability escapes.
+    pub(super) fn attach_physical_owner(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match self.anchor.edit(owner, |_, roots, input| {
+            if roots.physical.is_some() {
+                return false;
+            }
+            roots.physical = input.take();
+            true
+        }) {
+            Ok((true, None)) => Ok(()),
+            Ok((_, input)) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 physical attachment already installed"),
+                input,
+            )
+            .into()),
+            Err(error) => Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 physical attachment refused"),
+                Some(error),
+            )
+            .into()),
+        }
+    }
+
     pub(super) fn raw(
         &self,
     ) -> &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>

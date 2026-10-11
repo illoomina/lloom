@@ -110,6 +110,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 /// an EOS gate the executor arms cannot run, are named here with their
 /// reasons, beside the arm the loaded line renders.
 pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::load_warning::{LoadWarning, LoadWarningKind};
     let mut notes = Vec::new();
     if let Some(note) = shape.decode.readback.adaptive_clamp() {

@@ -236,6 +236,7 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         &mut dyn FnMut(FamilyFacts, &Tokenizer, Option<&CausalPolicy>) -> Result<()>,
     ) -> Result<CausalEngine<M>>,
 ) -> Result<Engine<P, M>> {
+    lloom_tensor::memory_admission::begin_model_load();
     let mut metadata = None;
     let Serving {
         config,

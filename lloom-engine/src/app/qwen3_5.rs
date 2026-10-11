@@ -226,6 +226,7 @@ fn load_admitted_with<P: Profile, T>(
     load: lloom::nn::memory::LoadContext,
     capture: impl FnOnce(&Engines<P>) -> Result<T>,
 ) -> Result<(lloom::nn::memory::Loaded<Engines<P>>, T)> {
+    lloom_tensor::memory_admission::begin_model_load();
     if opts.cpu != device.is_cpu() {
         anyhow::bail!("supplied Qwen3.5 device disagrees with load options");
     }
@@ -414,6 +415,7 @@ fn prepare_text(opts: &mut LoadOptions, content: &Content, arch: &str) -> Result
 /// Detect, hold the regime, load — at `Ring × One` under
 /// `speculative.method = mtp` (the verify window), `No × One` otherwise.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::profile::{NoRewind, One, Rewind as _, Ring, Rows as _};
     let key = ProfileKey::at_contract(
         if opts.mtp { Ring::NAME } else { NoRewind::NAME },
@@ -447,6 +449,7 @@ fn load_on<P: Profile>(
     device: Device,
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
+    lloom_tensor::memory_admission::begin_model_load();
     let window = if opts.mtp {
         lloom::nn::speculator::checked_window_width(opts.mtp_k.max(1), 1)?
     } else {

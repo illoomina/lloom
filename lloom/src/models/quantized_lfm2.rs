@@ -335,6 +335,7 @@ impl Model {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
         Self::preflight_gguf_content(ct, reader)?.materialize(reader, device)
     }
 
@@ -553,6 +554,7 @@ impl GgufPlan<'_> {
         reader: &mut R,
         device: &Device,
     ) -> Result<Model> {
+        lloom_tensor::memory_admission::begin_model_load();
         Model::from_gguf_plan(self.weights, self.content, reader, device)
     }
 }

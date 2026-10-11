@@ -89,6 +89,9 @@ impl From<core::Refusal> for AdmissionError {
         match e {
             core::Refusal::Overflow => Self::Overflow,
             core::Refusal::DifferentDomain => Self::DifferentDomain,
+            core::Refusal::ConfigurationConflict { active, requested } => {
+                Self::ConfigurationConflict { active, requested }
+            }
             core::Refusal::Machine(s) => Self::Machine(s),
             core::Refusal::Limit {
                 scope,
@@ -152,7 +155,6 @@ impl From<Option<MachineAdmission>> for MachineStatus {
 
 /// Only the singleton is public; callers cannot create disjoint process caps.
 pub struct ProcessAccount {
-    cap: Option<usize>,
     core: Arc<core::ProcessAccount>,
 }
 
@@ -161,42 +163,48 @@ struct ProcessCell(OnceLock<ProcessAccount>);
 impl ProcessCell {
     fn get(&self) -> &ProcessAccount {
         self.0.get_or_init(|| ProcessAccount {
-            cap: None,
-            core: core::ProcessAccount::new(None),
+            core: core::ProcessAccount::bootstrap(),
         })
     }
     fn configure(&self, cap: Option<usize>) -> Result<()> {
-        let active = self.0.get_or_init(|| ProcessAccount {
-            cap,
-            core: core::ProcessAccount::new(cap),
-        });
-        if active.cap != cap {
-            return Err(AdmissionError::ConfigurationConflict {
-                active: active.cap,
-                requested: cap,
-            });
-        }
-        Ok(())
+        self.get()
+            .core
+            .configure_cap(cap)
+            .map_err(AdmissionError::from)
     }
 }
 static PROCESS: ProcessCell = ProcessCell(OnceLock::new());
 
-/// Identical repeated configuration is idempotent; conflicting configuration is
-/// an error, including after default initialization by `process_account`.
+/// Cold configuration may follow device/bootstrap metadata setup, but must
+/// precede the first genuine model load. Existing pending/committed demand is
+/// retained and checked. Explicit None/Some policy is immutable/idempotent.
 pub fn configure_process_account(cap: Option<usize>) -> Result<()> {
     PROCESS.configure(cap)
 }
-/// Initializes accounting without an aggregate cap unless explicitly configured.
+/// Initializes bootstrap accounting without freezing unspecified cap policy.
 pub fn process_account() -> &'static ProcessAccount {
     PROCESS.get()
 }
 
+/// Genuine cold model-load entry only. Factories must call this before model
+/// preflight/materialization; metadata/domain/device creation must not. Native
+/// or legacy factory enrollment is not inferred from this additive hook.
+pub fn begin_model_load() {
+    process_account().core.begin_model_load();
+}
+
 impl ProcessAccount {
+    /// Private device/bootstrap metadata-only numerical payer. Does not freeze
+    /// unspecified process policy or claim machine/native allocation admission.
+    /// Domain/Arc/control overhead still needs its separate price enrollment.
+    pub(crate) fn metadata_domain(&self) -> Result<ModelDomain> {
+        Ok(ModelDomain(self.core.domain(None)?))
+    }
     pub fn snapshot(&self) -> AccountSnapshot {
         self.core.snapshot().into()
     }
     pub fn cap(&self) -> Option<usize> {
-        self.cap
+        self.core.cap()
     }
     pub fn domain(&self, quota: Option<usize>, admitted: Admitted) -> Result<ModelDomain> {
         let owner =
@@ -437,7 +445,6 @@ mod tests {
     fn reusable_origin_checks_actual_domain_identity_and_explicit_legacy() {
         let account = ProcessAccount {
             core: core::ProcessAccount::new(Some(16)),
-            cap: Some(16),
         };
         let a = account.unadmitted_domain(Some(8)).unwrap();
         let b = account.unadmitted_domain(Some(8)).unwrap();
@@ -463,7 +470,6 @@ mod tests {
     fn reusable_affinity_checks_device_before_domain_and_rejects_unbound() {
         let account = ProcessAccount {
             core: core::ProcessAccount::new(Some(16)),
-            cap: Some(16),
         };
         let domain = account.unadmitted_domain(Some(8)).unwrap();
         let payer = AllocationOrigin::Domain(domain.key());
@@ -490,7 +496,6 @@ mod tests {
     fn cancellation_flag_and_racing_issuance_preserve_owned_ticket() {
         let account = ProcessAccount {
             core: core::ProcessAccount::new(Some(16)),
-            cap: Some(16),
         };
         let domain = account.unadmitted_domain(Some(16)).unwrap();
         let pass = domain.reserve(8).unwrap();
@@ -544,7 +549,6 @@ mod tests {
     fn numeric_domain_keys_distinguish_accounts_and_survive_cancellation() {
         let account = || ProcessAccount {
             core: core::ProcessAccount::new(Some(16)),
-            cap: Some(16),
         };
         let a = account().unadmitted_domain(Some(8)).unwrap();
         let b = account().unadmitted_domain(Some(8)).unwrap();
@@ -751,5 +755,58 @@ mod tests {
             pass.context().take(2).unwrap().machine_status(),
             MachineStatus::Off
         ));
+    }
+    #[test]
+    fn cap_adoption_metadata_facade_remains_configurable_without_reset() {
+        let cell = ProcessCell::default();
+        let account = cell.get();
+        let metadata = account.metadata_domain().unwrap();
+        let pass = metadata.reserve(4).unwrap();
+        let charge = pass.context().take(4).unwrap().commit(4).unwrap();
+        drop(pass);
+        assert_eq!(
+            account.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 4
+            }
+        );
+        assert!(matches!(
+            cell.configure(Some(3)),
+            Err(AdmissionError::Limit {
+                scope: LimitScope::Process,
+                limit: 3,
+                requested_total: 4
+            })
+        ));
+        assert_eq!(account.cap(), None);
+        cell.configure(Some(4)).unwrap();
+        assert_eq!(account.cap(), Some(4));
+        assert_eq!(
+            account.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 4
+            }
+        );
+        account.core.begin_model_load(); // Same core method used by public hook.
+        assert_eq!(
+            cell.configure(Some(8)),
+            Err(AdmissionError::ConfigurationConflict {
+                active: Some(4),
+                requested: Some(8)
+            })
+        );
+        assert!(matches!(
+            metadata.reserve(1),
+            Err(AdmissionError::Limit {
+                limit: 4,
+                requested_total: 5,
+                ..
+            })
+        ));
+        drop(charge);
+        assert_eq!(account.snapshot(), AccountSnapshot::default());
+        assert_eq!(account.cap(), Some(4));
     }
 }

@@ -325,6 +325,7 @@ pub fn load_admitted_as<P: QwenShape>(
     device: &Device,
     load: lloom::nn::memory::LoadContext,
 ) -> Result<lloom::nn::memory::Loaded<Engines<P>>> {
+    lloom_tensor::memory_admission::begin_model_load();
     if opts.cpu != device.is_cpu() {
         anyhow::bail!("supplied Qwen4Exp device disagrees with load options");
     }
@@ -509,6 +510,7 @@ fn load_dflash<P: Profile, R: ExpertResidency>(
 /// the regime from the contract — one `match` over the eight
 /// (`lloom::profile::dispatch!`), bounded by what the family ships.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = ProfileKey::at_contract(
         if opts.mtp.is_some() || opts.dflash.is_some() {
@@ -562,6 +564,7 @@ fn load_on<P: QwenShape>(
     resolved: Option<Device>,
     admission: LoadAdmission,
 ) -> Result<Engines<P>> {
+    lloom_tensor::memory_admission::begin_model_load();
     {
         // The DFlash drafter's directory and config first: the slot plan
         // claims what it will hold beside the experts.

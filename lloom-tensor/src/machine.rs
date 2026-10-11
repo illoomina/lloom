@@ -995,10 +995,16 @@ impl Drop for HoldingDomainBinding {
 
 impl Holding {
     pub(crate) fn try_bind_domain(self: &Arc<Self>) -> crate::Result<HoldingDomainBinding> {
-        if self.domain_bound.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self
+            .domain_bound
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             crate::bail!("machine holding already belongs to an admission domain; reuse that Domain or obtain a distinct holding with Gate::admit");
         }
-        Ok(HoldingDomainBinding { holding: self.clone() })
+        Ok(HoldingDomainBinding {
+            holding: self.clone(),
+        })
     }
 
     /// Bytes reserved now.
@@ -1474,7 +1480,10 @@ mod tests {
             .unwrap_err();
             assert_eq!(calls, 2);
             assert!(error.to_string().contains("restoration failed"), "{error}");
-            assert!(error.to_string().contains("release this holding"), "{error}");
+            assert!(
+                error.to_string().contains("release this holding"),
+                "{error}"
+            );
         }
         assert_eq!(h.reserved(), 100, "uncommitted growth stays unpublished");
         let error = reg.entries().unwrap_err().to_string();

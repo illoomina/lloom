@@ -70,6 +70,7 @@ where
         decode: DecodeConfig,
         produce: impl FnOnce(&Device) -> Result<(M, M::Config, Tokenizer, Option<CausalPolicy>)>,
     ) -> Result<Loaded<Self>> {
+        lloom_tensor::memory_admission::begin_model_load();
         if capacity == 0 {
             lloom_tensor::bail!("causal app context capacity must be positive")
         }

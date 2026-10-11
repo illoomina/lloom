@@ -387,6 +387,8 @@ impl<T> Loaded<T> {
         load: LoadContext,
         producer: impl FnOnce(&Device, &AllocationContext) -> Result<T>,
     ) -> Result<Self> {
+        // A failed genuine load attempt freezes policy too; device/domain setup does not.
+        lloom_tensor::memory_admission::begin_model_load();
         #[cfg(feature = "metal")]
         if let Device::Metal(device) = device {
             let allocations = lloom_tensor::metal_backend::MetalAllocationDomain::new(

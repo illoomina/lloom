@@ -716,6 +716,7 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
 
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
 pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    lloom_tensor::memory_admission::begin_model_load();
     let path = match &model.model {
         Some(p) => p.clone(),
         None => lfm2::default_model_dir()

@@ -23,6 +23,7 @@ use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, profile_reset, profile_take,
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
+use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
 use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
@@ -58,19 +59,20 @@ pub struct Core<P: Profile> {
     pub device: Device,
 }
 
-/// The `--batch 1` state: the one sequence every request drives, taken out
-/// for the request's session and put back after it, the token rings kept
-/// across requests (`RingPool`, built at load, #702), and the drafter.
-struct Single<P: Profile> {
-    seq: Option<Sequence<State<P>>>,
-    rings: Option<RingPool>,
+/// Side state travels with the held sequence under one request checkout.
+struct SingleExtra {
     spec: Option<DSparkSpeculator>,
-    /// The loop's options, handed to every request's session.
     decode: crate::DecodeConfig,
-    /// The images whose rows the held sequence's image positions carry, in
-    /// order. A cached prefix is reused only across the same images: the
-    /// `<image>` ids of two different images are identical.
+    /// Pixel keys for the rows in the held prefix, not merely image token ids.
     image_keys: Vec<[u8; 32]>,
+}
+impl AbortState for SingleExtra {
+    fn abort(&mut self) {
+        self.image_keys.clear();
+        if let Some(spec) = &mut self.spec {
+            spec.reset_contexts();
+        }
+    }
 }
 
 /// The vision half of an LFM2-VL checkpoint: its config and preprocessing
@@ -323,7 +325,7 @@ pub struct Engine<P: Profile> {
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
     private_cache: PrivateCachePolicy,
-    single: Mutex<Single<P>>,
+    single: parking_lot::Mutex<Option<RequestState<State<P>, SingleExtra>>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -422,29 +424,6 @@ impl RowsArm {
 
     pub fn pooled(self) -> bool {
         matches!(self, Self::Pool | Self::PoolPerRow)
-    }
-}
-
-impl<P: Profile> Single<P> {
-    /// Run `f` over a session on the held sequence, and put the sequence back
-    /// whatever `f` returned.
-    fn with_session<T>(
-        &mut self,
-        core: &Core<P>,
-        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
-    ) -> Result<T> {
-        let seq = self
-            .seq
-            .take()
-            .context("the sequence is checked out — a previous request panicked mid-decode")?;
-        let rings = self.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&core.model, seq, core.device.clone(), rings)
-            .with_config(self.decode.clone());
-        let out = f(&mut session, &mut self.spec);
-        let (seq, rings) = session.into_parts();
-        self.seq = Some(seq);
-        self.rings = Some(rings);
-        out
     }
 }
 
@@ -560,6 +539,7 @@ fn shape_key(opts: &LoadOptions) -> Result<ProfileKey> {
 /// profile the resolved config names, one `match` over the eight
 /// (`lloom::profile::dispatch!`), bounded by what the family ships.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn super::served::Served>> {
+    lloom_tensor::memory_admission::begin_model_load();
     let key = shape_key(&opts)?;
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => {
         Engine::<P>::load_as(opts).map(|e| Box::new(e) as Box<dyn super::served::Served>)
@@ -577,6 +557,7 @@ impl<P: Lfm2Shape> Engine<P> {
     /// The engine at the shape `P` names; `load` picks `P` from the
     /// resolved config (`shape_key`) and dispatches here.
     pub fn load_as(opts: LoadOptions) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
         let device = if opts.cpu {
             Device::Cpu
         } else {
@@ -602,6 +583,7 @@ impl<P: Lfm2Shape> Engine<P> {
         device: &Device,
         load: lloom::nn::memory::LoadContext,
     ) -> Result<lloom::nn::memory::Loaded<Self>> {
+        lloom_tensor::memory_admission::begin_model_load();
         if opts.cpu != device.is_cpu() {
             anyhow::bail!("supplied LFM2 device disagrees with load options");
         }
@@ -640,7 +622,7 @@ impl<P: Lfm2Shape> Engine<P> {
     /// touching its held chat sequence or loading another checkpoint. The
     /// already-prepared request's host storage keeps its origin; the pass must
     /// cover a fresh configured cache, retained frames and all readout scratch.
-    /// A common single-sequence lock serializes both callers' model executor.
+    /// A common request checkout excludes both callers from the model executor.
     /// Media expansion, raw HTTP rendering and full producer enrollment remain
     /// factory/frontend obligations, not implicit behavior of this token API.
     pub fn decide_admitted(
@@ -652,8 +634,8 @@ impl<P: Lfm2Shape> Engine<P> {
             engine
                 .check_fits(request.max_prompt_tokens(), 0)
                 .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
-            let single = lock(&engine.single);
-            let options = single.decode.options(0, ReadbackArm::Blocking, 0);
+            let lease = RequestLease::<Model<P>, _>::checkout(&engine.single, true)?;
+            let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
             let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &engine.core.device)?;
             request.execute_with_cache_factory(
                 &engine.core.model,
@@ -1105,13 +1087,16 @@ impl<P: Lfm2Shape> Engine<P> {
             load_warnings,
             machine,
             private_cache,
-            single: Mutex::new(Single {
-                seq: Some(Sequence::new(cache)),
+            single: parking_lot::Mutex::new(Some(RequestState {
+                sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
-                spec: None,
-                decode: opts.decode.clone(),
-                image_keys: Vec::new(),
-            }),
+                extra: SingleExtra {
+                    spec: None,
+                    decode: opts.decode.clone(),
+                    image_keys: Vec::new(),
+                },
+                needs_recovery: false,
+            })),
             sched: None,
             sched_thread: Mutex::new(None),
         };
@@ -1227,7 +1212,8 @@ impl<P: Lfm2Shape> Engine<P> {
         if opts.batch == 1 {
             if dcfg.is_some() {
                 let spec = build_spec(1)?;
-                lock(&engine.single).spec = Some(spec);
+                let mut lease = RequestLease::<Model<P>, _>::checkout(&engine.single, true)?;
+                lease.extra_mut().spec = Some(spec);
             }
             return Ok(engine);
         }
@@ -1378,11 +1364,31 @@ impl<P: Lfm2Shape> Engine<P> {
         Ok(engine)
     }
 
+    fn checkout_single(&self) -> Result<RequestLease<'_, Model<P>, SingleExtra>> {
+        let lease = RequestLease::<Model<P>, _>::checkout(&self.single, true)?;
+        if lease.needs_recovery() {
+            if let Some(spec) = &lease.extra().spec {
+                // Before any target/extra reset or mapped-slot overwrite. Err
+                // restores unchanged custody and the recovery marker via Drop.
+                spec.fence_failed_request()?;
+            }
+        }
+        Ok(lease)
+    }
+
     fn with_single<T>(
         &self,
-        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
+        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut SingleExtra) -> Result<T>,
     ) -> Result<T> {
-        lock(&self.single).with_session(&self.core, f)
+        let mut lease = self.checkout_single()?;
+        let decode = lease.extra().decode.clone();
+        lease.start_decode(&self.core.model, &self.core.device, decode);
+        let (session, extra) = lease.parts_mut();
+        let out = f(session, extra);
+        if out.is_ok() {
+            lease.mark_complete();
+        }
+        out
     }
 
     /// Run a closed job on the batch thread and wait for it.
@@ -1526,15 +1532,13 @@ impl<P: Lfm2Shape> Engine<P> {
         }
         let reuse = self.reuse_prefix;
         let detok = self.detok();
-        let mut single = lock(&self.single);
-        // A text prompt holds no image position, so neither does what it
-        // leaves in the cache.
-        single.image_keys.clear();
-        single.with_session(&self.core, |s, spec| {
+        self.with_single(|s, extra| {
+            // A text prompt leaves no image rows in the held cache.
+            extra.image_keys.clear();
             if !reuse {
                 s.reset();
             }
-            match spec {
+            match &mut extra.spec {
                 Some(spec) => s
                     .decode_speculative_until(
                         rewindable::<P>()?,
@@ -1642,21 +1646,18 @@ impl<P: Lfm2Shape> Engine<P> {
         }
         let keys: Vec<[u8; 32]> = images.iter().map(|im| im.key).collect();
         let device = self.core.device.clone();
+        let mut lease = self.checkout_single()?;
+        let decode = lease.extra().decode.clone();
+        // Install stage custody and recover abandoned target/drafter state before
+        // encoder work or comparing the kept token/pixel prefix.
+        lease.with_model(&self.core.model, &device, decode.clone(), |s, _| {
+            s.reconcile();
+            Ok::<_, anyhow::Error>(())
+        })?;
         let encoder = v.encoder(&device)?;
 
-        let mut single = lock(&self.single);
-        // The previous run's overrun (the flow's forwards past its EOS) is
-        // discarded first, as `Session::prepare` does, so the check below
-        // compares the cache's own position with the token log.
-        single.with_session(&self.core, |s, _| {
-            s.reconcile();
-            Ok(())
-        })?;
         let start = {
-            let seq = single
-                .seq
-                .as_ref()
-                .context("the sequence is checked out — a previous request panicked mid-decode")?;
+            let seq = lease.sequence();
             let cached = seq.tokens();
             let extends = self.reuse_prefix
                 && seq.pos() == cached.len()
@@ -1670,7 +1671,8 @@ impl<P: Lfm2Shape> Engine<P> {
                 rows += rows_of[k];
                 k += 1;
             }
-            let same_images = single.image_keys.len() >= k && single.image_keys[..k] == keys[..k];
+            let same_images =
+                lease.extra().image_keys.len() >= k && lease.extra().image_keys[..k] == keys[..k];
             if extends && same_images {
                 cached.len()
             } else {
@@ -1724,28 +1726,21 @@ impl<P: Lfm2Shape> Engine<P> {
                     features,
                     first_rank,
                 );
-                let seq = single.seq.take().context("the sequence is checked out")?;
-                let rings = single.rings.take().unwrap_or_default();
-                let mut s = DecodeSession::from_parts(&lm, seq, device.clone(), rings)
-                    .with_config(single.decode.clone());
-                if start == 0 {
-                    s.reset();
-                }
-                let run = (|| -> Result<_> {
+                let run = lease.with_model(&lm, &device, decode.clone(), |s, _| {
+                    if start == 0 {
+                        s.reset();
+                    }
                     let pre = s.prefill(&prompt_ids[start..], params)?;
                     let prefill_w = take_window(&device)?;
                     let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
                     let decode_w = take_window(&device)?;
-                    Ok((d, pre, prefill_w, decode_w))
-                })();
-                let (seq, rings) = s.into_parts();
-                single.seq = Some(seq);
-                single.rings = Some(rings);
+                    Ok::<_, anyhow::Error>((d, pre, prefill_w, decode_w))
+                });
                 rows_placed = lm.spliced();
                 run
             }
             // Every image row is in the kept prefix: the rest is text.
-            None => single.with_session(&self.core, |s, _| {
+            None => lease.with_model(&self.core.model, &device, decode, |s, _| {
                 let pre = s.prefill(&prompt_ids[start..], params)?;
                 let prefill_w = take_window(&device)?;
                 let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
@@ -1756,12 +1751,11 @@ impl<P: Lfm2Shape> Engine<P> {
         let (mut decoded, pre, prefill_w, decode_w) = match run {
             Ok(r) => r,
             Err(e) => {
-                single.image_keys.clear();
+                lease.extra_mut().image_keys.clear();
                 return Err(e);
             }
         };
-        single.image_keys = keys;
-        drop(single);
+        lease.extra_mut().image_keys = keys;
         if rows_placed != total - rows_kept {
             anyhow::bail!(
                 "image prefill placed {rows_placed} image rows; the uncached prompt holds {}",
@@ -1794,6 +1788,7 @@ impl<P: Lfm2Shape> Engine<P> {
         report["image_rows_placed"] = json!(rows_placed);
         report["census"] = census.map(|c| c.json()).unwrap_or(Value::Null);
         *lock(&self.last_vision) = report;
+        lease.mark_complete();
         Ok(decoded)
     }
 
@@ -2190,9 +2185,9 @@ impl<P: Lfm2Shape> Engine<P> {
         let prefill_tile = self.prefill_tile;
         let detok = self.detok();
         let gauge = MemGauge::start(&device, self.mem_sample);
-        let mut timing = self.with_single(|s, spec| {
+        let mut timing = self.with_single(|s, extra| {
             s.reset();
-            if let Some(spec) = spec {
+            if let Some(spec) = &mut extra.spec {
                 // One run of `D` tokens; the prompt's submit time subtracted
                 // (the prefill's GPU tail is inside the bracket).
                 let params = DecodeParams {
@@ -2357,10 +2352,11 @@ impl<P: Lfm2Shape> Engine<P> {
     /// is the reading).
     pub fn diagnostics(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let single = lock(&self.single);
-        let flag = single.decode.in_flight;
-        if let Some((measured, (host_ns, gpu_ns))) = self.warm_in_flight {
-            out.push(format!(
+        let slot = self.single.lock();
+        if let Some(single) = slot.as_ref() {
+            let flag = single.extra.decode.in_flight;
+            if let Some((measured, (host_ns, gpu_ns))) = self.warm_in_flight {
+                out.push(format!(
                 "[in-flight: depth {} (warmup measured {:.2} ms host encode / {:.2} ms gpu step -> \
                  {measured}){}]",
                 if flag > 0 { flag } else { lloom::nn::decode::IN_FLIGHT_FLOOR },
@@ -2372,22 +2368,22 @@ impl<P: Lfm2Shape> Engine<P> {
                     "; the pacer takes decode.in_flight, whose 0 is the floor, not the measured depth"
                 },
             ));
-        }
-        if let Some(seq) = single.seq.as_ref() {
-            let kv = seq.cache().kv_report();
-            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-            #[cfg(feature = "metal")]
-            let device_line = match &self.core.device {
-                Device::Metal(m) => format!(
-                    " device_allocated={:.2} GB working_set={:.2} GB",
-                    m.device().current_allocated_size() as f64 / 1e9,
-                    m.device().recommended_max_working_set_size() as f64 / 1e9
-                ),
-                _ => String::new(),
-            };
-            #[cfg(not(feature = "metal"))]
-            let device_line = String::new();
-            out.push(format!(
+            }
+            if let Some(seq) = single.sequence.as_ref() {
+                let kv = seq.cache().kv_report();
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                #[cfg(feature = "metal")]
+                let device_line = match &self.core.device {
+                    Device::Metal(m) => format!(
+                        " device_allocated={:.2} GB working_set={:.2} GB",
+                        m.device().current_allocated_size() as f64 / 1e9,
+                        m.device().recommended_max_working_set_size() as f64 / 1e9
+                    ),
+                    _ => String::new(),
+                };
+                #[cfg(not(feature = "metal"))]
+                let device_line = String::new();
+                out.push(format!(
                 "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
                 kv.kv_len,
                 kv.slab,
@@ -2396,7 +2392,11 @@ impl<P: Lfm2Shape> Engine<P> {
                 kv.grows,
                 mib(kv.bytes)
             ));
+            }
+        } else {
+            out.push("[kv: request owner busy; cache report unavailable]".to_string());
         }
+        drop(slot);
         // §4.8: the weight-group tier's shape and counters, when the layers
         // stream (nothing at full quota — R1, the tier is not there).
         if let Some((slots, groups, slot_bytes, g)) = self.core.model.streamed_layers_stats() {

@@ -55,6 +55,11 @@ where
             needs_recovery,
         })
     }
+    /// Native slot owners may need a fallible, recovery-only data fence BEFORE
+    /// cache/extra reset. A refused fence leaves this marker and custody intact.
+    pub fn needs_recovery(&self) -> bool {
+        self.recover && self.needs_recovery
+    }
     pub fn extra(&self) -> &E {
         match self.state.as_ref() {
             Some(LeaseState::Held(state)) => &state.extra,

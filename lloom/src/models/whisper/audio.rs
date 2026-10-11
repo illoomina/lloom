@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::thread;
 
 // Keep the public trait path used by Voxtral and external Whisper callers.
-pub use crate::nn::signal::Float;
-use crate::nn::signal::fft;
 #[cfg(test)]
 use crate::nn::signal::dft;
+use crate::nn::signal::fft;
+pub use crate::nn::signal::Float;
 
 #[allow(clippy::too_many_arguments)]
 // https://github.com/ggerganov/whisper.cpp/blob/4774d2feb01a772a15de81ffc34b34a1f294f020/whisper.cpp#L2414

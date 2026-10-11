@@ -9683,6 +9683,7 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl<P: Profile> Model<P> {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
         crate::profile::hold::<P::Regime>("lfm2")?;
         cfg.check_shape::<P>()?;
         // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING

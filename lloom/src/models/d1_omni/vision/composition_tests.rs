@@ -3,7 +3,7 @@ use crate::nn::attention::bounded::MaskedAttentionPlan;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-fn fixture() -> Result<Vision> {
+fn fixture_parts() -> Result<(VisionConfig, HashMap<String, Tensor>)> {
     let cfg = VisionConfig {
         hidden_size: 4,
         intermediate_size: 8,
@@ -34,14 +34,19 @@ fn fixture() -> Result<Vision> {
         Ok(())
     };
     put(
-        "tower.embeddings.patch_embedding.weight",
+        "tower.vision_model.embeddings.patch_embedding.weight",
         &[4, 768],
         1,
         false,
     )?;
-    put("tower.embeddings.patch_embedding.bias", &[4], 2, false)?;
     put(
-        "tower.embeddings.position_embedding.weight",
+        "tower.vision_model.embeddings.patch_embedding.bias",
+        &[4],
+        2,
+        false,
+    )?;
+    put(
+        "tower.vision_model.embeddings.position_embedding.weight",
         &[4, 4],
         3,
         false,
@@ -51,26 +56,46 @@ fn fixture() -> Result<Vision> {
         .enumerate()
     {
         put(
-            &format!("tower.encoder.layers.0.self_attn.{p}.weight"),
+            &format!("tower.vision_model.encoder.layers.0.self_attn.{p}.weight"),
             &[4, 4],
             i + 4,
             false,
         )?;
         put(
-            &format!("tower.encoder.layers.0.self_attn.{p}.bias"),
+            &format!("tower.vision_model.encoder.layers.0.self_attn.{p}.bias"),
             &[4],
             i + 5,
             false,
         )?;
     }
-    put("tower.encoder.layers.0.mlp.fc1.weight", &[8, 4], 8, false)?;
-    put("tower.encoder.layers.0.mlp.fc1.bias", &[8], 9, false)?;
-    put("tower.encoder.layers.0.mlp.fc2.weight", &[4, 8], 10, false)?;
-    put("tower.encoder.layers.0.mlp.fc2.bias", &[4], 11, false)?;
+    put(
+        "tower.vision_model.encoder.layers.0.mlp.fc1.weight",
+        &[8, 4],
+        8,
+        false,
+    )?;
+    put(
+        "tower.vision_model.encoder.layers.0.mlp.fc1.bias",
+        &[8],
+        9,
+        false,
+    )?;
+    put(
+        "tower.vision_model.encoder.layers.0.mlp.fc2.weight",
+        &[4, 8],
+        10,
+        false,
+    )?;
+    put(
+        "tower.vision_model.encoder.layers.0.mlp.fc2.bias",
+        &[4],
+        11,
+        false,
+    )?;
     for (i, p) in [
-        "tower.encoder.layers.0.layer_norm1",
-        "tower.encoder.layers.0.layer_norm2",
-        "tower.post_layernorm",
+        "tower.vision_model.encoder.layers.0.layer_norm1",
+        "tower.vision_model.encoder.layers.0.layer_norm2",
+        "tower.vision_model.post_layernorm",
     ]
     .iter()
     .enumerate()
@@ -83,8 +108,12 @@ fn fixture() -> Result<Vision> {
     put("projector.linear_2.weight", &[4, 8], 31, false)?;
     put("projector.linear_2.bias", &[4], 32, false)?;
     assert_eq!(weights.len(), 25);
-    // No vision_model spelling exists in this source map. Incorrect stripping
-    // or double-applying wrapper.vision fails in the actual loader.
+    assert_pinned_schema(&weights);
+    Ok((cfg, weights))
+}
+
+fn fixture() -> Result<Vision> {
+    let (cfg, weights) = fixture_parts()?;
     Vision::load(
         &cfg,
         8,
@@ -92,6 +121,47 @@ fn fixture() -> Result<Vision> {
         VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu).pp("wrapper.vision"),
     )
 }
+
+fn assert_pinned_schema(weights: &HashMap<String, Tensor>) {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("checkpoint_vision_schema.json")).unwrap();
+    let tensors = schema["tensors"].as_object().unwrap();
+    assert_eq!(tensors.len(), 25);
+    assert_eq!(weights.len(), tensors.len());
+    for (name, tensor) in weights {
+        let key = name.strip_prefix("wrapper.").unwrap();
+        let recorded = tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("checkpoint key absent: {key}"));
+        assert_eq!(recorded["dtype"], "F32", "checkpoint dtype: {key}");
+        assert_eq!(tensor.dtype(), DType::F32);
+        assert_eq!(
+            recorded["shape"].as_array().unwrap().len(),
+            tensor.rank(),
+            "checkpoint rank: {key}"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_namespace_rejects_stripping_vision_model() -> Result<()> {
+    let (cfg, weights) = fixture_parts()?;
+    let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu).pp("wrapper.vision");
+    let stripped = vb.root().rename_f(|name: &str| {
+        format!(
+            "wrapper.vision.tower.{}",
+            name.strip_prefix("vision_model.").unwrap_or(name)
+        )
+    });
+    let err = VisionTower::new(&cfg, stripped).unwrap_err().to_string();
+    assert!(
+        err.contains("wrapper.vision.tower.embeddings.patch_embedding.weight"),
+        "{err}"
+    );
+    let _vision = Vision::load(&cfg, 8, 4, vb)?;
+    Ok(())
+}
+
 fn attend(q: &Tensor, k: &Tensor, v: &Tensor, m: Option<&Tensor>, scale: f64) -> Result<Tensor> {
     MaskedAttentionPlan::new(q, k, v, m.unwrap(), scale, NonZeroUsize::new(2).unwrap())?.execute()
 }

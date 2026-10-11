@@ -215,21 +215,7 @@ impl Vision {
         vb: VarBuilder,
     ) -> Result<Self> {
         Self::validate_config(cfg, projector_hidden, out, vb.dtype())?;
-        // rename uses the existing backend. Start from root so an incoming
-        // prefix is not applied a second time by the inner VarBuilder.
-        let prefix = vb.prefix();
-        let root = if prefix.is_empty() {
-            "tower.".to_owned()
-        } else {
-            format!("{prefix}.tower.")
-        };
-        let tower_vb = vb.root().rename_f(move |name: &str| {
-            format!(
-                "{root}{}",
-                name.strip_prefix("vision_model.").unwrap_or(name)
-            )
-        });
-        let tower = VisionTower::new(cfg, tower_vb)?;
+        let tower = VisionTower::new(cfg, vb.pp("tower"))?;
         let projector_cfg = Lfm2VlConfig {
             vision_config: cfg.clone(),
             image_token_id: 0,

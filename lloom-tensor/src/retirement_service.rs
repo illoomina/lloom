@@ -33,10 +33,17 @@ use std::{
 /// depend on this service. Native adapters must use a concrete rooted active cell,
 /// not only promise that a stack local will survive unwinding.
 ///
-/// `can_unregister` is true ONLY when no producer capable of installing a new
-/// payload exists and every resource/panic payload has left the inbox. Delayed
-/// native block copies then retain empty metadata only. Quarantined/unknown
-/// handoffs keep this false; queue poisoning is not native terminal proof.
+/// Without worker-final metadata opt-in, `can_unregister` is true ONLY when
+/// no producer capable of installing a payload exists and every resource/panic
+/// payload has left the inbox. For immutable worker-final opt-in it may instead
+/// report local resource/panic quiescence: removal additionally requires the
+/// service's exclusive count2 census under its snapshot/acquisition guard, then
+/// revalidation of this predicate while that guard still excludes acquisition.
+/// No Weak/raw-Arc path is permitted; count2 proves no foreign producer remains.
+/// Opt-in revalidation must be trusted nonpanicking host metadata observation,
+/// without registry re-entry or an inverse lock edge to that service guard.
+/// Delayed native block copies keep counted roots, and quarantined/unknown
+/// payloads keep this predicate false; poisoning is not native terminal proof.
 ///
 /// `fail` publishes admission/wait failure and wakes waiters without dropping
 /// pending owners, acquiring a producer lock, or inventing completed status.
@@ -123,11 +130,28 @@ impl Inbox {
     }
     /// Called only under the registry snapshot/census lock. The pass holds
     /// one matching inner Arc and the registry holds the other. No extra clone
-    /// is made to inspect the opt-in contract.
+    /// is made to inspect the opt-in contract. Revalidate local quiescence
+    /// only AFTER count2: an earlier offguard observation can precede a final
+    /// producer publication and Arc release; the guard now excludes snapshots.
     fn metadata_removable(&self) -> bool {
         match self {
             Self::Cleanup(entry) => {
-                !entry.worker_final_metadata_drop() || Arc::strong_count(entry) == 2
+                if !entry.worker_final_metadata_drop() {
+                    return true;
+                }
+                if Arc::strong_count(entry) != 2 {
+                    return false;
+                }
+                // Arc::strong_count is Relaxed. The pass's own Arc clone RMW
+                // precedes this load, so atomic coherence excludes older counts:
+                // clone read1 -> wrote2, following any prior foreign Release drop;
+                // clone read>=2 -> wrote>=3, so count2 follows a foreign decrement.
+                // All subsequent count changes are RMWs in that release sequence.
+                // Acquire the foreign writes BEFORE rechecking local quiescence.
+                // No Weak/raw resurrection; this guard excludes service snapshots.
+                // Proof/source versions: tagged-service-revalidation report.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+                entry.can_unregister()
             }
             Self::Lifecycle(_) => true,
         }
@@ -753,7 +777,7 @@ mod metadata_charge_tests {
         memory_admission::ModelDomain,
         retirement_registry::{HostMetadataHandle, MetadataWake},
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct MetadataInbox {
         service: Arc<HostRetirementService>,
@@ -856,6 +880,116 @@ mod metadata_charge_tests {
         assert_eq!(domain.snapshot().committed, 8);
         drop(panic);
         drop(service); // Fake-only teardown; production static never does this.
+        assert_eq!(domain.snapshot().committed, 0);
+    }
+    struct StaleQuiescenceInbox {
+        service: Arc<HostRetirementService>,
+        domain: ModelDomain,
+        charge: Mutex<Option<PhysicalCharge>>,
+        producer: Mutex<Option<Arc<dyn CleanupInbox>>>,
+        first_observation: AtomicBool,
+        pending: AtomicBool,
+        finished: AtomicUsize,
+        drops: Arc<AtomicUsize>,
+    }
+    // SAFETY: fixed fake payload, no native/use/callback obligations. Its first
+    // offguard empty observation deterministically performs a final publication
+    // then producer Arc release. Revalidation observes atoms only, no registry
+    // re-entry or inverse lock. Actual Drop witnesses retained final charge.
+    unsafe impl CleanupInbox for StaleQuiescenceInbox {
+        fn begin_retire(&self) -> bool {
+            self.pending.swap(false, Ordering::AcqRel)
+        }
+        fn drop_captures(&self) {}
+        fn finish_retire(&self) {
+            self.finished.fetch_add(1, Ordering::Release);
+        }
+        fn can_unregister(&self) -> bool {
+            let empty = !self.pending.load(Ordering::Acquire);
+            if self.first_observation.swap(false, Ordering::AcqRel) {
+                assert!(
+                    self.service.registry.try_lock().is_some(),
+                    "first local observation is offguard"
+                );
+                // Actual sequence at the production predicate/census seam:
+                // observe empty -> final publish -> last producer root release.
+                self.pending.store(true, Ordering::Release);
+                let producer = self.producer.lock().take().expect("one fake producer");
+                drop(producer);
+                return empty;
+            }
+            empty && self.finished.load(Ordering::Acquire) == 1
+        }
+        fn worker_final_metadata_drop(&self) -> bool {
+            true
+        }
+        fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
+            self.charge.lock().take()
+        }
+        fn fail(&self, _: Failure) {}
+    }
+    impl Drop for StaleQuiescenceInbox {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.finished.load(Ordering::Acquire),
+                1,
+                "stale quiescence must not discard final publication"
+            );
+            assert!(
+                self.service.registry.try_lock().is_some(),
+                "metadata Drop offguard"
+            );
+            assert_eq!(
+                self.domain.snapshot().committed,
+                8,
+                "charge spans actual metadata Drop"
+            );
+            assert!(
+                self.service.active_metadata_charge.lock().is_some(),
+                "service charge custody"
+            );
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[test]
+    fn worker_final_census_rechecks_quiescence_after_last_publication() {
+        let service = HostRetirementService::manual();
+        let domain = ModelDomain::isolated_numeric_fixture(16);
+        let charge = domain
+            .reserve(8)
+            .unwrap()
+            .context()
+            .take(8)
+            .unwrap()
+            .commit(8)
+            .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let inbox = Arc::new(StaleQuiescenceInbox {
+            service: service.clone(),
+            domain: domain.clone(),
+            charge: Mutex::new(Some(charge)),
+            producer: Mutex::new(None),
+            first_observation: AtomicBool::new(true),
+            pending: AtomicBool::new(false),
+            finished: AtomicUsize::new(0),
+            drops: drops.clone(),
+        });
+        let erased: Arc<dyn CleanupInbox> = inbox.clone();
+        *inbox.producer.lock() = Some(erased.clone());
+        service.register(&erased).unwrap();
+        drop(erased);
+        drop(inbox); // Now only service + fake delayed producer roots exist.
+        assert!(!service.manual_pass());
+        assert_eq!(
+            service.registry.lock().len(),
+            1,
+            "pending publication retains service root"
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(domain.snapshot().committed, 8);
+        assert!(service.manual_pass());
+        assert!(service.registry.lock().is_empty());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(domain.snapshot().committed, 0);
     }
 }

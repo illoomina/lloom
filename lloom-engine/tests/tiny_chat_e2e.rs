@@ -1882,3 +1882,112 @@ fn serve_answers_a_template_failure_on_client_data_with_a_400() {
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A `/v1/systemone` body the tiny byte-level tokenizer can answer: one
+/// choice between `A` and `B` (single byte tokens; `yes`/`no` are not).
+fn tiny_decision() -> Value {
+    json!({
+        "state": "The loom threads warp and weft.",
+        "questions": {"pick": {"type": "choice", "instructions": "Which one?",
+                               "criteria": {"A": "the first", "B": "the second"}}}
+    })
+}
+
+fn assert_tiny_answer(response: &Value) {
+    let answer = &response["answers"]["pick"];
+    let probabilities = answer["probabilities"].as_object().unwrap();
+    let total: f64 = probabilities.values().map(|p| p.as_f64().unwrap()).sum();
+    assert!((total - 1.0).abs() < 1e-9, "{response}");
+    assert!(
+        matches!(answer["choice"].as_str(), Some("A" | "B")),
+        "{response}"
+    );
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+}
+
+/// `lloom chat -p "/decide {…}"` on a plain tiny LFM2 with the shipped d1
+/// template selected (`decision.template = lfm2-d1`, installable on the
+/// default family now that it has an executor): one answer on stdout, and
+/// the process ends: a command line given as `--prompt` is read once, not
+/// again for a turn it never ran.
+#[test]
+fn lfm2_tiny_chat_answers_one_decide_line_and_exits() {
+    let dir = scratch("decide-chat-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let line = format!("/decide {}", tiny_decision());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--cpu", "--decision-template", "lfm2-d1", "-p", &line])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("`lloom chat -p \"/decide …\"` did not exit: the prompt was read again");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "exited {status:?}:\n{stderr}");
+    assert!(
+        stderr.contains("[decision template: lfm2-d1 (engine-shipped, sha256 b47201d7"),
+        "{stderr}"
+    );
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with('{')).collect();
+    assert_eq!(lines.len(), 1, "one answer, once:\n{stdout}");
+    assert_tiny_answer(&serde_json::from_str(lines[0]).unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `lloom serve` on the same plain tiny LFM2 with the d1 template selected:
+/// a decision, a chat, the decision again on the one loaded model (equal,
+/// on the CPU's deterministic arithmetic); the response names the model
+/// first, and `/v1/models` does not advertise decisions for a selected
+/// (not native) template.
+#[test]
+fn lfm2_tiny_serves_decisions_and_chat_on_one_model() {
+    let dir = scratch("decide-serve-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu", "--decision-template", "lfm2-d1"]);
+    let (status, first) = server.call("POST", "/v1/systemone", &tiny_decision());
+    assert_eq!(status, 200, "{first}");
+    assert_tiny_answer(&first);
+    assert!(first["model"].is_string(), "{first}");
+    let (status, body) = server.chat(json!({}));
+    assert_eq!(status, 200, "{body}");
+    let (status, again) = server.call("POST", "/v1/systemone", &tiny_decision());
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(
+        first, again,
+        "a chat between two decisions moved the second"
+    );
+    let (status, models) = server.call("GET", "/v1/models", &json!({}));
+    assert_eq!(status, 200, "{models}");
+    assert_eq!(
+        models["data"][0]["architecture"]["output_modalities"],
+        json!(["text"])
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}

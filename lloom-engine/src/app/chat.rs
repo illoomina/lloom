@@ -341,10 +341,16 @@ pub fn run(args: ChatArgs) -> Result<()> {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let mut turn = 0usize;
+    // `--prompt` is one line, read once: a command line (`/decide`, `/image`)
+    // that runs no turn must not be read again.
+    let mut prompted = false;
     loop {
         let user = match &args.prompt {
-            Some(p) if turn == 0 => p.clone(),
-            Some(_) => break,
+            Some(_) if prompted => break,
+            Some(p) => {
+                prompted = true;
+                p.clone()
+            }
             None => {
                 print!("> ");
                 std::io::stdout().flush()?;

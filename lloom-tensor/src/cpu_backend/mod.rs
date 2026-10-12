@@ -1463,6 +1463,87 @@ impl MatMul {
     }
 }
 
+impl MatMul {
+    /// The f16 matmul: `cpu::f16_matmul`'s kernel, whose accumulator the
+    /// tuning names, over k-contiguous rows of both operands. A layout that
+    /// is not k-contiguous (an lhs with a column stride, an rhs stored
+    /// `[k, n]`) is packed into one first; the kernel's arithmetic does not
+    /// depend on the layout.
+    fn f16<T: 'static + WithDType>(
+        &self,
+        lhs: &[T],
+        lhs_l: &Layout,
+        rhs: &[T],
+        rhs_l: &Layout,
+    ) -> Result<Vec<T>> {
+        use crate::cpu::f16_matmul::{matmul, Operands};
+        debug_assert_eq!(T::DTYPE, DType::F16);
+        // SAFETY: `T::DTYPE == F16` names `T = f16` (`with_dtype!`), so the
+        // slices and the result have the layout of `f16`.
+        let lhs: &[f16] =
+            unsafe { std::slice::from_raw_parts(lhs.as_ptr() as *const f16, lhs.len()) };
+        let rhs: &[f16] =
+            unsafe { std::slice::from_raw_parts(rhs.as_ptr() as *const f16, rhs.len()) };
+        let (b, m, n, k) = self.0;
+        let lhs = &lhs[lhs_l.start_offset()..];
+        let rhs = &rhs[rhs_l.start_offset()..];
+        let lhs_stride = lhs_l.stride();
+        let rhs_stride = rhs_l.stride();
+        let rank = lhs_stride.len();
+        let (lhs_cs, lhs_rs) = (lhs_stride[rank - 1], lhs_stride[rank - 2]);
+        let (rhs_cs, rhs_rs) = (rhs_stride[rank - 1], rhs_stride[rank - 2]);
+        let (a_skip, b_skip) = self.ab_skip(lhs_l, rhs_l)?;
+        let c_skip = m * n;
+        let mut dst = vec![f16::ZERO; b * m * n];
+        let threads = crate::utils::get_num_threads();
+        let mut x_pack: Vec<f16> = Vec::new();
+        let mut w_pack: Vec<f16> = Vec::new();
+        for step in 0..b {
+            let lhs_p = &lhs[step * a_skip..];
+            let rhs_p = &rhs[step * b_skip..];
+            let (x, x_rs) = if lhs_cs == 1 || k == 1 {
+                (lhs_p.as_ptr(), lhs_rs)
+            } else {
+                x_pack.clear();
+                x_pack.extend(
+                    (0..m).flat_map(|i| (0..k).map(move |kk| lhs_p[i * lhs_rs + kk * lhs_cs])),
+                );
+                (x_pack.as_ptr(), k)
+            };
+            // `w[j][kk] = rhs[kk][j]`: the transposed operand's rows are the
+            // columns of rhs, contiguous when `rhs_rs == 1`.
+            let (w, w_rs) = if rhs_rs == 1 || k == 1 {
+                (rhs_p.as_ptr(), rhs_cs)
+            } else {
+                w_pack.clear();
+                w_pack.extend(
+                    (0..n).flat_map(|j| (0..k).map(move |kk| rhs_p[kk * rhs_rs + j * rhs_cs])),
+                );
+                (w_pack.as_ptr(), k)
+            };
+            let o = Operands {
+                m,
+                n,
+                k,
+                x,
+                x_rs,
+                w,
+                w_rs,
+                dst: dst[step * c_skip..].as_mut_ptr(),
+                dst_rs: n,
+                dst_cs: 1,
+            };
+            // SAFETY: the strides describe the operands' extents, which the
+            // slices hold (`ab_skip` checked the batch layout); `dst` is this
+            // step's `[m, n]` block.
+            unsafe { matmul(&o, threads)? };
+        }
+        // SAFETY: as above, `T = f16`; the vector keeps its allocation.
+        let mut dst = std::mem::ManuallyDrop::new(dst);
+        Ok(unsafe { Vec::from_raw_parts(dst.as_mut_ptr() as *mut T, dst.len(), dst.capacity()) })
+    }
+}
+
 impl Map2 for MatMul {
     const OP: &'static str = "mat_mul";
 
@@ -1477,7 +1558,8 @@ impl Map2 for MatMul {
         use gemm::{gemm, Parallelism};
 
         match T::DTYPE {
-            DType::F16 | DType::F32 | DType::F64 => {}
+            DType::F16 => return self.f16(lhs, lhs_l, rhs, rhs_l),
+            DType::F32 | DType::F64 => {}
             _ => Err(Error::UnsupportedDTypeForOp(T::DTYPE, "matmul").bt())?,
         }
 

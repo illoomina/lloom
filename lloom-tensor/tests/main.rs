@@ -17,6 +17,7 @@
 //! not running.
 mod bilinear_tests;
 mod conv_tests;
+mod cpu_f16_matmul_accum;
 mod custom_op_tests;
 mod depthwise_conv;
 mod display_tests;

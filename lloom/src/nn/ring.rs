@@ -128,7 +128,11 @@ mod tests {
         ring.frame(1)?.slice_set(&ones, 0, 0)?;
         assert_eq!(ring.frame(1)?.sum_all()?.to_scalar::<f32>()?, 6.0);
         assert_eq!(ring.frame(0)?.sum_all()?.to_scalar::<f32>()?, 0.0);
-        assert_eq!(ring.frame(5)?.sum_all()?.to_scalar::<f32>()?, 6.0, "index wraps");
+        assert_eq!(
+            ring.frame(5)?.sum_all()?.to_scalar::<f32>()?,
+            6.0,
+            "index wraps"
+        );
         assert!(ring.fits(4, (2, 3), DType::F32));
         assert!(!ring.fits(4, (2, 4), DType::F32));
         assert!(!ring.fits(8, (2, 3), DType::F32));

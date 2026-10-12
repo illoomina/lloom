@@ -10,14 +10,16 @@
 //! the collapsed per-layer value (`LayerOutputPoint`).
 
 use super::config::Config;
-use super::deltanet_block::GatedDeltaNet;
+use super::deltanet_block::{GatedDeltaNet, GdnCheckpoint};
 use super::hc::HyperConnection;
 use super::moe::{ExpertResidency, MoeLayer, WindowPlan, WindowPlanKind, WindowRecord};
 use super::ple::{NgramHash, NgramWindow, PleLayer, PleTable};
 use super::qsa::{KvCache, KvPool, QsaAttention};
 use super::trace;
+use crate::nn::decoder::WindowMark;
 use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
+use crate::nn::turn_checkpoint::CheckpointRing;
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
 use crate::profile::{NoRewind, One, Own, Paged, Profile, Rewind, Ring, Rows};
@@ -305,9 +307,56 @@ impl<P: Profile, R: ExpertResidency> Layer<P, R> {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [1, seq, d]
         cache.keep_tap(l, &cur)?;
+        // The turn checkpoint inside the pass (`State::ckpt_take`): the
+        // DeltaNet's recurrence a second time over the tile's prefix from
+        // the same `S`; a full layer's KV lengths at the position.
+        let take = cache.ckpt_take(l)?;
         let mixed = match &self.mixer {
-            Mixer::Linear(dn) => dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
-            Mixer::Full(qsa) => qsa.prefill(&cur, &mut cache.kv[l])?,
+            Mixer::Linear(dn) => match take {
+                Some((rows, Some(frame))) => {
+                    let (ns, nc) = dn.checkpoint_parts();
+                    let s_view = frame.narrow(0, 0, ns)?;
+                    let c_view = frame.narrow(0, ns, nc)?;
+                    let ck = GdnCheckpoint {
+                        s: &s_view,
+                        conv: &c_view,
+                    };
+                    dn.prefill_checkpointing(
+                        &cur,
+                        l,
+                        &mut cache.s_state,
+                        &mut cache.conv_state,
+                        rows,
+                        &ck,
+                    )?
+                }
+                Some((_, None)) => {
+                    lloom_tensor::bail!("qwen4exp: layer {l}'s turn checkpoint needs a ring frame")
+                }
+                None => dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
+            },
+            Mixer::Full(qsa) => {
+                let before = cache.kv[l].lens();
+                let out = qsa.prefill(&cur, &mut cache.kv[l])?;
+                if let Some((rows, _)) = take {
+                    let seq = cur.dim(1)?;
+                    let after = cache.kv[l].lens();
+                    let tokens = before.0 + rows;
+                    // The indexer's compressed blocks complete within
+                    // `tokens` (`ratio` keys a block, `truncate_attention`'s
+                    // rule); a full tile's are the pass's own.
+                    let blocks = if rows == seq {
+                        after.1
+                    } else {
+                        match qsa.indexer() {
+                            Some(ix) => after.1.min(tokens / ix.ratio().max(1)),
+                            None => before.1,
+                        }
+                    };
+                    cache.ckpt_mark(l, WindowMark { tokens, blocks });
+                }
+                out
+            }
         };
         trace("mixer", l, &mixed);
         let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
@@ -507,6 +556,16 @@ pub struct State<P: Profile> {
     tap_drops: u64,
     /// The open speculative window's pre-window bookkeeping, if any.
     window: Option<CacheWindow>,
+    /// The turn checkpoints (`sequence-reuse-design.md` §2.3b, the
+    /// `Decoder`'s mechanism on this family's own state): a ring of every
+    /// linear layer's `S` and conv window, the full layers' KV lengths in
+    /// the marks; `Qwen4Exp::arm_turn_checkpoints` sizes it.
+    pub(crate) ckpt: CheckpointRing,
+    /// The checkpoint the pass in flight takes inside itself.
+    ckpt_pass: Option<PassCkpt>,
+    /// Per ring slot, the PLE's n-gram window at the checkpoint (its conv
+    /// history is the ring frame's last entry).
+    ckpt_ngram: Vec<Option<NgramWindow>>,
     /// A decode step's window HELD behind the standing one (`hold_standing`):
     /// a provisional step settled one step behind (`Provisional::Behind`,
     /// a lookahead ring) is still undone after the next step was encoded —
@@ -600,6 +659,10 @@ pub struct State<P: Profile> {
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+    /// Retained admission-planner scratch, never an authoritative cached total.
+    /// Growth/State clone can allocate host metadata; steady collection reuses it.
+    #[cfg(feature = "metal")]
+    heap_credit: lloom_tensor::kernels::metal::backing::ReuseCredit,
     /// A driver owns the settles of this cache's device-planned decode steps
     /// (`CausalLM::provisional`): a step returns its logits unsettled, and
     /// the driver settles it once it has read them back
@@ -653,6 +716,22 @@ struct CacheWindow {
 }
 
 use crate::nn::row_log::RowLog;
+
+/// A checkpoint a pass takes inside itself: the tile (of a pipelined pass)
+/// the hinted position falls in, the rows into that tile, the ring slot,
+/// and per layer how many tiles the layer has run (every layer sees the
+/// tiles in order), with the full layers' marks as they are recorded.
+#[derive(Debug, Clone)]
+struct PassCkpt {
+    tile: usize,
+    rows: usize,
+    slot: usize,
+    seen: Vec<usize>,
+    marks: Vec<WindowMark>,
+    /// The n-gram window after the checkpoint's rows (the PLE's host
+    /// state), taken by `Qwen4Exp::ple_delta` in the checkpoint's tile.
+    ngram: Option<NgramWindow>,
+}
 
 /// The one-sequence, no-rewind shape (`No × One`): every channel and the
 /// KV the state's own, the standing window a snapshot.
@@ -804,6 +883,7 @@ impl<P: Profile> State<P> {
         self.pending_tokens = w.pending_tokens;
         self.pending_noted = false;
         self.pos = w.pos + a;
+        self.ckpt.forget_past(self.pos);
         self.keep_first_rows(a)?;
         Ok(())
     }
@@ -833,6 +913,9 @@ impl<P: Profile> State<P> {
                 .collect(),
             ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
+            ckpt: CheckpointRing::none(),
+            ckpt_pass: None,
+            ckpt_ngram: Vec::new(),
             pending_tokens: std::collections::VecDeque::new(),
             #[cfg(feature = "metal")]
             ledger: None,
@@ -875,6 +958,8 @@ impl<P: Profile> State<P> {
             window_draft_loads: false,
             window_real_loads_ema: 0.0,
             prepared: None,
+            #[cfg(feature = "metal")]
+            heap_credit: Default::default(),
         }
     }
 
@@ -898,6 +983,203 @@ impl<P: Profile> State<P> {
         self.window = None;
         self.held = None;
         self.standing = false;
+        self.ckpt.forget_all();
+        self.ckpt_pass = None;
+    }
+
+    /// Keep `slots` turn checkpoints, each `elems[l]` f32s for layer `l`
+    /// (`Qwen4Exp::arm_turn_checkpoints`).
+    pub fn set_turn_checkpoints(&mut self, elems: &[usize], slots: usize) {
+        self.ckpt = CheckpointRing::new(elems, slots);
+        self.ckpt_ngram = vec![None; slots];
+    }
+
+    pub fn checkpoint_slots(&self) -> usize {
+        self.ckpt.slots()
+    }
+
+    pub fn checkpoint_bytes(&self) -> usize {
+        self.ckpt.bytes()
+    }
+
+    /// The positions the valid turn checkpoints stand at.
+    pub fn checkpoint_positions(&self) -> Vec<usize> {
+        self.ckpt.positions()
+    }
+
+    /// Have the passes that follow leave their checkpoint at `pos`
+    /// (`CausalLM::checkpoint_at`).
+    pub fn checkpoint_at(&mut self, pos: usize) {
+        self.ckpt.hint(pos);
+    }
+
+    /// The checkpoint `Layer::prefill_mix` of layer `l` takes in the pass
+    /// in flight, when this call is the hinted tile: the rows into the tile
+    /// and the layer's frame slice (`None` for a full layer, whose mark is
+    /// its lengths).
+    pub(crate) fn ckpt_take(&mut self, l: usize) -> Result<Option<(usize, Option<Tensor>)>> {
+        let Some(p) = &mut self.ckpt_pass else {
+            return Ok(None);
+        };
+        let t = p.seen[l];
+        p.seen[l] += 1;
+        if t != p.tile {
+            return Ok(None);
+        }
+        let frame = self.ckpt.frame(p.slot, l)?;
+        Ok(Some((p.rows, frame)))
+    }
+
+    /// The rows into the chunk the PLE at layer `l` runs that the pass in
+    /// flight checkpoints at: `Some` when this call (before layer `l`'s
+    /// mixer, which counts the tile) is the checkpoint's tile.
+    pub(crate) fn ckpt_ple_rows(&self, l: usize) -> Option<usize> {
+        let p = self.ckpt_pass.as_ref()?;
+        (p.seen[l] == p.tile).then_some(p.rows)
+    }
+
+    /// The PLE's state at the checkpoint's rows: the conv history into the
+    /// frame's last entry, the n-gram window beside it.
+    pub(crate) fn ckpt_ple_store(&mut self, hist: &Tensor, ngram: NgramWindow) -> Result<()> {
+        let Some(p) = &mut self.ckpt_pass else {
+            return Ok(());
+        };
+        p.ngram = Some(ngram);
+        let slot = p.slot;
+        if let Some(frame) = self.ckpt.frame(slot, self.kv.len())? {
+            let h = hist
+                .to_dtype(lloom_tensor::DType::F32)?
+                .contiguous()?
+                .flatten_all()?;
+            frame.slice_set(&h, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ckpt_mark(&mut self, l: usize, mark: WindowMark) {
+        if let Some(p) = &mut self.ckpt_pass {
+            p.marks[l] = mark;
+        }
+    }
+
+    /// Whether [`Self::restore`] can put the state back at exactly `pos`: a
+    /// checkpoint stands there, no verify window is open, none is held.
+    pub fn can_restore(&self, pos: usize) -> bool {
+        !self.window_open()
+            && self.held.is_none()
+            && pos <= self.pos
+            && self.ckpt.index(pos).is_some()
+    }
+
+    /// The latest checkpoint at or before `pos` this state can be put back
+    /// at (`CacheRewind::restore_point`).
+    pub fn restore_point(&self, pos: usize) -> Option<usize> {
+        if self.window_open() || self.held.is_some() {
+            return None;
+        }
+        self.ckpt
+            .latest_at_or_before(pos.min(self.pos))
+            .map(|(_, p)| p)
+    }
+
+    /// Put the state back where the checkpoint at `pos` was taken: every
+    /// linear layer's `S` and conv window from the frame (in place, or the
+    /// pool's next phase), every full layer's KV to its lengths, the
+    /// position; the standing window settled first, what the discarded
+    /// positions retained gone.
+    pub fn restore(&mut self, pos: usize) -> Result<()> {
+        self.settle_standing()?;
+        let Some(idx) = self.ckpt.index(pos).filter(|_| self.can_restore(pos)) else {
+            lloom_tensor::bail!(
+                "qwen4exp cache: no turn checkpoint stands at {pos} (position {}, checkpoints at {:?})",
+                self.pos,
+                self.ckpt.positions()
+            )
+        };
+        let marks = self.ckpt.marks(idx).to_vec();
+        let n = self.kv.len();
+        if marks.len() != n || self.ckpt.layers() != n + 1 {
+            lloom_tensor::bail!(
+                "qwen4exp cache: a checkpoint of {} layers for {n} layers",
+                marks.len()
+            )
+        }
+        for (l, &m) in marks.iter().enumerate() {
+            match self.ckpt.frame(idx, l)? {
+                Some(frame) => {
+                    let (Some(s_cur), Some(c_cur)) = (self.s_state.get(l), self.conv_state.get(l))
+                    else {
+                        lloom_tensor::bail!(
+                            "qwen4exp cache: layer {l} restores over an unwritten state"
+                        )
+                    };
+                    let (s_dims, s_dt) = (s_cur.dims().to_vec(), s_cur.dtype());
+                    let (c_dims, c_dt) = (c_cur.dims().to_vec(), c_cur.dtype());
+                    let ns: usize = s_dims.iter().product();
+                    let nc: usize = c_dims.iter().product();
+                    if frame.elem_count() != ns + nc {
+                        lloom_tensor::bail!(
+                            "qwen4exp cache: layer {l}'s frame holds {} elements for a state of {}",
+                            frame.elem_count(),
+                            ns + nc
+                        )
+                    }
+                    let s = frame
+                        .narrow(0, 0, ns)?
+                        .reshape(s_dims)?
+                        .to_dtype(s_dt)?
+                        .contiguous()?;
+                    let w = frame
+                        .narrow(0, ns, nc)?
+                        .reshape(c_dims)?
+                        .to_dtype(c_dt)?
+                        .contiguous()?;
+                    self.s_state.write(l, s)?;
+                    self.conv_state.write(l, w)?;
+                }
+                None => {
+                    if m.tokens > self.kv[l].len() {
+                        lloom_tensor::bail!(
+                            "qwen4exp cache: layer {l}'s KV of {} positions cannot be put back at {}",
+                            self.kv[l].len(),
+                            m.tokens
+                        )
+                    }
+                    self.kv[l].truncate(m.tokens, m.blocks);
+                }
+            }
+        }
+        // The PLE: its conv history from the frame's last entry, its n-gram
+        // window from the slot's copy.
+        if let Some(frame) = self.ckpt.frame(idx, n)? {
+            let Some(ngram) = self.ckpt_ngram.get(idx).cloned().flatten() else {
+                lloom_tensor::bail!(
+                    "qwen4exp cache: the checkpoint at {pos} keeps no n-gram window"
+                )
+            };
+            let Some(l) = (0..n).find(|&l| self.ple_conv.get(l).is_some()) else {
+                lloom_tensor::bail!(
+                    "qwen4exp cache: the PLE's history restores over an unwritten state"
+                )
+            };
+            let cur = self.ple_conv.get(l).expect("found");
+            let h = frame
+                .reshape(cur.dims())?
+                .to_dtype(cur.dtype())?
+                .contiguous()?;
+            self.ple_conv.write(l, h)?;
+            self.ngram = ngram;
+        }
+        self.pos = pos;
+        self.nextn.clear();
+        for t in &mut self.taps {
+            t.clear();
+        }
+        self.pending_tokens.clear();
+        self.pending_noted = false;
+        self.prepared = None;
+        self.ckpt.forget_past(pos);
+        Ok(())
     }
 
     /// The carries retained since the last take, concatenated along the
@@ -1076,6 +1358,7 @@ impl<P: Profile> State<P> {
         self.pending_tokens = w.pending_tokens;
         self.pending_noted = false;
         self.pos = w.pos;
+        self.ckpt.forget_past(self.pos);
         // What the window's passes retained goes with them.
         self.nextn.keep_first(w.retained.0)?;
         for t in &mut self.taps {
@@ -1112,6 +1395,7 @@ impl<P: Profile> State<P> {
             k.truncate(tokens, blocks);
         }
         self.pos = tokens;
+        self.ckpt.forget_past(tokens);
         self.nextn.clear();
         for t in &mut self.taps {
             t.clear();
@@ -1294,6 +1578,7 @@ impl<P: Profile> State<P> {
 fn declared_copy(t: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "metal")]
     if let Ok(m) = t.device().as_metal_device() {
+        let m = m.execution_device()?;
         if m.activations_may_be_reused() {
             let _declared = lloom_tensor::EscapeGuard::new();
             return crate::nn::recurrent::own_copy(t);
@@ -1444,6 +1729,25 @@ pub struct Ple<P: Profile> {
 /// quarantine and give the parked slots' pages back.
 pub type ExpertTenant = crate::nn::group_tenant::GroupTenant;
 
+fn expert_tenant(
+    bytes_per_slot: usize,
+    slots: usize,
+    n_experts: usize,
+    topk: usize,
+) -> Result<ExpertTenant> {
+    let floor = topk.checked_add(1).ok_or_else(|| {
+        lloom_tensor::Error::Msg("qwen4exp expert tenant: topk + 1 exceeds usize".into())
+    })?;
+    ExpertTenant::new(
+        "qwen4exp-experts",
+        bytes_per_slot,
+        slots,
+        floor,
+        n_experts,
+        slots,
+    )
+}
+
 #[derive(Debug)]
 pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
@@ -1457,6 +1761,11 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     lm_head: QMatMul,
     /// The N-gram PLE, when its table was loaded (`LoadOptions::ple_shard`).
     ple: Option<Ple<P>>,
+    /// Turn checkpoints a state built from this model keeps
+    /// (`State::ckpt`, `sequence-reuse-design.md` §2.3b): 2 by default,
+    /// the engine admits them beside the experts' budget
+    /// (`set_turn_checkpoints`); 0 keeps none.
+    turn_checkpoints: usize,
     /// The PLE-window instrument, when armed (`arm_ple_window`).
     ple_window: Option<parking_lot::Mutex<PleWindowMarks>>,
     /// Whether [`CausalLM::host_feed`] offers the PLE's host fill to a loop
@@ -1480,6 +1789,9 @@ pub struct Qwen4Exp<P: Profile, R: ExpertResidency> {
     /// the streamed loader; dropped with the model.
     #[cfg(feature = "metal")]
     ledger_gauge: Option<std::sync::Arc<ExpertTenant>>,
+    /// What the load reserved on the machine (`lloom_tensor::machine`),
+    /// released when the model drops.
+    reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
     mem_check: MemCheck,
     /// How the streamed tier's prefetch hint is formed on a prefill pass
     /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
@@ -1658,6 +1970,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             hc_head,
             lm_head,
             ple: None,
+            turn_checkpoints: 2,
             ple_window: None,
             host_fill: true,
             mtp: None,
@@ -1667,6 +1980,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             #[cfg(feature = "metal")]
             ledger_gauge: None,
+            reservation: None,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
@@ -1948,6 +2262,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if !m.pass_plans_enabled() || m.pass_open() {
                 return Ok(false);
             }
@@ -2116,24 +2431,19 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         slots: usize,
         n_experts: usize,
         topk: usize,
-    ) {
+    ) -> Result<()> {
+        let tenant = expert_tenant(bytes_per_slot, slots, n_experts, topk)?;
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = device {
             use lloom_tensor::kernels::metal::ledger::Tenant;
-            let tenant = std::sync::Arc::new(ExpertTenant::new(
-                "qwen4exp-experts",
-                bytes_per_slot,
-                slots,
-                topk + 1,
-                n_experts,
-                slots,
-            ));
+            let tenant = std::sync::Arc::new(tenant);
             let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
             m.ledger().register(&dyn_tenant);
             self.ledger_gauge = Some(tenant);
         }
         #[cfg(not(feature = "metal"))]
-        let _ = (device, bytes_per_slot, slots, n_experts, topk);
+        let _ = (device, tenant);
+        Ok(())
     }
 
     /// Apply the expert tenant's grant to every layer's tier: shrink the
@@ -2183,6 +2493,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     pub fn memory_fraction(&self) -> f64 {
         self.memory_fraction
+    }
+
+    /// Keep the load's machine reservation for the model's life.
+    pub fn hold_reservation(
+        &mut self,
+        reservation: Option<std::sync::Arc<lloom_tensor::machine::Holding>>,
+    ) {
+        self.reservation = reservation;
+    }
+
+    pub fn reservation(&self) -> Option<&std::sync::Arc<lloom_tensor::machine::Holding>> {
+        self.reservation.as_ref()
     }
 
     /// What a pass the budget cannot take does (the env's arm by default).
@@ -2280,6 +2602,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if seq > 1 {
             if let Ok(m) = self.device().as_metal_device() {
+                let m = m.execution_device()?;
                 if m.pass_plans_enabled() {
                     let opener = if own && !m.pass_open() {
                         PassOpener::Model
@@ -2312,31 +2635,37 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             // The transients come from the heap chunks first (§6.3k), whose
             // whole size the allocated figure already counts: what the chunks
             // have free is transient the pass will NOT allocate.
-            let (hs, hp) = m.heap_stats();
-            let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
-            let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
+            // Legacy planner cannot spend foreign admitted-domain or not-yet-
+            // published capacity. Admitted callers must pass their domain key.
+            let heap_free = m.heap_reusable_bytes(None, &mut cache.heap_credit)?;
+            let need = plan
+                .kv_grow
+                .checked_add(plan.transient.saturating_sub(heap_free))
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("pass demand exceeds usize after heap credit".into())
+                })?;
             // Read with the free lists given back first when the first
             // figure would refuse (`MetalDevice::admit_bytes`); the arithmetic
             // is `kv_grow_fits`'.
             let mut a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-            if !a.fits && a.pledged > 0 {
+            if a.needs_yield_retry() {
                 // The tenants pledged a yield (the expert tier's slots):
                 // apply it — park the slots, their pages given back — and
                 // ask again on the figure after.
                 let parked = self.apply_expert_grant()?;
-                let (pledged, reclaimed) = (a.pledged, a.reclaimed);
+                let (yielded, reclaimed) = (a.yield_report(), a.reclaimed);
                 a = m.admit_bytes(need, kv_grow_budget(working_set, self.memory_fraction));
-                a.pledged = pledged;
+                a.merge_yield_report(yielded)?;
                 a.reclaimed += reclaimed + parked;
             }
             let (allocated, fits) = (a.committed, a.fits);
             debug_assert_eq!(
-                fits,
+                fits || a.machine.is_some(),
                 kv_grow_fits(allocated, working_set, self.memory_fraction, need)
             );
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB committed={:.2} GB reclaimed={:.3} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits} pledged={} yield_contended={}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
@@ -2348,9 +2677,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,
                 gb(working_set),
+                a.pledged,
+                a.yield_contended,
             );
             match self.mem_check {
                 MemCheck::Report => eprintln!("MEMCHECK {line}"),
+                MemCheck::Refuse if !fits && a.machine.is_some() => {
+                    cache.prepared = None;
+                    lloom_tensor::bail!(
+                        "qwen4exp pass refused {line}: {}",
+                        a.machine.as_deref().unwrap_or_default()
+                    )
+                }
                 MemCheck::Refuse if !fits => {
                     cache.prepared = None;
                     lloom_tensor::bail!(
@@ -2452,6 +2790,170 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 
     pub fn prefill_mode(&self) -> PrefillMode {
         self.prefill_mode
+    }
+
+    /// Turn checkpoints a state built from this model keeps
+    /// (`sequence-reuse-design.md` §2.3b); 0 keeps none.
+    pub fn set_turn_checkpoints(&mut self, slots: usize) {
+        self.turn_checkpoints = slots;
+    }
+
+    pub fn turn_checkpoints(&self) -> usize {
+        self.turn_checkpoints
+    }
+
+    /// f32 elements one turn checkpoint holds per layer: a linear layer's
+    /// `S` and conv window; a full layer's checkpoint is its KV lengths.
+    fn checkpoint_elems(&self) -> Vec<usize> {
+        let mut elems: Vec<usize> = self
+            .layers
+            .iter()
+            .map(|l| match &l.mixer {
+                Mixer::Linear(dn) => {
+                    let (s, c) = dn.checkpoint_parts();
+                    s + c
+                }
+                Mixer::Full(_) => 0,
+            })
+            .collect();
+        // The PLE's conv history, the frame's last entry (0 without a PLE).
+        elems.push(
+            self.ple
+                .as_ref()
+                .map_or(0, |p| p.block.hc_dim() * p.block.history_len()),
+        );
+        elems
+    }
+
+    /// The bytes one turn checkpoint of a state takes.
+    pub fn checkpoint_frame_bytes(&self) -> usize {
+        self.checkpoint_elems().iter().sum::<usize>() * std::mem::size_of::<f32>()
+    }
+
+    /// Size `cache`'s checkpoint ring from this model: `turn_checkpoints`
+    /// frames of the linear layers' state and the PLE's conv history.
+    pub fn arm_turn_checkpoints(&self, cache: &mut State<P>) {
+        cache.set_turn_checkpoints(&self.checkpoint_elems(), self.turn_checkpoints);
+    }
+
+    /// A turn checkpoint of the state as it stands, at its position: every
+    /// linear layer's `S` and conv window copied into a ring frame, every
+    /// full layer's KV lengths marked.
+    fn checkpoint_here(&self, cache: &mut State<P>, dev: &lloom_tensor::Device) -> Result<()> {
+        if cache.ckpt.slots() == 0 {
+            return Ok(());
+        }
+        let slot = cache.ckpt.open(cache.pos, dev)?;
+        let mut marks = Vec::with_capacity(self.layers.len());
+        for (l, layer) in self.layers.iter().enumerate() {
+            marks.push(match &layer.mixer {
+                Mixer::Linear(dn) => {
+                    let Some(frame) = cache.ckpt.frame(slot, l)? else {
+                        lloom_tensor::bail!(
+                            "qwen4exp: layer {l}'s turn checkpoint needs a ring frame"
+                        )
+                    };
+                    let (ns, nc) = dn.checkpoint_parts();
+                    let s_view = frame.narrow(0, 0, ns)?;
+                    let c_view = frame.narrow(0, ns, nc)?;
+                    dn.store_checkpoint(
+                        l,
+                        &cache.s_state,
+                        &cache.conv_state,
+                        dev,
+                        &GdnCheckpoint {
+                            s: &s_view,
+                            conv: &c_view,
+                        },
+                    )?;
+                    WindowMark::default()
+                }
+                Mixer::Full(_) => {
+                    let (tokens, blocks) = cache.kv[l].lens();
+                    WindowMark { tokens, blocks }
+                }
+            });
+        }
+        if let Some(ple) = &self.ple {
+            if let Some(frame) = cache.ckpt.frame(slot, self.layers.len())? {
+                let h = match cache.ple_conv.get(ple.layer) {
+                    Some(h) => h.to_dtype(lloom_tensor::DType::F32)?,
+                    None => Tensor::zeros(
+                        (ple.block.hc_dim(), ple.block.history_len()),
+                        lloom_tensor::DType::F32,
+                        dev,
+                    )?,
+                };
+                frame.slice_set(&h.contiguous()?.flatten_all()?, 0, 0)?;
+            }
+            cache.ckpt_ngram[slot] = Some(cache.ngram.clone());
+        }
+        cache.ckpt.close(slot, marks);
+        Ok(())
+    }
+
+    /// Open the checkpoint a pass over `lens` tiles (in order, from
+    /// `cache.pos`) takes inside itself at `rows` positions in — the tile
+    /// the position falls in and the rows into that tile — for
+    /// `Layer::prefill_mix` to take (`State::ckpt_take`); nothing when
+    /// `rows` is `None`.
+    fn ckpt_pass_open(
+        &self,
+        cache: &mut State<P>,
+        lens: &[usize],
+        rows: Option<usize>,
+        dev: &lloom_tensor::Device,
+    ) -> Result<()> {
+        let Some(r) = rows else {
+            return Ok(());
+        };
+        let mut off = 0;
+        let mut found = None;
+        for (t, &len) in lens.iter().enumerate() {
+            if r <= off + len {
+                found = Some((t, r - off));
+                break;
+            }
+            off += len;
+        }
+        let Some((tile, rows)) = found else {
+            lloom_tensor::bail!(
+                "qwen4exp: a checkpoint {r} positions into a pass of {} positions",
+                lens.iter().sum::<usize>()
+            )
+        };
+        let slot = cache.ckpt.open(cache.pos + r, dev)?;
+        let n = self.layers.len();
+        cache.ckpt_pass = Some(PassCkpt {
+            tile,
+            rows,
+            slot,
+            seen: vec![0; n],
+            marks: vec![WindowMark::default(); n],
+            ngram: None,
+        });
+        Ok(())
+    }
+
+    /// Close the pass's checkpoint: every layer ran the tile; its marks.
+    fn ckpt_pass_close(&self, cache: &mut State<P>) -> Result<()> {
+        let Some(p) = cache.ckpt_pass.take() else {
+            return Ok(());
+        };
+        if let Some(l) = p.seen.iter().position(|&seen| seen <= p.tile) {
+            lloom_tensor::bail!(
+                "qwen4exp: layer {l} did not run tile {} of the pass its checkpoint is in",
+                p.tile
+            )
+        }
+        if self.ple.is_some() {
+            let Some(ngram) = p.ngram else {
+                lloom_tensor::bail!("qwen4exp: the PLE did not run the tile its checkpoint is in")
+            };
+            cache.ckpt_ngram[p.slot] = Some(ngram);
+        }
+        cache.ckpt.close(p.slot, p.marks);
+        Ok(())
     }
 
     pub fn config(&self) -> &Config {
@@ -2731,6 +3233,35 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn ple_delta(&self, ple: &Ple<P>, res_hc: &Tensor, cache: &mut State<P>) -> Result<Tensor> {
         self.ple_window_cut(res_hc)?;
         let seq = res_hc.dim(1)?;
+        // The turn checkpoint inside the pass: the n-gram window and the
+        // conv history after its rows (the gather path, which sees them).
+        let cap = cache.ckpt_ple_rows(ple.layer);
+        if let Some(rows) = cap {
+            let n_heads = ple.hash.n_heads();
+            let mut ids = vec![0i64; seq * n_heads];
+            let mut at = (rows == 0).then(|| cache.ngram.clone());
+            for t in 0..seq {
+                let token = cache.pending_tokens.pop_front();
+                let token = token.or(self.cfg.ple_image_token_id);
+                let window = cache.ngram.window(token);
+                ple.hash
+                    .row_ids(&window, &mut ids[t * n_heads..(t + 1) * n_heads]);
+                cache.ngram.push(token);
+                if t + 1 == rows {
+                    at = Some(cache.ngram.clone());
+                }
+            }
+            let emb = ple.table.gather(&ids, res_hc.device())?;
+            let emb = emb.reshape((seq, emb.elem_count() / seq))?;
+            let (out, hist) =
+                ple.block
+                    .forward_at(res_hc, &emb, &mut cache.ple_conv, ple.layer, Some(rows))?;
+            let (Some(hist), Some(ngram)) = (hist, at) else {
+                lloom_tensor::bail!("qwen4exp: the PLE's checkpoint at {rows} rows of {seq}")
+            };
+            cache.ckpt_ple_store(&hist, ngram)?;
+            return Ok(out);
+        }
         if seq == 1 && cache.pending_tokens.is_empty() {
             if let Some(link) = &cache.host.run {
                 // The host fill: wait on the GPU for the rows a producer
@@ -2794,12 +3325,13 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 if buf.contents().is_null() {
                     return Ok(None);
                 }
-                let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
-                    buf.clone(),
-                    m.clone(),
-                    n,
-                    lloom_tensor::DType::F32,
-                ));
+                let storage =
+                    lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
+                        buf.clone(),
+                        m.clone(),
+                        n,
+                        lloom_tensor::DType::F32,
+                    )?);
                 let t =
                     Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
                 *g = Some((buf, t, None));
@@ -2894,12 +3426,28 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
         #[cfg(not(feature = "metal"))]
         cache.settle_standing()?;
+        // The turn checkpoint this forward leaves (§2.3b): at the hinted
+        // position when a pass covers it, else at the end of a multi-token
+        // pass a caller never hinted; none under a verify window.
+        cache.ckpt.drop_stale_hint(cache.pos);
+        let windowed = cache.window_open();
+        let dev = embeds.device().clone();
         let mut logits = None;
         match self.prefill_mode {
             PrefillMode::Replay => {
+                let want = cache
+                    .ckpt
+                    .rows_for(cache.pos, seq, true, seq, windowed)
+                    .map(|r| cache.pos + r);
+                if want == Some(cache.pos) {
+                    self.checkpoint_here(cache, &dev)?;
+                }
                 for t in 0..seq {
                     let h = embeds.narrow(1, t, 1)?;
                     logits = Some(self.decode_embed(&h, cache, obs)?);
+                    if want == Some(cache.pos) {
+                        self.checkpoint_here(cache, &dev)?;
+                    }
                 }
             }
             PrefillMode::Chunk => {
@@ -2936,6 +3484,14 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                             at += l;
                         }
                         let total: usize = lens.iter().sum();
+                        let rows = cache.ckpt.rows_for(
+                            cache.pos,
+                            total,
+                            start + total == seq,
+                            seq,
+                            windowed,
+                        );
+                        self.ckpt_pass_open(cache, &lens, rows, &dev)?;
                         self.prepare_pass_as(cache, total, true)?;
                         let bracket = self.open_pass_variant(
                             crate::nn::decode::PassShape::Prefill {
@@ -2946,16 +3502,30 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         )?;
                         logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
                         self.close_pass(bracket)?;
+                        self.ckpt_pass_close(cache)?;
                         start += total;
                         continue;
                     }
                     let h = embeds.narrow(1, start, len)?;
+                    let rows =
+                        cache
+                            .ckpt
+                            .rows_for(cache.pos, len, start + len == seq, seq, windowed);
                     // Each chunk is a pass of its own: admitted here when the
                     // driver handed the whole prompt over untiled.
                     self.prepare_pass_as(cache, len, true)?;
                     logits = Some(if len == 1 {
-                        self.decode_embed(&h, cache, obs)?
+                        // A decode step: the state before or after it.
+                        if rows == Some(0) {
+                            self.checkpoint_here(cache, &dev)?;
+                        }
+                        let l = self.decode_embed(&h, cache, obs)?;
+                        if rows == Some(1) {
+                            self.checkpoint_here(cache, &dev)?;
+                        }
+                        l
                     } else {
+                        self.ckpt_pass_open(cache, &[len], rows, &dev)?;
                         let bracket = self.open_pass_variant(
                             crate::nn::decode::PassShape::Prefill {
                                 w: len,
@@ -2965,6 +3535,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         )?;
                         let l = self.prefill_embeds(&h, cache, obs)?;
                         self.close_pass(bracket)?;
+                        self.ckpt_pass_close(cache)?;
                         l
                     });
                     start += len;
@@ -3361,7 +3932,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             let bound = self.layers.len().max(1);
             let mut h = h.clone();
             for _ in 0..bound {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 cache.device_replays += 1;
@@ -3388,7 +3959,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             cache.replay_fallbacks += 1;
         }
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
@@ -3618,6 +4189,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     fn replay_input_owned(&self, h: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if let Ok(m) = h.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.activations_may_be_reused() {
                 let clock = m.gpu_clock();
                 let mut g = self.replay_h.lock();
@@ -3680,16 +4252,17 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// The pass in progress replays: its recording holds the replay, which
     /// a pass that settles clean never runs, so it must not become its key's
     /// plan (`MetalDevice::pass_diverged`).
-    fn note_replay(&self) {
+    fn note_replay(&self) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
-            m.pass_diverged();
+            m.execution_device()?.pass_diverged();
         }
         // The tiers: the replay's resolves must not count the settled
         // token's experts into the hotlist again (#899's finding).
         for layer in &self.layers {
             layer.moe().experts().note_replay();
         }
+        Ok(())
     }
 
     /// Whether the fetch arm (`QWEN4EXP_FETCH=inside`) can run on this
@@ -4082,7 +4655,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         let bound = self.layers.len().max(1);
         for attempt in 0..bound {
             if replay || attempt > 0 {
-                self.note_replay();
+                self.note_replay()?;
                 cache.rewind_window()?;
                 cache.redos += 1;
                 if attempt > 0 {
@@ -4124,7 +4697,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             cache.settle_after_first += after_first;
         }
         cache.replay_fallbacks += 1;
-        self.note_replay();
+        self.note_replay()?;
         cache.rewind_window()?;
         cache.redos += 1;
         cache.open_window()?;
@@ -4443,7 +5016,9 @@ impl<G: crate::profile::Regime> Shape for crate::profile::P<G, Ring, One> {
         k: usize,
     ) -> Result<State<Self>> {
         let pools = model.spec_pools(1, k.max(1), dev);
-        State::<Self>::in_ring(model.config(), &pools)
+        let mut cache = State::<Self>::in_ring(model.config(), &pools)?;
+        model.arm_turn_checkpoints(&mut cache);
+        Ok(cache)
     }
     fn rows<R: ExpertResidency>(
         _model: &Qwen4Exp<Self, R>,
@@ -4526,8 +5101,10 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     /// driver holds (`State::in_ring` over `spec_pools`, `State::in_pools`
     /// over `state_pools`), so here it is refused by name.
     fn new_cache(&self, cfg: &Self::Config, dev: &lloom_tensor::Device) -> Result<Self::Cache> {
-        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        // Validate the unit before state construction, not after its allocations.
+        let _slab_unit = super::loader::kv_slab_bytes(cfg)?;
         let mut cache = State::<P>::own(cfg)?;
+        self.arm_turn_checkpoints(&mut cache);
         #[cfg(feature = "metal")]
         if let lloom_tensor::Device::Metal(m) = dev {
             use lloom_tensor::kernels::metal::ledger::{Claim, Class, Gauge, Tenant};
@@ -4539,7 +5116,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
                 Claim {
                     floor: 0,
                     want: 0,
-                    unit: super::qsa::KV_SLAB_TOKENS * super::loader::kv_bytes_per_token(cfg),
+                    unit: _slab_unit,
                     class: Class::Capability,
                 },
                 0,
@@ -4554,6 +5131,7 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
+            let m = m.execution_device()?;
             if m.pass_plans_enabled() {
                 let variant = if seq_len == 1 {
                     let planned = self.device_plan && plan_on_device() && !cache.window_open();
@@ -4752,6 +5330,11 @@ impl<P: Profile, R: ExpertResidency> CausalLM for Qwen4Exp<P, R> {
     fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
     }
+
+    fn checkpoint_at(&self, cache: &mut Self::Cache, pos: usize) -> Result<()> {
+        cache.checkpoint_at(pos);
+        Ok(())
+    }
 }
 
 impl<P: Profile> CacheReset for State<P> {
@@ -4847,7 +5430,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             return Ok(logits);
         }
         let t0 = std::time::Instant::now();
-        self.note_replay();
+        self.note_replay()?;
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
@@ -5240,7 +5823,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 .collect();
             R::settle_window(&parts, 0)?;
             let t1 = std::time::Instant::now();
-            self.note_replay();
+            self.note_replay()?;
             cache.accept_window(0)?;
             cache.redos += 1;
             cache.window_redos += 1;
@@ -5745,10 +6328,37 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
         }
         self.rewind_window()
     }
+    fn can_restore(&self, pos: usize) -> bool {
+        State::<P>::can_restore(self, pos)
+    }
+    fn restore_point(&self, pos: usize) -> Option<usize> {
+        State::<P>::restore_point(self, pos)
+    }
+    fn restore(&mut self, pos: usize) -> Result<()> {
+        State::<P>::restore(self, pos)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_expert_tenant_checks_the_actual_registration_input() {
+        assert!(super::expert_tenant(1, 1, 1, usize::MAX).is_err());
+        assert!(super::expert_tenant(usize::MAX, 2, 2, 0).is_err());
+        assert!(super::expert_tenant(usize::MAX, 1, 2, 0).is_err());
+        let tenant = super::expert_tenant(100, 8, 30, 2).unwrap();
+        assert_eq!(
+            (
+                tenant.unit(),
+                tenant.wanted_units(),
+                tenant.floor_units(),
+                tenant.max_units()
+            ),
+            (100, 8, 3, 8)
+        );
+        assert!(super::expert_tenant(0, usize::MAX, usize::MAX, usize::MAX - 1).is_ok());
+    }
+
     /// The KV store reaches the caches built from the config, and the
     /// shapes it has no arm on are refused by name: a quantized store on a
     /// device without the kernels (CPU), and any non-default store on the

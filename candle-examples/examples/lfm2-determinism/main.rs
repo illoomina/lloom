@@ -653,6 +653,7 @@ fn main() -> Result<()> {
 }
 
 fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
+    let _load_pool = candle::AutoreleaseScope::new();
     let contract = candle::tuning::gate_contract("lfm2-determinism").map_err(anyhow::Error::msg)?;
     println!("CONTRACT {}", contract.report());
     let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
@@ -1142,11 +1143,16 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
                 .to_vec()
         };
 
-        let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
-        let mut logits = model
-            .forward(&input, kv_len, &mut cache)
-            .context("prefill forward pass")?
-            .squeeze(0)?;
+        let mut logits = {
+            // Rust-owned logits/cache survive; temporary Obj-C references do not
+            // accumulate for the lifetime of the standalone harness thread.
+            let _pool = candle::AutoreleaseScope::new();
+            let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
+            model
+                .forward(&input, kv_len, &mut cache)
+                .context("prefill forward pass")?
+                .squeeze(0)?
+        };
         kv_len += turn_ids.len();
         turns_run = turn + 1;
 
@@ -1189,6 +1195,7 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
             // §2.4's rule that an instrument must be shown to have engaged, in
             // the one quantity that can distinguish these two.
             loop {
+                let _pool = candle::AutoreleaseScope::new();
                 let done = per_step.len();
                 if tokens.len() >= args.n || done >= oracle.len() {
                     break 'turns;
@@ -1335,6 +1342,7 @@ fn run<P: Lfm2Shape>(args: Args, matches: ArgMatches) -> Result<()> {
         }
 
         loop {
+            let _pool = candle::AutoreleaseScope::new();
             if tokens.len() >= args.n {
                 break 'turns;
             }

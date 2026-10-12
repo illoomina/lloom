@@ -94,6 +94,8 @@ pub const NO_EFFECT: &str =
 /// A compiled chat template and the variables its source names.
 pub struct Template {
     compiled: ChatTemplate,
+    /// Renders so far: a request renders its conversation once.
+    renders: std::sync::atomic::AtomicU64,
     /// `None` when the source cannot be analysed (a construct the static
     /// parser rejects and the renderer accepts): nothing is then refused as
     /// unread, and the render probe still runs.
@@ -106,6 +108,7 @@ impl Template {
             .map_err(|e| anyhow::anyhow!("compiling chat_template.jinja: {e}"))?;
         Ok(Self {
             compiled,
+            renders: std::sync::atomic::AtomicU64::new(0),
             reads: undeclared_variables(source),
         })
     }
@@ -133,11 +136,29 @@ impl Template {
         bos_token: &str,
         kwargs: &Map<String, Value>,
     ) -> Result<String> {
+        self.render_with(messages, bos_token, kwargs, true)
+    }
+
+    /// The renders this template has run (requests, probes, budgets).
+    pub fn renders(&self) -> u64 {
+        self.renders.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`Self::render`] with the generation prompt appended or not.
+    pub fn render_with(
+        &self,
+        messages: &Value,
+        bos_token: &str,
+        kwargs: &Map<String, Value>,
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        self.renders
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ctx = |messages: &Value, kwargs: &Map<String, Value>| {
             let mut ctx = json!({
                 "messages": messages,
                 "bos_token": bos_token,
-                "add_generation_prompt": true,
+                "add_generation_prompt": add_generation_prompt,
             });
             for (k, v) in kwargs {
                 ctx[k] = v.clone();
@@ -236,6 +257,28 @@ impl ThinkTags {
 
 /// A user message no template writes on its own, for the probe renders.
 const PROBE_USER: &str = "lloom-probe-user";
+
+impl Template {
+    /// The generation prompt's ids under `kwargs` — what rendering with
+    /// `add_generation_prompt` appends to a conversation, encoded: the
+    /// one-user-message conversation rendered with and without it, the
+    /// first's ids past the second's (which must be a prefix of them).
+    /// A constant of template × arguments, read once at load: the turn
+    /// checkpoint is placed at its start in a request's ids
+    /// (`sequence-reuse-design.md` §2.3b). `None` when the two renders do
+    /// not nest.
+    pub fn generation_prompt(
+        &self,
+        bos_token: &str,
+        kwargs: &Map<String, Value>,
+        encode: impl Fn(&str) -> Result<Vec<u32>>,
+    ) -> Option<(Vec<u32>, Vec<u32>)> {
+        let user = json!([{ "role": "user", "content": PROBE_USER }]);
+        let with = encode(&self.render_with(&user, bos_token, kwargs, true).ok()?).ok()?;
+        let without = encode(&self.render_with(&user, bos_token, kwargs, false).ok()?).ok()?;
+        (with.len() > without.len() && with.starts_with(&without)).then_some((with, without))
+    }
+}
 
 /// Reasoning text no template writes on its own, for the probe renders.
 const PROBE_REASONING: &str = "lloom-probe-reasoning";
@@ -684,6 +727,35 @@ mod tests {
             |s| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec()),
             |id| added.contains_key(&id),
         )
+    }
+
+    /// The generation prompt each tiny template appends, read at load: the
+    /// ids a prompt rendered with it ends with, per think mode.
+    #[test]
+    fn the_generation_prompt_is_read_from_the_template() {
+        for tok in [
+            TinyTokenizer::qwen3_5(),
+            TinyTokenizer::qwen4exp(),
+            TinyTokenizer::lfm2(),
+        ] {
+            let json = lloom::testing::tiny::tokenizer::tokenizer_json(&tok.added);
+            let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap();
+            let t = Template::compile(tok.chat_template).unwrap();
+            for want in [None, Some(true), Some(false)] {
+                let mut kwargs = Map::new();
+                if let Some(w) = want {
+                    if t.reads(ENABLE_THINKING) == Some(true) {
+                        kwargs.insert(ENABLE_THINKING.into(), Value::Bool(w));
+                    }
+                }
+                let enc = |s: &str| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec());
+                let got = t.generation_prompt("", &kwargs, enc);
+                let user = json!([{ "role": "user", "content": "hi there" }]);
+                let full = enc(&t.render(&user, "", &kwargs).unwrap()).unwrap();
+                let (with, without) = got.expect("the renders nest");
+                assert!(full.ends_with(&with[without.len()..]), "want {want:?}");
+            }
+        }
     }
 
     /// Each family's tags, read from its template by rendering: Qwen4-exp's

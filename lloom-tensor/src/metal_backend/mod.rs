@@ -9,13 +9,11 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
     metal::{
-        heap_chunk_bytes, transient_heaps_on, Backing, Backings, Buffer, BufferHandle, BufferPool,
-        Commands, Commit, Device, DeviceBuffer, HeapChunks, MTLResourceOptions, Mapped,
-        ResidencySet,
+        Backing, Buffer, BufferHandle, Commands, Commit, Device, DeviceBuffer, HeapChunks,
+        MTLResourceOptions, Mapped, ResidencySet,
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
 };
-use objc2_foundation::NSRange;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
@@ -23,16 +21,22 @@ use objc2_metal::MTLCommandQueue;
 use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
+mod allocation_namespace;
+mod allocation_scope;
+pub use allocation_scope::{
+    AllocationRequest, AllocationWorker, ExecutionScope, MetalAllocationDomain,
+};
 mod device;
+pub(crate) mod device_retirement;
+pub(crate) use device::retain_evicted_allocations;
+mod physical_context;
 pub use device::{
     served_pass_request_sites, set_admission_drain, set_served_request_trace, wire_weights_on,
     DeviceId, MetalDevice, PassPlansPaused,
 };
 mod host_fed;
 mod host_slot;
-use device::{
-    ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
-};
+use device::{DeviceTeardown, PRIVATE_RESOURCE_OPTIONS};
 pub use host_fed::{HostEvent, HostFedRing, PublishEvent};
 pub use host_slot::HostSlot;
 
@@ -135,8 +139,7 @@ pub static TO_CPU_STAGED_READBACK: std::sync::atomic::AtomicU64 =
 /// Of `TO_CPU_STAGED_READBACK`, the reads that waited on their blit's
 /// command buffer: a host sync. A deferred stage reads after a drain some
 /// other readback already waited for, and is not one.
-pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static TO_CPU_STAGED_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Reads of a host-read slot ([`HostSlot::read`]): the producing kernel
 /// wrote a Shared, persistent buffer the host reads in place, so there is no
@@ -685,7 +688,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn powf(&self, layout: &Layout, pow: f64) -> Result<Self> {
@@ -741,7 +744,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
@@ -797,7 +800,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
@@ -883,7 +886,7 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
 
-            return Ok(Self::new(buffer, device, dst_el, dtype));
+            return Ok(Self::new_allocated(buffer, device, dst_el, dtype)?);
         }
 
         let (name, check_empty, return_index) = match (op, self.dtype) {
@@ -943,7 +946,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(buffer, device, dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device, dst_el, dtype)?)
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
@@ -1167,7 +1170,12 @@ impl BackendStorage for MetalStorage {
             )
             .map_err(MetalError::from)?;
         }
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
@@ -1353,7 +1361,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
         }
 
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1424,7 +1437,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device, el, dtype))
+        Ok(Self::new_allocated(buffer, device, el, dtype)?)
     }
 
     fn conv1d(
@@ -1467,12 +1480,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
         drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
+        let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
         let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
@@ -1506,7 +1514,7 @@ impl BackendStorage for MetalStorage {
             .with_size_for(el_count, res.dtype())
             .with_label("conv1d_out")
             .build()?;
-        let mut res_t = Self::new(buffer, self.device().clone(), el_count, res.dtype());
+        let mut res_t = Self::new_allocated(buffer, self.device().clone(), el_count, res.dtype())?;
         res.copy_strided_src(&mut res_t, 0, &res_l)?;
         Ok(res_t)
     }
@@ -1596,7 +1604,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?,
         }
 
-        Ok(Self::new(dst, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            dst,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn conv_transpose1d(
@@ -1702,7 +1715,12 @@ impl BackendStorage for MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn conv2d(
@@ -1749,12 +1767,7 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
         drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
+        let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
         let h_out = params.out_h();
         let w_out = params.out_w();
         let b = params.b_size;
@@ -1844,7 +1857,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn avg_pool2d(
@@ -1884,7 +1902,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn max_pool2d(
@@ -1924,7 +1947,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
@@ -1967,7 +1995,12 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn upsample_bilinear2d(
@@ -2021,7 +2054,12 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(buffer, self.device.clone(), dst_el, self.dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )?)
     }
 
     fn gather(&self, src_l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
@@ -2080,7 +2118,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
 
     fn scatter_set(
@@ -2212,7 +2250,7 @@ impl BackendStorage for MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), dst_el, dtype))
+        Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
 
     fn index_add(
@@ -2264,6 +2302,33 @@ impl BackendStorage for MetalStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // GEMV consumes contiguous vectors. Preserve transposed/strided
+        // matmul support under the row-invariant contract using the existing
+        // pooled allocation and strided-copy path, before taking an encoder.
+        if self.dtype == DType::F16
+            && !crate::tuning::contract().is_fast()
+            && !lhs_l.is_contiguous()
+        {
+            let contiguous = self
+                .device
+                .new_buffer_builder()
+                .with_size_for(lhs_l.shape().elem_count(), self.dtype)
+                .with_label("deterministic matmul activation")
+                .build()?;
+            let mut lhs = Self::new_allocated(
+                contiguous,
+                self.device.clone(),
+                lhs_l.shape().elem_count(),
+                self.dtype,
+            )?;
+            self.copy_strided_src(&mut lhs, 0, lhs_l)?;
+            return lhs.matmul(
+                rhs,
+                (b, m, n, k),
+                &Layout::contiguous(lhs_l.shape().clone()),
+                rhs_l,
+            );
+        }
         let buffer = self
             .device
             .new_buffer_builder()
@@ -2297,12 +2362,12 @@ impl BackendStorage for MetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::new(
+        Ok(Self::new_allocated(
             buffer,
             self.device.clone(),
             b * m * n,
             self.dtype(),
-        ))
+        )?)
     }
 
     fn copy2d(
@@ -2498,6 +2563,18 @@ impl MetalStorage {
         }
     }
 
+    /// A newly allocated output inherits the active payer, not an input's
+    /// namespace. Existing-buffer aliases must use `new` to retain their origin.
+    pub fn new_allocated(
+        buffer: BufferHandle,
+        device: MetalDevice,
+        count: usize,
+        dtype: DType,
+    ) -> Result<Self> {
+        let device = device.allocated_output_device(&buffer)?;
+        Ok(Self::new(buffer, device, count, dtype))
+    }
+
     /// The batched EOS-index reduction: over the first `n` `U32` token ids in this
     /// storage, return a `[1]` `U32` storage whose element is the FIRST index whose
     /// token is one of `eos_ids`' `n_eos` stop ids, or `n` if none. One dispatch
@@ -2538,7 +2615,7 @@ impl MetalStorage {
             &buffer,
         )
         .map_err(MetalError::from)?;
-        Ok(Self::new(buffer, device.clone(), 1, DType::U32))
+        Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -2632,7 +2709,12 @@ impl MetalStorage {
             .map_err(MetalError::from)?;
             buffer
         };
-        Ok(Self::new(buffer, device.clone(), el_count, dtype))
+        Ok(Self::new_allocated(
+            buffer,
+            device.clone(),
+            el_count,
+            dtype,
+        )?)
     }
 
     /// Stage `count` elements starting at element `offset` for a later host
@@ -2658,7 +2740,7 @@ impl MetalStorage {
             .with_size(bytes)
             .with_label("staged_read_dst")
             .build()?;
-        {
+        if count != 0 {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("staged_read");
             blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem);
@@ -2851,15 +2933,17 @@ impl MetalStorage {
     /// and `memcpy`s; it reaches nothing that waits on or orders against the GPU,
     /// so the caller owns the ordering (as the ring's slot writes already do).
     ///
-    /// Returns `false` if the buffer is not CPU-mapped (`contents()` null — a
-    /// `StorageModePrivate` allocation past the 16384 B window, §15.2 #12a) or the
+    /// Returns `false` if the buffer is not CPU-mapped (Private by default;
+    /// the experimental policy is described in §15.2 #12a) or the
     /// write would run past the extent; the caller then takes the `slice_set`
     /// upload fallback. `false` is a signal, not a panic.
     ///
-    /// SAFETY: the caller guarantees `src` is valid for `src.len()` elements and
-    /// that no GPU work is concurrently reading `[index, index+len)` of this
-    /// buffer (the same discipline the mapped read relies on: writes happen while
-    /// the slot is not in flight).
+    /// # Safety
+    ///
+    /// `T` must match this storage's element type. The source must not overlap
+    /// the destination, and no other host or GPU access may overlap the written
+    /// range during this copy. The caller must complete earlier accesses and
+    /// order later GPU work after the write; mapped aliases share this duty.
     pub(crate) unsafe fn write_host_slice<T: Copy>(&self, index: usize, src: &[T]) -> bool {
         if index.saturating_add(src.len()) > self.count {
             return false;
@@ -2870,8 +2954,8 @@ impl MetalStorage {
         }
         // SAFETY: `dst` is non-null; `index + src.len() <= self.count`, so the
         // destination range is within the buffer's extent; `src` is valid for
-        // `src.len()` per the caller's contract; the ranges do not overlap (src is
-        // host memory, dst is the mapped buffer).
+        // `src.len()` through its slice; the ranges do not overlap and accesses
+        // are synchronized by the caller's safety contract.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), (dst as *mut T).add(index), src.len());
         }
@@ -2880,6 +2964,12 @@ impl MetalStorage {
 
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
+        if size == 0 {
+            // Preserve the completion/error boundary without issuing Metal's
+            // forbidden zero-byte blit (or allocating a staging buffer).
+            self.device.flush_and_wait_current()?;
+            return Ok(Vec::new());
+        }
 
         // Fast path: read the source directly, no destination and no blit.
         //
@@ -2890,22 +2980,14 @@ impl MetalStorage {
         // can read; when the source is already CPU-readable there is nothing
         // for it to do.
         //
-        // **The test is `contents()`, and what it decides is not the storage
-        // mode -- it is whether Metal happened to MAP this allocation.**
-        // Measured on M1 Max / macOS 26.6.2 (`measurements/issue-336-raw/`):
-        // a `StorageModePrivate` buffer is CPU-mapped below **16384 bytes** and
-        // never at or above it, exactly. So `buffer.rs`'s "null for a
-        // Private-storage allocation" is wrong for small allocations and right
-        // for large ones, and neither a mode test nor a size test is the honest
-        // predicate: the pool rounds, so the same 4-byte `to_scalar` lands in a
-        // 12288 B buffer on one arm and a 731136 B one on another, and only the
-        // first is readable.
-        //
-        // Asking the pointer asks the only question whose answer is
-        // load-bearing, and it fails **closed**: an unmapped buffer takes the
-        // blit, which is the pre-existing path. That is why this is safe to
-        // ship even though which arm a given readback takes is a property of
-        // the allocator rather than of this function.
+        // Shared storage is CPU-readable by contract. Private storage takes
+        // the documented staging path by default; its small owned-buffer
+        // mapping probe is retained only behind `private_cpu_mapping`.
+        // That experimental pointer is implementation-dependent and forbidden
+        // by Metal API Validation, even when the runtime returns non-null.
+        // Private heap sub-buffers are never probed (their offset can masquerade
+        // as a mapping). The cached policy skips the pointless first wait when
+        // a source is known to require staging.
         //
         // What is NOT skipped is the wait. The GPU still has to finish writing
         // the value before the CPU may read it, so `flush_and_wait_current`
@@ -2936,7 +3018,7 @@ impl MetalStorage {
         // ordering is the fix — the wait must come first, because the pointer is
         // only meaningful once the GPU has finished — which is the same
         // §6.7 L4 shape as the pool's own two clocks, in a readback.
-        if !crate::metal_backend::to_cpu_force_blit() {
+        if !crate::metal_backend::to_cpu_force_blit() && self.buffer.may_be_cpu_mapped() {
             // Wait first: `contents()` is only worth asking after the GPU has
             // finished writing, and asking before means the answer can change
             // before it is used.
@@ -3054,6 +3136,20 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
+        // Cold metadata-only process payer. This does not change the native
+        // Legacy origin, acquire a machine owner, or latch first model load.
+        // The process policy remains safely configurable before that load.
+        // Outer header and managed first slab Layouts are quoted; constructor Arc,
+        // registry/service and generation storage still need explicit pricing.
+        let metadata_domain = crate::memory_admission::process_account()
+            .metadata_domain()
+            .map_err(crate::Error::wrap)?;
+        let metadata_bytes =
+            DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
+        let metadata_pass = metadata_domain
+            .reserve(metadata_bytes)
+            .map_err(crate::Error::wrap)?;
+        let metadata = metadata_pass.context();
         let device = Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue().map_err(MetalError::from)?;
         #[cfg(feature = "metal-debug-labels")]
@@ -3074,128 +3170,79 @@ impl BackendDevice for MetalDevice {
         let commands =
             Commands::new(command_queue, Arc::clone(&residency_set)).map_err(MetalError::from)?;
 
-        // Both pools decide reuse against the GPU's progress through the command
-        // queue, not against CPU refcounts. `Commands` owns that clock and is
-        // the only thing that advances it.
-        let buffers = BufferPool::with_clock(commands.clock());
-        let private_buffers = BufferPool::with_clock(commands.clock());
         let ledger = crate::kernels::metal::ledger::Ledger::new();
-        // The backings (`profiles-and-memory-design.md` §4.1, L0). A pool
-        // miss takes from placement heap chunks when `transient_heaps_on()`,
-        // else from one `MTLBuffer` per miss with its residency committed at
-        // the next cut; a persistent allocation takes from a resident
-        // backing, wired when it is Shared.
-        let transient = |options: MTLResourceOptions| -> Arc<dyn Backing> {
-            if transient_heaps_on() {
-                Arc::new(HeapChunks::new(
-                    &device,
-                    Arc::clone(&residency_set),
-                    options,
-                    heap_chunk_bytes(),
-                    Some(Arc::clone(&ledger)),
-                ))
-            } else {
-                Arc::new(DeviceBuffer::new(
-                    &device,
-                    Arc::clone(&residency_set),
-                    options,
-                    Commit::Deferred,
-                    Some(Arc::clone(&ledger)),
-                ))
-            }
-        };
-        let backings = Arc::new(Backings {
-            transient_shared: transient(RESOURCE_OPTIONS),
-            transient_private: transient(PRIVATE_RESOURCE_OPTIONS),
-            resident_shared: DeviceBuffer::new(
-                &device,
-                Arc::clone(&residency_set),
-                RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-            resident_private: DeviceBuffer::new(
-                &device,
-                Arc::clone(&residency_set),
-                PRIVATE_RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-            mapped_shared: Mapped::new(
-                &device,
-                Arc::clone(&residency_set),
-                RESOURCE_OPTIONS,
-                Commit::Now,
-                Some(Arc::clone(&ledger)),
-            ),
-        });
-        // The pools do not subscribe to command-buffer completion. The handler
-        // advances the clock, and each pool drains what it made reusable at
-        // its next `acquire`, on the host: a handler that took the pool's lock
-        // could be descheduled holding it and stall the encoding thread
-        // (`DESIGN.md` §6.4e).
-
-        {
-            // Installed before any allocation, so no buffer is evicted without
-            // the residency set hearing about it. The pool bounds its free list
-            // by destroying buffers (§6.3b), which is the second place a
-            // buffer's existence ends and the one nothing was announcing
-            // (`DESIGN.md` §6.3c).
-            let observer = Arc::new(ResidencyEvictionObserver::new(
-                Arc::clone(&residency_set),
-                Arc::clone(&backings),
-            ));
-            buffers.set_eviction_observer(observer.clone());
-            private_buffers.set_eviction_observer(observer);
-        }
-
+        commands.attach_command_ledger(Arc::clone(&ledger));
+        let allocation_namespace = allocation_namespace::AllocationNamespace::new(
+            &device,
+            commands.clock(),
+            &residency_set,
+            &ledger,
+            None,
+            None,
+        );
         let emulated = Arc::new(
             crate::kernels::metal::arms::EmulatedArms::for_device(&device)
                 .map_err(MetalError::from)?,
         );
         let commands = Arc::new(commands);
-        // The guard holds its own `Arc` to the two things it needs, so it fires
-        // when the last `MetalDevice` handle drops rather than when any clone
-        // does -- every `Tensor` holds a clone, so the difference is a teardown
-        // guard against a per-tensor GPU synchronize (`DESIGN.md` §6.3c).
-        let teardown = Arc::new(DeviceTeardown::new(
-            Arc::clone(&commands),
-            Arc::clone(&residency_set),
-        ));
+        // Cold enrollment before any MetalDevice/recording capability escapes.
+        // Seed uses the same allocation-local membership protocol as backings.
+        let seed_membership = allocation_namespace
+            .membership
+            .for_buffer(&seed.lock())
+            .map_err(crate::Error::wrap)?;
+        let enriched_seed = seed.lock().clone().with_membership(seed_membership);
+        let old_seed = std::mem::replace(&mut *seed.lock(), enriched_seed);
+        drop(old_seed);
+        let teardown = DeviceTeardown::new(
+            allocation_namespace.clone(),
+            seed.clone(),
+            kernels.clone(),
+            commands.in_flight_hold().cloned(),
+            device.clone(),
+            residency_set.clone(),
+            ledger.clone(),
+            &metadata,
+        )
+        .map_err(MetalError::from)?;
+        commands
+            .attach_physical_owner(teardown.physical_owner().map_err(MetalError::from)?)
+            .map_err(MetalError::from)?;
 
         Ok(Self {
-            constants: Arc::new(ConstantsByValue::new()),
+            constants: allocation_namespace.constants.clone(),
             teardown,
             id: DeviceId::new(),
             device,
             commands,
-            buffers,
-            private_buffers,
-            backings,
+            buffers: allocation_namespace.buffers.clone(),
+            private_buffers: allocation_namespace.private_buffers.clone(),
+            backings: allocation_namespace.backings.clone(),
             kernels,
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
             residency_set,
             ledger,
-            arena_reservation: Arc::new(parking_lot::Mutex::new(None)),
+            arena_reservation: allocation_namespace.arena_reservation.clone(),
             // No arena until one is installed: the classical path is the
             // default, and the cost of the seam is one `Option` test per
             // allocation (`DESIGN.md` §9.2a, §11.1).
-            arena: Arc::new(parking_lot::RwLock::new(None)),
-            arena_recorder: Arc::new(parking_lot::Mutex::new(None)),
-            arena_auto: Arc::new(parking_lot::Mutex::new(None)),
-            arena_auto_report: Arc::new(parking_lot::Mutex::new(None)),
-            arena_rerecord: Arc::new(parking_lot::Mutex::new(None)),
-            arena_rerecordings: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            arena: allocation_namespace.arena.clone(),
+            arena_recorder: allocation_namespace.arena_recorder.clone(),
+            arena_auto: allocation_namespace.arena_auto.clone(),
+            arena_auto_report: allocation_namespace.arena_auto_report.clone(),
+            arena_rerecord: allocation_namespace.arena_rerecord.clone(),
+            arena_rerecordings: allocation_namespace.arena_rerecordings.clone(),
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
-            session_region: Arc::new(parking_lot::RwLock::new(None)),
-            pass_plans: Arc::new(parking_lot::Mutex::new(None)),
-            base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            served_pass_pool_requests: Arc::new(Default::default()),
-            next_pass_variant: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            session_region: allocation_namespace.session_region.clone(),
+            pass_plans: allocation_namespace.pass_plans.clone(),
+            base_mode: allocation_namespace.base_mode.clone(),
+            pass_state: allocation_namespace.pass_state.clone(),
+            served_pass_pool_requests: allocation_namespace.served_pass_pool_requests.clone(),
+            next_pass_variant: allocation_namespace.next_pass_variant.clone(),
             emulated,
+            allocation_namespace,
         })
     }
 
@@ -3224,12 +3271,12 @@ impl BackendDevice for MetalDevice {
             .with_size_for(shape.elem_count(), dtype)
             .with_label("alloc-uninit")
             .build()?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
@@ -3239,12 +3286,12 @@ impl BackendDevice for MetalDevice {
             .with_zeros(size)
             .with_label("zeros")
             .build()?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
@@ -3327,7 +3374,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(T::DTYPE, "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new(buffer?, self.clone(), count, T::DTYPE))
+        Ok(Self::Storage::new_allocated(
+            buffer?,
+            self.clone(),
+            count,
+            T::DTYPE,
+        )?)
     }
 
     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
@@ -3410,12 +3462,12 @@ impl BackendDevice for MetalDevice {
                 return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
             }
         };
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer?,
             self.clone(),
             count,
             storage.dtype(),
-        ))
+        )?)
     }
 
     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<Self::Storage> {
@@ -3454,12 +3506,12 @@ impl BackendDevice for MetalDevice {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn rand_normal(
@@ -3494,12 +3546,12 @@ impl BackendDevice for MetalDevice {
         )
         .map_err(MetalError::from)?;
 
-        Ok(Self::Storage::new(
+        Ok(Self::Storage::new_allocated(
             buffer,
             self.clone(),
             shape.elem_count(),
             dtype,
-        ))
+        )?)
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
@@ -3551,7 +3603,9 @@ impl BackendDevice for MetalDevice {
         unsafe {
             std::ptr::copy_nonoverlapping([hi, lo].as_ptr(), contents as *mut u32, 2);
         }
-        seed_buffer.did_modify_range(NSRange::new(0, 8));
+        // The seed allocation is Shared, not Managed: didModifyRange is
+        // forbidden for Shared storage. The next submitted dispatch observes
+        // the host write without a Managed-storage notification.
 
         Ok(())
     }
@@ -3570,18 +3624,20 @@ impl BackendDevice for MetalDevice {
     /// Declines — `Ok(false)` — until `enable_pass_plans` turns the cache
     /// on, so the brackets are inert on every arm that has not asked for it.
     fn begin_pass(&self, key: crate::backend::PassShapeKey) -> Result<bool> {
-        if !self.pass_plans_enabled() {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
             return Ok(false);
         }
-        MetalDevice::begin_pass(self, Self::key_of(key))?;
+        MetalDevice::begin_pass(&view, Self::key_of(key))?;
         Ok(true)
     }
 
     fn finish_pass(&self) -> Result<()> {
-        if !self.pass_plans_enabled() {
+        let view = self.execution_device()?;
+        if !view.pass_plans_enabled() {
             return Ok(());
         }
-        MetalDevice::finish_pass(self)
+        MetalDevice::finish_pass(&view)
     }
 }
 
@@ -3640,6 +3696,7 @@ mod issue_336_split {
             unreachable!()
         };
         let n = 256usize;
+        let readbacks_before = super::readback_counts();
 
         let mut t_fast = Vec::new();
         let mut t_blit = Vec::new();
@@ -3659,11 +3716,12 @@ mod issue_336_split {
             // `--sample-in-buffer` leaves it.
             mdev.wait_until_completed().unwrap();
 
-            // FAST: direct read + a wait that has nothing to do.
+            // Resolved policy: Shared staging by default, experimental mapping
+            // only when explicitly enabled. Counters below prove engagement.
             let s = Instant::now();
             let v: Vec<u32> = ms.to_cpu().unwrap();
             t_fast.push(s.elapsed().as_secs_f64() * 1e3);
-            std::hint::black_box(v);
+            std::hint::black_box(&v);
 
             // BLIT, decomposed.
             let size = ms.count * ms.dtype.size_in_bytes();
@@ -3689,7 +3747,7 @@ mod issue_336_split {
             ms.device.flush_and_wait_current().unwrap();
             let w = s3.elapsed().as_secs_f64() * 1e3;
             let v2: Vec<u32> = super::read_to_vec(&dst, ms.count);
-            std::hint::black_box(v2);
+            assert_eq!(v, v2, "resolved readback versus explicit Shared blit");
 
             if i >= 32 {
                 // warmup
@@ -3708,9 +3766,13 @@ mod issue_336_split {
         let (f, b) = (med(&mut t_fast.split_off(32)), med(&mut t_blit));
         let (al, en, wa) = (med(&mut t_alloc), med(&mut t_encode), med(&mut t_wait));
         println!("ISSUE336-SPLIT n={} (queue pre-drained)", t_wait.len());
-        println!("ISSUE336-SPLIT fast_total_ms={f:.4}");
+        println!(
+            "ISSUE336-SPLIT resolved_total_ms={f:.4} mapping_opt_in={} readbacks={:?}",
+            crate::tuning::tuning().metal.private_cpu_mapping,
+            super::readback_counts().since(&readbacks_before)
+        );
         println!("ISSUE336-SPLIT blit_total_ms={b:.4}  alloc={al:.4} encode={en:.4} wait={wa:.4}");
-        println!("ISSUE336-SPLIT blit_minus_fast_ms={:.4}", b - f);
+        println!("ISSUE336-SPLIT blit_minus_resolved_ms={:.4}", b - f);
     }
 }
 
@@ -3834,19 +3896,12 @@ mod issue_336_to_cpu {
         assert_eq!(seen.len(), 32, "fixture did not vary");
     }
 
-    /// **Which allocations are CPU-mapped, pinned as a fact about the machine.**
-    ///
-    /// This is what decides how often the fast path fires, and it is a property
-    /// of *(device, OS)* rather than of candle (`CONTRIBUTING.md` §2.7). A
-    /// Private allocation is mapped below 16 KiB and unmapped at or above it,
-    /// so the same 4-byte `to_scalar` is readable or not depending on what size
-    /// the pool rounded its buffer to.
-    ///
-    /// If this changes, the fast path's *hit rate* changes and nothing else --
-    /// `to_cpu` still returns the right bytes either way, because the null test
-    /// fails closed onto the blit.
+    /// Default policy denies Private CPU access at every size and keeps the
+    /// Shared control mapped. With the explicit experimental opt-in, retain
+    /// the historical machine-specific 16 KiB threshold probe. That probe is
+    /// not an API guarantee and must not run under Metal API Validation.
     #[test]
-    fn private_allocations_are_mapped_below_16k_and_not_above() {
+    fn private_mapping_policy_and_opt_in_threshold() {
         let Some(dev) = metal() else { return };
         let Device::Metal(m) = &dev else {
             unreachable!()
@@ -3872,6 +3927,23 @@ mod issue_336_to_cpu {
         // `to_cpu` and `read_to_vec`, landing on the check for it.
         let mapped_ptr = std::hint::black_box(mapped.contents());
         let unmapped_ptr = std::hint::black_box(unmapped.contents());
+
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                mapped_ptr.is_null(),
+                "Private mapping must be opt-in at small sizes"
+            );
+            assert!(
+                unmapped_ptr.is_null(),
+                "Private mapping must be opt-in at large sizes"
+            );
+            let shared = m.allocate_buffer(1 << 20).unwrap();
+            assert!(
+                !std::hint::black_box(shared.contents()).is_null(),
+                "Shared control must remain mapped"
+            );
+            return;
+        }
 
         assert!(
             !mapped_ptr.is_null(),
@@ -3921,6 +3993,40 @@ mod issue_336_to_cpu {
             "a 128 B Private heap sub-buffer at offset {offset} was reported \
              CPU-mapped; its contents() is {raw_ptr:?}, which is not a mapping"
         );
+        heaps.release(&placed);
+        heaps.release(&first);
+    }
+
+    /// The documented path and the opt-in both reject Private heap pointers.
+    /// Unlike the opt-in machine probe above, this never calls the forbidden
+    /// raw Private `contents()` getter, so API Validation can check the guard.
+    #[test]
+    fn private_heap_buffers_never_expose_a_cpu_pointer() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let heaps = crate::kernels::metal::HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            1 << 20,
+            None,
+        );
+        let first = heaps.alloc(128).unwrap();
+        let placed = heaps.alloc(128).unwrap();
+        use objc2_metal::MTLResource as _;
+        assert!(
+            placed.as_ref().heapOffset() > 0,
+            "nonzero placement control"
+        );
+        for buffer in [&first, &placed] {
+            assert!(!buffer.may_be_cpu_mapped());
+            assert!(std::hint::black_box(buffer.contents()).is_null());
+        }
+        let shared = m.allocate_buffer(128).unwrap();
+        assert!(shared.may_be_cpu_mapped());
+        assert!(!std::hint::black_box(shared.contents()).is_null());
         heaps.release(&placed);
         heaps.release(&first);
     }
@@ -4332,6 +4438,18 @@ mod issue_481_arena_mapping {
             "the control arm allocated {small_len} B, which is not below the \
              16384 B threshold it exists to sit under"
         );
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                small_null && big_null,
+                "Private arenas must not expose CPU pointers by default"
+            );
+            let shared = m.allocate_buffer(small_len).unwrap();
+            assert!(
+                !std::hint::black_box(shared.contents()).is_null(),
+                "Shared control must be mapped"
+            );
+            return;
+        }
         assert!(
             !small_null,
             "a {small_len} B arena is ALSO unmapped, so this probe cannot \
@@ -4358,7 +4476,7 @@ mod issue_481_arena_mapping {
     /// arm that says *why* the arena is unmapped -- it is size, not something
     /// particular to `install_arena`.
     #[test]
-    fn the_arena_mapping_transition_is_the_16384_b_threshold() {
+    fn arena_mapping_policy_and_opt_in_threshold() {
         let Some(dev) = metal() else { return };
         let Device::Metal(m) = &dev else {
             unreachable!()
@@ -4377,6 +4495,20 @@ mod issue_481_arena_mapping {
             println!("ISSUE481 sweep asked={asked} allocated={len} null={is_null}");
         }
 
+        if !crate::tuning::tuning().metal.private_cpu_mapping {
+            assert!(
+                rows.iter().all(|r| r.2),
+                "Private arena mapping is opt-in: {rows:?}"
+            );
+            for (_, len, _) in &rows {
+                let shared = m.allocate_buffer(*len).unwrap();
+                assert!(
+                    !std::hint::black_box(shared.contents()).is_null(),
+                    "Shared control at {len} bytes must be mapped"
+                );
+            }
+            return;
+        }
         // Both answers must appear, or the sweep is measuring its own fixture.
         assert!(
             rows.iter().any(|r| !r.2),

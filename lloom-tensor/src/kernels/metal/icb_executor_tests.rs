@@ -1289,6 +1289,26 @@ fn run_mlp_steps(
             )
             .unwrap();
         };
+    // Make the cap arm deterministic rather than relying on GPU/host speed.
+    // The host releases this event as soon as the executor falls back. Drop
+    // also releases it during unwinding, before Commands drains its queue.
+    struct HoldGpu(
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLSharedEvent>>,
+    );
+    impl Drop for HoldGpu {
+        fn drop(&mut self) {
+            use objc2_metal::MTLSharedEvent as _;
+            self.0.setSignaledValue(1);
+        }
+    }
+    let mut held = if executor.is_some() && matches!(pacing, Pacing::Unbounded) {
+        use objc2_metal::MTLDevice as _;
+        let event = device.as_ref().newSharedEvent().expect("shared event");
+        cmds.encode_wait_for_event(&event, 1).unwrap();
+        Some(HoldGpu(event))
+    } else {
+        None
+    };
     for step in 0..steps {
         let residual = match consumer {
             Consumer::PackedMoving => &residuals[step % 2],
@@ -1354,8 +1374,12 @@ fn run_mlp_steps(
         }
         if let Some(e) = executor {
             e.end_step(&device, &cmds).unwrap();
+            if e.skipped_steps() > 0 {
+                drop(held.take());
+            }
         }
     }
+    drop(held);
     cmds.flush_and_wait().unwrap();
     // SAFETY: completed, shared storage; `steps * k` f16 values.
     unsafe { std::slice::from_raw_parts(results.contents() as *const f16, steps * k) }
@@ -1374,8 +1398,8 @@ enum Pacing {
     /// flight: the executor encodes new generations while earlier ones run and
     /// reuses them once they complete.
     Bounded(usize),
-    /// Never: the host encodes every step before the GPU finishes the first,
-    /// so the generations reach their cap and later steps run classically.
+    /// No host wait; a test event holds GPU progress until the generation cap
+    /// is reached, then releases it so all classical and replayed work finishes.
     Unbounded,
 }
 

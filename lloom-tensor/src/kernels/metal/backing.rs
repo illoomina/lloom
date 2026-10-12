@@ -36,8 +36,13 @@
 use super::heap::{HeapChunks, HeapStats};
 use super::ledger::{Ledger, Reservation};
 use super::{Buffer, Device, ResidencySet};
+pub use crate::allocation_admission::PredictionBasis;
+use crate::allocation_admission::{self, Prediction};
+pub use crate::heap_ranges::ReuseCredit;
 use crate::kernels::MetalKernelError;
-use objc2_metal::MTLResourceOptions;
+use crate::memory_admission::{AllocationContext, DomainKey};
+pub type BackingAdmissionError = crate::allocation_admission::AllocationError<MetalKernelError>;
+use objc2_metal::{MTLDevice as _, MTLResource as _, MTLResourceOptions};
 use std::sync::Arc;
 
 /// What a backing holds, in the heap's terms (a whole-buffer backing
@@ -65,12 +70,29 @@ impl From<Buffer> for Allocation {
 pub trait Backing: Send + Sync + std::fmt::Debug {
     /// `bytes` resident bytes of this backing's storage mode.
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError>;
+    /// Explicit admitted route. Unsupported implementations MUST NOT silently
+    /// fall back to legacy unadmitted allocation. Each implementation opts in.
+    fn alloc_in(
+        &self,
+        _bytes: usize,
+        _context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        Err(BackingAdmissionError::Unsupported(
+            "backing has no admitted allocation route",
+        ))
+    }
     /// Take `buffer`'s range back, if it is this backing's sub-allocation;
     /// `false` for a buffer that is not (or is a whole allocation, which
     /// frees when its last handle drops — its residency entry is the
     /// holder's to remove).
     fn reclaim(&self, buffer: &Buffer) -> bool;
     fn stats(&self) -> BackingStats;
+    /// Enumerate ready free capacity already charged to this domain. Source
+    /// identity must remain retained for the whole collection; delegating
+    /// wrappers preserve identities so aliases are counted once. None means
+    /// legacy/unadmitted capacity. This is advisory capacity, not fit proof.
+    fn collect_reusable_allocations(&self, _domain: Option<&DomainKey>, _credit: &mut ReuseCredit) {
+    }
 }
 
 /// When a [`DeviceBuffer`]'s residency entry is committed.
@@ -100,6 +122,33 @@ pub struct DeviceBuffer {
     commit: Commit,
     /// Where each buffer's bytes are committed (`None` in a bare test).
     ledger: Option<Arc<Ledger>>,
+    membership: Arc<super::membership::MembershipDomain>,
+}
+
+type RawBuffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>;
+
+/// A cold candidate not yet published into residency or planner state. The
+/// admitted arm retains its uncommitted ticket, raw-first, through selection.
+pub(crate) struct StagedDeviceBuffer<'a> {
+    backing: &'a DeviceBuffer,
+    native: StagedNativeBuffer,
+    requested: usize,
+}
+enum StagedNativeBuffer {
+    Legacy(Buffer),
+    Accounted(allocation_admission::StagedAllocation<RawBuffer>),
+}
+impl StagedDeviceBuffer<'_> {
+    pub(crate) fn commit(self) -> Result<Allocation, BackingAdmissionError> {
+        let buffer = match self.native {
+            StagedNativeBuffer::Legacy(buffer) => buffer,
+            StagedNativeBuffer::Accounted(staged) => {
+                let (raw, owner) = staged.commit()?;
+                Buffer::new_owned(raw, owner)
+            }
+        };
+        self.backing.publish(buffer, self.requested)
+    }
 }
 
 impl DeviceBuffer {
@@ -110,13 +159,151 @@ impl DeviceBuffer {
         commit: Commit,
         ledger: Option<Arc<Ledger>>,
     ) -> Self {
+        let membership = super::membership::MembershipDomain::new(
+            residency.clone(),
+            crate::metal_backend::retain_evicted_allocations(),
+        );
         Self {
             device: device.clone(),
             residency,
             options,
             commit,
             ledger,
+            membership,
         }
+    }
+    pub(crate) fn with_membership(
+        mut self,
+        membership: Arc<super::membership::MembershipDomain>,
+    ) -> Self {
+        self.membership = membership;
+        self
+    }
+    /// The admitted upload preserves native newBufferWithBytes; only the
+    /// requested input length reaches the native creator, never padded demand.
+    pub(crate) fn alloc_data_in<T>(
+        &self,
+        data: &[T],
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Err(BackingAdmissionError::Geometry(
+                "empty upload uses pooled minimum allocation",
+            ));
+        }
+        let pointer = std::ptr::NonNull::new(data.as_ptr().cast_mut().cast::<std::ffi::c_void>())
+            .expect("nonempty slice pointer");
+        self.alloc_native_in(bytes, context, |length| {
+            debug_assert_eq!(length, bytes);
+            // SAFETY: synchronous native copy of exactly this borrowed slice's
+            // object representation. No predicted alignment padding is read.
+            unsafe {
+                self.device.as_ref().newBufferWithBytes_length_options(
+                    pointer,
+                    length,
+                    self.options,
+                )
+            }
+            .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+        })
+    }
+
+    fn alloc_native_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+        create: impl FnOnce(
+            usize,
+        ) -> Result<
+            objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+            MetalKernelError,
+        >,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        self.stage_native_in(bytes, context, create)?.commit()
+    }
+
+    /// Selection-capable cold allocation. No residency entry exists until commit.
+    pub(crate) fn stage(
+        &self,
+        bytes: usize,
+        context: Option<&AllocationContext>,
+    ) -> Result<StagedDeviceBuffer<'_>, BackingAdmissionError> {
+        match context {
+            Some(context) => self.stage_native_in(bytes, context, |length| {
+                self.device
+                    .as_ref()
+                    .newBufferWithLength_options(length, self.options)
+                    .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+            }),
+            None => Ok(StagedDeviceBuffer {
+                backing: self,
+                native: StagedNativeBuffer::Legacy(
+                    self.device
+                        .new_buffer(bytes.max(1), self.options)
+                        .map_err(BackingAdmissionError::Native)?,
+                ),
+                requested: bytes.max(1),
+            }),
+        }
+    }
+
+    fn stage_native_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+        create: impl FnOnce(usize) -> Result<RawBuffer, MetalKernelError>,
+    ) -> Result<StagedDeviceBuffer<'_>, BackingAdmissionError> {
+        let requested = bytes.max(1);
+        if requested > self.device.as_ref().maxBufferLength() {
+            return Err(BackingAdmissionError::Geometry(
+                "request exceeds device maxBufferLength",
+            ));
+        }
+        let estimate = self
+            .device
+            .as_ref()
+            .heapBufferSizeAndAlignWithLength_options(requested, self.options);
+        let prediction = Prediction::standalone(requested, estimate.size, estimate.align)?;
+        let native =
+            allocation_admission::stage(context, prediction, create, |raw| raw.allocatedSize())?;
+        Ok(StagedDeviceBuffer {
+            backing: self,
+            native: StagedNativeBuffer::Accounted(native),
+            requested,
+        })
+    }
+
+    /// A selected candidate invalidated after commit. Remove its published
+    /// residency ownership while its raw Buffer still exists, outside planner
+    /// locks; then raw release precedes physical owner/legacy reservation Drop.
+    pub(crate) fn discard_selected(&self, allocation: Allocation) {
+        self.residency.remove(&allocation.buffer);
+        drop(allocation);
+    }
+
+    fn publish(
+        &self,
+        buffer: Buffer,
+        requested: usize,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        // Mint custody before membership publication. Native submission leases
+        // and alias eligibility remain required before family enablement.
+        let token = self
+            .membership
+            .for_buffer(&buffer)
+            .map_err(|e| BackingAdmissionError::Retirement(e.to_string()))?;
+        let buffer = buffer.with_membership(token);
+        match self.commit {
+            Commit::Deferred => self.residency.add(&buffer),
+            Commit::Now => self.residency.insert(&buffer),
+        };
+        // Parallel legacy diagnostics; physical owner remains on every Buffer alias.
+        let reservation = self.ledger.as_ref().map(|l| l.reserve(requested));
+        Ok(Allocation {
+            buffer,
+            reservation,
+        })
     }
 }
 
@@ -130,17 +317,26 @@ impl std::fmt::Debug for DeviceBuffer {
 }
 
 impl Backing for DeviceBuffer {
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        self.alloc_native_in(bytes, context, |length| {
+            self.device
+                .as_ref()
+                .newBufferWithLength_options(length, self.options)
+                .ok_or_else(|| MetalKernelError::FailedToCreateResource("Buffer".into()))
+        })
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let buffer = self.device.new_buffer(bytes.max(1), self.options)?;
-        match self.commit {
-            Commit::Deferred => self.residency.add(&buffer),
-            Commit::Now => self.residency.insert(&buffer),
-        };
-        let reservation = self.ledger.as_ref().map(|l| l.reserve(bytes.max(1)));
-        Ok(Allocation {
-            buffer,
-            reservation,
-        })
+        self.publish(buffer, bytes.max(1))
+            .map_err(|error| match error {
+                BackingAdmissionError::Native(error) => error,
+                other => MetalKernelError::InvalidInput(other.to_string()),
+            })
     }
 
     fn reclaim(&self, _buffer: &Buffer) -> bool {
@@ -156,6 +352,19 @@ impl Backing for DeviceBuffer {
 pub type Heap = HeapChunks;
 
 impl Backing for HeapChunks {
+    fn collect_reusable_allocations(&self, domain: Option<&DomainKey>, credit: &mut ReuseCredit) {
+        HeapChunks::collect_reusable_allocations(self, domain, credit)
+    }
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        Ok(Allocation {
+            buffer: HeapChunks::alloc_in(self, bytes, context)?,
+            reservation: None,
+        })
+    }
     /// The chunk holds the reservation; the sub-buffer carries none.
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         Ok(Allocation {
@@ -194,6 +403,16 @@ impl Mapped {
     }
 }
 
+impl Mapped {
+    pub(crate) fn with_membership(
+        mut self,
+        membership: Arc<super::membership::MembershipDomain>,
+    ) -> Self {
+        self.inner = self.inner.with_membership(membership);
+        self
+    }
+}
+
 impl std::fmt::Debug for Mapped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mapped")
@@ -203,6 +422,16 @@ impl std::fmt::Debug for Mapped {
 }
 
 impl Backing for Mapped {
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        let a = self.inner.alloc_in(bytes, context)?;
+        wire_pages(a.buffer.contents(), bytes);
+        Ok(a)
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         let a = self.inner.alloc(bytes)?;
         wire_pages(a.buffer.contents(), bytes);
@@ -226,6 +455,23 @@ pub struct Fallback<A, B> {
 }
 
 impl<A: Backing, B: Backing> Backing for Fallback<A, B> {
+    fn collect_reusable_allocations(&self, domain: Option<&DomainKey>, credit: &mut ReuseCredit) {
+        self.first.collect_reusable_allocations(domain, credit);
+        self.then.collect_reusable_allocations(domain, credit);
+    }
+    fn alloc_in(
+        &self,
+        bytes: usize,
+        context: &AllocationContext,
+    ) -> Result<Allocation, BackingAdmissionError> {
+        match self.first.alloc_in(bytes, context) {
+            Err(error) if error.permits_fallback(native_allocation_refusal) => {
+                self.then.alloc_in(bytes, context)
+            }
+            result => result,
+        }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Allocation, MetalKernelError> {
         match self.first.alloc(bytes) {
             Ok(b) => Ok(b),
@@ -285,5 +531,13 @@ impl std::fmt::Debug for Backings {
             .field("transient_shared", &self.transient_shared)
             .field("transient_private", &self.transient_private)
             .finish()
+    }
+}
+
+fn native_allocation_refusal(error: &MetalKernelError) -> bool {
+    match error {
+        MetalKernelError::FailedToCreateResource(_) => true,
+        MetalKernelError::WithBacktrace { inner, .. } => native_allocation_refusal(inner),
+        _ => false,
     }
 }

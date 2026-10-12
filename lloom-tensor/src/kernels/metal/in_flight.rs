@@ -16,7 +16,7 @@
 //! every drop is the plain release it always was.
 
 use super::{Buffer, GpuClock};
-use crate::retire::Retire;
+use crate::retire::{Completed, Retire};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::MTLFence;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,26 +78,25 @@ impl InFlightHold {
             Held::Fence(_) => self.fences.fetch_add(1, Ordering::Relaxed),
             Held::Buffer(_) => self.buffers.fetch_add(1, Ordering::Relaxed),
         };
-        let epoch = self.clock.current_epoch();
-        self.held.lock().retire(epoch, item);
+        retire_at_current(&self.held, || self.clock.current_epoch(), item);
     }
 
     /// Release everything whose epoch has completed. A prefix walk that stops
     /// at the first entry still outstanding; the releases happen outside the
     /// lock.
     pub fn release_completed(&self) -> usize {
-        let completed = self.clock.completed_count();
-        let mut n = 0;
-        loop {
-            let item = self.held.lock().pop_ready(|e| completed.covers(e));
-            match item {
-                Some(item) => {
-                    drop(item);
-                    n += 1;
-                }
-                None => return n,
-            }
-        }
+        self.release_completed_up_to(self.clock.completed_count())
+    }
+
+    /// The same completed-prefix drain with a caller's earlier snapshot.
+    fn release_completed_up_to(&self, completed: Completed) -> usize {
+        release_completed_prefix(&self.held, completed)
+    }
+
+    /// Borrowed cleanup for Commands' off-EntryState custody. Captures the
+    /// cutoff now, but takes no hold lock until the cleanup itself is dropped.
+    pub(super) fn defer_release_completed(&self) -> CompletedRelease<'_, Held> {
+        CompletedRelease::new(&self.held, self.clock.completed_count())
     }
 
     pub fn counts(&self) -> HoldCounts {
@@ -105,6 +104,54 @@ impl InFlightHold {
             fences: self.fences.load(Ordering::Relaxed),
             buffers: self.buffers.load(Ordering::Relaxed),
             pending: self.held.lock().held(),
+        }
+    }
+}
+
+/// Serialize stamp acquisition with insertion: reading a monotone clock before
+/// taking this mutex would let a delayed older stamp follow a newer queue entry.
+/// The production closure is one atomic clock load; no new lock or queue scan.
+fn retire_at_current<I>(
+    held: &parking_lot::Mutex<Retire<I>>,
+    current_epoch: impl FnOnce() -> crate::retire::Epoch,
+    item: I,
+) {
+    let mut queue = held.lock();
+    queue.retire(current_epoch(), item);
+}
+
+/// Snapshot-bearing borrowed cleanup. No Arc clone, allocation or extra
+/// producer lock: the caller keeps its hold alive and drops this after its
+/// outer state guard. Generic only so host controls exercise the actual loop
+/// and cleanup with nonempty fake payloads, not a second implementation.
+pub(super) struct CompletedRelease<'a, I> {
+    held: &'a parking_lot::Mutex<Retire<I>>,
+    completed: Completed,
+}
+impl<'a, I> CompletedRelease<'a, I> {
+    pub(super) fn new(held: &'a parking_lot::Mutex<Retire<I>>, completed: Completed) -> Self {
+        Self { held, completed }
+    }
+}
+impl<I> Drop for CompletedRelease<'_, I> {
+    fn drop(&mut self) {
+        release_completed_prefix(self.held, self.completed);
+    }
+}
+
+fn release_completed_prefix<I>(
+    held: &parking_lot::Mutex<Retire<I>>,
+    completed: Completed,
+) -> usize {
+    let mut n = 0;
+    loop {
+        let item = held.lock().pop_ready(|e| completed.covers(e));
+        match item {
+            Some(item) => {
+                drop(item);
+                n += 1;
+            }
+            None => return n,
         }
     }
 }
@@ -122,5 +169,36 @@ pub fn hold_buffer(hold: Option<&Arc<InFlightHold>>, buffer: &Buffer) {
 impl std::fmt::Debug for InFlightHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "InFlightHold {:?}", self.counts())
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use crate::retire::Epoch;
+
+    #[test]
+    fn retirement_stamp_is_sampled_under_the_insertion_lock() {
+        let clock = GpuClock::new();
+        let held = parking_lot::Mutex::new(Retire::new());
+        let sample = || {
+            assert!(
+                held.try_lock().is_none(),
+                "retirement epoch sampled before insertion lock"
+            );
+            clock.current_epoch()
+        };
+        retire_at_current(&held, sample, 10u8);
+        assert_eq!(clock.commit_epoch(), Epoch(0));
+        retire_at_current(&held, sample, 20u8);
+        clock.mark_completed(Epoch(0));
+        let mut queue = held.lock();
+        assert_eq!(
+            queue.pop_ready(|e| clock.completed_count().covers(e)),
+            Some(10)
+        );
+        assert_eq!(queue.head_epoch(), Some(Epoch(1)));
+        assert_eq!(queue.pop_ready(|e| clock.completed_count().covers(e)), None);
+        assert_eq!(queue.held(), 1);
     }
 }

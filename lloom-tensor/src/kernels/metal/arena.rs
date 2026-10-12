@@ -106,11 +106,30 @@ fn observer_slot() -> &'static Mutex<Option<Arc<Mutex<ArenaRecorder>>>> {
 
 /// Install `recorder` as the bind observer, or clear it with `None`.
 pub fn set_bind_observer(recorder: Option<Arc<Mutex<ArenaRecorder>>>) {
-    {
+    let previous = {
         let mut slot = observer_slot().lock();
         OBSERVING.store(recorder.is_some(), Ordering::Relaxed);
-        *slot = recorder;
-    }
+        std::mem::replace(&mut *slot, recorder)
+    };
+    drop(previous);
+}
+
+/// Detach only this recording. A superseding recorder, including one on another
+/// namespace, must not be cleared by delayed cleanup from an older transaction.
+pub fn clear_bind_observer_if(recorder: &Arc<Mutex<ArenaRecorder>>) {
+    let previous = {
+        let mut slot = observer_slot().lock();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, recorder))
+        {
+            OBSERVING.store(false, Ordering::Relaxed);
+            slot.take()
+        } else {
+            None
+        }
+    };
+    drop(previous);
 }
 
 /// Whether anything is observing binds. One relaxed load.
@@ -523,6 +542,26 @@ impl StepPlan {
             .map(|s| s.offset + align_up(s.size, ARENA_ALIGNMENT))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Checked bound for a native base, including bump padding. Call before
+    /// allocation; legacy diagnostic methods retain their existing signatures.
+    pub fn checked_base_bytes(&self) -> Result<usize, String> {
+        let mut bytes = 0usize;
+        for slot in &self.slots {
+            let rounded = slot
+                .size
+                .checked_add(ARENA_ALIGNMENT - 1)
+                .map(|n| n / ARENA_ALIGNMENT * ARENA_ALIGNMENT)
+                .ok_or_else(|| "arena slot padding overflow".to_string())?;
+            let end = slot
+                .offset
+                .checked_add(rounded)
+                .ok_or_else(|| "arena base size overflow".to_string())?;
+            bytes = bytes.max(end);
+        }
+        self.check_disjoint()?;
+        Ok(bytes.max(1))
     }
 
     pub fn slots(&self) -> &[Slot] {
@@ -1995,6 +2034,91 @@ impl ArenaRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These numeric fixtures never call device()/arena_of or native Metal.
+    #[test]
+    fn checked_planner_base_geometry() {
+        let plan = |slots| StepPlan::new(slots, Vec::new());
+        assert_eq!(plan(vec![]).checked_base_bytes().unwrap(), 1);
+        assert_eq!(
+            plan(vec![Slot { offset: 0, size: 0 }])
+                .checked_base_bytes()
+                .unwrap(),
+            1
+        );
+        for size in [1, 127, 128, 129, usize::MAX - 127] {
+            let exact = (size as u128).div_ceil(128) * 128;
+            assert_eq!(
+                plan(vec![Slot { offset: 0, size }])
+                    .checked_base_bytes()
+                    .unwrap() as u128,
+                exact
+            );
+        }
+        assert!(plan(vec![Slot {
+            offset: 0,
+            size: usize::MAX
+        }])
+        .checked_base_bytes()
+        .is_err());
+        assert!(plan(vec![Slot {
+            offset: usize::MAX - 127,
+            size: 128
+        }])
+        .checked_base_bytes()
+        .is_err());
+        assert!(plan(vec![Slot { offset: 1, size: 1 }])
+            .checked_base_bytes()
+            .is_err());
+        assert!(plan(vec![
+            Slot {
+                offset: 0,
+                size: 129
+            },
+            Slot {
+                offset: 128,
+                size: 1
+            }
+        ])
+        .checked_base_bytes()
+        .is_err());
+        assert_eq!(
+            plan(vec![
+                Slot {
+                    offset: 0,
+                    size: 128
+                },
+                Slot {
+                    offset: 128,
+                    size: 1
+                }
+            ])
+            .checked_base_bytes()
+            .unwrap(),
+            256
+        );
+    }
+
+    #[test]
+    fn checked_planner_observer_cleanup_preserves_replacement() {
+        // Run this exact filter with one test worker: the production observer is
+        // process-global. No device or tensor is constructed.
+        let old = Arc::new(Mutex::new(ArenaRecorder::new()));
+        let new = Arc::new(Mutex::new(ArenaRecorder::new()));
+        set_bind_observer(Some(old.clone()));
+        set_bind_observer(Some(new.clone()));
+        clear_bind_observer_if(&old);
+        assert!(observing_binds());
+        assert!(observer_slot()
+            .lock()
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &new)));
+        clear_bind_observer_if(&new);
+        assert!(!observing_binds());
+        assert!(observer_slot().lock().is_none());
+        clear_bind_observer_if(&old);
+        assert!(!observing_binds());
+    }
+
     // Imported here rather than at module scope: the arena itself must not be
     // able to reach a pool (issue #489), and the tests are the only thing that
     // legitimately holds one.

@@ -8,10 +8,10 @@ extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 use lloom::models::falcon::{Config, Falcon};

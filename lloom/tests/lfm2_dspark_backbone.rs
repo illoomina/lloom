@@ -41,10 +41,10 @@
 //! generic path is not (`CONTRIBUTING.md` §3.1, §2.3.8a). It also keeps this
 //! runnable with no `metal` feature, which is the build §14.1 gates on.
 
-use lloom_tensor::{DType, Device, IndexOp, Result, Tensor, D};
 use lloom::models::lfm2_dspark::{
     confidence_feature_width, drafter_params, DSparkConfig, MarkovHead,
 };
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor, D};
 
 /// The released 2.6B drafter's own totals, read from the payload-bearing
 /// safetensors header rather than from any section's prose.
@@ -552,10 +552,7 @@ fn the_drafter_has_no_embedding_and_no_lm_head() {
 /// bytes as the wrong numbers.
 #[test]
 fn the_checkpoint_dtype_is_bf16() {
-    assert_eq!(
-        lloom::models::lfm2_dspark::CHECKPOINT_DTYPE,
-        DType::BF16
-    );
+    assert_eq!(lloom::models::lfm2_dspark::CHECKPOINT_DTYPE, DType::BF16);
 }
 
 // ---------------------------------------------------------------------------

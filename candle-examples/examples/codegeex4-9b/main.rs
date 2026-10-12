@@ -1,9 +1,9 @@
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
-use lloom::models::codegeex4_9b::*;
 use clap::Parser;
 use hf_hub::{Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::models::codegeex4_9b::*;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 struct TextGeneration {

@@ -9,9 +9,9 @@ mod darknet;
 
 use anyhow::Result;
 use candle::{DType, Device, Tensor};
-use lloom::nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{DynamicImage, ImageBuffer};
+use lloom::nn::{Module, VarBuilder};
 
 // Assumes x1 <= x2 and y1 <= y2
 pub fn draw_rect(

@@ -1,7 +1,7 @@
-//! The quantized-kernel parity matrix (`quant_parity/mod.rs`) under the
-//! default tuning: every instantiated (format × entry point × activation
-//! dtype) except the rows kernels, which `quant_parity_matrix_rows` runs
-//! under their process-wide switch.
+//! The quantized-kernel parity matrix (`quant_parity/mod.rs`) under
+//! `deterministic`: every instantiated (format × entry point × activation
+//! dtype) except the row axis's kernels, which `quant_parity_matrix_rows`
+//! runs under `fast` (the contract is read once per process).
 //!
 //! One test: the dispatch census is a per-device window, and two tests on
 //! parallel threads would count each other's launches.
@@ -37,8 +37,8 @@ fn device() -> Device {
         let _ = lloom_tensor::tuning::install(t);
     });
     assert!(
-        !lloom_tensor::tuning::tuning().qmv.rows,
-        "the rows arm is quant_parity_matrix_rows' binary"
+        !lloom_tensor::tuning::contract().is_fast(),
+        "the row axis is quant_parity_matrix_rows' binary"
     );
     Device::new_metal(0).expect("a Metal device")
 }

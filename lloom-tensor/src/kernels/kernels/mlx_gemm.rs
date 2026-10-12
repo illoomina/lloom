@@ -9,8 +9,8 @@ use crate::kernels::{
 };
 use objc2_metal::MTLSize;
 
-pub use crate::gemv_tile::{gemv_mixed_gnorm_serves, gemv_norm_serves, GEMV_GROUP_NORM_MAX_GROUPS};
 use crate::gemv_tile::{derive_gemv_tile, gemv_tile_dims};
+pub use crate::gemv_tile::{gemv_mixed_gnorm_serves, gemv_norm_serves, GEMV_GROUP_NORM_MAX_GROUPS};
 
 /// Trailing alignment of the packed block, so its length matches the `sizeof`
 /// the kernel sees. Taken from the Rust mirror rather than written as a
@@ -84,23 +84,25 @@ const TILE_16_16_16_2_2: TileConfig = TileConfig::new(16, 16, 16, 2, 2);
 /// determinism run, and the whole point of this knob is to be A/B'd.
 fn forced_tile() -> Option<TileConfig> {
     static TILE: std::sync::OnceLock<Option<TileConfig>> = std::sync::OnceLock::new();
-    *TILE.get_or_init(|| match crate::tuning::tuning().gemm.tile.as_deref() {
-        Some(v) => Some(match v {
-            "32x32" => TILE_32_32_16_2_2,
-            "32x16" => TILE_32_16_16_2_2,
-            "16x32" => TILE_16_32_16_2_2,
-            "16x16" => TILE_16_16_16_2_2,
-            "64x32" => TILE_64_32_32_2_2,
-            "64x64" => TILE_64_64_16_2_2,
-            other => panic!(
-                "LLOOM_383_TILE must be one of \
+    *TILE.get_or_init(|| {
+        crate::tuning::tuning()
+            .gemm
+            .tile
+            .as_deref()
+            .map(|v| match v {
+                "32x32" => TILE_32_32_16_2_2,
+                "32x16" => TILE_32_16_16_2_2,
+                "16x32" => TILE_16_32_16_2_2,
+                "16x16" => TILE_16_16_16_2_2,
+                "64x32" => TILE_64_32_32_2_2,
+                "64x64" => TILE_64_64_16_2_2,
+                other => panic!(
+                    "LLOOM_383_TILE must be one of \
                  32x32|32x16|16x32|16x16|64x32|64x64, got {other:?}"
-            ),
-        }),
-        None => None,
+                ),
+            })
     })
 }
-
 
 /// The largest `m` `select_tile_config` serves with the 16-row tile
 /// (`TILE_16_32_16_2_2`), inclusive. Measured cheapest of the three
@@ -1254,7 +1256,6 @@ pub struct GemvGroupNorm<'a> {
     pub scales: Option<(&'a Buffer, usize)>,
 }
 
-
 /// [`call_mlx_gemv_mixed`] with a grouped RMSNorm of `vec` computed inside it
 /// ([`GemvGroupNorm`]): `out = epilogue(scale · mat · norm(vec))`, one launch
 /// where the composed route is the norm's launch and the GEMV. Refused where
@@ -1501,6 +1502,57 @@ pub fn call_mlx_gemm_out(
         }
         .bt())?;
     };
+
+    if dtype == GemmDType::F16
+        && out_dtype == dtype
+        && !crate::tuning::contract().is_fast()
+        && forced_gemm().is_some()
+    {
+        return Err(MetalKernelError::InvalidInput(
+            "--force-gemm conflicts with deterministic f16 row identity; use --determinism fast for the forcing experiment, or unset --force-gemm".into()));
+    }
+
+    // #942: deterministic half output uses the existing one-row reduction
+    // at every row count. Rows occupy GEMV's batch axis, not a new core.
+    // The storage caller materializes a transposed activation first. Weight
+    // strides and both input offsets remain those of the caller's views.
+    if dtype == GemmDType::F16
+        && out_dtype == dtype
+        && !crate::tuning::contract().is_fast()
+        && !a_trans
+        && m > 1
+    {
+        let a_batch = if lhs_stride.len() > 2 {
+            lhs_stride[lhs_stride.len() - 3]
+        } else {
+            m * k
+        };
+        let b_batch = if rhs_stride.len() > 2 {
+            rhs_stride[rhs_stride.len() - 3]
+        } else {
+            n * k
+        };
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        for batch in 0..b {
+            let out = output.view(batch * m * n * 2, m * n * 2);
+            call_mlx_gemv(
+                device,
+                encoder,
+                kernels,
+                dtype,
+                (m, 1, n, k),
+                &[k, k, 1],
+                lhs_offset + batch * a_batch * 2,
+                lhs_buffer,
+                &[0, rhs_m2, rhs_m1],
+                rhs_offset + batch * b_batch * 2,
+                rhs_buffer,
+                &out,
+            )?;
+        }
+        return Ok(());
+    }
 
     // The routing decision this project has never audited (issue #386): no
     // threshold, no config axis, and `select_tile_config` is never consulted.

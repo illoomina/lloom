@@ -1,21 +1,54 @@
-//! The routed matvec's union form (`LLOOM_QMV_ID_UNION`, the wrappers'
-//! function constant 917): over two or more rows, the threadgroup of the
+//! The routed matvec's union form (`kernels.quant_matvec.routed_union`,
+//! `LLOOM_QMV_ID_UNION`): over two to eight rows, the threadgroup of the
 //! first plane naming a slot runs every plane naming it, so a slot the rows
-//! share is read once. Every plane must be the incumbent's, bit for bit —
-//! the single launch (`kernel_mul_mv_id`), the f16 store
-//! (`kernel_mul_mv_id_f16`) and the gate|up pair (`kernel_mul_mv_id2`) — and
+//! share is read once. It is the routed row axis at capacity 1
+//! (`kernel_mul_mv_id{,2}_<stem>_<triple>_r1`, `docs/tuning.md` §13.5w), and
+//! under `deterministic` (pinned here: the union is the one routed form the
+//! contract admits) every plane must be the per-plane launch's, bit for bit —
+//! the single launch, the f16 store and the gate|up pair — and
 //! within the dense reference's tolerance (`moe_routed_metal`'s, which pins
 //! the incumbent). The slot ids repeat across rows and within a row (a missing
 //! expert maps to slot 0 on the streamed tier's device plan), so the union
 //! runs more than one plane in a threadgroup on every shape.
 //!
-//! Its own binary: the arm is process-wide (`set_qmv_id_union`).
+//! Its own process (nextest's): the contract and the arm are process-wide
+//! (`set_qmv_id_union`).
 #![cfg(feature = "metal")]
 
 use half::f16;
 use lloom_tensor::quantized::{GgmlDType, PairOrder, QStorage, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::borrow::Cow;
+
+fn device() -> Result<Device> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut t = lloom_tensor::tuning::Tuning::default();
+        t.contract.profile = "deterministic".into();
+        t.instrument.profile = true;
+        let _ = lloom_tensor::tuning::install(t);
+    });
+    assert!(!lloom_tensor::tuning::contract().is_fast());
+    Device::new_metal(0)
+}
+
+/// The kernels a closure ran whose names carry the union's suffix.
+fn union_kernels(dev: &Device, f: impl FnOnce() -> Result<()>) -> Result<u64> {
+    dev.synchronize()?;
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("a window");
+    f()?;
+    dev.synchronize()?;
+    Ok(window
+        .close()
+        .iter()
+        .filter(|(l, _)| l.starts_with("kernel_mul_mv_id") && l.ends_with("_r1"))
+        .map(|(_, n)| *n)
+        .sum())
+}
 
 fn lcg(seed: u32) -> impl FnMut() -> u8 {
     let mut state = seed.wrapping_mul(2654435761).wrapping_add(12345);
@@ -125,7 +158,7 @@ const SHAPE: (usize, usize, usize) = (6, 40, 256);
 /// One kind at one activation dtype: the single launch on the gate shape
 /// (`in_dim1 = 1`) and the down shape (`in_dim1 = topk`), and the pair.
 fn union_is_the_incumbent(dtype: GgmlDType, act: DType) -> Result<()> {
-    let dev = Device::new_metal(0)?;
+    let dev = device()?;
     let (e, n, k) = SHAPE;
     let (batch, topk) = (4usize, 3usize);
     let (wg, refg) = stacked(dtype, (e, n, k), 11, &dev)?;
@@ -144,19 +177,29 @@ fn union_is_the_incumbent(dtype: GgmlDType, act: DType) -> Result<()> {
             "the incumbent took the union"
         );
         lloom_tensor::kernels::set_qmv_id_union(true);
-        let uni = wg.indexed_moe_forward(&xd, &ids)?;
-        let (uni_g, uni_u) = wg.indexed_moe_forward_pair(&wu, &xd, &ids)?;
+        let mut out = None;
+        let in_census = union_kernels(&dev, || {
+            out = Some((
+                wg.indexed_moe_forward(&xd, &ids)?,
+                wg.indexed_moe_forward_pair(&wu, &xd, &ids)?,
+            ));
+            Ok(())
+        })?;
+        let (uni, (uni_g, uni_u)) = out.unwrap();
         let launched = lloom_tensor::kernels::qmv_id_union_launches() - before;
         lloom_tensor::kernels::set_qmv_id_union(false);
-        // Non-vacuity: the single launch is always the union's, and the
-        // pair's launches are unions iff their grid is order 0's — the only
-        // one the union body decodes. `PairOrder::Split` is TWO launches,
-        // one per half, each on `OneHalf` (order 0); the other orders are
-        // one launch, a union only on `half` / `half-cmp`.
+        // Non-vacuity: the single launch is the union's, and so is the pair
+        // on every grid order (the row kernel decodes each order's grid);
+        // `PairOrder::Split` is TWO launches, one per half.
         let pair_unions = match PairOrder::configured() {
             PairOrder::Split => 2,
-            o => u64::from(o.grid().is_some_and(|g| g.order() == 0)),
+            _ => 1,
         };
+        assert_eq!(
+            in_census,
+            launched,
+            "{dtype:?} {act:?} in_dim1={in_dim1}: the counter and the census's `_r1` kernels disagree"
+        );
         assert_eq!(
             launched,
             1 + pair_unions,
@@ -207,7 +250,7 @@ fn union_is_the_incumbent(dtype: GgmlDType, act: DType) -> Result<()> {
 /// One launch of one row is never the union's: nothing to share.
 #[test]
 fn a_one_row_launch_is_the_incumbents() -> Result<()> {
-    let dev = Device::new_metal(0)?;
+    let dev = device()?;
     let (w, _) = stacked(GgmlDType::Q4K, SHAPE, 3, &dev)?;
     let ids = Tensor::from_vec(vec![5u32, 2, 1], (1, 3), &Device::Cpu)?.to_device(&dev)?;
     let x = activations((1, 1, SHAPE.2), 0.1)?.to_device(&dev)?;
@@ -225,7 +268,7 @@ fn a_one_row_launch_is_the_incumbents() -> Result<()> {
 /// one after another.
 #[test]
 fn a_launch_past_the_union_cap_is_the_incumbents() -> Result<()> {
-    let dev = Device::new_metal(0)?;
+    let dev = device()?;
     let (w, _) = stacked(GgmlDType::Q4K, SHAPE, 3, &dev)?;
     let rows = lloom_tensor::kernels::MV_ID_UNION_MAX_ROWS + 1;
     let ids: Vec<u32> = (0..rows * 3).map(|i| (i % 6) as u32).collect();

@@ -36,10 +36,8 @@
 //! path is not (`CONTRIBUTING.md` §3.1, §2.3.8a). This also keeps the file
 //! runnable with no `metal` feature, which is the build §14.1 gates on.
 
+use lloom::models::lfm2_dspark::{projection_params, DSparkProjection, CHECKPOINT_DTYPE};
 use lloom_tensor::{DType, Device, Result, Tensor};
-use lloom::models::lfm2_dspark::{
-    projection_params, DSparkProjection, CHECKPOINT_DTYPE,
-};
 
 /// Deliberately non-square and small enough to hand-compute: 3 taps of width 4
 /// project to width 4 through an `fc` of `[4, 12]`.

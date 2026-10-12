@@ -74,7 +74,7 @@ impl Rig {
     /// encoder's binding, then the kernel variants.
     fn begin(&self) {
         self.cmds.eos_gate().begin(&self.device).unwrap();
-        self.cmds.bind_eos_gate_current();
+        self.cmds.bind_eos_gate_current().unwrap();
         self.kernels.set_eos_gated(true);
     }
 

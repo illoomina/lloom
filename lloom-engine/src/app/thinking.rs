@@ -67,6 +67,26 @@ pub fn set_kwarg(engine: &dyn Served, want: Option<bool>, kwargs: &mut Map<Strin
     }
 }
 
+/// Where the turn checkpoint goes in a prompt rendered with `kwargs` and
+/// passed through the thinking switch `want`: the length of the generation
+/// prompt the ids end with (the load-time constant,
+/// `Served::generation_prompt`), so the prefill leaves its checkpoint at the
+/// generation prompt's start — the position the next turn's render keeps
+/// (`sequence-reuse-design.md` §2.3b). 0 — no hint, the next turn
+/// prefills — where the ids do not end with it.
+pub fn checkpoint_tail(
+    engine: &dyn Served,
+    kwargs: &Map<String, Value>,
+    want: Option<bool>,
+    ids: &[u32],
+) -> usize {
+    let kwarg = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
+    engine
+        .generation_prompt(kwarg, want)
+        .filter(|g| !g.is_empty() && ids.ends_with(g))
+        .map_or(0, |g| g.len())
+}
+
 /// Apply `want` to a rendered and encoded prompt: off closes a block the
 /// prompt leaves open (the end marker appended), on requires one open. `Err`
 /// says why thinking on cannot apply.

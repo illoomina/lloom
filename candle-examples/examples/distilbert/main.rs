@@ -3,15 +3,13 @@ extern crate intel_mkl_src;
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
-use lloom::models::distilbert::{
-    Config, DistilBertForMaskedLM, DistilBertModel, DTYPE,
-};
+use lloom::models::distilbert::{Config, DistilBertForMaskedLM, DistilBertModel, DTYPE};
 
 use anyhow::{Context, Error as E, Result};
 use candle::{Device, Tensor};
-use lloom::nn::VarBuilder;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 

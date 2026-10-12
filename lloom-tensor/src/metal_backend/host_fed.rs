@@ -111,19 +111,22 @@ impl HostFedRing {
             .as_ref()
             .newSharedEvent()
             .ok_or_else(|| crate::Error::Msg("newSharedEvent returned nil".into()))?;
+        let bytes = len
+            .checked_mul(DType::F32.size_in_bytes())
+            .ok_or_else(|| crate::Error::Msg("HostFedRing byte size overflow".into()))?;
         let mut buffers = Vec::with_capacity(slots);
         let mut tensors = Vec::with_capacity(slots);
         for _ in 0..slots {
-            let buf = device.new_persistent_shared(len * DType::F32.size_in_bytes())?;
+            let buf = device.new_persistent_shared(bytes)?;
             if buf.contents().is_null() {
                 crate::bail!("HostFedRing: a Shared buffer with no CPU mapping")
             }
-            let storage = crate::Storage::Metal(super::MetalStorage::new(
+            let storage = crate::Storage::Metal(super::MetalStorage::new_allocated(
                 BufferHandle::clone(&buf),
                 device.clone(),
                 len,
                 DType::F32,
-            ));
+            )?);
             tensors.push(crate::tensor::from_storage(
                 storage,
                 len,

@@ -12,9 +12,9 @@ use lloom::models::recurrent_gemma::{Config, Model as BModel};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -293,10 +293,7 @@ fn main() -> Result<()> {
         DType::F32
     };
     let model = if args.quantized {
-        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-            &filenames[0],
-            &device,
-        )?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&filenames[0], &device)?;
         Model::Q(QModel::new(&config, vb.pp("model"))?)
     } else {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };

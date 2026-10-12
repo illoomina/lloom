@@ -116,17 +116,14 @@ jobs:
       # lloom-tensor 284 + the 1 known red; lloom 581; lloom-engine 34 (+ the
       # serve tests).
       #
-      # lloom-tensor's known red is the last of the three #750 names (a
-      # parser whose refusals only exist with `metal`, `tuning.rs`). Each is
-      # removed here in the PR that makes it pass -- the gate fails on a listed
-      # test that passes, so a fixed test cannot stay silently listed.
+      # The CutPolicy parser is shared with CPU builds (PR #957), so the
+      # former parser red is now required to pass, not allowlisted.
       - name: lloom-tensor tests (no metal)
         env:
           LLOOM_CI_REGISTRY: /home/runner/.cargo/registry
           LLOOM_CI_TARGET: ${{ github.workspace }}/target
         run: >-
           .github/ci/in-container.sh -- cpu-tests.sh
-          --known-red lloom-tensor::tuning::tests::the_parsers_refuse_what_the_sites_refused
           lloom-tensor 176
 
       # `serve` is on so #938's option-spelling tests run (lloom-engine's

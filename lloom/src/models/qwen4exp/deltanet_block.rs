@@ -634,10 +634,10 @@ impl<P: Profile> GatedDeltaNet<P> {
         Ok(Some(out))
     }
 
-    /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]` (Kernel B), the
-    /// same composition as [`Self::decode`] with the conv over the chunk and
-    /// the chunkwise recurrence; leaves the state channels where `seq` decode
-    /// steps would (position by position, to fp32 reorder).
+    /// The chunked prefill over `x [1, seq, hidden]` (Kernel B): the stems,
+    /// the conv against the carried window, the chunkwise recurrence from
+    /// the layer's `S`, the gated norm and the out-proj; the window and `S`
+    /// left where `seq` decode steps would leave them.
     pub fn prefill(
         &self,
         x: &Tensor,
@@ -645,9 +645,91 @@ impl<P: Profile> GatedDeltaNet<P> {
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
     ) -> Result<Tensor> {
-        if let Some(out) = self.prefill_fused(x, l, s_state, conv_state)? {
+        if let Some(out) = self.prefill_fused_at(x, l, s_state, conv_state, None)? {
             return Ok(out);
         }
+        self.prefill_composed_at(x, l, s_state, conv_state, None)
+    }
+
+    /// f32 elements a turn checkpoint of one layer's recurrent state holds:
+    /// `(S [d_k, d_v, h_v], the conv window [C, k])`.
+    pub fn checkpoint_parts(&self) -> (usize, usize) {
+        (
+            self.dims.d_k * self.dims.d_v * self.dims.h_v,
+            self.conv_channels * self.conv.k(),
+        )
+    }
+
+    /// Leave the layer's state as it stands in `into` (zeros where nothing
+    /// was written).
+    pub fn store_checkpoint(
+        &self,
+        l: usize,
+        s_state: &RecurrentState,
+        conv_state: &RecurrentState,
+        dev: &lloom_tensor::Device,
+        into: &GdnCheckpoint<'_>,
+    ) -> Result<()> {
+        let f32 = lloom_tensor::DType::F32;
+        let dims = self.dims;
+        let s = match s_state.get(l) {
+            Some(s) => s.clone(),
+            None => Tensor::zeros((dims.d_k, dims.d_v, dims.h_v), f32, dev)?,
+        };
+        let conv = match conv_state.get(l) {
+            Some(w) => w.clone(),
+            None => Tensor::zeros((self.conv_channels, self.conv.k()), f32, dev)?,
+        };
+        into.store(&s, &conv)
+    }
+
+    /// [`Self::prefill`] that also leaves, in `into`, the state after the
+    /// chunk's first `rows` positions — a turn checkpoint inside the pass
+    /// (`sequence-reuse-design.md` §2.3b). `rows == seq` is the state the
+    /// pass leaves; `rows == 0` the state before it; in between, the
+    /// recurrence is run a second time over the prefix from the same `S` —
+    /// the stems and the prologue once, bit for bit what a pass of `rows`
+    /// positions leaves — and the pass itself is unchanged.
+    pub fn prefill_checkpointing(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+        rows: usize,
+        into: &GdnCheckpoint<'_>,
+    ) -> Result<Tensor> {
+        let seq = x.dim(1)?;
+        if rows > seq {
+            lloom_tensor::bail!("deltanet checkpoint: {rows} rows of a {seq}-position chunk")
+        }
+        if rows == 0 {
+            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
+            return self.prefill(x, l, s_state, conv_state);
+        }
+        if rows == seq {
+            let out = self.prefill(x, l, s_state, conv_state)?;
+            self.store_checkpoint(l, s_state, conv_state, x.device(), into)?;
+            return Ok(out);
+        }
+        let at = Some((rows, into));
+        if let Some(out) = self.prefill_fused_at(x, l, s_state, conv_state, at)? {
+            return Ok(out);
+        }
+        self.prefill_composed_at(x, l, s_state, conv_state, at)
+    }
+
+    /// The composed prefill (the reference on every backend), with the
+    /// checkpoint `at` (rows, where) computed from the pre-pass state before
+    /// the pass writes it.
+    fn prefill_composed_at(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+        at: Option<(usize, &GdnCheckpoint<'_>)>,
+    ) -> Result<Tensor> {
         let dims = self.dims;
         let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
         let (b, seq, _) = x.dims3()?;
@@ -674,7 +756,6 @@ impl<P: Profile> GatedDeltaNet<P> {
             self.conv_channels,
             self.conv.k(),
         )?;
-        conv_state.write(l, new_win)?;
         let conv_out = ops::silu(&conv_out)?; // [seq, conv_channels]
 
         let q = conv_out
@@ -692,7 +773,32 @@ impl<P: Profile> GatedDeltaNet<P> {
         let k = gqa_expand_seq::<false>(&k, h_k, h_v)?;
         let q = q_scale(&q, d_k)?;
 
+        if let Some((rows, into)) = at {
+            // The prefix's own recurrence from the same `S`: what a pass of
+            // `rows` positions computes, the rows being per-position
+            // functions of the same inputs.
+            let win_r = crate::nn::short_conv::window_after(
+                &qkv,
+                conv_state.get(l),
+                self.conv_channels,
+                self.conv.k(),
+                rows,
+            )?;
+            let (_, s_r) = chunk_forward(
+                dims,
+                &q.narrow(0, 0, rows)?,
+                &k.narrow(0, 0, rows)?,
+                &v.narrow(0, 0, rows)?,
+                &g.narrow(0, 0, rows)?,
+                &beta.narrow(0, 0, rows)?,
+                s_state.get(l),
+                CHUNK_SIZE,
+            )?;
+            into.store(&s_r, &win_r)?;
+        }
+
         let (o, new_s) = chunk_forward(dims, &q, &k, &v, &g, &beta, s_state.get(l), CHUNK_SIZE)?;
+        conv_state.write(l, new_win)?;
         s_state.write(l, new_s)?;
 
         let o_flat = o.reshape((1, seq, self.value_dim))?;
@@ -702,8 +808,6 @@ impl<P: Profile> GatedDeltaNet<P> {
         self.ssm_out.forward(&gated)
     }
 
-    /// GatedRMSNorm over the value-head dim with the `ssm_norm` weight. `o` is
-    /// `[1, 1, value_dim]`; normalize per value-head (over d_v) then scale.
     /// [`Self::prefill`] as launches (Metal, f32, `d_k == d_v`): the four
     /// projections; `kernels::GdnGate` (g, β chunked); `kernels::GdnPrefillPrologue`
     /// (the conv against the window, SiLU, the split, the L2 norms, the GQA
@@ -714,21 +818,21 @@ impl<P: Profile> GatedDeltaNet<P> {
     /// on transposed VIEWS (the gemm takes the stride); the fused inverse;
     /// the chunk loop as `chunk_forward`'s; `kernels::GdnChunkEpilogue` (the
     /// gated RMS norm read straight from the head-first output). `None` where
-    /// the composed path applies — which stays the reference.
-    fn prefill_fused(
+    /// the composed path applies — which stays the reference. The checkpoint
+    /// `at` (rows, where) runs the prologue and the recurrence a second time
+    /// over the prefix, from the same window and `S`, before the pass writes
+    /// them.
+    fn prefill_fused_at(
         &self,
         x: &Tensor,
         l: usize,
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
+        at: Option<(usize, &GdnCheckpoint<'_>)>,
     ) -> Result<Option<Tensor>> {
-        use super::deltanet::{unit_lower_inverse, CHUNK_SIZE};
-        use super::kernels::{
-            fused_off, GdnChunkDecay, GdnChunkEpilogue, GdnChunkScale, GdnConvWindow, GdnGate,
-            GdnPrefillPrologue,
-        };
+        use super::kernels::{fused_off, GdnChunkEpilogue, GdnConvWindow};
         let dims = self.dims;
-        let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let (d, h_v) = (dims.d_k, dims.h_v);
         let (b, seq, _) = x.dims3()?;
         if fused_off()
             || !x.device().is_metal()
@@ -742,14 +846,14 @@ impl<P: Profile> GatedDeltaNet<P> {
         }
         let dev = x.device();
         let f32 = lloom_tensor::DType::F32;
-        let cs = CHUNK_SIZE;
-        let nc = seq.div_ceil(cs);
-        let padded = nc * cs;
-        let n = h_v * nc * cs;
         let kk = self.conv.k();
         let win = match conv_state.get(l) {
             Some(w) => w.to_dtype(f32)?.contiguous()?,
             None => Tensor::zeros((self.conv_channels, kk), f32, dev)?,
+        };
+        let s_in = match s_state.get(l) {
+            Some(s) => s.to_dtype(f32)?.permute((2, 0, 1))?.contiguous()?, // [h_v, d, d]
+            None => Tensor::zeros((h_v, d, d), f32, dev)?,
         };
 
         // The projections.
@@ -774,9 +878,80 @@ impl<P: Profile> GatedDeltaNet<P> {
             .to_dtype(f32)?
             .reshape((seq, h_v))?;
 
+        if let Some((rows, into)) = at {
+            let qkv_r = qkv.narrow(0, 0, rows)?.contiguous()?;
+            let win_r = win.apply_op1_no_bwd(&GdnConvWindow {
+                seq: rows,
+                channels: self.conv_channels,
+                kk,
+                qkv: qkv_r.clone(),
+            })?;
+            let (_, s_r, _) = self.fused_recurrence(
+                &qkv_r,
+                &alpha.narrow(0, 0, rows)?.contiguous()?,
+                &beta.narrow(0, 0, rows)?.contiguous()?,
+                &win,
+                &s_in,
+                rows,
+            )?;
+            into.store(&s_r.permute((1, 2, 0))?.contiguous()?, &win_r)?;
+        }
+
+        let new_win = win.apply_op1_no_bwd(&GdnConvWindow {
+            seq,
+            channels: self.conv_channels,
+            kk,
+            qkv: qkv.clone(),
+        })?;
+        let (o, s, padded) = self.fused_recurrence(&qkv, &alpha, &beta, &win, &s_in, seq)?;
+        conv_state.write(l, new_win)?;
+        s_state.write(l, s.permute((1, 2, 0))?.contiguous()?)?;
+        let out = o.apply_op2_no_bwd(
+            &z,
+            &GdnChunkEpilogue {
+                seq,
+                padded,
+                d,
+                h_v,
+                eps: self.norm_eps as f32,
+                gamma: self.ssm_norm.to_dtype(f32)?,
+                gate: self.gate,
+            },
+        )?; // [seq, h_v·d]
+        Ok(Some(self.ssm_out.forward(&out.reshape((
+            1,
+            seq,
+            self.value_dim,
+        ))?)?))
+    }
+
+    /// The fused chunked recurrence over `seq` positions: the prologue over
+    /// `qkv [seq, C]` against `win [C, kk]`, the gate over `alpha` / `beta
+    /// [seq, h_v]`, the decay and WY form, the inter-chunk scan from `s_in
+    /// [h_v, d, d]` → `(o [h_v, padded, d], S after [h_v, d, d], padded)`.
+    fn fused_recurrence(
+        &self,
+        qkv: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        win: &Tensor,
+        s_in: &Tensor,
+        seq: usize,
+    ) -> Result<(Tensor, Tensor, usize)> {
+        use super::deltanet::{unit_lower_inverse, CHUNK_SIZE};
+        use super::kernels::{GdnChunkDecay, GdnChunkScale, GdnGate, GdnPrefillPrologue};
+        let dims = self.dims;
+        let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let f32 = lloom_tensor::DType::F32;
+        let cs = CHUNK_SIZE;
+        let nc = seq.div_ceil(cs);
+        let padded = nc * cs;
+        let n = h_v * nc * cs;
+        let kk = self.conv.k();
+
         // The chunked operands.
         let gb = alpha.apply_op2_no_bwd(
-            &beta,
+            beta,
             &GdnGate {
                 seq,
                 h_v,
@@ -788,7 +963,7 @@ impl<P: Profile> GatedDeltaNet<P> {
         )?; // [2, h_v, nc, cs]
         let g_ch = gb.narrow(0, 0, 1)?.reshape((h_v, nc, cs))?;
         let pack = qkv.apply_op3_no_bwd(
-            &win,
+            win,
             self.conv.weight(),
             &GdnPrefillPrologue {
                 seq,
@@ -802,13 +977,6 @@ impl<P: Profile> GatedDeltaNet<P> {
                 q_scale: 1.0 / (d as f32).sqrt(),
             },
         )?; // [3, h_v, nc, cs, d]
-        let new_win = win.apply_op1_no_bwd(&GdnConvWindow {
-            seq,
-            channels: self.conv_channels,
-            kk,
-            qkv: qkv.clone(),
-        })?;
-        conv_state.write(l, new_win)?;
         let decay_op = GdnChunkDecay { h_v, nc, cs };
         let small = g_ch.apply_op1_no_bwd(&decay_op)?; // flat
         let (_, _, o_last, o_decay, o_strict, _) = decay_op.offsets();
@@ -835,10 +1003,7 @@ impl<P: Profile> GatedDeltaNet<P> {
         let kq = q.matmul(&k_t)?.mul(&decay)?; // [h_v, nc, cs, cs]
         let kg_t = kg.transpose(2, 3)?; // [h_v, nc, d, cs] view
 
-        let mut s = match s_state.get(l) {
-            Some(s) => s.to_dtype(f32)?.permute((2, 0, 1))?.contiguous()?, // [h_v, d, d]
-            None => Tensor::zeros((h_v, d, d), f32, dev)?,
-        };
+        let mut s = s_in.clone();
         // The inter-chunk recurrence as one launch (`kernels::GdnChunkScan`);
         // the host loop below is its A/B arm and the CPU's.
         let scanned =
@@ -885,26 +1050,11 @@ impl<P: Profile> GatedDeltaNet<P> {
             None if nc == 1 => outs.pop().expect("one chunk"),
             None => Tensor::cat(&outs, 1)?,
         }; // [h_v, padded, d]
-        let out = o.apply_op2_no_bwd(
-            &z,
-            &GdnChunkEpilogue {
-                seq,
-                padded,
-                d,
-                h_v,
-                eps: self.norm_eps as f32,
-                gamma: self.ssm_norm.to_dtype(f32)?,
-                gate: self.gate,
-            },
-        )?; // [seq, h_v·d]
-        s_state.write(l, s.permute((1, 2, 0))?.contiguous()?)?;
-        Ok(Some(self.ssm_out.forward(&out.reshape((
-            1,
-            seq,
-            self.value_dim,
-        ))?)?))
+        Ok((o, s, padded))
     }
 
+    /// GatedRMSNorm over the value-head dim with the `ssm_norm` weight. `o` is
+    /// `[1, 1, value_dim]`; normalize per value-head (over d_v) then scale.
     fn gated_rms_norm(&self, o: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = o.dims3()?;
         let (h_v, d_v) = (self.dims.h_v, self.dims.d_v);
@@ -920,6 +1070,16 @@ impl<P: Profile> GatedDeltaNet<P> {
     /// The head dim, for the caller (used nowhere yet; keeps the API discoverable).
     pub fn value_dim(&self) -> usize {
         self.value_dim
+    }
+
+    /// Bytes one sequence's state takes over `phases` buffers per channel —
+    /// the `[d_k, d_v, h_v]` recurrence and the conv window, f32; two
+    /// unpooled (the slab and the spare a decode step writes into), the
+    /// ring's phases pooled.
+    pub fn state_bytes(&self, phases: usize) -> usize {
+        let s = self.dims.d_k * self.dims.d_v * self.dims.h_v;
+        let conv = self.conv_channels * self.conv.k();
+        phases * (s + conv) * std::mem::size_of::<f32>()
     }
 
     /// One layer's state on its own phase rings (`StatePool::with_phases`,
@@ -1021,6 +1181,36 @@ pub struct GdnState {
     pub layer: usize,
     pub s: RecurrentState,
     pub conv: RecurrentState,
+}
+
+/// Where a turn checkpoint of one layer's recurrent state is kept: views
+/// of a ring frame, `S` as `[d_k · d_v · h_v]` and the conv window as
+/// `[C · k]` f32, written in place by [`GatedDeltaNet::prefill_checkpointing`]
+/// and read back by [`GatedDeltaNet::restore_checkpoint`].
+#[derive(Debug, Clone, Copy)]
+pub struct GdnCheckpoint<'a> {
+    pub s: &'a Tensor,
+    pub conv: &'a Tensor,
+}
+
+impl GdnCheckpoint<'_> {
+    /// Copy `s [d_k, d_v, h_v]` and `conv [C, k]` into the frame, as f32.
+    pub fn store(&self, s: &Tensor, conv: &Tensor) -> Result<()> {
+        let f32 = lloom_tensor::DType::F32;
+        let s = s.to_dtype(f32)?.contiguous()?.flatten_all()?;
+        let conv = conv.to_dtype(f32)?.contiguous()?.flatten_all()?;
+        if s.elem_count() != self.s.elem_count() || conv.elem_count() != self.conv.elem_count() {
+            lloom_tensor::bail!(
+                "deltanet checkpoint: S {} / window {} elements into a frame of {} / {}",
+                s.elem_count(),
+                conv.elem_count(),
+                self.s.elem_count(),
+                self.conv.elem_count()
+            )
+        }
+        self.s.slice_set(&s, 0, 0)?;
+        self.conv.slice_set(&conv, 0, 0)
+    }
 }
 
 /// The Gated DeltaNet as a level-0 block (`nn::blocks::Mixer`): one

@@ -9,11 +9,11 @@
 //! at `Checkpoint` because the quantized model is a different type that does not
 //! implement `Model` (documented on `Checkpoint::var_builder`).
 
+use lloom::hub::{Checkpoint, Hub, LocalDir, Pretrained, TokenizerFromCheckpoint, Weights};
+use lloom::nn::{Model, VarBuilder};
 use lloom_tensor::quantized::gguf_file;
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
-use lloom::hub::{Checkpoint, Hub, LocalDir, Pretrained, TokenizerFromCheckpoint, Weights};
-use lloom::nn::{Model, VarBuilder};
 use std::collections::HashMap;
 
 /// A model that reads exactly one tensor, so `from_weights` proves the

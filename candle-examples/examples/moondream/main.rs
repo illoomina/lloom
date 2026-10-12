@@ -306,10 +306,7 @@ async fn main() -> anyhow::Result<()> {
         DType::F32
     };
     let model = if args.quantized {
-        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-            &model_file,
-            &device,
-        )?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&model_file, &device)?;
         let model = quantized_moondream::Model::new(&config, vb)?;
         Model::Quantized(model)
     } else {

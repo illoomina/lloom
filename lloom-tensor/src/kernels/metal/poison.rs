@@ -245,7 +245,12 @@ pub use imp::{counters, is_poisoned, poison, unpoison, ENABLED};
 /// dropped *and* the GPU epoch it was released in completed (§6.3b), which is
 /// strictly stronger than "the CPU is done with it".
 pub unsafe fn poison_buffer(buffer: &super::Buffer) {
+    // Do not evaluate Objective-C accessors for an inert diagnostic hook.
+    // In debug builds their signature verification itself can allocate.
+    #[cfg(feature = "asan-poison")]
     poison(buffer.data(), buffer.length());
+    #[cfg(not(feature = "asan-poison"))]
+    let _ = buffer;
 }
 
 /// Clears a buffer's mark as it is handed to a caller.
@@ -255,7 +260,10 @@ pub unsafe fn poison_buffer(buffer: &super::Buffer) {
 /// As [`poison_buffer`]. Must be called before the caller can observe the
 /// buffer, or the caller's first legitimate access is reported.
 pub unsafe fn unpoison_buffer(buffer: &super::Buffer) {
+    #[cfg(feature = "asan-poison")]
     unpoison(buffer.data(), buffer.length());
+    #[cfg(not(feature = "asan-poison"))]
+    let _ = buffer;
 }
 
 #[cfg(test)]

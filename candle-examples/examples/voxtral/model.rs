@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use anyhow::{Context, Error, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use candle::{utils, DType, Device, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::models::voxtral;
 use lloom::models::voxtral::{
     VoxtralCache, VoxtralConfig, VoxtralEncoderConfig, VoxtralForConditionalGeneration,
     VoxtralGenerationConfig, VoxtralLlamaConfig as LlamaConfig,
 };
+use lloom::nn::VarBuilder;
 use serde_json;
 
 use std::io::Cursor;

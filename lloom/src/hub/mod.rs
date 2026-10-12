@@ -28,8 +28,8 @@
 //!
 //! Data is interoperable, code is not: no `trust_remote_code`, no Python.
 
-use lloom_tensor::{DType, Device, Result};
 use crate::nn::{Model, VarBuilder};
+use lloom_tensor::{DType, Device, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -521,7 +521,8 @@ fn fetch_safetensors_shards(repo: &hf_hub::api::sync::ApiRepo, dir: &Path) -> Re
             }
         }
     } else {
-        repo.get("model.safetensors").map_err(lloom_tensor::Error::wrap)?;
+        repo.get("model.safetensors")
+            .map_err(lloom_tensor::Error::wrap)?;
     }
     Ok(())
 }
@@ -546,7 +547,9 @@ fn gguf_string(content: &lloom_tensor::quantized::gguf_file::Content, key: &str)
 /// Lift the GGUF's scalar and short-array metadata into a JSON object, so a
 /// `Checkpoint` from either format exposes its config the same way. Tensor data
 /// is not touched — only the metadata table.
-fn gguf_metadata_to_json(content: &lloom_tensor::quantized::gguf_file::Content) -> serde_json::Value {
+fn gguf_metadata_to_json(
+    content: &lloom_tensor::quantized::gguf_file::Content,
+) -> serde_json::Value {
     use lloom_tensor::quantized::gguf_file::Value as GV;
     fn conv(v: &GV) -> serde_json::Value {
         use serde_json::Value as J;

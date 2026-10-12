@@ -20,6 +20,8 @@ mod block_traits;
 mod cpu_flash_attn;
 mod cpu_numerics_probe;
 mod decode_driver_tests;
+mod decoder_memory;
+mod decoder_turn_checkpoint;
 mod dspark_decode_identity;
 mod emulated_bf16_load;
 mod fixture_switch;
@@ -116,6 +118,7 @@ mod qwen4exp_streamed_identity;
 mod qwen4exp_streamed_metal;
 mod qwen4exp_tiny_determinism;
 mod qwen4exp_tiny_metal_blocks;
+mod qwen4exp_turn_checkpoint;
 mod qwen4exp_verify_window;
 mod qwen4exp_walk;
 mod qwen4exp_walk_census;
@@ -154,8 +157,14 @@ fn every_test_file_is_a_module() {
     let mut missing = Vec::new();
     let mut files = 0;
     for entry in std::fs::read_dir(dir).expect("tests/ is readable") {
-        let name = entry.expect("an entry").file_name().into_string().expect("utf-8");
-        let Some(stem) = name.strip_suffix(".rs") else { continue };
+        let name = entry
+            .expect("an entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8");
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
         if stem == "main" || own.contains(&stem) {
             continue;
         }

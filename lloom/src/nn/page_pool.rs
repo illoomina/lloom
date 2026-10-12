@@ -203,7 +203,11 @@ mod tests {
         let dev = Device::Cpu;
         let mut p = PagePool::new(4, 4, 2, 5, &dev);
         p.pages_mut().append(0, 8).unwrap();
-        assert_eq!(p.pages_short([(0, 8)]), 0, "two free pages take the next eight");
+        assert_eq!(
+            p.pages_short([(0, 8)]),
+            0,
+            "two free pages take the next eight"
+        );
         assert_eq!(p.pages_short([(0, 12)]), 1);
         let freed = p.release(0);
         assert_eq!(freed.len(), 2);

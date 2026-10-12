@@ -6,9 +6,9 @@ extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, IndexOp, Tensor};
-use lloom::nn::{ops::softmax, VarBuilder};
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::{ops::softmax, VarBuilder};
 use rand::{distr::Distribution, SeedableRng};
 use tokenizers::Tokenizer;
 
@@ -538,10 +538,7 @@ pub fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let model = if args.quantized {
-        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-            &weights_filename,
-            &device,
-        )?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&weights_filename, &device)?;
         Model::Quantized(m::quantized_model::Whisper::load(&vb, config.clone())?)
     } else {
         let vb =

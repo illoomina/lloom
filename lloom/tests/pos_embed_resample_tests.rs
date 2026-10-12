@@ -33,8 +33,8 @@
 //! Goldens from torch 2.14.0 via
 //! `design/measurements/issue-609-raw/make_test_golden.py`.
 
-use lloom_tensor::{Device, Result, Tensor};
 use lloom::utils::{interpolate2d_bilinear_antialias, resize_pos_embed_antialias};
+use lloom_tensor::{Device, Result, Tensor};
 
 #[rustfmt::skip]
 const SRC: [f32; 128] = [
@@ -314,9 +314,9 @@ fn host_and_tensor_entry_points_agree() -> Result<()> {
 /// the model reproduces the bilinear one.
 #[test]
 fn siglip_vision_model_resamples_position_grid_with_antialiased_bilinear() -> Result<()> {
-    use lloom_tensor::DType;
-    use lloom::nn::{Module, VarBuilder};
     use lloom::models::siglip::{VisionConfig, VisionModel};
+    use lloom::nn::{Module, VarBuilder};
+    use lloom_tensor::DType;
     use std::collections::HashMap;
 
     let dev = Device::Cpu;

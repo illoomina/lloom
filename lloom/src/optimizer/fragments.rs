@@ -398,8 +398,20 @@ mod tests {
         // The quantized matvec's two store blocks: the SiLU, and the product
         // multiplied into its operand's own buffer.
         assert_eq!(
-            (cat[6].name, cat[6].core, cat[6].semantics, cat[6].operand, cat[6].class()),
-            ("quant_silu", Core::Quant, Semantics::Silu, OperandKind::None, NumericClass::Rounding)
+            (
+                cat[6].name,
+                cat[6].core,
+                cat[6].semantics,
+                cat[6].operand,
+                cat[6].class()
+            ),
+            (
+                "quant_silu",
+                Core::Quant,
+                Semantics::Silu,
+                OperandKind::None,
+                NumericClass::Rounding
+            )
         );
         assert_eq!(
             (cat[7].name, cat[7].semantics, cat[7].operand),
@@ -415,7 +427,13 @@ mod tests {
         // in the reorder class; the imported-scale norm and the grouped norm
         // catalogued with the reason they are refused.
         assert_eq!(
-            (cat[8].name, cat[8].core, cat[8].side, cat[8].needs, cat[8].class()),
+            (
+                cat[8].name,
+                cat[8].core,
+                cat[8].side,
+                cat[8].needs,
+                cat[8].class()
+            ),
             (
                 "norm",
                 Core::Gemv,
@@ -429,8 +447,18 @@ mod tests {
         assert_eq!((cat[9].name, cat[9].side), ("rmsnorm", Side::Load));
         assert_eq!(cat[9].refusal, Some(RMSNORM_REFUSAL));
         assert_eq!(
-            (cat[10].name, cat[10].core, cat[10].semantics, cat[10].class()),
-            ("mixed_gnorm", Core::Mixed, Semantics::GroupRmsNorm, NumericClass::BitExact)
+            (
+                cat[10].name,
+                cat[10].core,
+                cat[10].semantics,
+                cat[10].class()
+            ),
+            (
+                "mixed_gnorm",
+                Core::Mixed,
+                Semantics::GroupRmsNorm,
+                NumericClass::BitExact
+            )
         );
         assert_eq!(cat[10].refusal, Some(MIXED_GNORM_REFUSAL));
         let k = kernels();

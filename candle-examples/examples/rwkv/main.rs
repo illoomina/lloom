@@ -11,14 +11,12 @@ use lloom::models::quantized_rwkv_v5::Model as Q5;
 use lloom::models::quantized_rwkv_v6::Model as Q6;
 use lloom::models::rwkv_v5::{Config, Model as M5, State, Tokenizer};
 use lloom::models::rwkv_v6::Model as M6;
-use lloom::models::rwkv_v7::{
-    Config as ConfigV7, Model as M7, ModelVersion, State as StateV7,
-};
+use lloom::models::rwkv_v7::{Config as ConfigV7, Model as M7, ModelVersion, State as StateV7};
 
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 
 const EOS_TOKEN_ID: u32 = 261;
 
@@ -755,9 +753,7 @@ fn main() -> Result<()> {
         let config: Config = serde_json::from_slice(&std::fs::read(config_filename.unwrap())?)?;
         let model = if args.quantized {
             let filename = &filenames[0];
-            let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-                filename, &device,
-            )?;
+            let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
             match args.which {
                 Which::World1b5 | Which::World3b | Which::Eagle7b => {
                     Model::Q5(Q5::new(&config, vb)?)

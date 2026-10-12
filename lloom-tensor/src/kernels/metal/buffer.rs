@@ -1,3 +1,4 @@
+use crate::allocation_owner::{AllocationLease, AllocationOwner};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{MTLBuffer, MTLResource};
@@ -6,9 +7,9 @@ use std::{collections::HashMap, sync::Arc};
 pub type MetalResource = ProtocolObject<dyn MTLResource>;
 pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Buffer {
-    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    raw: AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>>,
 
     /// Byte offset this handle addresses within `raw`.
     ///
@@ -40,31 +41,66 @@ pub struct Buffer {
     /// carries its slot size so `length()` cannot report the whole arena.
     length: Option<usize>,
 
-    /// Whether `contents()` may be trusted at all: false for a Private buffer
-    /// placed in a heap, decided once at construction (see `new`).
+    /// Whether CPU access is permitted by storage mode and the selected
+    /// experimental mapping policy, fixed at construction (see `new`).
     cpu_visible: bool,
+    membership: Option<super::membership::Membership>,
 }
 
 unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
+    /// Legacy unadmitted native handle. External raw retains are not tracked.
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
-        // A Private buffer placed in an `MTLHeap` answers `contents()` with
-        // null plus its heap offset: non-null, not a CPU mapping, and reading
-        // it faults (§6.3k). A Private buffer of its own answers truthfully: a
-        // mapping below 16384 B, null at or above (§15.2 #12a). So heap
-        // placement is what makes the answer untrustworthy, and only it is
-        // overridden.
-        let cpu_visible =
-            raw.storageMode() != objc2_metal::MTLStorageMode::Private || raw.heap().is_none();
+        Self::with_owner(raw, None)
+    }
+
+    /// Additive source-only admitted constructor; callers must provide both
+    /// preallocation admission and native/residency leases before enabling it.
+    pub(crate) fn new_owned(
+        raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+        owner: AllocationOwner,
+    ) -> Buffer {
+        Self::with_owner(raw, Some(owner))
+    }
+
+    pub(crate) fn allocation_owner(&self) -> Option<&AllocationOwner> {
+        self.raw.owner()
+    }
+
+    pub(crate) fn allocation_lease(
+        &self,
+    ) -> AllocationLease<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        self.raw.clone()
+    }
+
+    fn with_owner(
+        raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+        owner: Option<AllocationOwner>,
+    ) -> Buffer {
+        // Private storage has no documented CPU mapping. The experimental
+        // opt-in retains the owned-buffer probe, never the heap-offset value
+        // (which can be non-null without being a CPU address).
+        let cpu_visible = raw.storageMode() != objc2_metal::MTLStorageMode::Private
+            || (crate::tuning::tuning().metal.private_cpu_mapping && raw.heap().is_none());
         super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
         Buffer {
-            raw,
+            raw: AllocationLease::new(raw, owner),
             base_offset: 0,
             length: None,
             cpu_visible,
+            membership: None,
         }
+    }
+
+    pub(crate) fn with_membership(mut self, membership: super::membership::Membership) -> Self {
+        assert!(
+            self.membership.is_none(),
+            "membership identity is minted once"
+        );
+        self.membership = Some(membership);
+        self
     }
 
     /// A handle addressing `base_offset..base_offset + length` of this buffer.
@@ -80,18 +116,24 @@ impl Buffer {
     /// a write to any other. That is conservative rather than unsound: Metal
     /// barriers are resource-granular anyway (§3.5), so a finer key could not
     /// have expressed a narrower edge.
+    ///
+    /// # Panics
+    /// Invalid or overflowing ranges are rejected in every build before native
+    /// handle cloning. The return type is preserved; this is not quota refusal.
     pub fn view(&self, base_offset: usize, length: usize) -> Buffer {
-        debug_assert!(
-            base_offset + length <= self.length(),
-            "arena view {base_offset}..{} runs past its {} byte parent",
-            base_offset + length,
-            self.length()
-        );
+        let absolute = crate::allocation_geometry::checked_view_offset(
+            self.base_offset,
+            self.length(),
+            base_offset,
+            length,
+        )
+        .expect("invalid Buffer::view range");
         Buffer {
             raw: self.raw.clone(),
-            base_offset: self.base_offset + base_offset,
+            base_offset: absolute,
             length: Some(length),
             cpu_visible: self.cpu_visible,
+            membership: self.membership.clone(),
         }
     }
 
@@ -127,6 +169,12 @@ impl Buffer {
         self.length.is_some()
     }
 
+    /// Whether querying a CPU pointer is permitted by the selected policy.
+    /// An experimental Private probe can still return null.
+    pub fn may_be_cpu_mapped(&self) -> bool {
+        self.cpu_visible
+    }
+
     pub fn contents(&self) -> *mut u8 {
         self.data()
     }
@@ -139,12 +187,10 @@ impl Buffer {
     /// being a silent-corruption hazard: `read_to_vec` and every other CPU-side
     /// consumer takes this pointer without knowing whether it holds a view.
     ///
-    /// Null for a Private-storage allocation at or above 16384 B, which has no
-    /// CPU mapping -- unchanged by the offset, since `null + n` is still not
-    /// readable and callers already assert on it. Below that threshold a
-    /// Private allocation *is* mapped, which is `DESIGN.md` §15.2 #12a's
-    /// correction to the older "null for Private" reading. Null, too, for a
-    /// Private buffer placed in a heap, whatever `contents()` returns (`new`).
+    /// Null for Private storage by default, without invoking Metal's CPU
+    /// getter. With `private_cpu_mapping` enabled, non-heap Private buffers
+    /// retain the implementation-dependent mapping probe; heap placements
+    /// remain inaccessible. Shared storage retains the direct-access path.
     ///
     /// # This function's own null check folded away (#366, repaired #454)
     ///
@@ -177,15 +223,15 @@ impl Buffer {
             return base;
         }
         // SAFETY: `base_offset` is within the parent allocation by construction
-        // -- `view` is only called by the arena, with an offset and length that
-        // the plan has already fitted inside the arena buffer.
+        // -- public `view` checks relative and absolute ranges in every build
+        // before constructing metadata; nested views preserve that invariant.
         unsafe { base.add(self.base_offset) }
     }
 
     /// Get the raw pointer to the underlying Metal buffer object.
     /// Used for dependency tracking in the compute encoder.
     pub(crate) fn raw_ptr(&self) -> *const ProtocolObject<dyn MTLBuffer> {
-        Retained::as_ptr(&self.raw)
+        Retained::as_ptr(self.raw.raw())
     }
 
     /// Address of the underlying `MTLBuffer`, as the encoder sees it.
@@ -217,13 +263,34 @@ impl Buffer {
     }
 
     pub fn set_label(&self, label: &str) {
-        self.raw.setLabel(Some(&NSString::from_str(label)))
+        self.raw.raw().setLabel(Some(&NSString::from_str(label)))
     }
 }
 
+// Ownership metadata is not buffer identity. Preserve the pre-token fields.
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+            && self.base_offset == other.base_offset
+            && self.length == other.length
+            && self.cpu_visible == other.cpu_visible
+    }
+}
+impl std::hash::Hash for Buffer {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.raw, state);
+        std::hash::Hash::hash(&self.base_offset, state);
+        std::hash::Hash::hash(&self.length, state);
+        std::hash::Hash::hash(&self.cpu_visible, state);
+    }
+}
+
+/// Borrowed native compatibility view. Independently retaining this raw object
+/// does not retain its Rust accounting lease; admitted native consumers must
+/// retain `allocation_lease()` through actual completion instead.
 impl AsRef<ProtocolObject<dyn MTLBuffer>> for Buffer {
     fn as_ref(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.raw
+        self.raw.raw()
     }
 }
 

@@ -15,12 +15,16 @@
 //! `every_test_file_is_a_module` below reads this directory and this file,
 //! so a file that is not a module here fails the suite instead of silently
 //! not running.
+#[cfg(not(feature = "metal"))]
+use lloom_tensor::retire;
+
 mod bilinear_tests;
 mod conv_tests;
 mod cpu_f16_matmul_accum;
 mod custom_op_tests;
 mod depthwise_conv;
 mod display_tests;
+mod f16_rows_identity;
 mod fp_kind_codes;
 mod gate_contract_pinned;
 mod gate_contract_unpinned;
@@ -34,6 +38,7 @@ mod host_fed_ring;
 mod indexing_tests;
 mod iq3xxs_gguf_read;
 mod iq_metal;
+mod kv_pages_cpu;
 mod layout_tests;
 mod matmul_tests;
 mod metal_arena_lifetime_fuzz;
@@ -56,6 +61,7 @@ mod metal_strided_reduce_repeat_tests;
 mod mmap_advice_installed;
 mod moe_pair_order;
 mod moe_routed_metal;
+mod moe_routed_rows;
 mod moe_routed_union;
 mod options_derive;
 mod pool_tests;
@@ -68,6 +74,7 @@ mod qmatmul_id_mm;
 mod qmatmul_id_mm_arm;
 mod qmatmul_id_mm_k_block;
 mod qmatmul_rows_arm;
+mod qmatmul_rows_ceiling;
 mod qmatmul_rows_default;
 mod qmatmul_rows_timing;
 mod qmatmul_rows_under_fast;
@@ -94,8 +101,14 @@ fn every_test_file_is_a_module() {
     let mut missing = Vec::new();
     let mut files = 0;
     for entry in std::fs::read_dir(dir).expect("tests/ is readable") {
-        let name = entry.expect("an entry").file_name().into_string().expect("utf-8");
-        let Some(stem) = name.strip_suffix(".rs") else { continue };
+        let name = entry
+            .expect("an entry")
+            .file_name()
+            .into_string()
+            .expect("utf-8");
+        let Some(stem) = name.strip_suffix(".rs") else {
+            continue;
+        };
         if stem == "main" || own.contains(&stem) {
             continue;
         }

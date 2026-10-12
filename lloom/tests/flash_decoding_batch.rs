@@ -35,8 +35,8 @@
 //! where it can run without a checkpoint.
 #![cfg(feature = "metal")]
 
-use lloom_tensor::{DType, Device, Result, Tensor};
 use half::f16;
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A deterministic filler. A fixed pattern rather than an RNG: the assertion is
 /// bit-equality between two arms of one run, so what the values *are* does not

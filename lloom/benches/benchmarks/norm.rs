@@ -1,7 +1,7 @@
 use crate::benchmarks::{BenchDevice, BenchDeviceHandler};
-use candle::{DType, Device, Module, Tensor};
-use candle_nn::{LayerNorm, RmsNorm};
 use criterion::{criterion_group, Criterion, Throughput};
+use lloom::nn::{LayerNorm, RmsNorm};
+use lloom_tensor::{DType, Device, Module, Tensor};
 use std::hint::black_box;
 use std::time::Instant;
 

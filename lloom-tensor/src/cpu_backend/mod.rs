@@ -1591,7 +1591,11 @@ impl Map2 for MatMul {
         } else {
             Parallelism::None
         };
-        let (b, m, n, k) = if b_skip == 0 && a_skip == m * k {
+        // Folding batch b and row r must preserve the lhs address:
+        // (b*m+r)*lhs_rs == b*a_skip+r*lhs_rs. A transposed matrix can
+        // have a_skip == m*k without satisfying this row-stack identity.
+        let row_stackable = m.checked_mul(lhs_rs) == Some(a_skip);
+        let (b, m, n, k) = if b_skip == 0 && a_skip == m * k && row_stackable {
             // A batch-invariant rhs lets the batches of lhs stack into the rows of a single
             // (b * m, k) matrix, which the destination already matches row for row.
             // a_skip and c_skip should be updated but step is always 0 so

@@ -714,3 +714,628 @@ mod controlled_loopback {
         drop(origin);
     }
 }
+
+mod managed_origins {
+    use super::*;
+    struct OriginInventory {
+        state: Mutex<OriginInventoryState>,
+    }
+    struct OriginInventoryState {
+        closed: bool,
+        slots: Vec<OriginSlot>,
+    }
+    struct OriginSlot {
+        epoch: u64,
+        value: OriginSlotValue,
+    }
+    enum OriginSlotValue {
+        Vacant,
+        Reserved,
+        Live(Arc<Origin>),
+        Retiring,
+    }
+    enum ClosedOriginSlot {
+        Vacant,
+        Reserved { epoch: u64 },
+        Live(ConnectionCancellation),
+        Retiring { epoch: u64 },
+    }
+    enum OriginReserveStep {
+        Reserved(OriginReservation),
+        Retiring(OriginRetirement),
+    }
+    struct OriginRetirement {
+        inventory: Arc<OriginInventory>,
+        index: usize,
+        epoch: u64,
+        origin: Arc<Origin>,
+    }
+    impl OriginRetirement {
+        fn finish(self) {
+            let Self {
+                inventory,
+                index,
+                epoch,
+                origin,
+            } = self;
+            drop(origin);
+            let mut state = inventory.state.lock();
+            let slot = &mut state.slots[index];
+            assert!(slot.epoch == epoch && matches!(slot.value, OriginSlotValue::Retiring));
+            slot.value = OriginSlotValue::Vacant;
+        }
+    }
+    struct OriginReservation {
+        inventory: Arc<OriginInventory>,
+        index: usize,
+        epoch: u64,
+        reserved: bool,
+    }
+    impl OriginInventory {
+        fn new(limit: std::num::NonZeroUsize) -> io::Result<Arc<Self>> {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(limit.get())
+                .map_err(io::Error::other)?;
+            slots.extend((0..limit.get()).map(|_| OriginSlot {
+                epoch: 0,
+                value: OriginSlotValue::Vacant,
+            }));
+            Ok(Arc::new(Self {
+                state: Mutex::new(OriginInventoryState {
+                    closed: false,
+                    slots,
+                }),
+            }))
+        }
+        // A slot is not reclaimed until the last registry-held Origin has been
+        // dropped outside the mutex. Retiring remains occupied across that Drop.
+        fn reserve(self: &Arc<Self>) -> io::Result<OriginReservation> {
+            loop {
+                match self.reserve_step()? {
+                    OriginReserveStep::Reserved(reservation) => return Ok(reservation),
+                    OriginReserveStep::Retiring(retirement) => retirement.finish(),
+                }
+            }
+        }
+        fn reserve_step(self: &Arc<Self>) -> io::Result<OriginReserveStep> {
+            let mut state = self.state.lock();
+            if state.closed {
+                drop(state);
+                return Err(io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "origin intake closed",
+                ));
+            }
+            for (index, slot) in state.slots.iter_mut().enumerate() {
+                // No managed API publishes Weak<Origin> or an Open inventory snapshot.
+                if matches!(&slot.value, OriginSlotValue::Live(origin) if Arc::strong_count(origin)==1)
+                {
+                    if let OriginSlotValue::Live(origin) =
+                        std::mem::replace(&mut slot.value, OriginSlotValue::Retiring)
+                    {
+                        return Ok(OriginReserveStep::Retiring(OriginRetirement {
+                            inventory: Arc::clone(self),
+                            index,
+                            epoch: slot.epoch,
+                            origin,
+                        }));
+                    }
+                    unreachable!("last registry root is live");
+                }
+                if !matches!(slot.value, OriginSlotValue::Vacant) {
+                    continue;
+                }
+                let Some(epoch) = slot.epoch.checked_add(1) else {
+                    continue;
+                };
+                slot.epoch = epoch;
+                slot.value = OriginSlotValue::Reserved;
+                return Ok(OriginReserveStep::Reserved(OriginReservation {
+                    inventory: Arc::clone(self),
+                    index,
+                    epoch,
+                    reserved: true,
+                }));
+            }
+            drop(state);
+            Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "origin capacity exhausted",
+            ))
+        }
+        // Publish before any queue drain or cancellation. Calls after the first
+        // return false; runtime stores cancellation/join progress separately.
+        fn close_intake(&self) -> bool {
+            let mut state = self.state.lock();
+            let was_open = !state.closed;
+            state.closed = true;
+            was_open
+        }
+        // Pending reservation and destructor custody cannot be treated as an empty
+        // cancellation snapshot. Returned live authority is cloned only after close.
+        fn slot_after_close(&self, index: usize) -> Option<ClosedOriginSlot> {
+            let state = self.state.lock();
+            assert!(state.closed, "cancel inventory only after intake closed");
+            let slot = state.slots.get(index)?;
+            Some(match &slot.value {
+                OriginSlotValue::Live(origin) => ClosedOriginSlot::Live(ConnectionCancellation {
+                    origin: Arc::clone(origin),
+                }),
+                OriginSlotValue::Vacant => ClosedOriginSlot::Vacant,
+                OriginSlotValue::Reserved => ClosedOriginSlot::Reserved { epoch: slot.epoch },
+                OriginSlotValue::Retiring => ClosedOriginSlot::Retiring { epoch: slot.epoch },
+            })
+        }
+    }
+    impl OriginReservation {
+        fn attach(&mut self, control: &ConnectionCancellation) -> io::Result<()> {
+            {
+                let mut state = self.inventory.state.lock();
+                if state.closed {
+                    drop(state);
+                    return Err(io::Error::new(
+                        ErrorKind::ConnectionAborted,
+                        "origin intake closed",
+                    ));
+                }
+                let slot = &mut state.slots[self.index];
+                assert!(
+                    slot.epoch == self.epoch && matches!(slot.value, OriginSlotValue::Reserved)
+                );
+                slot.value = OriginSlotValue::Live(Arc::clone(&control.origin));
+                self.reserved = false;
+            }
+            // The caller still owns control on Err; it must cancel outside locks
+            // before dropping the accepted ClientConnection/capture state.
+            Ok(())
+        }
+    }
+    impl Drop for OriginReservation {
+        fn drop(&mut self) {
+            if !self.reserved {
+                return;
+            }
+            let mut state = self.inventory.state.lock();
+            let slot = &mut state.slots[self.index];
+            if slot.epoch == self.epoch && matches!(slot.value, OriginSlotValue::Reserved) {
+                slot.value = OriginSlotValue::Vacant;
+            }
+            // Never remove Live here; returned Request/escaped stream may still own its origin.
+        }
+    }
+
+    use crate::client::ClientConnection;
+    use crate::connection::{Connection, Listener};
+    use crate::util::RefinedTcpStream;
+
+    struct AcceptedSetup {
+        // Field destruction order keeps reservation occupied until every accepted
+        // socket/control/view below has completed its own Drop.
+        views: Option<(RefinedTcpStream, RefinedTcpStream)>,
+        control: Option<ConnectionCancellation>,
+        socket: Option<Connection>,
+        reservation: OriginReservation,
+    }
+    enum AcceptAttempt {
+        Idle,
+        Ready(ClientConnection),
+    }
+    enum AcceptSetupFailure {
+        BeforeAccept(io::Error),
+        Retained {
+            error: io::Error,
+            setup: AcceptedSetup,
+        },
+    }
+    impl AcceptedSetup {
+        fn prepare_views(&mut self, policy: TransportPolicy) -> io::Result<()> {
+            let socket = self.socket.as_ref().expect("accepted socket retained");
+            socket.set_nonblocking(false)?;
+            self.control = Some(ConnectionCancellation::new(socket, policy)?);
+            let control = self
+                .control
+                .as_ref()
+                .expect("origin retained before splitting");
+            let socket = self
+                .socket
+                .take()
+                .expect("accepted socket retained before splitting");
+            self.views = Some(RefinedTcpStream::try_new_controlled(
+                socket,
+                control.clone(),
+            )?);
+            Ok(())
+        }
+        fn attach(&mut self) -> io::Result<()> {
+            let control = self
+                .control
+                .as_ref()
+                .expect("origin retained before attach");
+            self.reservation.attach(control)
+        }
+        fn prepare(&mut self, policy: TransportPolicy) -> io::Result<()> {
+            self.prepare_views(policy)?;
+            self.attach()
+        }
+        fn into_client(mut self) -> ClientConnection {
+            let (reader, writer) = self.views.take().expect("registered views retained");
+            let control = self.control.take().expect("registered origin retained");
+            ClientConnection::new(writer, reader, Some(control))
+        }
+        fn cancel_retained(&self) -> io::Result<()> {
+            match (&self.control, &self.socket) {
+                (Some(control), _) => control.cancel(),
+                (None, Some(socket)) => socket.shutdown(Shutdown::Both),
+                (None, None) => Ok(()),
+            }
+        }
+    }
+    fn accept_managed_once(
+        listener: &Listener,
+        inventory: &Arc<OriginInventory>,
+        policy: TransportPolicy,
+    ) -> Result<AcceptAttempt, AcceptSetupFailure> {
+        let reservation = inventory
+            .reserve()
+            .map_err(AcceptSetupFailure::BeforeAccept)?;
+        let mut setup = AcceptedSetup {
+            views: None,
+            control: None,
+            socket: None,
+            reservation,
+        };
+        match listener.accept() {
+            Ok((socket, _)) => setup.socket = Some(socket),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(AcceptAttempt::Idle),
+            Err(error) => return Err(AcceptSetupFailure::Retained { error, setup }),
+        }
+        if let Err(error) = setup.prepare(policy) {
+            return Err(AcceptSetupFailure::Retained { error, setup });
+        }
+        Ok(AcceptAttempt::Ready(setup.into_client()))
+    }
+
+    #[cfg(test)]
+    mod managed_origin_controls {
+        use super::*;
+        use crate::connection::ConnectionProbe;
+        use crate::util::{SequentialReaderBuilder, SequentialWriterBuilder};
+        use crate::{HTTPVersion, Header, Method, Response};
+        use std::io::{Read, Write};
+        use std::num::NonZeroUsize;
+
+        fn policy() -> TransportPolicy {
+            TransportPolicy {
+                io_timeout: Duration::from_millis(100),
+                disposal_timeout: Duration::from_millis(50),
+                max_discard_bytes: 4,
+            }
+        }
+        fn setup() -> (Arc<OriginInventory>, Arc<ConnectionProbe>, AcceptedSetup) {
+            let inventory = OriginInventory::new(NonZeroUsize::new(1).unwrap()).unwrap();
+            let probe = Arc::new(ConnectionProbe::default());
+            probe.state.lock().nonblocking = true;
+            let setup = AcceptedSetup {
+                views: None,
+                control: None,
+                socket: Some(Connection::Probe(probe.clone())),
+                reservation: inventory.reserve().unwrap(),
+            };
+            (inventory, probe, setup)
+        }
+        fn assert_reserved(inventory: &OriginInventory, epoch: u64) {
+            let state = inventory.state.lock();
+            assert_eq!(state.slots[0].epoch, epoch);
+            assert!(matches!(state.slots[0].value, OriginSlotValue::Reserved));
+        }
+        fn registered(inventory: &OriginInventory) -> ConnectionCancellation {
+            match inventory.slot_after_close(0).unwrap() {
+                ClosedOriginSlot::Live(control) => control,
+                _ => panic!("original live origin must remain discoverable"),
+            }
+        }
+
+        #[test]
+        fn actual_setup_io_refusals_keep_original_reserved_custody() {
+            for failure in 0..3 {
+                let (inventory, probe, mut setup) = setup();
+                {
+                    let mut state = probe.state.lock();
+                    match failure {
+                        0 => state.refuse_nonblocking = true,
+                        1 => state.refuse_clone_at = Some(1),
+                        2 => state.refuse_clone_at = Some(2),
+                        _ => unreachable!(),
+                    }
+                }
+                let error = setup.prepare(policy()).unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::Other);
+                assert_reserved(&inventory, 1);
+                assert!(setup.views.is_none());
+                assert_eq!(setup.socket.is_some(), failure < 2);
+                assert_eq!(setup.control.is_some(), failure == 2);
+                {
+                    let state = probe.state.lock();
+                    assert_eq!(state.nonblocking_modes, vec![false]);
+                    assert_eq!(state.clone_calls, failure);
+                    assert_eq!(state.nonblocking, failure == 0);
+                }
+                assert!(
+                    matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::WouldBlock)
+                );
+                assert!(inventory.close_intake());
+                assert!(matches!(
+                    inventory.slot_after_close(0),
+                    Some(ClosedOriginSlot::Reserved { epoch: 1 })
+                ));
+                probe.state.lock().refuse_shutdown = true;
+                assert_eq!(
+                    setup.cancel_retained().unwrap_err().kind(),
+                    ErrorKind::Other
+                );
+                assert_reserved(&inventory, 1);
+                assert!(matches!(
+                    inventory.slot_after_close(0),
+                    Some(ClosedOriginSlot::Reserved { epoch: 1 })
+                ));
+                drop(setup);
+                assert!(matches!(
+                    inventory.slot_after_close(0),
+                    Some(ClosedOriginSlot::Vacant)
+                ));
+            }
+        }
+
+        #[test]
+        fn actual_close_before_attach_keeps_views_origin_and_reservation() {
+            let (inventory, probe, mut setup) = setup();
+            setup.prepare_views(policy()).unwrap();
+            let original = Arc::downgrade(&setup.control.as_ref().unwrap().origin);
+            assert!(inventory.close_intake());
+            assert_eq!(
+                setup.attach().unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            assert_reserved(&inventory, 1);
+            assert!(setup.views.is_some());
+            assert!(setup.socket.is_none());
+            assert!(std::sync::Weak::ptr_eq(
+                &original,
+                &Arc::downgrade(&setup.control.as_ref().unwrap().origin)
+            ));
+            probe.state.lock().refuse_shutdown = true;
+            assert_eq!(
+                setup.cancel_retained().unwrap_err().kind(),
+                ErrorKind::Other
+            );
+            let (reader, writer) = setup.views.as_mut().unwrap();
+            assert_eq!(
+                reader.read(&mut [0]).unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            assert_eq!(
+                writer.write(b"X").unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            {
+                let state = probe.state.lock();
+                assert_eq!((state.reads, state.writes), (0, 0));
+            }
+            assert_reserved(&inventory, 1);
+            drop(setup);
+            assert!(original.upgrade().is_none());
+            assert!(matches!(
+                inventory.slot_after_close(0),
+                Some(ClosedOriginSlot::Vacant)
+            ));
+        }
+
+        #[test]
+        fn actual_client_reclaims_original_root_only_after_last_external_owner() {
+            let (inventory, probe, mut setup) = setup();
+            probe.state.lock().input = std::io::Cursor::new(
+                b"GET /managed HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            );
+            setup.prepare(policy()).unwrap();
+            let original = Arc::downgrade(&setup.control.as_ref().unwrap().origin);
+            let mut client = setup.into_client();
+            let request = client.next().expect("same actual ClientConnection parser");
+            assert_eq!(request.url(), "/managed");
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::WouldBlock)
+            );
+            request.respond(Response::empty(200)).unwrap();
+            drop(client);
+            {
+                let state = inventory.state.lock();
+                match &state.slots[0].value {
+                    OriginSlotValue::Live(origin) => assert_eq!(Arc::strong_count(origin), 1),
+                    _ => panic!("registry remains original last strong owner before reclamation"),
+                }
+            }
+            assert!(original.upgrade().is_some());
+            let replacement = inventory.reserve().unwrap();
+            assert!(
+                original.upgrade().is_none(),
+                "actual reclaim drops the old payload before replacement reservation"
+            );
+            assert_reserved(&inventory, 2);
+            drop(replacement);
+            assert!(matches!(
+                inventory.state.lock().slots[0].value,
+                OriginSlotValue::Vacant
+            ));
+            assert!(probe.state.lock().writes > 0);
+        }
+
+        #[test]
+        fn actual_retiring_step_remains_pending_when_intake_closes() {
+            let inventory = OriginInventory::new(NonZeroUsize::new(1).unwrap()).unwrap();
+            let probe = Arc::new(ConnectionProbe::default());
+            let control = ConnectionCancellation::new(&Connection::Probe(probe), policy()).unwrap();
+            let original = Arc::downgrade(&control.origin);
+            inventory.reserve().unwrap().attach(&control).unwrap();
+            drop(control);
+            let retirement = match inventory.reserve_step().unwrap() {
+                OriginReserveStep::Retiring(retirement) => retirement,
+                OriginReserveStep::Reserved(_) => {
+                    panic!("actual last root must enter retirement before reuse")
+                }
+            };
+            assert_eq!((retirement.index, retirement.epoch), (0, 1));
+            assert!(inventory.close_intake());
+            assert!(matches!(
+                inventory.slot_after_close(0),
+                Some(ClosedOriginSlot::Retiring { epoch: 1 })
+            ));
+            assert!(original.upgrade().is_some());
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::ConnectionAborted)
+            );
+            retirement.finish();
+            assert!(original.upgrade().is_none());
+            assert!(matches!(
+                inventory.slot_after_close(0),
+                Some(ClosedOriginSlot::Vacant)
+            ));
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::ConnectionAborted)
+            );
+        }
+
+        fn extraction_fixture() -> (
+            Arc<OriginInventory>,
+            ConnectionCancellation,
+            Arc<ConnectionProbe>,
+        ) {
+            let inventory = OriginInventory::new(NonZeroUsize::new(1).unwrap()).unwrap();
+            let probe = Arc::new(ConnectionProbe::default());
+            let control =
+                ConnectionCancellation::new(&Connection::Probe(probe.clone()), policy()).unwrap();
+            inventory.reserve().unwrap().attach(&control).unwrap();
+            (inventory, control, probe)
+        }
+        fn request(
+            control: &ConnectionCancellation,
+            probe: &Arc<ConnectionProbe>,
+            upgrade: bool,
+        ) -> crate::Request {
+            let (reader, writer) = RefinedTcpStream::try_new_controlled(
+                Connection::Probe(probe.clone()),
+                control.clone(),
+            )
+            .unwrap();
+            let mut readers = SequentialReaderBuilder::with_control(reader, Some(control.clone()));
+            let mut writers = SequentialWriterBuilder::with_control(writer, Some(control.clone()));
+            crate::request::new_request_with_control(
+                false,
+                Method::Get,
+                if upgrade { "/upgrade" } else { "/writer" }.to_owned(),
+                HTTPVersion(1, 1),
+                if upgrade {
+                    vec![Header::from_bytes("Connection", "upgrade").unwrap()]
+                } else {
+                    vec![Header::from_bytes("Content-Length", "0").unwrap()]
+                },
+                None,
+                readers.next().unwrap(),
+                writers.next().unwrap(),
+                Some(control.clone()),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn actual_escaped_writer_stays_in_closed_origin_census_after_cancel_refusal() {
+            let (inventory, control, probe) = extraction_fixture();
+            let original = Arc::downgrade(&control.origin);
+            let mut escaped = request(&control, &probe, false).into_writer();
+            drop(control);
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::WouldBlock)
+            );
+            assert!(inventory.close_intake());
+            {
+                let retained = registered(&inventory);
+                assert!(std::sync::Weak::ptr_eq(
+                    &original,
+                    &Arc::downgrade(&retained.origin)
+                ));
+                probe.state.lock().refuse_shutdown = true;
+                assert_eq!(retained.cancel().unwrap_err().kind(), ErrorKind::Other);
+            }
+            let writes = probe.state.lock().writes;
+            assert_eq!(
+                escaped.write(b"X").unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            assert_eq!(probe.state.lock().writes, writes);
+            drop(escaped);
+            {
+                let state = inventory.state.lock();
+                match &state.slots[0].value {
+                    OriginSlotValue::Live(origin) => assert_eq!(Arc::strong_count(origin), 1),
+                    _ => panic!("closed inventory cannot silently remove original origin"),
+                }
+            }
+            assert!(original.upgrade().is_some());
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::ConnectionAborted)
+            );
+            drop(inventory);
+            assert!(
+                original.upgrade().is_none(),
+                "inert fixture releases explicit registry root, not a shutdown receipt"
+            );
+        }
+
+        #[test]
+        fn actual_upgraded_stream_keeps_both_directions_on_original_origin() {
+            let (inventory, control, probe) = extraction_fixture();
+            let original = Arc::downgrade(&control.origin);
+            probe.state.lock().input = std::io::Cursor::new(b"DATA".to_vec());
+            let mut escaped = request(&control, &probe, true).upgrade("test", Response::empty(101));
+            drop(control);
+            assert!(
+                matches!(inventory.reserve(), Err(error) if error.kind()==ErrorKind::WouldBlock)
+            );
+            assert!(inventory.close_intake());
+            {
+                let retained = registered(&inventory);
+                assert!(std::sync::Weak::ptr_eq(
+                    &original,
+                    &Arc::downgrade(&retained.origin)
+                ));
+                retained.cancel().unwrap();
+            }
+            let counts = {
+                let state = probe.state.lock();
+                (state.reads, state.writes)
+            };
+            assert_eq!(
+                escaped.read(&mut [0]).unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            assert_eq!(
+                escaped.write(b"X").unwrap_err().kind(),
+                ErrorKind::ConnectionAborted
+            );
+            {
+                let state = probe.state.lock();
+                assert_eq!((state.reads, state.writes), counts);
+            }
+            drop(escaped);
+            {
+                let state = inventory.state.lock();
+                match &state.slots[0].value {
+                    OriginSlotValue::Live(origin) => assert_eq!(Arc::strong_count(origin), 1),
+                    _ => panic!("closed inventory still retains upgrade origin"),
+                }
+            }
+            assert!(original.upgrade().is_some());
+            drop(inventory);
+            assert!(original.upgrade().is_none());
+        }
+    }
+}

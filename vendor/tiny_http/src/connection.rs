@@ -14,6 +14,14 @@ pub enum Listener {
     Unix(unix_net::UnixListener),
 }
 impl Listener {
+    pub(crate) fn set_nonblocking(&self, enabled: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(listener) => listener.set_nonblocking(enabled),
+            #[cfg(unix)]
+            Self::Unix(listener) => listener.set_nonblocking(enabled),
+        }
+    }
+
     pub(crate) fn local_addr(&self) -> std::io::Result<ListenAddr> {
         match self {
             Self::Tcp(l) => l.local_addr().map(ListenAddr::from),
@@ -93,6 +101,24 @@ impl std::io::Write for Connection {
     }
 }
 impl Connection {
+    pub(crate) fn set_nonblocking(&self, enabled: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_nonblocking(enabled),
+            #[cfg(unix)]
+            Self::Unix(socket) => socket.set_nonblocking(enabled),
+            #[cfg(test)]
+            Self::Probe(probe) => {
+                let mut state = probe.state.lock();
+                state.nonblocking_modes.push(enabled);
+                if state.refuse_nonblocking {
+                    return Err(std::io::Error::other("inert blocking-mode refusal"));
+                }
+                state.nonblocking = enabled;
+                Ok(())
+            }
+        }
+    }
+
     /// Gets the peer's address. Some for TCP, None for Unix sockets.
     pub(crate) fn peer_addr(&mut self) -> std::io::Result<Option<SocketAddr>> {
         match self {
@@ -160,7 +186,15 @@ impl Connection {
         match self {
             Self::Tcp(s) => s.try_clone().map(Self::from),
             #[cfg(test)]
-            Self::Probe(s) => Ok(Self::Probe(s.clone())),
+            Self::Probe(s) => {
+                let mut state = s.state.lock();
+                state.clone_calls += 1;
+                if state.refuse_clone_at == Some(state.clone_calls) {
+                    return Err(std::io::Error::other("inert connection-clone refusal"));
+                }
+                drop(state);
+                Ok(Self::Probe(s.clone()))
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.try_clone().map(Self::from),
         }
@@ -264,6 +298,11 @@ pub(crate) struct ConnectionProbe {
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct ProbeState {
+    pub(crate) nonblocking: bool,
+    pub(crate) nonblocking_modes: Vec<bool>,
+    pub(crate) refuse_nonblocking: bool,
+    pub(crate) clone_calls: usize,
+    pub(crate) refuse_clone_at: Option<usize>,
     pub(crate) input: std::io::Cursor<Vec<u8>>,
     pub(crate) reads: usize,
     pub(crate) writes: usize,

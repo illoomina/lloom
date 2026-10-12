@@ -14,11 +14,7 @@ pub(crate) enum Stream {
 
 impl Clone for Stream {
     fn clone(&self) -> Self {
-        match self {
-            Stream::Http(tcp_stream) => Stream::Http(tcp_stream.try_clone().unwrap()),
-            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-            Stream::Https(ssl_stream) => Stream::Https(ssl_stream.clone()),
-        }
+        self.try_clone().unwrap()
     }
 }
 
@@ -29,6 +25,14 @@ impl From<Connection> for Stream {
 }
 
 impl Stream {
+    fn try_clone(&self) -> IoResult<Self> {
+        match self {
+            Stream::Http(socket) => socket.try_clone().map(Stream::Http),
+            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+            Stream::Https(stream) => Ok(Stream::Https(stream.clone())),
+        }
+    }
+
     fn secure(&self) -> bool {
         match self {
             Stream::Http(_) => false,
@@ -94,35 +98,42 @@ impl RefinedTcpStream {
     where
         S: Into<Stream>,
     {
-        let stream: Stream = stream.into();
+        Self::try_split(stream.into(), None).unwrap()
+    }
 
-        let (read, write) = (stream.clone(), stream);
+    fn try_split(
+        stream: Stream,
+        control: Option<crate::ConnectionCancellation>,
+    ) -> IoResult<(Self, Self)> {
+        let read = stream.try_clone()?;
+        Ok((
+            Self {
+                stream: read,
+                close_read: true,
+                close_write: false,
+                control: control.clone(),
+            },
+            Self {
+                stream,
+                close_read: false,
+                close_write: true,
+                control,
+            },
+        ))
+    }
 
-        let read = RefinedTcpStream {
-            stream: read,
-            close_read: true,
-            close_write: false,
-            control: None,
-        };
-
-        let write = RefinedTcpStream {
-            stream: write,
-            close_read: false,
-            close_write: true,
-            control: None,
-        };
-
-        (read, write)
+    pub(crate) fn try_new_controlled(
+        socket: Connection,
+        control: crate::ConnectionCancellation,
+    ) -> IoResult<(Self, Self)> {
+        Self::try_split(socket.into(), Some(control))
     }
 
     pub(crate) fn new_controlled(
         socket: Connection,
         control: crate::ConnectionCancellation,
     ) -> (Self, Self) {
-        let (mut read, mut write) = Self::new(socket);
-        read.control = Some(control.clone());
-        write.control = Some(control);
-        (read, write)
+        Self::try_new_controlled(socket, control).unwrap()
     }
 
     /// Returns true if this struct wraps around a secure connection.

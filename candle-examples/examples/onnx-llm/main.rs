@@ -6,9 +6,9 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use candle::{DType, Tensor};
-use lloom::generation::{LogitsProcessor, Sampling};
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
+use lloom::generation::{LogitsProcessor, Sampling};
 use serde::Deserialize;
 use std::io::Write;
 use tokenizers::Tokenizer;

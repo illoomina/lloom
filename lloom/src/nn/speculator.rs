@@ -762,9 +762,10 @@ pub struct RoundTiming {
     /// drafter's state is owned (issue #894).
     pub pool_allocations: u64,
     pub residency_adds: u64,
-    /// Of `pool_allocations`, those made while a buffer of the same size
-    /// was released and not yet complete (`PoolCounters::pending_twin_allocations`):
-    /// the pool's deferred-release window, not a size the round lacked.
+    /// Of `pool_allocations`, misses with an eligible released buffer still
+    /// pending (`PoolCounters::pending_twin_allocations`), including larger
+    /// buckets permitted by the reuse policy. An observed deferred-reuse
+    /// opportunity, not proof that an allocation could have been avoided.
     pub pool_allocations_pending_twin: u64,
 }
 
@@ -1184,7 +1185,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             });
         }
         // Everything cached: the last token must be re-fed for its prediction.
-        let keep = if lcp == full.len() { lcp - 1 } else { lcp };
+        let mut keep = if lcp == full.len() { lcp - 1 } else { lcp };
         let drop = cached - keep;
         let action = if drop == 0 {
             ReuseAction::Extend
@@ -1194,15 +1195,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
             ReuseAction::Rewound(drop)
-        } else if self.seq.cache.can_restore(keep) {
+        } else if let Some(at) = self.seq.cache.restore_point(keep) {
             // Past the horizon but within a turn checkpoint's reach: the
-            // chat re-render that drops the previous generation prompt's
-            // last token and the whole reply diverges exactly here.
-            self.seq.cache.restore(keep)?;
+            // chat re-render drops the previous generation prompt's tail and
+            // the whole reply, and diverges at or just after a checkpoint.
+            self.seq.cache.restore(at)?;
+            keep = at;
             self.seq.pos = keep;
             self.seq.tokens.truncate(keep);
             self.seq.last_logits = None;
-            ReuseAction::Rewound(drop)
+            ReuseAction::Rewound(cached - keep)
         } else {
             self.reset();
             ReuseAction::Fresh

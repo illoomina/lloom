@@ -467,11 +467,18 @@ impl KvPagePool {
     /// [`Self::chunk_pages_are_contiguous`] is the check, and it is a check
     /// rather than an assumption because §3.5 makes the failure silent.
     pub fn table_for(&self, seq: usize, pages_per_chunk: usize) -> Vec<u32> {
-        let k = pages_per_chunk.max(1);
-        self.seqs
-            .get(seq)
-            .map(|s| s.pages.iter().step_by(k).map(|p| p.0).collect())
-            .unwrap_or_default()
+        let mut table = Vec::new();
+        self.extend_table_for(seq, pages_per_chunk, &mut table);
+        table
+    }
+
+    /// Append a sequence's chunk table into caller-owned staging, retaining its
+    /// allocation across passes. The owned form delegates here so addressing
+    /// cannot drift between the reusable and convenience APIs.
+    pub fn extend_table_for(&self, seq: usize, pages_per_chunk: usize, out: &mut Vec<u32>) {
+        if let Some(s) = self.seqs.get(seq) {
+            out.extend(s.pages.iter().step_by(pages_per_chunk.max(1)).map(|p| p.0));
+        }
     }
 
     /// Whether every chunk's pages are consecutive in the pool, at `k > 1`.

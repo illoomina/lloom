@@ -1,5 +1,5 @@
-use lloom_tensor::{Result, Shape, Tensor};
 use lloom::nn::encoding::one_hot;
+use lloom_tensor::{Result, Shape, Tensor};
 
 #[test]
 fn test_i64_one_hot() -> Result<()> {

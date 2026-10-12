@@ -10,9 +10,9 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
 use std::io::Write;
 
 use lloom::models::granite as model;

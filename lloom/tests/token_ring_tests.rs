@@ -19,8 +19,8 @@
 //! nothing when the token is unchanged. So every parity arm below **moves the
 //! value it checks**, and the mutation arms assert the tests can fail.
 
-use lloom_tensor::{DType, Device, Result, Tensor};
 use lloom::generation::token_ring::TokenRing;
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// EOS ids from `DESIGN.md` §5.1: bos / eos / pad = 124894 / 124900 / 124893.
 const EOS: &[u32] = &[124900];

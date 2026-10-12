@@ -17,14 +17,18 @@ fn case_with(rows: usize, out: usize, k: usize, view_off: usize) -> Result<()> {
     let gpu = Device::new_metal(0)?;
     let big = out + 2 * view_off;
     let w_all = Tensor::from_vec(
-        (0..big * k).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect::<Vec<_>>(),
+        (0..big * k)
+            .map(|i| ((i as f32) * 0.37).sin() * 0.5)
+            .collect::<Vec<_>>(),
         (big, k),
         &cpu,
     )?
     .to_dtype(DType::F16)?;
     let w = w_all.narrow(0, view_off, out)?;
     let x = Tensor::from_vec(
-        (0..rows * k).map(|i| ((i as f32) * 0.11).cos()).collect::<Vec<_>>(),
+        (0..rows * k)
+            .map(|i| ((i as f32) * 0.11).cos())
+            .collect::<Vec<_>>(),
         (1, rows, k),
         &cpu,
     )?;
@@ -38,10 +42,18 @@ fn case_with(rows: usize, out: usize, k: usize, view_off: usize) -> Result<()> {
     let mut runs: Vec<Vec<f32>> = Vec::new();
     for _ in 0..5 {
         let y = qm.forward(&xg)?;
-        runs.push(y.to_dtype(DType::F32)?.to_device(&cpu)?.flatten_all()?.to_vec1()?);
+        runs.push(
+            y.to_dtype(DType::F32)?
+                .to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1()?,
+        );
     }
     for r in &runs[1..] {
-        assert_eq!(&runs[0], r, "rows {rows} out {out} k {k} off {view_off}: not deterministic");
+        assert_eq!(
+            &runs[0], r,
+            "rows {rows} out {out} k {k} off {view_off}: not deterministic"
+        );
     }
     let maxdiff = runs[0]
         .iter()
@@ -49,14 +61,24 @@ fn case_with(rows: usize, out: usize, k: usize, view_off: usize) -> Result<()> {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
-    assert!(maxdiff < 4e-3 * scale.max(1.0), "rows {rows} out {out} k {k} off {view_off}: maxdiff {maxdiff} vs cpu");
+    assert!(
+        maxdiff < 4e-3 * scale.max(1.0),
+        "rows {rows} out {out} k {k} off {view_off}: maxdiff {maxdiff} vs cpu"
+    );
     Ok(())
 }
 
 #[test]
 fn tiny_shapes_are_deterministic_and_match_cpu() -> Result<()> {
     for rows in [5usize, 7, 9, 16, 33] {
-        for (out, k) in [(64usize, 32usize), (32, 64), (96, 32), (160, 32), (32, 96), (48, 32)] {
+        for (out, k) in [
+            (64usize, 32usize),
+            (32, 64),
+            (96, 32),
+            (160, 32),
+            (32, 96),
+            (48, 32),
+        ] {
             case(rows, out, k)?;
         }
     }
@@ -66,7 +88,17 @@ fn tiny_shapes_are_deterministic_and_match_cpu() -> Result<()> {
 #[test]
 fn odd_shapes_and_row_views() -> Result<()> {
     for rows in [7usize, 9] {
-        for (out, k) in [(100usize, 32usize), (72, 32), (36, 32), (40, 32), (8, 32), (4, 32), (96, 40), (64, 24), (72, 8)] {
+        for (out, k) in [
+            (100usize, 32usize),
+            (72, 32),
+            (36, 32),
+            (40, 32),
+            (8, 32),
+            (4, 32),
+            (96, 40),
+            (64, 24),
+            (72, 8),
+        ] {
             for off in [0usize, 4, 36] {
                 if let Err(e) = case_with(rows, out, k, off) {
                     panic!("{e}");

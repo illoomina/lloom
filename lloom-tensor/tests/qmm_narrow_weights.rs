@@ -61,7 +61,12 @@ fn a_row_view_is_read_from_its_own_first_row() -> Result<()> {
     let mut bad = Vec::new();
     for dtype in [GgmlDType::Q8_0, GgmlDType::Q4_0, GgmlDType::Q4K] {
         let k = if dtype == GgmlDType::Q4K { 256 } else { 32 };
-        for &(n, rows, skip) in &[(16usize, 45usize, 19usize), (64, 45, 1), (16, 80, 19), (128, 80, 7)] {
+        for &(n, rows, skip) in &[
+            (16usize, 45usize, 19usize),
+            (64, 45, 1),
+            (16, 80, 19),
+            (128, 80, 7),
+        ] {
             let (vs_cpu, vs_owned) = case(dtype, n, k, rows, skip)?;
             eprintln!("{dtype:?} n={n} k={k} rows={rows} skip={skip}: vs cpu {vs_cpu:e}, vs owned {vs_owned:e}");
             if vs_cpu > 2e-2 || vs_owned != 0.0 {

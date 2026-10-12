@@ -1072,13 +1072,13 @@ pub(crate) fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
 
 /// Whether `device` may hand a later pass the memory an earlier pass's
 /// activation lives in (`MetalDevice::activations_may_be_reused`).
-fn activations_may_be_reused(device: &Device) -> bool {
+fn activations_may_be_reused(device: &Device) -> Result<bool> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
-        return m.activations_may_be_reused();
+        return Ok(m.execution_device()?.activations_may_be_reused());
     }
     let _ = device;
-    false
+    Ok(false)
 }
 
 pub(crate) fn end_pass(device: &Device) -> Result<()> {
@@ -1211,21 +1211,54 @@ pub fn in_flight_mem_cap(_device: &Device) -> usize {
 /// completion, which retires or errors and cannot wait for a value that is
 /// never published. That is the whole difference from a cap spun on the ring's
 /// generation counter: a counter a stale replay stops advancing is a livelock,
-/// a command buffer that never retires is a reported error. When the GPU is
+/// Metal can report a command-buffer error, but an indefinitely scheduled
+/// buffer can still block its native wait indefinitely. When the GPU is
 /// within the bound the marker is already complete and the wait is a status
 /// read.
 pub(crate) struct StepPacer {
     #[cfg(feature = "metal")]
-    markers: std::collections::VecDeque<lloom_tensor::metal_backend::CommandMarker>,
-    /// How many forwards the host may have in flight — the computed depth
-    /// ([`compute_in_flight_depth`]), not a constant. `>= IN_FLIGHT_FLOOR`.
+    pending: PacerQueue<PacerMarker>,
     depth: usize,
     taken: u64,
     waited: u64,
-    /// Under the adaptive commit (lloom #735): the steps each queued buffer
-    /// holds, and their sum — the bound is then in steps, not buffers.
-    sizes: std::collections::VecDeque<usize>,
+}
+
+/// One circular queue owns both the completion marker and its step count.
+/// Retiring either cadence therefore cannot leave unmatched size entries.
+/// Capacity is reserved before prefill/decode, not on the token path.
+#[cfg(any(feature = "metal", test))]
+struct PacerQueue<M> {
+    entries: std::collections::VecDeque<(M, usize)>,
     queued_steps: usize,
+}
+
+#[cfg(any(feature = "metal", test))]
+impl<M> PacerQueue<M> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(capacity),
+            queued_steps: 0,
+        }
+    }
+
+    fn push(&mut self, marker: M, steps: usize) {
+        debug_assert!(steps > 0);
+        debug_assert!(
+            self.entries.len() < self.entries.capacity(),
+            "pacer setup must reserve its bound"
+        );
+        self.entries.push_back((marker, steps));
+        self.queued_steps += steps;
+    }
+
+    /// Keep the entry if waiting fails: an error must not masquerade as retirement.
+    fn retire(&mut self, wait: impl FnOnce(&M) -> Result<bool>) -> Result<bool> {
+        let (marker, _) = self.entries.front().expect("non-empty pacer");
+        let waited = wait(marker)?;
+        let (_, steps) = self.entries.pop_front().expect("same entry");
+        self.queued_steps -= steps;
+        Ok(waited)
+    }
 }
 
 impl StepPacer {
@@ -1233,92 +1266,83 @@ impl StepPacer {
         let depth = depth.max(IN_FLIGHT_FLOOR);
         Self {
             #[cfg(feature = "metal")]
-            markers: std::collections::VecDeque::with_capacity(depth),
+            pending: PacerQueue::new(depth),
             depth,
             taken: 0,
             waited: 0,
-            sizes: std::collections::VecDeque::with_capacity(depth),
-            queued_steps: 0,
         }
     }
 
-    /// The adaptive commit's bound: wait while the steps queued in incomplete
-    /// buffers reach `max_queued`, retiring the oldest buffer each time.
+    /// Reserve the largest bound this run can use before encoding starts.
+    fn for_decode(opts: &DecodeOptions) -> Self {
+        let capacity =
+            opts.pacer_depth()
+                .max(opts.prefill_pacer_depth)
+                .max(if opts.adaptive_commit {
+                    2 * if opts.run_ahead == 0 {
+                        8
+                    } else {
+                        opts.run_ahead
+                    }
+                } else {
+                    0
+                });
+        let mut pacer = Self::new(capacity);
+        pacer.set_depth(opts.pacer_depth());
+        pacer
+    }
+
     fn before_forward_bounded(&mut self, device: &Device, max_queued: usize) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
-            while self.queued_steps >= max_queued && !self.markers.is_empty() {
-                let oldest = self.markers.pop_front().expect("non-empty");
-                let steps = self.sizes.pop_front().unwrap_or(1);
-                if !m.marker_complete(&oldest) {
-                    self.waited += 1;
-                }
-                m.wait_marker(&oldest)?;
-                self.queued_steps = self.queued_steps.saturating_sub(steps);
+            while self.pending.queued_steps >= max_queued && !self.pending.entries.is_empty() {
+                self.waited += self.pending.retire(|oldest| {
+                    let waited = !m.marker_complete(oldest);
+                    m.wait_marker(oldest)?;
+                    Ok(waited)
+                })? as u64;
             }
         }
         let _ = (device, max_queued);
         Ok(())
     }
 
-    /// Set the in-flight bound. Used to run the **prefill** at a different
-    /// (deeper) depth than steady decode: prefill is compute-bound and many
-    /// small forwards want to overlap, not serialize at the decode depth of 2.
-    /// Restored to the decode depth before the step loop. Does not retire
-    /// markers — only the bound the next `before_forward` enforces changes; a
-    /// LOWER depth is honoured on the next `before_forward` (it retires down to
-    /// the new bound then).
+    /// Setup-only depth changes reuse the capacity reserved by `for_decode`.
     fn set_depth(&mut self, depth: usize) {
         self.depth = depth.max(IN_FLIGHT_FLOOR);
+        #[cfg(feature = "metal")]
+        debug_assert!(self.depth <= self.pending.entries.capacity());
     }
 
-    /// Before encoding a forward: retire the oldest marker if the bound would
-    /// otherwise be exceeded.
     pub(crate) fn before_forward(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
-            while self.markers.len() >= self.depth {
-                let oldest = self.markers.pop_front().expect("len >= depth");
-                if !m.marker_complete(&oldest) {
-                    self.waited += 1;
-                }
-                m.wait_marker(&oldest)?;
+            while self.pending.entries.len() >= self.depth {
+                self.waited += self.pending.retire(|oldest| {
+                    let waited = !m.marker_complete(oldest);
+                    m.wait_marker(oldest)?;
+                    Ok(waited)
+                })? as u64;
             }
         }
         let _ = device;
         Ok(())
     }
 
-    /// After encoding a forward: commit what the step encoded and keep the
-    /// marker. The cut this makes lands at the step boundary -- the one
-    /// dependency edge every step has, the publish the next forward reads.
     pub(crate) fn after_forward(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
-            self.markers.push_back(m.flush_marker()?);
-            // One forward per marker on this path; the size keeps `sizes`
-            // aligned with `markers` for a loop that mixes both (the prefill
-            // marks per forward, the adaptive commit per buffer).
-            self.sizes.push_back(1);
-            self.queued_steps += 1;
-            self.taken += 1;
+            self.push(m.flush_marker()?, 1);
         }
         let _ = device;
         Ok(())
     }
 
-    /// Take a marker the adaptive commit produced (lloom #735): the bound is
-    /// then in buffers, each holding as many steps as the GPU let the host
-    /// encode.
     fn push(&mut self, marker: PacerMarker, steps: usize) {
         #[cfg(feature = "metal")]
-        {
-            self.markers.push_back(marker);
-        }
+        self.pending.push(marker, steps);
         #[cfg(not(feature = "metal"))]
-        let _ = marker;
-        self.sizes.push_back(steps);
-        self.queued_steps += steps;
+        let _ = (marker, steps);
         self.taken += 1;
     }
 }
@@ -1845,7 +1869,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // blocking arm's readback drains the queue every step, so its stream stays
         // the incumbent's; depth is the computed host/GPU balance
         // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
-        let mut pacer = StepPacer::new(opts.pacer_depth());
+        let mut pacer = StepPacer::for_decode(opts);
         let pace = readback.loop_commits();
         // The caller streams off its own `RingReader`: the ring arm skips the
         // hot-loop drain and materialises the host id vec once at end-of-run.
@@ -2645,7 +2669,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
     /// declared).
     pub(crate) fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
-        if !activations_may_be_reused(logits.device()) {
+        if !activations_may_be_reused(logits.device())? {
             return Ok(logits);
         }
         let hold = match &self.seq.logits_hold {
@@ -4046,6 +4070,65 @@ mod in_flight_depth_tests {
         assert_eq!(StepPacer::new(0).depth, IN_FLIGHT_FLOOR);
         assert_eq!(StepPacer::new(1).depth, IN_FLIGHT_FLOOR);
         assert_eq!(StepPacer::new(7).depth, 7);
+    }
+}
+
+#[cfg(test)]
+mod pacer_queue_tests {
+    use super::*;
+
+    #[test]
+    fn pacer_wraps_without_growth_and_retires_sizes_with_markers() -> Result<()> {
+        let mut q = PacerQueue::new(8);
+        let capacity = q.entries.capacity();
+        // Fixed prefill, then adaptive multi-step commits in the same queue.
+        for step in 0..10000 {
+            if step < 100 {
+                while q.entries.len() >= 2 {
+                    q.retire(|_| Ok(false))?;
+                }
+                q.push(step, 1);
+            } else {
+                while q.queued_steps >= 8 {
+                    q.retire(|_| Ok(true))?;
+                }
+                q.push(step, step % 4 + 1);
+            }
+            assert_eq!(
+                q.queued_steps,
+                q.entries.iter().map(|(_, n)| n).sum::<usize>()
+            );
+            assert_eq!(q.entries.capacity(), capacity);
+        }
+        while !q.entries.is_empty() {
+            q.retire(|_| Ok(false))?;
+        }
+        assert_eq!(q.queued_steps, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pacer_failed_wait_preserves_the_entry_and_accounting() {
+        let mut q = PacerQueue::new(2);
+        q.push(42, 7);
+        let result = q.retire(|_| Err(lloom_tensor::Error::Msg("injected wait failure".into())));
+        assert!(result.is_err());
+        assert_eq!(q.entries.front(), Some(&(42, 7)));
+        assert_eq!(q.queued_steps, 7);
+    }
+
+    #[test]
+    fn pacer_reserves_prefill_and_adaptive_bounds_before_decode() {
+        let opts = DecodeOptions {
+            prefill_pacer_depth: 24,
+            adaptive_commit: true,
+            run_ahead: 16,
+            ..DecodeOptions::new(32)
+        };
+        let p = StepPacer::for_decode(&opts);
+        assert_eq!(p.depth, opts.pacer_depth().max(IN_FLIGHT_FLOOR));
+        #[cfg(feature = "metal")]
+        assert!(p.pending.entries.capacity() >= 32);
     }
 }
 

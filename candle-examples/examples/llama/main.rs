@@ -16,9 +16,9 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
 use std::io::Write;
 
 use lloom::models::llama as model;
@@ -258,11 +258,7 @@ fn main() -> Result<()> {
             logits
         } else {
             let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-            lloom::utils::apply_repeat_penalty(
-                &logits,
-                args.repeat_penalty,
-                &tokens[start_at..],
-            )?
+            lloom::utils::apply_repeat_penalty(&logits, args.repeat_penalty, &tokens[start_at..])?
         };
         index_pos += ctxt.len();
 

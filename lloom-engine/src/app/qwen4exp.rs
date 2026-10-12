@@ -124,6 +124,32 @@ pub fn routed_act(
     })
 }
 
+/// `auto` is a preference, not permission to dispatch a missing kernel.
+/// Check every routed stack, including MTP and shards beyond the first.
+#[cfg(feature = "metal")]
+fn routed_half_supported<'a>(
+    tensors: impl IntoIterator<Item = (&'a str, lloom_tensor::quantized::GgmlDType)>,
+) -> bool {
+    let mut found = false;
+    for (name, dtype) in tensors {
+        if name.starts_with("blk.")
+            && [
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            found = true;
+            if !lloom_tensor::kernels::GgmlDType::from(dtype).has_gemv_triple() {
+                return false;
+            }
+        }
+    }
+    found
+}
+
 /// The HF cache directory of the DFlash drafter trained for this target.
 pub const DFLASH_SNAPSHOT: &str = "models--PixelML--Qwen3.8-Flash-Next-NVFP4-DFlash";
 
@@ -422,6 +448,22 @@ fn rewindable<P: Profile>() -> Result<lloom::profile::RewindProof<P>> {
 }
 
 /// Load the family `opts` names, on the tier `opts.experts` names, at `P`.
+/// The turn checkpoints the device's ledger admits: `want`, or as many
+/// frames of `frame_bytes` as the quota leaves uncommitted; `want` where
+/// there is no ledger (CPU) or no quota.
+fn admitted_checkpoints(device: &Device, frame_bytes: usize, want: usize) -> usize {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        let quota = m.ledger().quota();
+        if quota > 0 && frame_bytes > 0 {
+            let free = quota.saturating_sub(m.ledger().committed());
+            return want.min(free / frame_bytes);
+        }
+    }
+    let _ = (device, frame_bytes);
+    want
+}
+
 fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
     {
         // The DFlash drafter's directory and config first: the slot plan
@@ -452,6 +494,31 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
             }
             shards.push(p.clone());
         }
+        #[cfg(feature = "metal")]
+        if opts.moe_act == "auto"
+            && device.is_metal()
+            && routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? == DType::F16
+        {
+            // Header-only inspection at load, never on the decode hot path.
+            let headers = shards
+                .iter()
+                .map(|path| {
+                    let mut file = std::fs::File::open(path)?;
+                    lloom_tensor::quantized::gguf_file::Content::read(&mut file)
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !routed_half_supported(headers.iter().flat_map(|h| {
+                h.tensor_infos
+                    .iter()
+                    .map(|(name, ti)| (name.as_str(), ti.ggml_dtype))
+            })) {
+                opts.moe_act = "f32".into();
+                eprintln!(
+                    "[moe-act auto: f32; checkpoint has no complete native f16 routed kernel set]"
+                );
+            }
+        }
         let moe_act = match routed_act(&opts.moe_act, lloom_tensor::tuning::contract())? {
             DType::F16 => Some(DType::F16),
             _ => None,
@@ -464,7 +531,22 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
             kv_precision: opts.kv_precision,
+            machine: Some(lloom::nn::memory::MachineLoad {
+                gate: opts.memory.machine_gate(),
+                label: super::common::machine_label("qwen4exp", &opts.first_shard),
+                rows: opts.batch.max(1),
+                kv_tokens: opts.kv_reserve_tokens.unwrap_or(opts.kv_capacity).max(1),
+                prefill_tile: opts.prefill_tile,
+            }),
         };
+        // The ledger's quota, set before the load so the load's own
+        // allocations are admitted against it (§9.5c).
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            let ws = m.device().recommended_max_working_set_size() as f64;
+            m.ledger()
+                .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
+        }
         let prefill_mode = match opts.prefill_mode.as_str() {
             "chunk" => PrefillMode::Chunk,
             "replay" => PrefillMode::Replay,
@@ -486,12 +568,6 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                         .context("loading Qwen4-exp (resident experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
-                #[cfg(feature = "metal")]
-                if let Device::Metal(m) = &device {
-                    let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger()
-                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
-                }
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
                 Engine::<P, Resident>::finish(model, device, opts, tier, installed)
             }
@@ -522,12 +598,6 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
-                #[cfg(feature = "metal")]
-                if let Device::Metal(m) = &device {
-                    let ws = m.device().recommended_max_working_set_size() as f64;
-                    m.ledger()
-                        .set_quota((ws * opts.memory_fraction.max(0.0)) as usize);
-                }
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
                     if path.exists() {
@@ -570,7 +640,7 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
 
 impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<P, R> {
     fn finish(
-        model: Qwen4Exp<P, R>,
+        mut model: Qwen4Exp<P, R>,
         device: Device,
         opts: LoadOptions,
         mut tier: Value,
@@ -648,6 +718,21 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             Some((spec, _)) => lloom::nn::Speculator::max_draft(spec),
             None => opts.mtp_k.max(1),
         };
+        // The turn-checkpoint ring (`sequence-reuse-design.md` §2.3b)
+        // beside the experts' budget: as many of the model's frames as the
+        // ledger's quota leaves uncommitted after the load (the streamed
+        // tier's pool is a `Cache` claim the arbiter already sized; the
+        // ring is a capability a sequence holds).
+        let frame = model.checkpoint_frame_bytes();
+        let slots = admitted_checkpoints(&device, frame, model.turn_checkpoints());
+        model.set_turn_checkpoints(slots);
+        eprintln!(
+            "[checkpoint ring: {slots} × {:.1} MiB ({:.1} MiB; 0 = every re-rendered turn prefills whole)]",
+            frame as f64 / (1024.0 * 1024.0),
+            (slots * frame) as f64 / (1024.0 * 1024.0)
+        );
+        tier["turn_checkpoints"] =
+            json!({ "slots": slots, "frame_bytes": frame, "bytes": slots * frame });
         let mut cache = P::single(&model, &device, k)?;
         if let Some((_, taps)) = &dflash {
             cache.set_tap_layers(taps)?;
@@ -677,6 +762,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 eos_ids,
                 seed_tokens,
                 think: Default::default(),
+                gen_prompts: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -755,6 +841,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
                 ms(t.elapsed())
             );
         }
+        engine.text.prime();
         Ok(Box::new(engine))
     }
 
@@ -1188,6 +1275,14 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         self.text.think_tags().cloned()
     }
+    fn generation_prompt(&self, kwarg: Option<bool>, want: Option<bool>) -> Option<Vec<u32>> {
+        self.text
+            .generation_prompt(kwarg, want)
+            .map(<[u32]>::to_vec)
+    }
+    fn template_renders(&self) -> u64 {
+        self.text.template.as_ref().map_or(0, |t| t.renders())
+    }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {
             Some(super::budgets::BATCHED)
@@ -1548,6 +1643,29 @@ mod tests {
         }
         assert!(super::routed_act("bf16", Fast).is_err());
         assert!(lloom_tensor::tuning::Contract::FAST_ARMS.contains(&"moe-act-f16"));
+    }
+    #[cfg(feature = "metal")]
+    #[test]
+    fn moe_auto_checks_every_routed_stack_not_dense_stems() {
+        use lloom_tensor::quantized::GgmlDType::{F32, Q4_0, Q8_0};
+        assert!(super::routed_half_supported([
+            ("blk.0.ffn_gate_exps.weight", Q4_0),
+            ("blk.0.ffn_up_exps.weight", Q4_0),
+            ("blk.0.ffn_down_exps.weight", Q8_0),
+            ("blk.0.attn_norm.weight", F32),
+        ]));
+        for missing in [
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ] {
+            let name = format!("blk.99.{missing}");
+            assert!(!super::routed_half_supported([
+                ("blk.0.ffn_gate_exps.weight", Q4_0),
+                (name.as_str(), F32),
+            ]));
+        }
+        assert!(!super::routed_half_supported(std::iter::empty()));
     }
     use crate::{ReadbackArm, RingArm};
     use lloom::generation::EosRead;

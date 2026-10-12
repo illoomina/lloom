@@ -551,6 +551,29 @@ impl<K: Copy + Eq, I: KeyIndex<K>> SlotCache<K, I, TickLru> {
         self.policy.last_use[slot.index()] = tick;
     }
 
+    /// Empty slots in the same order as the hint path's repeated free pops
+    /// (quarantined) or empty-victim scans (in place), without reserving them.
+    /// The caller must keep exclusive access through submission and publication.
+    #[cfg(any(feature = "metal", test))]
+    pub(crate) fn hint_slots(&self, tick: Tick) -> impl Iterator<Item = SlotId> + '_ {
+        let quarantined = self.quarantined();
+        self.free
+            .iter()
+            .rev()
+            .copied()
+            .take(if quarantined { self.free.len() } else { 0 })
+            .chain(
+                (0..if quarantined { 0 } else { self.active }).filter_map(move |s| {
+                    (self.key_in[s].is_none()
+                        && !self.policy.pinned[s]
+                        && self.policy.last_use[s] != tick
+                        && self.policy.inflight[s] == 0
+                        && Completed::ALL.covers(self.reader_epoch(SlotId(s as u32))))
+                    .then_some(SlotId(s as u32))
+                }),
+            )
+    }
+
     /// The least-recently-used resident unpinned slot not used in `tick`
     /// and not in flight.
     pub fn lru_resident(&self, tick: Tick) -> Option<SlotId> {

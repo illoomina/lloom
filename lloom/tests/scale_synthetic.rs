@@ -377,7 +377,8 @@ fn the_committed_mtp_sidecar_shape_is_the_real_headers() -> Result<()> {
         println!("SKIPPED: no MTP sidecar at {}", sidecar.display());
         return Ok(());
     }
-    let real = ShapeManifest::from_gguf(std::slice::from_ref(&sidecar), "qwen4exp-mtp-quantize Q8")?;
+    let real =
+        ShapeManifest::from_gguf(std::slice::from_ref(&sidecar), "qwen4exp-mtp-quantize Q8")?;
     let path = mtp_sidecar_manifest_path();
     if std::env::var_os("LLOOM_BLESS_LISTINGS").is_some() {
         real.write(&path)?;

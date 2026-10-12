@@ -21,6 +21,8 @@ pub mod batch_norm;
 pub mod batched;
 mod batched_spec;
 pub mod blocks;
+#[cfg(any(feature = "metal", test))]
+mod checkout;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
@@ -63,6 +65,7 @@ pub mod short_conv;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
+pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
 pub mod weight_groups;

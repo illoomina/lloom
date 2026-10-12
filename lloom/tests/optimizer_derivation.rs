@@ -361,7 +361,15 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     let refused: Vec<&str> = d.refused.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         refused,
-        ["silu", "residual", "mul", "swiglu", "norm", "rmsnorm", "silu_mul_f16"],
+        [
+            "silu",
+            "residual",
+            "mul",
+            "swiglu",
+            "norm",
+            "rmsnorm",
+            "silu_mul_f16"
+        ],
         "{:?}",
         d.refused
     );
@@ -556,7 +564,9 @@ fn the_norm_prologue_is_derived_on_the_real_step_at_the_reorder_budget() {
     }
     let swiglu = d.plan.sites_of("norm_swiglu");
     assert_eq!(swiglu.len(), 30);
-    assert!(swiglu.iter().all(|s| s.ends_with(".feed_forward.w3.weight")));
+    assert!(swiglu
+        .iter()
+        .all(|s| s.ends_with(".feed_forward.w3.weight")));
     assert_eq!(d.plan.sites_of("residual").len(), 60);
     assert_eq!(d.plan.sites.len(), 47 + 30 + 60);
     assert_eq!(d.plan.dispatches_after(), 410 - 61);
@@ -567,5 +577,9 @@ fn the_norm_prologue_is_derived_on_the_real_step_at_the_reorder_budget() {
     let m = d.marginals.iter().find(|m| m.fragment == "norm").unwrap();
     assert_eq!(m.sites, 77);
     assert!(m.delta_us < 0.0, "{m:?}");
-    assert!(d.refused.iter().all(|(n, _)| n != "norm"), "{:?}", d.refused);
+    assert!(
+        d.refused.iter().all(|(n, _)| n != "norm"),
+        "{:?}",
+        d.refused
+    );
 }

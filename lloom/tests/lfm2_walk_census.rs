@@ -211,7 +211,10 @@ fn check_at<P: Lfm2Shape>(
         Set::DerivedReorder => {
             let r = model.derive_fusion_at(cfg, NumericClass::ReorderEquiv)?;
             eprintln!("{name}: {r}");
-            assert!(r.norm_gemv, "{name}: the plan at `reorder` takes the norm prologue");
+            assert!(
+                r.norm_gemv,
+                "{name}: the plan at `reorder` takes the norm prologue"
+            );
         }
     }
     let mut cache = State::<P>::new(true, DType::F16, cfg, dev)?;

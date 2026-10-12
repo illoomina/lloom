@@ -159,7 +159,10 @@ fn assert_accuracy_dominates(
     truth: &[f64],
 ) -> Result<()> {
     assert_eq!(fused.shape(), double_round.shape(), "{name}: shape");
-    let f = fused.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let f = fused
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let d = double_round
         .to_dtype(DType::F32)?
         .flatten_all()?
@@ -243,8 +246,8 @@ fn run_with(
     )?
     .to_dtype(dtype)?;
     // The squeezed conv weight `[hidden, l_cache]`, as `convolve` passes it.
-    let w = Tensor::from_vec(fill(hidden * l_cache, 3), (hidden, l_cache), device)?
-        .to_dtype(dtype)?;
+    let w =
+        Tensor::from_vec(fill(hidden * l_cache, 3), (hidden, l_cache), device)?.to_dtype(dtype)?;
 
     // The fused arm first: it does not write its inputs. The reference builds a
     // fresh state via `cat`, so order is not load-bearing here — but kept for
@@ -335,7 +338,12 @@ fn parity(dtype: DType) -> Result<()> {
         // (that pins the worse value). Accuracy dominance against the f64 truth,
         // computed from the same T window the kernel wrote (`want_state`, which
         // == `state` bit-for-bit as just asserted).
-        let truth = gate_truth(&want_state, &c_of(case, dtype, &device)?, &w_of(case, dtype, &device)?, case.l_cache)?;
+        let truth = gate_truth(
+            &want_state,
+            &c_of(case, dtype, &device)?,
+            &w_of(case, dtype, &device)?,
+            case.l_cache,
+        )?;
         assert_accuracy_dominates(&format!("case {i} {dtype:?} out"), &out, &want_out, &truth)?;
         total_closer += count_strictly_closer(&out, &want_out, &truth)?;
         // The fused output, before the caller's transpose: `[b, hidden, 1]`.
@@ -393,7 +401,10 @@ fn bcx_of(case: &Case, dtype: DType, device: &Device) -> Result<(Tensor, Tensor,
 }
 
 fn count_strictly_closer(fused: &Tensor, double_round: &Tensor, truth: &[f64]) -> Result<usize> {
-    let f = fused.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let f = fused
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let d = double_round
         .to_dtype(DType::F32)?
         .flatten_all()?

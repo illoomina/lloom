@@ -11,9 +11,9 @@ use lloom::models::deepseek2::{DeepSeekV2, DeepSeekV2Config};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 struct TextGeneration {

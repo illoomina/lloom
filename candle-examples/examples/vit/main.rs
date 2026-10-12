@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, IndexOp, D};
-use lloom::nn::VarBuilder;
 use lloom::models::vit;
+use lloom::nn::VarBuilder;
 
 #[derive(Parser)]
 struct Args {

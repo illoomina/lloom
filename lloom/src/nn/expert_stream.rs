@@ -753,6 +753,50 @@ impl ResidencyMap {
         self.cache.take_free().map(SlotId::index)
     }
 
+    /// Plan free-only hints without exposing a key or an unsignaled sentinel.
+    /// `issue` returns (completion value, bytes issued). An Err must mean no IO
+    /// write was submitted; unknown/partial native handoff needs separate custody,
+    /// not this pre-submit error contract. Exclusive map access spans the call.
+    #[cfg(any(feature = "metal", test))]
+    fn issue_free_hint(
+        &mut self,
+        experts: &[u32],
+        protect: Tick,
+        issue: impl FnOnce(&[(usize, usize)]) -> Result<(u64, u64)>,
+    ) -> Result<(usize, u64)> {
+        let mut chosen = Vec::with_capacity(experts.len().min(self.cache.active()));
+        let mut slots = self.cache.hint_slots(protect);
+        for &expert in experts {
+            let e = expert as usize;
+            if e >= self.usage.len()
+                || self.slot_of(e).is_some()
+                || chosen.iter().any(|&(key, _)| key == e)
+            {
+                continue;
+            }
+            let Some(slot) = slots.next() else { break };
+            chosen.push((e, slot.index()));
+        }
+        drop(slots);
+        if chosen.is_empty() {
+            return Ok((0, 0));
+        }
+        // No mutation above or on this error edge: even quarantined free-list
+        // order is unchanged, and another attempt can choose the same slots.
+        let (value, bytes) = issue(&chosen)?;
+        let tick = self.tick();
+        for &(e, s) in &chosen {
+            if self.quarantined() {
+                let taken = self.take_free();
+                debug_assert_eq!(taken, Some(s));
+            }
+            self.install(s, e);
+            self.set_inflight(s, value);
+            self.touch(s, tick);
+        }
+        Ok((chosen.len(), bytes))
+    }
+
     /// The least-recently-used RESIDENT unpinned slot not used in `tick` and
     /// not in flight.
     fn lru_resident(&self, tick: Tick) -> Option<usize> {
@@ -913,6 +957,38 @@ impl ResidencyMap {
         self.cache.set_inflight(SlotId(slot as u32), value)
     }
 
+    /// Retire dependency marks only after the compute wait is accepted. `slots`
+    /// selects a resolved group; None covers a device plan's whole map. A split
+    /// resolve may have released Inner's lock since collecting `value`, so do
+    /// not clear newer stamps. The existing IO lane-prefix contract is still
+    /// required; this transaction does not prove native completion or submission.
+    #[cfg(any(feature = "metal", test))]
+    fn order_inflight(
+        &mut self,
+        value: u64,
+        slots: Option<&[usize]>,
+        order: impl FnOnce() -> Result<()>,
+    ) -> Result<u64> {
+        if value == 0 {
+            return Ok(0);
+        }
+        // Refusal or unwind preserves every mark. No rollback vector or
+        // speculative mutation; the existing Pending owns the slot list.
+        order()?;
+        let Some(slots) = slots else {
+            return Ok(self.settle_inflight(value));
+        };
+        let mut retired = 0;
+        for &slot in slots {
+            let stamp = self.inflight(slot);
+            if stamp != 0 && stamp <= value {
+                self.set_inflight(slot, 0);
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
     /// The largest in-flight value over the slots (0: none in flight).
     fn inflight_max(&self) -> u64 {
         self.cache.inflight_max()
@@ -946,6 +1022,189 @@ impl ResidencyMap {
     /// [`SlotCache::free_slots`]).
     pub fn free_slots(&self) -> usize {
         self.cache.free_slots()
+    }
+}
+
+#[cfg(test)]
+mod wait_transaction_tests {
+    use super::*;
+
+    fn pending() -> ResidencyMap {
+        let mut map = ResidencyMap::new(8, 4);
+        for s in 0..4 {
+            map.install(s, s);
+            map.set_inflight(s, 7 + s as u64);
+        }
+        map
+    }
+
+    #[test]
+    fn refused_wait_preserves_marks_then_retry_retires_only_selected() -> Result<()> {
+        let mut map = pending();
+        let before = format!("{map:?}");
+        let err = map
+            .order_inflight(9, Some(&[0, 1, 1]), || {
+                lloom_tensor::bail!("injected wait admission refusal")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("injected wait admission refusal"));
+        assert_eq!(format!("{map:?}"), before, "refused wait erased dependency");
+        assert_eq!(map.order_inflight(9, Some(&[0, 1, 1]), || Ok(()))?, 2);
+        assert_eq!((map.inflight(0), map.inflight(1)), (0, 0));
+        assert_eq!(map.inflight(2), 9, "unselected stamp changed");
+        assert_eq!(map.inflight(3), 10, "newer stamp changed");
+        Ok(())
+    }
+
+    #[test]
+    fn wait_unwind_preserves_marks_and_plan_clears_only_covered_prefix() -> Result<()> {
+        let mut map = pending();
+        let before = format!("{map:?}");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.order_inflight(9, None, || panic!("injected wait unwind"))
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(format!("{map:?}"), before, "wait unwind erased dependency");
+        assert_eq!(map.order_inflight(9, None, || Ok(()))?, 3);
+        assert_eq!(map.inflight(3), 10);
+        assert_eq!(map.inflight_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn split_resolve_preserves_newer_stamp_and_zero_never_encodes() -> Result<()> {
+        let mut map = pending();
+        let collected = 8;
+        // Inner's lock can be released between begin and finish. A newer load
+        // assigned to a selected slot is not covered by the collected wait.
+        map.set_inflight(0, 12);
+        assert_eq!(map.order_inflight(collected, Some(&[0, 1]), || Ok(()))?, 1);
+        assert_eq!(map.inflight(0), 12);
+        assert_eq!(map.inflight(1), 0);
+        let before = format!("{map:?}");
+        assert_eq!(
+            map.order_inflight(0, None, || panic!("empty wait encoded"))?,
+            0
+        );
+        assert_eq!(format!("{map:?}"), before);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hint_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn refused_hint_preserves_map_and_free_order_then_retry_publishes() -> Result<()> {
+        for spare in [0, 1] {
+            let mut map = ResidencyMap::new(8, 4);
+            map.set_spare(spare);
+            if spare != 0 {
+                assert_eq!(map.take_free(), Some(0));
+            }
+            map.install(0, 0);
+            map.begin();
+            let before = format!("{map:?}");
+            let hints = [0, 99, 1, 1, 2];
+            let refused = map.issue_free_hint(&hints, Tick::NEVER, |chosen| {
+                assert_eq!(chosen, &[(1, 1), (2, 2)]);
+                lloom_tensor::bail!("injected refusal before IO submission")
+            });
+            assert!(refused
+                .unwrap_err()
+                .to_string()
+                .contains("injected refusal"));
+            assert_eq!(format!("{map:?}"), before, "refusal changed cache state");
+            let issued = map.issue_free_hint(&hints, Tick::NEVER, |chosen| {
+                assert_eq!(chosen, &[(1, 1), (2, 2)]);
+                Ok((9, 48))
+            })?;
+            assert_eq!(issued, (2, 48));
+            assert_eq!(map.resident(), vec![0, 1, 2]);
+            assert_eq!(map.inflight(1), 9);
+            assert_eq!(map.inflight(2), 9);
+            assert_eq!(map.inflight_max(), 9);
+            assert_eq!(map.usage, vec![0; 8], "a hint is not a use");
+            if spare != 0 {
+                assert_eq!(map.take_free(), Some(3));
+                assert_eq!(map.take_free(), None);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hint_pre_submit_unwind_leaves_no_reservation() {
+        for spare in [0, 1] {
+            let mut map = ResidencyMap::new(8, 3);
+            map.set_spare(spare);
+            let before = format!("{map:?}");
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                map.issue_free_hint(&[1, 2], Tick::NEVER, |_| {
+                    panic!("injected unwind BEFORE IO submission")
+                })
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(format!("{map:?}"), before);
+        }
+    }
+
+    #[test]
+    fn hint_selection_matches_existing_policy_without_eviction() -> Result<()> {
+        for spare in [0, 1] {
+            let mut map = ResidencyMap::new(16, 8);
+            map.set_spare(spare);
+            for s in 0..2 {
+                if spare != 0 {
+                    assert_eq!(map.take_free(), Some(s));
+                }
+                map.install(s, s);
+            }
+            let protect = map.begin();
+            if spare == 0 {
+                map.set_pinned(2, true);
+                map.touch(3, protect);
+                map.set_inflight(4, 7);
+                map.stamp(5, Epoch(u64::MAX));
+            } else {
+                map.evict(1, Epoch(7), false);
+            }
+            assert!(map.shrink_to(7, 1).is_empty());
+            let mut old = map.clone();
+            let mut expected = Vec::new();
+            for e in 8..16 {
+                let slot = if old.quarantined() {
+                    old.take_free()
+                } else {
+                    old.victim_in(protect, true, Completed::ALL)
+                        .and_then(|(s, evicted)| (!evicted).then_some(s))
+                };
+                let Some(s) = slot else { break };
+                old.install(s, e);
+                old.set_inflight(s, u64::MAX);
+                old.touch(s, old.tick());
+                expected.push((e, s));
+            }
+            let hints: Vec<u32> = (8..16).collect();
+            map.issue_free_hint(&hints, protect, |chosen| {
+                assert_eq!(chosen, expected);
+                Ok((11, 0))
+            })?;
+            for (_, s) in expected {
+                old.set_inflight(s, 11);
+            }
+            assert_eq!(format!("{map:?}"), format!("{old:?}"));
+        }
+        let mut full = ResidencyMap::new(2, 1);
+        full.install(0, 0);
+        assert_eq!(
+            full.issue_free_hint(&[1], Tick::NEVER, |_| {
+                panic!("no free slot must not submit")
+            })?,
+            (0, 0)
+        );
+        Ok(())
     }
 }
 
@@ -1473,12 +1732,12 @@ impl Inner {
             if buf.contents().is_null() {
                 return Ok(None);
             }
-            let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+            let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
                 buf.clone(),
                 m.clone(),
                 n,
                 lloom_tensor::DType::U32,
-            ));
+            )?);
             let t =
                 Tensor::from_storage(storage, (1, n), lloom_tensor::op::BackpropOp::none(), false);
             self.decode_io.slots = Some((buf, t));
@@ -1511,12 +1770,12 @@ impl LiveTable {
         if buf.contents().is_null() {
             lloom_tensor::bail!("the live residency table has no CPU mapping")
         }
-        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
             buf.clone(),
             device.clone(),
             n,
             lloom_tensor::DType::U32,
-        ));
+        )?);
         let tensor = Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
         let t = Self { tensor, buf, n };
         for e in 0..n {
@@ -1746,9 +2005,9 @@ impl Streamed {
     ) -> Result<Self> {
         #[cfg(feature = "metal")]
         let staging = match (device, &loader) {
-            (Device::Metal(d), LoaderArm::Pread) => Some(
-                lloom_tensor::kernels::metal::staging::StagingRing::shared(d),
-            ),
+            (Device::Metal(d), LoaderArm::Pread) => {
+                Some(lloom_tensor::kernels::metal::staging::StagingRing::try_shared(d)?)
+            }
             _ => None,
         };
         #[cfg(not(feature = "metal"))]
@@ -2173,7 +2432,7 @@ impl Streamed {
                             (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
                         })
                         .collect();
-                    p.take_needed(self.key, &needed)
+                    p.try_take_needed(self.key, &needed)?
                         .into_iter()
                         .map(|s| (s.expert, s))
                         .collect()
@@ -2233,7 +2492,7 @@ impl Streamed {
                     #[cfg(feature = "metal")]
                     if inner.map.inflight(s) != 0 {
                         wait_value = wait_value.max(inner.map.inflight(s));
-                        inner.map.set_inflight(s, 0);
+                        // Keep the dependency until resolve_finish accepts its wait.
                         self.counters
                             .io_inflight_hits
                             .fetch_add(1, Ordering::Relaxed);
@@ -2437,7 +2696,7 @@ impl Streamed {
                         inner.sources[2].plane_source(),
                     ];
                     let t0 = std::time::Instant::now();
-                    let ticket = p.submit_now(self.key, &want, &planes);
+                    let ticket = p.try_submit_now(self.key, &want, &planes)?;
                     pending.now = Some((ticket, std::mem::take(&mut misses), t0.elapsed()));
                 }
             }
@@ -2516,7 +2775,7 @@ impl Streamed {
                 inner.table_stale = true;
             }
             if wait_value != 0 {
-                self.await_inflight(inner, wait_value)?;
+                self.await_inflight(inner, wait_value, Some(&slots))?;
             }
         }
         if !misses.is_empty() {
@@ -2557,7 +2816,12 @@ impl Streamed {
     /// Make the compute stream wait for the `io` arm's loads up to `value`
     /// (the in-flight entries a group uses), once per group.
     #[cfg(feature = "metal")]
-    fn await_inflight(&self, inner: &mut Inner, value: u64) -> Result<()> {
+    fn await_inflight(
+        &self,
+        inner: &mut Inner,
+        value: u64,
+        slots: Option<&[usize]>,
+    ) -> Result<u64> {
         let queue = match &inner.loader {
             LoaderArm::Io(q) => q,
             LoaderArm::Pread => {
@@ -2568,14 +2832,16 @@ impl Streamed {
             Device::Metal(d) => d.commands().clone(),
             _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
         };
-        queue
-            .await_value(&commands, value)
-            .map_err(lloom_tensor::Error::wrap)
+        inner.map.order_inflight(value, slots, || {
+            queue
+                .await_value(&commands, value)
+                .map_err(lloom_tensor::Error::wrap)
+        })
     }
 
     /// The `io` arm's hint: give each of `experts` (missing, in the order
-    /// the hint ranks them) a slot NOW — the LRU victim among the slots not
-    /// in flight, stopping when none is left — and issue their loads as
+    /// the hint ranks them) a FREE slot, stopping when none is left, and
+    /// publish the mappings only after successfully issuing their loads as
     /// one IO command buffer, ordered after everything encoded so far. The
     /// slots are in flight until the layer's `resolve` waits for them (or
     /// the host sees the event past their value). A hint is not a use:
@@ -2602,75 +2868,66 @@ impl Streamed {
         // for the later groups runs between the two) is protected: its
         // slots are never victims. Any other epoch's dispatches are encoded
         // and the load is ordered after them.
-        let tick = inner.map.tick();
         let protect = inner.open_epoch.unwrap_or(Tick::NEVER);
-        let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(experts.len());
-        for &e in experts {
-            let e = e as usize;
-            if e >= self.n_experts || inner.map.slot_of(e).is_some() {
-                continue;
-            }
-            // FREE slots only, no eviction: a hint that evicts on a pool
-            // smaller than the tile's working set displaces what the tile
-            // needs now for what it may need next (measured: misses 23 802
-            // → 30 368 and the prefill 12.6 → 21–37 s on the 937-token
-            // prompt; 15 459 → 18 808 and 5.8 → 11.0 s on the 25-token one
-            // over a hotlist-warmed pool, `p26-io2-*.txt`). The `pread`
-            // arm's ring is the room its hints read into; the `io` arm's
-            // room is its empty slots.
-            let s = if inner.map.quarantined() {
-                match inner.map.take_free() {
-                    Some(s) => s,
-                    None => break,
-                }
-            } else {
-                let Some((s, false)) = inner.map.victim_in(protect, true, Completed::ALL) else {
-                    break;
-                };
-                s
-            };
-            inner.map.install(s, e);
-            // In flight from here (the value below once issued), so the
-            // next pick of this loop skips it.
-            inner.map.set_inflight(s, u64::MAX);
-            inner.map.touch(s, tick);
-            chosen.push((e, s));
-        }
-        if chosen.is_empty() {
-            return Ok(());
-        }
-        let mut bytes = 0u64;
-        let value = {
-            let mut loads = Vec::with_capacity(chosen.len() * 3);
-            for (pool, src) in inner.pools.iter().zip(inner.sources.iter()) {
+        // FREE slots only: preserve the existing no-eviction hint policy.
+        // The Inner mutex remains held while planning, submitting and publishing;
+        // no other host producer can claim a selected slot in between.
+        let pools = &inner.pools;
+        let sources = &inner.sources;
+        let (issued, bytes) = inner.map.issue_free_hint(experts, protect, |chosen| {
+            let capacity = chosen
+                .len()
+                .checked_mul(pools.len())
+                .ok_or_else(|| lloom_tensor::Error::Msg("io hint load count overflow".into()))?;
+            let mut loads = Vec::with_capacity(capacity);
+            let mut bytes = 0u64;
+            for (pool, src) in pools.iter().zip(sources.iter()) {
                 let dst = pool.qt.metal_buffer()?;
                 let file = match &src.io {
                     Some(f) => f,
                     None => lloom_tensor::bail!("io arm: {} was not opened", src.path.display()),
                 };
                 let plane = pool.plane_bytes;
-                for &(e, s) in &chosen {
+                for &(e, s) in chosen {
+                    let dst_offset = s.checked_mul(plane).ok_or_else(|| {
+                        lloom_tensor::Error::Msg("io hint destination offset overflow".into())
+                    })?;
+                    let src_relative = e.checked_mul(src.plane_bytes).ok_or_else(|| {
+                        lloom_tensor::Error::Msg("io hint source plane offset overflow".into())
+                    })?;
+                    let src_offset =
+                        src.data_start
+                            .checked_add(src_relative as u64)
+                            .ok_or_else(|| {
+                                lloom_tensor::Error::Msg("io hint source offset overflow".into())
+                            })?;
                     loads.push(IoLoad {
                         dst,
-                        dst_offset: s * plane,
+                        dst_offset,
                         file,
-                        src_offset: src.plane_offset(e),
+                        src_offset,
                         len: plane,
                     });
-                    bytes += plane as u64;
+                    bytes = bytes.checked_add(plane as u64).ok_or_else(|| {
+                        lloom_tensor::Error::Msg("io hint byte count overflow".into())
+                    })?;
                 }
             }
-            queue
+            // issue's ordinary Rust errors precede native IO submission. Do not
+            // replace this with load_ordered: its compute wait can fail AFTER IO
+            // submission, which would require retaining/quarantining these slots.
+            let value = queue
                 .issue(&commands, &loads)
-                .map_err(lloom_tensor::Error::wrap)?
-        };
-        for &(_, s) in &chosen {
-            inner.map.set_inflight(s, value);
+                .map_err(lloom_tensor::Error::wrap)?;
+            Ok((value, bytes))
+        })?;
+        if issued == 0 {
+            return Ok(());
         }
         inner.table_stale = true;
         self.counters
             .io_hints
-            .fetch_add(chosen.len() as u64, Ordering::Relaxed);
+            .fetch_add(issued as u64, Ordering::Relaxed);
         self.counters
             .bytes_loaded
             .fetch_add(bytes, Ordering::Relaxed);
@@ -2690,7 +2947,7 @@ impl Streamed {
             return Ok(());
         }
         if let Some(p) = &self.prefetch {
-            p.request(self.key, &missing, &planes);
+            p.try_request(self.key, &missing, &planes)?;
             return Ok(());
         }
         if self.io_hints {
@@ -2722,8 +2979,7 @@ impl Streamed {
         if pending == 0 {
             return Ok(());
         }
-        self.await_inflight(inner, pending)?;
-        let n = inner.map.settle_inflight(pending);
+        let n = self.await_inflight(inner, pending, None)?;
         self.counters
             .io_inflight_planned
             .fetch_add(n, Ordering::Relaxed);
@@ -3119,13 +3375,13 @@ pub fn fetch_on() -> bool {
 /// Whether a value allocated now is read after the open pass closes: the
 /// open pass is a model's own (`MetalDevice::model_pass_open`), whose settle
 /// runs after it. False with no pass open, off Metal, or under a driver's.
-fn record_outlives_pass(t: &Tensor) -> bool {
+fn record_outlives_pass(t: &Tensor) -> Result<bool> {
     #[cfg(feature = "metal")]
     if let Ok(m) = t.device().as_metal_device() {
-        return m.model_pass_open();
+        return Ok(m.execution_device()?.model_pass_open());
     }
     let _ = t;
-    false
+    Ok(false)
 }
 
 /// An escape guard while the streamed tier allocates (Metal): the pool
@@ -3324,13 +3580,23 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 {
                     lloom_tensor::bail!("slot_map: the record slot must be a fresh u32 [3·n]")
                 }
-                os.buffer_handle().clone()
+                lloom_tensor::MetalStorage::new(
+                    os.buffer_handle().clone(),
+                    os.device().clone(),
+                    3 * n,
+                    s.dtype(),
+                )
             }
-            None => device
-                .new_buffer_builder()
-                .with_size_for(3 * n, lloom_tensor::DType::U32)
-                .with_label("moe_slot_map")
-                .build()?,
+            None => lloom_tensor::MetalStorage::new_allocated(
+                device
+                    .new_buffer_builder()
+                    .with_size_for(3 * n, lloom_tensor::DType::U32)
+                    .with_label("moe_slot_map")
+                    .build()?,
+                device.clone(),
+                3 * n,
+                s.dtype(),
+            )?,
         };
         lloom_tensor::kernels::call_moe_slot_map(
             device.metal_device(),
@@ -3346,13 +3612,10 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 buffer: ts.buffer(),
                 offset_in_bytes: tl.start_offset() * ts.dtype().size_in_bytes(),
             },
-            &output,
+            output.buffer(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
-        Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), 3 * n, s.dtype()),
-            lloom_tensor::Shape::from(3 * n),
-        ))
+        Ok((output, lloom_tensor::Shape::from(3 * n)))
     }
 }
 
@@ -4094,7 +4357,7 @@ impl ExpertResidency for Streamed {
         // The record is read by the settle after the pass body: inside a
         // driver's pass, where a plan serves it, and after a model's own
         // pass has closed, where it must be declared (`DESIGN.md` §9.2aa).
-        let _escape = if record_outlives_pass(&ids) {
+        let _escape = if record_outlives_pass(&ids)? {
             escape_guard()
         } else {
             None
@@ -5511,18 +5774,28 @@ mod tests {
         let a = Tensor::new(&[[1u32, 2, 3]], &dev).unwrap();
         let (_, rec_a) = tier.plan_device(&a).unwrap().expect("a device plan");
         let want_a = read(&rec_a);
-        assert_eq!(&want_a[6..9], &[0, 0, 0], "plan A misses nothing: {want_a:?}");
+        assert_eq!(
+            &want_a[6..9],
+            &[0, 0, 0],
+            "plan A misses nothing: {want_a:?}"
+        );
         let b = Tensor::new(&[[7u32, 8, 9]], &dev).unwrap();
         let (_, rec_b) = tier.plan_device(&b).unwrap().expect("a device plan");
         let got_b = read(&rec_b);
-        assert_ne!(want_a, got_b, "the two plans' records are the same: no test");
+        assert_ne!(
+            want_a, got_b,
+            "the two plans' records are the same: no test"
+        );
         assert_eq!(
             read(&rec_a),
             want_a,
             "plan A's record read after plan B ran is not plan A's"
         );
         assert!(!tier.settle_host(&want_a).unwrap());
-        assert!(tier.settle_host(&got_b).unwrap(), "plan B computed on missing experts");
+        assert!(
+            tier.settle_host(&got_b).unwrap(),
+            "plan B computed on missing experts"
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -5580,7 +5853,10 @@ mod tests {
         // The settle proper loads the two missing experts.
         let _ = tier.plan_device(&tok).unwrap().expect("a device plan");
         tier.settle_host(&record).unwrap();
-        assert!(tier.stats().bytes_loaded > before.bytes_loaded, "the control loaded nothing");
+        assert!(
+            tier.stats().bytes_loaded > before.bytes_loaded,
+            "the control loaded nothing"
+        );
         std::fs::remove_file(path).ok();
     }
 

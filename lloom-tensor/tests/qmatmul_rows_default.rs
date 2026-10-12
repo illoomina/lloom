@@ -1,10 +1,10 @@
-//! Under the default knobs and the `deterministic` contract (pinned here) an `m`-row
-//! quantized matmul-vec (2..=8 rows) is one launch with the rows on the
-//! grid's second axis, and each row is bit-identical to a one-row launch of
-//! that row: a sequence's logits do not depend on how many rows share its
-//! batch. The rows kernels (`qmatmul_rows_arm`) must not run.
+//! Under the `deterministic` contract (pinned here) an `m`-row quantized
+//! matmul-vec (2..=8 rows) is one launch of the one-row core with the rows
+//! on the grid's second axis, and each row is bit-identical to a one-row
+//! launch of that row: a sequence's logits do not depend on how many rows
+//! share its batch. No kernel on the row axis (`_r<N>`) may run.
 //!
-//! Its own binary: the knobs are read once per process.
+//! Its own binary: the contract is read once per process.
 #![cfg(feature = "metal")]
 
 #[path = "rows_identity/mod.rs"]
@@ -21,10 +21,14 @@ fn device() -> Device {
         let _ = lloom_tensor::tuning::install(t);
     });
     assert!(!lloom_tensor::tuning::contract().is_fast());
+    assert!(
+        lloom_tensor::tuning::tuning().qmv.rows,
+        "the axis is on by default; it is the contract that keeps it off here"
+    );
     Device::new_metal(0).expect("a Metal device")
 }
 
 #[test]
 fn a_row_is_the_same_bits_whatever_rows_share_its_launch() -> Result<()> {
-    rows_identity::a_row_is_the_same_bits_whatever_rows_share_its_launch(&device())
+    rows_identity::a_row_is_the_same_bits_whatever_rows_share_its_launch(&device(), false)
 }

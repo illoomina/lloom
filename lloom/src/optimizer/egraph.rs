@@ -100,7 +100,10 @@ pub fn admitted_kernels(
         if let Some((_, why)) = policy.unavailable.iter().find(|(n, _)| n == k.name) {
             refused.push((k.name.to_string(), why.clone()));
         } else if policy.excluded.iter().any(|e| e == k.name) {
-            refused.push((k.name.to_string(), "excluded by the exclusion set".to_string()));
+            refused.push((
+                k.name.to_string(),
+                "excluded by the exclusion set".to_string(),
+            ));
         } else if !k.class.within(policy.budget) {
             refused.push((
                 k.name.to_string(),
@@ -145,7 +148,11 @@ fn quote(s: &str) -> String {
 
 /// The datatype declarations and the derivation rules for `fragments` and
 /// `kernels`.
-fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String, Vec<String>)]) -> String {
+fn prelude(
+    fragments: &[Fragment],
+    kernels: &[KernelFragment],
+    sites: &[(String, Vec<String>)],
+) -> String {
     let epilogues: Vec<&Fragment> = fragments.iter().filter(|f| f.side == Side::Store).collect();
     // A block restricted to some sites rides a product whose weight carries
     // the site fact; the rule reads it.
@@ -342,7 +349,11 @@ fn prelude(fragments: &[Fragment], kernels: &[KernelFragment], sites: &[(String,
         let at = |name: &str, w: &str| format!("{}{}", at(name, w), packed(w));
         match (f.semantics, f.operand) {
             (Semantics::Silu | Semantics::Sigmoid, OperandKind::None) => {
-                let act = if f.semantics == Semantics::Silu { "Silu" } else { "Sigmoid" };
+                let act = if f.semantics == Semantics::Silu {
+                    "Silu"
+                } else {
+                    "Sigmoid"
+                };
                 let ok = at(name, "w");
                 let _ = writeln!(
                     p,
@@ -821,20 +832,26 @@ impl<'a> Rebuild<'a> {
     }
 
     /// A prologue marker: the fragment it names and its weight.
-    fn prologue(&mut self, dag: &egglog::TermDag, id: egglog::TermId) -> Result<(Fragment, NodeId)> {
+    fn prologue(
+        &mut self,
+        dag: &egglog::TermDag,
+        id: egglog::TermId,
+    ) -> Result<(Fragment, NodeId)> {
         let egglog::Term::App(head, children) = dag.get(id) else {
             return Err(Error::Msg("optimizer: malformed prologue term".to_string()));
         };
         let children = children.clone();
-        let name = head
-            .strip_prefix("Pro_")
-            .ok_or_else(|| Error::Msg(format!("optimizer: unknown prologue constructor `{head}`")))?;
+        let name = head.strip_prefix("Pro_").ok_or_else(|| {
+            Error::Msg(format!("optimizer: unknown prologue constructor `{head}`"))
+        })?;
         let fragment = self
             .fragments
             .iter()
             .find(|f| f.name == name && f.side == Side::Load)
             .ok_or_else(|| {
-                Error::Msg(format!("optimizer: extracted prologue `{name}` not in the catalogue"))
+                Error::Msg(format!(
+                    "optimizer: extracted prologue `{name}` not in the catalogue"
+                ))
             })?
             .clone();
         let pw = self.term(dag, children[0])?;
@@ -853,10 +870,11 @@ impl<'a> Rebuild<'a> {
 
     /// A kernel fragment by name.
     fn kernel(&self, name: &str) -> Result<&'a KernelFragment> {
-        self.kernels
-            .iter()
-            .find(|k| k.name == name)
-            .ok_or_else(|| Error::Msg(format!("optimizer: extracted kernel `{name}` not in the catalogue")))
+        self.kernels.iter().find(|k| k.name == name).ok_or_else(|| {
+            Error::Msg(format!(
+                "optimizer: extracted kernel `{name}` not in the catalogue"
+            ))
+        })
     }
 
     /// Revert every prologue whose producer survived as a dispatch: a norm
@@ -917,7 +935,9 @@ impl<'a> Rebuild<'a> {
                         m
                     }
                 };
-                *reverted.entry(n.prologue.clone().unwrap_or_default()).or_insert(0) += 1;
+                *reverted
+                    .entry(n.prologue.clone().unwrap_or_default())
+                    .or_insert(0) += 1;
                 let mut node = n.clone();
                 node.inputs = inputs;
                 node.inputs.pop();
@@ -1056,7 +1076,10 @@ impl<'a> Rebuild<'a> {
             "Norm" => {
                 let w = self.term(dag, children[0])?;
                 let x = self.term(dag, children[1])?;
-                let key = (self.graph.node(w).name.clone(), Self::value_key(&self.graph, x));
+                let key = (
+                    self.graph.node(w).name.clone(),
+                    Self::value_key(&self.graph, x),
+                );
                 if let Some(&n) = self.norms.get(&key) {
                     n
                 } else {
@@ -1071,7 +1094,12 @@ impl<'a> Rebuild<'a> {
                 let b = self.term(dag, children[1])?;
                 let (shape, dtype) = (self.graph.node(a).shape.clone(), self.graph.node(a).dtype);
                 let id = self.graph.opaque(k.family, &[a, b], shape, dtype);
-                let class = self.graph.node(a).numeric.join(self.graph.node(b).numeric).join(k.class);
+                let class = self
+                    .graph
+                    .node(a)
+                    .numeric
+                    .join(self.graph.node(b).numeric)
+                    .join(k.class);
                 self.graph.set_numeric(id, class);
                 *self.placed.entry(k.name.to_string()).or_insert(0) += 1;
                 id
@@ -1125,9 +1153,15 @@ impl<'a> Rebuild<'a> {
                     (operand, fragment.scales.then_some(1.0))
                 };
                 match prologue {
-                    None => self
-                        .graph
-                        .fused_on(core, fragment.name, fragment.class(), w, x, operand, scale),
+                    None => self.graph.fused_on(
+                        core,
+                        fragment.name,
+                        fragment.class(),
+                        w,
+                        x,
+                        operand,
+                        scale,
+                    ),
                     Some((pro, pw)) => self.graph.fused_with_prologue(
                         core,
                         fragment.name,

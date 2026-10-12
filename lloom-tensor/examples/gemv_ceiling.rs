@@ -331,7 +331,9 @@ fn parse_shape(s: &str) -> Result<Shape> {
                 rest = rest
                     .strip_prefix(key)
                     .with_context(|| format!("shape {other:?}: expected {key}"))?;
-                let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
                 v[i] = rest[..end].parse()?;
                 rest = &rest[end..];
             }
@@ -929,12 +931,36 @@ fn main() -> Result<()> {
     };
     // Every class once, for the pipelines and the parity gate.
     let class_reps = [
-        Mat { name: "q_proj", n: 2048, k: 2048 },
-        Mat { name: "k_proj", n: 512, k: 2048 },
-        Mat { name: "conv_in", n: 6144, k: 2048 },
-        Mat { name: "w1", n: 10752, k: 2048 },
-        Mat { name: "w2", n: 2048, k: 10752 },
-        Mat { name: "lm_head", n: 128000, k: 2048 },
+        Mat {
+            name: "q_proj",
+            n: 2048,
+            k: 2048,
+        },
+        Mat {
+            name: "k_proj",
+            n: 512,
+            k: 2048,
+        },
+        Mat {
+            name: "conv_in",
+            n: 6144,
+            k: 2048,
+        },
+        Mat {
+            name: "w1",
+            n: 10752,
+            k: 2048,
+        },
+        Mat {
+            name: "w2",
+            n: 2048,
+            k: 10752,
+        },
+        Mat {
+            name: "lm_head",
+            n: 128000,
+            k: 2048,
+        },
     ];
     let stream_lib = compile(&device, STREAM_SRC)?;
     let all_mats: Vec<Mat> = class_reps.iter().chain(&mats).copied().collect();

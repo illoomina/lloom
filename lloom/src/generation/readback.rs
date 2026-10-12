@@ -42,6 +42,12 @@ use crate::generation::poll::PollMechanism;
 use crate::generation::token_ring::TokenRing;
 use crate::generation::{LogitsProcessor, Sampling};
 use lloom_tensor::{DType, Device, Result, Tensor};
+#[cfg(feature = "metal")]
+use std::sync::atomic::fence;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 /// How long the EOS wait parks on the publish event before it takes the
 /// blocking read: a fail-safe two orders of magnitude above a token, never a
@@ -657,7 +663,10 @@ impl Geometry {
 ///   which holds for every token of the run it was taken for.
 /// * **Laps**: the loop's lap guard protects the loop's own drain, not this
 ///   reader. If the reader falls more than `capacity` tokens behind the writer,
-///   `read_new` returns [`RingLap`] rather than stale slots; how far behind a
+///   `read_new` returns [`RingLap`] rather than stale slots. A host reservation
+///   boundary brackets every copy, so even an overwrite not yet published by
+///   the GPU is rejected. Reuse of a retracted draw also invalidates a reader
+///   that has not consumed that draw; how far behind a
 ///   consumer may fall is the ring's `capacity` (the consumer slack,
 ///   `LLOOM_RING_SLACK_BYTES`), which the caller sizes.
 ///
@@ -669,6 +678,8 @@ pub struct RingReader {
     /// Held for liveness only: the pointers below are into these buffers.
     _segments: Vec<Tensor>,
     _step: Tensor,
+    /// Host reservation boundary, advanced before any queued overwrite.
+    safe_after: Arc<AtomicUsize>,
     #[cfg(feature = "metal")]
     seg_bases: Vec<*const u32>,
     #[cfg(feature = "metal")]
@@ -695,9 +706,9 @@ pub struct RingReader {
 // reader only ever loads through them, and a consumer thread is the point.
 unsafe impl Send for RingReader {}
 
-/// The writer overtook a [`RingReader`]: more than `capacity` tokens were
-/// published since the reader's `cursor`, so the slots between are no longer
-/// the tokens they were.
+/// The writer reused a [`RingReader`] window. This includes an overwrite
+/// reserved by the host but not yet published by the GPU, and reuse of a
+/// retracted draw. The copy returns no ids from the invalidated batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RingLap {
     pub cursor: usize,
@@ -709,7 +720,7 @@ impl std::fmt::Display for RingLap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ring reader lapped: cursor {} published {} capacity {}",
+            "ring reader window reused: cursor {} published {} capacity {}",
             self.cursor, self.published, self.capacity
         )
     }
@@ -823,6 +834,17 @@ impl RingReader {
         out: &mut Vec<u32>,
         stop_at_eos: bool,
     ) -> std::result::Result<usize, RingLap> {
+        self.read_published_with(out, stop_at_eos, || {})
+    }
+
+    // The hook makes the exact check/copy interleaving deterministic in tests;
+    // the production no-op is monomorphized away, with no dynamic dispatch.
+    fn read_published_with(
+        &mut self,
+        out: &mut Vec<u32>,
+        stop_at_eos: bool,
+        after_copy: impl FnMut(),
+    ) -> std::result::Result<usize, RingLap> {
         if self.ended {
             return Ok(0);
         }
@@ -833,38 +855,53 @@ impl RingReader {
         if published <= self.cursor {
             return Ok(0);
         }
-        if published - self.cursor > self.total_tiles {
-            return Err(RingLap {
-                cursor: self.cursor,
-                published,
-                capacity: self.total_tiles,
-            });
+        let start = self.cursor;
+        let lap = RingLap {
+            cursor: start,
+            published,
+            capacity: self.total_tiles,
+        };
+        if published - start > self.total_tiles || start < self.safe_after.load(Ordering::SeqCst) {
+            return Err(lap);
         }
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (published, stop_at_eos, out);
-            return Ok(0);
+            let _ = (stop_at_eos, out, after_copy);
+            Ok(0)
         }
         #[cfg(feature = "metal")]
         {
-            let mut n = 0usize;
-            while self.cursor < published {
-                let t = (self.cursor + self.slot_shift) % self.total_tiles;
+            let mut after_copy = after_copy;
+            let before = out.len();
+            let mut cursor = start;
+            let mut ended = false;
+            while cursor < published {
+                let t = (cursor + self.slot_shift) % self.total_tiles;
                 let seg = t / self.tiles_per_seg;
                 let off = t % self.tiles_per_seg;
-                // SAFETY: a mapped pointer into a buffer `_segments` keeps alive,
-                // `off < tiles_per_seg`; the slot was written before the stamp
-                // that made `published` cover it.
+                // SAFETY: retained, mapped segment; offset is in bounds. The
+                // published stamp certifies the original write. A concurrent
+                // overwrite is detected below before any copied id escapes.
                 let id = unsafe { self.seg_bases[seg].add(off).read_volatile() };
-                self.cursor += 1;
+                after_copy();
+                cursor += 1;
                 if stop_at_eos && self.eos_ids.contains(&id) {
-                    self.ended = true;
+                    ended = true;
                     break;
                 }
                 out.push(id);
-                n += 1;
             }
-            Ok(n)
+            // Keep mapped loads before the second host reservation check. The
+            // writer's SeqCst store precedes encoding an overwrite. Thus a
+            // copy either finishes before reuse, or discards its whole batch.
+            fence(Ordering::SeqCst);
+            if start < self.safe_after.load(Ordering::SeqCst) {
+                out.truncate(before);
+                return Err(lap);
+            }
+            self.cursor = cursor;
+            self.ended = ended;
+            Ok(out.len() - before)
         }
     }
 }
@@ -1542,6 +1579,12 @@ pub struct Ring {
     history: History,
     /// The ordinal stamped on the last publish; 0 before any.
     generation: u32,
+    /// Readers reject a copy whose starting cursor precedes this boundary.
+    /// Updated before encoding reuse, not after the GPU publishes it.
+    safe_after: Arc<AtomicUsize>,
+    safe_after_host: usize,
+    /// An EOS/retracted draw may reuse the newest slot without a full lap.
+    retracted_stamp: Option<usize>,
     /// The history segments written since the deferred arms' last stamp, each
     /// with the generation its last slot carries, oldest first. The window's
     /// stamp certifies each in turn ([`TokenRing::publish_marker`]), so a
@@ -1762,6 +1805,9 @@ impl Ring {
             eos,
             history,
             generation: 0,
+            safe_after: Arc::new(AtomicUsize::new(0)),
+            safe_after_host: 0,
+            retracted_stamp: None,
             unstamped: Vec::with_capacity(2),
             fused_publish: false,
             fused_step: false,
@@ -1803,6 +1849,21 @@ impl Ring {
         self.live_every = commits.max(1);
     }
 
+    /// Reserve before encoding a history write. A GPU completion stamp cannot
+    /// protect a host copy from a later overwrite whose stamp has not landed.
+    /// Stamps spent on retractions only make the normal capacity bound more
+    /// conservative; reusing the retracted slot invalidates that stamp itself.
+    fn reserve_reader_window(&mut self) {
+        let floor = (self.generation as usize)
+            .saturating_sub(self.history.total_tiles())
+            .max(self.retracted_stamp.take().unwrap_or(0));
+        if floor > self.safe_after_host {
+            self.safe_after_host = floor;
+            // Order reservation before any dispatch/commit that can overwrite.
+            self.safe_after.store(floor, Ordering::SeqCst);
+        }
+    }
+
     /// The ring itself, for a caller that wants to observe its counters.
     pub fn token_ring(&self) -> &TokenRing {
         &self.ring
@@ -1821,7 +1882,7 @@ impl Ring {
     /// A [`RingReader`] over this ring's history for another thread: `None`
     /// off Metal, when the ring's words are not CPU-mapped, or on a
     /// `quantum > 1` layout (no slot-per-token indexing). Take it before the
-    /// run; it costs the loop nothing afterwards.
+    /// run; the loop publishes a host boundary only when reserving overwritten slots.
     ///
     /// The reader starts at stamp zero; on a ring an earlier run used,
     /// [`RingReader::resume_at_published`] starts it at this run's first
@@ -1862,6 +1923,7 @@ impl Ring {
             Some(RingReader {
                 _segments: segments,
                 _step: step,
+                safe_after: Arc::clone(&self.safe_after),
                 seg_bases,
                 step_ptr,
                 tiles_per_seg: self.history.ring.tiles_per_seg,
@@ -1965,6 +2027,7 @@ impl ReadbackStrategy for Ring {
             self.stamp_unstamped()?;
             let (seg, offset) = self.history.begin_step()?;
             self.generation += 1;
+            self.reserve_reader_window();
             let history_slot = self.history.ring.segments[seg].narrow(0, offset, 1)?;
             let token_slot = self.ring.next_input_slot_view()?;
             self.device().argmax_publish(
@@ -2004,6 +2067,7 @@ impl ReadbackStrategy for Ring {
         // encoder two `copy2d` dispatches on different buffers are unordered,
         // and the stamp waits only on what it binds (`TokenRing::publish_marker`).
         self.generation += 1;
+        self.reserve_reader_window();
         // Into this step's tile (segment `seg`, `offset`), before the host knows
         // whether it is EOS; `eos_of_last` retracts by stepping the tile cursor
         // back. `begin_step` guaranteed the tile begins a contiguous run within
@@ -2163,6 +2227,7 @@ impl ReadbackStrategy for Ring {
             lloom_tensor::bail!("Ring::retract_draw: no draw in the open tile to take back");
         }
         self.history.retract_one();
+        self.retracted_stamp = Some(self.generation as usize);
         self.counters.ring_retracted += 1;
         Ok(())
     }
@@ -2260,6 +2325,7 @@ impl ReadbackStrategy for Ring {
             // Retract the EOS token from the still-open tile (the loop never
             // streams it). The tile closes on the next `begin_step`.
             self.history.retract_one();
+            self.retracted_stamp = Some(self.generation as usize);
         }
         Ok(is_eos)
     }
@@ -2699,6 +2765,83 @@ mod tests {
         assert!(b.due(5));
         assert!(CommitBudget::per_token().due(1));
         assert!(!CommitBudget::per_token().due(0));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn reader_rejects_reserved_wrap_during_copy_before_gpu_publish() -> Result<()> {
+        let _scope = lloom_tensor::AutoreleaseScope::new();
+        let device = Device::new_metal(0)?;
+        let mut ring = Ring::with_cap_and_quantum(&[99], &device, 2, 1, 1, 1, EosRead::Blocking)?;
+        device.synchronize()?;
+        // Establish a published two-token window. All fixture GPU work has
+        // retired before the mapped fixture writes; no concurrent CPU writes.
+        assert!(unsafe { ring.history.ring.segments[0].write_host_slice(0, &[11u32, 22]) });
+        assert!(unsafe { ring.ring.step_counter().write_host_slice(0, &[2u32]) });
+        let mut reader = ring.reader().expect("mapped fixture");
+        let mut out = vec![7];
+        let mut injected = false;
+        let result = reader.read_published_with(&mut out, true, || {
+            if injected {
+                return;
+            }
+            injected = true;
+            // Force the producer's actual reservation path between the first
+            // check and the second copy. The GPU overwrites slot 1, but its
+            // publish word remains 2: a post-copy published() check is blind.
+            ring.generation = ring.history.total_tiles() as u32 + 2;
+            ring.reserve_reader_window();
+            let new = Tensor::new(&[999u32], &device).unwrap();
+            ring.history.ring.segments[0].slice_set(&new, 0, 1).unwrap();
+            device.synchronize().unwrap();
+        });
+        assert!(injected);
+        assert_eq!(
+            reader.published(),
+            Some(2),
+            "overwrite precedes new publish"
+        );
+        assert!(result.is_err(), "a mixed old/new batch escaped");
+        assert_eq!(
+            out,
+            vec![7],
+            "caller prefix preserved; whole new batch discarded"
+        );
+        assert_eq!(reader.cursor(), 0);
+        assert!(!reader.ended());
+        println!("RING_READER forced_wrap_during_copy=true unpublished_overwrite_rejected=true output_rollback=true cursor_rollback=true");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn reader_retracted_slot_reservation_preserves_consumed_reader() -> Result<()> {
+        let _scope = lloom_tensor::AutoreleaseScope::new();
+        let device = Device::new_metal(0)?;
+        let mut ring = Ring::with_cap_and_quantum(&[99], &device, 2, 1, 1, 1, EosRead::Blocking)?;
+        device.synchronize()?;
+        assert!(unsafe { ring.history.ring.segments[0].write_host_slice(0, &[11u32]) });
+        assert!(unsafe { ring.ring.step_counter().write_host_slice(0, &[1u32]) });
+        let mut slow = ring.reader().expect("mapped fixture");
+        let mut consumed = ring.reader().expect("mapped fixture");
+        let mut out = Vec::new();
+        assert_eq!(consumed.read_all_new(&mut out), Ok(1));
+        assert_eq!(out, vec![11]);
+        consumed.retract_one();
+        ring.retracted_stamp = Some(1);
+        ring.generation = 2;
+        ring.reserve_reader_window();
+        assert!(
+            slow.read_new(&mut Vec::new()).is_err(),
+            "old draw was invalidated before reuse"
+        );
+        assert!(unsafe { ring.history.ring.segments[0].write_host_slice(0, &[22u32]) });
+        assert!(unsafe { ring.ring.step_counter().write_host_slice(0, &[2u32]) });
+        out.clear();
+        assert_eq!(consumed.read_all_new(&mut out), Ok(1));
+        assert_eq!(out, vec![22]);
+        println!("RING_READER retracted_slot_reuse_rejected=true consumed_reader_redraw=22");
+        Ok(())
     }
 
     // ---- History: the ring-of-rings, driven directly (no Metal) -------------

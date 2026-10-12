@@ -203,7 +203,7 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     prefix_share: false,
     speculation: &["mtp"],
     model_axes: false,
-    rewind: "a verify window over every layer's state (speculative.method = mtp, the Ring shape); no standing window",
+    rewind: "a verify window over every layer's state (speculative.method = mtp, the Ring shape); no standing window; turn checkpoints (a request re-rendering the previous turn restores where its prefill left one)",
     executor_arms: false,
     kv_quant: &[KvQuant::Off],
     kv_dtype: "f32",

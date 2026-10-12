@@ -12,9 +12,9 @@ use lloom::models::stable_lm::{Config, Model as StableLM};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -290,8 +290,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let model = if args.quantized {
         let filename = &filenames[0];
-        let vb =
-            lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         let model = QStableLM::new(&config, vb)?;
         Model::Quantized(model)
     } else {

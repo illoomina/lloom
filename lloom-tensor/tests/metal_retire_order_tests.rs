@@ -18,7 +18,7 @@ use lloom_tensor::kernels::metal::{Buffer, CommandBuffer, ComputeCommandEncoder,
 use lloom_tensor::kernels::{
     call_unary_contiguous, unary, BufferOffset, Kernels, RESOURCE_OPTIONS,
 };
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
         let heavy = CommandBuffer::new(queue.commandBuffer().unwrap());
         let tiny = CommandBuffer::new(queue.commandBuffer().unwrap());
         {
-            let enc = heavy.compute_command_encoder_no_fence();
+            let enc = heavy.compute_command_encoder_no_fence().unwrap();
             for k in 0..4000 {
                 let (a, b) = if k % 2 == 0 {
                     (&ping, &pong)
@@ -65,20 +65,22 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
                 };
                 cos(&enc, a, b);
             }
-            enc.end_encoding();
+            enc.end_encoding().unwrap();
         }
         {
-            let enc = tiny.compute_command_encoder_no_fence();
+            let enc = tiny.compute_command_encoder_no_fence().unwrap();
             cos(&enc, &small_in, &small_out);
-            enc.end_encoding();
+            enc.end_encoding().unwrap();
         }
         let heavy_done_at_tiny_handler = Arc::new(AtomicBool::new(false));
         let handlers = Arc::new(AtomicU32::new(0));
         {
             let h = Arc::clone(&handlers);
-            heavy.on_completion(move || {
-                h.fetch_add(1, Ordering::AcqRel);
-            });
+            heavy
+                .on_completion(move || {
+                    h.fetch_add(1, Ordering::AcqRel);
+                })
+                .unwrap();
         }
         {
             let (h, seen, heavy) = (
@@ -92,13 +94,14 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
                     Ordering::Release,
                 );
                 h.fetch_add(1, Ordering::AcqRel);
-            });
+            })
+            .unwrap();
         }
-        heavy.commit();
-        tiny.commit();
-        tiny.wait_until_completed();
+        heavy.commit().unwrap();
+        tiny.commit().unwrap();
+        tiny.wait_until_completed().unwrap();
         let heavy_status_at_tiny_wait = heavy.status();
-        heavy.wait_until_completed();
+        heavy.wait_until_completed().unwrap();
         while handlers.load(Ordering::Acquire) < 2 {
             std::hint::spin_loop();
         }
@@ -111,8 +114,8 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
             heavy_done_at_tiny_handler.load(Ordering::Acquire),
             "trial {trial}: the later buffer's handler ran before the earlier one completed"
         );
-        let heavy_end = heavy.as_ref().GPUEndTime();
-        let tiny_end = tiny.as_ref().GPUEndTime();
+        let heavy_end = heavy.gpu_end_time();
+        let tiny_end = tiny.gpu_end_time();
         gpu_inverted += u32::from(tiny_end < heavy_end);
     }
     eprintln!("RETIREORDER trials={trials} tiny_gpu_end_first={gpu_inverted}");

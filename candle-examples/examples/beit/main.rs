@@ -10,8 +10,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
-use lloom::nn::{Module, VarBuilder};
 use lloom::models::beit;
+use lloom::nn::{Module, VarBuilder};
 
 /// Loads an image from disk using the image crate, this returns a tensor with shape
 /// (3, 384, 384). Beit special normalization is applied.

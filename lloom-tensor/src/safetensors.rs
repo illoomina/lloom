@@ -266,12 +266,12 @@ impl Tensor {
                             .with_label("safetensors_view")
                             .build()?;
 
-                        let storage = crate::metal_backend::MetalStorage::new(
+                        let storage = crate::metal_backend::MetalStorage::new_allocated(
                             buffer,
                             device.clone(),
                             data.len(),
                             dtype,
-                        );
+                        )?;
                         Storage::Metal(storage)
                     }
                     #[cfg(not(feature = "metal"))]
@@ -370,8 +370,12 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 .with_label("safetensors_load")
                 .build()?;
 
-            let storage =
-                crate::metal_backend::MetalStorage::new(buffer, device.clone(), data.len(), dtype);
+            let storage = crate::metal_backend::MetalStorage::new_allocated(
+                buffer,
+                device.clone(),
+                data.len(),
+                dtype,
+            )?;
             Storage::Metal(storage)
         }
         #[cfg(not(feature = "metal"))]
@@ -488,12 +492,12 @@ impl MmapAdvice {
     /// passing measurement for the path it was supposed to change, which is
     /// the vacuous-arm failure this project has already paid for once.
     ///
-    /// Unset and empty are deliberately *not* the same as `none`. Unset means
-    /// "no opinion", so it takes `Self::default()` and moves with it; the
-    /// empty string is what a shell supplies for `CANDLE_MMAP_ADVICE=`, which
-    /// reads as an explicit request to disable and so stays pinned to `None`.
-    /// Collapsing the two would make the default unreachable-by-omission the
-    /// moment it changed.
+    /// Unset is deliberately *not* the same as `none`. Unset means "no
+    /// opinion", so it takes `Self::default()` and moves with it; `none` is
+    /// the explicit request to advise nothing. Collapsing the two would make
+    /// the default unreachable-by-omission the moment it changed. The empty
+    /// value is neither: it is refused, naming `none` (the option tree's
+    /// grammar, `decode-driver-design.md` Stage 7).
     pub fn from_env() -> Result<Self> {
         Self::from_knob(crate::tuning::tuning().cpu.mmap_advice.as_deref())
     }
@@ -837,9 +841,11 @@ mod tests {
         assert_eq!(resolve(None).unwrap(), MmapAdvice::WillNeed);
 
         // Unset and `none` must NOT agree: unset follows the default, `none`
-        // (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
-        // an explicit request to disable. A parser that clears `none` to
-        // "unset" makes `--mmap-advice none` run the advised default.
+        // is an explicit request to disable. A parser that clears `none` to
+        // "unset" makes `--mmap-advice none` run the advised default. The
+        // empty value (`CANDLE_MMAP_ADVICE=`) is neither: it is refused, as
+        // every typed key refuses it, so an unexpanded variable cannot pick
+        // either arm silently.
         assert_ne!(
             resolve(None).unwrap(),
             MmapAdvice::None,
@@ -850,7 +856,6 @@ mod tests {
         // no measurement can select.
         for (value, want) in [
             ("none", MmapAdvice::None),
-            ("", MmapAdvice::None),
             ("NONE", MmapAdvice::None),
             ("willneed", MmapAdvice::WillNeed),
             ("will_need", MmapAdvice::WillNeed),
@@ -874,6 +879,11 @@ mod tests {
         assert!(
             resolve(Some("wilneed")).is_err(),
             "a misspelled arm fell back to the default instead of failing"
+        );
+        let empty = resolve(Some("")).unwrap_err().to_string();
+        assert!(
+            empty.contains("`none`"),
+            "the empty value's refusal names the arm that advises nothing: {empty}"
         );
         assert!(
             MmapAdvice::from_knob(Some("wilneed")).is_err(),

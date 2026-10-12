@@ -745,15 +745,27 @@ impl ModelConfig {
             return Ok(());
         }
         let key = key.strip_prefix("axes.").unwrap_or(key);
-        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        if lloom_tensor::options::is_none(value) {
             self.axes.remove(key);
             return Ok(());
         }
         // Validate on a scratch config so a bad value is refused here, with
-        // the axis's own message, rather than at load.
+        // the axis's own message, rather than at load; keep the spelling the
+        // axis parses (a bool as `true`/`false`, an arm in lower case).
+        let value = lloom_tensor::options::non_empty(value).map_err(|e| format!("--{key}: {e}"))?;
+        let is_bool = lloom::models::lfm2::Config::AXES_META
+            .iter()
+            .any(|a| a.key == key && a.is_bool);
+        let value = if is_bool {
+            lloom_tensor::options::parse_bool(value)
+                .map_err(|e| format!("--{key}: {e}"))?
+                .to_string()
+        } else {
+            value.to_ascii_lowercase()
+        };
         let mut probe = lloom::models::lfm2::Config::default();
-        probe.set_axis(key, value)?;
-        self.axes.insert(key.to_string(), value.to_string());
+        probe.set_axis(key, &value)?;
+        self.axes.insert(key.to_string(), value);
         Ok(())
     }
 
@@ -892,14 +904,14 @@ fn parse_logit_bias(v: &str) -> Result<std::collections::BTreeMap<u32, f64>, Str
     Ok(out)
 }
 fn parse_prompt_budget_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "refuse" => Ok("refuse".into()),
         "truncate" => Ok("truncate".into()),
         other => Err(format!("`{other}` is not `refuse` or `truncate`")),
     }
 }
 fn parse_defaults(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "greedy" => Ok("greedy".into()),
         "checkpoint" => Ok("checkpoint".into()),
         other => Err(format!("`{other}` is not `greedy` or `checkpoint`")),
@@ -1170,6 +1182,7 @@ impl SamplingConfig {
             logits_digest: false,
             prefill_tile,
             thinking: None,
+            turn_tail: 0,
         }
     }
 }
@@ -1177,7 +1190,7 @@ impl SamplingConfig {
 // ---- speculation ----------------------------------------------------------------
 
 pub(crate) fn parse_method(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "none" | "off" => Ok("none".into()),
         "dspark" => Ok("dspark".into()),
         "mtp" => Ok("mtp".into()),
@@ -1245,7 +1258,7 @@ impl Default for SpeculativeConfig {
 // ---- the executor ---------------------------------------------------------------
 
 fn parse_arena_layout(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "packed" => Ok("packed".into()),
         "non-aliasing" | "nonaliasing" | "reference" => Ok("non-aliasing".into()),
         other => Err(format!(
@@ -1254,7 +1267,7 @@ fn parse_arena_layout(v: &str) -> Result<String, String> {
     }
 }
 fn parse_replay_barriers(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "always" => Ok("always".into()),
         "skip-replayed" => Ok("skip-replayed".into()),
         other => Err(format!(
@@ -1263,7 +1276,7 @@ fn parse_replay_barriers(v: &str) -> Result<String, String> {
     }
 }
 fn parse_barrier_scope(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "run-start" => Ok("run-start".into()),
         "since-barrier" => Ok("since-barrier".into()),
         other => Err(format!(
@@ -1400,8 +1413,23 @@ pub struct MemoryConfig {
     )]
     pub kv_reserve_tokens: Option<usize>,
     /// Qwen4-exp `--experts stream`: streamed experts per layer per projection — a count, or `auto` (from the working set at `memory_fraction`).
-    #[opt(flag = "slots", variants = ["auto", "<count>"], path = "weights.experts.slots", status = "stable", cli = "slots", facets = ["buffer"], flows = ["weights-in"])]
+    #[opt(flag = "slots", parser = "parse_slots", variants = ["auto", "<count>"], path = "weights.experts.slots", status = "stable", cli = "slots", facets = ["buffer"], flows = ["weights-in"])]
     pub slots: String,
+    /// Admit every load against the machine before anything is allocated: its predicted peak against the memory the host has available now, less a reserve for the OS and the UI and what other lloom processes have reserved and not yet taken (memory.md §9.10). False loads unadmitted.
+    #[opt(bool, path = "memory.machine.gate", status = "advanced")]
+    pub machine_gate: bool,
+    /// Load even when the machine gate refuses; the reservation is still recorded, so other lloom processes see it.
+    #[opt(bool, path = "memory.machine.force", status = "stable", cli = "force")]
+    pub force: bool,
+    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, the machine's memory less the Metal device's recommended working set), or max(4 GiB, 10 % of the machine's memory) with no Metal device.
+    #[opt(path = "memory.machine.reserve_gb", status = "advanced")]
+    pub machine_reserve_gb: Option<f64>,
+    /// The directory of the machine-wide registry of lloom processes' reservations; none = ~/.cache/lloom/memory.
+    #[opt(path = "memory.machine.registry", status = "advanced")]
+    pub machine_registry: Option<std::path::PathBuf>,
+    /// GB the machine gate takes as available instead of reading the host, for tests and dry runs; none = the host's reading.
+    #[opt(path = "memory.machine.available_gb", status = "instrument")]
+    pub machine_available_gb: Option<f64>,
 }
 
 impl Default for MemoryConfig {
@@ -1414,14 +1442,48 @@ impl Default for MemoryConfig {
             free_budget_mb: None,
             kv_reserve_tokens: None,
             slots: "auto".into(),
+            machine_gate: true,
+            force: false,
+            machine_reserve_gb: None,
+            machine_registry: None,
+            machine_available_gb: None,
         }
+    }
+}
+
+impl MemoryConfig {
+    /// The machine gate these options describe (`lloom_tensor::machine`).
+    pub fn machine_gate(&self) -> lloom_tensor::machine::Gate {
+        let bytes = |gb: f64| (gb.max(0.0) * 1e9) as u64;
+        lloom_tensor::machine::Gate::new(lloom_tensor::machine::GateConfig {
+            reserve: self.machine_reserve_gb.map(bytes),
+            registry: self.machine_registry.clone(),
+            available: self.machine_available_gb.map(bytes),
+            total: None,
+            working_set: None,
+            force: self.force,
+            off: !self.machine_gate,
+        })
     }
 }
 
 // ---- what to load, and the front-ends' own keys -----------------------------------
 
+/// `auto` or a count of slots.
+fn parse_slots(v: &str) -> Result<String, String> {
+    if v.trim().eq_ignore_ascii_case("auto") {
+        return Ok("auto".into());
+    }
+    lloom_tensor::options::parse_count::<usize>(v)
+        .map(|n| n.to_string())
+        .map_err(|e| format!("{e}, or `auto`"))
+}
+fn parse_rows(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["auto", "pool", "pool-per-row", "private"])
+        .map(str::to_string)
+}
 fn parse_device(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok("auto".into()),
         "cpu" => Ok("cpu".into()),
         other => Err(format!(
@@ -1430,25 +1492,25 @@ fn parse_device(v: &str) -> Result<String, String> {
     }
 }
 fn parse_experts(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("stream" | "resident") => Ok(s.into()),
         other => Err(format!("`{other}` is not `stream` or `resident`")),
     }
 }
 fn parse_loader(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("pread" | "io") => Ok(s.into()),
         other => Err(format!("`{other}` is not `pread` or `io`")),
     }
 }
 fn parse_moe_act(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("auto" | "f32" | "f16") => Ok(s.into()),
         other => Err(format!("`{other}` is not `auto`, `f32` or `f16`")),
     }
 }
 fn parse_prefill_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("chunk" | "replay") => Ok(s.into()),
         other => Err(format!("`{other}` is not `chunk` or `replay`")),
     }
@@ -1572,7 +1634,7 @@ pub struct SchedulerConfig {
     #[opt(flag = "batch", path = "scheduler.max_sequences", status = "stable", cli = "batch", aliases = ["max-num-seqs"])]
     pub max_sequences: usize,
     /// How the rows of a batch hold their state: `auto` (`pool` at a batch), `pool` (one shared paged pool, the batch in one dispatch per kernel), `pool-per-row` (the same pool, the per-row loop) or `private` (a cache per row).
-    #[opt(flag = "rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
+    #[opt(flag = "rows", parser = "parse_rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
     pub rows: String,
 }
 
@@ -1703,7 +1765,7 @@ impl Default for ServerConfig {
 }
 
 fn parse_bench_mode(v: &str) -> Result<String, String> {
-    match v.trim() {
+    match v.trim().to_ascii_lowercase().as_str() {
         s @ ("cells" | "reuse" | "concurrent") => Ok(s.into()),
         other => Err(format!("`{other}` is not `cells`, `reuse` or `concurrent`")),
     }

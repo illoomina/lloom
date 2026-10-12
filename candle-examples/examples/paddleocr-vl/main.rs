@@ -58,9 +58,9 @@ extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::models::paddleocr_vl::{Config, PaddleOCRVLModel};
 use clap::{Parser, ValueEnum};
+use lloom::models::paddleocr_vl::{Config, PaddleOCRVLModel};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 const DEFAULT_MODEL_ID: &str = "PaddlePaddle/PaddleOCR-VL";

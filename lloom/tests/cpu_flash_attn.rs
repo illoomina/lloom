@@ -1,5 +1,5 @@
-use lloom_tensor::{DType, Device, Result, Tensor};
 use lloom::nn::attention::{flash_attn, AttnMask};
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// Reference SDPA: softmax(Q @ K^T * scale) @ V
 fn reference_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {

@@ -12,9 +12,9 @@ use lloom::models::quantized_mistral::Model as QMistral;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom::nn::VarBuilder;
-use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -320,8 +320,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let (model, device) = if args.quantized {
         let filename = &filenames[0];
-        let vb =
-            lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         let model = QMistral::new(&config, vb)?;
         (Model::Quantized(model), device)
     } else {

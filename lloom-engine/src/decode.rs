@@ -257,6 +257,12 @@ pub struct DecodeParams {
     /// K=1 body carries it on every readback arm; the speculative body and
     /// the batch scheduler refuse it.
     pub thinking: Option<ThinkingBudget>,
+    /// The generation prompt's length at the end of the prompt
+    /// (`thinking::checkpoint_tail`, the load-time constant): the prefill
+    /// leaves its turn checkpoint before it (`CausalLM::checkpoint_at`), so
+    /// the next request, whose render keeps everything before it, is a
+    /// restore there rather than a fresh prefill. 0: no hint.
+    pub turn_tail: usize,
 }
 
 impl DecodeParams {
@@ -338,6 +344,7 @@ impl Default for DecodeParams {
             logits_digest: false,
             prefill_tile: 0,
             thinking: None,
+            turn_tail: 0,
         }
     }
 }
@@ -382,19 +389,15 @@ pub struct Decoded {
 /// what every request did before #677.
 /// The token rings a serving process keeps across requests, one per EOS set.
 ///
-/// A [`Ring`] is a wrapping history of `RING_HISTORY_SLOTS` plus the consumer
-/// slack (32 MiB by default, ~2 050 zero-filled segments): building one is
-/// ~35 ms of `Tensor::zeros` and a `synchronize` (issue #702, §11.5y's TTFT
-/// finding), and its capacity is its live window, not the generation, so one
-/// ring serves every run — mapped, which is also the fast drain (a history
-/// sized past `RING_HISTORY_SLOTS` is not CPU-mapped and snapshots on every
-/// drain). What a ring cannot change after construction is its EOS set
-/// (uploaded once, read by the `eos_index` kernel), so the pool is keyed on
-/// it; a serving binary holds two — the checkpoint's EOS ids and the
-/// never-EOS set its throughput cells use.
+/// This pool calls `Ring::new` with `RING_HISTORY_SLOTS` (4,092 dense slots,
+/// 16,368 bytes), not `Ring::with_geometry` with its configurable consumer
+/// slack. Capacity bounds the live window, not the generation: the same mapped
+/// ring wraps across long runs. Larger segmented rings can remain mapped too;
+/// mapping is a per-segment property, not a total-capacity threshold.
 ///
-/// Built on first use, or ahead of it by [`RingPool::prepare`] at load, so no
-/// request pays the construction inside its own latency.
+/// A ring's EOS set and read mechanism are fixed at construction, so the pool
+/// keys both. Built on first use, or ahead of it by [`RingPool::prepare`] at
+/// load, it is reused across requests rather than zero-filled per request.
 #[derive(Default)]
 pub struct RingPool {
     rings: Vec<(Vec<u32>, EosRead, Ring)>,
@@ -689,6 +692,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
         let prepared = self.session.prepare(prompt_ids)?;
+        self.hint_checkpoint(&prepared, params.turn_tail)?;
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
@@ -833,13 +837,21 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                                 .load(std::sync::atomic::Ordering::Acquire)
                                             {
                                                 buf.clear();
-                                                if let Ok(n) = reader.read_new(&mut buf) {
-                                                    if n > 0 && !hook(&buf)? {
+                                                let n =
+                                                    reader.read_new(&mut buf).map_err(|lap| {
                                                         stop_flag.store(
                                                             true,
                                                             std::sync::atomic::Ordering::Release,
                                                         );
-                                                    }
+                                                        lloom_tensor::Error::msg(format!(
+                                                            "ring reader final drain: {lap}"
+                                                        ))
+                                                    })?;
+                                                if n > 0 && !hook(&buf)? {
+                                                    stop_flag.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::Release,
+                                                    );
                                                 }
                                                 return Ok(());
                                             }
@@ -856,6 +868,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                                             }
                                         }
                                         Err(lap) => {
+                                            stop_flag
+                                                .store(true, std::sync::atomic::Ordering::Release);
                                             lloom_tensor::bail!("ring reader: {lap}");
                                         }
                                     }
@@ -922,6 +936,21 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
+    /// Where the prefill of `prepared.suffix` should leave its turn
+    /// checkpoint: `tail` tokens before the prompt's end, the position the
+    /// next turn's render returns to (`DecodeParams::turn_tail`). A suffix
+    /// no longer than the tail ends where it starts, and the hint is the
+    /// current position (the state as it stands).
+    fn hint_checkpoint(&mut self, prepared: &lloom::nn::Prepared, tail: usize) -> Result<()> {
+        if tail == 0 {
+            return Ok(());
+        }
+        let end = self.session.pos() + prepared.suffix.len();
+        let at = end.saturating_sub(tail).max(self.session.pos());
+        let model = self.session.model();
+        model.checkpoint_at(self.session.cache_mut(), at)
+    }
+
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
     /// block per round and the target verifies it
     /// ([`Session::decode_speculative`], `design/docs/speculation.md`
@@ -989,6 +1018,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 prepared.action
             );
         }
+        self.hint_checkpoint(&prepared, params.turn_tail)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;

@@ -1,8 +1,8 @@
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::generation::LogitsProcessor;
 use lloom::models::glm4::{Config as ConfigOld, EosTokenId, Model as ModelOld};
 use lloom::models::glm4_new::{Config as ConfigNew, ModelForCausalLM as ModelNew};
+use lloom::nn::VarBuilder;
 
 use clap::Parser;
 use hf_hub::{Repo, RepoType};

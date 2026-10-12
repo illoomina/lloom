@@ -209,7 +209,10 @@ mod tests {
         let v = s.append(&rows(3, 1.0, &dev))?;
         assert_eq!(v.dims(), [1, 3, 1]);
         assert_eq!(s.bytes(), 4 * 4, "allocated at the capacity");
-        assert!(s.append(&rows(2, 9.0, &dev)).is_err(), "past the capacity is refused");
+        assert!(
+            s.append(&rows(2, 9.0, &dev)).is_err(),
+            "past the capacity is refused"
+        );
         s.rewind(1)?;
         assert_eq!(s.len(), 2);
         s.grow_to(8)?;
@@ -232,7 +235,10 @@ mod tests {
         s.append(&rows(2, 1.0, &dev))?;
         let v = s.append(&rows(3, 3.0, &dev))?;
         assert_eq!(s.capacity(), 6, "two steps of 2 past the first 2");
-        assert_eq!(v.flatten_all()?.to_vec1::<f32>()?, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            v.flatten_all()?.to_vec1::<f32>()?,
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
         s.truncate(1);
         assert_eq!(s.current()?.unwrap().dims(), [1, 1, 1]);
         assert_eq!(s.dtype_or(DType::F32), DType::F32);

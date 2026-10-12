@@ -8,9 +8,9 @@ use anyhow::{Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Device, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::models::llama::{Cache, Llama, LlamaConfig};
 use lloom::models::snac::{Config as SnacConfig, Model as SnacModel};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 // https://github.com/canopyai/Orpheus-TTS/blob/df0b0d96685dd21885aef7f900ee7f705c669e94/realtime_streaming_example/main.py#L43

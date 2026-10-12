@@ -214,7 +214,9 @@ impl Node {
 
     /// A `Fused` node's prologue weight, if it carries a prologue.
     pub fn prologue_weight(&self) -> Option<NodeId> {
-        self.prologue.as_ref().and_then(|_| self.inputs.last().copied())
+        self.prologue
+            .as_ref()
+            .and_then(|_| self.inputs.last().copied())
     }
 
     /// Whether this `Fused` node carries `fragment` at either end.
@@ -351,7 +353,15 @@ pub fn kernel_family(label: &str) -> String {
     let mut f = label;
     loop {
         let before = f;
-        for suffix in ["_strided", "_lstrided", "_rstrided", "_cs", "_f32", "_f16", "_bf16"] {
+        for suffix in [
+            "_strided",
+            "_lstrided",
+            "_rstrided",
+            "_cs",
+            "_f32",
+            "_f16",
+            "_bf16",
+        ] {
             f = f.strip_suffix(suffix).unwrap_or(f);
         }
         if f == before {
@@ -844,11 +854,23 @@ mod tests {
             ("kernel_mul_mv_id_q2_0_f32", "mul_mv_id"),
             ("kernel_mul_mv_q4_K_f32", "mul_mv"),
             ("kernel_get_rows_iq3_s", "get_rows"),
-            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0", "gemv_mixed"),
-            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu", "gemv_mixed_silu"),
-            ("gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid", "gemv_mixed_sigmoid"),
+            (
+                "gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0",
+                "gemv_mixed",
+            ),
+            (
+                "gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu",
+                "gemv_mixed_silu",
+            ),
+            (
+                "gemv_mixed_f16w_f32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_sigmoid",
+                "gemv_mixed_sigmoid",
+            ),
             ("gemv_float32_bm1_bn8_sm1_sn32_tm1_tn4_nc0_axpby0", "gemv"),
-            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_residual_packed", "gemv_residual"),
+            (
+                "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_residual_packed",
+                "gemv_residual",
+            ),
             ("gdn_step_r16_f32", "gdn_step"),
             ("sdpa_vector_float_256", "sdpa_vector"),
             ("copy2d_f32", "copy2d"),
@@ -868,18 +890,36 @@ mod tests {
             ("is_u32_f16", "is_u32"),
             ("bmul_f16_lstrided", "bmul"),
             ("shortconv_step_f16_k3", "shortconv_step"),
-            ("gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0", "gemv_t"),
+            (
+                "gemv_t_float32_bm1_bn2_sm8_sn4_tm4_tn4_nc0_axpby0",
+                "gemv_t",
+            ),
             ("softmax_f32", "softmax"),
             ("quantize_kv_float_64_8", "quantize_kv"),
             ("sdpa_vector_quant_float_64_8", "sdpa_quant"),
             ("is_u32_f32", "is_u32"),
             // The prologues: the classical GEMV's before its epilogue, the
             // mixed GEMV's after it; a family names the prologue first.
-            ("gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm", "gemv_norm"),
-            ("gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_silu", "gemv_norm_silu"),
-            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_swiglu", "gemv_norm_swiglu"),
-            ("gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_rmsnorm", "gemv_rmsnorm"),
-            ("gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_gnorm", "gemv_mixed_gnorm"),
+            (
+                "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm",
+                "gemv_norm",
+            ),
+            (
+                "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_silu",
+                "gemv_norm_silu",
+            ),
+            (
+                "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_norm_swiglu",
+                "gemv_norm_swiglu",
+            ),
+            (
+                "gemv_float16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_rmsnorm",
+                "gemv_rmsnorm",
+            ),
+            (
+                "gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_gnorm",
+                "gemv_mixed_gnorm",
+            ),
             (
                 "gemv_mixed_f16w_f32_bm1_bn8_sm1_sn32_tm4_tn4_nc0_axpby0_silu_gnorm",
                 "gemv_mixed_gnorm_silu",

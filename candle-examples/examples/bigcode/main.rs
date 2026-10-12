@@ -10,9 +10,9 @@ use clap::Parser;
 use lloom::models::bigcode::{Config, GPTBigCode};
 
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 struct TextGeneration {

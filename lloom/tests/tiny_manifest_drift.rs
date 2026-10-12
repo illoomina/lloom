@@ -15,7 +15,7 @@
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
-use lloom::profile::CrownExact;
+use lloom::profile::{Crown, CrownExact, Profile};
 use lloom::testing::tiny::{self, Geometry, TinyConfig, TinyFamily, ValueLaw, Weights};
 use lloom_tensor::kernels::metal::profile;
 use lloom_tensor::shape_probe;
@@ -31,21 +31,22 @@ fn hex(s: &str) -> Vec<u8> {
 
 /// What one entry reached on Metal, as the campaign names points, and the
 /// largest relative CPU-vs-Metal logit difference.
-fn replay<F: TinyFamily>(g: &Geometry, weights: Weights, gpu: &Device) -> (BTreeSet<String>, f32) {
+fn replay<F: TinyFamily, P: Profile>(
+    g: &Geometry,
+    weights: Weights,
+    gpu: &Device,
+) -> (BTreeSet<String>, f32) {
     let ckpt = g
         .checkpoint::<F>(weights)
         .unwrap_or_else(|| panic!("{}: the geometry drops a layer kind", g.describe::<F>()));
     let vocab = ckpt.cfg.axis("vocab_size").unwrap_or(1);
-    let reference =
-        F::reference::<CrownExact>(&ckpt, &Device::Cpu).expect("the CPU reference builds");
+    let reference = F::reference::<P>(&ckpt, &Device::Cpu).expect("the CPU reference builds");
     let want = tiny::run(&reference, &ckpt.cfg, vocab, &Device::Cpu, &g.work)
         .expect("the CPU reference runs");
     let armed = shape_probe::arm();
     gpu.synchronize().unwrap();
     profile::reset();
-    let model = ckpt
-        .model::<CrownExact>(gpu)
-        .expect("the Metal model builds");
+    let model = ckpt.model::<P>(gpu).expect("the Metal model builds");
     let got = tiny::run(&model, &ckpt.cfg, vocab, gpu, &g.work).expect("the Metal model runs");
     gpu.synchronize().unwrap();
     let events = armed.take();
@@ -60,7 +61,14 @@ fn replay<F: TinyFamily>(g: &Geometry, weights: Weights, gpu: &Device) -> (BTree
             .map(|(l, _)| format!("census|{l}")),
     );
     let mut rel = 0f32;
+    assert_eq!(want.len(), got.len(), "CPU/Metal step count");
     for (c, m) in want.iter().zip(&got) {
+        assert_eq!(c.len(), m.len(), "CPU/Metal logit width");
+        assert!(
+            c.iter().chain(m).all(|v| v.is_finite()),
+            "{}: a non-finite CPU or Metal logit",
+            g.describe::<F>()
+        );
         let scale = c.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-3);
         let d = c
             .iter()
@@ -73,11 +81,16 @@ fn replay<F: TinyFamily>(g: &Geometry, weights: Weights, gpu: &Device) -> (BTree
     (points, rel)
 }
 
-fn check<F: TinyFamily>(gpu: &Device) {
+fn check<F: TinyFamily, P: Profile>(gpu: &Device, contract: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/tiny_manifests")
-        .join(format!("{}.json", F::NAME));
+        .join(if contract == "fast" {
+            format!("{}.json", F::NAME)
+        } else {
+            format!("{}-deterministic.json", F::NAME)
+        });
     let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(m["contract"].as_str(), Some(contract), "manifest contract");
     let weights = Weights {
         law: ValueLaw::parse(m["law"].as_str().unwrap()).unwrap(),
         seed: m["weight_seed"].as_u64().unwrap(),
@@ -94,7 +107,7 @@ fn check<F: TinyFamily>(gpu: &Device) {
             e["describe"].as_str().unwrap(),
             "the geometry encoding moved"
         );
-        let (reached, rel) = replay::<F>(&g, weights, gpu);
+        let (reached, rel) = replay::<F, P>(&g, weights, gpu);
         assert!(
             rel <= tol,
             "{}: CPU vs Metal {rel:e} > {tol}",
@@ -123,8 +136,7 @@ fn check<F: TinyFamily>(gpu: &Device) {
 
 /// One process, one device, one test: the census and the probes are
 /// process-wide and the tuning is read once.
-#[test]
-fn every_manifest_entry_still_reaches_its_points() {
+fn replay_manifests<P: Profile>(contract: &str) {
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
     let mut t = lloom::tuning::Tuning::default();
     // The Qwen4-exp campaign ran with the fused HC prologue on, which is what
@@ -133,11 +145,17 @@ fn every_manifest_entry_still_reaches_its_points() {
     let _ = lloom::tuning::install(t);
     // And with the step form its manifest records: the census names the
     // step's kernel, so the replay runs the form the campaign ran.
-    let qwen =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tiny_manifests/qwen4exp.json");
+    let qwen = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/tiny_manifests")
+        .join(if contract == "fast" {
+            "qwen4exp.json"
+        } else {
+            "qwen4exp-deterministic.json"
+        });
     let m: serde_json::Value = serde_json::from_slice(&std::fs::read(qwen).unwrap()).unwrap();
     let mut tt = lloom_tensor::tuning::Tuning::default();
     tt.from_env().unwrap();
+    tt.contract.profile = contract.into();
     tt.gdn.step_reg = m["gdn_step_reg"].as_bool().unwrap_or(false);
     assert!(
         lloom_tensor::tuning::install(tt).is_ok(),
@@ -148,6 +166,17 @@ fn every_manifest_entry_still_reaches_its_points() {
         return;
     };
     assert!(profile::enabled(), "the census must be on");
-    check::<Lfm2Tiny>(&gpu);
-    check::<Qwen4ExpTiny>(&gpu);
+    check::<Lfm2Tiny, P>(&gpu, contract);
+    check::<Qwen4ExpTiny, P>(&gpu, contract);
+}
+
+// Separate nextest processes: a regime is process-wide and immutable.
+#[test]
+fn every_manifest_entry_still_reaches_its_points() {
+    replay_manifests::<Crown>("fast");
+}
+
+#[test]
+fn deterministic_manifest_entries_still_reach_their_points() {
+    replay_manifests::<CrownExact>("deterministic");
 }

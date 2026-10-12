@@ -208,7 +208,10 @@ fn a_fetching_steps_settle_trails_and_the_run_end_settles_it_metal() -> Result<(
         let next = row
             .iter()
             .enumerate()
-            .fold((0usize, f32::MIN), |m, (i, &v)| if v > m.1 { (i, v) } else { m })
+            .fold(
+                (0usize, f32::MIN),
+                |m, (i, &v)| if v > m.1 { (i, v) } else { m },
+            )
             .0 as u32;
         let input = Tensor::from_vec(vec![next], (1, 1), &dev)?;
         logits = streamed.forward(&input, cache.pos, &mut cache)?;
@@ -218,7 +221,10 @@ fn a_fetching_steps_settle_trails_and_the_run_end_settles_it_metal() -> Result<(
         );
     }
     streamed.settle_pending(&mut cache)?;
-    assert!(!streamed.fetch_settle_trailing(), "settle_pending left a step trailing");
+    assert!(
+        !streamed.fetch_settle_trailing(),
+        "settle_pending left a step trailing"
+    );
     // Through the session: the run's end settles the last step.
     let cache = streamed.new_cache(&cfg, &dev)?;
     let mut session = Session::new(&streamed, cache);
@@ -372,9 +378,19 @@ fn ring_run() -> Result<()> {
         out.stats.provisional,
         "the ring's fixed cadence did not settle its steps behind the next forward"
     );
-    assert_eq!(out.ids, want, "the fetching ring's ids differ from the resident model's");
-    assert!(cache.fetch_passes > 0 && f.loads > 0, "no step fetched: {f:?}");
-    assert_eq!((f.short, f.timeouts), (0, 0), "a layer went short or timed out");
+    assert_eq!(
+        out.ids, want,
+        "the fetching ring's ids differ from the resident model's"
+    );
+    assert!(
+        cache.fetch_passes > 0 && f.loads > 0,
+        "no step fetched: {f:?}"
+    );
+    assert_eq!(
+        (f.short, f.timeouts),
+        (0, 0),
+        "a layer went short or timed out"
+    );
     assert_eq!(
         streamed.stream_stats().settle_loads,
         0,

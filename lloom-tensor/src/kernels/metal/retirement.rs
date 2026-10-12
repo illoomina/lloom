@@ -19,13 +19,29 @@ pub(super) type Callback = Box<dyn Fn(&metal4::Feedback) + Send + Sync>;
 pub(super) type Registry = OwnerRegistry<Captures, NativeOwners, metal4::Feedback>;
 pub(super) type Record = Registration<Captures, NativeOwners, metal4::Feedback>;
 
-pub(super) struct Captures(pub Vec<Callback>);
+pub(super) struct Captures(
+    pub Vec<Callback>,
+    Option<super::native_generation_bindings::GenerationBindings>,
+);
 impl Captures {
+    pub fn new(callbacks: Vec<Callback>) -> Self {
+        Self(callbacks, None)
+    }
+    pub fn with_binding(head: super::native_generation_bindings::GenerationBindings) -> Self {
+        Self(Vec::new(), Some(head))
+    }
     pub fn run(&self, queue: usize, feedback: &metal4::Feedback) {
         crate::completion_scope::with_callback(queue, || {
             // Borrow callback boxes; destruction belongs to the host service.
             for callback in &self.0 {
                 callback(feedback);
+            }
+            if let Some(head) = &self.1 {
+                // SAFETY: only AssociatedBuffer's original record installs this
+                // head. M3 elected prefix drain calls run after own native ready
+                // and preceding records; every arbitrary callback just returned.
+                // C/record custody spans this genuine HeaderStrong borrow.
+                unsafe { head.ordered_callbacks_finished() };
             }
         });
     }
@@ -40,8 +56,10 @@ pub(super) type Metal3Anchor = crate::host_anchor::HostAnchorPermit<(), Metal3Ra
 pub(super) struct Metal3RawOwners {
     pub raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     pub physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
-    // LAST: original raw retain releases before metadata capability publication.
+    // Original raw retain releases before namespace metadata capabilities.
     pub namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
+    // LAST: actual raw/native/namespace drops precede counted generation release.
+    pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 // SAFETY: same cross-thread retain/release contract as CommandBuffer.
 unsafe impl Send for Metal3RawOwners {}
@@ -327,7 +345,7 @@ mod tests {
         let notify = wake.clone();
         let record0 = registry
             .prepare(
-                Captures(vec![Box::new(move |_| {
+                Captures::new(vec![Box::new(move |_| {
                     first.fetch_add(1, Ordering::SeqCst);
                     signal.publish(Failure::Closing, || notify.notify());
                 })]),
@@ -338,7 +356,7 @@ mod tests {
         let later = later_calls.clone();
         let record1 = registry
             .prepare(
-                Captures(vec![Box::new(move |_| {
+                Captures::new(vec![Box::new(move |_| {
                     later.fetch_add(1, Ordering::SeqCst);
                 })]),
                 NativeOwners::vacant(),

@@ -5,8 +5,12 @@ use crate::kernels::{
     Output, Source,
 };
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_random_uniform(
+pub unsafe fn call_random_uniform(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -39,17 +43,24 @@ pub fn call_random_uniform(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "rand_uniform {name} elems={length}");
 
-    set_params!(
-        encoder,
-        (length, min, max, Output::new(seed), Output::new(buffer))
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (length, min, max, Output::new(seed), Output::new(buffer))
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_random_normal(
+pub unsafe fn call_random_normal(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -70,10 +81,13 @@ pub fn call_random_normal(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "rand_normal {name} elems={length}");
 
-    set_params!(
-        encoder,
-        (length, mean, stddev, Output::new(seed), Output::new(buffer))
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (length, mean, stddev, Output::new(seed), Output::new(buffer))
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())

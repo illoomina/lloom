@@ -184,16 +184,20 @@ fn encode(
         let guard = cmds
             .command_encoder()
             .map_err(|e| format!("command_encoder: {e:?}"))?;
-        call_unary_contiguous(
-            device,
-            &guard,
-            kernels,
-            unary::contiguous::cos::FLOAT,
-            std::mem::size_of::<f32>(),
-            64,
-            BufferOffset::zero_offset(src),
-            dst,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_contiguous(
+                device,
+                &guard,
+                kernels,
+                unary::contiguous::cos::FLOAT,
+                std::mem::size_of::<f32>(),
+                64,
+                BufferOffset::zero_offset(src),
+                dst,
+            )
+        }
         .map_err(|e| format!("call_unary_contiguous: {e:?}"))?;
     }
     Ok(())

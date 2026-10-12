@@ -194,47 +194,53 @@ impl crate::CustomOp1 for GemvMixed {
                 if g.groups == 0 || k % g.groups != 0 {
                     crate::bail!("gemv_mixed: {k} does not split into {} groups", g.groups)
                 }
-                crate::kernels::call_mlx_gemv_mixed_gnorm(
-                    device.metal_device(),
-                    &encoder,
-                    device.kernels(),
-                    (b, n_out, k),
-                    ws.buffer(),
-                    wl.start_offset() * DType::F16.size_in_bytes(),
-                    s.buffer(),
-                    l.start_offset() * DType::F32.size_in_bytes(),
-                    k,
-                    &output,
-                    self.epilogue,
-                    self.scale,
-                    crate::kernels::GemvGroupNorm {
-                        weight: gs.buffer(),
-                        weight_offset: gl.start_offset() * DType::F32.size_in_bytes(),
-                        eps: g.eps,
-                        group: k / g.groups,
-                        groups: g.groups,
-                        scales: g
-                            .scales
-                            .then_some((&output, n_out * DType::F32.size_in_bytes())),
-                    },
-                )
+                // SAFETY: storage-owned buffers (binding authority, `metal_backend` module head).
+                unsafe {
+                    crate::kernels::call_mlx_gemv_mixed_gnorm(
+                        device.metal_device(),
+                        &encoder,
+                        device.kernels(),
+                        (b, n_out, k),
+                        ws.buffer(),
+                        wl.start_offset() * DType::F16.size_in_bytes(),
+                        s.buffer(),
+                        l.start_offset() * DType::F32.size_in_bytes(),
+                        k,
+                        &output,
+                        self.epilogue,
+                        self.scale,
+                        crate::kernels::GemvGroupNorm {
+                            weight: gs.buffer(),
+                            weight_offset: gl.start_offset() * DType::F32.size_in_bytes(),
+                            eps: g.eps,
+                            group: k / g.groups,
+                            groups: g.groups,
+                            scales: g
+                                .scales
+                                .then_some((&output, n_out * DType::F32.size_in_bytes())),
+                        },
+                    )
+                }
                 .map_err(crate::Error::wrap)?;
             }
             _ => {
-                crate::kernels::call_mlx_gemv_mixed(
-                    device.metal_device(),
-                    &encoder,
-                    device.kernels(),
-                    (b, n_out, k),
-                    ws.buffer(),
-                    wl.start_offset() * DType::F16.size_in_bytes(),
-                    s.buffer(),
-                    l.start_offset() * DType::F32.size_in_bytes(),
-                    k,
-                    &output,
-                    self.epilogue,
-                    self.scale,
-                )
+                // SAFETY: storage-owned buffers (binding authority, `metal_backend` module head).
+                unsafe {
+                    crate::kernels::call_mlx_gemv_mixed(
+                        device.metal_device(),
+                        &encoder,
+                        device.kernels(),
+                        (b, n_out, k),
+                        ws.buffer(),
+                        wl.start_offset() * DType::F16.size_in_bytes(),
+                        s.buffer(),
+                        l.start_offset() * DType::F32.size_in_bytes(),
+                        k,
+                        &output,
+                        self.epilogue,
+                        self.scale,
+                    )
+                }
                 .map_err(crate::Error::wrap)?;
             }
         }

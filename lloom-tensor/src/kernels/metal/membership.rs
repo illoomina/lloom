@@ -100,6 +100,31 @@ impl std::fmt::Display for MembershipError {
         write!(f, "membership retirement: {self:?}")
     }
 }
+/// A refusal inside membership registration surfaces as the refusal it was;
+/// a registry/anchor/edit failure is a retirement-registration failure.
+impl From<MembershipError> for crate::memory_admission::AllocationError {
+    fn from(error: MembershipError) -> Self {
+        use crate::memory_admission::AllocationError;
+        match error {
+            MembershipError::Registry(RegistryError::Admission(e))
+            | MembershipError::Anchor(AnchorError::Registry(RegistryError::Admission(e))) => e,
+            MembershipError::Registry(RegistryError::MetadataAllocation)
+            | MembershipError::Anchor(AnchorError::Registry(RegistryError::MetadataAllocation)) => {
+                AllocationError::HostAllocation
+            }
+            MembershipError::Anchor(AnchorError::PermitExhausted) => {
+                AllocationError::CountExhausted
+            }
+            MembershipError::Registry(_) | MembershipError::Anchor(AnchorError::Registry(_)) => {
+                AllocationError::Retirement("membership registry")
+            }
+            MembershipError::Anchor(AnchorError::Pin(_)) => {
+                AllocationError::Retirement("membership anchor pin")
+            }
+            MembershipError::Edit => AllocationError::Retirement("membership edit"),
+        }
+    }
+}
 
 /// Arc keeps Buffer Clone/view infallible. Its final metadata deallocation is
 /// still on the dropping thread; native/raw/charge cleanup is not.
@@ -220,7 +245,7 @@ impl MembershipDomain {
     pub(crate) fn for_buffer(&self, buffer: &Buffer) -> Result<Membership, MembershipError> {
         // SAFETY: MTLBuffer implements MTLAllocation; protocol upcast only.
         let allocation = unsafe {
-            &*(buffer.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
+            &*(buffer.raw_unchecked() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
                 as *const ProtocolObject<dyn MTLAllocation>)
         };
         self.for_allocation(allocation, buffer.allocation_owner().cloned())

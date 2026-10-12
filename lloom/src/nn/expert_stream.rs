@@ -1729,7 +1729,8 @@ impl Inner {
         if !fits {
             let _escape = escape_guard();
             let buf = m.new_persistent_shared(std::mem::size_of_val(slot_ids))?;
-            if buf.contents().is_null() {
+            // SAFETY: the pointer is only compared with null.
+            if unsafe { buf.contents() }.is_null() {
                 return Ok(None);
             }
             let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
@@ -1767,7 +1768,8 @@ impl LiveTable {
     #[cfg(feature = "metal")]
     fn new(device: &lloom_tensor::MetalDevice, n: usize) -> Result<Self> {
         let buf = device.new_persistent_shared(n * std::mem::size_of::<u32>())?;
-        if buf.contents().is_null() {
+        // SAFETY: the pointer is only compared with null.
+        if unsafe { buf.contents() }.is_null() {
             lloom_tensor::bail!("the live residency table has no CPU mapping")
         }
         let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new_allocated(
@@ -1829,7 +1831,9 @@ impl Inner {
                     let (old, new) = (self.pools[i].qt.metal_buffer()?, qt.metal_buffer()?);
                     let mut blit = m.blit_command_encoder()?;
                     blit.set_label("slot pools reallocated");
-                    blit.copy_from_buffer(old, 0, new, 0, bytes);
+                    // SAFETY: both pools are persistent tier buffers no pool
+                    // recycles, and nothing writes the old one after this copy.
+                    unsafe { blit.copy_from_buffer(old, 0, new, 0, bytes) };
                 }
             }
             fresh.push(SlotPool {
@@ -2649,7 +2653,9 @@ impl Streamed {
                         let mut dsts =
                             [crate::nn::expert_prefetch::DirectDst(std::ptr::null_mut()); 3];
                         for (i, pool) in inner.pools.iter().enumerate() {
-                            let base = pool.qt.metal_buffer()?.contents();
+                            // SAFETY: only slots whose last reader's epoch
+                            // `settled` covers are written (the partition above).
+                            let base = unsafe { pool.qt.metal_buffer()?.contents() };
                             if base.is_null() {
                                 lloom_tensor::bail!("direct read: the slot pool has no CPU mapping")
                             }
@@ -3598,22 +3604,26 @@ impl lloom_tensor::CustomOp1 for SlotMap {
                 s.dtype(),
             )?,
         };
-        lloom_tensor::kernels::call_moe_slot_map(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            n,
-            self.n_experts,
-            lloom_tensor::kernels::BufferOffset {
-                buffer: s.buffer(),
-                offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
-            },
-            lloom_tensor::kernels::BufferOffset {
-                buffer: ts.buffer(),
-                offset_in_bytes: tl.start_offset() * ts.dtype().size_in_bytes(),
-            },
-            output.buffer(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_moe_slot_map(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                n,
+                self.n_experts,
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: s.buffer(),
+                    offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
+                },
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: ts.buffer(),
+                    offset_in_bytes: tl.start_offset() * ts.dtype().size_in_bytes(),
+                },
+                output.buffer(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((output, lloom_tensor::Shape::from(3 * n)))
     }
@@ -3915,8 +3925,10 @@ impl Streamed {
                 self.counters.misses.fetch_add(1, Ordering::Relaxed);
                 let mut dsts = [crate::nn::expert_prefetch::DirectDst(std::ptr::null_mut()); 3];
                 for (i, pool) in inner.pools.iter().enumerate() {
+                    // SAFETY: `s` came from `take_free` or `victim_beside` under
+                    // `completed`: no command that reads it is pending.
                     let base = match pool.qt.metal_buffer() {
-                        Ok(b) => b.contents(),
+                        Ok(b) => unsafe { b.contents() },
                         Err(_) => std::ptr::null_mut(),
                     };
                     // SAFETY: `s * plane` is inside the pool (`s < n_slots`);
@@ -6381,7 +6393,8 @@ mod tests {
             let tt = &inner.live.as_ref().unwrap().tensor;
             let (st, _) = tt.storage_and_layout();
             match &*st {
-                lloom_tensor::Storage::Metal(m) => m.buffer().contents() as usize,
+                // SAFETY: the address is compared for identity, never dereferenced.
+                lloom_tensor::Storage::Metal(m) => (unsafe { m.buffer().contents() }) as usize,
                 _ => unreachable!(),
             }
         };

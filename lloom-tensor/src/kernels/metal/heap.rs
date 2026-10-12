@@ -27,19 +27,19 @@
 //! has completed (the pool evicts from its FREE list), so no two live
 //! buffers overlap and no returned range is still read.
 
-use super::backing::BackingAdmissionError;
 use super::{Buffer, ResidencySet};
 use crate::allocation_admission::{self, Prediction};
 use crate::allocation_owner::AllocationOwner;
 use crate::heap_ranges::{aligned, reusable_for, Ranges};
-use crate::kernels::MetalKernelError;
-use crate::memory_admission::{AllocationContext, DomainKey};
+use crate::memory_admission::AllocationError;
+use crate::memory_admission::{AllocationContext, DomainKey, ModelDomain};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLAllocation as _, MTLDevice as _, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
     MTLHeapType, MTLResourceOptions, MTLStorageMode,
 };
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 /// The default chunk: 512 MiB. A 512-row prefill tile's transients are
@@ -101,7 +101,7 @@ impl NewHeap {
             Retained<ProtocolObject<dyn MTLHeap>>,
             Option<AllocationOwner>,
         ),
-        BackingAdmissionError,
+        AllocationError,
     > {
         match self {
             Self::Admitted(staged) => staged.commit().map(|(raw, owner)| (raw, Some(owner))),
@@ -142,10 +142,75 @@ struct PendingPlacement {
     membership: super::membership::Membership,
 }
 
+enum LivePlacement {
+    Manual(Placement),
+    // Exact never-reused receipt, NOT native pointer identity. A managed
+    // placement remains reserved until its sole root-owned custody drops.
+    Rooted { receipt: u64 },
+}
+
+/// Cold placement handoff. Field order releases the native Buffer before the
+/// sole range-return owner. This is not a submit capability or an alias pin.
+/// Only a trusted physical root may accept it; Buffer aliases alone do not
+/// retain this custody. No Clone/raw accessors are provided.
+pub(crate) struct PlacementAllocation {
+    pub(crate) buffer: Buffer,
+    pub(crate) custody: PlacementCustody,
+}
+
+/// Sole exact range-return owner, moved into independently service-rooted
+/// physical A. It retains allocation-local state/heap/chunk charges only,
+/// never Backings/Device/Commands/namespace/pool or the physical header.
+/// Final Drop must be cold rejection or host service after all rich/native/IO
+/// aliases and emission capabilities close. It is NOT producer-warm Drop.
+pub(crate) struct PlacementCustody {
+    // Retain state on any failed restoration or unwind. State itself contains
+    // no custody owner, so this quarantine cannot form a reference cycle.
+    state: ManuallyDrop<Arc<parking_lot::Mutex<State>>>,
+    placement: Placement,
+    receipt: u64,
+    native_key: usize,
+}
+impl Drop for PlacementCustody {
+    fn drop(&mut self) {
+        let restored = {
+            let mut st = self.state.lock();
+            let p = self.placement;
+            // A corrupt census quarantines; do not credit a range then panic.
+            if st.rooted_live == 0 {
+                return;
+            }
+            let Some(chunk) = st.chunks.get_mut(p.chunk) else {
+                return;
+            };
+            if !chunk.ranges.give_back(p.offset, p.size) {
+                return;
+            }
+            // Native Buffer address may be reused after its raw release but
+            // before this Drop. Never remove a successor's live entry.
+            if matches!(st.live.get(&self.native_key),
+                Some(LivePlacement::Rooted { receipt }) if *receipt == self.receipt)
+            {
+                st.live.remove(&self.native_key);
+            }
+            // Prechecked before claim; only this non-Clone owner decrements.
+            st.rooted_live -= 1;
+            true
+        };
+        if restored {
+            // SAFETY: exactly one successful range return; no guard remains.
+            // Release heap/native/accounting owners outside allocator state.
+            unsafe { ManuallyDrop::drop(&mut self.state) };
+        }
+    }
+}
+
 struct State {
     chunks: Vec<Chunk>,
     /// Keyed by the `MTLBuffer` pointer (`Buffer::raw_ptr`).
-    live: HashMap<usize, Placement>,
+    live: HashMap<usize, LivePlacement>,
+    next_receipt: u64,
+    rooted_live: usize,
 }
 
 /// Chunks of one storage mode, and the residency set they are added to.
@@ -157,8 +222,10 @@ pub struct HeapChunks {
     options: MTLResourceOptions,
     storage: MTLStorageMode,
     chunk_bytes: usize,
-    state: parking_lot::Mutex<State>,
+    state: Arc<parking_lot::Mutex<State>>,
     membership: Arc<super::membership::MembershipDomain>,
+    default_domain: Option<ModelDomain>,
+    requires_context: bool,
 }
 
 // SAFETY: an `MTLHeap` is a thread-safe Metal object; the state is behind a
@@ -196,15 +263,26 @@ impl HeapChunks {
             device: device.clone(),
             residency_set,
             membership,
+            default_domain: None,
+            requires_context: false,
             ledger,
             options,
             storage,
             chunk_bytes: chunk_bytes.max(1 << 20),
-            state: parking_lot::Mutex::new(State {
+            state: Arc::new(parking_lot::Mutex::new(State {
                 chunks: Vec::new(),
                 live: HashMap::new(),
-            }),
+                next_receipt: 0,
+                rooted_live: 0,
+            })),
         }
+    }
+
+    /// Immutable engine-native payer, installed cold before chunks exist.
+    pub(crate) fn with_native_payer(mut self, domain: ModelDomain, requires_context: bool) -> Self {
+        self.default_domain = Some(domain);
+        self.requires_context = requires_context;
+        self
     }
 
     pub(crate) fn with_membership(
@@ -217,19 +295,41 @@ impl HeapChunks {
 
     /// Legacy unadmitted placement route, sharing the checked allocator with
     /// alloc_in but never borrowing an admitted domain's chunks.
-    pub fn alloc(&self, length: usize) -> Result<Buffer, MetalKernelError> {
-        self.alloc_impl(length, None).map_err(|error| match error {
-            BackingAdmissionError::Native(error) => error,
-            other => MetalKernelError::InvalidInput(other.to_string()),
-        })
+    pub fn alloc(&self, length: usize) -> Result<Buffer, AllocationError> {
+        self.alloc_impl(length, None, false)
+            .map(|(buffer, _)| buffer)
     }
 
     pub(crate) fn alloc_in(
         &self,
         length: usize,
         context: &AllocationContext,
-    ) -> Result<Buffer, BackingAdmissionError> {
-        self.alloc_impl(length, Some(context))
+    ) -> Result<Buffer, AllocationError> {
+        self.alloc_impl(length, Some(context), false)
+            .map(|(buffer, _)| buffer)
+    }
+
+    /// Same checked heap allocator for default and supplied physical origins.
+    /// Does not activate rich pool/Buffer callers by itself.
+    ///
+    /// # Safety
+    /// Caller moves returned custody inseparably into the same physical A as
+    /// buffer baseline before any usable raw alias escapes. Every future
+    /// clone/view/encoder/IO owner retains that physical root's NativeUse until
+    /// actual terminality and emission closure. Observer callbacks receive a
+    /// counted External role, never this tokenless baseline. Final custody Drop
+    /// is cold error handling or actual host-service cleanup, never warm final
+    /// producer Drop. Existing legacy alloc/release remains a separate route.
+    pub(crate) unsafe fn alloc_custodied(
+        &self,
+        length: usize,
+        context: Option<&AllocationContext>,
+    ) -> Result<PlacementAllocation, AllocationError> {
+        let (buffer, custody) = self.alloc_impl(length, context, true)?;
+        Ok(PlacementAllocation {
+            buffer,
+            custody: custody.expect("managed route always installs range custody"),
+        })
     }
 
     fn select(
@@ -237,7 +337,7 @@ impl HeapChunks {
         size: usize,
         align: usize,
         domain: Option<&DomainKey>,
-    ) -> Result<Option<PendingPlacement>, BackingAdmissionError> {
+    ) -> Result<Option<PendingPlacement>, AllocationError> {
         let mut best: Option<(usize, usize, usize)> = None;
         for (ci, chunk) in st.chunks.iter().enumerate() {
             if !chunk.available_to(domain) {
@@ -253,13 +353,12 @@ impl HeapChunks {
             return Ok(None);
         };
         let chunk = &mut st.chunks[ci];
-        let offset =
-            chunk
-                .ranges
-                .take_at(ri, size, align)
-                .ok_or(BackingAdmissionError::Geometry(
-                    "selected heap range became invalid",
-                ))?;
+        let offset = chunk
+            .ranges
+            .take_at(ri, size, align)
+            .ok_or(AllocationError::Geometry(
+                "selected heap range became invalid",
+            ))?;
         Ok(Some(PendingPlacement {
             placement: Placement {
                 chunk: ci,
@@ -277,10 +376,9 @@ impl HeapChunks {
         size: usize,
         align: usize,
         context: Option<&AllocationContext>,
-    ) -> Result<NewHeap, BackingAdmissionError> {
-        let rounded = aligned(size, align).ok_or(BackingAdmissionError::Geometry(
-            "heap chunk rounding overflow",
-        ))?;
+    ) -> Result<NewHeap, AllocationError> {
+        let rounded = aligned(size, align)
+            .ok_or(AllocationError::Geometry("heap chunk rounding overflow"))?;
         let chunk_size = self.chunk_bytes.max(rounded);
         let create = |bytes| {
             let desc = MTLHeapDescriptor::new();
@@ -288,32 +386,38 @@ impl HeapChunks {
             desc.setStorageMode(self.storage);
             desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
             desc.setType(MTLHeapType::Placement);
-            self.device
-                .as_ref()
-                .newHeapWithDescriptor(&desc)
-                .ok_or_else(|| {
-                    MetalKernelError::FailedToCreateResource(format!(
-                        "placement heap chunk of {bytes} bytes"
-                    ))
-                })
+            self.device.as_ref().newHeapWithDescriptor(&desc)
         };
         if let Some(context) = context {
-            allocation_admission::stage(context, Prediction::heap(chunk_size), create, |raw| {
-                raw.allocatedSize()
-            })
+            allocation_admission::stage_owned(
+                context,
+                Prediction::heap(chunk_size),
+                create,
+                |raw| raw.allocatedSize(),
+            )
+            .map(NewHeap::Admitted)
+        } else if let Some(domain) = &self.default_domain {
+            // Only cold growth reserves. Charged warm free-range reuse below
+            // checks the immutable default key and does not take a promise.
+            let quote = Prediction::heap(chunk_size).requested_owned_bytes()?;
+            let pass = domain.reserve(quote)?;
+            allocation_admission::stage_owned(
+                &pass.context(),
+                Prediction::heap(chunk_size),
+                create,
+                |raw| raw.allocatedSize(),
+            )
             .map(NewHeap::Admitted)
         } else {
             create(chunk_size)
                 .map(NewHeap::Legacy)
-                .map_err(BackingAdmissionError::Native)
+                .ok_or(AllocationError::DeviceOom {
+                    requested: chunk_size,
+                })
         }
     }
 
-    fn commit_chunk(
-        &self,
-        staged: NewHeap,
-        ranges: Ranges,
-    ) -> Result<Chunk, BackingAdmissionError> {
+    fn commit_chunk(&self, staged: NewHeap, ranges: Ranges) -> Result<Chunk, AllocationError> {
         let (raw, owner) = staged.commit()?;
         let capacity = ranges.capacity();
         let heap = Arc::new(HeapAnchor { raw });
@@ -328,7 +432,7 @@ impl HeapChunks {
         let membership = self
             .membership
             .for_allocation(allocation, owner.clone())
-            .map_err(|e| BackingAdmissionError::Retirement(e.to_string()))?;
+            .map_err(AllocationError::from)?;
         let reservation = self.ledger.as_ref().map(|ledger| ledger.reserve(capacity));
         Ok(Chunk {
             heap,
@@ -359,10 +463,25 @@ impl HeapChunks {
         &self,
         length: usize,
         context: Option<&AllocationContext>,
-    ) -> Result<Buffer, BackingAdmissionError> {
+        rooted: bool,
+    ) -> Result<(Buffer, Option<PlacementCustody>), AllocationError> {
+        if let Some(context) = context {
+            if self
+                .default_domain
+                .as_ref()
+                .is_some_and(|d| d.key() != context.domain_key())
+            {
+                return Err(AllocationError::DifferentDomain);
+            }
+            context.check_open()?;
+        } else if self.requires_context {
+            return Err(AllocationError::Unsupported(
+                "model heap requires supplied allocation context",
+            ));
+        }
         let length = length.max(1);
         if length > self.device.as_ref().maxBufferLength() {
-            return Err(BackingAdmissionError::Geometry(
+            return Err(AllocationError::Geometry(
                 "heap buffer exceeds device maxBufferLength",
             ));
         }
@@ -372,17 +491,31 @@ impl HeapChunks {
             .heapBufferSizeAndAlignWithLength_options(length, self.options);
         let (size, align) = (sa.size.max(length), sa.align);
         if align == 0 {
-            return Err(BackingAdmissionError::Geometry(
-                "zero heap buffer alignment",
-            ));
+            return Err(AllocationError::Geometry("zero heap buffer alignment"));
         }
-        let domain = context.map(AllocationContext::domain_key);
+        let domain = context
+            .map(AllocationContext::domain_key)
+            .or_else(|| self.default_domain.as_ref().map(ModelDomain::key));
         // A context must be open even when reusing an already charged chunk.
         // The zero ticket validates cancellation without charging reused bytes.
-        let reuse_ticket = context
-            .map(|context| context.take(0))
-            .transpose()
-            .map_err(BackingAdmissionError::Admission)?;
+        let reuse_ticket = context.map(|context| context.take(0)).transpose()?;
+        // Cold receipt allocation is bounded numeric state, not a raw-address
+        // generation guess. Refusal occurs before any range claim. Gaps after
+        // failed attempts are intentional; receipt values are never recycled.
+        let receipt = if rooted {
+            let mut st = self.state.lock();
+            let receipt = st
+                .next_receipt
+                .checked_add(1)
+                .ok_or(AllocationError::Geometry("placement receipt exhausted"))?;
+            st.rooted_live
+                .checked_add(1)
+                .ok_or(AllocationError::Geometry("placement live census exhausted"))?;
+            st.next_receipt = receipt;
+            Some(receipt)
+        } else {
+            None
+        };
         let selected = {
             let mut st = self.state.lock();
             Self::select(&mut st, size, align, domain.as_ref())?
@@ -410,7 +543,7 @@ impl HeapChunks {
                     None => {
                         drop(ranges);
                         drop(staged);
-                        return Err(BackingAdmissionError::Geometry(
+                        return Err(AllocationError::Geometry(
                             "fresh heap capacity cannot fit requested range",
                         ));
                     }
@@ -451,27 +584,57 @@ impl HeapChunks {
                 .ranges
                 .give_back(placement.offset, size);
             if !restored {
-                return Err(BackingAdmissionError::Geometry(
-                    "failed buffer range restoration",
-                ));
+                return Err(AllocationError::Geometry("failed buffer range restoration"));
             }
-            return Err(BackingAdmissionError::Native(
-                MetalKernelError::FailedToCreateResource(format!(
-                    "{size} bytes at offset {} of placement heap",
-                    placement.offset
-                )),
-            ));
+            return Err(AllocationError::DeviceOom { requested: size });
         };
         let buffer = match pending.owner {
             Some(owner) => Buffer::new_owned(raw, owner),
             None => Buffer::new(raw),
         }
         .with_membership(pending.membership);
-        self.state
-            .lock()
-            .live
-            .insert(buffer.raw_ptr() as usize, placement);
-        Ok(buffer)
+        let native_key = buffer.raw_ptr() as usize;
+        let custody = if let Some(receipt) = receipt {
+            let custody = PlacementCustody {
+                state: ManuallyDrop::new(self.state.clone()),
+                placement,
+                receipt,
+                native_key,
+            };
+            let mut st = self.state.lock();
+            // Other growers may have increased the count since precheck.
+            // If exhausted, release guard then native raw before exact custody
+            // rollback; no entry is installed and no observable credit escapes.
+            let Some(next_live) = st.rooted_live.checked_add(1) else {
+                drop(st);
+                drop(buffer);
+                // This rejected owner has not joined the live census yet.
+                // Restore its exact range directly, retaining state on failure.
+                let custody = ManuallyDrop::new(custody);
+                let restored = self.state.lock().chunks[placement.chunk]
+                    .ranges
+                    .give_back(placement.offset, placement.size);
+                if restored {
+                    // SAFETY: rejected exclusive owner; read state once,
+                    // no live census decrement or ordinary custody Drop.
+                    let state = unsafe { std::ptr::read(&*custody.state) };
+                    drop(state);
+                }
+                return Err(AllocationError::Geometry("placement live census exhausted"));
+            };
+            st.rooted_live = next_live;
+            st.live
+                .insert(native_key, LivePlacement::Rooted { receipt });
+            drop(st);
+            Some(custody)
+        } else {
+            self.state
+                .lock()
+                .live
+                .insert(native_key, LivePlacement::Manual(placement));
+            None
+        };
+        Ok((buffer, custody))
     }
 
     /// Give a sub-buffer's range back (the pool evicting it, or a trim).
@@ -480,8 +643,14 @@ impl HeapChunks {
     pub fn release(&self, buf: &Buffer) -> bool {
         let mut st = self.state.lock();
         let key = buf.raw_ptr() as usize;
-        let Some(p) = st.live.get(&key).copied() else {
+        let Some(entry) = st.live.get(&key) else {
             return false;
+        };
+        let p = match entry {
+            // Eviction acknowledges membership in this heap; actual range
+            // eligibility belongs to the exact physical custody, not callback.
+            LivePlacement::Rooted { .. } => return true,
+            LivePlacement::Manual(p) => *p,
         };
         if !st.chunks[p.chunk].ranges.give_back(p.offset, p.size) {
             return false;
@@ -512,7 +681,11 @@ impl HeapChunks {
             chunks: st.chunks.len(),
             size: st.chunks.iter().map(|c| c.ranges.capacity()).sum(),
             used: st.chunks.iter().map(|c| c.ranges.used()).sum(),
-            live: st.live.len(),
+            live: st.rooted_live
+                + st.live
+                    .values()
+                    .filter(|p| matches!(p, LivePlacement::Manual(_)))
+                    .count(),
         }
     }
 }

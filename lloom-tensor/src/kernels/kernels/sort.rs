@@ -4,8 +4,12 @@ use crate::kernels::{
 };
 use crate::kernels::{Buffer, ComputeCommandEncoder, Device, MTLSize, RESOURCE_OPTIONS};
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_arg_sort(
+pub unsafe fn call_arg_sort(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -22,10 +26,13 @@ pub fn call_arg_sort(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "arg_sort {name} nrows={nrows} ncols={ncols}");
 
-    set_params!(
-        encoder,
-        (&src, Output::new(dst), ncols as i64, ncols_pad as i64)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&src, Output::new(dst), ncols as i64, ncols_pad as i64)
+        );
+    }
 
     let thread_group_count = MTLSize {
         width: 1,
@@ -54,8 +61,12 @@ fn mlx_dtype_str(dtype: DType) -> &'static str {
     }
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-fn multi_block_sort(
+unsafe fn multi_block_sort(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -94,19 +105,22 @@ fn multi_block_sort(
             encoder,
             "mlx_arg_sort multi_block block_sort {dtype_str} nrows={nrows} ncols={ncols} blocks={nblocks}"
         );
-        set_params!(
-            encoder,
-            (
-                &src,
-                &mut dev_vals_0,
-                &mut dev_idxs_0,
-                /* size_sorted_axis */ ncols as i32,
-                /* stride_sorted_axis */ 1i32,
-                /* nc_dim */ 1i32,
-                /* nc_shape */ nrows as i32,
-                /* nc_str */ ncols as i64
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    &src,
+                    &mut dev_vals_0,
+                    &mut dev_idxs_0,
+                    /* size_sorted_axis */ ncols as i32,
+                    /* stride_sorted_axis */ 1i32,
+                    /* nc_dim */ 1i32,
+                    /* nc_shape */ nrows as i32,
+                    /* nc_str */ ncols as i64
+                )
+            );
+        }
         let thread_group_count = MTLSize {
             width: nblocks,
             height: nrows,
@@ -151,17 +165,20 @@ fn multi_block_sort(
                 encoder,
                 "mlx_arg_sort multi_block partition {dtype_str} merge_tiles={merge_tiles} blocks={nblocks}"
             );
-            set_params!(
-                encoder,
-                (
-                    &mut block_partitions,
-                    &*dev_vals_in,
-                    &*dev_idxs_in,
-                    /* size_sorted_axis */ ncols as i32,
-                    /* merge_tiles */ merge_tiles as i32,
-                    /* n_blocks */ nblocks as i32
-                )
-            );
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(
+                    encoder,
+                    (
+                        &mut block_partitions,
+                        &*dev_vals_in,
+                        &*dev_idxs_in,
+                        /* size_sorted_axis */ ncols as i32,
+                        /* merge_tiles */ merge_tiles as i32,
+                        /* n_blocks */ nblocks as i32
+                    )
+                );
+            }
             let thread_group_count = MTLSize {
                 width: 1,
                 height: nrows,
@@ -182,19 +199,22 @@ fn multi_block_sort(
                 encoder,
                 "mlx_arg_sort multi_block merge {dtype_str} merge_tiles={merge_tiles} blocks={nblocks}"
             );
-            set_params!(
-                encoder,
-                (
-                    &block_partitions,
-                    &*dev_vals_in,
-                    &*dev_idxs_in,
-                    Output::new(&*dev_vals_out),
-                    Output::new(&*dev_idxs_out),
-                    /* size_sorted_axis */ ncols as i32,
-                    /* merge_tiles */ merge_tiles as i32,
-                    /* n_blocks */ nblocks as i32
-                )
-            );
+            // SAFETY: this function's contract (# Safety above).
+            unsafe {
+                set_params!(
+                    encoder,
+                    (
+                        &block_partitions,
+                        &*dev_vals_in,
+                        &*dev_idxs_in,
+                        Output::new(&*dev_vals_out),
+                        Output::new(&*dev_idxs_out),
+                        /* size_sorted_axis */ ncols as i32,
+                        /* merge_tiles */ merge_tiles as i32,
+                        /* n_blocks */ nblocks as i32
+                    )
+                );
+            }
             let thread_group_count = MTLSize {
                 width: nblocks,
                 height: nrows,
@@ -241,8 +261,12 @@ fn multi_block_sort(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-fn block_sort(
+unsafe fn block_sort(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -266,18 +290,21 @@ fn block_sort(
         encoder,
         "mlx_arg_sort block {name_for_label} nrows={nrows} ncols={ncols}"
     );
-    set_params!(
-        encoder,
-        (
-            &src,
-            Output::new(dst),
-            ncols as i32,
-            1i32,
-            1i32,
-            ncols as i32,
-            ncols as i32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &src,
+                Output::new(dst),
+                ncols as i32,
+                1i32,
+                1i32,
+                ncols as i32,
+                ncols as i32
+            )
+        );
+    }
     let thread_group_count = MTLSize {
         width: 1,
         height: nrows,
@@ -292,8 +319,12 @@ fn block_sort(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_arg_sort(
+pub unsafe fn call_mlx_arg_sort(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -312,11 +343,15 @@ pub fn call_mlx_arg_sort(
     let n_per_block = bn * tn;
     let n_blocks = ncols.div_ceil(n_per_block);
     if n_blocks > 1 {
-        multi_block_sort(
-            device, ep, kernels, dtype, bn, tn, n_blocks, nrows, ncols, src, dst,
-        )?
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            multi_block_sort(
+                device, ep, kernels, dtype, bn, tn, n_blocks, nrows, ncols, src, dst,
+            )
+        }?
     } else {
-        block_sort(device, ep, kernels, dtype, bn, tn, nrows, ncols, src, dst)?
+        // SAFETY: this function's contract (# Safety above).
+        unsafe { block_sort(device, ep, kernels, dtype, bn, tn, nrows, ncols, src, dst) }?
     }
     Ok(())
 }

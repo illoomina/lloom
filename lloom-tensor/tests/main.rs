@@ -94,7 +94,11 @@ mod words_publish_order;
 /// files that owns its binary), read from the directory at test time.
 #[test]
 fn every_test_file_is_a_module() {
-    let own: &[&str] = &["metal_pool_alloc_free", "metal_cb_failure_tests"];
+    let own: &[&str] = &[
+        "metal_pool_alloc_free",
+        "metal_cb_failure_tests",
+        "allocation_refusal_alloc_free",
+    ];
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
     let me = include_str!("main.rs");
     let mut missing = Vec::new();

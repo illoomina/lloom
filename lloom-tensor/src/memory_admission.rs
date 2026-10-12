@@ -34,88 +34,179 @@ impl From<core::Snapshot> for AccountSnapshot {
     }
 }
 
+/// Which account refused an allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LimitScope {
+pub enum RefusalDomain {
+    /// The process cap every model domain shares.
     Process,
-    Domain,
+    /// One model domain's own quota.
+    Model,
+    /// The issued promise of a pass (`AllocationContext`).
+    Promise,
+    /// The machine gate's room beside every other lloom process (`machine`).
+    Machine,
+    /// The per-process budget's residual (`memory.md` §9.5k).
+    Budget,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AdmissionError {
+/// Why the machine could not admit a reservation's growth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineFailure {
+    /// The registry or the host's memory could not be read.
+    Unavailable,
+    /// The holding is absent without an explicit override, or bound to
+    /// another domain.
+    Binding,
+}
+
+impl MachineFailure {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Unavailable => {
+                "the registry or the host's memory could not be read; admission cannot establish room"
+            }
+            Self::Binding => {
+                "the machine holding is absent without an explicit force/off override, or already \
+                 belongs to another admission domain; reuse that domain or obtain a distinct \
+                 holding with Gate::admit"
+            }
+        }
+    }
+}
+
+/// Every refusal an allocation entry point can return, on every backend.
+///
+/// `Copy` and allocation-free by construction: a refusal on a warm path is
+/// built without `format!`, `Box` or a backtrace, and widens into
+/// [`crate::Error::Allocation`] with `?`. Detail that needs text (the machine
+/// gate's arithmetic) stays with its owner (`machine::Holding::last_refusal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AllocationError {
+    #[error("{domain:?} memory refused {requested} bytes: {available} bytes available")]
+    Refused {
+        requested: usize,
+        available: usize,
+        domain: RefusalDomain,
+    },
+    #[error("allocation reference count exhausted")]
+    CountExhausted,
+    #[error("allocation context was cancelled")]
+    Cancelled,
+    #[error("the device refused a {requested}-byte allocation")]
+    DeviceOom { requested: usize },
+    #[error("cold host allocation returned null")]
+    HostAllocation,
+    #[error("memory admission arithmetic exceeds usize")]
     Overflow,
+    #[error("allocation geometry: {0}")]
+    Geometry(&'static str),
+    #[error(
+        "allocation prediction exceeded: {actual} actual bytes > {predicted} predicted ({basis:?}); \
+         raw allocation released; transient peak was not prevented"
+    )]
+    PredictionExceeded {
+        predicted: usize,
+        actual: usize,
+        basis: PredictionBasis,
+    },
+    #[error("admitted allocation unsupported: {0}")]
+    Unsupported(&'static str),
+    #[error("allocation retirement registration: {0}")]
+    Retirement(&'static str),
+    #[error("allocation custody invariant violated")]
+    InvalidCustody,
+    #[error(
+        "owned Arc quote requires an audited std toolchain/source; legacy allocation APIs remain available"
+    )]
+    UnsupportedLayout,
+    #[error("cannot return a promise to a different model domain")]
     DifferentDomain,
+    #[error("reusable allocation container and operation target different native devices")]
     DifferentAllocationDevice,
+    #[error("clock-only allocation container has no native device binding")]
     UnboundAllocationDevice,
+    #[error(
+        "reusable allocation domain mismatch: container={expected}, active payer={actual}; \
+         accounted domains require identical origin"
+    )]
     ReuseDomainMismatch {
         expected: &'static str,
         actual: &'static str,
     },
-    Machine(String),
-    Limit {
-        scope: LimitScope,
-        limit: usize,
-        requested_total: usize,
-    },
-    PromiseTooSmall {
-        remaining: usize,
-        requested: usize,
-    },
-    Cancelled,
+    #[error("machine admission: {}", .0.describe())]
+    Machine(MachineFailure),
+    #[error(
+        "process memory cap already initialized to {active:?}, requested {requested:?}; \
+         configure before the first load"
+    )]
     ConfigurationConflict {
         active: Option<usize>,
         requested: Option<usize>,
     },
 }
 
-impl std::fmt::Display for AdmissionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Overflow => write!(f, "memory admission arithmetic exceeds usize"),
-            Self::DifferentAllocationDevice => write!(f, "reusable allocation container and operation target different native devices"),
-            Self::UnboundAllocationDevice => write!(f, "clock-only allocation container has no native device binding"),
-            Self::ReuseDomainMismatch { expected, actual } => write!(f, "reusable allocation domain mismatch: container={expected}, active payer={actual}; accounted domains require identical origin"),
-            Self::DifferentDomain => write!(f, "cannot return a promise to a different model domain"),
-            Self::Machine(why) => write!(f, "machine admission: {why}"),
-            Self::Limit { scope, limit, requested_total } => write!(f, "{scope:?} memory demand {requested_total} exceeds limit {limit}"),
-            Self::PromiseTooSmall { remaining, requested } => write!(f, "allocation requests {requested} bytes from a {remaining}-byte promise"),
-            Self::Cancelled => write!(f, "allocation context was cancelled"),
-            Self::ConfigurationConflict { active, requested } => write!(f, "process memory cap already initialized to {active:?}, requested {requested:?}; configure before the first load"),
-        }
-    }
+/// How an allocation's byte prediction was derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictionBasis {
+    /// Heap size/alignment queried for the same options, at least requested
+    /// bytes, rounded with checked arithmetic up to the larger of that
+    /// alignment and the VM page. An estimator bounding a standalone buffer's
+    /// `allocatedSize` (checked natively), NOT Apple's guarantee.
+    HeapSizeAndAlignEstimate,
+    /// Checked placement chunk request; actual heap allocation may differ.
+    HeapDescriptorSizeEstimate,
 }
-impl std::error::Error for AdmissionError {}
-impl From<core::Refusal> for AdmissionError {
+
+impl From<core::Refusal> for AllocationError {
     fn from(e: core::Refusal) -> Self {
         match e {
             core::Refusal::Overflow => Self::Overflow,
+            core::Refusal::UnsupportedLayout => Self::UnsupportedLayout,
             core::Refusal::DifferentDomain => Self::DifferentDomain,
             core::Refusal::ConfigurationConflict { active, requested } => {
                 Self::ConfigurationConflict { active, requested }
             }
-            core::Refusal::Machine(s) => Self::Machine(s),
+            core::Refusal::Machine(m) => m.into(),
             core::Refusal::Limit {
                 scope,
                 limit,
+                requested,
                 requested_total,
-            } => Self::Limit {
-                scope: match scope {
-                    core::Scope::Process => LimitScope::Process,
-                    core::Scope::Domain => LimitScope::Domain,
+            } => Self::Refused {
+                requested,
+                available: limit.saturating_sub(requested_total.saturating_sub(requested)),
+                domain: match scope {
+                    core::Scope::Process => RefusalDomain::Process,
+                    core::Scope::Domain => RefusalDomain::Model,
                 },
-                limit,
-                requested_total,
             },
             core::Refusal::PromiseTooSmall {
                 remaining,
                 requested,
-            } => Self::PromiseTooSmall {
-                remaining,
+            } => Self::Refused {
                 requested,
+                available: remaining,
+                domain: RefusalDomain::Promise,
             },
         }
     }
 }
-pub type Result<T> = std::result::Result<T, AdmissionError>;
+
+impl From<crate::memory_accounting_machine::MachineRefusal> for AllocationError {
+    fn from(m: crate::memory_accounting_machine::MachineRefusal) -> Self {
+        use crate::memory_accounting_machine::MachineRefusal;
+        match m {
+            MachineRefusal::Room { need, room } => Self::Refused {
+                requested: usize::try_from(need).unwrap_or(usize::MAX),
+                available: usize::try_from(room.max(0)).unwrap_or(usize::MAX),
+                domain: RefusalDomain::Machine,
+            },
+            MachineRefusal::Unavailable => Self::Machine(MachineFailure::Unavailable),
+            MachineRefusal::Binding => Self::Machine(MachineFailure::Binding),
+        }
+    }
+}
+pub type Result<T> = std::result::Result<T, AllocationError>;
 
 /// Machine-policy status is separate from numerical accounting. Registered
 /// includes the forced flag: even a registered reservation can bypass refusal.
@@ -170,7 +261,7 @@ impl ProcessCell {
         self.get()
             .core
             .configure_cap(cap)
-            .map_err(AdmissionError::from)
+            .map_err(AllocationError::from)
     }
 }
 static PROCESS: ProcessCell = ProcessCell(OnceLock::new());
@@ -207,8 +298,7 @@ impl ProcessAccount {
         self.core.cap()
     }
     pub fn domain(&self, quota: Option<usize>, admitted: Admitted) -> Result<ModelDomain> {
-        let owner =
-            MachineOwner::new(admitted).map_err(|e| AdmissionError::Machine(e.to_string()))?;
+        let owner = MachineOwner::new(admitted)?;
         Ok(ModelDomain(self.core.domain_with_machine(quota, owner)?))
     }
     /// Compatibility path: numerical accounting, explicitly no machine owner.
@@ -263,7 +353,7 @@ impl AllocationOrigin {
         if self == active {
             Ok(())
         } else {
-            Err(AdmissionError::ReuseDomainMismatch {
+            Err(AllocationError::ReuseDomainMismatch {
                 expected: self.category(),
                 actual: active.category(),
             })
@@ -294,8 +384,8 @@ impl<D: PartialEq> AllocationAffinity<D> {
     }
     pub fn validate_reuse(&self, device: &D, payer: &AllocationOrigin) -> Result<()> {
         match &self.device {
-            None => Err(AdmissionError::UnboundAllocationDevice),
-            Some(bound) if bound != device => Err(AdmissionError::DifferentAllocationDevice),
+            None => Err(AllocationError::UnboundAllocationDevice),
+            Some(bound) if bound != device => Err(AllocationError::DifferentAllocationDevice),
             Some(_) => self.origin.validate_reuse(payer),
         }
     }
@@ -325,6 +415,10 @@ impl ModelDomain {
     }
     pub fn snapshot(&self) -> AccountSnapshot {
         self.0.snapshot().into()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_account_snapshot_nonblocking(&self) -> Option<AccountSnapshot> {
+        self.0.test_account_snapshot_nonblocking().map(Into::into)
     }
     pub fn machine_status(&self) -> MachineStatus {
         self.0.machine_admission().into()
@@ -370,6 +464,10 @@ impl Drop for PassReservation {
 #[derive(Clone)]
 pub struct AllocationContext(Arc<PassState>);
 impl AllocationContext {
+    /// Borrow warm permission only; no promise issuance, allocation or lock.
+    pub(crate) fn operation_context(&self) -> OperationContext<'_> {
+        OperationContext(OperationPermission::Supplied(self))
+    }
     pub fn domain_key(&self) -> DomainKey {
         DomainKey(self.0.domain.clone())
     }
@@ -378,7 +476,7 @@ impl AllocationContext {
     /// `take` remains the authoritative serialized issuance boundary on misses.
     pub(crate) fn check_open(&self) -> Result<()> {
         if self.0.closed.load(Ordering::Acquire) {
-            Err(AdmissionError::Cancelled)
+            Err(AllocationError::Cancelled)
         } else {
             Ok(())
         }
@@ -389,12 +487,48 @@ impl AllocationContext {
             .promise
             .lock()
             .as_mut()
-            .ok_or(AdmissionError::Cancelled)?
+            .ok_or(AllocationError::Cancelled)?
             .split(upper_bound)?;
         Ok(AllocationTicket {
             promise: Some(promise),
             parent: Arc::downgrade(&self.0),
         })
+    }
+}
+
+/// Borrowed warm-reuse permission. This is NOT a numerical promise or an
+/// execution lease: supplied cancellation may follow a successful observation.
+/// No take/reserve/owner clone exists. Actual cold misses still issue from the
+/// authoritative same-account AllocationContext outside native/engine guards.
+/// Never store this borrow in catalog/native cleanup captures.
+pub(crate) struct OperationContext<'a>(OperationPermission<'a>);
+enum OperationPermission<'a> {
+    Supplied(&'a AllocationContext),
+    DefaultNamespace(&'a ModelDomain),
+}
+impl OperationContext<'_> {
+    /// # Safety
+    /// `domain` is borrowed from the actual DEFAULT AllocationNamespace whose
+    /// lifetime/root custody spans this operation. Its model-domain field is
+    /// None. Never use this route for a supplied/admitted namespace or to bypass
+    /// an active supplied context's cancellation/origin checks. This permission
+    /// authorizes no allocation, uninitialized read, raw escape or native use.
+    pub(crate) unsafe fn default_namespace(domain: &ModelDomain) -> OperationContext<'_> {
+        OperationContext(OperationPermission::DefaultNamespace(domain))
+    }
+    pub(crate) fn domain_key(&self) -> DomainKey {
+        match self.0 {
+            OperationPermission::Supplied(context) => context.domain_key(),
+            OperationPermission::DefaultNamespace(domain) => domain.key(),
+        }
+    }
+    pub(crate) fn check_open(&self) -> Result<()> {
+        match self.0 {
+            OperationPermission::Supplied(context) => context.check_open(),
+            // Default has no pass to cancel. Namespace borrow/root and the
+            // actual capsule/Commands failure checks still gate every attempt.
+            OperationPermission::DefaultNamespace(_) => Ok(()),
+        }
     }
 }
 
@@ -420,6 +554,20 @@ impl AllocationTicket {
     /// remainder returns on drop; an over-bound commit fails without charging.
     pub fn commit(mut self, actual: usize) -> Result<PhysicalCharge> {
         self.try_commit(actual)
+    }
+    /// Cold requested-layout path. The prediction includes actual payload plus
+    /// requested_charge_control_bytes BEFORE allocation. A refusal keeps this
+    /// ticket live; destroy unchargeable storage before returning its promise.
+    pub(crate) fn try_commit_with_control(&mut self, actual: usize) -> Result<PhysicalCharge> {
+        Ok(PhysicalCharge(
+            self.promise
+                .as_mut()
+                .expect("live ticket")
+                .commit_with_control(actual)?,
+        ))
+    }
+    pub(crate) fn requested_charge_control_bytes() -> Result<usize> {
+        core::PhysicalCharge::requested_control_bytes().map_err(AllocationError::from)
     }
     /// Transfer demand without consuming the ticket on refusal. Native callers
     /// must destroy an unchargeable raw allocation BEFORE dropping this ticket.
@@ -484,7 +632,7 @@ mod tests {
         for (container, payer) in [(&origin, &foreign), (&origin, &legacy), (&legacy, &origin)] {
             assert_eq!(
                 container.validate_reuse(payer),
-                Err(AdmissionError::ReuseDomainMismatch {
+                Err(AllocationError::ReuseDomainMismatch {
                     expected: container.category(),
                     actual: payer.category(),
                 })
@@ -504,17 +652,17 @@ mod tests {
         assert!(ring.validate_reuse(&7, &payer).is_ok());
         assert_eq!(
             ring.validate_reuse(&8, &payer),
-            Err(AdmissionError::DifferentAllocationDevice)
+            Err(AllocationError::DifferentAllocationDevice)
         );
         assert!(matches!(
             ring.validate_reuse(&7, &AllocationOrigin::Legacy),
-            Err(AdmissionError::ReuseDomainMismatch { .. })
+            Err(AllocationError::ReuseDomainMismatch { .. })
         ));
         let legacy = AllocationAffinity::bound(7u32, AllocationOrigin::Legacy);
         assert!(legacy.validate_reuse(&7, &AllocationOrigin::Legacy).is_ok());
         assert_eq!(
             AllocationAffinity::<u32>::clock_only().validate_reuse(&7, &AllocationOrigin::Legacy),
-            Err(AdmissionError::UnboundAllocationDevice)
+            Err(AllocationError::UnboundAllocationDevice)
         );
         assert_eq!(account.snapshot(), AccountSnapshot::default());
     }
@@ -547,12 +695,12 @@ mod tests {
                     assert_eq!(domain.snapshot().pending, 8);
                     drop(ticket);
                 }
-                Err(e) => assert_eq!(e, AdmissionError::Cancelled),
+                Err(e) => assert_eq!(e, AllocationError::Cancelled),
             }
             worker.join().unwrap();
         });
-        assert_eq!(context.check_open(), Err(AdmissionError::Cancelled));
-        assert!(matches!(context.take(0), Err(AdmissionError::Cancelled)));
+        assert_eq!(context.check_open(), Err(AllocationError::Cancelled));
+        assert!(matches!(context.take(0), Err(AllocationError::Cancelled)));
         assert_eq!(
             domain.snapshot(),
             AccountSnapshot {
@@ -594,7 +742,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         drop(pass);
         assert_eq!(context.domain_key(), key);
-        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
         let charge = ticket.commit(4).unwrap();
         assert_eq!(charge.domain_key(), key);
         drop(a);
@@ -612,7 +760,7 @@ mod tests {
         default.configure(None).unwrap();
         assert_eq!(
             default.configure(Some(8)),
-            Err(AdmissionError::ConfigurationConflict {
+            Err(AllocationError::ConfigurationConflict {
                 active: None,
                 requested: Some(8)
             })
@@ -649,20 +797,22 @@ mod tests {
         assert!(matches!(a.machine_status(), MachineStatus::Unadmitted));
         let pa = a.reserve(8).unwrap();
         let pb = b.reserve(8).unwrap();
-        assert!(matches!(
-            a.reserve(1),
-            Err(AdmissionError::Limit {
-                scope: LimitScope::Domain,
-                ..
+        assert_eq!(
+            a.reserve(1).err(),
+            Some(AllocationError::Refused {
+                requested: 1,
+                available: 0,
+                domain: RefusalDomain::Model,
             })
-        ));
-        assert!(matches!(
-            b.reserve(1),
-            Err(AdmissionError::Limit {
-                scope: LimitScope::Process,
-                ..
+        );
+        assert_eq!(
+            b.reserve(1).err(),
+            Some(AllocationError::Refused {
+                requested: 1,
+                available: 0,
+                domain: RefusalDomain::Process,
             })
-        ));
+        );
         let context = pa.context();
         let ticket = context.take(6).unwrap();
         let charge = ticket.commit(4).unwrap(); // two unused bytes rejoin the open pass
@@ -691,7 +841,7 @@ mod tests {
         assert_eq!(alias.bytes(), 4);
         drop(alias);
         assert_eq!(account.snapshot(), AccountSnapshot::default());
-        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
     }
 
     #[test]
@@ -706,7 +856,7 @@ mod tests {
         let (done, result) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             start.recv_timeout(Duration::from_secs(5)).unwrap();
-            done.send(matches!(context.take(1), Err(AdmissionError::Cancelled)))
+            done.send(matches!(context.take(1), Err(AllocationError::Cancelled)))
                 .unwrap();
             ticket.commit(3).unwrap()
         });
@@ -742,15 +892,19 @@ mod tests {
             left.as_mut()
                 .unwrap()
                 .rejoin(right.as_mut().unwrap())
-                .map_err(AdmissionError::from),
-            Err(AdmissionError::DifferentDomain)
+                .map_err(AllocationError::from),
+            Err(AllocationError::DifferentDomain)
         );
         drop(left);
         drop(right);
-        assert!(matches!(
-            pa.context().take(4).unwrap().commit(5),
-            Err(AdmissionError::PromiseTooSmall { .. })
-        ));
+        assert_eq!(
+            pa.context().take(4).unwrap().commit(5).err(),
+            Some(AllocationError::Refused {
+                requested: 5,
+                available: 4,
+                domain: RefusalDomain::Promise,
+            })
+        );
         assert_eq!(
             account.snapshot(),
             AccountSnapshot {

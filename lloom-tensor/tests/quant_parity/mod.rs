@@ -1368,15 +1368,19 @@ impl Matrix {
                         _ => unreachable!("a Metal tensor"),
                     };
                     let enc = md.command_encoder()?;
-                    lloom_tensor::kernels::call_quantized_dequant_rows_f16(
-                        md.device(),
-                        &enc,
-                        md.kernels(),
-                        d.into(),
-                        (n, k),
-                        w.q.metal_buffer()?,
-                        dst,
-                    )
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    unsafe {
+                        lloom_tensor::kernels::call_quantized_dequant_rows_f16(
+                            md.device(),
+                            &enc,
+                            md.kernels(),
+                            d.into(),
+                            (n, k),
+                            w.q.metal_buffer()?,
+                            dst,
+                        )
+                    }
                     .map_err(lloom_tensor::Error::wrap)?;
                     Ok(())
                 })?;
@@ -1491,25 +1495,29 @@ impl Matrix {
                     _ => unreachable!("a Metal tensor"),
                 };
                 let enc = md.command_encoder()?;
-                lloom_tensor::kernels::call_dequantize_kv(
-                    md.device(),
-                    &enc,
-                    md.kernels(),
-                    &m(&c),
-                    &m(&s),
-                    &m(&b),
-                    &m(&o),
-                    &params,
-                    heads,
-                    n_tok,
-                    dim,
-                    bits,
-                    if act == Act::F16 {
-                        SdpaDType::F16
-                    } else {
-                        SdpaDType::F32
-                    },
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    lloom_tensor::kernels::call_dequantize_kv(
+                        md.device(),
+                        &enc,
+                        md.kernels(),
+                        &m(&c),
+                        &m(&s),
+                        &m(&b),
+                        &m(&o),
+                        &params,
+                        heads,
+                        n_tok,
+                        dim,
+                        bits,
+                        if act == Act::F16 {
+                            SdpaDType::F16
+                        } else {
+                            SdpaDType::F32
+                        },
+                    )
+                }
                 .map_err(lloom_tensor::Error::wrap)?;
                 Ok(())
             })?;
@@ -1593,44 +1601,52 @@ impl Matrix {
                 let enc = md.command_encoder()?;
                 let q_shape = [1usize, hq, 1, dim];
                 if sel {
-                    lloom_tensor::kernels::call_sdpa_vector_quant_sel(
-                        md.device(),
-                        &enc,
-                        md.kernels(),
-                        0,
-                        &q_shape,
-                        &m(&q),
-                        &m(&kc_t),
-                        &m(&ks_t),
-                        &m(&kb_t),
-                        &m(&vc_t),
-                        &m(&vs_t),
-                        &m(&vb_t),
-                        &m(&out),
-                        &params,
-                        (&m(&sel_t), 0),
-                        bits,
-                        itype,
-                    )
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    unsafe {
+                        lloom_tensor::kernels::call_sdpa_vector_quant_sel(
+                            md.device(),
+                            &enc,
+                            md.kernels(),
+                            0,
+                            &q_shape,
+                            &m(&q),
+                            &m(&kc_t),
+                            &m(&ks_t),
+                            &m(&kb_t),
+                            &m(&vc_t),
+                            &m(&vs_t),
+                            &m(&vb_t),
+                            &m(&out),
+                            &params,
+                            (&m(&sel_t), 0),
+                            bits,
+                            itype,
+                        )
+                    }
                 } else {
-                    lloom_tensor::kernels::call_sdpa_vector_quant(
-                        md.device(),
-                        &enc,
-                        md.kernels(),
-                        0,
-                        &q_shape,
-                        &m(&q),
-                        &m(&kc_t),
-                        &m(&ks_t),
-                        &m(&kb_t),
-                        &m(&vc_t),
-                        &m(&vs_t),
-                        &m(&vb_t),
-                        &m(&out),
-                        &params,
-                        bits,
-                        itype,
-                    )
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    unsafe {
+                        lloom_tensor::kernels::call_sdpa_vector_quant(
+                            md.device(),
+                            &enc,
+                            md.kernels(),
+                            0,
+                            &q_shape,
+                            &m(&q),
+                            &m(&kc_t),
+                            &m(&ks_t),
+                            &m(&kb_t),
+                            &m(&vc_t),
+                            &m(&vs_t),
+                            &m(&vb_t),
+                            &m(&out),
+                            &params,
+                            bits,
+                            itype,
+                        )
+                    }
                 }
                 .map_err(lloom_tensor::Error::wrap)?;
                 Ok(())

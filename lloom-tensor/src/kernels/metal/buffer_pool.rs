@@ -243,7 +243,22 @@ impl GpuClock {
 /// Derefs to `Buffer`, so it substitutes for the `Arc<Buffer>` this replaces
 /// everywhere the buffer is read. It is shared through a [`BufferHandle`];
 /// the return happens when the final clone drops.
+enum PooledCleanup {
+    Legacy,
+    // Constructed only by the private PhysicalPreparation initializer, then
+    // moved directly into a preclaimed independently service-rooted header.
+    Rich {
+        pooled: bool,
+        generation: crate::allocation_physical_ready::UseGeneration,
+    },
+}
+pub(super) struct RichSidecars {
+    pooled: bool,
+    pool: Weak<PoolInner>,
+    residency: Option<Arc<super::ResidencySet>>,
+}
 pub struct PooledBuffer {
+    cleanup: PooledCleanup,
     /// `Option` only so `drop` can take ownership and hand the buffer back
     /// rather than destroying it. Always `Some` for a live handle.
     buffer: Option<Buffer>,
@@ -276,6 +291,102 @@ pub struct PooledBuffer {
 }
 
 impl PooledBuffer {
+    /// Cold/offguard preparation BEFORE sole physical receipt handoff. The
+    /// caller's genuine BufferPool borrow keeps the weak control nonfinal.
+    pub(super) fn rich_sidecars(
+        pool: Option<&BufferPool>,
+        residency: Option<Arc<super::ResidencySet>>,
+    ) -> RichSidecars {
+        RichSidecars {
+            pooled: pool.is_some(),
+            pool: pool.map_or_else(Weak::new, |pool| Arc::downgrade(&pool.inner)),
+            residency,
+        }
+    }
+    /// Actual rich C, never a legacy FreeNode. Reserve/prepare clones and all
+    /// other fallible work precede this constructor; native membership already
+    /// belongs to the allocation-local physical baseline.
+    /// # Safety
+    /// Move directly into the correct preclaimed rich header before publication.
+    /// Its Drop runs only under that HeaderRoot's sole cleanup authority after
+    /// alias closure + native cutoff, or initialized never-published abandonment.
+    /// The Primary Buffer must never be moved out or returned independently.
+    pub(super) unsafe fn rich_primary(
+        physical: super::physical_roles::PhysicalStrong<64>,
+        generation: crate::allocation_physical_ready::UseGeneration,
+        size: usize,
+        sidecars: RichSidecars,
+    ) -> Self {
+        let RichSidecars {
+            pooled,
+            pool,
+            residency,
+        } = sidecars;
+        Self {
+            cleanup: PooledCleanup::Rich { pooled, generation },
+            // SAFETY: the caller moves this private Primary directly into C.
+            buffer: Some(unsafe { Buffer::primary(physical) }),
+            size,
+            residency,
+            pool,
+            reservation: None, // Actual ledger stays in PhysicalAnchors.
+            hold: None, // ONLY terminal-counted route: all native+IO holders keep External pins.
+        }
+    }
+
+    /// Service-owned rich cleanup, not a producer callback or pool notification.
+    /// Alias closure and this generation's exact successful cutoff precede C.
+    /// Abandoned initialization has no published primary/native use and restores
+    /// its original eligibility only after C returns and sole A finishes.
+    fn cleanup_rich(
+        &self,
+        pooled: bool,
+        generation: crate::allocation_physical_ready::UseGeneration,
+    ) {
+        let buffer = self.buffer();
+        super::upload_shadow::check_at_release(buffer);
+        // A private Primary cannot export a new alias here. This is baseline
+        // access only; exact generation/clock custody is bound by the initializer.
+        let physical = unsafe { buffer.physical_primary_unchecked() };
+        if let Some(epoch) = physical
+            .cleanup_epoch(generation)
+            .expect("sole rich cleanup generation")
+        {
+            super::late_bind::on_release(buffer, epoch);
+        }
+        if pooled {
+            // SAFETY: service ready predicate established every future/native
+            // holder closed, this generation's cutoff completed, or no publish.
+            unsafe { super::poison::poison_buffer(buffer) };
+            // Preserve the device-visible free sentinel using this actual
+            // pool's LIVE setting, not a captured birth-time byte. No new
+            // strong pool edge exists in physical C/A; this weak lives in rich
+            // C only and its final control release is host-service custody.
+            #[cfg(feature = "fuzzing")]
+            if let Some(pool) = self.pool.upgrade() {
+                let poison = pool.free_poison.load(Ordering::Relaxed);
+                if poison & 0x100 != 0 && !buffer.is_view() {
+                    // SAFETY: the same sole service C cleanup/native terminal
+                    // and future-use closure required by the poison above.
+                    // Primary baseline access covers exactly this allocation.
+                    unsafe {
+                        std::ptr::write_bytes(buffer.contents(), poison as u8, buffer.length());
+                    }
+                }
+            }
+        } else {
+            if let Some(set) = &self.residency {
+                // Baseline member cleanup is host-owned; no namespace remove_all.
+                set.remove_deferred(buffer);
+            }
+            // SAFETY: same cutoff/abandonment proof, before native baseline free.
+            unsafe { super::poison::unpoison_buffer(buffer) };
+        }
+        // Do not move Primary into legacy pool/hold. Field Drop publishes only
+        // its physical strong decrement; independently rooted A still retains
+        // raw/member/charge/ledger until C succeeds and eligibility is published.
+    }
+
     /// A handle with no pool behind it: dropping it frees the buffer instead
     /// of offering it for reuse.
     ///
@@ -283,6 +394,7 @@ impl PooledBuffer {
     /// which must not participate in reuse still get the same handle type.
     pub fn unpooled(buffer: Buffer, size: usize) -> Self {
         Self {
+            cleanup: PooledCleanup::Legacy,
             buffer: Some(buffer),
             size,
             pool: Weak::new(),
@@ -300,6 +412,7 @@ impl PooledBuffer {
         residency: Arc<super::ResidencySet>,
     ) -> Self {
         Self {
+            cleanup: PooledCleanup::Legacy,
             buffer: Some(buffer),
             size,
             pool: Weak::new(),
@@ -372,6 +485,10 @@ impl Drop for PooledBuffer {
     /// `Arc<Buffer>` -- except that now it is a notification rather than a
     /// state to be discovered later by a scan.
     fn drop(&mut self) {
+        if let PooledCleanup::Rich { pooled, generation } = self.cleanup {
+            self.cleanup_rich(pooled, generation);
+            return;
+        }
         let Some(buffer) = self.buffer.take() else {
             return;
         };
@@ -427,151 +544,325 @@ impl Drop for PooledBuffer {
 /// exists, since a weak handle to a node handed to another tenant would
 /// upgrade to that tenant's buffer; otherwise the buffer alone goes back and
 /// the node lives until its last weak handle drops.
-pub struct BufferHandle {
-    node: NonNull<HandleNode>,
+type RichHandle = crate::allocation_header_root::HeaderStrong<
+    PooledBuffer,
+    super::physical_roles::RecycleAnchor<64>,
+    64,
+>;
+type RichWeak = crate::allocation_header_root::HeaderWeak<
+    PooledBuffer,
+    super::physical_roles::RecycleAnchor<64>,
+    64,
+>;
+enum HandleKind {
+    Legacy(NonNull<HandleNode>),
+    Rich(RichHandle),
 }
-
+enum WeakHandleKind {
+    Legacy(NonNull<HandleNode>),
+    Rich(RichWeak),
+}
+pub struct BufferHandle {
+    kind: HandleKind,
+}
 struct HandleNode {
     strong: AtomicUsize,
-    /// Weak handles, plus one the strong handles hold between them.
     weak: AtomicUsize,
-    /// Dropped by hand: a node that goes back to its pool keeps its value.
     value: ManuallyDrop<PooledBuffer>,
 }
-
-/// A weak [`BufferHandle`]: it keeps nothing alive, and upgrades while a
-/// strong handle exists.
 pub struct WeakBufferHandle {
-    node: NonNull<HandleNode>,
+    kind: WeakHandleKind,
 }
-
-// SAFETY: a handle shares a `PooledBuffer` across threads exactly as
-// `BufferHandle` did, and its counts are atomics; `PooledBuffer` is
-// `Send + Sync` (asserted below), so the bounds are `Arc`'s.
+// SAFETY: Legacy preserves the existing sole-counted-node protocol. Rich owns
+// an inseparable HeaderStrong with Send+Sync PooledBuffer C and trusted engine A;
+// only atomic count/publication occurs on producer Drop. HeaderRoot retains C
+// and A through actual service detachment, including foreign weak holders.
 unsafe impl Send for BufferHandle {}
 unsafe impl Sync for BufferHandle {}
-// SAFETY: as above; a weak handle only touches the counts until it upgrades.
+// SAFETY: both variants touch metadata only until a genuine counted upgrade;
+// a rich old weak cannot expose replacement C even when its backing is reused.
 unsafe impl Send for WeakBufferHandle {}
 unsafe impl Sync for WeakBufferHandle {}
-
 const _: () = {
     const fn send_sync<T: Send + Sync>() {}
     send_sync::<PooledBuffer>();
 };
-
 impl BufferHandle {
-    /// One strong handle to `value`, in a fresh node.
     pub fn new(value: PooledBuffer) -> Self {
+        // Public compatibility constructor never receives a private rich C.
         let node = Box::new(HandleNode {
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
             value: ManuallyDrop::new(value),
         });
         Self {
-            node: NonNull::from(Box::leak(node)),
+            kind: HandleKind::Legacy(NonNull::from(Box::leak(node))),
         }
     }
-
+    pub(super) fn from_rich(header: RichHandle) -> Self {
+        Self {
+            kind: HandleKind::Rich(header),
+        }
+    }
+    fn legacy_node(&self) -> NonNull<HandleNode> {
+        match self.kind {
+            HandleKind::Legacy(node) => node,
+            HandleKind::Rich(_) => unreachable!("rich header never joins legacy FreeNode"),
+        }
+    }
     fn inner(&self) -> &HandleNode {
-        // SAFETY: a strong handle keeps its node and value alive.
-        unsafe { self.node.as_ref() }
+        // SAFETY: private legacy callers own a strong or exclusively parked node.
+        unsafe { self.legacy_node().as_ref() }
     }
-
-    /// Whether `a` and `b` are handles to one buffer.
+    fn value(&self) -> &PooledBuffer {
+        match &self.kind {
+            HandleKind::Legacy(_) => &self.inner().value,
+            HandleKind::Rich(header) => header.captures(),
+        }
+    }
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        a.node == b.node
+        match (&a.kind, &b.kind) {
+            (HandleKind::Legacy(a), HandleKind::Legacy(b)) => a == b,
+            (HandleKind::Rich(a), HandleKind::Rich(b)) => RichHandle::same(a, b),
+            _ => false,
+        }
     }
-
-    /// The shared value's address, stable for as long as a handle exists.
     pub fn as_ptr(this: &Self) -> *const PooledBuffer {
-        &*this.inner().value as *const PooledBuffer
+        this.value()
     }
-
     pub fn strong_count(this: &Self) -> usize {
-        this.inner().strong.load(Ordering::Relaxed)
+        match &this.kind {
+            HandleKind::Legacy(_) => this.inner().strong.load(Ordering::Relaxed),
+            HandleKind::Rich(header) => header.strong_count(),
+        }
     }
-
+    /// Counted metadata only, never native allocation or admission failure.
+    pub fn try_clone(&self) -> Result<Self, crate::memory_admission::AllocationError> {
+        match &self.kind {
+            HandleKind::Legacy(node) => {
+                try_increment_handle_count(&self.inner().strong)?;
+                Ok(Self {
+                    kind: HandleKind::Legacy(*node),
+                })
+            }
+            HandleKind::Rich(header) => Ok(Self::from_rich(
+                header
+                    .try_clone()
+                    .map_err(crate::memory_admission::AllocationError::from)?,
+            )),
+        }
+    }
+    /// Fallible metadata count acquisition, not allocation admission.
+    pub fn try_downgrade(
+        this: &Self,
+    ) -> Result<WeakBufferHandle, crate::memory_admission::AllocationError> {
+        match &this.kind {
+            HandleKind::Legacy(node) => {
+                try_increment_handle_count(&this.inner().weak)?;
+                Ok(WeakBufferHandle {
+                    kind: WeakHandleKind::Legacy(*node),
+                })
+            }
+            HandleKind::Rich(header) => Ok(WeakBufferHandle {
+                kind: WeakHandleKind::Rich(
+                    header
+                        .downgrade()
+                        .map_err(crate::memory_admission::AllocationError::from)?,
+                ),
+            }),
+        }
+    }
     pub fn downgrade(this: &Self) -> WeakBufferHandle {
-        this.inner().weak.fetch_add(1, Ordering::Relaxed);
-        WeakBufferHandle { node: this.node }
+        match &this.kind {
+            HandleKind::Legacy(node) => {
+                this.inner().weak.fetch_add(1, Ordering::Relaxed);
+                WeakBufferHandle {
+                    kind: WeakHandleKind::Legacy(*node),
+                }
+            }
+            HandleKind::Rich(header) => WeakBufferHandle {
+                // Checked count/invariant refusal only; no quota/capacity/native
+                // operation occurs, and refused CAS changes no owning count.
+                kind: WeakHandleKind::Rich(header.downgrade().expect("rich weak count exhausted")),
+            },
+        }
     }
 }
-
 impl Clone for BufferHandle {
     fn clone(&self) -> Self {
-        let old = self.inner().strong.fetch_add(1, Ordering::Relaxed);
-        if old > isize::MAX as usize {
-            std::process::abort();
+        match &self.kind {
+            HandleKind::Legacy(node) => {
+                let old = self.inner().strong.fetch_add(1, Ordering::Relaxed);
+                if old > isize::MAX as usize {
+                    std::process::abort();
+                }
+                Self {
+                    kind: HandleKind::Legacy(*node),
+                }
+            }
+            // Checked panic preserves the public trait shape; refusal is
+            // metadata-only, leaves the original valid, and never aborts.
+            HandleKind::Rich(_) => self.try_clone().expect("rich strong count exhausted"),
         }
-        Self { node: self.node }
     }
 }
-
 impl std::ops::Deref for BufferHandle {
     type Target = PooledBuffer;
-
     fn deref(&self) -> &PooledBuffer {
-        &self.inner().value
+        self.value()
     }
 }
-
 impl AsRef<Buffer> for BufferHandle {
     fn as_ref(&self) -> &Buffer {
-        self.inner().value.buffer()
+        self.value().buffer()
     }
 }
-
 impl std::fmt::Debug for BufferHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&*self.inner().value, f)
+        self.value().fmt(f)
     }
 }
-
 impl Drop for BufferHandle {
     fn drop(&mut self) {
+        let HandleKind::Legacy(node) = self.kind else {
+            return;
+        };
         if self.inner().strong.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        // Every other strong handle's use of the value happens before this.
         fence(Ordering::Acquire);
-        // SAFETY: that was the last strong handle, so the value is ours.
-        unsafe { HandleNode::last_strong_dropped(self.node) }
+        // SAFETY: same legacy last-strong ownership as the original mechanism.
+        unsafe { HandleNode::last_strong_dropped(node) }
+        // Rich fields instead auto-Drop HeaderStrong once; no C move/destruction.
     }
 }
-
 impl WeakBufferHandle {
-    /// A strong handle, if one still exists.
-    pub fn upgrade(&self) -> Option<BufferHandle> {
-        // SAFETY: a weak handle keeps its node allocated.
-        let strong = unsafe { &self.node.as_ref().strong };
-        let mut n = strong.load(Ordering::Relaxed);
-        loop {
-            if n == 0 {
-                return None;
+    /// Expiration is Ok(None); refusal is Err, never disguised as expiration.
+    pub fn try_upgrade(
+        &self,
+    ) -> Result<Option<BufferHandle>, crate::memory_admission::AllocationError> {
+        match &self.kind {
+            WeakHandleKind::Rich(header) => header
+                .upgrade()
+                .map(|h| h.map(BufferHandle::from_rich))
+                .map_err(Into::into),
+            WeakHandleKind::Legacy(node) => {
+                // SAFETY: this genuine weak holds the original node allocation.
+                let strong = unsafe { &node.as_ref().strong };
+                let mut n = strong.load(Ordering::Relaxed);
+                loop {
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    let next = n
+                        .checked_add(1)
+                        .filter(|n| *n <= isize::MAX as usize)
+                        .ok_or(crate::memory_admission::AllocationError::CountExhausted)?;
+                    match strong.compare_exchange_weak(
+                        n,
+                        next,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Ok(Some(BufferHandle {
+                                kind: HandleKind::Legacy(*node),
+                            }))
+                        }
+                        Err(seen) => n = seen,
+                    }
+                }
             }
-            match strong.compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return Some(BufferHandle { node: self.node }),
-                Err(seen) => n = seen,
+        }
+    }
+    pub fn try_clone(&self) -> Result<Self, crate::memory_admission::AllocationError> {
+        match &self.kind {
+            WeakHandleKind::Rich(header) => Ok(Self {
+                kind: WeakHandleKind::Rich(
+                    header
+                        .try_clone()
+                        .map_err(crate::memory_admission::AllocationError::from)?,
+                ),
+            }),
+            WeakHandleKind::Legacy(node) => {
+                // SAFETY: this genuine weak roots count metadata through CAS.
+                try_increment_handle_count(&unsafe { node.as_ref() }.weak)?;
+                Ok(Self {
+                    kind: WeakHandleKind::Legacy(*node),
+                })
+            }
+        }
+    }
+    pub fn upgrade(&self) -> Option<BufferHandle> {
+        match &self.kind {
+            WeakHandleKind::Rich(header) => header
+                .upgrade()
+                .expect("rich weak upgrade count")
+                .map(BufferHandle::from_rich),
+            WeakHandleKind::Legacy(node) => {
+                // SAFETY: a legacy weak keeps metadata allocated.
+                let strong = unsafe { &node.as_ref().strong };
+                let mut n = strong.load(Ordering::Relaxed);
+                loop {
+                    if n == 0 {
+                        return None;
+                    }
+                    match strong.compare_exchange_weak(
+                        n,
+                        n + 1,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return Some(BufferHandle {
+                                kind: HandleKind::Legacy(*node),
+                            })
+                        }
+                        Err(seen) => n = seen,
+                    }
+                }
             }
         }
     }
 }
-
 impl Clone for WeakBufferHandle {
     fn clone(&self) -> Self {
-        // SAFETY: a weak handle keeps its node allocated.
-        unsafe { self.node.as_ref() }
-            .weak
-            .fetch_add(1, Ordering::Relaxed);
-        Self { node: self.node }
+        match &self.kind {
+            WeakHandleKind::Legacy(node) => {
+                // SAFETY: existing counted legacy weak owns this increment.
+                unsafe { node.as_ref() }
+                    .weak
+                    .fetch_add(1, Ordering::Relaxed);
+                Self {
+                    kind: WeakHandleKind::Legacy(*node),
+                }
+            }
+            WeakHandleKind::Rich(header) => Self {
+                kind: WeakHandleKind::Rich(header.try_clone().expect("rich weak count exhausted")),
+            },
+        }
+    }
+}
+impl Drop for WeakBufferHandle {
+    fn drop(&mut self) {
+        if let WeakHandleKind::Legacy(node) = self.kind {
+            // SAFETY: same legacy counted weak release; Rich auto-Drops once.
+            unsafe { HandleNode::drop_weak(node) }
+        }
     }
 }
 
-impl Drop for WeakBufferHandle {
-    fn drop(&mut self) {
-        // SAFETY: this weak handle's share of the count is what it gives up.
-        unsafe { HandleNode::drop_weak(self.node) }
-    }
+/// New fallible legacy helper only. Existing legacy infallible methods keep
+/// their incumbent operations; no ordinary allocation/admission error enters here.
+fn try_increment_handle_count(
+    count: &AtomicUsize,
+) -> Result<(), crate::memory_admission::AllocationError> {
+    count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            n.checked_add(1).filter(|n| *n <= isize::MAX as usize)
+        })
+        .map(|_| ())
+        .map_err(|_| crate::memory_admission::AllocationError::CountExhausted)
 }
 
 impl HandleNode {
@@ -638,6 +929,7 @@ impl FreeNode {
         reservation: Option<super::ledger::Reservation>,
     ) -> Self {
         let handle = BufferHandle::new(PooledBuffer {
+            cleanup: PooledCleanup::Legacy,
             buffer: Some(buffer),
             size,
             residency: None,
@@ -645,7 +937,7 @@ impl FreeNode {
             pool,
             hold: None,
         });
-        let node = handle.node;
+        let node = handle.legacy_node();
         std::mem::forget(handle);
         // SAFETY: the node was just made with one strong handle, now given up
         // without running its drop.
@@ -674,7 +966,9 @@ impl FreeNode {
         // SAFETY: exclusively ours until returned; the handle is published to
         // other threads only through a synchronising transfer.
         unsafe { node.as_ref() }.strong.store(1, Ordering::Relaxed);
-        BufferHandle { node }
+        BufferHandle {
+            kind: HandleKind::Legacy(node),
+        }
     }
 
     /// Free the node, keeping its buffer (for a caller that destroys it).
@@ -1290,6 +1584,18 @@ pub struct ResidualExceeded {
     pub planned: usize,
 }
 
+/// The residual's refusal as the shared allocation error: what the request
+/// asked for against what the residual had left (`DESIGN.md` §9.5k).
+impl From<ResidualExceeded> for crate::memory_admission::AllocationError {
+    fn from(e: ResidualExceeded) -> Self {
+        Self::Refused {
+            requested: e.requested,
+            available: e.limit.saturating_sub(e.unplanned),
+            domain: crate::memory_admission::RefusalDomain::Budget,
+        }
+    }
+}
+
 impl std::fmt::Display for ResidualExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gb = |b: usize| b as f64 / 1e9;
@@ -1705,6 +2011,24 @@ impl PoolState {
     /// The lookup half of [`BufferPool::acquire`]: a buffer of at least
     /// `size` bytes out of the free list, with the counters for it, or `None`.
     fn take(&mut self, size: usize) -> Option<(FreeNode, usize)> {
+        self.take_for_origin(size, None)
+    }
+    fn take_for_origin(
+        &mut self,
+        size: usize,
+        expected: Option<&crate::memory_admission::AllocationOrigin>,
+    ) -> Option<(FreeNode, usize)> {
+        let eligible = |node: &FreeNode| {
+            expected.is_none_or(|expected| {
+                let actual = node
+                    .buffer()
+                    .allocation_owner()
+                    .map_or(crate::memory_admission::AllocationOrigin::Legacy, |owner| {
+                        crate::memory_admission::AllocationOrigin::Domain(owner.domain_key())
+                    });
+                expected.validate_reuse(&actual).is_ok()
+            })
+        };
         self.counters.lookups += 1;
 
         // Exact hit. Checked separately from the range query below because it
@@ -1712,7 +2036,18 @@ impl PoolState {
         // -- and because an exact match is optimal, so there is nothing to gain
         // by looking further.
         self.counters.buckets_probed += 1;
-        let found = self.pop_free(size).map(|n| (n, size));
+        // Bounded top-of-bucket check BEFORE removing eligibility or hit stats.
+        // A mismatch remains reserved/free for its rightful origin, never used
+        // as another payer's credit. Do not scan a mixed bucket on decode.
+        let exact_eligible = self
+            .free
+            .get(&size)
+            .and_then(|b| b.nodes.last())
+            .is_some_and(&eligible);
+        let found = exact_eligible
+            .then(|| self.pop_free(size))
+            .flatten()
+            .map(|n| (n, size));
 
         // Otherwise the smallest bucket that can satisfy the request. One
         // ordered probe: `range` starts at the first key > size and stops.
@@ -1738,7 +2073,13 @@ impl PoolState {
                     .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
                     .next()
                     .map(|(k, _)| *k)
-                    .filter(|k| bucket_admissible(size, *k, bound));
+                    .filter(|k| bucket_admissible(size, *k, bound))
+                    .filter(|k| {
+                        self.free
+                            .get(k)
+                            .and_then(|b| b.nodes.last())
+                            .is_some_and(&eligible)
+                    });
                 let next = candidate.and_then(|k| self.pop_free(k).map(|n| (n, k)));
                 if next.is_none() && bound.is_some() {
                     // Only when a candidate existed and the bound is what
@@ -1749,7 +2090,7 @@ impl PoolState {
                         .free
                         .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
                         .next()
-                        .is_some();
+                        .is_some_and(|(k, _)| !bucket_admissible(size, *k, bound));
                     if had_candidate {
                         self.counters.oversize_declined += 1;
                     }
@@ -2169,6 +2510,21 @@ impl BufferPool {
         &self,
         size: usize,
     ) -> Result<BufferHandle, AllocationMiss> {
+        self.acquire_for_origin(size, None)
+    }
+    /// Engine-only charged native affinity; legacy public pool API unchanged.
+    pub(crate) fn acquire_for_allocation_in(
+        &self,
+        size: usize,
+        expected: &crate::memory_admission::AllocationOrigin,
+    ) -> Result<BufferHandle, AllocationMiss> {
+        self.acquire_for_origin(size, Some(expected))
+    }
+    fn acquire_for_origin(
+        &self,
+        size: usize,
+        expected: Option<&crate::memory_admission::AllocationOrigin>,
+    ) -> Result<BufferHandle, AllocationMiss> {
         let (found, miss, evicted) = {
             let mut state = self.inner.state.lock(Side::Host);
             let evicted = self.inner.drain_locked(&mut state);
@@ -2176,7 +2532,7 @@ impl BufferPool {
             let found = if reuse_disabled {
                 None
             } else {
-                state.take(size)
+                state.take_for_origin(size, expected)
             };
             let pending_reuse = found.is_none()
                 && !reuse_disabled
@@ -2364,6 +2720,7 @@ impl BufferPool {
             trace_allocation(size, &why);
         }
         BufferHandle::new(PooledBuffer {
+            cleanup: PooledCleanup::Legacy,
             buffer: Some(buffer),
             size,
             pool: Arc::downgrade(&self.inner),
@@ -2410,6 +2767,26 @@ impl BufferPool {
         miss: AllocationMiss,
     ) -> BufferHandle {
         self.adopt_requesting_at_miss(allocation, miss.requested, allocated, Some(miss))
+    }
+
+    /// Cold incoming native custody is validated BEFORE pool counters mutate.
+    /// Refusal drops the intact allocation off all pool guards. Range-managed
+    /// rich caller must retain its own rejected custody instead; not enabled here.
+    pub(crate) fn adopt_after_miss_in(
+        &self,
+        allocation: super::backing::Allocation,
+        allocated: usize,
+        miss: AllocationMiss,
+        expected: &crate::memory_admission::AllocationOrigin,
+    ) -> Result<BufferHandle, crate::memory_admission::AllocationError> {
+        let actual = allocation
+            .buffer
+            .allocation_owner()
+            .map_or(crate::memory_admission::AllocationOrigin::Legacy, |owner| {
+                crate::memory_admission::AllocationOrigin::Domain(owner.domain_key())
+            });
+        expected.validate_reuse(&actual)?;
+        Ok(self.adopt_after_miss(allocation, allocated, miss))
     }
 
     fn adopt_requesting_at_miss(
@@ -3801,7 +4178,7 @@ mod tests {
         // matters is that the same MTLBuffer came back.
         fn metal_id(b: &PooledBuffer) -> usize {
             let raw: &Buffer = b;
-            raw.as_ref() as *const _ as *const () as usize
+            raw.raw_ptr() as usize
         }
 
         let first = alloc(&pool, &dev, 2048);
@@ -4941,7 +5318,9 @@ mod contention_tests {
         let b = dev.allocate_buffer(4096).expect("allocation");
         {
             let mut blit = dev.blit_command_encoder().expect("encoder");
-            blit.fill_buffer(&b, (0, 4096), 0);
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { blit.fill_buffer(&b, (0, 4096), 0) };
         }
         drop(b);
         let census = dev.pool_contention();

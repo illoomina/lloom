@@ -44,6 +44,7 @@ impl Snapshot {
                 return Err(Refusal::Limit {
                     scope,
                     limit,
+                    requested: bytes,
                     requested_total: total,
                 });
             }
@@ -64,15 +65,17 @@ pub(crate) enum Scope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     Overflow,
+    UnsupportedLayout,
     DifferentDomain,
     ConfigurationConflict {
         active: Option<usize>,
         requested: Option<usize>,
     },
-    Machine(String),
+    Machine(crate::memory_accounting_machine::MachineRefusal),
     Limit {
         scope: Scope,
         limit: usize,
+        requested: usize,
         requested_total: usize,
     },
     PromiseTooSmall {
@@ -139,9 +142,11 @@ impl ProcessAccount {
                 let total = state.total.total()?;
                 if let Some(limit) = requested {
                     if total > limit {
+                        // Adopting the cap admits the existing demand whole.
                         return Err(Refusal::Limit {
                             scope: Scope::Process,
                             limit,
+                            requested: total,
                             requested_total: total,
                         });
                     }
@@ -240,6 +245,12 @@ impl Domain {
         self.0.account.state.lock().domains[&self.0.id]
     }
 
+    /// Fixed nonblocking unit-test observation from the exact allocator hook.
+    #[cfg(test)]
+    pub(crate) fn test_account_snapshot_nonblocking(&self) -> Option<Snapshot> {
+        Some(self.0.account.state.try_lock()?.total)
+    }
+
     pub fn try_reserve(&self, bytes: usize) -> Result<Promise, Refusal> {
         self.reserve_with(bytes, |_| {})
     }
@@ -270,11 +281,7 @@ impl Domain {
         // Never hold the numeric mutex across registry/flock/host observation.
         // On failure, the unpublished promise drops and cancels its intent.
         if let Some(owner) = &self.0.machine {
-            promise.machine = Some(
-                owner
-                    .ensure_reserved(target)
-                    .map_err(|e| Refusal::Machine(e.to_string()))?,
-            );
+            promise.machine = Some(owner.ensure_reserved(target).map_err(Refusal::Machine)?);
         }
         Ok(promise)
     }
@@ -337,34 +344,51 @@ impl Promise {
     /// Transfer already promised bytes, without a second quota charge.
     /// Caller must reserve a verified upper bound BEFORE native allocation.
     pub fn commit(&mut self, bytes: usize) -> Result<PhysicalCharge, Refusal> {
-        if bytes > self.remaining {
+        self.commit_inner(bytes, 0)
+    }
+
+    /// Cold managed allocation path: its caller quotes this control block and
+    /// splits bytes + control BEFORE any owned allocation. Existing numeric-only
+    /// commit remains explicit; this is not retroactive universal enrollment.
+    pub(crate) fn commit_with_control(&mut self, bytes: usize) -> Result<PhysicalCharge, Refusal> {
+        let control = PhysicalCharge::requested_control_bytes()?;
+        self.commit_inner(bytes, control)
+    }
+
+    fn commit_inner(&mut self, bytes: usize, control: usize) -> Result<PhysicalCharge, Refusal> {
+        let charged = bytes.checked_add(control).ok_or(Refusal::Overflow)?;
+        if charged > self.remaining {
             return Err(Refusal::PromiseTooSmall {
                 remaining: self.remaining,
-                requested: bytes,
+                requested: charged,
             });
         }
         let mut state = self.domain.0.account.state.lock();
         let own = state.domains[&self.domain.0.id];
-        let committed = own.committed.checked_add(bytes).ok_or(Refusal::Overflow)?;
+        let committed = own
+            .committed
+            .checked_add(charged)
+            .ok_or(Refusal::Overflow)?;
         let total_committed = state
             .total
             .committed
-            .checked_add(bytes)
+            .checked_add(charged)
             .ok_or(Refusal::Overflow)?;
         state.domains.insert(
             self.domain.0.id,
             Snapshot {
-                pending: own.pending - bytes,
+                pending: own.pending - charged,
                 committed,
             },
         );
-        state.total.pending -= bytes;
+        state.total.pending -= charged;
         state.total.committed = total_committed;
-        self.remaining -= bytes;
-        Ok(PhysicalCharge(Arc::new(ChargeInner {
+        self.remaining -= charged;
+        Ok(PhysicalCharge(Some(Arc::new(ChargeInner {
             domain: self.domain.clone(),
             bytes,
-        })))
+            charged,
+        }))))
     }
 }
 
@@ -380,32 +404,56 @@ impl Drop for Promise {
 /// chunk's charge; returning a range is not physical release. Native command
 /// and residency owners must explicitly retain this token until retirement.
 #[derive(Clone)]
-pub(crate) struct PhysicalCharge(Arc<ChargeInner>);
+pub(crate) struct PhysicalCharge(Option<Arc<ChargeInner>>);
 
 impl PhysicalCharge {
+    pub(crate) fn requested_control_bytes() -> Result<usize, Refusal> {
+        crate::managed_layout::arc_requested_layout::<ChargeInner>()
+            .map(|layout| layout.size())
+            .map_err(|error| match error {
+                crate::managed_layout::ManagedLayoutError::Overflow => Refusal::Overflow,
+                crate::managed_layout::ManagedLayoutError::Unsupported => {
+                    Refusal::UnsupportedLayout
+                }
+            })
+    }
+    fn inner(&self) -> &Arc<ChargeInner> {
+        self.0.as_ref().expect("live charge")
+    }
     pub(crate) fn same_allocation(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(self.inner(), other.inner())
     }
-
     pub fn domain(&self) -> &Domain {
-        &self.0.domain
+        &self.inner().domain
     }
-
+    /// Logical payload bytes; the separately priced control is not native size.
     pub fn bytes(&self) -> usize {
-        self.0.bytes
+        self.inner().bytes
+    }
+}
+impl Drop for PhysicalCharge {
+    fn drop(&mut self) {
+        // ChargeInner has no Weak/raw-Arc acquisition/export path. Every clone
+        // uses this wrapper, hence every decrement uses into_inner. Exactly one
+        // racing final Drop gets the value; its Arc allocation is already freed
+        // (implicit weak removed) before ChargeInner refunds numeric demand.
+        // This remains host-only: final refund takes the existing account mutex.
+        if let Some(inner) = Arc::into_inner(self.0.take().expect("live charge")) {
+            drop(inner);
+        }
     }
 }
 
 struct ChargeInner {
     domain: Domain,
     bytes: usize,
+    charged: usize,
 }
-
 impl Drop for ChargeInner {
     fn drop(&mut self) {
         let mut state = self.domain.0.account.state.lock();
-        state.domains.get_mut(&self.domain.0.id).unwrap().committed -= self.bytes;
-        state.total.committed -= self.bytes;
+        state.domains.get_mut(&self.domain.0.id).unwrap().committed -= self.charged;
+        state.total.committed -= self.charged;
     }
 }
 
@@ -424,7 +472,9 @@ mod tests {
             a.try_reserve(1),
             Err(Refusal::Limit {
                 scope: Scope::Domain,
-                ..
+                limit: 4,
+                requested: 1,
+                requested_total: 5,
             })
         ));
         let pb = b.try_reserve(8).unwrap();
@@ -433,7 +483,9 @@ mod tests {
             b.try_reserve(1),
             Err(Refusal::Limit {
                 scope: Scope::Process,
-                ..
+                limit: 12,
+                requested: 1,
+                requested_total: 13,
             })
         ));
         assert_eq!(b.snapshot(), before);
@@ -766,7 +818,12 @@ mod machine_bridge_tests {
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(
             domain.try_reserve(20_000),
-            Err(Refusal::Machine(_))
+            Err(Refusal::Machine(
+                crate::memory_accounting_machine::MachineRefusal::Room {
+                    need: 19_990,
+                    room: 10_000
+                }
+            ))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(domain.snapshot(), Snapshot::default());
@@ -801,11 +858,13 @@ mod machine_bridge_tests {
             .domain_with_machine(None, MachineOwner::new(admitted).unwrap())
             .unwrap();
         let mut promise = domain.try_reserve(80).unwrap();
-        let err = match MachineOwner::new(alias()) {
-            Ok(_) => panic!("aliased holding was bound to a second domain"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("reuse that Domain"), "{err}");
+        assert!(
+            matches!(
+                MachineOwner::new(alias()),
+                Err(crate::memory_accounting_machine::MachineRefusal::Binding)
+            ),
+            "aliased holding was bound to a second domain"
+        );
         // Recovery 1: share the original domain, hence the same pending total.
         let same = domain.clone();
         let extra = same.try_reserve(20).unwrap();

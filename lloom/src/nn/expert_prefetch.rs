@@ -978,7 +978,8 @@ fn acquire_three(
     let mut got: Vec<(Option<usize>, BufferHandle)> = Vec::with_capacity(3);
     for src in planes {
         match ring.acquire(w.allocation.device(), src.plane_bytes) {
-            Ok((entry, buf)) if !buf.contents().is_null() => got.push((entry, buf)),
+            // SAFETY: the pointer is only compared with null.
+            Ok((entry, buf)) if !unsafe { buf.contents() }.is_null() => got.push((entry, buf)),
             other => {
                 if let Ok((entry, buf)) = &other {
                     ring.release(*entry, buf);
@@ -1292,7 +1293,9 @@ fn stage(w: &Shared, req: &Req) -> Result<Staged> {
                 .lock()
                 .acquire(w.allocation.device(), src.plane_bytes)
         })?;
-        let ptr = buf.contents();
+        // SAFETY: the ring hands out an entry only once the epoch that last
+        // read it has completed, and no command binds it until this read lands.
+        let ptr = unsafe { buf.contents() };
         if ptr.is_null() {
             lloom_tensor::bail!(
                 "the staging buffer has no CPU mapping ({} bytes)",

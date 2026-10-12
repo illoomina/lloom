@@ -362,41 +362,49 @@ fn run_slot(
         // arms differ only in what follows it.
         let gemv_dest = if arm == Arm::Fused { &out } else { &acc };
         if arm == Arm::Fused {
-            call_mlx_gemv_epilogue(
-                device,
-                &encoder,
-                kernels,
-                dtype,
-                (1, n_out, 1, k),
-                &[n_out * k, k, 1],
-                0,
-                &mat_buf,
-                &[k, 1, 1],
-                0,
-                &vec_buf,
-                gemv_dest,
-                ParamStyle::Split,
-                None,
-                GemvEpilogue::Residual,
-                Some((&res_buf, 0)),
-            )
+            // SAFETY: the example owns every buffer bound or mapped here and reads them
+            // only after waiting for the command buffer that writes them.
+            unsafe {
+                call_mlx_gemv_epilogue(
+                    device,
+                    &encoder,
+                    kernels,
+                    dtype,
+                    (1, n_out, 1, k),
+                    &[n_out * k, k, 1],
+                    0,
+                    &mat_buf,
+                    &[k, 1, 1],
+                    0,
+                    &vec_buf,
+                    gemv_dest,
+                    ParamStyle::Split,
+                    None,
+                    GemvEpilogue::Residual,
+                    Some((&res_buf, 0)),
+                )
+            }
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         } else {
-            call_mlx_gemv_with(
-                device,
-                &encoder,
-                kernels,
-                dtype,
-                (1, n_out, 1, k),
-                &[n_out * k, k, 1],
-                0,
-                &mat_buf,
-                &[k, 1, 1],
-                0,
-                &vec_buf,
-                gemv_dest,
-                ParamStyle::Split,
-            )
+            // SAFETY: the example owns every buffer bound or mapped here and reads them
+            // only after waiting for the command buffer that writes them.
+            unsafe {
+                call_mlx_gemv_with(
+                    device,
+                    &encoder,
+                    kernels,
+                    dtype,
+                    (1, n_out, 1, k),
+                    &[n_out * k, k, 1],
+                    0,
+                    &mat_buf,
+                    &[k, 1, 1],
+                    0,
+                    &vec_buf,
+                    gemv_dest,
+                    ParamStyle::Split,
+                )
+            }
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
 
@@ -409,23 +417,27 @@ fn run_slot(
             Arm::GemvPlusBaddIndep => Some((&spare_a, &spare_b, &spare_dst)),
         };
         if let Some((lhs, rhs, dst)) = second {
-            call_binary_contiguous(
-                device,
-                &encoder,
-                kernels,
-                badd_kernel,
-                elem_size,
-                n_out,
-                BufferOffset {
-                    buffer: lhs,
-                    offset_in_bytes: 0,
-                },
-                BufferOffset {
-                    buffer: rhs,
-                    offset_in_bytes: 0,
-                },
-                dst,
-            )
+            // SAFETY: the example owns every buffer bound or mapped here and reads them
+            // only after waiting for the command buffer that writes them.
+            unsafe {
+                call_binary_contiguous(
+                    device,
+                    &encoder,
+                    kernels,
+                    badd_kernel,
+                    elem_size,
+                    n_out,
+                    BufferOffset {
+                        buffer: lhs,
+                        offset_in_bytes: 0,
+                    },
+                    BufferOffset {
+                        buffer: rhs,
+                        offset_in_bytes: 0,
+                    },
+                    dst,
+                )
+            }
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         }
 
@@ -471,7 +483,9 @@ fn read_as_f32(
     len: usize,
     dtype: GemmDType,
 ) -> Vec<f32> {
-    let ptr = buffer.contents();
+    // SAFETY: the example owns every buffer bound or mapped here and reads them
+    // only after waiting for the command buffer that writes them.
+    let ptr = unsafe { buffer.contents() };
     // §11.5d / #454: the null check must survive the optimiser, and a bare
     // `assert!` on `contents()` is elided at `opt-level=1` with LTO off.
     assert!(

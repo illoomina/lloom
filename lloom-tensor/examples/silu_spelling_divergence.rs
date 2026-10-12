@@ -212,9 +212,11 @@ fn dispatch<T: Copy>(device: &Device, library: &Library, name: &str, input: &[T]
     let cb = queue.commandBuffer().expect("command buffer");
     let enc = cb.computeCommandEncoder().expect("compute encoder");
     enc.setComputePipelineState(pipeline.as_ref());
+    // SAFETY: both buffers are this function's and outlive the wait below;
+    // nothing else binds or writes them.
     unsafe {
-        enc.setBuffer_offset_atIndex(Some(inbuf.as_ref()), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(outbuf.as_ref()), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(inbuf.raw_unchecked()), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(outbuf.raw_unchecked()), 0, 1);
     }
     enc.dispatchThreads_threadsPerThreadgroup(
         MTLSize {
@@ -232,7 +234,8 @@ fn dispatch<T: Copy>(device: &Device, library: &Library, name: &str, input: &[T]
     cb.commit();
     unsafe { cb.waitUntilCompleted() };
 
-    let ptr = outbuf.contents() as *const T;
+    // SAFETY: Shared, `input.len()` elements, read after the wait above.
+    let ptr = unsafe { outbuf.contents() } as *const T;
     unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
 }
 

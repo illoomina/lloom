@@ -107,20 +107,24 @@ impl Rig {
             if let Some(t) = token {
                 self.gate_step(t, &enc);
             }
-            call_copy2d(
-                &self.device,
-                &enc,
-                &self.kernels,
-                copy2d::FLOAT,
-                &self.src,
-                &self.dst,
-                1,
-                N,
-                N,
-                N,
-                0,
-                0,
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_copy2d(
+                    &self.device,
+                    &enc,
+                    &self.kernels,
+                    copy2d::FLOAT,
+                    &self.src,
+                    &self.dst,
+                    1,
+                    N,
+                    N,
+                    N,
+                    0,
+                    0,
+                )
+            }
             .unwrap();
         }
         self.cmds.flush_and_wait_current().unwrap();
@@ -132,18 +136,22 @@ impl Rig {
         {
             let enc = self.cmds.command_encoder().unwrap();
             self.gate_step(token, &enc);
-            call_affine(
-                &self.device,
-                &enc,
-                &self.kernels,
-                "affine_f32",
-                4,
-                N,
-                BufferOffset::zero_offset(&self.src),
-                &self.dst,
-                mul,
-                add,
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_affine(
+                    &self.device,
+                    &enc,
+                    &self.kernels,
+                    "affine_f32",
+                    4,
+                    N,
+                    BufferOffset::zero_offset(&self.src),
+                    &self.dst,
+                    mul,
+                    add,
+                )
+            }
             .unwrap();
         }
         self.cmds.flush_and_wait_current().unwrap();
@@ -300,30 +308,34 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                     zero(&flag, 4);
                     {
                         let enc = cmds.command_encoder().unwrap();
-                        call_argmax_publish(
-                            &device,
-                            &enc,
-                            &kernels,
-                            kernel,
-                            BufferOffset::zero_offset(logits),
-                            n,
-                            BufferOffset {
-                                buffer: &slots,
-                                offset_in_bytes: 4,
-                            },
-                            BufferOffset {
-                                buffer: &slots,
-                                offset_in_bytes: 12,
-                            },
-                            BufferOffset::zero_offset(&eos),
-                            2,
-                            &flag,
-                            BufferOffset {
-                                buffer: &slots,
-                                offset_in_bytes: 20,
-                            },
-                            generation,
-                        )
+                        // SAFETY: the test owns every buffer bound or mapped here and reads its
+                        // results only after waiting for the command buffer that writes them.
+                        unsafe {
+                            call_argmax_publish(
+                                &device,
+                                &enc,
+                                &kernels,
+                                kernel,
+                                BufferOffset::zero_offset(logits),
+                                n,
+                                BufferOffset {
+                                    buffer: &slots,
+                                    offset_in_bytes: 4,
+                                },
+                                BufferOffset {
+                                    buffer: &slots,
+                                    offset_in_bytes: 12,
+                                },
+                                BufferOffset::zero_offset(&eos),
+                                2,
+                                &flag,
+                                BufferOffset {
+                                    buffer: &slots,
+                                    offset_in_bytes: 20,
+                                },
+                                generation,
+                            )
+                        }
                         .unwrap();
                     }
                     cmds.flush_and_wait_current().unwrap();
@@ -387,20 +399,24 @@ fn a_gated_shortconv_step_carries_its_state_through_an_eos() {
             if let Some(t) = gate_token {
                 rig.gate_step(t, &enc);
             }
-            call_shortconv_step(
-                &rig.device,
-                &enc,
-                &rig.kernels,
-                "shortconv_step_f32_k3",
-                (HIDDEN, HIDDEN, 0, 1),
-                BufferOffset::zero_offset(&b_in),
-                BufferOffset::zero_offset(&x_in),
-                BufferOffset::zero_offset(&c_in),
-                BufferOffset::zero_offset(&state_in),
-                BufferOffset::zero_offset(&weight),
-                &state_out,
-                &dst,
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_shortconv_step(
+                    &rig.device,
+                    &enc,
+                    &rig.kernels,
+                    "shortconv_step_f32_k3",
+                    (HIDDEN, HIDDEN, 0, 1),
+                    BufferOffset::zero_offset(&b_in),
+                    BufferOffset::zero_offset(&x_in),
+                    BufferOffset::zero_offset(&c_in),
+                    BufferOffset::zero_offset(&state_in),
+                    BufferOffset::zero_offset(&weight),
+                    &state_out,
+                    &dst,
+                )
+            }
             .unwrap();
         }
         rig.cmds.flush_and_wait_current().unwrap();
@@ -462,23 +478,27 @@ fn the_ring_stamp_writes_the_generation_and_nothing_else() {
     for generation in [1u32, 77, u32::MAX, 77] {
         {
             let enc = cmds.command_encoder().unwrap();
-            call_ring_stamp(
-                &device,
-                &enc,
-                &kernels,
-                BufferOffset {
-                    buffer: &step,
-                    offset_in_bytes: 12,
-                },
-                generation,
-                [
-                    BufferOffset::zero_offset(&cert),
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_ring_stamp(
+                    &device,
+                    &enc,
+                    &kernels,
                     BufferOffset {
-                        buffer: &cert,
-                        offset_in_bytes: 16,
+                        buffer: &step,
+                        offset_in_bytes: 12,
                     },
-                ],
-            )
+                    generation,
+                    [
+                        BufferOffset::zero_offset(&cert),
+                        BufferOffset {
+                            buffer: &cert,
+                            offset_in_bytes: 16,
+                        },
+                    ],
+                )
+            }
             .unwrap();
         }
         cmds.flush_and_wait_current().unwrap();
@@ -525,22 +545,26 @@ fn the_words_publish_copies_n_words_and_stamps_only_off_generation_0() {
             write_u32(&step, &[UNTOUCHED; 8]);
             {
                 let enc = cmds.command_encoder().unwrap();
-                call_words_publish(
-                    &device,
-                    &enc,
-                    &kernels,
-                    BufferOffset::zero_offset(&src),
-                    n,
-                    BufferOffset {
-                        buffer: &out,
-                        offset_in_bytes: 8,
-                    },
-                    BufferOffset {
-                        buffer: &step,
-                        offset_in_bytes: 12,
-                    },
-                    generation,
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_words_publish(
+                        &device,
+                        &enc,
+                        &kernels,
+                        BufferOffset::zero_offset(&src),
+                        n,
+                        BufferOffset {
+                            buffer: &out,
+                            offset_in_bytes: 8,
+                        },
+                        BufferOffset {
+                            buffer: &step,
+                            offset_in_bytes: 12,
+                        },
+                        generation,
+                    )
+                }
                 .unwrap();
             }
             cmds.flush_and_wait_current().unwrap();

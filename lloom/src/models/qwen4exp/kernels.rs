@@ -56,18 +56,22 @@ impl lloom_tensor::CustomOp1 for UnitLowerInverse {
             .with_size_for(elem_count, s.dtype())
             .with_label("unit_lower_inverse")
             .build()?;
-        lloom_tensor::kernels::call_unit_lower_inverse(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            batch,
-            n,
-            lloom_tensor::kernels::BufferOffset {
-                buffer: s.buffer(),
-                offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
-            },
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_unit_lower_inverse(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                batch,
+                n,
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: s.buffer(),
+                    offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
+                },
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -196,18 +200,22 @@ impl lloom_tensor::CustomOp2 for HcNorm {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("hc_norm")
             .build()?;
-        lloom_tensor::kernels::call_hc_norm(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_norm(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -333,26 +341,30 @@ impl lloom_tensor::CustomOp1 for HcMixA {
             Some((is_, il)) => metal_bo_of(is_, il),
             None => metal_bo_of(&ds, dl),
         };
-        lloom_tensor::kernels::call_hc_mix_a(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            lr,
-            if inj.is_some() { self.n } else { 0 },
-            self.eps,
-            self.scale,
-            metal_bo(s, l),
-            lloom_tensor::kernels::BufferOffset {
-                buffer: gs_m.buffer(),
-                offset_in_bytes: gl.start_offset() * 4,
-            },
-            w_down,
-            w_inject,
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_mix_a(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                lr,
+                if inj.is_some() { self.n } else { 0 },
+                self.eps,
+                self.scale,
+                metal_bo(s, l),
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: gs_m.buffer(),
+                    offset_in_bytes: gl.start_offset() * 4,
+                },
+                w_down,
+                w_inject,
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -414,19 +426,23 @@ impl lloom_tensor::CustomOp1 for HcMixB {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("hc_mix_b")
             .build()?;
-        lloom_tensor::kernels::call_hc_mix_b(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            self.lr,
-            1.0 / self.n as f32,
-            metal_bo(s, l),
-            metal_bo_of(&us, ul),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_mix_b(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                self.lr,
+                1.0 / self.n as f32,
+                metal_bo(s, l),
+                metal_bo_of(&us, ul),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -621,17 +637,21 @@ impl lloom_tensor::CustomOp2 for HcCollapse {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("hc_collapse")
             .build()?;
-        lloom_tensor::kernels::call_hc_collapse(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_collapse(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let mut dims = l1.dims().to_vec();
         *dims.last_mut().unwrap() = self.d;
@@ -725,19 +745,23 @@ impl lloom_tensor::CustomOp3 for HcCollapseScaled {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("hc_collapse_scaled")
             .build()?;
-        lloom_tensor::kernels::call_hc_collapse_scaled(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            metal_bo(sh, lh),
-            metal_bo(gs, gl),
-            metal_bo(ss, ls),
-            metal_bo(sg, lg),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_collapse_scaled(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                metal_bo(sh, lh),
+                metal_bo(gs, gl),
+                metal_bo(ss, ls),
+                metal_bo(sg, lg),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let mut dims = lh.dims().to_vec();
         *dims.last_mut().unwrap() = self.d;
@@ -817,18 +841,22 @@ impl lloom_tensor::CustomOp3 for HcCombine {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("hc_combine")
             .build()?;
-        lloom_tensor::kernels::call_hc_combine(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            self.n,
-            self.d,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_hc_combine(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                self.n,
+                self.d,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -996,17 +1024,21 @@ impl lloom_tensor::CustomOp1 for MoeTopk {
                 lloom_tensor::DType::U32,
             )?,
         };
-        lloom_tensor::kernels::call_moe_topk(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            n_experts,
-            self.k,
-            metal_bo(s, l),
-            ids.buffer(),
-            ws.buffer(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_moe_topk(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                n_experts,
+                self.k,
+                metal_bo(s, l),
+                ids.buffer(),
+                ws.buffer(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let mut out_dims = dims.to_vec();
         *out_dims.last_mut().unwrap() = self.k;
@@ -1055,16 +1087,20 @@ impl lloom_tensor::CustomOp2 for SiluMul {
             .with_size_for(elem_count, s1.dtype())
             .with_label("silu_mul")
             .build()?;
-        lloom_tensor::kernels::call_silu_mul(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            dtype,
-            elem_count,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_silu_mul(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                dtype,
+                elem_count,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -1171,21 +1207,25 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("moe_combine")
             .build()?;
-        lloom_tensor::kernels::call_moe_combine(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            y_dtype,
-            rows,
-            self.k,
-            self.d,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            metal_bo(gs, gl),
-            &output,
-            flags,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_moe_combine(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                y_dtype,
+                rows,
+                self.k,
+                self.d,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                metal_bo(gs, gl),
+                &output,
+                flags,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -1726,22 +1766,26 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_heads")
             .build()?;
-        lloom_tensor::kernels::call_gdn_prologue(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            self.d,
-            self.h_k,
-            self.h_v,
-            kk,
-            self.eps,
-            self.q_scale,
-            metal_bo(s, l),
-            metal_bo(ws, wl),
-            metal_bo(ns, nl),
-            &output,
-            metal_bo(os, ol),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_prologue(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                self.d,
+                self.h_k,
+                self.h_v,
+                kk,
+                self.eps,
+                self.q_scale,
+                metal_bo(s, l),
+                metal_bo(ws, wl),
+                metal_bo(ns, nl),
+                &output,
+                metal_bo(os, ol),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -1810,19 +1854,23 @@ impl lloom_tensor::CustomOp3 for GdnGatedNorm {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_gated")
             .build()?;
-        lloom_tensor::kernels::call_gdn_gated_norm(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            d,
-            h_v,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            &output,
-            self.gate.is_silu(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_gated_norm(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                d,
+                h_v,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                &output,
+                self.gate.is_silu(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -1908,23 +1956,27 @@ impl lloom_tensor::CustomOp2 for QsaPrep {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("qsa_prep")
             .build()?;
-        lloom_tensor::kernels::call_qsa_prep(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            hd,
-            self.n_rot,
-            nh,
-            nkv,
-            self.pos,
-            self.theta,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(qs, ql),
-            metal_bo(ks, kl),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_qsa_prep(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                hd,
+                self.n_rot,
+                nh,
+                nkv,
+                self.pos,
+                self.theta,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(qs, ql),
+                metal_bo(ks, kl),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2015,24 +2067,28 @@ impl lloom_tensor::CustomOp3 for QsaPrepBatch {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("qsa_prep_batch")
             .build()?;
-        lloom_tensor::kernels::call_qsa_prep_batch(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            hd,
-            self.n_rot,
-            nh,
-            nkv,
-            self.theta,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            metal_bo(qs, ql),
-            metal_bo(ks, kl),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_qsa_prep_batch(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                hd,
+                self.n_rot,
+                nh,
+                nkv,
+                self.theta,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                metal_bo(qs, ql),
+                metal_bo(ks, kl),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2177,33 +2233,37 @@ impl lloom_tensor::CustomOp3 for SdpaVectorPaged {
         } else {
             None
         };
-        lloom_tensor::kernels::call_sdpa_vector_paged(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            nh,
-            nh / nkv,
-            hd,
-            l1.start_offset() * esz,
-            s1.buffer(),
-            l2.start_offset() * esz,
-            s2.buffer(),
-            tokens * hd,
-            l3.start_offset() * esz,
-            s3.buffer(),
-            tokens * hd,
-            ts.buffer(),
-            tl.start_offset() * 4,
-            self.table_stride,
-            ns.buffer(),
-            nl.start_offset() * 4,
-            self.page_size,
-            &output,
-            self.scale,
-            itype,
-            scratch.as_ref().map(|(p, s, m)| (&***p, &***s, &***m)),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_sdpa_vector_paged(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                nh,
+                nh / nkv,
+                hd,
+                l1.start_offset() * esz,
+                s1.buffer(),
+                l2.start_offset() * esz,
+                s2.buffer(),
+                tokens * hd,
+                l3.start_offset() * esz,
+                s3.buffer(),
+                tokens * hd,
+                ts.buffer(),
+                tl.start_offset() * 4,
+                self.table_stride,
+                ns.buffer(),
+                nl.start_offset() * 4,
+                self.page_size,
+                &output,
+                self.scale,
+                itype,
+                scratch.as_ref().map(|(p, s, m)| (&***p, &***s, &***m)),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2257,15 +2317,19 @@ impl lloom_tensor::CustomOp2 for SigmoidMul {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("sigmoid_mul")
             .build()?;
-        lloom_tensor::kernels::call_sigmoid_mul(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            elem_count,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_sigmoid_mul(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                elem_count,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2356,20 +2420,24 @@ impl lloom_tensor::CustomOp2 for GdnGate {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_gate")
             .build()?;
-        lloom_tensor::kernels::call_gdn_gate(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            self.seq,
-            self.h_v,
-            self.nc,
-            self.cs,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(ds, dl),
-            metal_bo(as_, al),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_gate(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                self.seq,
+                self.h_v,
+                self.nc,
+                self.cs,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(ds, dl),
+                metal_bo(as_, al),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2450,24 +2518,28 @@ impl lloom_tensor::CustomOp3 for GdnPrefillPrologue {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_prefill_qkv")
             .build()?;
-        lloom_tensor::kernels::call_gdn_prefill_prologue(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            self.seq,
-            self.d,
-            self.h_k,
-            self.h_v,
-            self.kk,
-            self.cs,
-            self.nc,
-            self.eps,
-            self.q_scale,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_prefill_prologue(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                self.seq,
+                self.d,
+                self.h_k,
+                self.h_v,
+                self.kk,
+                self.cs,
+                self.nc,
+                self.eps,
+                self.q_scale,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2524,17 +2596,21 @@ impl lloom_tensor::CustomOp1 for GdnConvWindow {
             .with_size_for(n, lloom_tensor::DType::F32)
             .with_label("gdn_conv_window")
             .build()?;
-        lloom_tensor::kernels::call_gdn_conv_window(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            self.seq,
-            self.channels,
-            self.kk,
-            metal_bo(s, l),
-            metal_bo(qs, ql),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_conv_window(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                self.seq,
+                self.channels,
+                self.kk,
+                metal_bo(s, l),
+                metal_bo(qs, ql),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), n, s.dtype())?,
@@ -2593,16 +2669,20 @@ impl lloom_tensor::CustomOp1 for GdnChunkDecay {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_chunk_decay")
             .build()?;
-        lloom_tensor::kernels::call_gdn_chunk_decay(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            self.h_v,
-            self.nc,
-            self.cs,
-            metal_bo(s, l),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_chunk_decay(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                self.h_v,
+                self.nc,
+                self.cs,
+                metal_bo(s, l),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2668,17 +2748,21 @@ impl lloom_tensor::CustomOp3 for GdnChunkScale {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_chunk_scale")
             .build()?;
-        lloom_tensor::kernels::call_gdn_chunk_scale(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            n,
-            d,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_chunk_scale(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                n,
+                d,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2757,21 +2841,25 @@ impl lloom_tensor::CustomOp2 for GdnChunkEpilogue {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_chunk_epilogue")
             .build()?;
-        lloom_tensor::kernels::call_gdn_chunk_epilogue(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            seq,
-            padded,
-            d,
-            h_v,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(gs, gl),
-            metal_bo(s2, l2),
-            &output,
-            self.gate.is_silu(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_chunk_epilogue(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                seq,
+                padded,
+                d,
+                h_v,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(gs, gl),
+                metal_bo(s2, l2),
+                &output,
+                self.gate.is_silu(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2865,25 +2953,29 @@ impl lloom_tensor::CustomOp3 for QsaPrepRows {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("qsa_prep_rows")
             .build()?;
-        lloom_tensor::kernels::call_qsa_prep_rows(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            hd,
-            self.n_rot,
-            nh,
-            nkv,
-            seq,
-            self.pos0,
-            self.theta,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            metal_bo(qs, ql),
-            metal_bo(ks, kl),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_qsa_prep_rows(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                hd,
+                self.n_rot,
+                nh,
+                nkv,
+                seq,
+                self.pos0,
+                self.theta,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                metal_bo(qs, ql),
+                metal_bo(ks, kl),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -2970,26 +3062,30 @@ impl lloom_tensor::CustomOp1 for GdnPrologueRows {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_heads_rows")
             .build()?;
-        lloom_tensor::kernels::call_gdn_prologue_rows(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            d,
-            h_k,
-            h_v,
-            kk,
-            self.eps,
-            self.q_scale,
-            self.win.n_slots,
-            self.win.n_phases,
-            metal_bo(s, l),
-            metal_bo(&ws, &wl),
-            metal_bo(&ps, &pl),
-            metal_bo(&ss, &sl),
-            metal_bo(&hs, &hl),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_prologue_rows(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                d,
+                h_k,
+                h_v,
+                kk,
+                self.eps,
+                self.q_scale,
+                self.win.n_slots,
+                self.win.n_phases,
+                metal_bo(s, l),
+                metal_bo(&ws, &wl),
+                metal_bo(&ps, &pl),
+                metal_bo(&ss, &sl),
+                metal_bo(&hs, &hl),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -3065,26 +3161,30 @@ impl lloom_tensor::CustomOp1 for GdnPrologueSeq {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_heads_seq")
             .build()?;
-        lloom_tensor::kernels::call_gdn_prologue_seq(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            steps,
-            d,
-            h_k,
-            h_v,
-            kk,
-            self.eps,
-            self.q_scale,
-            self.win.n_slots,
-            self.win.n_phases,
-            self.slot,
-            self.phase,
-            metal_bo(s, l),
-            metal_bo(&ws, &wl),
-            metal_bo(&ps, &pl),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_prologue_seq(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                steps,
+                d,
+                h_k,
+                h_v,
+                kk,
+                self.eps,
+                self.q_scale,
+                self.win.n_slots,
+                self.win.n_phases,
+                self.slot,
+                self.phase,
+                metal_bo(s, l),
+                metal_bo(&ws, &wl),
+                metal_bo(&ps, &pl),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -3152,20 +3252,24 @@ impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
             .with_size_for(elem_count, lloom_tensor::DType::F32)
             .with_label("gdn_gated_rows")
             .build()?;
-        lloom_tensor::kernels::call_gdn_gated_norm_rows(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            d,
-            h_v,
-            self.eps,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            &output,
-            self.gate.is_silu(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_gated_norm_rows(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                d,
+                h_v,
+                self.eps,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                &output,
+                self.gate.is_silu(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -3300,23 +3404,27 @@ impl lloom_tensor::CustomOp3 for GdnChunkScan {
             buffer: &output,
             offset_in_bytes: n * 4,
         };
-        lloom_tensor::kernels::call_gdn_chunk_scan_at(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            (h_v, nc, cs, d),
-            CHUNK_SCAN_SPLITS,
-            metal_bo(s1, l1),
-            metal_bo(s2, l2),
-            metal_bo(s3, l3),
-            metal_bo(kqm, &kql),
-            metal_bo(kgm, &kgl),
-            metal_bo(glm, &gll),
-            metal_bo(sim, &sil),
-            &output,
-            s_out_bo,
-            &vn,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_chunk_scan_at(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                (h_v, nc, cs, d),
+                CHUNK_SCAN_SPLITS,
+                metal_bo(s1, l1),
+                metal_bo(s2, l2),
+                metal_bo(s3, l3),
+                metal_bo(kqm, &kql),
+                metal_bo(kgm, &kgl),
+                metal_bo(glm, &gll),
+                metal_bo(sim, &sil),
+                &output,
+                s_out_bo,
+                &vn,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(

@@ -1,3 +1,4 @@
+use crate::memory_admission::AllocationError;
 use crate::{DType, Result};
 
 use crate::kernels::metal::CommandMarker;
@@ -768,12 +769,13 @@ impl MetalDevice {
         backing: &dyn Backing,
         bytes: usize,
         context: Option<&crate::memory_admission::AllocationContext>,
-    ) -> Result<crate::kernels::metal::backing::Allocation> {
+    ) -> std::result::Result<
+        crate::kernels::metal::backing::Allocation,
+        crate::memory_admission::AllocationError,
+    > {
         match context {
-            Some(context) => backing
-                .alloc_in(bytes, context)
-                .map_err(|e| crate::Error::Msg(e.to_string())),
-            None => backing.alloc(bytes).map_err(|e| MetalError::from(e).into()),
+            Some(context) => backing.alloc_in(bytes, context),
+            None => backing.alloc(bytes),
         }
     }
 
@@ -786,7 +788,7 @@ impl MetalDevice {
         // Standalone cold route only. Loaded uses allocation_view_in to split
         // its ALREADY promised term instead of reserving that term a second time.
         let bytes = DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
-        let pass = domain.reserve(bytes).map_err(crate::Error::wrap)?;
+        let pass = domain.reserve(bytes)?;
         self.allocation_view_in(domain, &pass.context())
     }
 
@@ -798,13 +800,14 @@ impl MetalDevice {
         if metadata.domain_key() != domain.key() {
             crate::bail!("namespace metadata and physical domain must name the supplied owner");
         }
-        metadata.check_open().map_err(crate::Error::wrap)?;
+        metadata.check_open()?;
         let namespace = super::allocation_namespace::AllocationNamespace::new(
             &self.device,
             self.commands.clock(),
             &self.residency_set,
             &self.ledger,
             Some(domain),
+            self.allocation_namespace.native_domain.clone(),
             Some((&self.buffers, &self.private_buffers)),
         );
         let mut view = self.clone();
@@ -871,9 +874,7 @@ impl MetalDevice {
             .map_or(crate::memory_admission::AllocationOrigin::Legacy, |owner| {
                 crate::memory_admission::AllocationOrigin::Domain(owner.domain_key())
             });
-        view.declared_allocation_origin()
-            .validate_reuse(&origin)
-            .map_err(crate::Error::wrap)?;
+        view.declared_allocation_origin().validate_reuse(&origin)?;
         Ok(view)
     }
 
@@ -883,15 +884,14 @@ impl MetalDevice {
         if let Some(scope) = super::allocation_scope::active(self)? {
             return Ok(scope.view.declared_allocation_origin());
         }
-        Ok(crate::memory_admission::AllocationOrigin::Legacy)
+        Ok(self.declared_allocation_origin())
     }
 
     /// Binding for explicit non-scoped constructors. Does not infer a first-use
     /// payer; an admitted original-device caller uses the scoped constructor.
     pub(crate) fn declared_allocation_origin(&self) -> crate::memory_admission::AllocationOrigin {
-        self.allocation_namespace.domain.as_ref().map_or(
-            crate::memory_admission::AllocationOrigin::Legacy,
-            |domain| crate::memory_admission::AllocationOrigin::Domain(domain.key()),
+        crate::memory_admission::AllocationOrigin::Domain(
+            self.allocation_namespace.native_domain.key(),
         )
     }
 
@@ -1479,21 +1479,27 @@ impl MetalDevice {
             }
         }
         let encoder = self.command_encoder()?;
-        crate::kernels::call_argmax_publish(
-            &self.device,
-            &encoder,
-            &self.kernels,
-            kernel,
-            bo(logits.0, logits.1),
-            n,
-            bo(token_slot.0, token_slot.1),
-            bo(history_slot.0, history_slot.1),
-            bo(eos_ids.0, eos_ids.1),
-            n_eos,
-            flag,
-            bo(step.0, step.1),
-            generation,
-        )
+        // SAFETY: the storages are the caller's (binding authority, `mod.rs`
+        // head). The gate's flag is the device's own: the host writes it only
+        // in `EosGate::begin`, before the round's first dispatch; ordering that
+        // write against an earlier round still in flight is the decode loop's.
+        unsafe {
+            crate::kernels::call_argmax_publish(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                kernel,
+                bo(logits.0, logits.1),
+                n,
+                bo(token_slot.0, token_slot.1),
+                bo(history_slot.0, history_slot.1),
+                bo(eos_ids.0, eos_ids.1),
+                n_eos,
+                flag,
+                bo(step.0, step.1),
+                generation,
+            )
+        }
         .map_err(MetalError::from)?;
         if armed.is_some() {
             use crate::kernels::utils::EncoderProvider;
@@ -1532,16 +1538,19 @@ impl MetalDevice {
         }
         {
             let encoder = self.command_encoder()?;
-            crate::kernels::call_words_publish(
-                &self.device,
-                &encoder,
-                &self.kernels,
-                bo(src.0, src.1),
-                n,
-                bo(out.0, out.1),
-                bo(step.0, step.1),
-                0,
-            )
+            // SAFETY: storage-owned buffers (binding authority, `mod.rs` head).
+            unsafe {
+                crate::kernels::call_words_publish(
+                    &self.device,
+                    &encoder,
+                    &self.kernels,
+                    bo(src.0, src.1),
+                    n,
+                    bo(out.0, out.1),
+                    bo(step.0, step.1),
+                    0,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         self.ring_stamp(step, generation, [out, out])
@@ -1561,14 +1570,17 @@ impl MetalDevice {
             }
         }
         let encoder = self.command_encoder()?;
-        crate::kernels::call_ring_stamp(
-            &self.device,
-            &encoder,
-            &self.kernels,
-            bo(step.0, step.1),
-            generation,
-            certified.map(|(s, off)| bo(s, off)),
-        )
+        // SAFETY: storage-owned buffers (binding authority, `mod.rs` head).
+        unsafe {
+            crate::kernels::call_ring_stamp(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                bo(step.0, step.1),
+                generation,
+                certified.map(|(s, off)| bo(s, off)),
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(())
     }
@@ -1998,16 +2010,20 @@ impl MetalDevice {
             .map_err(|e| MetalError::Message(format!("arena cursor: {e}")))?;
         {
             let guard = self.commands.command_encoder().map_err(MetalError::from)?;
-            call_arena_bump(
-                &self.device,
-                &guard,
-                &self.kernels,
-                cursor.cursor_buffer(),
-                cursor.sizes_buffer(),
-                cursor.offsets_buffer(),
-                cursor.len(),
-                cursor.capacity(),
-            )
+            // SAFETY: the cursor's three buffers are created above, written by
+            // no one else, and outlive the wait below.
+            unsafe {
+                call_arena_bump(
+                    &self.device,
+                    &guard,
+                    &self.kernels,
+                    cursor.cursor_buffer(),
+                    cursor.sizes_buffer(),
+                    cursor.offsets_buffer(),
+                    cursor.len(),
+                    cursor.capacity(),
+                )
+            }
             .map_err(MetalError::from)?;
         }
         // The offsets live in shared storage, so they are only meaningful once
@@ -2712,12 +2728,7 @@ impl MetalDevice {
                     return Err(MetalError::Message(format!("pass plan base grow refused: {} B committed, {} B budget, {} B net grow; no plan cached", a.committed, budget, needed.saturating_sub(transaction.have))).into());
                 }
             }
-            Some(
-                self.backings
-                    .resident_private
-                    .stage(needed, context)
-                    .map_err(crate::Error::wrap)?,
-            )
+            Some(self.backings.resident_private.stage(needed, context)?)
         } else {
             None
         };
@@ -2741,7 +2752,7 @@ impl MetalDevice {
             drop(session);
         }
         let mut candidate = match staged {
-            Some(staged) => Some(staged.commit().map_err(crate::Error::wrap)?),
+            Some(staged) => Some(staged.commit()?),
             None => None,
         };
 
@@ -3124,7 +3135,11 @@ impl MetalDevice {
             }
         }
         self.note_pool_request(1);
-        let buffer = match self.private_buffers.acquire_for_allocation(size) {
+        let origin = self.declared_allocation_origin();
+        let buffer = match self
+            .private_buffers
+            .acquire_for_allocation_in(size, &origin)
+        {
             Ok(b) => b,
             Err(miss) => {
                 // `DESIGN.md` §9.5k's one branch, on the derived residual. It
@@ -3135,7 +3150,7 @@ impl MetalDevice {
                 // installed, which is every process that has not run admission.
                 self.private_buffers
                     .check_residual(alloc)
-                    .map_err(|e| MetalError::Message(e.to_string()))?;
+                    .map_err(AllocationError::from)?;
                 let new_buffer = Self::allocate_backing(
                     self.backings.transient_private.as_ref(),
                     alloc,
@@ -3147,7 +3162,7 @@ impl MetalDevice {
                 // above, which is the last point where the two are both in
                 // scope (#47).
                 self.private_buffers
-                    .adopt_after_miss(new_buffer, alloc, miss)
+                    .adopt_after_miss_in(new_buffer, alloc, miss, &origin)?
             }
         };
         Ok(self.note_for_recording(buffer, size))
@@ -3419,7 +3434,7 @@ impl MetalDevice {
     /// (Private storage: its pages are not the process's to compress).
     pub fn wire_buffer(&self, buffer: &PooledBuffer) {
         // `contents()` is null for a Private buffer (`Buffer::new`).
-        crate::kernels::metal::backing::wire_pages(buffer.contents(), buffer.size());
+        crate::kernels::metal::backing::wire_pages(unsafe { buffer.contents() }, buffer.size());
     }
 
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<BufferHandle> {
@@ -3429,6 +3444,307 @@ impl MetalDevice {
                 .new_buffer_with_data_in(data, Some(&scope.context));
         }
         self.new_buffer_with_data_in(data, None)
+    }
+
+    /// Cold real output/data plan position using this namespace's actual payer
+    /// and transient Shared backing (including exact heap range custody).
+    /// # Safety
+    /// Same exhaustive closed rich/native/IO/foreign/raw contract as the private
+    /// rich upload constructor. The plan admits complete capsule/control costs,
+    /// stores this genuine descriptor by fixed position, and obtains admitted
+    /// cold spill/growth before effects when checkout is Busy/Full. Outputs are
+    /// not initialized values until the real operation establishes its writes.
+    /// Legacy Tensor/PoolState selectors are NOT switched by this addition.
+    pub(crate) unsafe fn new_prepared_buffer_in(
+        &self,
+        bytes: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<crate::kernels::metal::PreparedPoolSlot> {
+        unsafe {
+            self.new_prepared_buffer_profile_in(
+                bytes,
+                super::planned_output_catalog::OutputProfile::Shared,
+                context,
+            )
+        }
+    }
+
+    /// Actual same factory, preserving requested geometry and physical custody;
+    /// the original Shared method above is retained as a forwarding entry.
+    /// # Safety
+    /// Same complete closed-use contract as new_prepared_buffer_in. Profile is
+    /// selected before any birth; no bare/legacy handle is enrolled afterward.
+    unsafe fn new_prepared_buffer_profile_in(
+        &self,
+        bytes: usize,
+        profile: super::planned_output_catalog::OutputProfile,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<crate::kernels::metal::PreparedPoolSlot> {
+        let bytes = buf_size(bytes)?;
+        let default_pass = match context {
+            Some(_) => None,
+            None => Some(
+                self.allocation_namespace.native_domain.reserve(
+                    crate::kernels::metal::ColdUnpooled::requested_pool_owned_bytes()
+                        .map_err(|e| crate::Error::Msg(format!("pool metadata quote: {e:?}")))?,
+                )?,
+            ),
+        };
+        let default_context = default_pass.as_ref().map(|pass| pass.context());
+        let metadata = context
+            .or(default_context.as_ref())
+            .expect("cold pool context");
+        metadata.check_open()?;
+        self.commands.check_failed().map_err(crate::Error::wrap)?;
+        let capsule = unsafe { crate::kernels::metal::ColdUnpooled::cold_in(metadata) }
+            .map_err(|e| crate::Error::Msg(format!("pool metadata: {e:?}")))?;
+        unsafe {
+            capsule.allocate_pool_with(
+                metadata,
+                || {
+                    unsafe {
+                        match profile {
+                            super::planned_output_catalog::OutputProfile::Shared => self
+                                .backings
+                                .transient_shared
+                                .alloc_custodied(bytes, context),
+                            super::planned_output_catalog::OutputProfile::Private => self
+                                .backings
+                                .transient_private
+                                .alloc_custodied(bytes, context),
+                        }
+                    }
+                    .map_err(crate::Error::from)
+                },
+                self.commands.clock(),
+                bytes,
+                &self.commands,
+            )
+        }
+    }
+
+    /// Cold root installation only. Native operation positions are admitted
+    /// separately and returned as genuine direct capabilities, never selected
+    /// by raw identity or merely capacity. No legacy/Tensor selector changes.
+    /// # Safety
+    /// Same complete closed-use and full factory quote contract as the actual
+    /// prepared buffer/staging constructors; no Commands/EDIT guard is held.
+    pub(crate) unsafe fn prepare_output_catalog_in(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+    ) -> Result<()> {
+        use super::planned_output_catalog::PlannedOutputCatalog;
+        if context.domain_key() != self.allocation_namespace.native_domain.key() {
+            return Err(crate::memory_admission::AllocationError::DifferentDomain.into());
+        }
+        context.check_open()?;
+        self.commands.check_failed().map_err(crate::Error::wrap)?;
+        if self.allocation_namespace.output_catalog.get().is_some() {
+            return Err(crate::Error::Msg("output catalog already installed".into()));
+        }
+        let catalog = unsafe { PlannedOutputCatalog::cold_in(context) }
+            .map_err(|e| crate::Error::Msg(format!("output catalog root: {e:?}")))?;
+        context.check_open()?;
+        self.commands.check_failed().map_err(crate::Error::wrap)?;
+        self.allocation_namespace
+            .output_catalog
+            .set(catalog)
+            .map_err(|_| crate::Error::Msg("output catalog installation raced".into()))
+    }
+
+    /// Actual SAME-promise output + preloaded shader + direct params factory.
+    /// The returned position identifies THIS immutable operation node, not a
+    /// size/profile search result. Busy needs cold admitted alternate/growth.
+    /// # Safety
+    /// All Node/capsule/shadow/native/control/pipeline/cache terms are quoted
+    /// before their births. All rows are prepared before any row's phase moves.
+    /// The real safe caller authenticates original initialized input, implicit
+    /// EOS/IO/foreign/raw/ICB users and native terminal/emission custody.
+    pub(crate) unsafe fn prepare_affine_position_in(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+        bytes: usize,
+        profile: super::planned_output_catalog::OutputProfile,
+        dtype: crate::kernels::kernels::affine::AffineDType,
+        operation: crate::kernels::kernels::affine::AffineOperation,
+        style: crate::kernels::kernels::params::ParamStyle,
+        strided_rank: Option<usize>,
+    ) -> Result<super::planned_output_catalog::DirectOutputPosition> {
+        use super::operation_payload::{OperationPayload, PreparedAffineOperation};
+        use super::planned_output_catalog::CatalogError;
+        if context.domain_key() != self.allocation_namespace.native_domain.key() {
+            return Err(crate::memory_admission::AllocationError::DifferentDomain.into());
+        }
+        let catalog = self
+            .allocation_namespace
+            .output_catalog
+            .get()
+            .ok_or_else(|| crate::Error::Msg("output catalog requires cold installation".into()))?;
+        unsafe {
+            catalog.append_cold_with(context, profile, || {
+                let slot =
+                    unsafe { self.new_prepared_buffer_profile_in(bytes, profile, Some(context)) }
+                        .map_err(CatalogError::Creator)?;
+                let operation = unsafe {
+                    PreparedAffineOperation::cold_in(
+                        self,
+                        context,
+                        dtype,
+                        operation,
+                        style,
+                        strided_rank,
+                    )
+                }
+                .map_err(CatalogError::Operation)?;
+                Ok((slot, OperationPayload::Affine(operation)))
+            })
+        }
+        .map_err(|e| crate::Error::Msg(format!("affine plan birth: {e:?}")))
+    }
+
+    /// Genuine initialized F32 input factory for the first actual typed affine
+    /// caller. No legacy Handle/raw view is rewrapped as counted provenance.
+    /// # Safety
+    /// Same complete native/IO/foreign/raw/CPU/emission contract as the actual
+    /// rich upload. Complete default/supplied factory pricing precedes birth;
+    /// logical reads are bounded by elements, never unused native padding.
+    pub(crate) unsafe fn prepare_affine_f32_input_in(
+        &self,
+        data: &[f32],
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<PreparedAffineInput> {
+        let handle = unsafe { self.new_rich_upload_with_data_in(data, context) }?;
+        Ok(PreparedAffineInput {
+            handle,
+            elements: data.len(),
+        })
+    }
+
+    /// Cold plan-owned Shared staging allocation. Default and supplied routes
+    /// preserve the same actual native payer; supplied metadata partitions the
+    /// existing promise and never reserves physical bytes twice.
+    /// # Safety
+    /// Same exhaustive tracked CPU/native/IO/foreign/raw/ICB future-emission
+    /// contract as the private rich upload constructor. All complete capsule,
+    /// control, plan-shadow and native allocation costs precede construction.
+    /// Caller maps this returned slot to a fixed plan position, prepares writes
+    /// BEFORE exact generation EDIT, and obtains admitted spill/growth outside
+    /// guards on Busy/Full. This method is not selected by legacy ConstantsPool
+    /// or Tensor upload paths today. Instrumentation/rewrite caller companions
+    /// and native/ICB terminal closure remain activation obligations.
+    pub(crate) unsafe fn new_prepared_staging_in(
+        &self,
+        bytes: usize,
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<crate::kernels::metal::PreparedStagingSlot> {
+        if bytes == 0 {
+            return Err(crate::Error::Msg(
+                "staging requires nonempty storage".into(),
+            ));
+        }
+        let default_pass = match context {
+            Some(_) => None,
+            None => Some(
+                self.allocation_namespace.native_domain.reserve(
+                    crate::kernels::metal::ColdUnpooled::requested_pool_owned_bytes()
+                        .map_err(|e| crate::Error::Msg(format!("staging metadata quote: {e:?}")))?,
+                )?,
+            ),
+        };
+        let default_context = default_pass.as_ref().map(|pass| pass.context());
+        let metadata = context
+            .or(default_context.as_ref())
+            .expect("cold staging context");
+        metadata.check_open()?;
+        self.commands.check_failed().map_err(crate::Error::wrap)?;
+        let capsule = unsafe { crate::kernels::metal::ColdUnpooled::cold_in(metadata) }
+            .map_err(|e| crate::Error::Msg(format!("staging metadata: {e:?}")))?;
+        unsafe {
+            capsule.allocate_staging_with(
+                metadata,
+                || {
+                    unsafe {
+                        self.backings
+                            .resident_shared
+                            .alloc_custodied(bytes, context)
+                    }
+                    .map_err(crate::Error::from)
+                },
+                self.commands.clock(),
+                bytes,
+                &self.commands,
+            )
+        }
+    }
+
+    /// Cold actual backing→physical→rich Handle route. The existing Tensor large
+    /// upload branch may select this ONLY after actual native/IO/raw closure and
+    /// complete pricing are enforced. It is not an enabled fallback today.
+    /// # Safety
+    /// EVERY safe/native/IO/foreign/raw/CPU emission from the returned handle
+    /// retains counted External custody through own terminality. Submitted
+    /// creator-generation cleanup observes its exact epoch before releasing the
+    /// pin; no-submit cancellation and unknown differ. Same process account,
+    /// actual native payer and clock are preserved; no sampled OPEN cutoff.
+    /// Supplied producer prediction includes both requested capsule Layouts
+    /// ONCE plus complete still-unquoted Arc/control/service/constructor overhead.
+    unsafe fn new_rich_upload_with_data_in<T>(
+        &self,
+        data: &[T],
+        context: Option<&crate::memory_admission::AllocationContext>,
+    ) -> Result<BufferHandle> {
+        let size = core::mem::size_of_val(data);
+        // Empty logical tensors are legal. Metal still requires nonzero physical
+        // storage: preserve the existing minimum-allocation geometry, retaining
+        // real payer/range/accounting custody. No logical byte is readable, so
+        // this branch does not manufacture an initialized-padding certificate.
+        let empty_extent = if size == 0 { Some(buf_size(0)?) } else { None };
+        // Default metadata reserve uses THIS namespace's actual immutable payer,
+        // the same account/domain as resident_shared; never invent a model key.
+        // Supplied route takes the same existing promise, with no second reserve.
+        let default_pass = match context {
+            Some(_) => None,
+            None => Some(
+                self.allocation_namespace.native_domain.reserve(
+                    crate::kernels::metal::ColdUnpooled::requested_owned_bytes()
+                        .map_err(|e| crate::Error::Msg(format!("upload metadata quote: {e:?}")))?,
+                )?,
+            ),
+        };
+        let default_context = default_pass.as_ref().map(|pass| pass.context());
+        let metadata = context
+            .or(default_context.as_ref())
+            .expect("cold upload context");
+        metadata.check_open()?;
+        self.commands.check_failed().map_err(crate::Error::wrap)?;
+        let capsule = unsafe { crate::kernels::metal::ColdUnpooled::cold_in(metadata) }
+            .map_err(|e| crate::Error::Msg(format!("upload metadata: {e:?}")))?;
+        unsafe {
+            capsule.allocate_with(
+                metadata,
+                || {
+                    match empty_extent {
+                        // SAFETY: cold private whole-allocation birth, no raw/view escape;
+                        // logical extent remains zero and every later native use must
+                        // obey the same counted/closed-use contract as nonempty uploads.
+                        Some(bytes) => unsafe {
+                            self.backings
+                                .resident_shared
+                                .alloc_custodied(bytes, context)
+                        },
+                        None => self
+                            .backings
+                            .resident_shared
+                            .alloc_data_custodied(data, context),
+                    }
+                    .map_err(crate::Error::from)
+                },
+                self.commands.clock(),
+                size,
+                Some(Arc::clone(&self.residency_set)),
+                &self.commands,
+            )
+        }
     }
 
     fn new_buffer_with_data_in<T>(
@@ -3461,28 +3777,13 @@ impl MetalDevice {
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), buffer.contents(), size);
             }
-            crate::kernels::metal::upload_shadow::record(buffer.contents() as usize, unsafe {
-                std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size)
-            });
+            crate::kernels::metal::upload_shadow::record(
+                unsafe { buffer.contents() } as usize,
+                unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size) },
+            );
             return Ok(buffer);
         }
-        if let Some(context) = context {
-            let a = self
-                .backings
-                .resident_shared
-                .alloc_data_in(data, context)
-                .map_err(|e| crate::Error::Msg(e.to_string()))?;
-            return Ok(BufferHandle::new(
-                PooledBuffer::unpooled_resident(a.buffer, size, Arc::clone(&self.residency_set))
-                    .with_reservation(a.reservation)
-                    .held_in_flight(self.commands.in_flight_hold()),
-            ));
-        }
-        let new_buffer = self
-            .device
-            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        self.residency_set.insert(&new_buffer);
+        let allocation = self.backings.resident_shared.alloc_data(data, context)?;
 
         // Deliberately not pooled.
         //
@@ -3509,9 +3810,13 @@ impl MetalDevice {
         // holds, so an unpooled upload that stayed in it was never freed at
         // all — neither these staging buffers nor a per-round `Tensor::new`.
         Ok(BufferHandle::new(
-            PooledBuffer::unpooled_resident(new_buffer, size, Arc::clone(&self.residency_set))
-                .reserved(self.ledger.reserve(size))
-                .held_in_flight(self.commands.in_flight_hold()),
+            PooledBuffer::unpooled_resident(
+                allocation.buffer,
+                size,
+                Arc::clone(&self.residency_set),
+            )
+            .with_reservation(allocation.reservation)
+            .held_in_flight(self.commands.in_flight_hold()),
         ))
     }
 
@@ -3534,22 +3839,27 @@ impl MetalDevice {
             // A compute fill, inside the barrier chain (see `base_mode`).
             if size_in_bytes > 0 {
                 let encoder = self.command_encoder()?;
-                crate::kernels::kernels::call_const_fill(
-                    &self.device,
-                    &encoder,
-                    &self.kernels,
-                    "fill_u8",
-                    size_in_bytes,
-                    &buffer,
-                    0u8,
-                )
+                // SAFETY: `buffer` was just allocated here and is the caller's
+                // storage from now on (binding authority, `mod.rs` head).
+                unsafe {
+                    crate::kernels::kernels::call_const_fill(
+                        &self.device,
+                        &encoder,
+                        &self.kernels,
+                        "fill_u8",
+                        size_in_bytes,
+                        &buffer,
+                        0u8,
+                    )
+                }
                 .map_err(crate::Error::wrap)?;
             }
             return Ok(buffer);
         }
         let mut blit = self.blit_command_encoder()?;
         blit.set_label("zeros");
-        blit.fill_buffer(&buffer, (0, buffer.length()), 0);
+        // SAFETY: as the compute fill above.
+        unsafe { blit.fill_buffer(&buffer, (0, buffer.length()), 0) };
         Ok(buffer)
     }
 
@@ -3568,7 +3878,8 @@ impl MetalDevice {
     ) -> Result<BufferHandle> {
         let allocated = buf_size(size)?;
         self.note_pool_request(0);
-        let miss = match self.buffers.acquire_for_allocation(size) {
+        let origin = self.declared_allocation_origin();
+        let miss = match self.buffers.acquire_for_allocation_in(size, &origin) {
             Ok(b) => return Ok(b),
             Err(miss) => miss,
         };
@@ -3581,10 +3892,12 @@ impl MetalDevice {
         // subtracted `planned` figure includes KV.
         self.buffers
             .check_residual(size)
-            .map_err(|e| MetalError::Message(e.to_string()))?;
+            .map_err(AllocationError::from)?;
         let new_buffer =
             Self::allocate_backing(self.backings.transient_shared.as_ref(), size, context)?;
-        Ok(self.buffers.adopt_after_miss(new_buffer, size, miss))
+        Ok(self
+            .buffers
+            .adopt_after_miss_in(new_buffer, size, miss, &origin)?)
     }
 
     /// Create a metal GPU capture trace on [`path`].
@@ -3906,4 +4219,19 @@ mod tests {
 pub fn wire_weights_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().metal.wire_weights)
+}
+
+/// Closed initialized F32 input, created only from the actual rich upload.
+/// Geometry is logical input length; raw SDK access remains unsafe separately.
+pub(crate) struct PreparedAffineInput {
+    handle: BufferHandle,
+    elements: usize,
+}
+impl PreparedAffineInput {
+    pub(crate) fn handle(&self) -> &BufferHandle {
+        &self.handle
+    }
+    pub(crate) fn elements(&self) -> usize {
+        self.elements
+    }
 }

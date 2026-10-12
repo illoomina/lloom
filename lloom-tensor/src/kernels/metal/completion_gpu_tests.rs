@@ -79,18 +79,22 @@ fn run_affine_full(arm: CompletionWait, n: usize, mul: f32, add: f32) -> (Vec<f3
 
     {
         let encoder = cmds.command_encoder().unwrap();
-        call_affine(
-            &device,
-            &encoder,
-            &kernels,
-            "affine_f32",
-            std::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&src),
-            &dst,
-            mul,
-            add,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_affine(
+                &device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                std::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&src),
+                &dst,
+                mul,
+                add,
+            )
+        }
         .unwrap();
     }
 
@@ -98,7 +102,9 @@ fn run_affine_full(arm: CompletionWait, n: usize, mul: f32, add: f32) -> (Vec<f3
     // the host polls the shared event and never enters the kernel to wait.
     cmds.flush_and_wait_current().unwrap();
 
-    let p = dst.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let p = unsafe { dst.contents() } as *const f32;
     assert!(!p.is_null(), "destination has no CPU mapping");
     // SAFETY: shared storage sized for `n` f32, and the wait above has returned.
     let out = unsafe { std::slice::from_raw_parts(p, n) }.to_vec();

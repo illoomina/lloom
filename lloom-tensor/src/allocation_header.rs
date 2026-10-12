@@ -46,6 +46,16 @@ pub(crate) enum HeaderError {
     Phase,
     Count,
 }
+/// A counted handle whose count would overflow is a refusal; every other
+/// header error is a custody invariant the caller broke.
+impl From<HeaderError> for crate::memory_admission::AllocationError {
+    fn from(error: HeaderError) -> Self {
+        match error {
+            HeaderError::Count => Self::CountExhausted,
+            _ => Self::InvalidCustody,
+        }
+    }
+}
 /// Exclusive cold claim. It cannot be cloned into competing publishers or
 /// cancellers. Dropping an unfinished claim quarantines its slot; the payload
 /// adapter must install a rollback guard before initialization to cancel after
@@ -161,6 +171,15 @@ impl<const N: usize> HeaderInventory<N> {
         let cell = self.counts.get(ticket.index).ok_or(HeaderError::Stale)?;
         cell.state(ticket.generation)?;
         Ok(cell)
+    }
+    /// Diagnostic only while a genuine holder roots this ticket. Not uniqueness,
+    /// raw/native terminality, or permission to mutate/drop a payload.
+    pub(crate) fn strong_count(&self, ticket: HeaderTicket) -> Result<usize, HeaderError> {
+        Ok(self.resolve(ticket)?.strong.load(Ordering::Relaxed))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_strong_count(&self, ticket: HeaderTicket) -> Result<usize, HeaderError> {
+        Ok(self.resolve(ticket)?.strong.load(Ordering::Acquire))
     }
     pub(crate) fn reserve(&self) -> Result<Option<HeaderReservation<'_, N>>, HeaderError> {
         loop {

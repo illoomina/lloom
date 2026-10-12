@@ -452,8 +452,13 @@ impl FlashCombineParams {
 /// `chunk_size = k * page_size` (§9.1d). Shipped at `k = 1`, which is what
 /// §10.4 specifies — the difference is that it is now a *stated* value on a
 /// selectable axis rather than an equality welded into a kernel.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_flash_decoding(
+pub unsafe fn call_flash_decoding(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -534,18 +539,21 @@ pub fn call_flash_decoding(
         encoder.set_compute_pipeline_state(&pipeline);
         debug_group!(encoder, "flash_decoding single hd={head_dim}");
 
-        set_params!(
-            encoder,
-            (
-                (q_buffer, q_offset),
-                (k_buffer, k_offset),
-                (v_buffer, v_offset),
-                Output::new(output),
-                partial_params,
-                chunk_table,
-                n_keys_per_seq
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(output),
+                    partial_params,
+                    chunk_table,
+                    n_keys_per_seq
+                )
+            );
+        }
 
         // One threadgroup per head — the single chunk IS the cache, so there is
         // no `depth` axis to split over (contrast the partial pass's
@@ -577,20 +585,23 @@ pub fn call_flash_decoding(
             "flash_decoding partial hd={head_dim} chunks={n_chunks}"
         );
 
-        set_params!(
-            encoder,
-            (
-                (q_buffer, q_offset),
-                (k_buffer, k_offset),
-                (v_buffer, v_offset),
-                Output::new(partials),
-                Output::new(sums),
-                Output::new(maxs),
-                chunk_table,
-                partial_params,
-                n_keys_per_seq
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(partials),
+                    Output::new(sums),
+                    Output::new(maxs),
+                    chunk_table,
+                    partial_params,
+                    n_keys_per_seq
+                )
+            );
+        }
 
         // One threadgroup per (head, chunk). **This is where the parallelism
         // comes from**: §10.4's structural argument is that at B=1 attention
@@ -624,17 +635,20 @@ pub fn call_flash_decoding(
             "flash_decoding combine hd={head_dim} chunks={n_chunks}"
         );
 
-        set_params!(
-            encoder,
-            (
-                partials,
-                sums,
-                maxs,
-                Output::new(output),
-                combine_params,
-                Output::new(walk_order)
-            )
-        );
+        // SAFETY: this function's contract (# Safety above).
+        unsafe {
+            set_params!(
+                encoder,
+                (
+                    partials,
+                    sums,
+                    maxs,
+                    Output::new(output),
+                    combine_params,
+                    Output::new(walk_order)
+                )
+            );
+        }
 
         let grid_dims = MTLSize {
             width: 1,
@@ -662,8 +676,13 @@ pub fn call_flash_decoding(
 /// and `scatter_params` a [`FlashScatterParams`] built by
 /// [`FlashScatterParams::for_write`]. Both are caller-owned buffers for the
 /// same reason the attention params are (§3.7c).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_flash_kv_scatter(
+pub unsafe fn call_flash_kv_scatter(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -688,15 +707,18 @@ pub fn call_flash_kv_scatter(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "flash_kv_scatter rows={n_rows}");
-    set_params!(
-        encoder,
-        (
-            (src, src_offset),
-            Output::with_offset(dst, dst_offset),
-            (slots, slots_offset),
-            scatter_params
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (src, src_offset),
+                Output::with_offset(dst, dst_offset),
+                (slots, slots_offset),
+                scatter_params
+            )
+        );
+    }
     let grid_dims = MTLSize {
         width: head_dim,
         height: n_kv_heads,

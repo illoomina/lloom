@@ -712,8 +712,12 @@ fn needs_iq_shared(dtype: GgmlDType) -> bool {
     dtype.kind().iq_shared
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_t(
+pub unsafe fn call_quantized_matmul_mv_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -825,30 +829,33 @@ pub fn call_quantized_matmul_mv_t(
     }
     debug_group!(encoder, "qmm_mv {name} B={b} M={m} K={k} N={n}");
 
-    set_params!(
-        encoder,
-        (
-            rhs,
-            (lhs, lhs_offset),
-            Output::with_offset(dst, dst_offset),
-            ne00,
-            ne01,
-            ne02,
-            nb00,
-            nb01,
-            nb02,
-            ne10,
-            ne11,
-            ne12,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            r2,
-            r3
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                rhs,
+                (lhs, lhs_offset),
+                Output::with_offset(dst, dst_offset),
+                ne00,
+                ne01,
+                ne02,
+                nb00,
+                nb01,
+                nb02,
+                ne10,
+                ne11,
+                ne12,
+                nb10,
+                nb11,
+                nb12,
+                ne0,
+                ne1,
+                r2,
+                r3
+            )
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -878,8 +885,13 @@ pub fn mv_store_instantiations() -> Vec<(&'static str, &'static str, &'static st
 /// the products multiply into. The grid is the plain one-row matvec's: the
 /// block is the store's type, nothing else of the launch moves. A kind with
 /// no genericized core is refused by name.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_store(
+pub unsafe fn call_quantized_matmul_mv_store(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -942,30 +954,33 @@ pub fn call_quantized_matmul_mv_store(
         encoder.set_threadgroup_memory_length(0, 8192);
     }
     debug_group!(encoder, "qmm_mv_store {name} K={k} N={n}");
-    set_params!(
-        encoder,
-        (
-            rhs,
-            (lhs, lhs_offset),
-            Output::with_offset(dst, dst_offset),
-            ne00,
-            ne01,
-            ne02,
-            nb00,
-            nb01,
-            nb02,
-            ne10,
-            ne11,
-            ne12,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            r2,
-            r3
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                rhs,
+                (lhs, lhs_offset),
+                Output::with_offset(dst, dst_offset),
+                ne00,
+                ne01,
+                ne02,
+                nb00,
+                nb01,
+                nb02,
+                ne10,
+                ne11,
+                ne12,
+                nb10,
+                nb11,
+                nb12,
+                ne0,
+                ne1,
+                r2,
+                r3
+            )
+        );
+    }
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
 }
@@ -1008,8 +1023,13 @@ fn mv_id_stem(dtype: GgmlDType) -> Result<&'static str, MetalKernelError> {
 /// item B) wraps the same genericized cores at `<half, half>` — quantized
 /// weight rows only, as the plain dispatch. `src1` is read and `dst` written
 /// in the triple's legs.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_id_t(
+pub unsafe fn call_quantized_matmul_mv_id_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1103,34 +1123,37 @@ pub fn call_quantized_matmul_mv_id_t(
         "qmm_mv_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
     );
 
-    set_params!(
-        encoder,
-        (
-            src0,
-            (src1, src1_offset),
-            Output::new(dst),
-            (ids, ids_offset),
-            nei0,
-            nei1,
-            nbi1,
-            ne00,
-            ne01,
-            ne02,
-            nb00,
-            nb01,
-            nb02,
-            ne10,
-            ne11,
-            ne12,
-            ne13,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            nb1
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                src0,
+                (src1, src1_offset),
+                Output::new(dst),
+                (ids, ids_offset),
+                nei0,
+                nei1,
+                nbi1,
+                ne00,
+                ne01,
+                ne02,
+                nb00,
+                nb01,
+                nb02,
+                ne10,
+                ne11,
+                ne12,
+                ne13,
+                nb10,
+                nb11,
+                nb12,
+                ne0,
+                ne1,
+                nb1
+            )
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -1149,8 +1172,13 @@ pub fn mm_id_block_bound(rows: usize, topk: usize, n_experts: usize, bn: usize) 
 /// `kernel_moe_rowmap`: the router's `ids [rows, topk]` (u32) → `rowids`
 /// (`rows·topk` ushort2), `blocks` (`3 · bound` u32), `meta` (1 u32, the
 /// block count). One threadgroup.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_moe_rowmap(
+pub unsafe fn call_moe_rowmap(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1175,20 +1203,23 @@ pub fn call_moe_rowmap(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "moe_rowmap rows={rows} topk={topk} E={n_experts}");
-    set_params!(
-        encoder,
-        (
-            (ids, ids_offset),
-            Output::new(rowids),
-            Output::new(blocks),
-            Output::new(meta),
-            (rows * topk) as u32,
-            topk as u32,
-            n_experts as u32,
-            block_n as u32,
-            bound as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (ids, ids_offset),
+                Output::new(rowids),
+                Output::new(blocks),
+                Output::new(meta),
+                (rows * topk) as u32,
+                topk as u32,
+                n_experts as u32,
+                block_n as u32,
+                bound as u32
+            )
+        );
+    }
     let width = 1024usize.min(pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -1213,8 +1244,13 @@ pub fn call_moe_rowmap(
 /// the rows routed to it, where the matmul-vec reads it once per row: the
 /// prefill tile's arm (`LLOOM_MOE_MM_FROM`). Not bit-identical to the
 /// matmul-vec: the weights dequantize to f16 for the simdgroup multiply.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mm_id_mapped(
+pub unsafe fn call_quantized_matmul_mm_id_mapped(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1279,28 +1315,31 @@ pub fn call_quantized_matmul_mm_id_mapped(
         encoder,
         "qmm_mm_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n} bn={bn}"
     );
-    set_params!(
-        encoder,
-        (
-            src0,
-            (src1, src1_offset),
-            Output::new(dst),
-            rowids,
-            blocks,
-            meta,
-            ne00,
-            ne02,
-            nb01,
-            nb02,
-            ne11,
-            ne12,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                src0,
+                (src1, src1_offset),
+                Output::new(dst),
+                rowids,
+                blocks,
+                meta,
+                ne00,
+                ne02,
+                nb01,
+                nb02,
+                ne11,
+                ne12,
+                nb10,
+                nb11,
+                nb12,
+                ne0,
+                ne1
+            )
+        );
+    }
     encoder.set_threadgroup_memory_length(0, 8192 + bn * 4);
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -1319,7 +1358,12 @@ pub fn call_quantized_matmul_mm_id_mapped(
 
 /// `kernel_dequant_rows_f16_*`: the quantized `[n, k]` `src` to half in
 /// `dst` (`n · k` halves). The prefill stems' dequantise-once (P26).
-pub fn call_quantized_dequant_rows_f16(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_quantized_dequant_rows_f16(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1351,7 +1395,10 @@ pub fn call_quantized_dequant_rows_f16(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "qdequant_rows_f16 {stem} n={n} k={k}");
-    set_params!(encoder, (src, Output::new(dst), k as i64, row_bytes as u64));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (src, Output::new(dst), k as i64, row_bytes as u64));
+    }
     let chunks = k / 16;
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -1380,8 +1427,13 @@ fn dtype_type_size(dtype: GgmlDType) -> usize {
 
 /// - src0 is usually weight
 /// - src1 is usually xs
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mm_t(
+pub unsafe fn call_quantized_matmul_mm_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1446,28 +1498,31 @@ pub fn call_quantized_matmul_mm_t(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "qmm_mm {name} M={ne11} K={ne00} N={ne01}");
 
-    set_params!(
-        encoder,
-        (
-            (src0, src0_offset),
-            (src1, src1_offset),
-            Output::with_offset(dst, dst_offset),
-            ne00,
-            ne02,
-            nb01,
-            nb02,
-            nb03,
-            ne12,
-            nb10,
-            nb11,
-            nb12,
-            nb13,
-            ne0,
-            ne1,
-            r2,
-            r3
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (src0, src0_offset),
+                (src1, src1_offset),
+                Output::with_offset(dst, dst_offset),
+                ne00,
+                ne02,
+                nb01,
+                nb02,
+                nb03,
+                ne12,
+                nb10,
+                nb11,
+                nb12,
+                nb13,
+                ne0,
+                ne1,
+                r2,
+                r3
+            )
+        );
+    }
 
     encoder.set_threadgroup_memory_length(0, 8192);
 
@@ -1475,8 +1530,12 @@ pub fn call_quantized_matmul_mm_t(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_get_rows(
+pub unsafe fn call_quantized_get_rows(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1518,22 +1577,25 @@ pub fn call_quantized_get_rows(
         depth: 1,
     };
 
-    set_params!(
-        encoder,
-        (
-            src,
-            (ids, ids_offset),
-            Output::new(dst),
-            hidden_size as i64,
-            row_stride as u64,
-            0u64,
-            ids_len as i64,
-            core::mem::size_of::<u32>() as u64,
-            0u64,
-            dst_row_stride as u64,
-            0u64
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                src,
+                (ids, ids_offset),
+                Output::new(dst),
+                hidden_size as i64,
+                row_stride as u64,
+                0u64,
+                ids_len as i64,
+                core::mem::size_of::<u32>() as u64,
+                0u64,
+                dst_row_stride as u64,
+                0u64
+            )
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -1583,8 +1645,13 @@ impl PairGrid {
 /// [`call_quantized_matmul_mv_id_t`]'s, with the same reach — the f16 arm on
 /// quantized weight rows only — and each plane computes exactly what that
 /// launch computes for it under the same triple.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_id2_t(
+pub unsafe fn call_quantized_matmul_mv_id2_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1678,35 +1745,38 @@ pub fn call_quantized_matmul_mv_id2_t(
         "qmm_mv_id2 {name} {grid:?} E={n_experts} B={batch} topk={topk} K={k} N={n}"
     );
 
-    set_params!(
-        encoder,
-        (
-            src0a,
-            src0b,
-            (src1, src1_offset),
-            Output::new(dst),
-            (ids, ids_offset),
-            nei0,
-            nei1,
-            nbi1,
-            ne00,
-            ne01,
-            ne02,
-            nb00,
-            nb01,
-            nb02,
-            ne10,
-            ne11,
-            ne12,
-            ne13,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            nb1
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                src0a,
+                src0b,
+                (src1, src1_offset),
+                Output::new(dst),
+                (ids, ids_offset),
+                nei0,
+                nei1,
+                nbi1,
+                ne00,
+                ne01,
+                ne02,
+                nb00,
+                nb01,
+                nb02,
+                ne10,
+                ne11,
+                ne12,
+                ne13,
+                nb10,
+                nb11,
+                nb12,
+                ne0,
+                ne1,
+                nb1
+            )
+        );
+    }
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
@@ -1746,39 +1816,47 @@ mod arm_tests {
     fn dispatch_plain(triple: GemvTriple) -> Result<(), MetalKernelError> {
         let (device, kernels, commands, buf) = setup();
         let encoder = commands.command_encoder().unwrap();
-        call_quantized_matmul_mv_t(
-            &device,
-            &encoder,
-            &kernels,
-            GgmlDType::Q4K,
-            triple,
-            (1, 1, 32, 256),
-            &buf,
-            0,
-            &buf,
-            0,
-            &buf,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_quantized_matmul_mv_t(
+                &device,
+                &encoder,
+                &kernels,
+                GgmlDType::Q4K,
+                triple,
+                (1, 1, 32, 256),
+                &buf,
+                0,
+                &buf,
+                0,
+                &buf,
+            )
+        }
     }
 
     fn dispatch_routed(triple: GemvTriple) -> Result<(), MetalKernelError> {
         let (device, kernels, commands, buf) = setup();
         let encoder = commands.command_encoder().unwrap();
-        call_quantized_matmul_mv_id_t(
-            &device,
-            &encoder,
-            &kernels,
-            GgmlDType::Q4K,
-            triple,
-            (2, 32, 256),
-            (1, 1, 1),
-            &buf,
-            &buf,
-            0,
-            &buf,
-            0,
-            &buf,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_quantized_matmul_mv_id_t(
+                &device,
+                &encoder,
+                &kernels,
+                GgmlDType::Q4K,
+                triple,
+                (2, 32, 256),
+                (1, 1, 1),
+                &buf,
+                &buf,
+                0,
+                &buf,
+                0,
+                &buf,
+            )
+        }
     }
 
     /// The int8 arm needs a feature no family registers, so both dispatches

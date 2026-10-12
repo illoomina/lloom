@@ -427,22 +427,26 @@ impl lloom_tensor::CustomOp3 for StepOp {
             .with_size_for(elem_count, f32)
             .with_label("gdn_o")
             .build()?;
-        lloom_tensor::kernels::call_gdn_step(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            d,
-            h_v,
-            bo(s1, l1),
-            bo(s2, l2),
-            bo(s3, l3),
-            bo(&bs, &bl),
-            bo(&as_, &al),
-            bo(&ss, &sl),
-            &output,
-            bo(&os, &ol),
-            self.form == GdnStepForm::Register,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_step(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                d,
+                h_v,
+                bo(s1, l1),
+                bo(s2, l2),
+                bo(s3, l3),
+                bo(&bs, &bl),
+                bo(&as_, &al),
+                bo(&ss, &sl),
+                &output,
+                bo(&os, &ol),
+                self.form == GdnStepForm::Register,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), elem_count, f32)?,
@@ -528,26 +532,30 @@ impl lloom_tensor::CustomOp3 for StepRowsOp {
             .with_size_for(elem_count, DType::F32)
             .with_label("gdn_o_rows")
             .build()?;
-        lloom_tensor::kernels::call_gdn_step_rows(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            rows,
-            d,
-            h_v,
-            self.s.n_slots,
-            self.s.n_phases,
-            bo(s1, l1),
-            bo(s2, l2),
-            bo(s3, l3),
-            bo(&bs, &bl),
-            bo(&as_, &al),
-            bo(&ps, &pl),
-            bo(&ss, &sl),
-            bo(&hs, &hl),
-            &output,
-            self.form == GdnStepForm::Register,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_step_rows(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                rows,
+                d,
+                h_v,
+                self.s.n_slots,
+                self.s.n_phases,
+                bo(s1, l1),
+                bo(s2, l2),
+                bo(s3, l3),
+                bo(&bs, &bl),
+                bo(&as_, &al),
+                bo(&ps, &pl),
+                bo(&ss, &sl),
+                bo(&hs, &hl),
+                &output,
+                self.form == GdnStepForm::Register,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(
@@ -638,26 +646,30 @@ impl lloom_tensor::CustomOp3 for StepSeqOp {
             .with_size_for(elem_count, DType::F32)
             .with_label("gdn_o_seq")
             .build()?;
-        lloom_tensor::kernels::call_gdn_step_seq(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            steps,
-            d,
-            h_v,
-            self.s.n_slots,
-            self.s.n_phases,
-            self.slot,
-            self.phase,
-            bo(s1, l1),
-            bo(s2, l2),
-            bo(s3, l3),
-            bo(&bs, &bl),
-            bo(&as_, &al),
-            bo(&ps, &pl),
-            &output,
-            self.form == GdnStepForm::Register,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_gdn_step_seq(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                steps,
+                d,
+                h_v,
+                self.s.n_slots,
+                self.s.n_phases,
+                self.slot,
+                self.phase,
+                bo(s1, l1),
+                bo(s2, l2),
+                bo(s3, l3),
+                bo(&bs, &bl),
+                bo(&as_, &al),
+                bo(&ps, &pl),
+                &output,
+                self.form == GdnStepForm::Register,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new_allocated(

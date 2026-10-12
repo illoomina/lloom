@@ -359,7 +359,18 @@ impl LoadContext {
 impl MachineLoad {
     /// Shared gate/log path. Add the exact pool term ONCE and retain its checked
     /// total for the load promise; neither public route reconstructs that sum.
-    fn admit_unattached(&self, peak: Peak, pool_bound: usize) -> Result<(Admitted, usize)> {
+    /// The gate this load is admitted through on `device`: the reserve's
+    /// basis is the device's working set where it is a Metal device.
+    pub fn gate_for(&self, device: &Device) -> Gate {
+        self.gate.with_device_working_set(working_set_bytes(device))
+    }
+
+    fn admit_unattached(
+        &self,
+        gate: &Gate,
+        peak: Peak,
+        pool_bound: usize,
+    ) -> Result<(Admitted, usize)> {
         let pool_bound = u64::try_from(pool_bound).map_err(lloom_tensor::Error::wrap)?;
         let peak = peak.with("pool free lists", pool_bound);
         let total = peak.checked_total().ok_or_else(|| {
@@ -371,7 +382,7 @@ impl MachineLoad {
         let bytes = usize::try_from(total).map_err(lloom_tensor::Error::wrap)?;
         // Even gate-off must not make an unrepresentable allocation possible.
         let t = std::time::Instant::now();
-        let admitted = self.gate.admit(&self.label, &peak)?;
+        let admitted = gate.admit(&self.label, &peak)?;
         eprintln!(
             "[machine: peak {} for {}; gate {:.0} us]",
             peak.describe(),
@@ -390,7 +401,8 @@ impl MachineLoad {
     /// Legacy route: preserves device-ledger attachment and visible policy
     /// logging. Checked augmented geometry precedes the gate, including off.
     pub fn admit(&self, device: &Device, peak: Peak) -> Result<Admitted> {
-        let (admitted, _) = self.admit_unattached(peak, pool_bound_bytes(device))?;
+        let (admitted, _) =
+            self.admit_unattached(&self.gate_for(device), peak, pool_bound_bytes(device))?;
         if let (Some(h), Some(_)) = (&admitted.holding, &admitted.verdict) {
             attach(device, h);
         }
@@ -406,7 +418,8 @@ impl MachineLoad {
         peak: Peak,
         quota: Option<usize>,
     ) -> Result<LoadContext> {
-        let (admitted, bytes) = self.admit_unattached(peak, pool_bound_bytes(device))?;
+        let (admitted, bytes) =
+            self.admit_unattached(&self.gate_for(device), peak, pool_bound_bytes(device))?;
         LoadContext::from_admitted(admitted, bytes, quota)
     }
 }
@@ -419,6 +432,16 @@ pub fn attach(device: &Device, holding: &std::sync::Arc<Holding>) {
         m.ledger().attach_machine(holding);
     }
     let _ = (device, holding);
+}
+
+/// Metal's `recommendedMaxWorkingSetSize` for `device`; `None` off Metal.
+pub fn working_set_bytes(device: &Device) -> Option<u64> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return Some(m.device().recommended_max_working_set_size() as u64);
+    }
+    let _ = device;
+    None
 }
 
 /// The pools' free lists at their caps: bytes the process may keep that no
@@ -460,7 +483,7 @@ mod load_context_tests {
             .is_err());
         assert!(off().admit(&Device::Cpu, peak).is_err());
         assert!(off()
-            .admit_unattached(Peak::new().with("a", u64::MAX), 1)
+            .admit_unattached(&off().gate, Peak::new().with("a", u64::MAX), 1)
             .is_err());
         #[cfg(target_pointer_width = "32")]
         assert!(off()
@@ -473,7 +496,7 @@ mod load_context_tests {
         // The actual helper used by both public routes; injected pool=5 keeps
         // this CPU-only while checking that the returned total includes it once.
         let (admitted, bytes) = off()
-            .admit_unattached(Peak::new().with("weights", 7), 5)
+            .admit_unattached(&off().gate, Peak::new().with("weights", 7), 5)
             .unwrap();
         assert_eq!(bytes, 12);
         let load = LoadContext::from_admitted(admitted, bytes, Some(16)).unwrap();

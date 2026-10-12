@@ -559,7 +559,7 @@ fn open<R: Read + Seek>(
                     };
                     let fixed = peak.total() as i128 + pool - (tile * per_tile_position) as i128;
                     let fits = m
-                        .gate
+                        .gate_for(&gg.device)
                         .room()
                         .map(|room| (room - fixed) / per_tile_position as i128);
                     match fits {

@@ -1421,7 +1421,7 @@ pub struct MemoryConfig {
     /// Load even when the machine gate refuses; the reservation is still recorded, so other lloom processes see it.
     #[opt(bool, path = "memory.machine.force", status = "stable", cli = "force")]
     pub force: bool,
-    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, 10 % of the machine's memory).
+    /// GB the machine gate keeps for macOS and the UI; none = max(4 GiB, the machine's memory less the Metal device's recommended working set), or max(4 GiB, 10 % of the machine's memory) with no Metal device.
     #[opt(path = "memory.machine.reserve_gb", status = "advanced")]
     pub machine_reserve_gb: Option<f64>,
     /// The directory of the machine-wide registry of lloom processes' reservations; none = ~/.cache/lloom/memory.
@@ -1460,6 +1460,7 @@ impl MemoryConfig {
             registry: self.machine_registry.clone(),
             available: self.machine_available_gb.map(bytes),
             total: None,
+            working_set: None,
             force: self.force,
             off: !self.machine_gate,
         })

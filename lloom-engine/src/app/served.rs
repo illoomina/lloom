@@ -90,6 +90,14 @@ pub trait Served: Send + Sync {
         )))
     }
 
+    /// The template binding this family's decision executor was built with:
+    /// the native decision type the checkpoint is (`None` for a template
+    /// `decision.template` selected) and where the template came from.
+    /// `None` where the family does not say (an owner bound elsewhere).
+    fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
+        None
+    }
+
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;
     /// Fallible request seam for admitted adapters; existing families preserve

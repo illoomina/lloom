@@ -325,6 +325,9 @@ pub struct Engine<P: Profile> {
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
     private_cache: PrivateCachePolicy,
+    /// `/v1/systemone`'s executor binding: a native d1 checkpoint's own, or
+    /// the template `decision.template` selected; `None` refuses by name.
+    decisions: Option<ServedDecisions>,
     single: parking_lot::Mutex<Option<RequestState<State<P>, SingleExtra>>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -372,6 +375,10 @@ pub struct LoadOptions {
     /// `--flash-k`: pages per FlashDecoding chunk (the model's
     /// `flash_pages_per_chunk`), under `--attn flash` only.
     pub flash_k: Option<usize>,
+    /// `decision.template`: the systemone template the decision executor
+    /// renders, when the checkpoint is not a native decision model or a
+    /// different template is wanted (`decision::binding::Selection`).
+    pub decision_template: Option<String>,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -544,6 +551,122 @@ pub fn load(opts: LoadOptions) -> Result<Box<dyn super::served::Served>> {
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => {
         Engine::<P>::load_as(opts).map(|e| Box::new(e) as Box<dyn super::served::Served>)
     })
+}
+
+/// The bounds a served `/v1/systemone` request's images decode under.
+const SERVED_DECISION_IMAGES: super::vision::ImageDecodeLimits = super::vision::ImageDecodeLimits {
+    max_encoded_bytes: 64 << 20,
+    max_width: 16384,
+    max_height: 16384,
+    max_pixels: 64 << 20,
+    max_decoder_bytes: 3 * (64 << 20),
+};
+
+/// A served LFM2's decision executor: the bound template and its request
+/// limits (llama.cpp's for `lfm2-d1`: 255 options, `true`/`false` noul keys,
+/// a null state allowed), and what the load line and `/v1/models` say of it.
+struct ServedDecisions {
+    policy: super::causal_loaded::CausalPolicy,
+    native: Option<crate::decision::binding::DecisionType>,
+    origin: String,
+}
+
+impl ServedDecisions {
+    /// The binding `config.json` and `decision.template` resolve to, before
+    /// any weight is read. `generic` is the front end's (it reads through
+    /// `Served` alone), so the family builds nothing for it.
+    fn resolve(config: &Value, selection: Option<&str>) -> Result<Option<Self>> {
+        use crate::decision::binding::{self, Binding, CheckpointDecision, Selection};
+        let selection = Selection::parse(selection)?;
+        let facts = CheckpointDecision::from_config(config)?;
+        let binding = binding::resolve(
+            &selection,
+            &facts,
+            crate::decision::SystemOneTemplateKind::D1Causal,
+        )
+        .context("decision.template")?;
+        Ok(match binding {
+            Some(Binding::Template(binding)) if !binding.template.has_causal_certificate() => {
+                anyhow::bail!(
+                    "decision.template {}: the shared-state renderer reads only the audited \
+                     lfm2-d1 template (its state is rendered before any question), and this one \
+                     is not byte-identical to it",
+                    binding.origin
+                )
+            }
+            Some(Binding::Template(binding)) => Some(Self {
+                policy: super::causal_loaded::CausalPolicy {
+                    template: binding.template,
+                    calibration: binding.calibration,
+                    max_options: 255,
+                    noul_aliases: crate::decision::NoulAliases::TrueFalseOnly,
+                    state_nullability: crate::decision::StateNullability::AllowNull,
+                },
+                native: binding.native,
+                origin: binding.origin,
+            }),
+            Some(Binding::Generic) | None => None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod served_decisions_tests {
+    use super::ServedDecisions;
+    use crate::decision::binding::DecisionType;
+    use serde_json::json;
+
+    fn d1() -> serde_json::Value {
+        json!({"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}})
+    }
+
+    /// A native d1-3B config binds its shipped template with no selection; a
+    /// plain LFM2-VL binds nothing unless `decision.template` names one, and
+    /// then it is not native (so `/v1/models` does not advertise decisions).
+    #[test]
+    fn native_config_binds_itself_and_a_plain_one_only_when_selected() {
+        let native = ServedDecisions::resolve(&d1(), None).unwrap().unwrap();
+        assert_eq!(native.native, Some(DecisionType::Lfm2D1));
+        assert!(native
+            .origin
+            .starts_with("lfm2-d1 (engine-shipped, sha256 b47201d7"));
+        assert_eq!(native.policy.max_options, 255);
+        let plain = json!({"model_type": "lfm2_vl"});
+        assert!(ServedDecisions::resolve(&plain, None).unwrap().is_none());
+        assert!(ServedDecisions::resolve(&plain, Some("generic"))
+            .unwrap()
+            .is_none());
+        let selected = ServedDecisions::resolve(&plain, Some("lfm2-d1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.native, None);
+        assert!(selected.policy.template.has_causal_certificate());
+    }
+
+    /// What this family cannot render is refused at load, by name: the omni
+    /// layout, and a template the shared-state renderer was not audited for.
+    #[test]
+    fn omni_and_uncertified_templates_are_refused_at_load() {
+        let omni = json!({"model_type": "d1_omni"});
+        let error = ServedDecisions::resolve(&omni, None).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("lfm2-d1-omni decision model"),
+            "{error:#}"
+        );
+        let dir = std::env::temp_dir().join(format!("lloom947-template-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.jinja");
+        std::fs::write(&path, "{{ state }}QUESTION:{{ instructions }}").unwrap();
+        let error = ServedDecisions::resolve(&d1(), path.to_str())
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("not byte-identical"),
+            "{error:#}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }
 
 /// Internal choice only: CallerScoped is reached exclusively inside Loaded::new.
@@ -736,6 +859,7 @@ impl<P: Lfm2Shape> Engine<P> {
         let config_bytes = std::fs::read(model_dir.join("config.json"))?;
         let root: Value = serde_json::from_slice(&config_bytes).context("parsing config.json")?;
         let vl = root.get("vision_config").is_some();
+        let decisions = ServedDecisions::resolve(&root, opts.decision_template.as_deref())?;
         let config: Lfm2Config = if vl {
             text_config_of(&root)?
         } else {
@@ -1163,6 +1287,7 @@ impl<P: Lfm2Shape> Engine<P> {
             load_warnings,
             machine,
             private_cache,
+            decisions,
             single: parking_lot::Mutex::new(Some(RequestState {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -3005,7 +3130,29 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         self.generation.clone()
     }
     fn capabilities(&self) -> super::family::Capabilities {
-        super::family::LFM2_CAPABILITIES
+        super::family::Capabilities {
+            decisions: self.decisions.is_some(),
+            ..super::family::LFM2_CAPABILITIES
+        }
+    }
+    fn systemone(
+        &self,
+        body: &crate::decision::OrderedJson,
+    ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+    {
+        let Some(decisions) = &self.decisions else {
+            return Err(crate::decision::SystemOneError::Unsupported(format!(
+                "{} has no decision template: it is not a native decision checkpoint and \
+                 decision.template selected none",
+                self.model_name
+            )));
+        };
+        self.systemone_images_in_scope(body, &decisions.policy, SERVED_DECISION_IMAGES)
+    }
+    fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
+        self.decisions
+            .as_ref()
+            .map(|decisions| (decisions.native, decisions.origin.clone()))
     }
     fn load_warnings(&self) -> Vec<LoadWarning> {
         let mut w = self.load_warnings.clone();

@@ -38,3 +38,6 @@ mod contract_tests;
 
 #[cfg(test)]
 mod session_tests;
+
+#[cfg(test)]
+mod tree_identity_tests;

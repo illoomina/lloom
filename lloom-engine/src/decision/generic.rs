@@ -205,12 +205,19 @@ pub struct LabelRead {
     pub input_tokens: u64,
 }
 
-/// Per-question signal that the uncalibrated read is or is not about labels.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+/// Per-question read diagnostics, serialized after `usage`. The generic read
+/// says whether it was about labels (`label_mass`, `argmax_is_label`); a
+/// template binding with no slot for the request's `instructions` says it
+/// ignored them, as llama.cpp does silently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Diagnostics {
     /// The labels' total probability over the whole vocabulary.
-    pub label_mass: f64,
-    pub argmax_is_label: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_mass: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argmax_is_label: Option<bool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub instructions_ignored: bool,
 }
 
 /// The answers, in question order, from each question's read.
@@ -236,8 +243,9 @@ pub fn answers(
         diagnostics.push((
             id.clone(),
             Diagnostics {
-                label_mass: read.logprobs.iter().map(|&lp| f64::from(lp).exp()).sum(),
-                argmax_is_label: ids.contains(&read.argmax),
+                label_mass: Some(read.logprobs.iter().map(|&lp| f64::from(lp).exp()).sum()),
+                argmax_is_label: Some(ids.contains(&read.argmax)),
+                instructions_ignored: false,
             },
         ));
         input_tokens = input_tokens

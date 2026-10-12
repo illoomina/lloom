@@ -15,9 +15,12 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 
 pub(crate) enum Decisions {
-    /// The family's own executor, built with its binding.
+    /// The family's own executor, built with its binding: the native
+    /// decision type it is, and where its template came from when the family
+    /// says (`Served::decision_binding`).
     Family {
         native: Option<DecisionType>,
+        origin: Option<String>,
     },
     Generic(Generic),
     /// No binding: the refusal names why and what would give one.
@@ -54,9 +57,28 @@ impl Decisions {
                 }
                 Self::Generic(Generic::probe(engine)?)
             }
-            Selection::Auto if capabilities.decisions => Self::Family {
-                native: facts.decision_type,
+            Selection::Auto if capabilities.decisions => match engine.decision_binding() {
+                Some((native, origin)) => Self::Family {
+                    native,
+                    origin: Some(origin),
+                },
+                None => Self::Family {
+                    native: facts.decision_type,
+                    origin: None,
+                },
             },
+            // The family loaded with the same `decision.template` and bound it.
+            Selection::Shipped(_) | Selection::Path(_)
+                if capabilities.decisions && engine.decision_binding().is_some() =>
+            {
+                let (native, origin) = engine
+                    .decision_binding()
+                    .expect("checked by the guard above");
+                Self::Family {
+                    native,
+                    origin: Some(origin),
+                }
+            }
             Selection::Auto => match facts.decision_type {
                 Some(native) => Self::Refused(format!(
                     "{} is a native {} decision checkpoint, but the {family} family serving it has no \
@@ -82,9 +104,14 @@ impl Decisions {
     pub(crate) fn describe(&self) -> Option<String> {
         match self {
             Self::Family {
+                origin: Some(origin),
+                ..
+            } => Some(format!("decision template: {origin}")),
+            Self::Family {
                 native: Some(native),
+                ..
             } => Some(format!("decision template: {} (native)", native.name())),
-            Self::Family { native: None } => Some("decision template: the owner's".into()),
+            Self::Family { .. } => Some("decision template: the owner's".into()),
             Self::Generic(_) => Some("decision template: generic (uncalibrated)".into()),
             Self::Refused(_) => None,
         }
@@ -97,6 +124,7 @@ impl Decisions {
         match self {
             Self::Family {
                 native: Some(native),
+                ..
             } => {
                 if native.generates() && generates {
                     out.push("text");
@@ -114,7 +142,18 @@ impl Decisions {
         body: &OrderedJson,
     ) -> std::result::Result<SystemOneResponse, SystemOneError> {
         match self {
-            Self::Family { .. } => engine.systemone(body),
+            // A template binding renders each question's own instructions; a
+            // request-level `instructions` has no slot in it and is ignored,
+            // as llama.cpp ignores it, but said so per answer.
+            Self::Family { .. } => {
+                engine
+                    .systemone(body)
+                    .map(|response| match body.get("instructions") {
+                        None | Some(OrderedJson::Null) => response,
+                        Some(OrderedJson::String(text)) if text.is_empty() => response,
+                        Some(_) => response.with_instructions_ignored(),
+                    })
+            }
             Self::Generic(generic) => generic.decide(engine, body),
             Self::Refused(reason) => Err(SystemOneError::Unsupported(reason.clone())),
         }
@@ -273,6 +312,7 @@ mod tests {
         capabilities: Capabilities,
         thinking: Option<bool>,
         prompts: Mutex<Vec<String>>,
+        binding: Option<(Option<DecisionType>, String)>,
     }
 
     fn toy() -> Toy {
@@ -281,6 +321,7 @@ mod tests {
             capabilities: LFM2_CAPABILITIES,
             thinking: None,
             prompts: Mutex::new(Vec::new()),
+            binding: None,
         }
     }
 
@@ -299,6 +340,23 @@ mod tests {
     impl Served for Toy {
         fn device(&self) -> &Device {
             &self.device
+        }
+        fn decision_binding(&self) -> Option<(Option<DecisionType>, String)> {
+            self.binding.clone()
+        }
+        /// A family executor's answer: one noul at P(yes) = 0.75.
+        fn systemone(
+            &self,
+            _: &OrderedJson,
+        ) -> std::result::Result<SystemOneResponse, SystemOneError> {
+            let question = crate::decision::Question::Noul {
+                instructions: OrderedJson::String("?".into()),
+                criteria: None,
+            };
+            let answer = question
+                .systemone_answer(&[0.75, 0.25])
+                .map_err(|error| SystemOneError::Execution(error.to_string()))?;
+            SystemOneResponse::new(vec![("q".into(), answer)], 3)
         }
         fn model_name(&self) -> &str {
             "toy"
@@ -529,6 +587,47 @@ mod tests {
         );
     }
 
+    /// A family that bound a template answers through it: the load line names
+    /// the binding, a selected template is not advertised as native, and a
+    /// request-level `instructions` is accepted, ignored and said so.
+    #[test]
+    fn a_family_binding_is_named_and_ignored_instructions_are_reported() {
+        let mut engine = toy();
+        engine.capabilities.decisions = true;
+        engine.binding = Some((None, "lfm2-d1 (engine-shipped, sha256 b47201d7…)".into()));
+        let selected = Decisions::resolve(Some("lfm2-d1"), &engine, None).unwrap();
+        assert_eq!(
+            selected.describe().as_deref(),
+            Some("decision template: lfm2-d1 (engine-shipped, sha256 b47201d7…)")
+        );
+        assert_eq!(selected.output_modalities(true), ["text"]);
+        let plain = selected
+            .decide(&engine, &body(r#"{"state":"x","questions":{}}"#))
+            .unwrap();
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("diagnostics")
+            .is_none());
+        let ignored = selected
+            .decide(
+                &engine,
+                &body(r#"{"state":"x","instructions":"Be brief.","questions":{}}"#),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(&ignored).unwrap();
+        assert_eq!(wire["answers"]["q"]["noul"], 0.75);
+        assert_eq!(
+            wire["diagnostics"]["q"],
+            json!({"instructions_ignored": true})
+        );
+        engine.binding = Some((Some(DecisionType::Lfm2D1), "lfm2-d1 (native)".into()));
+        let native = Decisions::resolve(None, &engine, None).unwrap();
+        assert_eq!(native.output_modalities(true), ["text", "decisions"]);
+        // Without an installed executor a selected template is a load error.
+        engine.capabilities.decisions = false;
+        assert!(Decisions::resolve(Some("lfm2-d1"), &engine, None).is_err());
+    }
+
     #[test]
     fn a_native_checkpoint_is_named_and_only_native_advertises_decisions() {
         let dir = std::env::temp_dir().join(format!("lloom-d1-binding-{}", std::process::id()));
@@ -552,7 +651,8 @@ mod tests {
         assert_eq!(native.output_modalities(true), ["text", "decisions"]);
         assert_eq!(
             Decisions::Family {
-                native: Some(DecisionType::Lfm2D1Omni)
+                native: Some(DecisionType::Lfm2D1Omni),
+                origin: None,
             }
             .output_modalities(false),
             ["decisions"]

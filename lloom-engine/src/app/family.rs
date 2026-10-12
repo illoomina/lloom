@@ -468,6 +468,7 @@ impl Family for Lfm2Family {
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
             flash_k: model.flash_k,
+            decision_template: model.decision_template.clone(),
         })
     }
 }

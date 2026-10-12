@@ -54,6 +54,30 @@ impl SystemOneResponse {
         self.diagnostics = Some(diagnostics);
         self
     }
+    /// Mark every answer: the request's `instructions` reached no template slot.
+    pub fn with_instructions_ignored(mut self) -> Self {
+        let diagnostics = match self.diagnostics.take() {
+            Some(diagnostics) => diagnostics,
+            None => self
+                .answers
+                .iter()
+                .map(|(id, _)| (id.clone(), Default::default()))
+                .collect(),
+        };
+        self.diagnostics = Some(
+            diagnostics
+                .into_iter()
+                .map(|(id, entry)| {
+                    let entry = super::generic::Diagnostics {
+                        instructions_ignored: true,
+                        ..entry
+                    };
+                    (id, entry)
+                })
+                .collect(),
+        );
+        self
+    }
     pub fn diagnostics(&self) -> Option<&[(String, super::generic::Diagnostics)]> {
         self.diagnostics.as_deref()
     }

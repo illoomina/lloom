@@ -56,6 +56,27 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// the campaign must not execute bytes it failed to record.
 pub const MAX_INPUT: usize = 64 * 1024;
 
+/// Logical replay work/metadata quotas, not a process RSS or allocator quota.
+/// Larger old records remain supported through explicit larger limits. These
+/// limits never bypass identity, completion, per-input size or digest checks.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayLimits {
+    pub max_inputs: usize,
+    pub max_directory_entries: usize,
+    pub max_metadata_bytes: usize,
+    pub max_total_input_bytes: u64,
+}
+impl Default for ReplayLimits {
+    fn default() -> Self {
+        Self {
+            max_inputs: 4096,
+            max_directory_entries: 8192,
+            max_metadata_bytes: 8 * 1024 * 1024,
+            max_total_input_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
 struct Ring {
     inputs: InputRing,
     dir: PathBuf,
@@ -266,12 +287,33 @@ pub fn replay_with_identity<F>(
     path: &Path,
     expected: Option<&[u8]>,
     allow_mismatch: bool,
+    harness: F,
+) -> Result<usize, (usize, String)>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
+    replay_with_identity_and_limits(
+        path,
+        expected,
+        allow_mismatch,
+        ReplayLimits::default(),
+        harness,
+    )
+}
+
+/// Same replay contract with caller-selected finite metadata/work limits.
+/// Raising a limit supports larger archives; it is not an integrity override.
+pub fn replay_with_identity_and_limits<F>(
+    path: &Path,
+    expected: Option<&[u8]>,
+    allow_mismatch: bool,
+    limits: ReplayLimits,
     mut harness: F,
 ) -> Result<usize, (usize, String)>
 where
     F: FnMut(&[u8]) -> Result<(), String>,
 {
-    let replay = archive::prepare(path, MAX_INPUT)
+    let replay = archive::prepare_with_limits(path, MAX_INPUT, limits)
         .map_err(|error| (0, format!("{}: {error}", path.display())))?;
     let matched = archive::check_identity(replay.identity.as_deref(), expected, allow_mismatch)
         .map_err(|error| (0, format!("{}: {error}", path.display())))?;

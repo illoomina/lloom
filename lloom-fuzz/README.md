@@ -124,9 +124,10 @@ controlled schedule. The executable hash is not an immutable loaded-image
 attestation. V3 records verify every input digest before the first target and recheck the
 actual owned bytes at invocation, detecting same-length input replacements.
 This is not authenticated storage or an atomic multi-file snapshot: jointly
-rewriting the manifest and inputs is outside this integrity contract. Directory
-and manifest metadata reads remain unbounded; signal-safe capture and total
-archive-memory admission are still open. Do not modify a record during replay.
+rewriting the manifest and inputs is outside this integrity contract. Replay bounds directory traversal, input count,
+aggregate metadata and total declared input bytes with configurable limits.
+These are logical work limits, not an RSS or allocator quota. Signal-safe capture,
+record-ring allocation admission and writer-side archive bounds remain open. Do not modify a record during replay.
 Replay in one fresh process:
 
 ```sh
@@ -159,3 +160,20 @@ Measured: the campaign's solution replays clean under `--once`; the record
   every copy against what it wrote.
 - The paged pool has no bytes to poison; its partition invariant (every page
   in exactly one of free / allocated / quarantined) is the sentinel.
+
+### Replay work limits
+
+All existing replay formats remain supported. Defaults are 4096 inputs, 8192
+visited directory entries (including ignored non-input files), 8 MiB aggregate
+format/manifest/identity/input-path bytes and 256 MiB total declared input bytes.
+Each input remains limited to 64 KiB. Validation finishes before the first target;
+metadata files are size-checked and streamed within their remaining budget.
+Directory enumeration may consume one refusal lookahead entry.
+
+Larger archives can explicitly raise `--replay-max-inputs`, `--replay-max-entries`,
+`--replay-max-metadata-bytes` and `--replay-max-total-input-bytes`; these flags
+require `--replay`. Programmatic callers use `ReplayLimits` with
+`replay_with_identity_and_limits`. Neither larger budgets nor the identity
+override bypass completion, per-input size or v3 content integrity. Allocation
+overheads are bounded by counts but not included in metadata-byte accounting;
+filesystem latency and concurrent file replacement are not bounded by these quotas.

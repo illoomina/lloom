@@ -96,11 +96,56 @@ fn sort_numbered(entries: &mut [(usize, PathBuf)]) {
     entries.sort_by_key(|(index, _)| *index);
 }
 
+#[cfg(test)]
 fn ordered(entries: impl Iterator<Item = io::Result<PathBuf>>) -> io::Result<Vec<PathBuf>> {
+    ordered_with_limits(
+        entries,
+        &mut MetadataBudget::new(super::ReplayLimits::default()),
+    )
+}
+
+struct MetadataBudget {
+    limits: super::ReplayLimits,
+    bytes: usize,
+}
+impl MetadataBudget {
+    fn new(limits: super::ReplayLimits) -> Self {
+        Self { limits, bytes: 0 }
+    }
+    fn add(&mut self, bytes: usize) -> io::Result<()> {
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("replay metadata budget overflow"))?;
+        if total > self.limits.max_metadata_bytes {
+            return Err(invalid(
+                "replay metadata budget exceeded; raise the explicit replay metadata limit",
+            ));
+        }
+        self.bytes = total;
+        Ok(())
+    }
+}
+
+fn ordered_with_limits(
+    entries: impl Iterator<Item = io::Result<PathBuf>>,
+    budget: &mut MetadataBudget,
+) -> io::Result<Vec<PathBuf>> {
     let mut numbered = Vec::new();
-    for entry in entries {
+    for (seen, entry) in entries.enumerate() {
+        if seen >= budget.limits.max_directory_entries {
+            return Err(invalid(
+                "replay directory entry budget exceeded; raise the explicit replay entry limit",
+            ));
+        }
         let path = entry?; // A failed directory entry is not an absent input.
         if path.extension().is_some_and(|x| x == "bin") {
+            if numbered.len() >= budget.limits.max_inputs {
+                return Err(invalid(
+                    "replay input count budget exceeded; raise the explicit replay input limit",
+                ));
+            }
+            budget.add(path.as_os_str().as_encoded_bytes().len())?;
             numbered.push((index(&path)?, path));
         }
     }
@@ -118,9 +163,18 @@ fn ordered(entries: impl Iterator<Item = io::Result<PathBuf>>) -> io::Result<Vec
     Ok(numbered.into_iter().map(|(_, path)| path).collect())
 }
 
-fn optional(path: &Path) -> io::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(value) => Ok(Some(value)),
+fn optional(path: &Path, budget: &mut MetadataBudget) -> io::Result<Option<String>> {
+    let remaining = budget
+        .limits
+        .max_metadata_bytes
+        .saturating_sub(budget.bytes);
+    match read_single(path, remaining) {
+        Ok(value) => {
+            budget.add(value.len())?;
+            String::from_utf8(value)
+                .map(Some)
+                .map_err(|_| invalid("non-UTF8 replay metadata"))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -138,10 +192,20 @@ pub(super) struct Replay {
 /// Validate every directory entry and declared size before executing the first
 /// target. Legacy directories remain readable with explicitly weaker guarantees:
 /// their missing final input cannot be detected without a completion manifest.
+#[cfg(test)]
 pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
+    prepare_with_limits(path, maximum, super::ReplayLimits::default())
+}
+
+pub(super) fn prepare_with_limits(
+    path: &Path,
+    maximum: usize,
+    limits: super::ReplayLimits,
+) -> io::Result<Replay> {
+    let mut budget = MetadataBudget::new(limits);
     let (paths, manifest, legacy, format, identity) = if path.is_dir() {
-        let format = optional(&path.join(FORMAT_FILE))?;
-        let manifest = optional(&path.join(COMPLETE_FILE))?;
+        let format = optional(&path.join(FORMAT_FILE), &mut budget)?;
+        let manifest = optional(&path.join(COMPLETE_FILE), &mut budget)?;
         match (&format, &manifest) {
             (Some(format), Some(_))
                 if format == FORMAT
@@ -161,12 +225,18 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
             format.as_deref(),
             Some(IDENTIFIED_FORMAT | LEGACY_IDENTIFIED_FORMAT)
         ) {
-            let bytes = read_single(&path.join(IDENTITY_FILE), MAX_IDENTITY).map_err(|error| {
+            let remaining = budget
+                .limits
+                .max_metadata_bytes
+                .saturating_sub(budget.bytes)
+                .min(MAX_IDENTITY);
+            let bytes = read_single(&path.join(IDENTITY_FILE), remaining).map_err(|error| {
                 io::Error::new(error.kind(), format!("{IDENTITY_FILE}: {error}"))
             })?;
             if bytes.is_empty() {
                 return Err(invalid("empty record identity"));
             }
+            budget.add(bytes.len())?;
             Some(bytes)
         } else {
             if path.join(IDENTITY_FILE).try_exists()? {
@@ -176,15 +246,34 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
             }
             None
         };
-        let paths = ordered(fs::read_dir(path)?.map(|entry| entry.map(|entry| entry.path())))?;
+        let paths = ordered_with_limits(
+            fs::read_dir(path)?.map(|entry| entry.map(|entry| entry.path())),
+            &mut budget,
+        )?;
         let legacy = format.is_none();
         (paths, manifest, legacy, format, identity)
     } else {
+        if limits.max_inputs == 0 {
+            return Err(invalid(
+                "replay input count budget exceeded; raise the explicit replay input limit",
+            ));
+        }
+        budget.add(path.as_os_str().as_encoded_bytes().len())?;
         (vec![path.to_path_buf()], None, false, None, None)
     };
     let mut lengths = Vec::with_capacity(paths.len());
+    let mut total_input_bytes = 0u64;
     for path in &paths {
-        lengths.push(input_length(path, maximum)?);
+        let length = input_length(path, maximum)?;
+        total_input_bytes = total_input_bytes
+            .checked_add(length)
+            .ok_or_else(|| invalid("replay total input budget overflow"))?;
+        if total_input_bytes > limits.max_total_input_bytes {
+            return Err(invalid(
+                "replay total input byte budget exceeded; raise the explicit replay byte limit",
+            ));
+        }
+        lengths.push(length);
     }
     let mut digests = (format.as_deref() == Some(IDENTIFIED_FORMAT)).then(Vec::new);
     if let Some(manifest) = manifest {
@@ -491,6 +580,215 @@ mod tests {
             5,
             "oversized input read before validation"
         );
+    }
+
+    #[test]
+    fn replay_input_budget_counts_empty_inputs_and_can_be_raised() {
+        let tmp = Temp::new();
+        let dir = tmp.archive();
+        write(&dir, [b"".as_slice(); 4].into_iter(), b"reason").unwrap();
+        let mut limits = super::super::ReplayLimits {
+            max_inputs: 3,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error =
+            super::super::replay_with_identity_and_limits(&dir, None, false, limits, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.1.contains("input count budget exceeded"), "{error:?}");
+        assert_eq!(calls, 0, "input-count refusal executed a target");
+        limits.max_inputs = 4;
+        assert_eq!(
+            super::super::replay_with_identity_and_limits(&dir, None, false, limits, |bytes| {
+                assert!(bytes.is_empty());
+                calls += 1;
+                Ok(())
+            })
+            .unwrap(),
+            4
+        );
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn replay_total_byte_budget_precedes_every_target_and_retains_integrity() {
+        let tmp = Temp::new();
+        let dir = tmp.archive();
+        write_identified(
+            &dir,
+            [b"B".as_slice(), b"C"].into_iter(),
+            b"reason",
+            Some(b"identity"),
+        )
+        .unwrap();
+        let mut limits = super::super::ReplayLimits {
+            max_total_input_bytes: 1,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error = super::super::replay_with_identity_and_limits(
+            &dir,
+            Some(b"identity"),
+            false,
+            limits,
+            |_| {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.1.contains("total input byte budget exceeded"),
+            "{error:?}"
+        );
+        assert_eq!(calls, 0);
+        limits.max_total_input_bytes = 2;
+        assert_eq!(
+            super::super::replay_with_identity_and_limits(
+                &dir,
+                Some(b"identity"),
+                false,
+                limits,
+                |_| {
+                    calls += 1;
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            2
+        );
+        fs::write(dir.join(format!("{:020}.bin", 1)), b"X").unwrap();
+        let error = super::super::replay_with_identity_and_limits(&dir, None, true, limits, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.1.contains("content digest differs"), "{error:?}");
+        assert_eq!(
+            calls, 2,
+            "raised limits/identity override bypassed content integrity"
+        );
+    }
+
+    #[test]
+    fn replay_metadata_file_is_bounded_before_target() {
+        let tmp = Temp::new();
+        let dir = tmp.archive();
+        fixture(&dir);
+        fs::write(dir.join(COMPLETE_FILE), [b'x'; 64]).unwrap();
+        let limits = super::super::ReplayLimits {
+            max_metadata_bytes: FORMAT.len() + 63,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error =
+            super::super::replay_with_identity_and_limits(&dir, None, false, limits, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.1.contains("63-byte bound"), "{error:?}");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn replay_metadata_budget_includes_all_paths_and_exact_limit_recovers() {
+        let tmp = Temp::new();
+        let dir = tmp.archive();
+        fixture(&dir);
+        let paths = [
+            dir.join(format!("{:020}.bin", 0)),
+            dir.join(format!("{:020}.bin", 1)),
+        ];
+        let metadata = FORMAT.len() + fs::metadata(dir.join(COMPLETE_FILE)).unwrap().len() as usize;
+        let total = metadata
+            + paths
+                .iter()
+                .map(|p| p.as_os_str().as_encoded_bytes().len())
+                .sum::<usize>();
+        let limits = super::super::ReplayLimits {
+            max_metadata_bytes: total - 1,
+            ..Default::default()
+        };
+        let error = prepare_with_limits(&dir, 4, limits).unwrap_err();
+        assert!(
+            error.to_string().contains("metadata budget exceeded"),
+            "{error:?}"
+        );
+        let replay = prepare_with_limits(
+            &dir,
+            4,
+            super::super::ReplayLimits {
+                max_metadata_bytes: total,
+                ..limits
+            },
+        )
+        .unwrap();
+        assert_eq!(replay.paths, paths);
+        assert_eq!(replay.lengths, [1, 1]);
+    }
+
+    #[test]
+    fn replay_directory_budget_counts_ignored_entries_with_bounded_lookahead() {
+        let mut visited = 0;
+        let entries = [
+            "0000.bin",
+            "ignored-a",
+            "ignored-b",
+            "ignored-c",
+            "ignored-d",
+        ]
+        .into_iter()
+        .map(|path| {
+            visited += 1;
+            Ok(PathBuf::from(path))
+        });
+        let limits = super::super::ReplayLimits {
+            max_directory_entries: 2,
+            ..Default::default()
+        };
+        let error = ordered_with_limits(entries, &mut MetadataBudget::new(limits)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("directory entry budget exceeded"),
+            "{error:?}"
+        );
+        assert_eq!(
+            visited, 3,
+            "directory scan continued past one refusal lookahead"
+        );
+        let replay = ordered_with_limits(
+            ["ignored", "0000.bin"]
+                .into_iter()
+                .map(|p| Ok(PathBuf::from(p))),
+            &mut MetadataBudget::new(limits),
+        )
+        .unwrap();
+        assert_eq!(replay, [PathBuf::from("0000.bin")]);
+    }
+
+    #[test]
+    fn replay_zero_input_budget_refuses_single_file_before_target() {
+        let tmp = Temp::new();
+        let input = tmp.0.join("input.bin");
+        fs::write(&input, b"").unwrap();
+        let limits = super::super::ReplayLimits {
+            max_inputs: 0,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error =
+            super::super::replay_with_identity_and_limits(&input, None, false, limits, |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.1.contains("input count budget exceeded"), "{error:?}");
+        assert_eq!(calls, 0);
     }
 }
 

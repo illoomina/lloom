@@ -70,7 +70,7 @@ use libafl_bolts::{
 };
 use libafl_targets::{std_edges_map_observer, EDGES_MAP_DEFAULT_SIZE, MAX_EDGES_FOUND};
 
-use crate::record::{replay_with_identity, Record};
+use crate::record::{replay_with_identity_and_limits, Record, ReplayLimits};
 
 /// Points in the shape map. Sized for the probes' `(site, condition,
 /// outcome)` triples and the census labels with room to spare; a
@@ -192,6 +192,18 @@ pub struct Cli {
     /// not certify exact replay and never bypasses format/size/completion checks.
     #[arg(long, requires = "replay")]
     pub replay_unchecked_identity: bool,
+    /// Override the replay input-count budget (default 4096).
+    #[arg(long, requires = "replay")]
+    pub replay_max_inputs: Option<usize>,
+    /// Override all visited directory entries, including non-input files (default 8192).
+    #[arg(long, requires = "replay")]
+    pub replay_max_entries: Option<usize>,
+    /// Override aggregate format/manifest/identity/path bytes (default 8 MiB).
+    #[arg(long, requires = "replay")]
+    pub replay_max_metadata_bytes: Option<usize>,
+    /// Override total declared input bytes across the record (default 256 MiB).
+    #[arg(long, requires = "replay")]
+    pub replay_max_total_input_bytes: Option<u64>,
     /// Print the instrumentation readout (guards, map size) and exit.
     #[arg(long)]
     pub instrumentation: bool,
@@ -313,10 +325,24 @@ where
     }
     if let Some(path) = &cli.replay {
         let h = Rc::clone(&harness);
-        return match replay_with_identity(
+        let defaults = ReplayLimits::default();
+        let limits = ReplayLimits {
+            max_inputs: cli.replay_max_inputs.unwrap_or(defaults.max_inputs),
+            max_directory_entries: cli
+                .replay_max_entries
+                .unwrap_or(defaults.max_directory_entries),
+            max_metadata_bytes: cli
+                .replay_max_metadata_bytes
+                .unwrap_or(defaults.max_metadata_bytes),
+            max_total_input_bytes: cli
+                .replay_max_total_input_bytes
+                .unwrap_or(defaults.max_total_input_bytes),
+        };
+        return match replay_with_identity_and_limits(
             path,
             Some(&identity),
             cli.replay_unchecked_identity,
+            limits,
             move |bytes| {
                 record
                     .push(bytes)
@@ -573,5 +599,45 @@ fn remove_stale_shmem_server_socket() {
             "removed a stale {} (nothing was listening on it)",
             path.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_cli_tests {
+    use super::*;
+    #[test]
+    fn replay_limit_overrides_require_replay_without_changing_old_spellings() {
+        let old = Cli::try_parse_from(["fuzz", "--replay", "record", "--record", "2"]).unwrap();
+        assert_eq!(old.replay, Some(PathBuf::from("record")));
+        assert!(old.replay_max_inputs.is_none());
+        for flag in [
+            "--replay-max-inputs",
+            "--replay-max-entries",
+            "--replay-max-metadata-bytes",
+            "--replay-max-total-input-bytes",
+        ] {
+            assert!(
+                Cli::try_parse_from(["fuzz", flag, "1"]).is_err(),
+                "{flag} accepted without replay"
+            );
+        }
+        let raised = Cli::try_parse_from([
+            "fuzz",
+            "--replay",
+            "record",
+            "--replay-max-inputs",
+            "5",
+            "--replay-max-entries",
+            "9",
+            "--replay-max-metadata-bytes",
+            "1024",
+            "--replay-max-total-input-bytes",
+            "20",
+        ])
+        .unwrap();
+        assert_eq!(raised.replay_max_inputs, Some(5));
+        assert_eq!(raised.replay_max_entries, Some(9));
+        assert_eq!(raised.replay_max_metadata_bytes, Some(1024));
+        assert_eq!(raised.replay_max_total_input_bytes, Some(20));
     }
 }

@@ -301,7 +301,7 @@ impl crate::CustomOp1 for ArgSort {
                 .map_err(crate::Error::wrap)?;
             }
         }
-        let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
+        let dst = crate::MetalStorage::new_allocated(dst, device.clone(), el, DType::U32)?;
         Ok((dst, layout.shape().clone()))
     }
 }

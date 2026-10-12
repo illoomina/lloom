@@ -1,9 +1,9 @@
 use candle::{DType, Device, Result, Tensor, D};
+use lloom::models::{encodec, t5};
 use lloom::nn::{
     embedding, layer_norm, linear_no_bias, Activation, Embedding, LayerNorm, Linear, Module,
     VarBuilder,
 };
-use lloom::models::{encodec, t5};
 
 // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/models/musicgen/configuration_musicgen.py#L83
 #[derive(Debug, Clone, PartialEq)]

@@ -6381,6 +6381,127 @@ fn sdpa_packed_names_resolve() {
     );
 }
 
+/// A fixed-width paged reduction must write every output, including at the
+/// largest head dimension. Zero queries make the reference the selected values'
+/// mean, independent of another GPU attention implementation.
+#[test]
+fn sdpa_vector_paged_writes_every_head_dimension() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let rows = 3;
+    let nh = 4;
+    let nkv = 2;
+    let tokens = 64;
+    let stride = 48;
+    let lengths = [16i32, 33, 45];
+    for hd in SDPA_VECTOR_HEAD_DIMS {
+        for dtype in [SdpaDType::F32, SdpaDType::F16] {
+            let upload = |values: &[f32]| match dtype {
+                SdpaDType::F32 => new_buffer(&device, values),
+                SdpaDType::F16 => new_buffer(
+                    &device,
+                    &values
+                        .iter()
+                        .copied()
+                        .map(f16::from_f32)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => unreachable!(),
+            };
+            let q = upload(&vec![0.; rows * nh * hd]);
+            let k = upload(&vec![0.25; nkv * tokens * hd]);
+            let values: Vec<f32> = (0..nkv * tokens * hd)
+                .map(|i| {
+                    (i / (tokens * hd)) as f32 / 4.
+                        + ((i / hd) % 17) as f32 / 32.
+                        + (i % hd % 23) as f32 / 1024.
+                })
+                .collect();
+            let v = upload(&values);
+            let ns = new_buffer(&device, &lengths);
+            for page_size in [1, 4] {
+                let table: Vec<u32> = (0..rows * stride)
+                    .map(|i| ((i / stride * 7 + i % stride * 3) % (tokens / page_size)) as u32)
+                    .collect();
+                let tb = new_buffer(&device, &table);
+                for two_pass in [false, true] {
+                    let partials = new_buffer(&device, &vec![f32::NAN; rows * nh * 32 * hd]);
+                    let sums = new_buffer(&device, &vec![f32::NAN; rows * nh * 32]);
+                    let maxs = new_buffer(&device, &vec![f32::NAN; rows * nh * 32]);
+                    let mut previous: Option<Vec<u32>> = None;
+                    for rep in 0..3 {
+                        let out = upload(&vec![-999.; rows * nh * hd]);
+                        let enc = commands.command_encoder().unwrap();
+                        call_sdpa_vector_paged(
+                            &device,
+                            &enc,
+                            &kernels,
+                            rows,
+                            nh,
+                            nh / nkv,
+                            hd,
+                            0,
+                            &q,
+                            0,
+                            &k,
+                            tokens * hd,
+                            0,
+                            &v,
+                            tokens * hd,
+                            &tb,
+                            0,
+                            stride,
+                            &ns,
+                            0,
+                            page_size,
+                            &out,
+                            1.,
+                            dtype,
+                            two_pass.then_some((&partials, &sums, &maxs)),
+                        )
+                        .unwrap();
+                        drop(enc);
+                        commands.wait_until_completed().unwrap();
+                        let got: Vec<f32> = match dtype {
+                            SdpaDType::F32 => read_to_vec(&out, rows * nh * hd),
+                            SdpaDType::F16 => read_to_vec::<f16>(&out, rows * nh * hd)
+                                .into_iter()
+                                .map(f16::to_f32)
+                                .collect(),
+                            _ => unreachable!(),
+                        };
+                        for r in 0..rows {
+                            for h in 0..nh {
+                                for d in 0..hd {
+                                    let want = (0..lengths[r] as usize)
+                                        .map(|i| {
+                                            let slot = table[r * stride + i / page_size] as usize
+                                                * page_size
+                                                + i % page_size;
+                                            values[((h / (nh / nkv)) * tokens + slot) * hd + d]
+                                        })
+                                        .sum::<f32>()
+                                        / lengths[r] as f32;
+                                    let actual = got[(r * nh + h) * hd + d];
+                                    assert!(actual.is_finite() && (actual - want).abs() < 1e-3,
+                                        "hd={hd} dtype={dtype:?} page={page_size} two_pass={two_pass} rep={rep} row={r} head={h} d={d}: {actual} != {want}");
+                                }
+                            }
+                        }
+                        let bits: Vec<_> = got.iter().map(|x| x.to_bits()).collect();
+                        if let Some(previous) = &previous {
+                            assert_eq!(&bits, previous);
+                        }
+                        previous = Some(bits);
+                    }
+                    println!("PAGED_PARITY hd={hd} dtype={dtype:?} page={page_size} two_pass={two_pass} repetitions=3 pass=true");
+                }
+            }
+        }
+    }
+}
+
 /// `sdpa_vector` instantiates two head dimensions that `sdpa.rs` cannot ask
 /// for, and this pins that rather than silently inheriting it.
 ///
@@ -11152,4 +11273,70 @@ fn inverse_cdf_row_matches_the_f64_definition() {
         }
     }
     assert!(checked > 150, "only {checked} draws compared");
+}
+
+/// Tensor slices are element-aligned, including odd f16/bf16 and u8 offsets.
+/// Split and packed bindings must preserve the same independent CPU reference.
+#[test]
+fn strided_copy_accepts_element_aligned_offsets() {
+    fn check<T: Copy + PartialEq + std::fmt::Debug>(values: Vec<T>, name: &'static str) {
+        let dev = device();
+        let kernels = Kernels::new();
+        for offset in [1usize, 3, 5] {
+            for style in [ParamStyle::Split, ParamStyle::Packed] {
+                for repeat in 0..3 {
+                    let commands = commands(&dev);
+                    let input = new_buffer(&dev, &values);
+                    let sentinel = values[0];
+                    let output = new_buffer(&dev, &[sentinel; 8]);
+                    let encoder = commands.command_encoder().unwrap();
+                    call_unary_strided_with(
+                        &dev,
+                        &encoder,
+                        &kernels,
+                        unary::strided::Kernel(name),
+                        &[2, 3],
+                        BufferOffset {
+                            buffer: &input,
+                            offset_in_bytes: offset * size_of::<T>(),
+                        },
+                        &[1, 2],
+                        BufferOffset {
+                            buffer: &output,
+                            offset_in_bytes: size_of::<T>(),
+                        },
+                        style,
+                    )
+                    .unwrap();
+                    drop(encoder);
+                    commands.wait_until_completed().unwrap();
+                    let got = read_to_vec::<T>(&output, 8);
+                    let expected = [
+                        sentinel,
+                        values[offset],
+                        values[offset + 2],
+                        values[offset + 4],
+                        values[offset + 1],
+                        values[offset + 3],
+                        values[offset + 5],
+                        sentinel,
+                    ];
+                    assert_eq!(
+                        got, expected,
+                        "{name} offset={offset} style={style:?} repeat={repeat}"
+                    );
+                }
+            }
+        }
+    }
+    check(
+        (0..16).map(|i| f16::from_f32(i as f32 - 8.0)).collect(),
+        "copy_f16_strided",
+    );
+    check(
+        (0..16).map(|i| bf16::from_f32(i as f32 - 8.0)).collect(),
+        "copy_bf16_strided",
+    );
+    check((0..16u8).collect(), "copy_u8_strided");
+    println!("STRIDED_ALIGNMENT dtypes=3 offsets=3 styles=2 repeats=3 cases=54 cpu_reference=true guard_words=true");
 }

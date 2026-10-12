@@ -75,7 +75,10 @@ fn rel_err_at(
         .to_vec1::<f32>()?;
     assert_eq!(got.len(), n);
     // `f32::max` drops a NaN, so a non-finite output would read as no error.
-    assert!(got.iter().all(|v| v.is_finite()), "gemv_norm [{n}, {k}]: a non-finite output");
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "gemv_norm [{n}, {k}]: a non-finite output"
+    );
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
     Ok(got
         .iter()
@@ -204,7 +207,14 @@ fn gemv_norm_serves_the_tiles_it_runs_at() -> Result<()> {
 }
 
 /// `silu(gate·n(x)) * (up·n(x))` in f64 over the dtype-rounded inputs.
-fn reference_swiglu(x: &[f32], g: &[f32], up: &[f32], gate: &[f32], n: usize, k: usize) -> Vec<f32> {
+fn reference_swiglu(
+    x: &[f32],
+    g: &[f32],
+    up: &[f32],
+    gate: &[f32],
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
     let ms: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / k as f64;
     let inv = 1.0 / (ms + EPS as f64).sqrt();
     (0..n)
@@ -239,7 +249,10 @@ fn swiglu_rel_err(n: usize, k: usize, dtype: DType, seed: u64, x_scale: f32) -> 
         .flatten_all()?
         .to_vec1::<f32>()?;
     assert_eq!(got.len(), n);
-    assert!(got.iter().all(|v| v.is_finite()), "gemv_norm_swiglu [{n}, {k}]: a non-finite output");
+    assert!(
+        got.iter().all(|v| v.is_finite()),
+        "gemv_norm_swiglu [{n}, {k}]: a non-finite output"
+    );
     let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
     Ok(got
         .iter()
@@ -260,12 +273,18 @@ fn gemv_norm_swiglu_matches_the_reference_and_the_pair() -> Result<()> {
             let e = swiglu_rel_err(n, k, dtype, (n * 17 + k) as u64, 3.0)?;
             let tol = if dtype == DType::F32 { 1e-5 } else { 4e-3 };
             println!("gemv_norm_swiglu n={n} k={k} {dtype:?} rel_err={e:.3e} (tol {tol:.0e})");
-            assert!(e <= tol, "gemv_norm_swiglu n={n} k={k} {dtype:?}: rel_err {e} > {tol}");
+            assert!(
+                e <= tol,
+                "gemv_norm_swiglu n={n} k={k} {dtype:?}: rel_err {e} > {tol}"
+            );
         }
     }
     let e = swiglu_rel_err(2048, 2048, DType::F32, 98, 1e-3)?;
     println!("gemv_norm_swiglu n=2048 k=2048 F32 |x|~1e-3 rel_err={e:.3e}");
-    assert!(e <= 1e-5, "gemv_norm_swiglu at |x|~1e-3 (eps-dominated): rel_err {e}");
+    assert!(
+        e <= 1e-5,
+        "gemv_norm_swiglu at |x|~1e-3 (eps-dominated): rel_err {e}"
+    );
 
     let (n, k) = (6144, 2048);
     let dev = Device::new_metal(0)?;
@@ -290,7 +309,11 @@ fn gemv_norm_swiglu_matches_the_reference_and_the_pair() -> Result<()> {
     };
     let a = fused()?;
     for i in 1..4 {
-        assert_eq!(a, fused()?, "gemv_norm_swiglu is not bit-stable run to run (run {i})");
+        assert_eq!(
+            a,
+            fused()?,
+            "gemv_norm_swiglu is not bit-stable run to run (run {i})"
+        );
     }
     let scale = pair.iter().fold(0f32, |m, v| m.max(v.abs()));
     let err = a

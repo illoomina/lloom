@@ -10,10 +10,10 @@ use lloom::models::t5;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 const DTYPE: DType = DType::F32;

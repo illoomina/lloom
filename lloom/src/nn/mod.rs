@@ -21,6 +21,8 @@ pub mod batch_norm;
 pub mod batched;
 mod batched_spec;
 pub mod blocks;
+#[cfg(any(feature = "metal", test))]
+mod checkout;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
@@ -63,6 +65,7 @@ pub mod short_conv;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
+pub mod turn_checkpoint;
 pub mod var_builder;
 pub mod var_map;
 pub mod weight_groups;
@@ -82,9 +85,9 @@ pub use conv::{
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    ladder_width, ragged_layout, refuse, Asks, Body, DecodeOptions, DecodeOut, DecodeStats, FeedStep, FeedWait,
-    HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut, RoundStats,
-    StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED,
+    ladder_width, ragged_layout, refuse, Asks, Body, DecodeOptions, DecodeOut, DecodeStats,
+    FeedStep, FeedWait, HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut,
+    RoundStats, StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{

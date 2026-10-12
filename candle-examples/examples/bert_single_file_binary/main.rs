@@ -7,8 +7,8 @@ use lloom::models::bert::{BertModel, Config as BertConfig, DTYPE};
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use lloom::nn::VarBuilder;
 use clap::Parser;
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]

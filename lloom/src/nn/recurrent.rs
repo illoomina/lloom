@@ -214,6 +214,17 @@ impl StatePool {
         })
     }
 
+    /// Bytes the pool's allocated layers hold on the device.
+    pub fn bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .slabs
+            .iter()
+            .flatten()
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .sum()
+    }
+
     /// Layer `l`'s tensor `[phases, slots, ..shape]`, allocated (zero) on
     /// first use.
     pub fn layer(&self, l: usize) -> Result<Tensor> {
@@ -340,6 +351,32 @@ impl RecurrentState {
             .narrow(1, p.slot, 1)?
             .squeeze(0)?
             .squeeze(0)
+    }
+
+    /// Bytes the channel holds on the device: its pool's when pooled, else
+    /// every distinct buffer it keeps — the slabs, the spares and the
+    /// windows' bases (a base is the slab's or a spare's buffer at most
+    /// once, so nothing is counted twice).
+    pub fn bytes_held(&self) -> usize {
+        if let Some(p) = &self.pooled {
+            return p.pool.bytes();
+        }
+        let mut seen = Vec::new();
+        let mut bytes = 0;
+        for t in self
+            .slab
+            .iter()
+            .chain(&self.spare)
+            .chain(&self.base)
+            .chain(&self.held)
+            .flatten()
+        {
+            if !seen.contains(&t.id()) {
+                seen.push(t.id());
+                bytes += t.elem_count() * t.dtype().size_in_bytes();
+            }
+        }
+        bytes
     }
 
     /// Whether the channel is pooled.
@@ -864,7 +901,10 @@ mod tests {
         rs.hold_window().unwrap();
         rs.write(0, t(2.0, &dev)).unwrap();
         assert_eq!(val(&rs), 2.0);
-        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+        assert_eq!(
+            rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0],
+            0.0
+        );
     }
 
     /// A write lands in neither base, in place or not.
@@ -880,7 +920,10 @@ mod tests {
         rs.write(0, t(5.0, &dev)).unwrap();
         rs.write(0, t(6.0, &dev)).unwrap();
         assert_eq!(val(&rs), 6.0);
-        assert_eq!(rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0);
+        assert_eq!(
+            rs.held[0].as_ref().unwrap().to_vec2::<f32>().unwrap()[0][0],
+            0.0
+        );
         rs.rewind_to_window().unwrap();
         rs.unhold_window().unwrap();
         rs.rewind_to_window().unwrap();

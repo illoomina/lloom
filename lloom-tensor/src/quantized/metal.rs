@@ -17,9 +17,10 @@ impl QMetalStorage {
             .with_zeros(size)
             .with_label("qstorage_zeros")
             .build()?;
+        let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
             buffer,
-            device: device.clone(),
+            device,
             dtype,
         })
     }
@@ -50,9 +51,10 @@ impl QMetalStorage {
             blit.set_label("qstorage_persistent_zero");
             blit.fill_buffer(&buffer, (0, size), 0);
         }
+        let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
             buffer,
-            device: device.clone(),
+            device,
             dtype,
         })
     }
@@ -205,12 +207,12 @@ impl QMetalStorage {
             .with_data(&out)
             .with_label("qstorage_dequantized")
             .build()?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             buffer,
             self.device.clone(),
             elem_count,
             DType::F32,
-        ))
+        )?)
     }
 
     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
@@ -226,7 +228,9 @@ impl QMetalStorage {
             .with_data(&qcpu_storage.data()?)
             .with_label("qstorage_quantized")
             .build()?;
+        let device = self.device.allocated_output_device(&buffer)?;
         self.buffer = buffer;
+        self.device = device;
         Ok(())
     }
 
@@ -248,7 +252,9 @@ impl QMetalStorage {
             .with_data(&qcpu_storage.data()?)
             .with_label("qstorage_quantize_imatrix")
             .build()?;
+        let device = self.device.allocated_output_device(&buffer)?;
         self.buffer = buffer;
+        self.device = device;
         Ok(())
     }
 
@@ -274,7 +280,9 @@ impl QMetalStorage {
             .with_data(&qcpu_storage.data()?)
             .with_label("qstorage_quantize_imatrix_onto")
             .build()?;
+        let device = self.device.allocated_output_device(&buffer)?;
         self.buffer = buffer;
+        self.device = device;
         Ok(())
     }
 
@@ -295,7 +303,9 @@ impl QMetalStorage {
             .with_data(&qcpu_storage.data()?)
             .with_label("qstorage_quantize_onto")
             .build()?;
+        let device = self.device.allocated_output_device(&buffer)?;
         self.buffer = buffer;
+        self.device = device;
         Ok(())
     }
 
@@ -356,12 +366,12 @@ impl QMetalStorage {
             &dst,
         )
         .map_err(MetalError::from)?;
-        Ok(MetalStorage::new(
+        Ok(MetalStorage::new_allocated(
             dst,
             device.clone(),
             ids_len * hidden,
             DType::F32,
-        ))
+        )?)
     }
 
     /// Rows up to which a quantized matmul runs the matmul-vec kernel over
@@ -374,7 +384,8 @@ impl QMetalStorage {
     fn qmv_rows_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
-            crate::tuning::tuning().qmv
+            crate::tuning::tuning()
+                .qmv
                 .mm_from
                 .map(|from| from.saturating_sub(1).max(1))
                 .unwrap_or(8)
@@ -468,8 +479,12 @@ impl QMetalStorage {
             &dst,
         )
         .map_err(MetalError::from)?;
-        let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
+        let dst_storage = crate::MetalStorage::new_allocated(
+            dst,
+            device.clone(),
+            dst_shape.elem_count(),
+            store_dtype,
+        )?;
         Ok((dst_storage, dst_shape))
     }
 
@@ -488,8 +503,13 @@ impl QMetalStorage {
     ) -> Result<Option<MetalStorage>> {
         use crate::MetalError;
         let (n, k) = self_shape.dims2()?;
-        if !layout.is_contiguous() || layout.shape().elem_count() != k || storage.dtype() != DType::F32 {
-            crate::bail!("quantized matvec store block: one contiguous f32 row of {k}, got {layout:?}")
+        if !layout.is_contiguous()
+            || layout.shape().elem_count() != k
+            || storage.dtype() != DType::F32
+        {
+            crate::bail!(
+                "quantized matvec store block: one contiguous f32 row of {k}, got {layout:?}"
+            )
         }
         let device = storage.device().clone();
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
@@ -516,7 +536,12 @@ impl QMetalStorage {
                     store,
                 )
                 .map_err(MetalError::from)?;
-                Ok(Some(crate::MetalStorage::new(dst, device.clone(), n, DType::F32)))
+                Ok(Some(crate::MetalStorage::new_allocated(
+                    dst,
+                    device.clone(),
+                    n,
+                    DType::F32,
+                )?))
             }
             Some((dst, dst_layout)) => {
                 if !dst_layout.is_contiguous()
@@ -630,7 +655,7 @@ impl QMetalStorage {
         // persistent scratch, then the f16 GEMM arm reads plain halves —
         // measured 4.3 → 3.2 ms on `[10240 × 2560]` Q4_K at 512 rows, the
         // block unpack being the difference (P24/P26). The scratch is one
-        // Private buffer a device, sized to the largest stem seen; the
+        // Private buffer per allocation namespace, sized to the largest stem seen; the
         // encoder's hazard chain orders each stem's dequant after the
         // previous stem's GEMM read of it.
         if let Some(scratch) = dequant_scratch_buf {
@@ -689,8 +714,12 @@ impl QMetalStorage {
                 )
                 .map_err(MetalError::from)?;
                 drop(encoder);
-                let dst_storage =
-                    MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+                let dst_storage = MetalStorage::new_allocated(
+                    dst,
+                    device.clone(),
+                    dst_shape.elem_count(),
+                    DType::F32,
+                )?;
                 return Ok((dst_storage, dst_shape));
             }
             let src0_l = crate::Layout::contiguous(vec![1, 1, n_rows_w, k_w]);
@@ -727,8 +756,12 @@ impl QMetalStorage {
                 &dst,
             )
             .map_err(MetalError::from)?;
-            let dst_storage =
-                MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            let dst_storage = MetalStorage::new_allocated(
+                dst,
+                device.clone(),
+                dst_shape.elem_count(),
+                DType::F32,
+            )?;
             return Ok((dst_storage, dst_shape));
         }
         let src0_l = crate::Layout::contiguous(
@@ -776,8 +809,12 @@ impl QMetalStorage {
         )
         .map_err(MetalError::from)?;
 
-        let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        let dst_storage = crate::MetalStorage::new_allocated(
+            dst,
+            device.clone(),
+            dst_shape.elem_count(),
+            DType::F32,
+        )?;
         Ok((dst_storage, dst_shape))
     }
 
@@ -892,7 +929,12 @@ impl QMetalStorage {
                 &dst,
             )
             .map_err(MetalError::from)?;
-            let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
+            let out = MetalStorage::new_allocated(
+                dst,
+                device.clone(),
+                dst_shape.elem_count(),
+                store_dtype,
+            )?;
             return Ok((out, dst_shape));
         }
         let encoder = device.command_encoder()?;
@@ -912,7 +954,8 @@ impl QMetalStorage {
             &dst,
         )
         .map_err(MetalError::from)?;
-        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
+        let out =
+            MetalStorage::new_allocated(dst, device.clone(), dst_shape.elem_count(), store_dtype)?;
         Ok((out, dst_shape))
     }
 
@@ -959,7 +1002,10 @@ impl QMetalStorage {
         let (triple, store_dtype) =
             self.routed_triple(input.dtype(), act, "indexed_moe_forward_pair")?;
         if ids.dtype() != DType::U32 {
-            crate::bail!("indexed_moe_forward_pair ids must be u32, got {:?}", ids.dtype())
+            crate::bail!(
+                "indexed_moe_forward_pair ids must be u32, got {:?}",
+                ids.dtype()
+            )
         }
         let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
         let (batch, in_dim1, k_in) = input_l.shape().dims3()?;
@@ -1000,12 +1046,12 @@ impl QMetalStorage {
                     &dst,
                 )
                 .map_err(MetalError::from)?;
-                Ok(MetalStorage::new(
+                Ok(MetalStorage::new_allocated(
                     dst,
                     device.clone(),
                     shape.elem_count(),
                     store_dtype,
-                ))
+                )?)
             };
         let Some(grid) = order.grid() else {
             let shape = Shape::from((batch, topk, n));
@@ -1114,15 +1160,6 @@ impl QMetalStorage {
         ring: &mut crate::kernels::metal::staging::StagingRing,
         entry: Option<usize>,
     ) -> Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        if staging.size() < len {
-            crate::bail!(
-                "write_staged: a {}-byte staging buffer for {len} bytes",
-                staging.size()
-            )
-        }
         self.write_via(offset, len, staging, &mut |_| Ok(()), Some((ring, entry)))
     }
 
@@ -1138,7 +1175,30 @@ impl QMetalStorage {
         )>,
     ) -> Result<()> {
         use crate::MetalError;
-        if offset + len > self.buffer.length() {
+        type RingEntry<'a> = Option<(
+            &'a mut crate::kernels::metal::staging::StagingRing,
+            Option<usize>,
+        )>;
+        let mut pending: crate::checkout::Checkout<_, _, 1> =
+            crate::checkout::Checkout::new(|(ring, staging): (RingEntry<'_>, BufferHandle)| {
+                if let Some((ring, entry)) = ring {
+                    ring.release(entry, &staging);
+                }
+            });
+        let (_, staging) = pending.acquire(|| Ok::<_, crate::Error>((ring, staging)))?;
+        if len == 0 {
+            return Ok(());
+        }
+        if staging.size() < len {
+            crate::bail!(
+                "write_with: a {}-byte staging buffer for {len} bytes",
+                staging.size()
+            );
+        }
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > self.buffer.length())
+        {
             crate::bail!(
                 "write_with: {offset}+{len} past the {}-byte buffer",
                 self.buffer.length()
@@ -1161,6 +1221,9 @@ impl QMetalStorage {
         };
         let n = len / width;
         let encoder = self.device.command_encoder()?;
+        // Unused-entry cleanup ends at stamp: subsequent dispatch errors retain
+        // conservative epoch custody instead of making native work reusable.
+        let [(ring, staging)] = pending.into_array();
         // The encoder guard holds the command stream: no cut can move the copy
         // into a later command buffer than the epoch stamped here.
         if let Some((ring, entry)) = ring {
@@ -1224,7 +1287,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     if crate::metal_backend::wire_weights_on() {
         device.wire_buffer(&buffer);
     }
-    let device = device.clone();
+    let device = device.allocated_output_device(&buffer)?;
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,
         device,
@@ -1449,7 +1512,8 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
     )
     .map_err(MetalError::from)?;
     drop(encoder);
-    let storage = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+    let storage =
+        MetalStorage::new_allocated(dst, device.clone(), dst_shape.elem_count(), DType::F32)?;
     Ok(crate::tensor::from_storage(
         crate::Storage::Metal(storage),
         dst_shape,
@@ -1526,24 +1590,10 @@ fn dequant_once_kind(dtype: crate::kernels::GgmlDType) -> bool {
     dtype.kind().dequant_rows_f16
 }
 
-/// One Private scratch a device for the dequantised stems, grown to the
-/// largest asked for (outside the pools: a tenant with a fixed identity,
-/// the hazard chain orders every stem's write after the last stem's read).
+/// Domain-local scratch retains its identity across stems; the hazard chain
+/// orders each write after the preceding stem's read.
 fn dequant_scratch(device: &MetalDevice, bytes: usize) -> Result<BufferHandle> {
-    static SCRATCH: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<crate::metal_backend::DeviceId, BufferHandle>>,
-    > = std::sync::OnceLock::new();
-    let map = SCRATCH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let key = device.id();
-    let mut g = map.lock();
-    if let Some(b) = g.get(&key) {
-        if b.size() >= bytes {
-            return Ok(BufferHandle::clone(b));
-        }
-    }
-    let b = device.new_persistent_private(bytes)?;
-    g.insert(key, BufferHandle::clone(&b));
-    Ok(b)
+    device.dequant_scratch(bytes)
 }
 
 impl super::PairOrder {

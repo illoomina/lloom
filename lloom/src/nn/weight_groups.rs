@@ -276,6 +276,33 @@ pub struct WeightGroups {
     tenant: Option<std::sync::Arc<crate::nn::group_tenant::GroupTenant>>,
 }
 
+// Dense tables reserve u32::MAX for "no slot/no key". Counts up to
+// that value use only indices 0..MAX; larger counts would alias the sentinel.
+fn check_dense_count(kind: &str, count: usize) -> Result<()> {
+    if count > u32::MAX as usize {
+        lloom_tensor::bail!("weight groups: {kind} count {count} exceeds dense u32 index capacity")
+    }
+    Ok(())
+}
+
+/// Checked (slot bytes, total elements, total bytes), before any allocation
+/// or resize side effect. This is representation validity, not admission.
+fn slot_geometry(slots: usize, slot_elems: usize, dtype: DType) -> Result<(usize, usize, usize)> {
+    check_dense_count("slot", slots)?;
+    let fail = || {
+        lloom_tensor::Error::Msg(format!(
+            "weight groups: {slots} slots x {slot_elems} elements x {} bytes exceeds usize",
+            dtype.size_in_bytes()
+        ))
+    };
+    let slot_bytes = slot_elems
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(fail)?;
+    let elems = slots.checked_mul(slot_elems).ok_or_else(fail)?;
+    let bytes = slots.checked_mul(slot_bytes).ok_or_else(fail)?;
+    Ok((slot_bytes, elems, bytes))
+}
+
 /// The tier's storage: `[slots, slot_elems]` of `dtype`. On Metal a
 /// persistent Shared buffer from the device's `Mapped` backing — a weight
 /// placement, not a pool allocation: the pool's residual cap (§9.5k) counts
@@ -292,12 +319,12 @@ fn slot_backing(
     dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
+    let (_, _elems, _bytes) = slot_geometry(slots, slot_elems, dtype)?;
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
         use lloom_tensor::{op::BackpropOp, MetalStorage, Storage};
-        let bytes = slots * slot_elems * dtype.size_in_bytes();
-        let handle = m.new_persistent_shared(bytes)?;
-        let storage = MetalStorage::new(handle, m.clone(), slots * slot_elems, dtype);
+        let handle = m.new_persistent_shared(_bytes)?;
+        let storage = MetalStorage::new_allocated(handle, m.clone(), _elems, dtype)?;
         return Ok(Tensor::from_storage(
             Storage::Metal(storage),
             (slots, slot_elems),
@@ -322,27 +349,30 @@ impl WeightGroups {
     ) -> Result<Self> {
         let slot_elems = groups.iter().map(|g| g.elems).max().unwrap_or(0).max(1);
         let slots = slots.max(1);
+        check_dense_count("group", groups.len())?;
+        let (slot_bytes, _, _) = slot_geometry(slots, slot_elems, dtype)?;
+        // Validate every claim before allocating the backing on any backend.
+        let _tenant = crate::nn::group_tenant::GroupTenant::new(
+            site,
+            slot_bytes,
+            slots,
+            3,
+            groups.len().max(1),
+            groups.len().max(1),
+        )?;
         let backing = slot_backing(site, slots, slot_elems, dtype, device)?;
         #[cfg(feature = "metal")]
         let clock = match device {
             Device::Metal(d) => Some(d.gpu_clock()),
             _ => None,
         };
-        let slot_bytes = slot_elems * dtype.size_in_bytes();
         #[cfg(feature = "metal")]
         let tenant = match device {
             Device::Metal(m) => {
                 use lloom_tensor::kernels::metal::ledger::Tenant;
                 // Floor: the ring (three slots — in use, the previous
                 // stage's, loading); want: every group; unit: a slot.
-                let tenant = std::sync::Arc::new(crate::nn::group_tenant::GroupTenant::new(
-                    site,
-                    slot_bytes,
-                    slots,
-                    3,
-                    groups.len().max(1),
-                    groups.len().max(1),
-                ));
+                let tenant = std::sync::Arc::new(_tenant);
                 let dyn_tenant: std::sync::Arc<dyn Tenant> = tenant.clone();
                 m.ledger().register(&dyn_tenant);
                 Some(tenant)
@@ -385,6 +415,7 @@ impl WeightGroups {
     /// next).
     pub fn resize_slots(&mut self, slots: usize) -> Result<usize> {
         let slots = slots.max(3);
+        slot_geometry(slots, self.slot_elems, self.dtype)?;
         if self.current.is_some() {
             lloom_tensor::bail!("weight groups: resize_slots while a stage's group is in use")
         }
@@ -1288,6 +1319,48 @@ mod loader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_slot_geometry_checks_without_allocating() {
+        assert_eq!(slot_geometry(3, 1, DType::F32).unwrap(), (4, 3, 12));
+        assert!(slot_geometry(1, usize::MAX, DType::F32).is_err());
+        assert!(slot_geometry(3, usize::MAX / 2, DType::U8).is_err());
+        assert!(slot_geometry(3, usize::MAX / 4, DType::F32).is_err());
+        assert!(slot_geometry(u32::MAX as usize, 1, DType::U8).is_ok());
+        if let Some(past) = (u32::MAX as usize).checked_add(1) {
+            assert!(slot_geometry(past, 1, DType::U8).is_err());
+            assert!(check_dense_count("group", past).is_err());
+        }
+        // The actual backing entry refuses before zs::zeros/native allocation.
+        assert!(slot_backing("test.numeric", 3, usize::MAX, DType::F32, &Device::Cpu).is_err());
+        let impossible = GroupSpec {
+            id: WeightGroupId(0),
+            parts: vec![],
+            elems: usize::MAX,
+        };
+        assert!(WeightGroups::new(
+            vec![impossible],
+            3,
+            DType::F32,
+            &Device::Cpu,
+            "test.numeric"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn numeric_invalid_resize_preserves_tier() {
+        // Exactly 12 bytes of CPU backing; no model, loader or GPU.
+        let mut tier =
+            WeightGroups::new(vec![], 3, DType::F32, &Device::Cpu, "test.numeric").unwrap();
+        let backing = tier.backing.id();
+        let stats = tier.stats();
+        assert!(tier.resize_slots(usize::MAX).is_err());
+        assert_eq!(tier.n_slots(), 3);
+        assert_eq!(tier.backing.id(), backing);
+        assert_eq!(tier.stats(), stats);
+        assert_eq!(tier.backing.to_vec2::<f32>().unwrap(), vec![vec![0.0]; 3]);
+    }
 
     /// Groups of two parts, [k, 4] and [4, k] with k = 2 + id, filled with
     /// values that name the group and the part.

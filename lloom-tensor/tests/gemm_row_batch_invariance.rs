@@ -13,7 +13,9 @@
 //! the batch selects costs no batch invariance; the `m = 1` route is the one
 //! seam (`architecture.md` §2.3.5b).
 //!
-//! Its own binary: the census switch is read once per process.
+//! The fast contract retains the batch-dependent GEMM selection characterized
+//! here; deterministic row identity is covered by `f16_rows_identity`.
+//! Run with process isolation: the census switch is read once per process.
 #![cfg(feature = "metal")]
 
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -22,7 +24,7 @@ fn device() -> Device {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut t = lloom_tensor::tuning::Tuning::default();
-        t.contract.profile = "deterministic".into();
+        t.contract.profile = "fast".into();
         t.instrument.profile = true;
         let _ = lloom_tensor::tuning::install(t);
     });

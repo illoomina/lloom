@@ -81,6 +81,17 @@ pub trait Served: Send + Sync {
     fn think_tags(&self) -> Option<super::template::ThinkTags> {
         None
     }
+    /// The ids a prompt rendered with `enable_thinking` = `kwarg` and the
+    /// engine's thinking switch `want` ends with — the template's
+    /// generation prompt, read at load (`common::Text::generation_prompt`):
+    /// where the turn checkpoint is placed. `None` without a template.
+    fn generation_prompt(&self, _kwarg: Option<bool>, _want: Option<bool>) -> Option<Vec<u32>> {
+        None
+    }
+    /// The renders the chat template has run, for a per-turn count.
+    fn template_renders(&self) -> u64 {
+        0
+    }
     /// Why this process's decode path cannot feed a thinking budget's
     /// forced tokens (`budgets::BATCHED`); `None` on the K=1 body, which
     /// carries it on every readback arm, and on the speculative body, whose

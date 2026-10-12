@@ -25,7 +25,7 @@ pub mod testing;
 
 pub use config::{Config, ConfigArgs, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
-pub use deltanet_block::{GatedDeltaNet, GdnGeometry, GdnState};
+pub use deltanet_block::{GatedDeltaNet, GdnCheckpoint, GdnGeometry, GdnState};
 pub use dflash::QwenHead;
 pub use hc::HyperConnection;
 pub use loader::{

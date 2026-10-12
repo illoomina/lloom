@@ -107,6 +107,8 @@ impl Class {
 }
 
 pub struct StagingRing {
+    // Immutable before any entry exists; no first-use rebinding on warm reuse.
+    affinity: crate::memory_admission::AllocationAffinity<crate::metal_backend::DeviceId>,
     entries: Vec<Entry>,
     classes: Vec<Class>,
     /// Stamped one-shots past the cap, in stamp order, freed once their
@@ -136,11 +138,35 @@ impl StagingRing {
     }
 
     pub fn with_cap_bytes(device: &MetalDevice, cap_bytes: usize) -> Self {
-        Self::with_clock(device.gpu_clock(), cap_bytes)
+        Self::with_clock_affinity(
+            device.gpu_clock(),
+            cap_bytes,
+            crate::memory_admission::AllocationAffinity::bound(
+                device.id(),
+                device.declared_allocation_origin(),
+            ),
+        )
     }
 
-    fn with_clock(clock: Arc<GpuClock>, cap_bytes: usize) -> Self {
+    #[cfg(test)]
+    fn with_clock(device: &MetalDevice, clock: Arc<GpuClock>, cap_bytes: usize) -> Self {
+        Self::with_clock_affinity(
+            clock,
+            cap_bytes,
+            crate::memory_admission::AllocationAffinity::bound(
+                device.id(),
+                device.declared_allocation_origin(),
+            ),
+        )
+    }
+
+    fn with_clock_affinity(
+        clock: Arc<GpuClock>,
+        cap_bytes: usize,
+        affinity: crate::memory_admission::AllocationAffinity<crate::metal_backend::DeviceId>,
+    ) -> Self {
         Self {
+            affinity,
             entries: Vec::new(),
             classes: Vec::new(),
             overflow: VecDeque::new(),
@@ -166,6 +192,26 @@ impl StagingRing {
         )))
     }
 
+    /// Explicit scoped construction resolves payer before making a ring. The
+    /// legacy constructors above preserve their device-view origin, unchanged.
+    pub fn try_shared(device: &MetalDevice) -> Result<SharedStagingRing> {
+        Self::try_shared_with_cap(device, DEFAULT_CAP_BYTES)
+    }
+
+    pub fn try_shared_with_cap(
+        device: &MetalDevice,
+        cap_bytes: usize,
+    ) -> Result<SharedStagingRing> {
+        let origin = device.allocation_origin()?;
+        Ok(Arc::new(parking_lot::Mutex::new(
+            Self::with_clock_affinity(
+                device.gpu_clock(),
+                cap_bytes,
+                crate::memory_admission::AllocationAffinity::bound(device.id(), origin),
+            ),
+        )))
+    }
+
     /// The cap the ring was built with.
     pub fn cap_bytes(&self) -> usize {
         self.cap_bytes
@@ -182,6 +228,11 @@ impl StagingRing {
         device: &MetalDevice,
         len: usize,
     ) -> Result<(Option<usize>, BufferHandle)> {
+        // Validate BEFORE overflow cleanup or warm take mutates the ring. An
+        // original input device may resolve a different active output payer.
+        self.affinity
+            .validate_reuse(&device.id(), &device.allocation_origin()?)
+            .map_err(crate::Error::wrap)?;
         // A ring entry is the tier's, not a pass's: outside any pass plan.
         let _escape = super::arena::EscapeGuard::new();
         self.free_overflow();
@@ -416,7 +467,7 @@ mod tests {
         let Some(dev) = metal() else { return };
         let clock = Arc::new(GpuClock::new());
         // Room for eight 4 KiB entries: the schedule runs into the cap.
-        let mut ring = StagingRing::with_clock(Arc::clone(&clock), 8 * 4096);
+        let mut ring = StagingRing::with_clock(&dev, Arc::clone(&clock), 8 * 4096);
         let sizes = [4096usize, 4096, 3000, 8192];
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move |n: u64| {
@@ -530,7 +581,7 @@ mod tests {
     fn a_released_entry_is_reused_as_epoch_zero() {
         let Some(dev) = metal() else { return };
         let clock = Arc::new(GpuClock::new());
-        let mut ring = StagingRing::with_clock(Arc::clone(&clock), 1 << 20);
+        let mut ring = StagingRing::with_clock(&dev, Arc::clone(&clock), 1 << 20);
         let (ia, a) = ring.acquire(&dev, 4096).unwrap();
         ring.release(ia, &a);
         let (_, b) = ring.acquire(&dev, 4096).unwrap();
@@ -553,7 +604,7 @@ mod tests {
     fn acquire_does_not_scan_the_ring() {
         let Some(dev) = metal() else { return };
         let clock = Arc::new(GpuClock::new());
-        let mut ring = StagingRing::with_clock(Arc::clone(&clock), 1 << 30);
+        let mut ring = StagingRing::with_clock(&dev, Arc::clone(&clock), 1 << 30);
         for i in 0..2000 {
             let len = if i % 2 == 0 { 4096 } else { 8192 };
             let (entry, buf) = ring.acquire(&dev, len).unwrap();

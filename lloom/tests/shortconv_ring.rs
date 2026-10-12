@@ -559,8 +559,15 @@ fn per_row_case(seq_len: usize, dtype: DType, device: &Device) -> Result<()> {
 
     let row_slots = Tensor::new(&slots[..], device)?;
     let row_phases = Tensor::new(&phases[..], device)?;
-    let got =
-        lloom::nn::ops::shortconv_ring_rows(&b, &x, &c, &pool_rows, &table, &row_slots, &row_phases)?;
+    let got = lloom::nn::ops::shortconv_ring_rows(
+        &b,
+        &x,
+        &c,
+        &pool_rows,
+        &table,
+        &row_slots,
+        &row_phases,
+    )?;
 
     assert_bits(&format!("out seq_len={seq_len}"), &got, &want)?;
     assert_bits(&format!("pool seq_len={seq_len}"), &pool_rows, &pool_ref)?;

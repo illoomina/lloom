@@ -160,8 +160,8 @@ mod tests {
         // ended the run at that call. The window is the new text plus the
         // longest stop's length less one.
         st.push(&[11], &mut d)?; // "l"
-        // One call per push, as the decode loop makes it: "def" lies wholly
-        // in text an earlier call searched.
+                                 // One call per push, as the decode loop makes it: "def" lies wholly
+                                 // in text an earlier call searched.
         assert!(!st.hit_stop(&["def".to_string()]));
         assert_eq!(st.checked.get(), 9);
         Ok(())

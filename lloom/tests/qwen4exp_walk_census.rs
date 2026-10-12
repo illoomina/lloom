@@ -111,7 +111,12 @@ enum Hc {
 fn arms() -> Vec<(&'static str, Option<KvPrecision>, Option<bool>, Hc)> {
     vec![
         ("default", None, None, Hc::Off),
-        ("kv-f16", Some(KvPrecision::dense(DType::F16)), None, Hc::Off),
+        (
+            "kv-f16",
+            Some(KvPrecision::dense(DType::F16)),
+            None,
+            Hc::Off,
+        ),
         (
             "kv-int8",
             Some(KvPrecision::quantized(KvQuant::Int8).unwrap()),
@@ -128,7 +133,12 @@ fn arms() -> Vec<(&'static str, Option<KvPrecision>, Option<bool>, Hc)> {
         ("act-f16-composed", None, Some(false), Hc::Off),
         ("shared-store", None, None, Hc::Off),
         ("hc-norm-gemv", None, None, Hc::NormGemv),
-        ("hc-norm-gemv-switches-off", None, None, Hc::NormGemvSwitchesOff),
+        (
+            "hc-norm-gemv-switches-off",
+            None,
+            None,
+            Hc::NormGemvSwitchesOff,
+        ),
     ]
 }
 

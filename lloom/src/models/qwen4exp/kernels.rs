@@ -70,7 +70,12 @@ impl lloom_tensor::CustomOp1 for UnitLowerInverse {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             l.shape().clone(),
         ))
     }
@@ -205,7 +210,12 @@ impl lloom_tensor::CustomOp2 for HcNorm {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             l1.shape().clone(),
         ))
     }
@@ -345,7 +355,12 @@ impl lloom_tensor::CustomOp1 for HcMixA {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from(elem_count),
         ))
     }
@@ -414,7 +429,12 @@ impl lloom_tensor::CustomOp1 for HcMixB {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from((rows, self.d)),
         ))
     }
@@ -616,7 +636,12 @@ impl lloom_tensor::CustomOp2 for HcCollapse {
         let mut dims = l1.dims().to_vec();
         *dims.last_mut().unwrap() = self.d;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from(dims),
         ))
     }
@@ -717,7 +742,12 @@ impl lloom_tensor::CustomOp3 for HcCollapseScaled {
         let mut dims = lh.dims().to_vec();
         *dims.last_mut().unwrap() = self.d;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, sh.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                sh.dtype(),
+            )?,
             Shape::from(dims),
         ))
     }
@@ -801,7 +831,12 @@ impl lloom_tensor::CustomOp3 for HcCombine {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             l1.shape().clone(),
         ))
     }
@@ -943,13 +978,23 @@ impl lloom_tensor::CustomOp1 for MoeTopk {
                 if is.dtype() != lloom_tensor::DType::U32 {
                     lloom_tensor::bail!("moe_topk: ids must be U32")
                 }
-                is.buffer_handle().clone()
+                lloom_tensor::MetalStorage::new(
+                    is.buffer_handle().clone(),
+                    is.device().clone(),
+                    elem_count,
+                    lloom_tensor::DType::U32,
+                )
             }
-            None => device
-                .new_buffer_builder()
-                .with_size_for(elem_count, lloom_tensor::DType::U32)
-                .with_label("moe_topk_ids")
-                .build()?,
+            None => lloom_tensor::MetalStorage::new_allocated(
+                device
+                    .new_buffer_builder()
+                    .with_size_for(elem_count, lloom_tensor::DType::U32)
+                    .with_label("moe_topk_ids")
+                    .build()?,
+                device.clone(),
+                elem_count,
+                lloom_tensor::DType::U32,
+            )?,
         };
         lloom_tensor::kernels::call_moe_topk(
             device.metal_device(),
@@ -959,21 +1004,13 @@ impl lloom_tensor::CustomOp1 for MoeTopk {
             n_experts,
             self.k,
             metal_bo(s, l),
-            &ids,
+            ids.buffer(),
             ws.buffer(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         let mut out_dims = dims.to_vec();
         *out_dims.last_mut().unwrap() = self.k;
-        Ok((
-            lloom_tensor::MetalStorage::new(
-                ids,
-                device.clone(),
-                elem_count,
-                lloom_tensor::DType::U32,
-            ),
-            Shape::from(out_dims),
-        ))
+        Ok((ids, Shape::from(out_dims)))
     }
 }
 
@@ -1030,7 +1067,12 @@ impl lloom_tensor::CustomOp2 for SiluMul {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             l1.shape().clone(),
         ))
     }
@@ -1146,12 +1188,12 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(
+            lloom_tensor::MetalStorage::new_allocated(
                 output,
                 device.clone(),
                 elem_count,
                 lloom_tensor::DType::F32,
-            ),
+            )?,
             l3.shape().clone(),
         ))
     }
@@ -1702,7 +1744,12 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from((3, self.h_v, self.d)),
         ))
     }
@@ -1778,7 +1825,12 @@ impl lloom_tensor::CustomOp3 for GdnGatedNorm {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from(h_v * d),
         ))
     }
@@ -1875,7 +1927,12 @@ impl lloom_tensor::CustomOp2 for QsaPrep {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((2 * nh + nkv, hd)),
         ))
     }
@@ -1978,7 +2035,12 @@ impl lloom_tensor::CustomOp3 for QsaPrepBatch {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from(elem_count),
         ))
     }
@@ -2144,7 +2206,12 @@ impl lloom_tensor::CustomOp3 for SdpaVectorPaged {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((rows, nh, hd)),
         ))
     }
@@ -2201,7 +2268,12 @@ impl lloom_tensor::CustomOp2 for SigmoidMul {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             l2.shape().clone(),
         ))
     }
@@ -2300,7 +2372,12 @@ impl lloom_tensor::CustomOp2 for GdnGate {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((2, self.h_v, self.nc, self.cs)),
         ))
     }
@@ -2393,7 +2470,12 @@ impl lloom_tensor::CustomOp3 for GdnPrefillPrologue {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((3, self.h_v, self.nc, self.cs, self.d)),
         ))
     }
@@ -2455,7 +2537,7 @@ impl lloom_tensor::CustomOp1 for GdnConvWindow {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), n, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(output, device.clone(), n, s.dtype())?,
             l.shape().clone(),
         ))
     }
@@ -2523,7 +2605,12 @@ impl lloom_tensor::CustomOp1 for GdnChunkDecay {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from(elem_count),
         ))
     }
@@ -2594,7 +2681,12 @@ impl lloom_tensor::CustomOp3 for GdnChunkScale {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((5, n, d)),
         ))
     }
@@ -2682,7 +2774,12 @@ impl lloom_tensor::CustomOp2 for GdnChunkEpilogue {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((seq, h_v * d)),
         ))
     }
@@ -2789,7 +2886,12 @@ impl lloom_tensor::CustomOp3 for QsaPrepRows {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from(elem_count),
         ))
     }
@@ -2890,7 +2992,12 @@ impl lloom_tensor::CustomOp1 for GdnPrologueRows {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from((rows, 3, h_v, d)),
         ))
     }
@@ -2980,7 +3087,12 @@ impl lloom_tensor::CustomOp1 for GdnPrologueSeq {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s.dtype(),
+            )?,
             Shape::from((steps, 3, h_v, d)),
         ))
     }
@@ -3056,7 +3168,12 @@ impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                elem_count,
+                s1.dtype(),
+            )?,
             Shape::from((rows, h_v * d)),
         ))
     }
@@ -3202,7 +3319,12 @@ impl lloom_tensor::CustomOp3 for GdnChunkScan {
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
-            lloom_tensor::MetalStorage::new(output, device.clone(), out_count, s1.dtype()),
+            lloom_tensor::MetalStorage::new_allocated(
+                output,
+                device.clone(),
+                out_count,
+                s1.dtype(),
+            )?,
             Shape::from(out_count),
         ))
     }

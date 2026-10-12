@@ -1,8 +1,8 @@
 use candle::backend::BackendStorage;
 use candle::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
+use cudarc::nccl::safe::{Comm, ReduceOp};
 use lloom::nn::var_builder::ShardedVarBuilder as VarBuilder;
 use lloom::nn::{Embedding, Linear, Module, RmsNorm};
-use cudarc::nccl::safe::{Comm, ReduceOp};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 

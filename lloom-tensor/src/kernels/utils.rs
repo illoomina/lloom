@@ -1,20 +1,10 @@
 use crate::kernels::metal::{Buffer, CommandsGuard, ComputeCommandEncoder, ComputePipeline};
 use crate::kernels::MTLSize;
-use std::ffi::OsStr;
 use std::ops::Deref;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 pub struct WrappedEncoder<'a> {
     inner: &'a ComputeCommandEncoder,
-    end_encoding_on_drop: bool,
-}
-
-impl Drop for WrappedEncoder<'_> {
-    fn drop(&mut self) {
-        if self.end_encoding_on_drop {
-            self.inner.end_encoding()
-        }
-    }
 }
 
 impl AsRef<ComputeCommandEncoder> for WrappedEncoder<'_> {
@@ -367,10 +357,7 @@ impl EncoderProvider for &ComputeCommandEncoder {
     where
         Self: 'a;
     fn encoder(&self) -> Self::Encoder<'_> {
-        WrappedEncoder {
-            inner: self,
-            end_encoding_on_drop: false,
-        }
+        WrappedEncoder { inner: self }
     }
 }
 
@@ -410,17 +397,6 @@ impl<'a, T> From<RwLockWriteGuard<'a, T>> for RwLockGuard<'a, T> {
     fn from(g: RwLockWriteGuard<'a, T>) -> Self {
         RwLockGuard::Write(g)
     }
-}
-
-fn is_truthy(s: String) -> bool {
-    match s.as_str() {
-        "true" | "t" | "yes" | "y" | "1" => true,
-        _ => false,
-    }
-}
-
-pub(crate) fn get_env_bool<K: AsRef<OsStr>>(key: K, default: bool) -> bool {
-    std::env::var(key).map(is_truthy).unwrap_or(default)
 }
 
 /// One threadgroup per `groups` items of `width` threads.

@@ -8,9 +8,9 @@ use lloom::models::nomic_bert::{self, Config, NomicBertModel};
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 use tokenizers::{PaddingParams, Tokenizer};
 
 #[derive(Parser, Debug)]

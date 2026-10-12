@@ -70,9 +70,10 @@ impl HostSlot {
         if buffer.contents().is_null() {
             crate::bail!("HostSlot: a {bytes}-byte Shared allocation is not CPU-mapped")
         }
+        let device = device.allocated_output_device(&buffer)?;
         Ok(Self {
             buffer: buffer.clone(),
-            device: device.clone(),
+            device,
             dtype,
             cap,
         })
@@ -189,7 +190,10 @@ impl HostSlot {
         }
         let n = layout.shape().elem_count();
         if n > self.cap {
-            crate::bail!("HostSlot::write_from: {n} elements into a slot of {}", self.cap)
+            crate::bail!(
+                "HostSlot::write_from: {n} elements into a slot of {}",
+                self.cap
+            )
         }
         let elem = self.dtype.size_in_bytes();
         let kernel = match self.dtype {

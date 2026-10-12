@@ -6,10 +6,10 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use candle::{DType, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::models::mimi::{Config, Model};
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
+use lloom::models::mimi::{Config, Model};
+use lloom::nn::VarBuilder;
 
 mod audio_io;
 

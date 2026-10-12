@@ -1203,7 +1203,9 @@ impl FeedLink {
                 )
             }
             if t0.elapsed() > timeout {
-                lloom_tensor::bail!("host feed: the producer did not take a draw back in {timeout:?}")
+                lloom_tensor::bail!(
+                    "host feed: the producer did not take a draw back in {timeout:?}"
+                )
             }
             std::thread::sleep(std::time::Duration::from_micros(50));
             self.wake.wake();
@@ -1448,9 +1450,8 @@ mod tests {
         )
         .unwrap();
         let len = hash.n_heads() * head_dim;
-        let slot = |ring: &HostFedRing, v: u64| -> Vec<f32> {
-            ring.tensor(v).to_vec1::<f32>().unwrap()
-        };
+        let slot =
+            |ring: &HostFedRing, v: u64| -> Vec<f32> { ring.tensor(v).to_vec1::<f32>().unwrap() };
         let feed = |ring: &Arc<HostFedRing>| {
             let link = Arc::new(FeedLink::new(Arc::clone(ring), 10));
             HostFeed::new(
@@ -1470,11 +1471,17 @@ mod tests {
             for &t in tokens {
                 fill.fill(t).unwrap();
             }
-            (slot(&ring, base + tokens.len() as u64), fill.into_consumed())
+            (
+                slot(&ring, base + tokens.len() as u64),
+                fill.into_consumed(),
+            )
         };
         let (want, _) = fill_all(&[5, 6, 9, 11]);
         let (control, _) = fill_all(&[5, 6, 7, 11]);
-        assert_ne!(want, control, "11's rows do not see the token before it: no test");
+        assert_ne!(
+            want, control,
+            "11's rows do not see the token before it: no test"
+        );
         // 5, 6, 7 — then 7 taken back, and 9, 11 drawn after it.
         let ring = Arc::new(HostFedRing::new(&m, HOST_FILL_SLOTS, len).unwrap());
         let base = ring.base();

@@ -506,6 +506,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         }
         let tags = engine.think_tags();
         facts.thinking = Some(apply_thinking(engine, want, tags.as_ref(), &mut ids)?);
+        // A suffix property: dropping the oldest turns below leaves it.
+        params.turn_tail = thinking::checkpoint_tail(engine, &kwargs, want, &ids);
         // The prompt budget, before the engine sees the prompt: the oldest
         // turns go whole, so what runs is the template's own rendering.
         let mut dropped = Dropped::default();
@@ -915,6 +917,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         readback,
         logits_digest: false,
         prefill_tile: shared.engine.prefill_tile(),
+        turn_tail: 0,
         thinking: None,
     })
 }
@@ -1240,6 +1243,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         eos_ids: NEVER_EOS.to_vec(),
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
+        turn_tail: 0,
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
@@ -1278,6 +1282,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         eos_ids: NEVER_EOS.to_vec(),
         readback: engine.readback(),
         prefill_tile: engine.prefill_tile(),
+        turn_tail: 0,
         ..DecodeParams::default()
     };
     if batch == 1 {
@@ -1473,6 +1478,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             readback: engine.readback(),
                             logits_digest: false,
                             prefill_tile: engine.prefill_tile(),
+                            turn_tail: 0,
                             thinking: None,
                         };
                         let mut pending = String::new();

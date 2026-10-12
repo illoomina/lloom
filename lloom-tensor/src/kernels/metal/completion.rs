@@ -117,7 +117,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLSharedEvent, MTLSharedEventListener};
+use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 
 use super::cache_pad::CachePadded;
 use super::{CommandBuffer, Device};
@@ -496,18 +496,39 @@ impl CompletionWait {
     ///
     /// Returns `None` for [`Self::Synchronize`], which encodes nothing and
     /// leaves the incumbent path untouched.
-    pub fn encode_signal(&self, cb: &CommandBuffer, event: Option<&SharedEvent>) -> Option<u64> {
+    pub fn encode_signal(
+        &self,
+        cb: &CommandBuffer,
+        event: Option<&SharedEvent>,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        self.encode_signal_with(event, |event, value| cb.signal_event(event, value))
+    }
+
+    pub(super) fn encode_prepared_signal(
+        &self,
+        prepared: &super::command_buffer::PreparedCommandCommit<'_>,
+        event: Option<&SharedEvent>,
+    ) -> Result<Option<u64>, MetalKernelError> {
+        self.encode_signal_with(event, |event, value| prepared.signal_event(event, value))
+    }
+
+    fn encode_signal_with(
+        &self,
+        event: Option<&SharedEvent>,
+        encode: impl FnOnce(
+            &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+            u64,
+        ) -> Result<(), MetalKernelError>,
+    ) -> Result<Option<u64>, MetalKernelError> {
         if !self.needs_event() {
-            return None;
+            return Ok(None);
         }
-        let event = event?;
+        let Some(event) = event else {
+            return Ok(None);
+        };
         let value = event.next_value();
-        // SAFETY-adjacent note rather than an `unsafe` block: the objc2 binding
-        // for `encodeSignalEvent:value:` is safe, and its one documented
-        // precondition -- no open encoder -- is the caller's, discharged above.
-        cb.as_ref()
-            .encodeSignalEvent_value(ProtocolObject::from_ref(event.raw()), value);
-        Some(value)
+        encode(event.raw(), value)?;
+        Ok(Some(value))
     }
 
     /// Wait until `cb`'s work is done, by this arm's mechanism.
@@ -537,6 +558,13 @@ impl CompletionWait {
         event: Option<&SharedEvent>,
         signalled: Option<u64>,
     ) -> Result<WaitOutcome, MetalKernelError> {
+        cb.check_data_wait()?;
+        if cb.data_ready() {
+            return Ok(WaitOutcome {
+                already_complete: 1,
+                ..WaitOutcome::default()
+            });
+        }
         match self.wait_route(event.is_some(), signalled.is_some()) {
             // The incumbent, and the fallback whenever a signal was not
             // encoded. Falling back to a blocking wait can only ever be
@@ -544,7 +572,7 @@ impl CompletionWait {
             // will publish -- is a hang, so the asymmetry decides the
             // direction (§3.5).
             WaitRoute::Block => {
-                cb.wait_until_completed();
+                cb.try_wait_data_ready()?;
                 Ok(WaitOutcome::default())
             }
             WaitRoute::Poll => {
@@ -554,7 +582,7 @@ impl CompletionWait {
                 // fallback that blocks, keeping the fail-safe direction even if
                 // the two ever disagreed.
                 let (Some(ev), Some(target)) = (event, signalled) else {
-                    cb.wait_until_completed();
+                    cb.try_wait_data_ready()?;
                     return Ok(WaitOutcome::default());
                 };
                 let sleep = match self {
@@ -564,23 +592,45 @@ impl CompletionWait {
                     _ => None,
                 };
                 let mut polls = 0u64;
-                while ev.signaled_value() < target {
+                while ev.signaled_value() < target && !cb.data_ready() {
+                    cb.check_data_wait()?;
                     polls += 1;
                     match sleep {
-                        Some(d) => std::thread::sleep(d),
+                        Some(d) => {
+                            if d <= std::time::Duration::from_millis(50) {
+                                std::thread::sleep(d);
+                                continue;
+                            }
+                            let started = std::time::Instant::now();
+                            while started.elapsed() < d && !cb.data_ready() {
+                                cb.check_data_wait()?;
+                                std::thread::sleep(
+                                    d.saturating_sub(started.elapsed())
+                                        .min(std::time::Duration::from_millis(50)),
+                                );
+                            }
+                        }
                         None if polls >= SHARED_EVENT_POLL_BOUND => {
                             // Not imminent: park for the rest, woken by the
                             // listener, with the parking arms' fail-safe.
-                            if ev.notify_then_wait(target, DEFAULT_WAIT_TIMEOUT_MS) == 0
+                            if ev.notify_then_wait_checked(
+                                target,
+                                DEFAULT_WAIT_TIMEOUT_MS,
+                                || {
+                                    cb.check_data_wait()?;
+                                    Ok(cb.data_ready())
+                                },
+                            )? == 0
                                 && ev.signaled_value() < target
                             {
-                                cb.wait_until_completed();
+                                cb.try_wait_data_ready()?;
                             }
                             break;
                         }
                         None => {}
                     }
                 }
+                cb.try_wait_data_ready()?;
                 Ok(WaitOutcome {
                     polls,
                     fired: 0,
@@ -592,20 +642,24 @@ impl CompletionWait {
                 // construction, and re-deriving the decision here would make
                 // the routing function untestable. The fallback blocks.
                 let (Some(ev), Some(target)) = (event, signalled) else {
-                    cb.wait_until_completed();
+                    cb.try_wait_data_ready()?;
                     return Ok(WaitOutcome::default());
                 };
-                // The whole arm, in one call: the thread does not run until the
-                // runtime observes the value. No loop, so no poll to count --
-                // the 0 below is structural rather than a lucky first read.
-                if !ev.wait_until_signaled(target, timeout_ms) {
+                // Native event waits remain the selected mechanism. Pending
+                // waits use bounded slices for failure/reentry observation;
+                // these checks are not signaledValue polls.
+                if !ev.wait_until_signaled_checked(target, timeout_ms, || {
+                    cb.check_data_wait()?;
+                    Ok(cb.data_ready())
+                })? {
                     // A timeout is **not** completion. §3.5 makes reading before
                     // the GPU's write silent corruption rather than an error, so
                     // this falls back to the blocking wait -- the same
                     // fail-safe direction as a missing event, and for the same
                     // reason: blocking can only ever be early.
-                    cb.wait_until_completed();
+                    cb.try_wait_data_ready()?;
                 }
+                cb.try_wait_data_ready()?;
                 Ok(WaitOutcome::default())
             }
             WaitRoute::Notify { timeout_ms } => {
@@ -613,15 +667,18 @@ impl CompletionWait {
                 // construction, and re-deriving the decision would make
                 // `wait_route` untestable. The fallback blocks.
                 let (Some(ev), Some(target)) = (event, signalled) else {
-                    cb.wait_until_completed();
+                    cb.try_wait_data_ready()?;
                     return Ok(WaitOutcome::default());
                 };
                 // The block is registered on the event and fires on a GCD
                 // worker; this thread parks on the condvar it signals. Nothing
-                // here loops, so `polls` stays 0 -- and unlike the parking arm
+                // here polls signaledValue, so `polls` stays 0 -- unlike the parking arm
                 // above, that zero is NOT this arm's engagement proof, because
                 // a listener that never fired reads zero too. `fired` is.
-                let fired = ev.notify_then_wait(target, timeout_ms);
+                let fired = ev.notify_then_wait_checked(target, timeout_ms, || {
+                    cb.check_data_wait()?;
+                    Ok(cb.data_ready())
+                })?;
                 if fired == 0 {
                     // The block did not arrive inside the budget. Same
                     // fail-safe direction and the same reason as every arm
@@ -629,8 +686,9 @@ impl CompletionWait {
                     // reported rather than hidden, because a listener silently
                     // falling back to the incumbent is §7.1a-i's wrong-arm
                     // shape: a run that says one thing and does another.
-                    cb.wait_until_completed();
+                    cb.try_wait_data_ready()?;
                 }
+                cb.try_wait_data_ready()?;
                 Ok(WaitOutcome {
                     polls: 0,
                     fired,
@@ -844,8 +902,25 @@ pub struct NotifyState {
     ///
     /// The engagement proof for the listener arm, and it is a **count** rather
     /// than a flag so that a wait can tell *its own* block fired rather than
-    /// inheriting a previous one's.
+    /// inheriting a previous one's. Completion still requires `seen >= target`;
+    /// this count alone cannot identify which target fired.
     fired: u64,
+}
+
+impl NotifyState {
+    fn waiting_for(&self, target: u64) -> bool {
+        self.seen < target
+    }
+
+    fn completed_notifications(&self, target: u64, before: u64) -> u64 {
+        // A late callback for an earlier target is engagement, not completion
+        // of this wait. Returning zero preserves the caller's blocking fallback.
+        if self.waiting_for(target) {
+            0
+        } else {
+            self.fired.saturating_sub(before)
+        }
+    }
 }
 
 // SAFETY: `MTLSharedEvent` is documented as usable across threads and processes
@@ -954,6 +1029,32 @@ impl SharedEvent {
         self.raw.waitUntilSignaledValue_timeoutMS(value, timeout_ms)
     }
 
+    /// Preserve native event waiting, with bounded failure/reentry checks.
+    fn wait_until_signaled_checked(
+        &self,
+        value: u64,
+        timeout_ms: u64,
+        mut check: impl FnMut() -> Result<bool, MetalKernelError>,
+    ) -> Result<bool, MetalKernelError> {
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if check()? {
+                return Ok(false);
+            } // data-ready, not event-engagement
+            let remaining = budget.saturating_sub(started.elapsed());
+            let slice = remaining.as_millis().min(50) as u64;
+            if self.wait_until_signaled(value, slice) {
+                check()?;
+                return Ok(true);
+            }
+            check()?;
+            if started.elapsed() >= budget {
+                return Ok(false);
+            }
+        }
+    }
+
     /// Register a notification block for `value` and park until it fires, or
     /// until `timeout_ms` elapses (#583).
     ///
@@ -990,10 +1091,38 @@ impl SharedEvent {
     /// state that, because a genuine ordering defect here would be
     /// indistinguishable from the false ones.
     pub fn notify_then_wait(&self, value: u64, timeout_ms: u64) -> u64 {
+        self.notify_then_wait_impl(value, timeout_ms, None, || Ok(false))
+            .expect("infallible legacy notification check")
+    }
+
+    fn notify_then_wait_checked(
+        &self,
+        value: u64,
+        timeout_ms: u64,
+        check: impl FnMut() -> Result<bool, MetalKernelError>,
+    ) -> Result<u64, MetalKernelError> {
+        self.notify_then_wait_impl(
+            value,
+            timeout_ms,
+            Some(std::time::Duration::from_millis(50)),
+            check,
+        )
+    }
+
+    fn notify_then_wait_impl(
+        &self,
+        value: u64,
+        timeout_ms: u64,
+        check_interval: Option<std::time::Duration>,
+        mut check: impl FnMut() -> Result<bool, MetalKernelError>,
+    ) -> Result<u64, MetalKernelError> {
+        if check()? {
+            return Ok(0);
+        } // already data-ready, no listener fired
         let Some(listener) = self.listener.as_ref() else {
             // No listener: nothing will ever fire, so report the failure rather
             // than parking for the whole timeout. The caller blocks.
-            return 0;
+            return Ok(0);
         };
 
         // The state the block writes and this thread reads. Cloned into the
@@ -1039,14 +1168,31 @@ impl SharedEvent {
         // returns the timeout as a plain result, so the poison arm std needed
         // here is gone; a timeout still falls through to the count below,
         // which reads 0 and sends the caller to the blocking wait.
-        let _timed_out = cv.wait_while_for(
-            &mut guard,
-            |st| st.seen < value && st.fired == before,
-            deadline,
-        );
+        if let Some(interval) = check_interval {
+            let started = std::time::Instant::now();
+            while guard.waiting_for(value) && started.elapsed() < deadline {
+                // Never inspect queue failure or reentry under listener state.
+                drop(guard);
+                let data_ready = check()?;
+                guard = lock.lock();
+                if data_ready {
+                    break;
+                }
+                if !guard.waiting_for(value) {
+                    break;
+                }
+                let remaining = deadline.saturating_sub(started.elapsed());
+                cv.wait_for(&mut guard, remaining.min(interval));
+            }
+        } else {
+            let _timed_out = cv.wait_while_for(&mut guard, |st| st.waiting_for(value), deadline);
+        }
         // The count this wait observed, and 0 when nothing arrived. Reported
         // rather than a bool for the reason in the doc comment above.
-        guard.fired.saturating_sub(before)
+        let fired = guard.completed_notifications(value, before);
+        drop(guard);
+        check()?;
+        Ok(fired)
     }
 }
 
@@ -1061,6 +1207,19 @@ impl std::fmt::Debug for SharedEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_listener_callback_cannot_complete_a_newer_target() {
+        let mut state = NotifyState { seen: 7, fired: 2 };
+        assert!(state.waiting_for(8));
+        assert_eq!(state.completed_notifications(8, 1), 0);
+        // Timeout after an old callback still requests the native fallback.
+        state.seen = 8;
+        state.fired = 3;
+        assert!(!state.waiting_for(8));
+        assert_eq!(state.completed_notifications(8, 1), 2);
+        assert_eq!(state.completed_notifications(9, 1), 0);
+    }
 
     #[test]
     fn parses_every_arm() {

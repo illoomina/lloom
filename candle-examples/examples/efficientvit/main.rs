@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, IndexOp, D};
-use lloom::nn::{Module, VarBuilder};
 use lloom::models::efficientvit;
+use lloom::nn::{Module, VarBuilder};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Which {

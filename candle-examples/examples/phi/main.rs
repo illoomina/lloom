@@ -14,9 +14,9 @@ use lloom::models::phi3::{Config as Phi3Config, Model as Phi3};
 use lloom::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
 use candle::{DType, Device, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 enum Model {
@@ -355,10 +355,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let model = if args.quantized {
         let config = config();
-        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
-            &filenames[0],
-            &device,
-        )?;
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(&filenames[0], &device)?;
         let model = match args.model {
             WhichModel::V2 | WhichModel::V2Old => QMixFormer::new_v2(&config, vb)?,
             _ => QMixFormer::new(&config, vb)?,

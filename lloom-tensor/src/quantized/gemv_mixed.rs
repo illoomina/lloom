@@ -167,7 +167,9 @@ impl crate::CustomOp1 for GemvMixed {
         let extra = match &self.gnorm {
             Some(g) if g.scales => {
                 if b != 1 {
-                    crate::bail!("gemv_mixed: the grouped norm's scales are a one-row form, got {b} rows")
+                    crate::bail!(
+                        "gemv_mixed: the grouped norm's scales are a one-row form, got {b} rows"
+                    )
                 }
                 g.groups
             }
@@ -239,7 +241,7 @@ impl crate::CustomOp1 for GemvMixed {
         let mut shape = dims.to_vec();
         *shape.last_mut().unwrap() = n_out + extra;
         Ok((
-            crate::MetalStorage::new(output, device.clone(), elem_count, DType::F32),
+            crate::MetalStorage::new_allocated(output, device.clone(), elem_count, DType::F32)?,
             Shape::from(shape),
         ))
     }

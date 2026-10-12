@@ -91,10 +91,10 @@ template <typename T, typename U, typename unary, int W = work_per_thread<T>()>
     unary_body<T, U, unary, W>(pp->dim, input, output, tid);
 }
 
-// `InPtrT` is templated alongside `PtrT` so the classical wrapper keeps its
-// `constant const T *input` exactly as it was. That address space is not
-// incidental -- changing it would be a behaviour change to the classical path
-// smuggled in beside a binding change.
+// Strided tensor views can start at any element-aligned offset. Use the
+// device address space for their input: constant bindings require a stricter
+// hardware alignment (e.g. 4 bytes on Apple7), rejecting odd half/bfloat
+// offsets and byte slices. Both parameter styles share the arithmetic body.
 template <typename T, typename U, typename unary, typename PtrT, typename InPtrT>
 METAL_FUNC void unary_strided_body(
     size_t dim,
@@ -117,11 +117,11 @@ template <typename T, typename U, typename unary>
     constant size_t &num_dims,
     constant size_t *dims,
     constant size_t *strides,
-    constant const T *input,
+    device const T *input,
     device U *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    unary_strided_body<T, U, unary, constant size_t *, constant const T *>(
+    unary_strided_body<T, U, unary, constant size_t *, device const T *>(
         dim, num_dims, dims, strides, input, output, tid);
 }
 
@@ -130,11 +130,11 @@ template <typename T, typename U, typename unary>
     device const UnaryStridedParams *pp,
     device const size_t *dims,
     device const size_t *strides,
-    constant const T *input,
+    device const T *input,
     device U *output,
     uint tid [[ thread_position_in_grid ]]
 ) {
-    unary_strided_body<T, U, unary, device const size_t *, constant const T *>(
+    unary_strided_body<T, U, unary, device const size_t *, device const T *>(
         pp->dim, pp->num_dims, dims, strides, input, output, tid);
 }
 

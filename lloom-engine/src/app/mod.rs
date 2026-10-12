@@ -342,6 +342,9 @@ pub fn resolve_layers(
         }
         last = now;
     };
+    for note in crate::option_grammar::legacy_notes(env) {
+        eprintln!("{note}");
+    }
     o.from_env_with(env)
         .map_err(|e| anyhow::anyhow!("env: {e}"))?;
     mark("env", &o);
@@ -673,24 +676,30 @@ mod option_layer_tests {
         .unwrap();
         let path = file.to_str().unwrap();
         // file < --decode-config < --set < flags
-        let o = resolve_options_uninstalled(&common(&[
-            "--config",
-            path,
-            "--decode-config",
-            r#"{"in_flight": 5, "readback": {"wake_cadence": 2}}"#,
-            "--set",
-            "decode.in_flight=6",
-            "--set",
-            "decode.readback.kind=ring",
-            "--in-flight",
-            "7",
-        ]), &no_front)
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--config",
+                path,
+                "--decode-config",
+                r#"{"in_flight": 5, "readback": {"wake_cadence": 2}}"#,
+                "--set",
+                "decode.in_flight=6",
+                "--set",
+                "decode.readback.kind=ring",
+                "--in-flight",
+                "7",
+            ]),
+            &no_front,
+        )
         .unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain, "from the file");
         assert_eq!(o.decode.readback.lookahead, 0, "from the file");
         assert_eq!(o.decode.readback.wake_cadence, 2, "from --decode-config");
         assert_eq!(o.decode.readback.kind, ReadbackKind::Ring, "from --set");
-        assert_eq!(o.decode.in_flight, 7, "the flag wins over --set over the json over the file");
+        assert_eq!(
+            o.decode.in_flight, 7,
+            "the flag wins over --set over the json over the file"
+        );
         // The dump (`lloom config`'s tree) is a valid --config that
         // reproduces the options.
         let dumped = dir.join("dump.json");
@@ -699,7 +708,11 @@ mod option_layer_tests {
             serde_json::to_string_pretty(&crate::option_tree::index().render(&o)).unwrap(),
         )
         .unwrap();
-        let back = resolve_options_uninstalled(&common(&["--config", dumped.to_str().unwrap()]), &no_front).unwrap();
+        let back = resolve_options_uninstalled(
+            &common(&["--config", dumped.to_str().unwrap()]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(back, o);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -716,12 +729,14 @@ mod option_layer_tests {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.tuning.contract.profile, "fast");
         assert_eq!(o.tuning.tensor().contract.profile, "fast");
-        let o = resolve_options_uninstalled(&common(&["--profile", "deterministic"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--profile", "deterministic"]), &no_front)
+            .unwrap();
         assert_eq!(o.tuning.tensor().contract.profile, "deterministic");
-        assert!(
-            resolve_options_uninstalled(&common(&["--set", "tuning.contract.profile=relaxed"]), &no_front)
-                .is_err()
-        );
+        assert!(resolve_options_uninstalled(
+            &common(&["--set", "tuning.contract.profile=relaxed"]),
+            &no_front
+        )
+        .is_err());
         let o = resolve_options_uninstalled(&common(&["--gpu-profile"]), &no_front).unwrap();
         assert!(o.tuning.instrument.profile);
         assert_eq!(o.tuning.contract.profile, "fast");
@@ -730,7 +745,11 @@ mod option_layer_tests {
     #[test]
     fn a_refused_combination_names_itself() {
         // The blocking arm ignores the cadence knobs rather than refusing them.
-        let o = resolve_options_uninstalled(&common(&["--readback", "blocking", "--adaptive-commit"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["--readback", "blocking", "--adaptive-commit"]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(o.decode.readback.arm(), crate::ReadbackArm::Blocking);
         // The EOS gate defaults on and rides the adaptive commit: every
         // fixed-cadence route serves without it rather than being refused.
@@ -747,16 +766,26 @@ mod option_layer_tests {
         }
         // `ring` (the flag EOS read) resolves to the fixed cadence, and the
         // clamp note names the EOS gate that goes off with the commit.
-        for argv in [&["--readback", "ring"][..], &["--readback", "ring", "--eos-gate"]] {
+        for argv in [
+            &["--readback", "ring"][..],
+            &["--readback", "ring", "--eos-gate"],
+        ] {
             let o = resolve_options_uninstalled(&common(argv), &no_front).unwrap();
             assert!(
-                o.decode.readback.adaptive_clamp().is_some_and(|n| n.contains("EOS gate")),
+                o.decode
+                    .readback
+                    .adaptive_clamp()
+                    .is_some_and(|n| n.contains("EOS gate")),
                 "{argv:?}"
             );
             assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
         }
         // The stream reader streams every ring arm, the flag read included.
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["--readback", "ring", "--stream-reader"]),
+            &no_front,
+        )
+        .unwrap();
         assert!(o.decode.readback.stream_reader);
         let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]), &no_front)
             .unwrap_err()
@@ -792,7 +821,10 @@ mod option_layer_tests {
         };
         let mut s = shape(&["--replay"]);
         let note = clamp_eos_gate(&mut s).expect("the clamp is named");
-        assert!(note.contains("eos_gate is off") && note.contains("replay"), "{note}");
+        assert!(
+            note.contains("eos_gate is off") && note.contains("replay"),
+            "{note}"
+        );
         assert!(!s.decode.readback.eos_gate);
         for argv in [
             &[][..],
@@ -810,15 +842,24 @@ mod option_layer_tests {
 
     #[test]
     fn the_shorthands_are_lfm2_chats() {
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-gpubatch-nonblocking"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["--readback", "ring-gpubatch-nonblocking"]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(o.decode.readback.kind, ReadbackKind::Ring);
         assert_eq!(o.decode.readback.eos, EosKind::GpuBatchedNonblocking);
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-la0"]), &no_front).unwrap();
+        let o =
+            resolve_options_uninstalled(&common(&["--readback", "ring-la0"]), &no_front).unwrap();
         assert_eq!(o.decode.readback.lookahead, 0);
         assert!(!o.decode.readback.adaptive_commit);
         // The compound and its keys compose in either order: the spelling
         // sets kind + eos, the key flags override field by field.
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["--readback", "ring-hostdrain", "--lookahead", "0"]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain);
         assert_eq!(o.decode.readback.lookahead, 0);
     }
@@ -842,30 +883,49 @@ mod model_group_tests {
 
     #[test]
     fn the_axes_reach_the_config_by_flag_key_and_json() {
-        let o = resolve_options_uninstalled(&common(&[
-            "--cache",
-            "crown",
-            "--attn",
-            "flash",
-            "--gemv-silu=false",
-            "--set",
-            "model.kv-append=paged",
-            "--model-config",
-            r#"{"axes": {"qkv-layout": "fused"}}"#,
-        ]), &no_front)
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--cache",
+                "crown",
+                "--attn",
+                "flash",
+                "--gemv-silu=false",
+                "--set",
+                "model.kv-append=paged",
+                "--model-config",
+                r#"{"axes": {"qkv-layout": "fused"}}"#,
+            ]),
+            &no_front,
+        )
         .unwrap();
         assert_eq!(o.model.cache, "crown");
         assert_eq!(o.model.axes.get("attn").map(String::as_str), Some("flash"));
-        assert_eq!(o.model.axes.get("gemv-silu").map(String::as_str), Some("false"));
-        assert_eq!(o.model.axes.get("kv-append").map(String::as_str), Some("paged"));
-        assert_eq!(o.model.axes.get("qkv-layout").map(String::as_str), Some("fused"));
+        assert_eq!(
+            o.model.axes.get("gemv-silu").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            o.model.axes.get("kv-append").map(String::as_str),
+            Some("paged")
+        );
+        assert_eq!(
+            o.model.axes.get("qkv-layout").map(String::as_str),
+            Some("fused")
+        );
         let mut cfg = Config::default();
         cfg.gemv_silu = true;
         o.model.apply_axes(&mut cfg).unwrap();
         assert_eq!(cfg.attn_impl, AttnImpl::FlashDecoding);
         assert_eq!(cfg.kv_append, KvAppend::Paged);
-        assert!(!cfg.gemv_silu, "`--gemv-silu=false` forces the preset's arm off");
-        assert!(cfg.axes_line().contains("AttnImpl=FlashDecoding"), "{}", cfg.axes_line());
+        assert!(
+            !cfg.gemv_silu,
+            "`--gemv-silu=false` forces the preset's arm off"
+        );
+        assert!(
+            cfg.axes_line().contains("AttnImpl=FlashDecoding"),
+            "{}",
+            cfg.axes_line()
+        );
         // The dump round-trips.
         let v = serde_json::to_value(&o).unwrap();
         let mut back = crate::EngineOptions::default();
@@ -945,18 +1005,21 @@ mod sampling_and_speculation_tests {
     /// `--sampling-defaults checkpoint` only.
     #[test]
     fn the_processor_fields_reach_the_params_from_every_layer() {
-        let o = resolve_options_uninstalled(&common(&[
-            "--repetition-penalty",
-            "1.1",
-            "--presence-penalty",
-            "0.5",
-            "--frequency-penalty",
-            "-0.5",
-            "--min-p",
-            "0.05",
-            "--logit-bias",
-            "42:-100, 7:2.5",
-        ]), &no_front)
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--repetition-penalty",
+                "1.1",
+                "--presence-penalty",
+                "0.5",
+                "--frequency-penalty",
+                "-0.5",
+                "--min-p",
+                "0.05",
+                "--logit-bias",
+                "42:-100, 7:2.5",
+            ]),
+            &no_front,
+        )
         .unwrap();
         let p = o
             .sampling
@@ -972,12 +1035,15 @@ mod sampling_and_speculation_tests {
                 logit_bias: vec![(7, 2.5), (42, -100.0)],
             }
         );
-        let o = resolve_options_uninstalled(&common(&[
-            "--generation-config",
-            r#"{"presence_penalty": 1.0, "logit_bias": {"3": -5}}"#,
-            "--set",
-            "sampling.min_p=0.2",
-        ]), &no_front)
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--generation-config",
+                r#"{"presence_penalty": 1.0, "logit_bias": {"3": -5}}"#,
+                "--set",
+                "sampling.min_p=0.2",
+            ]),
+            &no_front,
+        )
         .unwrap();
         let p = o.sampling.processors();
         assert_eq!(
@@ -1033,19 +1099,55 @@ mod sampling_and_speculation_tests {
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::TopP { p: 0.9, temperature: 0.7 });
+        let o = resolve_options_uninstalled(
+            &common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"]),
+            &no_front,
+        )
+        .unwrap();
+        assert_eq!(
+            o.sampling.sampling(),
+            Sampling::TopP {
+                p: 0.9,
+                temperature: 0.7
+            }
+        );
         assert_eq!(o.sampling.max_tokens, 64);
         assert_eq!(o.sampling.seed, Some(7));
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-k", "40", "--top-p", "0.9"]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::TopKThenTopP { k: 40, p: 0.9, temperature: 0.7 });
-        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"]), &no_front).unwrap();
-        assert_eq!(o.sampling.sampling(), Sampling::GumbelSoftmax { temperature: 0.7 });
-        let o = resolve_options_uninstalled(&common(&["--generation-config", r#"{"temperature": 0.3, "stop": ["<|im_end|>", "\n\n"], "ignore_eos": true}"#]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["-t", "0.7", "--top-k", "40", "--top-p", "0.9"]),
+            &no_front,
+        )
+        .unwrap();
+        assert_eq!(
+            o.sampling.sampling(),
+            Sampling::TopKThenTopP {
+                k: 40,
+                p: 0.9,
+                temperature: 0.7
+            }
+        );
+        let o =
+            resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"]), &no_front).unwrap();
+        assert_eq!(
+            o.sampling.sampling(),
+            Sampling::GumbelSoftmax { temperature: 0.7 }
+        );
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--generation-config",
+                r#"{"temperature": 0.3, "stop": ["<|im_end|>", "\n\n"], "ignore_eos": true}"#,
+            ]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(o.sampling.sampling(), Sampling::All { temperature: 0.3 });
         assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
         let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
-        assert_eq!(p.eos_ids, vec![u32::MAX], "ignore_eos replaces the EOS set with an id no tokenizer emits");
+        assert_eq!(
+            p.eos_ids,
+            vec![u32::MAX],
+            "ignore_eos replaces the EOS set with an id no tokenizer emits"
+        );
         assert_eq!(p.max_tokens, 512);
         // The checkpoint's defaults fill only unset fields, only when asked.
         let gc = lloom::hub::GenerationConfig {
@@ -1055,7 +1157,11 @@ mod sampling_and_speculation_tests {
         };
         let mut s = o.sampling.clone();
         s.apply_checkpoint(Some(&gc));
-        assert_eq!(s.temperature, Some(0.3), "greedy mode ignores the checkpoint");
+        assert_eq!(
+            s.temperature,
+            Some(0.3),
+            "greedy mode ignores the checkpoint"
+        );
         s.defaults = "checkpoint".into();
         s.apply_checkpoint(Some(&gc));
         assert_eq!(s.temperature, Some(0.3), "a set field stays");
@@ -1064,19 +1170,41 @@ mod sampling_and_speculation_tests {
 
     #[test]
     fn the_speculation_shorthands_fill_the_group() {
-        let o = resolve_options_uninstalled(&common(&["--dspark", "--dspark-k", "3"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--dspark", "--dspark-k", "3"]), &no_front)
+            .unwrap();
         assert_eq!(o.speculative.method, "dspark");
         assert_eq!(o.speculative.k, Some(3));
         assert_eq!(o.speculative.drafter, None);
-        let o = resolve_options_uninstalled(&common(&["--mtp", "/tmp/mtp.gguf", "--mtp-k", "2"]), &no_front).unwrap();
+        let o = resolve_options_uninstalled(
+            &common(&["--mtp", "/tmp/mtp.gguf", "--mtp-k", "2"]),
+            &no_front,
+        )
+        .unwrap();
         assert_eq!(o.speculative.method, "mtp");
         assert_eq!(o.speculative.k, Some(2));
-        assert_eq!(o.speculative.drafter.as_deref(), Some(std::path::Path::new("/tmp/mtp.gguf")));
-        let o = resolve_options_uninstalled(&common(&["--speculative-config", r#"{"method": "dspark", "k": 4, "drafter": "/d"}"#]), &no_front).unwrap();
-        assert_eq!((o.speculative.method.as_str(), o.speculative.k), ("dspark", Some(4)));
-        let err = resolve_options_uninstalled(&common(&["--dspark", "--mtp", "/x"]), &no_front).unwrap_err().to_string();
+        assert_eq!(
+            o.speculative.drafter.as_deref(),
+            Some(std::path::Path::new("/tmp/mtp.gguf"))
+        );
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--speculative-config",
+                r#"{"method": "dspark", "k": 4, "drafter": "/d"}"#,
+            ]),
+            &no_front,
+        )
+        .unwrap();
+        assert_eq!(
+            (o.speculative.method.as_str(), o.speculative.k),
+            ("dspark", Some(4))
+        );
+        let err = resolve_options_uninstalled(&common(&["--dspark", "--mtp", "/x"]), &no_front)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("one speculative body"), "{err}");
-        let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"]), &no_front).unwrap_err().to_string();
+        let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"]), &no_front)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not a speculation method"), "{err}");
     }
 }
@@ -1098,35 +1226,41 @@ mod executor_and_memory_tests {
 
     #[test]
     fn the_groups_take_lfm2_chats_flags() {
-        let o = resolve_options_uninstalled(&common(&[
-            "--replay",
-            "--arena-layout",
-            "non-aliasing",
-            "--replay-barriers",
-            "always",
-            "--pass-plans",
-            "--memory-fraction",
-            "0.7",
-            "--kv-capacity",
-            "4096",
-            "--kv-bucket",
-            "2048",
-            "--kv-grow-fraction",
-            "0.5",
-            "--free-budget-mb",
-            "512",
-            "--slots",
-            "200",
-            "--kv-reserve-tokens",
-            "1024",
-        ]), &no_front)
+        let o = resolve_options_uninstalled(
+            &common(&[
+                "--replay",
+                "--arena-layout",
+                "non-aliasing",
+                "--replay-barriers",
+                "always",
+                "--pass-plans",
+                "--memory-fraction",
+                "0.7",
+                "--kv-capacity",
+                "4096",
+                "--kv-bucket",
+                "2048",
+                "--kv-grow-fraction",
+                "0.5",
+                "--free-budget-mb",
+                "512",
+                "--slots",
+                "200",
+                "--kv-reserve-tokens",
+                "1024",
+            ]),
+            &no_front,
+        )
         .unwrap();
         assert!(o.executor.replay && o.executor.pass_plans && !o.executor.arena);
         assert_eq!(o.executor.arena_layout, "non-aliasing");
         // The replay's arena is the single-key one; the plan cache would
         // bypass its recording, so the replay supersedes it.
         assert!(!o.executor.pass_plans_armed());
-        assert_eq!(o.executor.line(), "arena=non-aliasing packed=true replay=always/run-start pass_plans=false");
+        assert_eq!(
+            o.executor.line(),
+            "arena=non-aliasing packed=true replay=always/run-start pass_plans=false"
+        );
         assert_eq!(o.memory.memory_fraction, 0.7);
         assert_eq!(o.memory.kv_capacity, 4096);
         assert_eq!(o.memory.kv_bucket, 2048);
@@ -1139,13 +1273,25 @@ mod executor_and_memory_tests {
             .to_string();
         assert!(err.contains("not an arena layout"), "{err}");
         let o = resolve_options_uninstalled(&common(&[]), &no_front).unwrap();
-        assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=true");
-        let o = resolve_options_uninstalled(&common(&["--pass-plans", "false"]), &no_front).unwrap();
-        assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=false");
+        assert_eq!(
+            o.executor.line(),
+            "arena=off packed=false replay=off pass_plans=true"
+        );
+        let o =
+            resolve_options_uninstalled(&common(&["--pass-plans", "false"]), &no_front).unwrap();
+        assert_eq!(
+            o.executor.line(),
+            "arena=off packed=false replay=off pass_plans=false"
+        );
         let o = resolve_options_uninstalled(&common(&["--arena"]), &no_front).unwrap();
-        assert_eq!(o.executor.line(), "arena=packed packed=false replay=off pass_plans=false");
+        assert_eq!(
+            o.executor.line(),
+            "arena=packed packed=false replay=off pass_plans=false"
+        );
         // The layout selects the plans' layout too, and the line says so.
-        let o = resolve_options_uninstalled(&common(&["--arena-layout", "non-aliasing"]), &no_front).unwrap();
+        let o =
+            resolve_options_uninstalled(&common(&["--arena-layout", "non-aliasing"]), &no_front)
+                .unwrap();
         assert_eq!(
             o.executor.line(),
             "arena=off packed=false replay=off pass_plans=true/non-aliasing"

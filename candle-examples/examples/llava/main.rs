@@ -7,16 +7,14 @@ use lloom::models::llama::Cache;
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Device, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::models::llava::config::{
-    HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig,
-};
-use lloom::models::llava::{config::LLaVAConfig, LLaVA};
 use clap::Parser;
 use constants::*;
 use conversation::Conversation;
 use hf_hub::api::sync::Api;
 use image_processor::{process_image, ImageProcessor};
+use lloom::models::llava::config::{HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig};
+use lloom::models::llava::{config::LLaVAConfig, LLaVA};
+use lloom::nn::VarBuilder;
 use std::io::Write;
 use tokenizers::Tokenizer;
 

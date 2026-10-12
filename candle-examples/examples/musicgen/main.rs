@@ -16,9 +16,9 @@ use musicgen_model::{GenConfig, MusicgenForConditionalGeneration};
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Tensor};
-use lloom::nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+use lloom::nn::VarBuilder;
 
 const DTYPE: DType = DType::F32;
 

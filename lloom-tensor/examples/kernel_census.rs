@@ -123,7 +123,11 @@ fn main() {
     let mut rows: Vec<(&str, Vec<String>)> = Vec::new();
 
     // 25 arms in `label`; a list shorter than that under-reports.
-    assert_eq!(ALL_SOURCES.len(), 25, "ALL_SOURCES does not name every Source");
+    assert_eq!(
+        ALL_SOURCES.len(),
+        25,
+        "ALL_SOURCES does not name every Source"
+    );
     for source in ALL_SOURCES {
         let label = label(*source);
         let library = match kernels.load_library(&device, *source) {

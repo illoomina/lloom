@@ -7,8 +7,8 @@ use crate::kernels::metal::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLResourceUsage, MTLSize,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLComputeCommandEncoder,
+    MTLResourceUsage, MTLSize,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -458,6 +458,9 @@ impl BoundSet {
 /// Barrier tracking state for one encoder session.
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
 pub struct EncoderState {
+    recording: Option<super::command_buffer::EncoderAdmission>,
+    ended: bool,
+    close_succeeded: bool,
     /// How hazards are keyed this session.
     pub hazard_key: HazardKey,
     /// Bindings written since last barrier (RAW/WAW detection).
@@ -548,6 +551,9 @@ impl EncoderState {
 
     pub fn with_hazard_key(hazard_key: HazardKey) -> Self {
         EncoderState {
+            recording: None,
+            ended: false,
+            close_succeeded: false,
             hazard_key,
             prev_outputs: BoundSet::default(),
             next_outputs: BoundSet::default(),
@@ -567,17 +573,98 @@ impl EncoderState {
     }
 }
 
-#[derive(Clone)]
+/// Shared allocation: the mutex remains the existing hazard-state lock. The
+/// external count is touched only by wrapper construction/clone/drop, not binds.
+pub(crate) struct SharedEncoderState {
+    state: parking_lot::Mutex<EncoderState>,
+    external: std::sync::atomic::AtomicUsize,
+    domain: std::sync::OnceLock<Arc<EncoderDomain>>,
+    wake: std::sync::OnceLock<Arc<crate::completion_wake::Wake>>,
+}
+impl std::ops::Deref for SharedEncoderState {
+    type Target = parking_lot::Mutex<EncoderState>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+/// All escaped encoders created by one Commands, including older recordings.
+/// Only atomics and Wake are owned here: no Core, native resource or user capture
+/// can be finally destroyed by a foreign permit releasing this metadata.
+pub(super) struct EncoderDomain {
+    external: std::sync::atomic::AtomicUsize,
+    wake: Arc<crate::completion_wake::Wake>,
+}
+impl EncoderDomain {
+    pub(super) fn new(wake: Arc<crate::completion_wake::Wake>) -> Arc<Self> {
+        Arc::new(Self {
+            external: std::sync::atomic::AtomicUsize::new(0),
+            wake,
+        })
+    }
+    pub(super) fn has_external_handles(&self) -> bool {
+        self.external.load(Ordering::Acquire) != 0
+    }
+}
+struct DomainEncoderHandle(Arc<EncoderDomain>);
+impl DomainEncoderHandle {
+    fn acquire(domain: &Arc<EncoderDomain>) -> Self {
+        let domain = Arc::clone(domain);
+        // Each counted permit owns this Arc before increment and through release.
+        domain.external.fetch_add(1, Ordering::Relaxed);
+        Self(domain)
+    }
+}
+impl Drop for DomainEncoderHandle {
+    fn drop(&mut self) {
+        if self.0.external.fetch_sub(1, Ordering::Release) == 1 {
+            self.0.wake.notify();
+        }
+    }
+}
+/// Declared LAST in the wrapper: release follows every other field destructor.
+/// This retains shared encoder state, including its recording parent until
+/// final capture extraction takes it. Count zero proves external operation
+/// exclusion, not final metadata/physical destruction. It also rolls back a
+/// partly constructed Clone after earlier cloned fields unwind.
+struct ExternalEncoderHandle {
+    state: Arc<SharedEncoderState>,
+    // LAST: shared-state custody is released before aggregate capability.
+    _domain: Option<DomainEncoderHandle>,
+}
+impl ExternalEncoderHandle {
+    fn acquire(state: &Arc<SharedEncoderState>) -> Self {
+        // The state Arc is retained before counting, and released after decrement.
+        let state = Arc::clone(state);
+        let domain = state.domain.get().map(DomainEncoderHandle::acquire);
+        state.external.fetch_add(1, Ordering::Relaxed);
+        Self {
+            state,
+            _domain: domain,
+        }
+    }
+}
+impl Drop for ExternalEncoderHandle {
+    fn drop(&mut self) {
+        if self.state.external.fetch_sub(1, Ordering::Release) == 1 {
+            if let Some(wake) = self.state.wake.get() {
+                wake.notify();
+            }
+        }
+    }
+}
+
 pub struct ComputeCommandEncoder {
-    pub(crate) raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+    finalizer: Option<Arc<super::commands::EncoderFinalizer>>,
+    pub(crate) raw: super::raw_encoder::Compute,
     /// Retained so we can register completion handlers on this CB.
-    pub(crate) command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    pub(crate) command_buffer: super::CommandBuffer,
     /// Per-encoder-session fence. Updated at end_encoding.
     pub(crate) fence: Arc<Fence>,
-    /// Hazard tracking state. Arc shared between the canonical encoder in EntryState
-    /// and the clone held by CommandsGuard. Uncontended in practice (CommandsGuard
-    /// holds the outer Commands mutex for the entire kernel dispatch).
-    pub(crate) state: Arc<parking_lot::Mutex<EncoderState>>,
+    /// Hazard tracking state. CommandsGuard borrows the canonical EntryState
+    /// wrapper under the outer mutex. Explicit public clones share this allocation
+    /// and carry independently counted external handles.
+    pub(crate) state: Arc<SharedEncoderState>,
     /// Buffer -> fence of its last writer, so a bind can wait on just that
     /// buffer instead of on every live fence.
     pub(crate) prev_ce_outputs: PrevCeOutputs,
@@ -610,6 +697,31 @@ pub struct ComputeCommandEncoder {
     /// The device's own dispatch trace, when the trace switch is on
     /// (`trace::DeviceTrace`). `None` on encoders built outside `Commands`.
     pub(crate) trace: Option<Arc<trace::DeviceTrace>>,
+    // Keep LAST. None only for the canonical EntryState-owned wrapper.
+    external: Option<ExternalEncoderHandle>,
+}
+
+impl Clone for ComputeCommandEncoder {
+    fn clone(&self) -> Self {
+        // A clone of even the internal canonical wrapper is an external escape.
+        // Keep this rollback owner local until all other field clones succeed.
+        let external = Some(ExternalEncoderHandle::acquire(&self.state));
+        Self {
+            finalizer: self.finalizer.clone(),
+            raw: self.raw.clone(),
+            command_buffer: self.command_buffer.clone(),
+            fence: self.fence.clone(),
+            state: self.state.clone(),
+            prev_ce_outputs: self.prev_ce_outputs.clone(),
+            executor: self.executor.clone(),
+            capturing: self.capturing.clone(),
+            param_capture: self.param_capture.clone(),
+            clock: self.clock.clone(),
+            census: self.census.clone(),
+            trace: self.trace.clone(),
+            external,
+        }
+    }
 }
 
 /// Scalars accumulated for a packed params block, and the buffer renumbering
@@ -666,13 +778,35 @@ impl ComputeCommandEncoder {
         prev_ce_outputs: PrevCeOutputs,
         executor: Arc<ExecutorSlot>,
     ) -> ComputeCommandEncoder {
+        Self::with_backend(
+            super::raw_encoder::Compute::Metal3(raw),
+            super::CommandBuffer::new(command_buffer),
+            fence,
+            prev_ce_outputs,
+            executor,
+        )
+    }
+
+    pub(crate) fn with_backend(
+        raw: super::raw_encoder::Compute,
+        command_buffer: super::CommandBuffer,
+        fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
+        executor: Arc<ExecutorSlot>,
+    ) -> ComputeCommandEncoder {
+        let state = Arc::new(SharedEncoderState {
+            state: parking_lot::Mutex::new(EncoderState::with_hazard_key(hazard_key())),
+            external: std::sync::atomic::AtomicUsize::new(0),
+            domain: std::sync::OnceLock::new(),
+            wake: std::sync::OnceLock::new(),
+        });
+        let external = Some(ExternalEncoderHandle::acquire(&state));
         ComputeCommandEncoder {
+            finalizer: None,
             raw,
             command_buffer,
             fence,
-            state: Arc::new(parking_lot::Mutex::new(EncoderState::with_hazard_key(
-                hazard_key(),
-            ))),
+            state,
             prev_ce_outputs,
             executor,
             capturing: Arc::new(AtomicBool::new(false)),
@@ -680,7 +814,115 @@ impl ComputeCommandEncoder {
             clock: None,
             census: None,
             trace: None,
+            external,
         }
+    }
+
+    /// Commands alone converts a freshly constructed, never-published wrapper
+    /// into its canonical EntryState owner under EntryState. Borrowed guards do
+    /// not increment the count; cloning through one always does.
+    pub(super) fn into_canonical(mut self, domain: Arc<EncoderDomain>) -> Self {
+        let _ = self.state.wake.set(domain.wake.clone());
+        let _ = self.state.domain.set(domain);
+        self.external.take();
+        self
+    }
+
+    pub(super) fn has_external_handles(&self) -> bool {
+        self.state.external.load(Ordering::Acquire) != 0
+    }
+
+    /// Final Core extraction only; no native access is exposed by this check.
+    pub(super) fn retirement_closed(&self) -> bool {
+        self.external.is_none()
+            && !self.has_external_handles()
+            && self
+                .state
+                .try_lock()
+                .is_some_and(|state| state.close_succeeded)
+    }
+
+    pub(super) fn with_finalizer(
+        mut self,
+        finalizer: Arc<super::commands::EncoderFinalizer>,
+    ) -> Self {
+        self.finalizer = Some(finalizer);
+        self
+    }
+
+    pub(super) fn with_recording(self, admission: super::command_buffer::EncoderAdmission) -> Self {
+        self.state.lock().recording = Some(admission);
+        self
+    }
+
+    pub(super) fn end_encoding_with(
+        &self,
+        close: impl FnOnce(
+            super::command_buffer::EndingEncoder<'_>,
+            &mut EncoderState,
+        ) -> Result<(), crate::kernels::MetalKernelError>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.end_encoding_prepared(false, || Ok(()), |scope, state, ()| close(scope, state))
+    }
+
+    /// Acquire all fallible/nonblocking preparation before ENDING and any field
+    /// mutation. A pending poll does not notify itself; actual phase release or
+    /// exceptional native exit wakes only after state/preparation guards unwind.
+    pub(super) fn end_encoding_prepared<P>(
+        &self,
+        nonblocking: bool,
+        prepare: impl FnOnce() -> Result<P, crate::kernels::MetalKernelError>,
+        close: impl FnOnce(
+            super::command_buffer::EndingEncoder<'_>,
+            &mut EncoderState,
+            P,
+        ) -> Result<(), crate::kernels::MetalKernelError>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let mut wake = super::command_buffer::EncoderEndWake::pending(&self.command_buffer);
+        let mut state = if nonblocking {
+            self.state
+                .try_lock()
+                .ok_or(crate::kernels::MetalKernelError::RecordingAdmission(
+                    crate::command_lifecycle::LifecycleError::Busy,
+                ))?
+        } else {
+            self.state.lock()
+        };
+        if state.close_succeeded {
+            return Ok(());
+        }
+        if state.ended {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "encoder already ended",
+            ));
+        }
+        // self.command_buffer remains a live parent anchor even if unwind
+        // drops this nonfinal lease before the state guard. The wake guard was
+        // declared first and notifies only after the state lock is released.
+        let prepared = prepare()?;
+        let mut recording = state.recording.take();
+        let mut ended = false;
+        let result = match recording.as_mut() {
+            Some(admission) => admission.end(&mut ended, false, |scope| {
+                wake.arm();
+                state.ended = true;
+                close(scope, &mut state, prepared)
+            }),
+            None => {
+                wake.arm();
+                state.ended = true;
+                close(
+                    super::command_buffer::EndingEncoder::raw_compat(&self.command_buffer),
+                    &mut state,
+                    prepared,
+                )
+            }
+        };
+        state.recording = recording;
+        if result.is_ok() {
+            state.close_succeeded = true;
+        }
+        result
     }
 
     /// The GPU clock of the queue this encoder's command buffer is committed on.
@@ -1233,7 +1475,7 @@ impl ComputeCommandEncoder {
             return false;
         }
         let index = self.capture_buffer_index(usize::MAX);
-        let device = crate::kernels::metal::Device::new(self.command_buffer.device());
+        let device = self.command_buffer.device();
         let Ok(buffer) =
             device.new_buffer_with_data(bytes, len_bytes, crate::kernels::RESOURCE_OPTIONS)
         else {
@@ -1369,14 +1611,18 @@ impl ComputeCommandEncoder {
         self.raw.updateFence(fence.raw());
     }
 
-    pub fn end_encoding(&self) {
-        use objc2_metal::MTLCommandEncoder as _;
-        self.raw.updateFence(self.fence.raw());
-        self.raw.endEncoding();
+    pub fn end_encoding(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        if let Some(finalizer) = &self.finalizer {
+            return finalizer.end_encoding(self);
+        }
+        self.end_encoding_with(|_, _| {
+            self.raw.updateFence(self.fence.raw());
+            self.raw.endEncoding();
+            Ok(())
+        })
     }
 
     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
-        use MTLComputeCommandEncoder as _;
         trace::record_pipeline(
             self.trace.as_deref(),
             pipeline.name().unwrap_or("<unnamed>"),
@@ -1416,7 +1662,10 @@ impl ComputeCommandEncoder {
 }
 
 pub struct BlitCommandEncoder {
-    pub(crate) raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
+    pub(crate) raw: super::raw_encoder::Blit,
+    recording: Option<super::command_buffer::EncoderAdmission>,
+    ended: bool,
+    close_succeeded: bool,
     /// Per-encoder fence, updated at end_encoding.
     fence: Arc<Fence>,
     /// Shared global cross-encoder output map.
@@ -1437,8 +1686,22 @@ impl BlitCommandEncoder {
         fence: Arc<Fence>,
         prev_ce_outputs: PrevCeOutputs,
     ) -> BlitCommandEncoder {
+        Self::with_backend(
+            super::raw_encoder::Blit::Metal3(raw),
+            fence,
+            prev_ce_outputs,
+        )
+    }
+    pub(crate) fn with_backend(
+        raw: super::raw_encoder::Blit,
+        fence: Arc<Fence>,
+        prev_ce_outputs: PrevCeOutputs,
+    ) -> BlitCommandEncoder {
         BlitCommandEncoder {
             raw,
+            recording: None,
+            ended: false,
+            close_succeeded: false,
             fence,
             prev_ce_outputs,
             tracked_outputs: Vec::new(),
@@ -1455,25 +1718,87 @@ impl BlitCommandEncoder {
         self.raw.updateFence(fence.raw());
     }
 
-    pub fn end_encoding(&self) {
-        use objc2_metal::MTLCommandEncoder as _;
+    pub(super) fn with_recording(
+        mut self,
+        admission: super::command_buffer::EncoderAdmission,
+    ) -> Self {
+        self.recording = Some(admission);
+        self
+    }
 
-        // Signal this blit encoder's fence after all blit commands complete
-        self.update_fence(&self.fence);
-        self.raw.endEncoding();
+    pub fn end_encoding(&mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.end_encoding_mode(false)
+    }
+    pub(super) fn retirement_closed(&self) -> bool {
+        self.close_succeeded
+    }
 
-        // Register outputs so subsequent encoders can wait. A write, taken once
-        // per encoder close -- rare against the per-bind reads above.
-        {
-            let mut map = self.prev_ce_outputs.write(Side::Host);
-            for &out in &self.tracked_outputs {
-                map.insert(out, Arc::clone(&self.fence));
-            }
+    pub(super) fn try_end_encoding(&mut self) -> Result<bool, crate::kernels::MetalKernelError> {
+        match self.end_encoding_mode(true) {
+            Ok(()) => Ok(true),
+            Err(crate::kernels::MetalKernelError::RecordingAdmission(
+                crate::command_lifecycle::LifecycleError::Busy,
+            )) => Ok(false),
+            Err(error) => Err(error),
         }
+    }
+    fn end_encoding_mode(
+        &mut self,
+        nonblocking: bool,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let Self {
+            raw,
+            recording,
+            ended,
+            close_succeeded,
+            fence,
+            prev_ce_outputs,
+            tracked_outputs,
+        } = self;
+        // A confirmed close is idempotent for explicit end followed by guard
+        // Drop. An unknown native exit is not a successful close.
+        if *close_succeeded {
+            return Ok(());
+        }
+        if *ended {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "blit encoder already ended",
+            ));
+        }
+        let prepare = || {
+            if nonblocking {
+                prev_ce_outputs.try_write().ok_or(
+                    crate::kernels::MetalKernelError::RecordingAdmission(
+                        crate::command_lifecycle::LifecycleError::Busy,
+                    ),
+                )
+            } else {
+                Ok(prev_ce_outputs.write(Side::Host))
+            }
+        };
+        let close = |mut map: parking_lot::RwLockWriteGuard<'_, HashMap<usize, Arc<Fence>>>| {
+            raw.updateFence(fence.raw());
+            raw.endEncoding();
+            for &out in tracked_outputs.iter() {
+                map.insert(out, Arc::clone(fence));
+            }
+            Ok(())
+        };
+        let result = if let Some(admission) = recording.as_mut() {
+            admission.end_prepared(ended, true, prepare, |_, map| close(map))
+        } else {
+            // Raw constructor compatibility has no engine recording lease.
+            let map = prepare()?;
+            *ended = true;
+            close(map)
+        };
+        if result.is_ok() {
+            *close_succeeded = true;
+        }
+        result
     }
 
     pub fn set_label(&self, label: &str) {
-        use objc2_metal::MTLCommandEncoder as _;
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 
@@ -1492,8 +1817,6 @@ impl BlitCommandEncoder {
     /// two buffers that often share a writer, so the dedup avoids emitting the
     /// same wait twice on the common path.
     fn wait_for_last_writers(&self, ptrs: &[usize]) {
-        use objc2_metal::MTLBlitCommandEncoder as _;
-
         let fences: Vec<Arc<Fence>> = {
             // A read of the ordering map (blit-after-blit); see `PrevCeOutputs`.
             let map = self.prev_ce_outputs.read(Side::Host);
@@ -1538,6 +1861,11 @@ impl BlitCommandEncoder {
         dst_offset: usize,
         size: usize,
     ) {
+        // Empty tensor copies are no-ops, not legal zero-byte Metal blits.
+        // No byte is read or written, so there is no hazard to register.
+        if size == 0 {
+            return;
+        }
         let src_ptr = src_buffer.raw_ptr() as usize;
         let dst_ptr = dst_buffer.raw_ptr() as usize;
         // A blit reads and writes buffers exactly as a dispatch binds them, so
@@ -2004,5 +2332,129 @@ mod tests {
             "the sibling set has lost its reader in end_encoding, which is the \
              only thing that distinguished it from the removed one"
         );
+    }
+}
+
+#[cfg(test)]
+mod external_handle_tests {
+    #[test]
+    fn older_recording_keeps_domain_open_after_current_handle_releases() {
+        let wake = Arc::new(crate::completion_wake::Wake::default());
+        let domain = EncoderDomain::new(wake.clone());
+        let older = shared();
+        let current = shared();
+        for state in [&older, &current] {
+            assert!(state.domain.set(domain.clone()).is_ok());
+            assert!(state.wake.set(wake.clone()).is_ok());
+        }
+        let old_handle = ExternalEncoderHandle::acquire(&older);
+        let current_handle = ExternalEncoderHandle::acquire(&current);
+        assert_eq!(domain.external.load(Ordering::Acquire), 2);
+        drop(current_handle);
+        assert_eq!(current.external.load(Ordering::Acquire), 0);
+        assert!(
+            domain.has_external_handles(),
+            "older shared-map holder was ignored"
+        );
+        let seen = wake.snapshot();
+        let refused_clone = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _rollback = ExternalEncoderHandle::acquire(&older);
+            assert_eq!(domain.external.load(Ordering::Acquire), 2);
+            panic!("later clone field refused");
+        }));
+        assert!(refused_clone.is_err());
+        assert_eq!(domain.external.load(Ordering::Acquire), 1);
+        assert_eq!(
+            wake.snapshot(),
+            seen,
+            "rollback released another live domain handle"
+        );
+        drop(old_handle);
+        assert!(!domain.has_external_handles());
+        assert_ne!(
+            wake.snapshot(),
+            seen,
+            "aggregate last release did not notify"
+        );
+    }
+
+    use super::*;
+
+    fn shared() -> Arc<SharedEncoderState> {
+        Arc::new(SharedEncoderState {
+            state: parking_lot::Mutex::new(EncoderState::new()),
+            external: std::sync::atomic::AtomicUsize::new(0),
+            domain: std::sync::OnceLock::new(),
+            wake: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[test]
+    fn last_external_release_notifies_after_nonfinal_releases() {
+        let state = shared();
+        let wake = Arc::new(crate::completion_wake::Wake::default());
+        assert!(state.wake.set(wake.clone()).is_ok());
+        let seen = wake.snapshot();
+        let first = ExternalEncoderHandle::acquire(&state);
+        let second = ExternalEncoderHandle::acquire(&state);
+        assert_eq!(state.external.load(Ordering::Acquire), 2);
+        assert_eq!(Arc::strong_count(&state), 3);
+        drop(first);
+        assert_eq!(state.external.load(Ordering::Acquire), 1);
+        assert_eq!(wake.snapshot(), seen, "nonfinal release invented readiness");
+        drop(second);
+        assert_eq!(state.external.load(Ordering::Acquire), 0);
+        assert_ne!(wake.snapshot(), seen, "last release failed to notify");
+        assert_eq!(Arc::strong_count(&state), 1);
+    }
+
+    #[test]
+    fn partial_clone_unwind_rolls_back_without_releasing_live_handle() {
+        let state = shared();
+        let first = ExternalEncoderHandle::acquire(&state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _rollback = ExternalEncoderHandle::acquire(&state);
+            assert_eq!(state.external.load(Ordering::Acquire), 2);
+            panic!("later cloned field refused");
+        }));
+        assert!(result.is_err());
+        assert_eq!(state.external.load(Ordering::Acquire), 1);
+        assert_eq!(Arc::strong_count(&state), 2);
+        drop(first);
+        assert_eq!(state.external.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn field_custody_precedes_last_permit_release() {
+        struct Capture {
+            state: Arc<SharedEncoderState>,
+            drops: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.state.external.load(Ordering::Acquire),
+                    1,
+                    "readiness was published before preceding capture destruction"
+                );
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        struct Fixture {
+            _capture: Capture,
+            _permit: ExternalEncoderHandle,
+        }
+        let state = shared();
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fixture = Fixture {
+            _capture: Capture {
+                state: state.clone(),
+                drops: drops.clone(),
+            },
+            _permit: ExternalEncoderHandle::acquire(&state),
+        };
+        drop(fixture);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(state.external.load(Ordering::Acquire), 0);
     }
 }

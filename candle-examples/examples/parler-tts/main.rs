@@ -8,8 +8,8 @@ use anyhow::Error as E;
 use clap::Parser;
 
 use candle::{DType, IndexOp, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::models::parler_tts::{Config, Model};
+use lloom::nn::VarBuilder;
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -181,11 +181,7 @@ fn main() -> anyhow::Result<()> {
         .get_ids()
         .to_vec();
     let prompt_tokens = Tensor::new(prompt_tokens, &device)?.unsqueeze(0)?;
-    let lp = lloom::generation::LogitsProcessor::new(
-        args.seed,
-        Some(args.temperature),
-        args.top_p,
-    );
+    let lp = lloom::generation::LogitsProcessor::new(args.seed, Some(args.temperature), args.top_p);
     println!("starting generation...");
     let codes = model.generate(&prompt_tokens, &description_tokens, lp, args.max_steps)?;
     println!("generated codes\n{codes}");

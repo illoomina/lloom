@@ -82,7 +82,7 @@ fn icb(f: &Fixture, max_commands: usize) -> Retained<ProtocolObject<dyn MTLIndir
     let desc = MTLIndirectCommandBufferDescriptor::new();
     // Dispatch cannot be mixed with any other command type in one descriptor
     // (MTLIndirectCommandBuffer.h), so this is the only type set.
-    desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatch);
+    desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatchThreads);
     desc.setInheritBuffers(false);
     desc.setInheritPipelineState(false);
     desc.setMaxKernelBufferBindCount(2);

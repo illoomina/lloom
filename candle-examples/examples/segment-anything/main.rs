@@ -8,9 +8,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::DType;
-use lloom::nn::VarBuilder;
-use lloom::models::segment_anything::sam;
 use clap::Parser;
+use lloom::models::segment_anything::sam;
+use lloom::nn::VarBuilder;
 
 #[derive(Parser)]
 struct Args {

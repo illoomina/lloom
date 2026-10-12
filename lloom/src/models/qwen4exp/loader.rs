@@ -27,7 +27,7 @@ use super::qsa::{Indexer, QsaAttention};
 use crate::nn::expert_stream::{ExpertSource, LoaderArm};
 use crate::nn::RmsNorm;
 use crate::profile::Profile;
-use lloom_tensor::quantized::gguf_file::{Content, Value};
+use lloom_tensor::quantized::gguf_file::{Content, TensorInfo, Value};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
 use std::collections::HashMap;
@@ -431,19 +431,49 @@ pub const DEFAULT_KV_RESERVE_TOKENS: usize = 4096;
 /// (scale, bias) planes counted — §10.7a's 0.531× argument, at this
 /// geometry), plus the indexer's two f32 caches: the raw key per position
 /// and the compressed key per `indexer_compress_ratio` positions.
-pub fn kv_bytes_per_token(cfg: &Config) -> usize {
+pub fn kv_bytes_per_token(cfg: &Config) -> Result<usize> {
     let full = cfg
         .layer_types
         .iter()
         .filter(|k| matches!(k, LayerKind::Full))
         .count();
-    let f32 = std::mem::size_of::<f32>();
-    let kv =
-        cfg.kv_precision
-            .bytes_per_token(cfg.n_kv_heads, cfg.head_dim, lloom_tensor::DType::F32);
-    let indexer = cfg.indexer_head_dim * f32;
-    let blocks = (indexer).div_ceil(cfg.indexer_compress_ratio.max(1));
-    full * (kv + indexer + blocks)
+    // No full-attention layers means no KV predictor demand, regardless of
+    // fields belonging to absent attention geometry. Config validation is separate.
+    if full == 0 {
+        return Ok(0);
+    }
+    let fail = || lloom_tensor::Error::Msg("Qwen KV bytes per token exceed usize".into());
+    let kv = cfg.kv_precision.checked_bytes_per_token(
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        lloom_tensor::DType::F32,
+    )?;
+    let indexer = cfg
+        .indexer_head_dim
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(fail)?;
+    let blocks = indexer.div_ceil(cfg.indexer_compress_ratio.max(1));
+    kv.checked_add(indexer)
+        .and_then(|v| v.checked_add(blocks))
+        .and_then(|v| v.checked_mul(full))
+        .ok_or_else(fail)
+}
+
+pub(crate) fn kv_slab_bytes(cfg: &Config) -> Result<usize> {
+    kv_bytes_per_token(cfg)?
+        .checked_mul(super::qsa::KV_SLAB_TOKENS)
+        .ok_or_else(|| lloom_tensor::Error::Msg("Qwen KV slab unit exceeds usize".into()))
+}
+
+// Exact multiply before divide: saturating the product before /2 undercounts.
+fn prefill_transient_bytes(tile: usize, tiles: usize) -> Result<(usize, usize)> {
+    let fail = || lloom_tensor::Error::Msg("Qwen prefill transient exceeds usize".into());
+    let tile_bytes = tile
+        .checked_mul(super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN)
+        .ok_or_else(fail)?;
+    let further = (tile_bytes as u128) * (tiles.saturating_sub(2) as u128) / 2;
+    let total = (tile_bytes as u128).checked_add(further).ok_or_else(fail)?;
+    Ok((tile_bytes, usize::try_from(total).map_err(|_| fail())?))
 }
 
 /// The session's claims beside the expert pool, for the load-time
@@ -462,30 +492,33 @@ pub fn session_claims(
     prefill_tile: usize,
     loader: &StreamLoader,
     prefetch: bool,
-) -> Vec<SessionClaim> {
+) -> Result<Vec<SessionClaim>> {
     let tile = if prefill_tile == 0 {
         super::model::PREFILL_CHUNK
     } else {
         prefill_tile
     };
-    let tile_bytes = tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
     let tiles = if super::model::prefill_pair_on() {
         super::model::prefill_tiles()
     } else {
         2
     };
-    let further = tile_bytes.saturating_mul(tiles.saturating_sub(2)) / 2;
-    let per = kv_bytes_per_token(cfg);
-    vec![
+    let (tile_bytes, transient) = prefill_transient_bytes(tile, tiles)?;
+    let per = kv_bytes_per_token(cfg)?;
+    let kv = per
+        .checked_mul(kv_tokens)
+        .and_then(|v| v.checked_mul(rows.max(1)))
+        .ok_or_else(|| lloom_tensor::Error::Msg("Qwen session KV exceeds usize".into()))?;
+    Ok(vec![
         SessionClaim {
             name: "qwen4exp-kv",
-            bytes: rows.max(1) * kv_tokens * per,
+            bytes: kv,
             unit: per,
             capability: true,
         },
         SessionClaim {
             name: "qwen4exp-transient",
-            bytes: tile_bytes + further,
+            bytes: transient,
             unit: tile_bytes,
             capability: false,
         },
@@ -495,7 +528,7 @@ pub fn session_claims(
             unit: 1 << 20,
             capability: true,
         },
-    ]
+    ])
 }
 
 /// One of the session's fixed claims (`floor == want`): a capability
@@ -509,8 +542,11 @@ pub struct SessionClaim {
 }
 
 /// The session's claims summed: what the plan leaves out of the pool.
-pub fn session_floor_bytes(claims: &[SessionClaim]) -> usize {
-    claims.iter().map(|c| c.bytes).sum()
+pub fn session_floor_bytes(claims: &[SessionClaim]) -> Result<usize> {
+    claims.iter().try_fold(0usize, |sum, c| {
+        sum.checked_add(c.bytes)
+            .ok_or_else(|| lloom_tensor::Error::Msg("Qwen session claim sum exceeds usize".into()))
+    })
 }
 
 /// The staging ring's cap on the `pread` arm: `staging::DEFAULT_CAP_BYTES`
@@ -591,8 +627,70 @@ fn plan_load<Rd: Read + Seek>(
     device: &Device,
     fraction: f64,
     slots: Option<usize>,
-) -> LoadPlan {
+) -> Result<LoadPlan> {
     plan_load_holding(gg, device, fraction, slots, None)
+}
+
+// A transaction over header-derived device-weight terms, not an allocation or
+// a bound on opaque native objects. PLE is excluded because this term omits the
+// mmap tier; its mapping/page residency is not physically free.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct HeaderTotals {
+    resident: usize,
+    per_slot: usize,
+    total: usize,
+}
+
+impl HeaderTotals {
+    fn add(&mut self, name: &str, info: &TensorInfo, held_prefix: Option<&str>) -> Result<()> {
+        if name == "per_layer_token_embd.weight" {
+            return Ok(());
+        }
+        let overflow =
+            |term| lloom_tensor::Error::Msg(format!("tensor `{name}`: {term} overflows usize"));
+        // A zero dimension makes the exact product zero, even if a preceding
+        // partial product would overflow. An empty shape is one scalar.
+        let dims = info.shape.dims();
+        let elements = if dims.contains(&0) {
+            0
+        } else {
+            dims.iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| overflow("dimension product"))?
+        };
+        let block = info.ggml_dtype.block_size();
+        if !elements.is_multiple_of(block) {
+            lloom_tensor::bail!(
+                "tensor `{name}`: {elements} elements are not divisible by block size {block}"
+            )
+        }
+        let bytes = (elements / block)
+            .checked_mul(info.ggml_dtype.type_size())
+            .ok_or_else(|| overflow("packed bytes"))?;
+        let mut next = *self;
+        let held = held_prefix.is_some_and(|prefix| name.starts_with(prefix));
+        if name.ends_with("_exps.weight") && !held {
+            // Preserve the existing plane division. ExpertSource::from_gguf
+            // additionally validates dims3 and k/block for actual streamed IO;
+            // this header aggregate does not replace that reader's validation.
+            let experts = dims.first().copied().unwrap_or(1).max(1);
+            next.per_slot = next
+                .per_slot
+                .checked_add(bytes / experts)
+                .ok_or_else(|| overflow("per-slot sum"))?;
+            next.total = next
+                .total
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("expert total"))?;
+        } else {
+            next.resident = next
+                .resident
+                .checked_add(bytes)
+                .ok_or_else(|| overflow("resident sum"))?;
+        }
+        *self = next;
+        Ok(())
+    }
 }
 
 /// [`plan_load`] with layer `held`'s routed experts counted as resident
@@ -605,37 +703,22 @@ fn plan_load_holding<Rd: Read + Seek>(
     fraction: f64,
     slots: Option<usize>,
     held: Option<usize>,
-) -> LoadPlan {
+) -> Result<LoadPlan> {
     let held_prefix = held.map(|l| format!("blk.{l}."));
-    let mut resident = 0usize;
-    let mut per_slot = 0usize;
-    let mut total = 0usize;
+    let mut totals = HeaderTotals::default();
     for sh in &gg.shards {
         for (name, info) in &sh.content.tensor_infos {
-            let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
-                * info.ggml_dtype.type_size();
-            if name == "per_layer_token_embd.weight" {
-                continue; // memory-mapped, not resident
-            }
-            let held_layer = held_prefix.as_deref().is_some_and(|p| name.starts_with(p));
-            if name.ends_with("_exps.weight") && !held_layer {
-                // [n_experts, n, k]: one plane per slot
-                let n_experts = info.shape.dims().first().copied().unwrap_or(1).max(1);
-                per_slot += bytes / n_experts;
-                total += bytes;
-            } else {
-                resident += bytes;
-            }
+            totals.add(name, info, held_prefix.as_deref())?;
         }
     }
-    LoadPlan {
-        resident_bytes: resident,
-        expert_bytes_per_slot: per_slot,
-        expert_bytes_total: total,
+    Ok(LoadPlan {
+        resident_bytes: totals.resident,
+        expert_bytes_per_slot: totals.per_slot,
+        expert_bytes_total: totals.total,
         slots,
         working_set: working_set_of(device),
         fraction,
-    }
+    })
 }
 
 /// `recommendedMaxWorkingSetSize` of a Metal device; 0 elsewhere.
@@ -646,6 +729,20 @@ pub(crate) fn working_set_of(device: &Device) -> usize {
     }
     let _ = device;
     0
+}
+
+fn checked_expert_slot_floor(cfg: &Config) -> Result<usize> {
+    let floor = cfg
+        .n_experts_per_tok
+        .checked_add(1)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor overflows usize".into()))?;
+    if floor > cfg.n_experts {
+        lloom_tensor::bail!(
+            "expert slot floor {floor} exceeds expert count {}",
+            cfg.n_experts
+        )
+    }
+    Ok(floor)
 }
 
 /// The slot pool `SlotBudget::Auto` resolves to: the expert pool's grant
@@ -663,92 +760,113 @@ fn plan_slots<Rd: Read + Seek>(
     claims: &[SessionClaim],
     held: Option<usize>,
 ) -> Result<SlotPlan> {
-    let plan = plan_load_holding(gg, device, fraction, None, held);
+    let plan = plan_load_holding(gg, device, fraction, None, held)?;
     let per_slot = plan.expert_bytes_per_slot.max(1);
-    let reserve_bytes = session_floor_bytes(claims);
+    let reserve_bytes = session_floor_bytes(claims)?;
+    let min_slots = checked_expert_slot_floor(cfg)?;
     #[cfg(not(feature = "metal"))]
     let slots = {
         let _ = (per_slot, reserve_bytes);
         0usize
     };
     #[cfg(feature = "metal")]
-    let slots = {
-        use lloom_tensor::kernels::metal::ledger::{
-            arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
-        };
-        let fixed = |id: u32, name: &str, bytes: usize, unit: usize, class: Class| TenantRow {
-            id: TenantId(id),
-            name: name.to_string(),
-            claim: Claim {
-                floor: bytes,
-                want: bytes,
-                unit: unit.max(1),
-                class,
-            },
-            held: 0,
-        };
-        let mut rows = vec![fixed(
-            1,
-            "qwen4exp-resident",
-            plan.resident_bytes,
-            1 << 20,
-            Class::Capability,
-        )];
-        for (i, c) in claims.iter().enumerate() {
-            let class = if c.capability {
-                Class::Capability
-            } else {
-                Class::Scratch
-            };
-            rows.push(fixed(2 + i as u32, c.name, c.bytes, c.unit, class));
-        }
-        let experts = TenantId(100);
-        rows.push(TenantRow {
-            id: experts,
-            name: "qwen4exp-experts".to_string(),
-            claim: Claim {
-                floor: (cfg.n_experts_per_tok + 1) * per_slot,
-                want: cfg.n_experts * per_slot,
-                unit: per_slot,
-                class: Class::Cache,
-            },
-            held: 0,
-        });
-        if plan.working_set == 0 {
-            0
-        } else {
-            match arbitrate(plan.budget(), &rows) {
-                Arbitration::Granted(grants) => grants
-                    .iter()
-                    .find(|g| g.id == experts)
-                    .map_or(0, |g| g.bytes / per_slot),
-                Arbitration::Refused { floors, quota } => {
-                    let gb = |b: usize| b as f64 / 1e9;
-                    lloom_tensor::bail!(
-                        "the streamed load does not fit: the floors alone — the resident tier \
-                     {:.2} GB, the session's claims {:.2} GB, the pool's {} slots {:.2} GB — \
-                     are {:.2} GB against a budget of {:.2} GB ({fraction} x \
-                     recommendedMaxWorkingSetSize {:.2} GB): a smaller context, a smaller \
-                     tile, or a larger fraction",
-                        gb(plan.resident_bytes),
-                        gb(reserve_bytes),
-                        cfg.n_experts_per_tok + 1,
-                        gb((cfg.n_experts_per_tok + 1) * per_slot),
-                        gb(floors),
-                        gb(quota),
-                        gb(plan.working_set),
-                    )
-                }
-            }
-        }
-    };
-    let slots = slots.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
+    let slots = arbitrate_slots(&plan, cfg, fraction, claims, reserve_bytes)?;
+    let slots = slots.clamp(min_slots, cfg.n_experts);
     Ok(SlotPlan {
         slots,
         working_set: plan.working_set,
         resident_bytes: plan.resident_bytes,
         expert_bytes_per_slot: plan.expert_bytes_per_slot,
         reserve_bytes,
+    })
+}
+
+// Pure production loader policy, also compiled by CPU unit tests. No model
+// load or native object is needed to exercise the real Refused consumer.
+#[cfg(any(feature = "metal", test))]
+fn arbitrate_slots(
+    plan: &LoadPlan,
+    cfg: &Config,
+    fraction: f64,
+    claims: &[SessionClaim],
+    reserve_bytes: usize,
+) -> Result<usize> {
+    use lloom_tensor::memory_arbitration::{
+        arbitrate, Arbitration, Claim, Class, TenantId, TenantRow,
+    };
+    let per_slot = plan.expert_bytes_per_slot.max(1);
+    let min_slots = checked_expert_slot_floor(cfg)?;
+    let expert_floor = min_slots
+        .checked_mul(per_slot)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot floor bytes overflow usize".into()))?;
+    let expert_want = cfg
+        .n_experts
+        .checked_mul(per_slot)
+        .ok_or_else(|| lloom_tensor::Error::Msg("expert slot want bytes overflow usize".into()))?;
+    let fixed = |id: u32, name: &str, bytes: usize, unit: usize, class: Class| TenantRow {
+        id: TenantId(id),
+        name: name.to_string(),
+        claim: Claim {
+            floor: bytes,
+            want: bytes,
+            unit: unit.max(1),
+            class,
+        },
+        held: 0,
+    };
+    let mut rows = vec![fixed(
+        1,
+        "qwen4exp-resident",
+        plan.resident_bytes,
+        1 << 20,
+        Class::Capability,
+    )];
+    for (i, c) in claims.iter().enumerate() {
+        let class = if c.capability {
+            Class::Capability
+        } else {
+            Class::Scratch
+        };
+        rows.push(fixed(2 + i as u32, c.name, c.bytes, c.unit, class));
+    }
+    let experts = TenantId(100);
+    rows.push(TenantRow {
+        id: experts,
+        name: "qwen4exp-experts".to_string(),
+        claim: Claim {
+            floor: expert_floor,
+            want: expert_want,
+            unit: per_slot,
+            class: Class::Cache,
+        },
+        held: 0,
+    });
+    Ok(if plan.working_set == 0 {
+        0
+    } else {
+        match arbitrate(plan.budget(), &rows) {
+            Arbitration::Granted(grants) => grants
+                .iter()
+                .find(|g| g.id == experts)
+                .map_or(0, |g| g.bytes / per_slot),
+            Arbitration::Refused { floors, quota } => {
+                let gb = |b: usize| b as f64 / 1e9;
+                lloom_tensor::bail!(
+                    "the streamed load does not fit: the floors alone — the resident tier \
+                 {:.2} GB, the session's claims {:.2} GB, the pool's {} slots {:.2} GB — \
+                 are {:.2} GB against a budget of {:.2} GB ({fraction} x \
+                 recommendedMaxWorkingSetSize {:.2} GB): a smaller context, a smaller \
+                 tile, or a larger fraction",
+                    gb(plan.resident_bytes),
+                    gb(reserve_bytes),
+                    min_slots,
+                    gb(expert_floor),
+                    floors as f64 / 1e9,
+                    gb(quota),
+                    gb(plan.working_set),
+                )
+            }
+        }
     })
 }
 
@@ -786,6 +904,9 @@ pub struct LoadOptions {
     /// §10.7); `None` is the checkpoint's f32. Set at load, so the slot plan
     /// reserves for the store the caches will hold.
     pub kv_precision: Option<crate::nn::ops::KvPrecision>,
+    /// The machine gate the load passes before its first tensor
+    /// (`memory.md` §9.10); `None` loads unadmitted (a test, a harness).
+    pub machine: Option<crate::nn::memory::MachineLoad>,
 }
 
 impl LoadOptions {
@@ -820,22 +941,36 @@ pub struct LoadPlan {
 }
 
 impl LoadPlan {
-    /// Bytes the load holds on the device.
-    pub fn predicted(&self) -> usize {
+    /// Exact predicted bytes, including totals not representable by a native
+    /// allocation size. Public return widened from usize to u128 for #952.
+    /// On supported 32/64-bit targets max_slots * max_slot_bytes + max_resident
+    /// fits u128. Upstream header/predictor inputs still require checked math.
+    pub fn predicted(&self) -> u128 {
         let experts = match self.slots {
-            Some(n) => n * self.expert_bytes_per_slot,
-            None => self.expert_bytes_total,
+            Some(n) => n as u128 * self.expert_bytes_per_slot as u128,
+            None => self.expert_bytes_total as u128,
         };
-        self.resident_bytes + experts
+        self.resident_bytes as u128 + experts
+    }
+
+    fn physical_bytes(&self) -> Result<usize> {
+        usize::try_from(self.predicted()).map_err(|_| lloom_tensor::Error::Msg(format!(
+            "unrepresentable physical memory demand: {} bytes exceeds native usize maximum {}; reduce dimensions or slots; changing the quota or forcing admission cannot represent this size",
+            self.predicted(), usize::MAX,
+        )))
     }
     /// `fraction × working_set`.
     pub fn budget(&self) -> usize {
         (self.working_set as f64 * self.fraction) as usize
     }
     /// Whether the load is admitted: exactly on the budget is; no working
-    /// set (not Metal) or a zero fraction never refuses.
+    /// set (not Metal) or nonpositive fraction bypasses ONLY the quota.
+    /// An unrepresentable physical demand is refused before either bypass.
     pub fn fits(&self) -> bool {
-        self.working_set == 0 || self.fraction <= 0.0 || self.predicted() <= self.budget()
+        let Ok(predicted) = usize::try_from(self.predicted()) else {
+            return false;
+        };
+        self.working_set == 0 || self.fraction <= 0.0 || predicted <= self.budget()
     }
     /// The slots a streamed pool could hold under this budget (at least
     /// `topk + 1` is the pool's own floor, checked by the loader).
@@ -855,6 +990,10 @@ impl LoadPlan {
     /// §9.5g's report: the arithmetic and, on a refusal, the reductions
     /// that would fit in the order of what they cost.
     pub fn describe(&self) -> String {
+        let predicted = match self.physical_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return error.to_string(),
+        };
         let gb = |b: usize| b as f64 / 1e9;
         let experts = match self.slots {
             Some(n) => format!(
@@ -869,7 +1008,7 @@ impl LoadPlan {
         };
         let head = format!(
             "predicted {:.2} GB = resident {:.2} GB + experts {experts}; budget {:.2} GB = {:.2} x recommendedMaxWorkingSetSize {:.2} GB",
-            gb(self.predicted()),
+            gb(predicted),
             gb(self.resident_bytes),
             gb(self.budget()),
             self.fraction,
@@ -878,12 +1017,12 @@ impl LoadPlan {
         if self.fits() {
             return format!(
                 "memory budget OK at load: {head}; residual {:.2} GB for the KV, the prefill passes and the pool",
-                gb(self.budget().saturating_sub(self.predicted()))
+                gb(self.budget().saturating_sub(predicted))
             );
         }
         let mut s = format!(
             "memory budget exceeded at load: {head}; over by {:.2} GB. Nothing was loaded (DESIGN.md 9.5g: refuse rather than silently reduce). What would fit:",
-            gb(self.predicted().saturating_sub(self.budget()))
+            gb(predicted.saturating_sub(self.budget()))
         );
         if self.slots.is_none() {
             s.push_str(&format!(
@@ -896,10 +1035,74 @@ impl LoadPlan {
         s.push_str(&format!(
             "\n  --memory-fraction {:.2} (this load's share of the working set; the machine then has {:.2} GB for everything else, the OS included)",
             (self.fraction_needed() * 100.0).ceil() / 100.0,
-            gb(self.working_set.saturating_sub(self.predicted()))
+            gb(self.working_set.saturating_sub(predicted))
         ));
         s
     }
+}
+
+/// The reservation a load made on the machine, held by the model it built.
+type Reservation = Option<Arc<lloom_tensor::machine::Holding>>;
+
+/// Admit the load on the machine (`memory.md` §9.10) when `opts` names a
+/// gate: its predicted peak is what `plan` holds on the device plus the
+/// session's claims beside it — the same claims the slot plan leaves room
+/// for (`session_claims`; the staging only on the streamed tier) and a
+/// drafter's bytes.
+fn admit_machine<Rd: Read + Seek>(
+    gg: &Gguf<'_, Rd>,
+    opts: &LoadOptions,
+    plan: &LoadPlan,
+    stream: Option<&StreamOptions>,
+) -> Result<Reservation> {
+    let physical = plan.physical_bytes()?;
+    let resident = u64::try_from(plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
+    let experts =
+        u64::try_from(physical - plan.resident_bytes).map_err(lloom_tensor::Error::wrap)?;
+    let Some(m) = &opts.machine else {
+        return Ok(None);
+    };
+    let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
+    if let Some(p) = opts.kv_precision {
+        cfg.kv_precision = p;
+    }
+    let claims = match stream {
+        Some(st) => session_claims(
+            &cfg,
+            m.rows,
+            m.kv_tokens,
+            m.prefill_tile,
+            &st.loader,
+            st.prefetch,
+        )?,
+        None => session_claims(
+            &cfg,
+            m.rows,
+            m.kv_tokens,
+            m.prefill_tile,
+            &StreamLoader::Pread,
+            false,
+        )?
+        .into_iter()
+        .filter(|c| c.name != "qwen4exp-staging")
+        .collect(),
+    };
+    let mut peak = lloom_tensor::machine::Peak::new()
+        .with("weights (resident tier)", resident)
+        .with(
+            match plan.slots {
+                Some(n) => format!("weights (experts, {n} slots)"),
+                None => "weights (experts, every one resident)".to_string(),
+            },
+            experts,
+        );
+    for c in &claims {
+        peak.push(c.name, c.bytes as u64);
+    }
+    if let Some(st) = stream {
+        peak.push("drafter", st.drafter_bytes as u64);
+    }
+    Ok(m.admit(&gg.device, peak)?.holding)
 }
 
 /// Refuse a load the budget cannot take, with the arithmetic (§9.5g).
@@ -950,15 +1153,19 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             }],
             device,
         )?;
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
-        build(&mut gg, device, opts, |gg, l| {
+        let plan = plan_load(&gg, device, opts.fraction(), None)?;
+        admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, None)?;
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
             ))
-        })
+        })?;
+        model.hold_reservation(reservation);
+        Ok(model)
     }
 
     /// Load from an open GGUF shard with every float matrix kept f32
@@ -980,7 +1187,7 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
         )?;
         gg.dense_f32 = true;
         let opts = LoadOptions::default();
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
+        admit_load(&plan_load(&gg, device, opts.fraction(), None)?)?;
         build(&mut gg, device, &opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
@@ -1009,15 +1216,19 @@ impl<P: Profile> Qwen4Exp<P, Resident> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
-        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
-        build(&mut gg, device, opts, |gg, l| {
+        let plan = plan_load(&gg, device, opts.fraction(), None)?;
+        admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, None)?;
+        let mut model = build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
             ))
-        })
+        })?;
+        model.hold_reservation(reservation);
+        Ok(model)
     }
 }
 
@@ -1130,7 +1341,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     prefill_tile,
                     &stream.loader,
                     stream.prefetch,
-                );
+                )?;
                 if stream.drafter_bytes > 0 {
                     claims.push(SessionClaim {
                         name: "qwen4exp-drafter",
@@ -1155,8 +1366,9 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // A fixed count is admitted like any load; `Auto` sized itself to
         // the budget and passes by construction (or sits at the pool's
         // `topk + 1` floor, which is then refused with the arithmetic).
-        let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held);
+        let plan = plan_load_holding(&gg, device, opts.fraction(), Some(slots), held)?;
         admit_load(&plan)?;
+        let reservation = admit_machine(&gg, opts, &plan, Some(stream))?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -1180,10 +1392,10 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         #[cfg(feature = "metal")]
         let staging = match (device, &arm) {
             (Device::Metal(d), LoaderArm::Pread) => Some(
-                lloom_tensor::kernels::metal::staging::StagingRing::shared_with_cap(
+                lloom_tensor::kernels::metal::staging::StagingRing::try_shared_with_cap(
                     d,
                     staging_ring_bytes(&stream.loader, stream.prefetch),
-                ),
+                )?,
             ),
             _ => None,
         };
@@ -1192,13 +1404,13 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
         // One prefetcher for the tier, over the same ring.
         #[cfg(feature = "metal")]
         let prefetcher = match (device, &staging, stream.prefetch) {
-            (Device::Metal(d), Some(ring), true) => {
-                Some(Arc::new(crate::nn::expert_prefetch::Prefetcher::with_cap(
+            (Device::Metal(d), Some(ring), true) => Some(Arc::new(
+                crate::nn::expert_prefetch::Prefetcher::try_with_cap(
                     d,
                     Arc::clone(ring),
                     PREFETCH_STAGED_BYTES,
-                )))
-            }
+                )?,
+            )),
             _ => None,
         };
         let mut model = build(&mut gg, device, opts, |gg, l| {
@@ -1239,7 +1451,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
             slots,
             cfg0.n_experts,
             cfg0.n_experts_per_tok,
-        );
+        )?;
         if held.is_some() {
             if let Some(head) = model.mtp_head() {
                 // In groups of at most half the bytes the loads pass through
@@ -1251,7 +1463,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                     0 => IO_INFLIGHT_RESERVE_BYTES,
                     b => b,
                 };
-                let per_expert = (plan_load_holding(&gg, device, opts.fraction(), None, None)
+                let per_expert = (plan_load_holding(&gg, device, opts.fraction(), None, None)?
                     .expert_bytes_total
                     - plan.expert_bytes_total)
                     / cfg0.n_experts.max(1);
@@ -1269,6 +1481,7 @@ impl<P: Profile> Qwen4Exp<P, Streamed> {
                 }
             }
         }
+        model.hold_reservation(reservation);
         Ok(model)
     }
 }
@@ -1547,6 +1760,288 @@ fn load_layer<P: Profile, R: ExpertResidency, Rd: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_session_predictors_refuse_overflow_and_preserve_zero_attention() {
+        use crate::nn::ops::{KvPrecision, KvQuant};
+        use lloom_tensor::DType;
+        let mut cfg = Config::tiny();
+        assert!(kv_bytes_per_token(&cfg).unwrap() > 0);
+        cfg.n_kv_heads = usize::MAX;
+        assert!(kv_bytes_per_token(&cfg).is_err());
+        assert!(kv_slab_bytes(&cfg).is_err());
+        cfg.layer_types.clear();
+        cfg.head_dim = usize::MAX;
+        cfg.indexer_head_dim = usize::MAX;
+        cfg.kv_precision = KvPrecision::quantized(KvQuant::Int4).unwrap();
+        assert_eq!(kv_bytes_per_token(&cfg).unwrap(), 0);
+        assert_eq!(kv_slab_bytes(&cfg).unwrap(), 0);
+        let claims =
+            session_claims(&cfg, usize::MAX, usize::MAX, 1, &StreamLoader::Io, false).unwrap();
+        assert_eq!(claims[0].bytes, 0);
+        let cfg = Config::tiny();
+        assert!(session_claims(&cfg, usize::MAX, 1, 1, &StreamLoader::Io, false).is_err());
+        assert!(session_claims(&cfg, 1, usize::MAX, 1, &StreamLoader::Io, false).is_err());
+        for precision in [
+            KvPrecision::dense(DType::F32),
+            KvPrecision::quantized(KvQuant::Int8).unwrap(),
+            KvPrecision::quantized(KvQuant::Int4).unwrap(),
+        ] {
+            assert!(precision
+                .checked_bytes_per_token(usize::MAX, 4, DType::F32)
+                .is_err());
+        }
+        let int4 = KvPrecision::quantized(KvQuant::Int4).unwrap();
+        assert!(int4.checked_bytes_per_token(1, 3, DType::F32).is_err());
+        assert_eq!(int4.checked_bytes_per_token(0, 3, DType::F32).unwrap(), 0);
+        assert_eq!(int4.checked_bytes_per_token(2, 4, DType::F32).unwrap(), 40);
+    }
+
+    #[test]
+    fn numeric_transient_and_claim_sum_are_exact_or_refused() {
+        let per = super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
+        let tile = usize::MAX / 3 / per;
+        let (unit, bytes) = prefill_transient_bytes(tile, 6).unwrap();
+        assert_eq!(bytes as u128, unit as u128 * 3);
+        assert!(unit as u128 * 4 > usize::MAX as u128);
+        assert!(prefill_transient_bytes(usize::MAX, 2).is_err());
+        assert!(prefill_transient_bytes(1, usize::MAX).is_err());
+        let c = |bytes| SessionClaim {
+            name: "numeric",
+            bytes,
+            unit: 1,
+            capability: true,
+        };
+        assert_eq!(session_floor_bytes(&[c(2), c(3)]).unwrap(), 5);
+        assert!(session_floor_bytes(&[c(usize::MAX), c(1)]).is_err());
+        let mut cfg = Config::tiny();
+        cfg.n_experts_per_tok = usize::MAX;
+        assert!(checked_expert_slot_floor(&cfg).is_err());
+        cfg.n_experts_per_tok = cfg.n_experts;
+        assert!(checked_expert_slot_floor(&cfg).is_err());
+        cfg.n_experts_per_tok = 0;
+        assert_eq!(checked_expert_slot_floor(&cfg).unwrap(), 1);
+    }
+
+    fn header(dtype: GgmlDType, dims: &[usize]) -> TensorInfo {
+        TensorInfo {
+            ggml_dtype: dtype,
+            shape: dims.into(),
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn numeric_header_totals_preserve_tiers_scalar_quantized_and_zero() -> Result<()> {
+        let mut totals = HeaderTotals::default();
+        totals.add("scalar", &header(GgmlDType::F32, &[]), None)?;
+        assert_eq!(totals.resident, 4);
+        totals.add(
+            "blk.0.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 32]),
+            None,
+        )?;
+        assert_eq!((totals.per_slot, totals.total), (18, 36));
+        totals.add(
+            "blk.1.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 32]),
+            Some("blk.1."),
+        )?;
+        assert_eq!(
+            totals,
+            HeaderTotals {
+                resident: 40,
+                per_slot: 18,
+                total: 36
+            }
+        );
+        let before = totals;
+        totals.add("empty", &header(GgmlDType::F32, &[usize::MAX, 2, 0]), None)?;
+        // Mmap PLE remains outside this device-weight term, not an admitted or
+        // physically free allocation; its invalid/huge shape is not read here.
+        totals.add(
+            "per_layer_token_embd.weight",
+            &header(GgmlDType::F32, &[usize::MAX, 2]),
+            None,
+        )?;
+        assert_eq!(totals, before);
+        // Preserve bytes/experts truncation for a header rejected later by the
+        // streamed reader's stricter k/block validation (2*16 is one Q4 block).
+        let mut aggregate = HeaderTotals::default();
+        aggregate.add(
+            "blk.0.ffn_exps.weight",
+            &header(GgmlDType::Q4_0, &[2, 1, 16]),
+            None,
+        )?;
+        assert_eq!((aggregate.per_slot, aggregate.total), (9, 18));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_header_totals_refuse_overflow_without_partial_updates() {
+        let ordinary = HeaderTotals {
+            resident: 4,
+            per_slot: 18,
+            total: 36,
+        };
+        for (info, expected) in [
+            (
+                header(GgmlDType::F32, &[usize::MAX, 2]),
+                "dimension product",
+            ),
+            (header(GgmlDType::F32, &[usize::MAX]), "packed bytes"),
+            (header(GgmlDType::Q4_0, &[31]), "not divisible"),
+        ] {
+            let mut totals = ordinary;
+            let err = totals.add("bad", &info, None).unwrap_err().to_string();
+            assert!(err.contains("`bad`") && err.contains(expected), "{err}");
+            assert_eq!(totals, ordinary);
+        }
+        for (before, name, expected) in [
+            (
+                HeaderTotals {
+                    resident: usize::MAX - 3,
+                    ..ordinary
+                },
+                "scalar",
+                "resident sum",
+            ),
+            (
+                HeaderTotals {
+                    per_slot: usize::MAX - 3,
+                    ..ordinary
+                },
+                "ffn_exps.weight",
+                "per-slot sum",
+            ),
+            // The per-slot update succeeds in the local copy before total
+            // fails: neither field may be published by this failed add.
+            (
+                HeaderTotals {
+                    total: usize::MAX - 3,
+                    ..ordinary
+                },
+                "ffn_exps.weight",
+                "expert total",
+            ),
+        ] {
+            let mut totals = before;
+            let err = totals
+                .add(name, &header(GgmlDType::F32, &[1]), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+            assert_eq!(totals, before);
+        }
+    }
+
+    #[test]
+    fn numeric_load_plan_extremes_refuse_before_quota_bypasses() {
+        let max = usize::MAX;
+        let mut plan = LoadPlan {
+            resident_bytes: max,
+            expert_bytes_per_slot: 1,
+            expert_bytes_total: 0,
+            slots: None,
+            working_set: max,
+            fraction: 1.0,
+        };
+        assert_eq!(plan.predicted(), max as u128);
+        assert!(plan.fits());
+        assert!(admit_load(&plan).is_ok());
+        plan.expert_bytes_total = 1;
+        assert_eq!(plan.predicted(), max as u128 + 1);
+        for working_set in [0, max] {
+            for fraction in [0.0, -1.0, 1.0, f64::INFINITY, f64::NAN] {
+                plan.working_set = working_set;
+                plan.fraction = fraction;
+                assert!(!plan.fits());
+                let err = admit_load(&plan).unwrap_err().to_string();
+                assert!(
+                    err.contains("unrepresentable physical memory demand"),
+                    "{err}"
+                );
+                assert!(err.contains(&(max as u128 + 1).to_string()), "{err}");
+                assert!(!err.contains("budget OK"));
+                assert!(!err.contains("--memory-fraction"));
+            }
+        }
+        plan.slots = Some(max);
+        plan.expert_bytes_per_slot = max;
+        assert_eq!(plan.predicted(), max as u128 * max as u128 + max as u128);
+        assert!(!plan.fits());
+        assert!(admit_load(&plan).is_err());
+        assert!(plan.physical_bytes().is_err());
+    }
+
+    #[test]
+    fn numeric_load_plan_fraction_compatibility_is_not_new_policy_validation() {
+        let mut plan = LoadPlan {
+            resident_bytes: 1,
+            expert_bytes_per_slot: 0,
+            expert_bytes_total: 0,
+            slots: None,
+            working_set: 10,
+            fraction: -1.0,
+        };
+        // Existing policy, not a new recommendation: <=0 bypasses quota,
+        // infinity casts its budget to MAX; NaN casts to zero.
+        assert!(plan.fits());
+        plan.fraction = f64::INFINITY;
+        assert!(plan.fits());
+        plan.fraction = f64::NAN;
+        assert!(!plan.fits());
+        plan.working_set = 0;
+        assert!(plan.fits());
+        plan.working_set = 10;
+        plan.fraction = 0.5;
+        plan.resident_bytes = 5;
+        assert!(plan.fits());
+        plan.resident_bytes = 6;
+        assert!(!plan.fits());
+    }
+
+    #[test]
+    fn numeric_arbitration_loader_consumer_handles_wide_refusal_and_overflow() {
+        let mut cfg = Config::tiny();
+        cfg.n_experts_per_tok = 1;
+        cfg.n_experts = 4;
+        let mut plan = LoadPlan {
+            resident_bytes: 0,
+            expert_bytes_per_slot: 1,
+            expert_bytes_total: 4,
+            slots: None,
+            working_set: 4,
+            fraction: 1.0,
+        };
+        assert_eq!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0).unwrap(), 4);
+        plan.working_set = 3;
+        assert_eq!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0).unwrap(), 3);
+        plan.resident_bytes = usize::MAX;
+        let err = arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("floors alone"), "{err}");
+        assert!(err.contains("against a budget"), "{err}");
+        plan.resident_bytes = 0;
+        cfg.n_experts_per_tok = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("floor overflows"));
+        cfg.n_experts_per_tok = 1;
+        plan.expert_bytes_per_slot = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("floor bytes overflow"));
+        cfg.n_experts_per_tok = 0;
+        plan.expert_bytes_per_slot = 2;
+        cfg.n_experts = usize::MAX;
+        assert!(arbitrate_slots(&plan, &cfg, 1.0, &[], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("want bytes overflow"));
+    }
     use super::*;
 
     /// Holding a layer's experts whole (the MTP head, `qwen4exp.mtp_experts
@@ -1585,8 +2080,8 @@ mod tests {
             }],
             &dev,
         )?;
-        let all = plan_load(&gg, &dev, 0.65, Some(4));
-        let mtp = plan_load_holding(&gg, &dev, 0.65, Some(4), Some(held));
+        let all = plan_load(&gg, &dev, 0.65, Some(4))?;
+        let mtp = plan_load_holding(&gg, &dev, 0.65, Some(4), Some(held))?;
         std::fs::remove_file(&path).ok();
         assert!(held_bytes > 0);
         assert_eq!(mtp.resident_bytes, all.resident_bytes + held_bytes);
@@ -1598,7 +2093,7 @@ mod tests {
         // 4 slots of the other layers plus every expert of the held one.
         assert_eq!(
             mtp.predicted(),
-            all.resident_bytes + held_bytes + 4 * mtp.expert_bytes_per_slot
+            (all.resident_bytes + held_bytes + 4 * mtp.expert_bytes_per_slot) as u128
         );
         Ok(())
     }
@@ -1640,7 +2135,7 @@ mod tests {
     #[test]
     fn the_boundary_is_inclusive_and_the_check_is_metal_only() {
         let mut plan = this_machine(None, 1.0);
-        plan.working_set = plan.predicted();
+        plan.working_set = usize::try_from(plan.predicted()).unwrap();
         assert!(plan.fits());
         plan.working_set -= 1;
         assert!(!plan.fits());
@@ -1656,7 +2151,7 @@ mod tests {
     #[test]
     fn the_auto_plan_leaves_the_session_reserve() {
         let cfg = Config::tiny();
-        let per = kv_bytes_per_token(&cfg);
+        let per = kv_bytes_per_token(&cfg).unwrap();
         let full = cfg
             .layer_types
             .iter()
@@ -1668,14 +2163,10 @@ mod tests {
                 + cfg.indexer_head_dim)
         );
         let claims = |rows, tile| {
-            session_floor_bytes(&session_claims(
-                &cfg,
-                rows,
-                4096,
-                tile,
-                &StreamLoader::Io,
-                false,
-            ))
+            session_floor_bytes(
+                &session_claims(&cfg, rows, 4096, tile, &StreamLoader::Io, false).unwrap(),
+            )
+            .unwrap()
         };
         let r1 = claims(1, 512);
         let r4 = claims(4, 512);
@@ -1704,7 +2195,7 @@ mod tests {
         use lloom_tensor::DType;
         let mut cfg = Config::flash_next();
         let indexer = 128 * 4 + 128;
-        let per = |cfg: &Config| kv_bytes_per_token(cfg);
+        let per = |cfg: &Config| kv_bytes_per_token(cfg).unwrap();
         assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 4 + indexer));
         cfg.kv_precision = KvPrecision::dense(DType::F16);
         assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 2 + indexer));

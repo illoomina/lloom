@@ -41,6 +41,60 @@ pub struct IoLoad<'a> {
     pub len: usize,
 }
 
+/// Validate byte arithmetic without creating native objects. The raw extent is
+/// checked separately because a view's logical extent is not the allocation.
+fn checked_load_range(
+    base: usize,
+    view_len: usize,
+    raw_len: usize,
+    dst_offset: usize,
+    src_offset: u64,
+    len: usize,
+) -> Result<(), MetalKernelError> {
+    let refused = || {
+        MetalKernelError::FailedToCreateResource(
+            "io load byte range exceeds destination or address space".into(),
+        )
+    };
+    let logical_end = dst_offset.checked_add(len).ok_or_else(refused)?;
+    if logical_end > view_len {
+        return Err(refused());
+    }
+    let physical_end = base.checked_add(logical_end).ok_or_else(refused)?;
+    if physical_end > raw_len {
+        return Err(refused());
+    }
+    let source = usize::try_from(src_offset).map_err(|_| refused())?;
+    source.checked_add(len).ok_or_else(refused)?;
+    Ok(())
+}
+
+/// Entire-batch validation precedes the first compute signal or IO submission,
+/// including ranges assigned to later lanes. No descriptor copy is needed:
+/// IoLoad and Buffer extents remain immutable throughout the borrowed batch.
+fn validate_loads(loads: &[IoLoad<'_>]) -> Result<(), MetalKernelError> {
+    use objc2_metal::MTLBuffer as _;
+    let mut total = 0u64;
+    for load in loads {
+        checked_load_range(
+            load.dst.base_offset(),
+            load.dst.length(),
+            load.dst.as_ref().length(),
+            load.dst_offset,
+            load.src_offset,
+            load.len,
+        )?;
+        total = total
+            .checked_add(u64::try_from(load.len).map_err(|_| {
+                MetalKernelError::FailedToCreateResource("io load byte count overflow".into())
+            })?)
+            .ok_or_else(|| {
+                MetalKernelError::FailedToCreateResource("io batch byte count overflow".into())
+            })?;
+    }
+    Ok(())
+}
+
 /// An IO queue plus the pair of shared events that order it against the
 /// compute stream.
 ///
@@ -124,7 +178,8 @@ impl IoQueue {
 
     /// One IO command buffer over `loads`: waits for the compute signal
     /// `compute_value`, loads, signals lane `lane` with its next value
-    /// (returned), commits.
+    /// (returned), commits. Caller has validated the ENTIRE batch before any
+    /// lane is submitted; this method performs no fallible range discovery.
     fn commit_lane(
         &self,
         lane: usize,
@@ -137,14 +192,6 @@ impl IoQueue {
         cb.waitForEvent_value(&self.ev_compute, compute_value);
         let mut total = 0u64;
         for l in loads {
-            if l.dst_offset + l.len > l.dst.length() {
-                return Err(MetalKernelError::FailedToCreateResource(format!(
-                    "io load: {}+{} past the {}-byte buffer",
-                    l.dst_offset,
-                    l.len,
-                    l.dst.length()
-                )));
-            }
             // SAFETY: as in `issue`.
             unsafe {
                 cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
@@ -210,6 +257,7 @@ impl IoQueue {
             let value = self.issue(commands, loads)?;
             return self.await_value(commands, value);
         }
+        validate_loads(loads)?;
         // The compute signal, committed before any IO buffer waits on it
         // (see `issue`); then one IO buffer per lane, the loads dealt round
         // robin; then a compute wait per lane.
@@ -245,10 +293,13 @@ impl IoQueue {
         commands: &Commands,
         loads: &[IoLoad<'_>],
     ) -> Result<u64, MetalKernelError> {
-        let value = self.next.fetch_add(1, Ordering::AcqRel) + 1;
+        // Zero is already complete on every lane. An empty batch must not
+        // reserve a fresh value that no command buffer will ever signal.
         if loads.is_empty() {
-            return Ok(value);
+            return Ok(0);
         }
+        validate_loads(loads)?;
+        let value = self.next.fetch_add(1, Ordering::AcqRel) + 1;
         let compute_value = self.next_compute();
         commands.encode_signal_event(&self.ev_compute, compute_value)?;
         // Commit the compute buffer carrying the signal BEFORE the IO buffer
@@ -262,16 +313,8 @@ impl IoQueue {
         cb.waitForEvent_value(&self.ev_compute, compute_value);
         let mut total = 0u64;
         for l in loads {
-            if l.dst_offset + l.len > l.dst.length() {
-                return Err(MetalKernelError::FailedToCreateResource(format!(
-                    "io load: {}+{} past the {}-byte buffer",
-                    l.dst_offset,
-                    l.len,
-                    l.dst.length()
-                )));
-            }
-            // SAFETY: the destination range was bounds-checked against the
-            // buffer this handle addresses (`base_offset` folded in), the
+            // SAFETY: whole-batch preflight checked both logical and raw
+            // destination extents plus source address arithmetic. The
             // buffer outlives the command buffer (the caller keeps it), and the
             // source range is the file's — a short read is Metal's error, not
             // memory unsafety.
@@ -293,7 +336,8 @@ impl IoQueue {
         Ok(value)
     }
 
-    /// The value the most recent [`Self::issue`] returned (0 before any).
+    /// The latest reserved nonempty IO value (0 before any). Empty issues do
+    /// not change it. Reservation does not itself prove native submission.
     pub fn last_issued(&self) -> u64 {
         self.next.load(Ordering::Acquire)
     }
@@ -339,5 +383,26 @@ impl std::fmt::Debug for IoQueue {
 impl std::fmt::Debug for IoFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "IoFile")
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::checked_load_range;
+
+    #[test]
+    fn view_and_raw_extents_are_checked_independently() {
+        assert!(checked_load_range(16, 32, 64, 8, 4, 24).is_ok());
+        assert!(checked_load_range(16, 32, 64, 9, 4, 24).is_err());
+        assert!(checked_load_range(48, 32, 64, 8, 4, 24).is_err());
+        assert!(checked_load_range(64, 0, 64, 0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn offset_additions_refuse_wrap_without_allocating() {
+        assert!(checked_load_range(0, usize::MAX, usize::MAX, usize::MAX, 0, 1).is_err());
+        assert!(checked_load_range(usize::MAX, 1, usize::MAX, 0, 0, 1).is_err());
+        assert!(checked_load_range(0, 1, 1, 0, u64::MAX, 1).is_err());
+        assert!(checked_load_range(0, 1, 1, 0, (usize::MAX - 1) as u64, 1).is_ok());
     }
 }

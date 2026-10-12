@@ -1344,6 +1344,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         #[cfg(feature = "metal")]
         if verify_keyed_by_variant() {
             if let Ok(m) = self.device().as_metal_device() {
+                let m = m.execution_device()?;
                 if m.pass_plans_enabled() {
                     m.set_next_pass_variant(self.verify_variant(cache, t));
                 }

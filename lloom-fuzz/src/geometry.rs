@@ -40,9 +40,12 @@ use lloom_tensor::Device;
 
 use crate::campaign::shape_hit;
 
-/// Build the Metal side as the family's reference construction too (f32
-/// stems where the served load has f16 ones): a discriminator for a
-/// deviation — if it goes, the deviation was the served arm's precision.
+/// Select the Free profile for a Fast-contract campaign. Default false
+/// preserves the historical Exact-profile campaign entry point.
+pub static FAST_CONTRACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Build Metal through the f32 reference too, to distinguish served precision
+/// from a defect shared by both constructions.
 pub static METAL_REFERENCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -79,8 +82,8 @@ impl Outcome {
 }
 
 /// The logits of the model `make` builds on `dev`, over `w`.
-fn run_model<F: TinyFamily>(
-    make: impl FnOnce(&Device) -> lloom_tensor::Result<F::Model<lloom::profile::CrownExact>>,
+fn run_model<F: TinyFamily, P: lloom::profile::Profile>(
+    make: impl FnOnce(&Device) -> lloom_tensor::Result<F::Model<P>>,
     cfg: &F::Config,
     vocab: usize,
     dev: &Device,
@@ -165,7 +168,11 @@ pub fn execute<F: TinyFamily>(
 ) -> Outcome {
     REACH.with(|r| *r.borrow_mut() = (Vec::new(), Vec::new()));
     STEPS.with(|s| s.borrow_mut().clear());
-    let outcome = judge::<F>(g, weights, cpu, gpu, tol);
+    let outcome = if FAST_CONTRACT.load(std::sync::atomic::Ordering::Relaxed) {
+        judge::<F, lloom::profile::Crown>(g, weights, cpu, gpu, tol)
+    } else {
+        judge::<F, lloom::profile::CrownExact>(g, weights, cpu, gpu, tol)
+    };
     shape_hit(&format!("outcome|{}", outcome.class()));
     match &outcome {
         Outcome::CpuRefused(m) => shape_hit(&format!("cpu|{}", shape_of(m))),
@@ -175,7 +182,7 @@ pub fn execute<F: TinyFamily>(
     outcome
 }
 
-fn judge<F: TinyFamily>(
+fn judge<F: TinyFamily, P: lloom::profile::Profile>(
     g: &Geometry,
     weights: Weights,
     cpu: &Device,
@@ -193,22 +200,23 @@ fn judge<F: TinyFamily>(
     }
     let vocab = ckpt.cfg.axis("vocab_size").unwrap_or(1);
     let w = g.work;
-    let reference =
-        match quietly(|| run_model::<F>(|d| F::reference(&ckpt, d), &ckpt.cfg, vocab, cpu, &w)) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Outcome::CpuRefused(e),
-            Err(p) => return Outcome::CpuRefused(format!("panic: {p}")),
-        };
+    let reference = match quietly(|| {
+        run_model::<F, P>(|d| F::reference(&ckpt, d), &ckpt.cfg, vocab, cpu, &w)
+    }) {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Outcome::CpuRefused(e),
+        Err(p) => return Outcome::CpuRefused(format!("panic: {p}")),
+    };
     let armed = shape_probe::arm();
     profile::reset();
     let as_reference = METAL_REFERENCE.load(std::sync::atomic::Ordering::Relaxed);
     let metal = quietly(|| {
-        run_model::<F>(
+        run_model::<F, P>(
             |d| {
                 if as_reference {
                     F::reference(&ckpt, d)
                 } else {
-                    ckpt.model::<lloom::profile::CrownExact>(d)
+                    ckpt.model::<P>(d)
                 }
             },
             &ckpt.cfg,

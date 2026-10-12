@@ -1345,15 +1345,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // (`speculative.cpp:796`), and a family with no confidence signal leaves
         // `confidence` empty, so `position` finds nothing and the whole block
         // stands — uniform across families (§3.4.4).
+        // A target whose verify cannot run the anchor alone (LFM2) keeps one
+        // draft however unconfident: the cut, like the room's, stops at the
+        // floor (#943: a cut at the first position fed LFM2's verify nothing).
+        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
         if p_min > 0.0 {
             for d in drafts.iter_mut() {
                 if let Some(cut) = d.confidence.iter().position(|&p| p < p_min) {
-                    d.tokens.truncate(cut)?;
-                    d.confidence.truncate(cut);
+                    let cut = cut.max(floor);
+                    if cut < d.tokens.len() {
+                        d.tokens.truncate(cut)?;
+                        d.confidence.truncate(cut);
+                    }
                 }
             }
         }
-        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
         for d in drafts.iter_mut() {
             fit_to_room(d, room, floor)?;
         }

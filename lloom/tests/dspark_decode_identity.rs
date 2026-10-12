@@ -2288,6 +2288,8 @@ fn the_features_under_speculation_move_what_they_should() -> Result<()> {
 /// cuts every draft to two tokens before the verify.
 struct ConfidentDrafter {
     k: usize,
+    /// The positions it is confident of: its confidence is 0.9 there, 0.2 after.
+    confident: usize,
     truth: Vec<u32>,
     produced: usize,
     widest: usize,
@@ -2310,7 +2312,9 @@ impl Speculator for ConfidentDrafter {
         let tokens: Vec<u32> = (0..self.k)
             .map(|i| self.truth.get(self.produced + i).copied().unwrap_or(0))
             .collect();
-        let confidence: Vec<f32> = (0..self.k).map(|i| if i < 2 { 0.9 } else { 0.2 }).collect();
+        let confidence: Vec<f32> = (0..self.k)
+            .map(|i| if i < self.confident { 0.9 } else { 0.2 })
+            .collect();
         Ok(active
             .iter()
             .map(|_| Draft {
@@ -2334,7 +2338,9 @@ impl Speculator for ConfidentDrafter {
 /// `speculative.p_min` reaches the window body: drafts are cut at the first
 /// position the drafter is less confident of, so no round keeps more than
 /// the confident prefix and the target's own token — and the stream is the
-/// K=1 run's, at a temperature, as without the cut.
+/// K=1 run's, at a temperature, as without the cut. A drafter confident of
+/// nothing keeps one draft: LFM2's verify needs one (on the real model the cut
+/// to zero failed the turn, `lfm2 verify_tokens: no proposed tokens`).
 #[test]
 fn p_min_cuts_the_draft_and_keeps_the_stream() -> Result<()> {
     let mut t = lloom::tuning::Tuning::default();
@@ -2346,25 +2352,32 @@ fn p_min_cuts_the_draft_and_keeps_the_stream() -> Result<()> {
     let cfg = tiny_config(k);
     let model = build(&cfg, &dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
-    for cell in [
-        Cell::arm(Sampling::ArgMax),
-        Cell::arm(Sampling::All { temperature: 1.0 }),
-    ] {
-        let reference = k1_run(&model, &cfg, &dev, &cell, 3, &prompt, 30)?;
-        let mut d = ConfidentDrafter {
-            k,
-            truth: reference.0.clone(),
-            produced: 0,
-            widest: 0,
-        };
-        let ((ids, eos, _), rounds) = spec_run(&model, &cfg, &dev, &cell, 3, &prompt, 30, &mut d)?;
-        assert_eq!((&ids, eos), (&reference.0, reference.1), "{cell:?}");
-        assert_eq!(
-            d.widest, 3,
-            "{cell:?}: a round kept {} tokens; the cut keeps two drafts and the target's own",
-            d.widest
-        );
-        assert!(rounds > 4, "{cell:?}: {rounds} rounds");
+    for confident in [2usize, 0] {
+        for cell in [
+            Cell::arm(Sampling::ArgMax),
+            Cell::arm(Sampling::All { temperature: 1.0 }),
+        ] {
+            let reference = k1_run(&model, &cfg, &dev, &cell, 3, &prompt, 30)?;
+            let mut d = ConfidentDrafter {
+                k,
+                confident,
+                truth: reference.0.clone(),
+                produced: 0,
+                widest: 0,
+            };
+            let ((ids, eos, _), rounds) =
+                spec_run(&model, &cfg, &dev, &cell, 3, &prompt, 30, &mut d)?;
+            assert_eq!((&ids, eos), (&reference.0, reference.1), "{cell:?}");
+            let kept = confident.max(1);
+            assert_eq!(
+                d.widest,
+                kept + 1,
+                "{cell:?}, confident of {confident}: a round kept {} tokens; the cut keeps \
+                 {kept} drafts and the target's own",
+                d.widest
+            );
+            assert!(rounds > 4, "{cell:?}: {rounds} rounds");
+        }
     }
     Ok(())
 }

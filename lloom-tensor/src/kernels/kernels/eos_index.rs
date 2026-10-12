@@ -15,8 +15,13 @@ use objc2_metal::MTLSize;
 /// in-kernel tree reduction spans every real lane; lanes past `n` propose the
 /// sentinel and drop out. `n` must be `<= 1024` (the kernel's shared array and a
 /// threadgroup's ceiling) — the caller sizes the window well under that.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_eos_index(
+pub unsafe fn call_eos_index(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -34,16 +39,19 @@ pub fn call_eos_index(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "eos_index n={n} n_eos={n_eos}");
 
-    set_params!(
-        encoder,
-        (
-            (tokens, tokens_offset),
-            n as u32,
-            (eos_ids, eos_offset),
-            n_eos as u32,
-            Output::new(out)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (tokens, tokens_offset),
+                n as u32,
+                (eos_ids, eos_offset),
+                n_eos as u32,
+                Output::new(out)
+            )
+        );
+    }
 
     // One threadgroup; width = next_pow2(n), clamped to the kernel's shared array
     // (1024) and to the pipeline's own max. The reduction reads `width` lanes, so

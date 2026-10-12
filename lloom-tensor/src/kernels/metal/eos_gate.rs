@@ -129,22 +129,28 @@ impl DispatchGate {
         })?;
         let encoder = ep.encoder();
         let encoder: &super::ComputeCommandEncoder = encoder.as_ref();
-        crate::kernels::call_eos_gate(
-            device,
-            encoder,
-            kernels,
-            token,
-            token_offset,
-            eos_ids,
-            eos_offset,
-            n_eos,
-            flag,
-        )?;
+        // SAFETY: `token` and `eos_ids` are the caller's storages (binding
+        // authority, `metal_backend` module head); the flag is this gate's own
+        // buffer, which the host writes only in `begin`.
+        unsafe {
+            crate::kernels::call_eos_gate(
+                device,
+                encoder,
+                kernels,
+                token,
+                token_offset,
+                eos_ids,
+                eos_offset,
+                n_eos,
+                flag,
+            )
+        }?;
         encoder.insert_memory_barrier();
         // The gate kernel bound the flag as its output at index 3; the gated
         // variants read it at index 30 — rebind there in case a `set_params!`
         // of a wide kernel touched it (none binds 31 buffers, but cheap).
-        encoder.set_input_buffer(EOS_GATE_FLAG_INDEX, Some(flag), 0);
+        // SAFETY: as above.
+        unsafe { encoder.set_input_buffer(EOS_GATE_FLAG_INDEX, Some(flag), 0) };
         self.steps.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

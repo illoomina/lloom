@@ -168,16 +168,20 @@ impl lloom_tensor::CustomOp1 for Sigmoid {
                     lloom_tensor::bail!("Metal contiguous unary sigmoid {dtype:?} not implemented")
                 }
             };
-            lloom_tensor::kernels::call_unary_contiguous(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                kernel_name,
-                dtype.size_in_bytes(),
-                el_count,
-                src,
-                &buffer,
-            )
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            unsafe {
+                lloom_tensor::kernels::call_unary_contiguous(
+                    device.metal_device(),
+                    &encoder,
+                    device.kernels(),
+                    kernel_name,
+                    dtype.size_in_bytes(),
+                    el_count,
+                    src,
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             use lloom_tensor::kernels::unary::strided;
@@ -190,16 +194,20 @@ impl lloom_tensor::CustomOp1 for Sigmoid {
                 }
             };
             let dst = lloom_tensor::kernels::BufferOffset::zero_offset(&buffer);
-            lloom_tensor::kernels::call_unary_strided(
-                device.metal_device(),
-                &encoder,
-                device.kernels(),
-                kernel_name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                dst,
-            )
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            unsafe {
+                lloom_tensor::kernels::call_unary_strided(
+                    device.metal_device(),
+                    &encoder,
+                    device.kernels(),
+                    kernel_name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    dst,
+                )
+            }
             .map_err(MetalError::from)?;
         }
 
@@ -455,17 +463,21 @@ impl lloom_tensor::CustomOp1 for SoftmaxLastDim {
                 storage.dtype(),
             )?,
         };
-        lloom_tensor::kernels::call_last_softmax(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            elem_count,
-            last_dim,
-            storage.buffer(),
-            layout.start_offset() * storage.dtype().size_in_bytes(),
-            output.buffer(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_last_softmax(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                elem_count,
+                last_dim,
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                output.buffer(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((output, layout.shape().clone()))
     }
@@ -634,18 +646,22 @@ impl lloom_tensor::CustomOp3 for Conv1dDepthwiseScaled {
             .build()?;
 
         let encoder = device.command_encoder()?;
-        lloom_tensor::kernels::call_conv1d_depthwise_k_scaled(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            name,
-            wl.shape().dims(),
-            (self.k_size, self.padding),
-            buffer_o(window.buffer(), wl, dtype),
-            buffer_o(weight.buffer(), weight_l, dtype),
-            buffer_o(scale.buffer(), scale_l, dtype),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_conv1d_depthwise_k_scaled(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                wl.shape().dims(),
+                (self.k_size, self.padding),
+                buffer_o(window.buffer(), wl, dtype),
+                buffer_o(weight.buffer(), weight_l, dtype),
+                buffer_o(scale.buffer(), scale_l, dtype),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         let storage =
@@ -824,20 +840,24 @@ fn shortconv_step_impl(
         let encoder = device
             .command_encoder()
             .map_err(lloom_tensor::Error::wrap)?;
-        lloom_tensor::kernels::call_shortconv_step(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            name,
-            (dst_numel, hidden, proj_stride_b, proj_stride_c),
-            buffer_o(b_s.buffer(), &b_l, dtype),
-            buffer_o(x_s.buffer(), &x_l, dtype),
-            buffer_o(c_s.buffer(), &c_l, dtype),
-            buffer_o(st_s.buffer(), &st_l, dtype),
-            buffer_o(w_s.buffer(), &w_l, dtype),
-            state_out,
-            &dst,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_shortconv_step(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                (dst_numel, hidden, proj_stride_b, proj_stride_c),
+                buffer_o(b_s.buffer(), &b_l, dtype),
+                buffer_o(x_s.buffer(), &x_l, dtype),
+                buffer_o(c_s.buffer(), &c_l, dtype),
+                buffer_o(st_s.buffer(), &st_l, dtype),
+                buffer_o(w_s.buffer(), &w_l, dtype),
+                state_out,
+                &dst,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         let _ = elem_sz;
@@ -1061,21 +1081,25 @@ fn shortconv_ring_impl(
         let encoder = device
             .command_encoder()
             .map_err(lloom_tensor::Error::wrap)?;
-        lloom_tensor::kernels::call_shortconv_ring(
-            device.metal_device(),
-            &encoder,
-            device.kernels(),
-            name,
-            params,
-            buffer_o(b_s.buffer(), b_l, dtype),
-            buffer_o(x_s.buffer(), x_l, dtype),
-            buffer_o(c_s.buffer(), c_l, dtype),
-            buffer_o(st_s.buffer(), st_l, dtype),
-            buffer_o(w_s.buffer(), w_l, dtype),
-            &dst,
-            rs_buf,
-            rp_buf,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_shortconv_ring(
+                device.metal_device(),
+                &encoder,
+                device.kernels(),
+                name,
+                params,
+                buffer_o(b_s.buffer(), b_l, dtype),
+                buffer_o(x_s.buffer(), x_l, dtype),
+                buffer_o(c_s.buffer(), c_l, dtype),
+                buffer_o(st_s.buffer(), st_l, dtype),
+                buffer_o(w_s.buffer(), w_l, dtype),
+                &dst,
+                rs_buf,
+                rp_buf,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         use lloom_tensor::op::BackpropOp;
@@ -1294,20 +1318,24 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
             .with_label("rmsnorm")
             .build()?;
         if l1.is_contiguous() {
-            lloom_tensor::kernels::call_rms_norm(
-                device.metal_device(),
-                &encoder,
-                kernels,
-                name,
-                elem_count,
-                last_dim,
-                self.eps,
-                s1.buffer(),
-                l1.start_offset() * s1.dtype().size_in_bytes(),
-                s2.buffer(),
-                l2.start_offset() * s2.dtype().size_in_bytes(),
-                &output,
-            )
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            unsafe {
+                lloom_tensor::kernels::call_rms_norm(
+                    device.metal_device(),
+                    &encoder,
+                    kernels,
+                    name,
+                    elem_count,
+                    last_dim,
+                    self.eps,
+                    s1.buffer(),
+                    l1.start_offset() * s1.dtype().size_in_bytes(),
+                    s2.buffer(),
+                    l2.start_offset() * s2.dtype().size_in_bytes(),
+                    &output,
+                )
+            }
             .map_err(lloom_tensor::Error::wrap)?;
         } else {
             // A strided source -- a `transpose` view -- is read where it lies
@@ -1318,24 +1346,28 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
                 "rmsnorm_f16" => "rmsnorm_f16_strided",
                 _ => "rmsnorm_bf16_strided",
             };
-            lloom_tensor::kernels::call_rms_norm_strided(
-                device.metal_device(),
-                &encoder,
-                kernels,
-                strided,
-                l1.dims(),
-                l1.stride(),
-                self.eps,
-                lloom_tensor::kernels::BufferOffset {
-                    buffer: s1.buffer(),
-                    offset_in_bytes: l1.start_offset() * s1.dtype().size_in_bytes(),
-                },
-                lloom_tensor::kernels::BufferOffset {
-                    buffer: s2.buffer(),
-                    offset_in_bytes: l2.start_offset() * s2.dtype().size_in_bytes(),
-                },
-                &output,
-            )
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            unsafe {
+                lloom_tensor::kernels::call_rms_norm_strided(
+                    device.metal_device(),
+                    &encoder,
+                    kernels,
+                    strided,
+                    l1.dims(),
+                    l1.stride(),
+                    self.eps,
+                    lloom_tensor::kernels::BufferOffset {
+                        buffer: s1.buffer(),
+                        offset_in_bytes: l1.start_offset() * s1.dtype().size_in_bytes(),
+                    },
+                    lloom_tensor::kernels::BufferOffset {
+                        buffer: s2.buffer(),
+                        offset_in_bytes: l2.start_offset() * s2.dtype().size_in_bytes(),
+                    },
+                    &output,
+                )
+            }
             .map_err(lloom_tensor::Error::wrap)?;
         }
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
@@ -1429,21 +1461,25 @@ impl lloom_tensor::CustomOp2 for RmsNormRope {
         } else {
             (name_strided, Some(l1.stride()))
         };
-        lloom_tensor::kernels::call_rms_norm_rope(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            kernel,
-            l1.dims(),
-            strides,
-            t,
-            self.eps,
-            bo(s1, l1),
-            bo(s2, l2),
-            bo(cos_s, cos_l),
-            bo(sin_s, sin_l),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rms_norm_rope(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                kernel,
+                l1.dims(),
+                strides,
+                t,
+                self.eps,
+                bo(s1, l1),
+                bo(s2, l2),
+                bo(cos_s, cos_l),
+                bo(sin_s, sin_l),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
             output,
@@ -1760,22 +1796,26 @@ impl lloom_tensor::CustomOp3 for LayerNorm {
             .with_size_for(elem_count, s1.dtype())
             .with_label("layernorm")
             .build()?;
-        lloom_tensor::kernels::call_layer_norm(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            elem_count,
-            last_dim,
-            self.eps,
-            s1.buffer(),
-            l1.start_offset() * s1.dtype().size_in_bytes(),
-            s2.buffer(),
-            l2.start_offset() * s2.dtype().size_in_bytes(),
-            s3.buffer(),
-            l3.start_offset() * s3.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_layer_norm(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                elem_count,
+                last_dim,
+                self.eps,
+                s1.buffer(),
+                l1.start_offset() * s1.dtype().size_in_bytes(),
+                s2.buffer(),
+                l2.start_offset() * s2.dtype().size_in_bytes(),
+                s3.buffer(),
+                l3.start_offset() * s3.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
             output,
@@ -2167,50 +2207,58 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                     .build()?;
 
                 encoder.set_label("vector_attention");
-                lloom_tensor::kernels::call_sdpa_vector_2pass(
-                    q.device().device(),
-                    &encoder,
-                    q.device().kernels(),
-                    q_l.start_offset() * q.dtype().size_in_bytes(),
-                    q_l.dims(),
-                    q.buffer(),
-                    k_l.start_offset() * k.dtype().size_in_bytes(),
-                    k_l.dims(),
-                    k_l.stride(),
-                    k.buffer(),
-                    v_l.start_offset() * v.dtype().size_in_bytes(),
-                    v_l.stride(),
-                    v.buffer(),
-                    &output,
-                    &intermediate,
-                    &sums,
-                    &maxs,
-                    self.scale,
-                    self.softcapping,
-                    itype,
-                )
+                // SAFETY: the op binds storages, constant-cache blocks and uploads made
+                // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+                unsafe {
+                    lloom_tensor::kernels::call_sdpa_vector_2pass(
+                        q.device().device(),
+                        &encoder,
+                        q.device().kernels(),
+                        q_l.start_offset() * q.dtype().size_in_bytes(),
+                        q_l.dims(),
+                        q.buffer(),
+                        k_l.start_offset() * k.dtype().size_in_bytes(),
+                        k_l.dims(),
+                        k_l.stride(),
+                        k.buffer(),
+                        v_l.start_offset() * v.dtype().size_in_bytes(),
+                        v_l.stride(),
+                        v.buffer(),
+                        &output,
+                        &intermediate,
+                        &sums,
+                        &maxs,
+                        self.scale,
+                        self.softcapping,
+                        itype,
+                    )
+                }
                 .map_err(lloom_tensor::Error::wrap)?;
             } else {
                 encoder.set_label("vector_attention");
-                lloom_tensor::kernels::call_sdpa_vector(
-                    q.device().device(),
-                    &encoder,
-                    q.device().kernels(),
-                    q_l.start_offset() * q.dtype().size_in_bytes(),
-                    q_l.dims(),
-                    q.buffer(),
-                    k_l.start_offset() * k.dtype().size_in_bytes(),
-                    k_l.dims(),
-                    k_l.stride(),
-                    k.buffer(),
-                    v_l.start_offset() * v.dtype().size_in_bytes(),
-                    v_l.stride(),
-                    v.buffer(),
-                    &output,
-                    self.scale,
-                    self.softcapping,
-                    itype,
-                )
+                // SAFETY: the op binds storages, constant-cache blocks and uploads made
+                // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+                unsafe {
+                    lloom_tensor::kernels::call_sdpa_vector(
+                        q.device().device(),
+                        &encoder,
+                        q.device().kernels(),
+                        q_l.start_offset() * q.dtype().size_in_bytes(),
+                        q_l.dims(),
+                        q.buffer(),
+                        k_l.start_offset() * k.dtype().size_in_bytes(),
+                        k_l.dims(),
+                        k_l.stride(),
+                        k.buffer(),
+                        v_l.start_offset() * v.dtype().size_in_bytes(),
+                        v_l.stride(),
+                        v.buffer(),
+                        &output,
+                        self.scale,
+                        self.softcapping,
+                        itype,
+                    )
+                }
                 .map_err(lloom_tensor::Error::wrap)?;
             }
         } else if supports_sdpa_full {
@@ -2313,31 +2361,35 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 _ => None,
             };
 
-            lloom_tensor::kernels::call_sdpa_full_with(
-                q.device().device(),
-                &encoder,
-                q.device().kernels(),
-                q_l.start_offset() * q.dtype().size_in_bytes(),
-                q_l.dims(),
-                q_l.stride(),
-                q.buffer(),
-                k_l.start_offset() * k.dtype().size_in_bytes(),
-                &k_shape,
-                &k_stride,
-                k.buffer(),
-                v_l.start_offset() * v.dtype().size_in_bytes(),
-                v.buffer(),
-                &v_stride,
-                mask_type,
-                mask_buffer,
-                mask_strides.as_deref(),
-                &output,
-                out_layout.stride(),
-                self.scale,
-                self.do_causal,
-                itype,
-                paged,
-            )
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            unsafe {
+                lloom_tensor::kernels::call_sdpa_full_with(
+                    q.device().device(),
+                    &encoder,
+                    q.device().kernels(),
+                    q_l.start_offset() * q.dtype().size_in_bytes(),
+                    q_l.dims(),
+                    q_l.stride(),
+                    q.buffer(),
+                    k_l.start_offset() * k.dtype().size_in_bytes(),
+                    &k_shape,
+                    &k_stride,
+                    k.buffer(),
+                    v_l.start_offset() * v.dtype().size_in_bytes(),
+                    v.buffer(),
+                    &v_stride,
+                    mask_type,
+                    mask_buffer,
+                    mask_strides.as_deref(),
+                    &output,
+                    out_layout.stride(),
+                    self.scale,
+                    self.do_causal,
+                    itype,
+                    paged,
+                )
+            }
             .map_err(lloom_tensor::Error::wrap)?;
         } else {
             lloom_tensor::bail!("must be vector or full sdpa kernel");
@@ -2872,22 +2924,26 @@ pub fn quantize_kv_into(
         let encoder = device.command_encoder()?;
         encoder.set_label("quantize_kv");
 
-        lloom_tensor::kernels::call_quantize_kv(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            src_l.start_offset() * src.dtype().size_in_bytes(),
-            src_s.buffer(),
-            codes_s.buffer(),
-            scales_s.buffer(),
-            biases_s.buffer(),
-            &params_buf,
-            n_heads,
-            seq_len,
-            head_dim,
-            bits,
-            itype,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_quantize_kv(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                src_l.start_offset() * src.dtype().size_in_bytes(),
+                src_s.buffer(),
+                codes_s.buffer(),
+                scales_s.buffer(),
+                biases_s.buffer(),
+                &params_buf,
+                n_heads,
+                seq_len,
+                head_dim,
+                bits,
+                itype,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         Ok(())
     }
@@ -2978,21 +3034,25 @@ impl lloom_tensor::CustomOp1 for DequantizeKv {
 
         let encoder = device.command_encoder()?;
         encoder.set_label("dequantize_kv");
-        lloom_tensor::kernels::call_dequantize_kv(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            codes.buffer(),
-            scales_m.buffer(),
-            biases_m.buffer(),
-            &output,
-            &params_buf,
-            self.b_sz * self.n_heads,
-            self.n_tokens,
-            self.head_dim,
-            bits,
-            itype,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_dequantize_kv(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                codes.buffer(),
+                scales_m.buffer(),
+                biases_m.buffer(),
+                &output,
+                &params_buf,
+                self.b_sz * self.n_heads,
+                self.n_tokens,
+                self.head_dim,
+                bits,
+                itype,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         let storage = lloom_tensor::MetalStorage::new_allocated(
@@ -3165,27 +3225,10 @@ impl lloom_tensor::CustomOp1 for SdpaQuant {
         encoder.set_label("sdpa_quant");
 
         match &sel_guard {
-            None => lloom_tensor::kernels::call_sdpa_vector_quant(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                q_l.start_offset() * q.dtype().size_in_bytes(),
-                q_l.dims(),
-                q.buffer(),
-                kc.buffer(),
-                ks.buffer(),
-                kb.buffer(),
-                vc.buffer(),
-                vs.buffer(),
-                vb.buffer(),
-                &output,
-                &params_buf,
-                bits,
-                itype,
-            ),
-            Some(((sel_s, _), sel_offset)) => {
-                let sel_m = metal_buf(sel_s, "sel")?;
-                lloom_tensor::kernels::call_sdpa_vector_quant_sel(
+            // SAFETY: the op binds storages, constant-cache blocks and uploads made
+            // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+            None => unsafe {
+                lloom_tensor::kernels::call_sdpa_vector_quant(
                     device.device(),
                     &encoder,
                     device.kernels(),
@@ -3200,10 +3243,35 @@ impl lloom_tensor::CustomOp1 for SdpaQuant {
                     vb.buffer(),
                     &output,
                     &params_buf,
-                    (sel_m.buffer(), sel_offset * DType::U32.size_in_bytes()),
                     bits,
                     itype,
                 )
+            },
+            Some(((sel_s, _), sel_offset)) => {
+                let sel_m = metal_buf(sel_s, "sel")?;
+                // SAFETY: the op binds storages, constant-cache blocks and uploads made
+                // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+                unsafe {
+                    lloom_tensor::kernels::call_sdpa_vector_quant_sel(
+                        device.device(),
+                        &encoder,
+                        device.kernels(),
+                        q_l.start_offset() * q.dtype().size_in_bytes(),
+                        q_l.dims(),
+                        q.buffer(),
+                        kc.buffer(),
+                        ks.buffer(),
+                        kb.buffer(),
+                        vc.buffer(),
+                        vs.buffer(),
+                        vb.buffer(),
+                        &output,
+                        &params_buf,
+                        (sel_m.buffer(), sel_offset * DType::U32.size_in_bytes()),
+                        bits,
+                        itype,
+                    )
+                }
             }
         }
         .map_err(lloom_tensor::Error::wrap)?;
@@ -3926,31 +3994,35 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
 
         let encoder = q.device().command_encoder()?;
         encoder.set_label("flash_decoding");
-        lloom_tensor::kernels::call_flash_decoding(
-            q.device().device(),
-            &encoder,
-            q.device().kernels(),
-            q_l.start_offset() * q.dtype().size_in_bytes(),
-            q.buffer(),
-            k_l.start_offset() * k.dtype().size_in_bytes(),
-            k.buffer(),
-            v_l.start_offset() * v.dtype().size_in_bytes(),
-            v.buffer(),
-            &output,
-            &partials,
-            &sums,
-            &maxs,
-            chunk_table,
-            &partial_params,
-            &combine_params,
-            &walk_order,
-            n_keys_per_seq,
-            n_q_heads,
-            head_dim,
-            n_chunks,
-            itype,
-            flash_partial_width(),
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_flash_decoding(
+                q.device().device(),
+                &encoder,
+                q.device().kernels(),
+                q_l.start_offset() * q.dtype().size_in_bytes(),
+                q.buffer(),
+                k_l.start_offset() * k.dtype().size_in_bytes(),
+                k.buffer(),
+                v_l.start_offset() * v.dtype().size_in_bytes(),
+                v.buffer(),
+                &output,
+                &partials,
+                &sums,
+                &maxs,
+                chunk_table,
+                &partial_params,
+                &combine_params,
+                &walk_order,
+                n_keys_per_seq,
+                n_q_heads,
+                head_dim,
+                n_chunks,
+                itype,
+                flash_partial_width(),
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
@@ -4406,27 +4478,31 @@ fn gemv_fused_metal(
 
     let encoder = device.command_encoder()?;
     encoder.set_label("gemv_fused");
-    lloom_tensor::kernels::call_mlx_gemv_epilogue(
-        device.device(),
-        &encoder,
-        device.kernels(),
-        dtype,
-        (b, 1, n, k),
-        &x_stride,
-        x_l.start_offset() * x.dtype().size_in_bytes(),
-        x.buffer(),
-        &w_t_stride,
-        w_l.start_offset() * w.dtype().size_in_bytes(),
-        w.buffer(),
-        &output,
-        // The process's style, as the unfused GEMV takes it: under
-        // `ParamStyle::Packed` the fused arm dispatches its packed sibling,
-        // which is what lets an ICB replay cover it (issue #732 P3).
-        lloom_tensor::kernels::default_param_style(),
-        None,
-        epilogue,
-        operand,
-    )
+    // SAFETY: the op binds storages, constant-cache blocks and uploads made
+    // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+    unsafe {
+        lloom_tensor::kernels::call_mlx_gemv_epilogue(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            dtype,
+            (b, 1, n, k),
+            &x_stride,
+            x_l.start_offset() * x.dtype().size_in_bytes(),
+            x.buffer(),
+            &w_t_stride,
+            w_l.start_offset() * w.dtype().size_in_bytes(),
+            w.buffer(),
+            &output,
+            // The process's style, as the unfused GEMV takes it: under
+            // `ParamStyle::Packed` the fused arm dispatches its packed sibling,
+            // which is what lets an ICB replay cover it (issue #732 P3).
+            lloom_tensor::kernels::default_param_style(),
+            None,
+            epilogue,
+            operand,
+        )
+    }
     .map_err(lloom_tensor::Error::wrap)?;
 
     let newstorage =
@@ -4597,31 +4673,35 @@ impl lloom_tensor::CustomOp3 for GemvNorm {
             .build()?;
         let encoder = device.command_encoder()?;
         encoder.set_label("gemv_norm");
-        lloom_tensor::kernels::call_mlx_gemv_norm(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            dtype,
-            (b, 1, n, k),
-            x_l.stride(),
-            x_l.start_offset() * x.dtype().size_in_bytes(),
-            x.buffer(),
-            &[1usize, k],
-            w_l.start_offset() * w.dtype().size_in_bytes(),
-            w.buffer(),
-            &output,
-            GemvNormInline {
-                weight: g.buffer(),
-                weight_offset: g_l.start_offset() * g.dtype().size_in_bytes(),
-                eps: self.eps,
-            },
-            match (&gate, self.silu) {
-                (Some(_), _) => GemvEpilogue::Swiglu,
-                (None, true) => GemvEpilogue::Silu,
-                (None, false) => GemvEpilogue::None,
-            },
-            gate,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_mlx_gemv_norm(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                dtype,
+                (b, 1, n, k),
+                x_l.stride(),
+                x_l.start_offset() * x.dtype().size_in_bytes(),
+                x.buffer(),
+                &[1usize, k],
+                w_l.start_offset() * w.dtype().size_in_bytes(),
+                w.buffer(),
+                &output,
+                GemvNormInline {
+                    weight: g.buffer(),
+                    weight_offset: g_l.start_offset() * g.dtype().size_in_bytes(),
+                    eps: self.eps,
+                },
+                match (&gate, self.silu) {
+                    (Some(_), _) => GemvEpilogue::Swiglu,
+                    (None, true) => GemvEpilogue::Silu,
+                    (None, false) => GemvEpilogue::None,
+                },
+                gate,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let newstorage = lloom_tensor::MetalStorage::new_allocated(
             output,

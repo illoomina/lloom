@@ -49,6 +49,25 @@ struct Drain {
     elected: bool,
 }
 impl Completions {
+    pub(super) unsafe fn cold_binding_inventory(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+        clock: Arc<super::buffer_pool::GpuClock>,
+    ) -> Result<super::native_generation_bindings::BindingInventory, crate::kernels::MetalKernelError>
+    {
+        let relay = Arc::new(crate::deferred_failure_relay::DeferredFailureRelay::cold(
+            self.failure.clone(),
+            self.wake.clone(),
+        ));
+        unsafe {
+            super::native_generation_bindings::BindingInventory::cold_in(
+                context,
+                clock,
+                relay,
+                self.failure.clone(),
+            )
+        }
+    }
     pub(super) fn new() -> Result<Arc<Self>, crate::kernels::MetalKernelError> {
         let failure = Arc::new(FailureSignal::default());
         let wake = Arc::new(Wake::default());
@@ -69,7 +88,11 @@ impl Completions {
         wake: Arc<Wake>,
     ) -> Result<Arc<Self>, crate::kernels::MetalKernelError> {
         let sentinel = registry
-            .prepare(Captures(Vec::new()), NativeOwners::vacant(), |_| Ok(()))
+            .prepare(
+                Captures::new(Vec::new()),
+                NativeOwners::vacant(),
+                |_| Ok(()),
+            )
             .map_err(|_| unavailable("M3 sentinel registration refused"))?;
         let pins = (|| {
             let tail = sentinel
@@ -311,6 +334,7 @@ pub(super) struct PreparedCommit<'a> {
         ),
     >,
     phase: CommitPhase,
+    bindings: Option<&'a super::native_generation_bindings::GenerationBindings>,
 }
 impl Completions {
     pub(super) fn prepare_commit<'a>(
@@ -320,6 +344,7 @@ impl Completions {
         >,
         marker: &'a Marker,
         nonblocking: bool,
+        bindings: Option<&'a super::native_generation_bindings::GenerationBindings>,
     ) -> Result<PreparedCommit<'a>, crate::kernels::MetalKernelError> {
         let order = self.prepare_order_mode(nonblocking)?;
         if !matches!(
@@ -370,12 +395,41 @@ impl Completions {
             new_tail: Some(new_tail),
             handler,
             phase: CommitPhase::Unused,
+            bindings,
         })
     }
 }
 impl PreparedCommit<'_> {
+    pub(super) fn stage_binding_epoch(
+        &self,
+        epoch: crate::retire::Epoch,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        if let Some(head) = self.bindings {
+            head.stage_epoch(epoch)?;
+        }
+        Ok(())
+    }
+    fn binding_failure(&self, reason: Failure) {
+        if let Some(head) = self.bindings {
+            head.quarantine(reason);
+        } else {
+            self.core
+                .failure
+                .publish(reason, || self.core.wake.notify());
+        }
+    }
+    fn binding_cancelled(&self) {
+        if let Some(head) = self.bindings {
+            if unsafe { head.terminal_cancelled() }.is_err() {
+                head.quarantine(Failure::AdapterFailed);
+            }
+        }
+    }
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
+        if let Some(head) = self.bindings {
+            head.ensure_staged()?;
+        }
         // Record phase before entering Objective-C. Handler installation cannot
         // execute GPU work; cancellation can still use host-only destruction.
         self.phase = CommitPhase::HandlerAttached;
@@ -394,12 +448,24 @@ impl PreparedCommit<'_> {
             .record()
             .begin_handoff()
             .map_err(|_| unavailable("M3 native handoff refused"))?;
+        if let Some(head) = self.bindings {
+            head.entered().map_err(|error| {
+                self.binding_failure(Failure::AdapterFailed);
+                error
+            })?;
+        }
         self.phase = CommitPhase::EnteredNative;
         // Commit-order guard still held: no second associated producer can
         // append/commit while this raw call has not returned. Public enqueue
         // may already have reserved native placement; logical prefix remains
         // commit order, not a claim that earlier enqueue never changes order.
         self.raw.commit();
+        if let Some(head) = self.bindings {
+            head.returned().map_err(|error| {
+                self.binding_failure(Failure::UnknownHandoff);
+                error
+            })?;
+        }
         self.marker
             .record()
             .handoff_returned()
@@ -415,24 +481,26 @@ impl Drop for PreparedCommit<'_> {
             CommitPhase::HandlerAttached | CommitPhase::Linked => {
                 // Known no raw commit. Prepared captures remain in service
                 // custody, including error paths under the producer's locks.
-                if self.marker.record().cancel_before_handoff().is_err()
-                    || matches!(self.phase, CommitPhase::Linked)
-                {
-                    self.core
-                        .failure
-                        .publish(Failure::AdapterFailed, || self.core.wake.notify());
+                let cancelled = self.marker.record().cancel_before_handoff().is_ok();
+                if cancelled {
+                    self.binding_cancelled();
+                }
+                if !cancelled || matches!(self.phase, CommitPhase::Linked) {
+                    self.binding_failure(Failure::AdapterFailed);
                 }
             }
             CommitPhase::EnteredNative => {
                 // Unknown native return is NOT terminality. Strict cleanup
                 // policy retains CB/physical/capture owners and wakes failures.
-                let _ = self
-                    .marker
-                    .record()
-                    .handoff_unknown(|| self.core.wake.notify());
-                self.core
-                    .failure
-                    .publish(Failure::UnknownHandoff, || self.core.wake.notify());
+                if self.bindings.is_some() {
+                    let _ = self.marker.record().handoff_unknown(|| {});
+                } else {
+                    let _ = self
+                        .marker
+                        .record()
+                        .handoff_unknown(|| self.core.wake.notify());
+                }
+                self.binding_failure(Failure::UnknownHandoff);
             }
         }
     }
@@ -445,12 +513,24 @@ pub(super) struct AssociatedBuffer {
     marker: Marker,
     core: Arc<Completions>,
     anchor: Metal3Anchor,
+    // LAST: escaped raw/anchor wrapper references disappear before same head.
+    bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 pub(super) struct CallbackRejected {
     pub error: crate::kernels::MetalKernelError,
     pub callback: Option<super::retirement::Callback>,
 }
 impl AssociatedBuffer {
+    pub(super) fn bindings(
+        &self,
+    ) -> Result<
+        &super::native_generation_bindings::GenerationBindings,
+        crate::kernels::MetalKernelError,
+    > {
+        self.bindings
+            .as_ref()
+            .ok_or_else(|| unavailable("associated M3 is explicit legacy/untracked route"))
+    }
     pub(super) fn queue_identity(&self) -> usize {
         self.core.identity()
     }
@@ -464,9 +544,13 @@ impl AssociatedBuffer {
         self.core.check()
     }
     pub(super) fn fail_lifecycle(&self) {
-        self.core
-            .failure
-            .publish(Failure::AdapterFailed, || self.notify_lifecycle());
+        if let Some(head) = &self.bindings {
+            head.quarantine(Failure::AdapterFailed);
+        } else {
+            self.core
+                .failure
+                .publish(Failure::AdapterFailed, || self.notify_lifecycle());
+        }
     }
 
     pub(super) fn new(
@@ -474,6 +558,90 @@ impl AssociatedBuffer {
         core: Arc<Completions>,
         physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
+        Self::new_impl(raw, core, physical, None)
+    }
+    pub(super) fn new_bound(
+        raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+        core: Arc<Completions>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
+        prepared: super::native_generation_bindings::PreparedGeneration,
+    ) -> Result<Self, crate::kernels::MetalKernelError> {
+        Self::new_impl(raw, core, physical, Some(prepared))
+    }
+    fn new_impl(
+        raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+        core: Arc<Completions>,
+        physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+    ) -> Result<Self, crate::kernels::MetalKernelError> {
+        if prepared
+            .as_ref()
+            .is_some_and(|prepared| !prepared.matches_queue(&core.failure))
+        {
+            return Err(crate::kernels::err::CompletionRegistrationError::new(
+                unavailable("M3 binding inventory belongs to another associated queue"),
+                Some((
+                    Metal3RawOwners {
+                        raw,
+                        physical,
+                        namespaces: Vec::new(),
+                        bindings: None,
+                    },
+                    prepared,
+                )),
+            )
+            .into());
+        }
+        // All counted clones precede consuming preparation and publishing raw A.
+        // No usable native/encoder wrapper escapes before successful constructor.
+        let bindings = match prepared
+            .as_ref()
+            .map(|prepared| prepared.constructor_head())
+            .transpose()
+        {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some((
+                        Metal3RawOwners {
+                            raw,
+                            physical,
+                            namespaces: Vec::new(),
+                            bindings: None,
+                        },
+                        prepared,
+                    )),
+                )
+                .into())
+            }
+        };
+        let cancellation = match bindings.as_ref().map(|head| head.try_clone()).transpose() {
+            Ok(head) => head.map(super::native_generation_bindings::ConstructorCancellation::new),
+            Err(error) => {
+                return Err(crate::kernels::err::CompletionRegistrationError::new(
+                    error,
+                    Some((
+                        Metal3RawOwners {
+                            raw,
+                            physical,
+                            namespaces: Vec::new(),
+                            bindings: None,
+                        },
+                        prepared,
+                        bindings,
+                    )),
+                )
+                .into())
+            }
+        };
+        let (captures, native_head) = match prepared {
+            Some(prepared) => {
+                let (capture, native) = prepared.take();
+                (Captures::with_binding(capture), Some(native))
+            }
+            None => (Captures::new(Vec::new()), None),
+        };
         let anchor = core
             .raw_owners
             .reserve(
@@ -482,6 +650,7 @@ impl AssociatedBuffer {
                     raw,
                     physical,
                     namespaces: Vec::new(),
+                    bindings: native_head,
                 },
                 |_| Ok(()),
             )
@@ -513,6 +682,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
+                            bindings: None,
                         },
                         anchor,
                     )),
@@ -520,7 +690,7 @@ impl AssociatedBuffer {
                 .into())
             }
         };
-        let marker = match core.reserve(Captures(Vec::new()), NativeOwners::metal3(native_anchor)) {
+        let marker = match core.reserve(captures, NativeOwners::metal3(native_anchor)) {
             Ok(marker) => marker,
             Err(rejected) => {
                 return Err(crate::kernels::err::CompletionRegistrationError::new(
@@ -530,6 +700,7 @@ impl AssociatedBuffer {
                             raw,
                             physical: None,
                             namespaces: Vec::new(),
+                            bindings: None,
                         },
                         anchor,
                         rejected.rejected,
@@ -547,18 +718,24 @@ impl AssociatedBuffer {
                         raw,
                         physical: None,
                         namespaces: Vec::new(),
+                        bindings: None,
                     },
                     anchor,
                 )),
             )
             .into());
         }
-        Ok(Self {
+        let wrapper = Self {
             raw,
             marker,
             core,
             anchor,
-        })
+            bindings,
+        };
+        if let Some(cancellation) = cancellation {
+            cancellation.finish();
+        }
+        Ok(wrapper)
     }
     pub(super) fn retain_namespace(
         &self,
@@ -632,7 +809,7 @@ impl AssociatedBuffer {
         nonblocking: bool,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
         self.core
-            .prepare_commit(&self.raw, &self.marker, nonblocking)
+            .prepare_commit(&self.raw, &self.marker, nonblocking, self.bindings.as_ref())
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()
@@ -725,6 +902,10 @@ impl Clone for AssociatedBuffer {
             .try_clone()
             .expect("M3 metadata pin count exhausted");
         let core = self.core.clone();
+        let bindings = self.bindings.as_ref().map(|head| {
+            head.try_clone()
+                .expect("M3 generation head count exhausted")
+        });
         marker
             .add_wrapper_handle()
             .expect("M3 wrapper count exhausted");
@@ -733,6 +914,7 @@ impl Clone for AssociatedBuffer {
             marker,
             core,
             anchor,
+            bindings,
         }
     }
 }
@@ -743,7 +925,15 @@ impl Drop for AssociatedBuffer {
             // Native blocks/producer/drainer links are metadata pins, not user
             // wrapper references. After handoff this returns WrongPhase and
             // real native feedback/strict service custody determines cleanup.
-            let _ = self.marker.record().cancel_before_handoff();
+            if self.marker.record().cancel_before_handoff().is_ok() {
+                if let Some(head) = &self.bindings {
+                    // SAFETY: successful Prepared cancellation proves no native
+                    // handoff; original anchor/raw retains SAME head until Drop.
+                    if unsafe { head.terminal_cancelled() }.is_err() {
+                        head.quarantine(Failure::AdapterFailed);
+                    }
+                }
+            }
         }
     }
 }
@@ -769,7 +959,7 @@ mod tests {
         (service, core)
     }
     fn reserve(core: &Completions, callback: super::super::retirement::Callback) -> Marker {
-        core.reserve(Captures(vec![callback]), NativeOwners::vacant())
+        core.reserve(Captures::new(vec![callback]), NativeOwners::vacant())
             .unwrap_or_else(|_| panic!("fake owner reserve"))
     }
     fn handoff(core: &Completions, marker: &Marker) {

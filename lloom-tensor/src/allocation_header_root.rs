@@ -2,8 +2,9 @@
 //! Native physical-ready/alias closure and Buffer enrollment remain separate.
 use crate::{
     allocation_header::{HeaderDetachment, HeaderError, HeaderReservation, HeaderTicket},
-    allocation_header_storage::{HeaderStorage, HeaderStorageError},
-    memory_admission::{AdmissionError, AllocationContext, ModelDomain, PhysicalCharge},
+    allocation_header_storage::{HeaderStorage, HeaderStorageError, VacantPayload},
+    deferred_failure_relay::DeferredFailureRelay,
+    memory_admission::{AllocationContext, AllocationError, ModelDomain, PhysicalCharge},
     retirement_owners::{Failure, FailureSignal},
     retirement_service::{CleanupInbox, HostRetirementService, ServiceError},
 };
@@ -13,7 +14,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub(crate) enum RootError {
     Storage(HeaderStorageError),
-    Admission(AdmissionError),
+    Admission(AllocationError),
     Service(ServiceError),
     Header(HeaderError),
     Full,
@@ -49,6 +50,10 @@ struct HeaderRoot<C, A, const N: usize> {
     failure: FailureSignal,
     // Cold installed trusted engine predicate; service only, never producer.
     ready: fn(&C, &A) -> bool,
+    // Immutable cold opt-in. Independent existing failure/Wake identities only;
+    // no Queue/Core/namespace/page/native backedge. Producers publish atoms,
+    // actual service notifications occur outside active/registry guards.
+    relay: Option<Arc<DeferredFailureRelay>>,
 }
 /// Opaque pool capability: its internal Arc never escapes, so safe callers
 /// cannot create Weak<HeaderRoot>, raw pointers or late zero-count acquisitions.
@@ -64,17 +69,119 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderP
             .map(|layout| layout.size())
             .map_err(RootError::Storage)
     }
+    /// Owned requested terms: slab Layout + audited std Arc root Layout +
+    /// exact registration Box Layout + this allocation's charge-control Layout.
+    /// Shared service/bootstrap/pass/domain/map and opaque allocator/native
+    /// overhead are NOT hidden inside this quote. Their factory terms remain
+    /// independently required; this is not an RSS quote.
+    pub(crate) fn requested_owned_bytes() -> Result<usize, RootError> {
+        let storage = Self::requested_bytes()?;
+        let root = crate::managed_layout::arc_requested_layout::<HeaderRoot<C, A, N>>()
+            .map_err(|error| RootError::Admission(error.into()))?
+            .size();
+        let control = crate::memory_admission::AllocationTicket::requested_charge_control_bytes()
+            .map_err(RootError::Admission)?;
+        storage
+            .checked_add(root)
+            .and_then(|bytes| {
+                bytes.checked_add(HostRetirementService::requested_registration_bytes())
+            })
+            .and_then(|bytes| bytes.checked_add(control))
+            .ok_or(RootError::Admission(AllocationError::Overflow))
+    }
+    /// Cold owned requested-layout enrollment, using the SAME existing promise.
+    /// # Safety
+    /// Same C/A/ready/relay custody as cold_when_in_with_relay (None allowed).
+    /// Audited std Arc layout dependency and separately shared factory terms
+    /// must be validated; requested_owned_bytes is included exactly once.
+    /// Arc births retain std global allocation-error behavior; numerical
+    /// admission is not graceful recovery from system OOM or an RSS guarantee.
+    pub(crate) unsafe fn cold_owned_when_in(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+        relay: Option<Arc<DeferredFailureRelay>>,
+    ) -> Result<Self, RootError> {
+        let service = HostRetirementService::shared().map_err(RootError::Service)?;
+        Ok(Self {
+            root: unsafe {
+                HeaderRoot::cold_with_owned_context_and_service(context, ready, relay, service)?
+            },
+        })
+    }
+    /// Manual-service control of the genuine owned constructor. No root Arc,
+    /// ticket or native authority is exported; quote/admission/publication and
+    /// final service-charge custody are the same production bodies.
+    /// # Safety
+    /// Same C/A/ready/relay contract as cold_owned_when_in. The supplied service
+    /// must own all registered roots through genuine cleanup; test controls use
+    /// the existing manual service rather than starting the global worker.
+    #[cfg(test)]
+    pub(crate) unsafe fn cold_owned_when_in_service(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+        relay: Option<Arc<DeferredFailureRelay>>,
+        service: &Arc<HostRetirementService>,
+    ) -> Result<Self, RootError> {
+        Ok(Self {
+            // SAFETY: same constructor contract, only service selection differs.
+            root: unsafe {
+                HeaderRoot::cold_with_owned_context_and_service(context, ready, relay, service)?
+            },
+        })
+    }
     /// Partition an existing cold load promise instead of reserving it twice.
     /// # Safety
     /// Same C/A and native-use contract as cold. The existing prediction must
     /// include requested_bytes exactly once, plus separately priced overhead.
     pub(crate) unsafe fn cold_in(context: &AllocationContext) -> Result<Self, RootError> {
+        // SAFETY: cold_in's caller supplies the complete native-use/C-A proof
+        // before cleanup; true introduces no independent native inference.
+        unsafe { Self::cold_when_in(context, |_, _| true) }
+    }
+    /// Partition the same cold promise with an explicit per-cell readiness gate.
+    /// # Safety
+    /// Same C/A, ready and native/future-submit contracts as cold_when. The
+    /// prediction includes requested_bytes exactly once plus separately priced
+    /// overhead. False keeps the initialized payload/anchors/implicit weak and
+    /// polling enrollment intact; it does not permit Drop, refund or reuse.
+    pub(crate) unsafe fn cold_when_in(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+    ) -> Result<Self, RootError> {
         let service = HostRetirementService::shared().map_err(RootError::Service)?;
-        // SAFETY: caller supplies cold's exact C/A contract. This constructor
-        // partitions context before allocating storage or exposing handles.
+        // SAFETY: the caller supplies the per-cell readiness and anchor proof;
+        // existing context partition precedes storage allocation/publication.
+        Ok(Self {
+            root: unsafe { HeaderRoot::cold_with_context_and_service(context, ready, service)? },
+        })
+    }
+    /// Cold engine-only failure progress enrollment. Existing constructors keep
+    /// None; this does not infer native readiness or broaden any raw boundary.
+    /// # Safety
+    /// Same C/A/readiness contracts as cold_when_in. Relay preholds the SAME
+    /// actual queue/completion FailureSignal and Wake observed by its blocked
+    /// waiters, not an arbitrary pair. Caller identity/enrollment remains a
+    /// separate proof; no native caller is enrolled by this constructor alone.
+    /// Every relay producer must borrow through a genuine HeaderStrong/root
+    /// custody; independently escaped
+    /// relay Arcs are not producer capabilities. Private readiness payload may
+    /// prehold the same relay cold, but never export it. Prediction separately
+    /// covers relay/Arc/root metadata; requested_bytes remains storage-only.
+    pub(crate) unsafe fn cold_when_in_with_relay(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+        relay: Arc<DeferredFailureRelay>,
+    ) -> Result<Self, RootError> {
+        let service = HostRetirementService::shared().map_err(RootError::Service)?;
+        // SAFETY: same native/anchor contract plus exact relay custody above.
         Ok(Self {
             root: unsafe {
-                HeaderRoot::cold_with_context_and_service(context, |_, _| true, service)?
+                HeaderRoot::cold_with_context_relay_and_service(
+                    context,
+                    ready,
+                    Some(relay),
+                    service,
+                )?
             },
         })
     }
@@ -119,6 +226,14 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderP
         }
     }
     /// Claim header capacity before creating native primary/sidecar owners.
+    /// Readonly atomic failure observation through this genuine root owner.
+    /// Does not reserve credit or authorize concurrent recording/cleanup.
+    pub(crate) fn check_failed(&self) -> Result<(), RootError> {
+        match self.root.failure.get() {
+            Some(reason) => Err(RootError::Failed(reason)),
+            None => Ok(()),
+        }
+    }
     /// Cold slab growth is the caller's admitted, unlocked operation on Full.
     pub(crate) fn reserve_header(&self) -> Result<EmptyHeader<'_, C, A, N>, RootError> {
         if let Some(reason) = self.root.failure.get() {
@@ -140,6 +255,16 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderP
             },
         })
     }
+    /// Reserve and validate payload storage BEFORE building native sidecars.
+    /// Capacity/admission refusal constructs no sidecars. An impossible stale
+    /// initialized-cell observation quarantines its claim/root, never cancels
+    /// an unexplained payload. Initialization of the returned
+    /// exact-root token cannot return arbitrary C/A custody to its producer.
+    pub(crate) fn reserve_validated_header(
+        &self,
+    ) -> Result<ValidatedEmptyHeader<'_, C, A, N>, RootError> {
+        self.reserve_header()?.validate()
+    }
     pub(crate) fn insert(
         &self,
         captures: C,
@@ -159,6 +284,39 @@ pub(crate) struct EmptyHeader<
     root: &'a Arc<HeaderRoot<C, A, N>>,
     preparation: Preparation<'a, C, A, N>,
 }
+/// Exact-root empty credit plus exclusive validated vacant payload cell.
+/// Private fields inseparably bind the storage token to its live PREPARING
+/// reservation. No C/A has been constructed by this type or its validation.
+pub(crate) struct ValidatedEmptyHeader<
+    'a,
+    C: Send + Sync + 'static,
+    A: Send + Sync + 'static,
+    const N: usize,
+> {
+    empty: EmptyHeader<'a, C, A, N>,
+    vacant: VacantPayload<'a, Payload<C, A>>,
+}
+impl<'a, C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize>
+    ValidatedEmptyHeader<'a, C, A, N>
+{
+    /// Move owners directly into the already-validated service-rooted cell.
+    /// No callback/lock/allocation/native action, fallible path, or arbitrary
+    /// Drop occurs before initialized publication. Subsequent unwind uses the
+    /// existing initialized Preparation cleanup publication, not rollback.
+    pub(crate) fn initialize(self, captures: C, anchors: A) -> PreparedHeader<'a, C, A, N> {
+        let Self { mut empty, vacant } = self;
+        // SAFETY: private fields were constructed together by validate; the
+        // genuine same-root PREPARING reservation stays in empty through write.
+        unsafe {
+            vacant.initialize(Payload { captures, anchors });
+        }
+        empty.preparation.initialized = true;
+        PreparedHeader {
+            root: empty.root,
+            preparation: empty.preparation,
+        }
+    }
+}
 /// Initialized but unpublished. Drop queues rooted service cleanup, NOT credit
 /// rollback; native C/A cannot be silently destroyed on the producer thread.
 pub(crate) struct PreparedHeader<
@@ -173,6 +331,31 @@ pub(crate) struct PreparedHeader<
 impl<'a, C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize>
     EmptyHeader<'a, C, A, N>
 {
+    fn validate(mut self) -> Result<ValidatedEmptyHeader<'a, C, A, N>, RootError> {
+        let index = self
+            .preparation
+            .claim
+            .as_ref()
+            .expect("exclusive unpublished credit")
+            .index();
+        // SAFETY: exact root borrowed for 'a, sole genuine PREPARING reservation
+        // stays inside self; no payload owner/accessor exists for this credit.
+        let vacant = match unsafe { self.root.storage.vacant(index) } {
+            Ok(vacant) => vacant,
+            Err(error) => {
+                // No new C/A exists. Do not return unexplained initialized
+                // storage to free credit: an unfinished reservation has no
+                // implicit cancellation; failed root remains service-retained.
+                self.root.failed();
+                let _quarantined = self.preparation.claim.take();
+                return Err(RootError::Storage(error));
+            }
+        };
+        Ok(ValidatedEmptyHeader {
+            empty: self,
+            vacant,
+        })
+    }
     pub(crate) fn initialize(
         mut self,
         captures: C,
@@ -299,6 +482,17 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderR
         ready: fn(&C, &A) -> bool,
         service: &Arc<HostRetirementService>,
     ) -> Result<Arc<Self>, RootError> {
+        // SAFETY: preserve all existing constructors with no enrolled relay.
+        unsafe { Self::cold_with_context_relay_and_service(context, ready, None, service) }
+    }
+    /// Cold optional relay setup; same storage/C-A and inseparable producer-root
+    /// contract as cold_when_in_with_relay. Shared service registered last.
+    unsafe fn cold_with_context_relay_and_service(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+        relay: Option<Arc<DeferredFailureRelay>>,
+        service: &Arc<HostRetirementService>,
+    ) -> Result<Arc<Self>, RootError> {
         let bytes = HeaderPool::<C, A, N>::requested_bytes()?;
         let mut ticket = context.take(bytes).map_err(RootError::Admission)?;
         let storage = HeaderStorage::allocate().map_err(RootError::Storage)?;
@@ -315,11 +509,59 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderR
             active: Mutex::new(None),
             failure: FailureSignal::default(),
             ready,
+            relay,
         });
         // Cold Arc/control/registry/allocator rounding are still unenrolled.
         let inbox: Arc<dyn CleanupInbox> = root.clone();
         service.register(&inbox).map_err(RootError::Service)?;
         Ok(root)
+    }
+    /// Same owned cold contracts; caller service is already rooted. All four
+    /// owned terms are promised before storage/root/charge/registration allocation.
+    unsafe fn cold_with_owned_context_and_service(
+        context: &AllocationContext,
+        ready: fn(&C, &A) -> bool,
+        relay: Option<Arc<DeferredFailureRelay>>,
+        service: &Arc<HostRetirementService>,
+    ) -> Result<Arc<Self>, RootError> {
+        let quote = HeaderPool::<C, A, N>::requested_owned_bytes()?;
+        let control = crate::memory_admission::AllocationTicket::requested_charge_control_bytes()
+            .map_err(RootError::Admission)?;
+        let payload = quote
+            .checked_sub(control)
+            .ok_or(RootError::Admission(AllocationError::Overflow))?;
+        let mut ticket = context.take(quote).map_err(RootError::Admission)?;
+        let storage = HeaderStorage::allocate().map_err(RootError::Storage)?;
+        let charge = match ticket.try_commit_with_control(payload) {
+            Ok(charge) => charge,
+            Err(error) => {
+                drop(storage); // owned Layout free precedes ticket cancellation
+                return Err(RootError::Admission(error));
+            }
+        };
+        let root = Arc::new(Self {
+            storage,
+            charge: Mutex::new(Some(charge)),
+            active: Mutex::new(None),
+            failure: FailureSignal::default(),
+            ready,
+            relay,
+        });
+        let inbox: Arc<dyn CleanupInbox> = root.clone();
+        match service.register_owned(&inbox) {
+            Ok(()) => {
+                drop(inbox);
+                Ok(root)
+            }
+            Err(error) => {
+                drop(inbox);
+                // Failed registration retained no foreign root; its candidate
+                // Box was freed before returning. into_inner frees root Arc
+                // storage BEFORE returning inline root for storage/charge Drop.
+                drop(Arc::into_inner(root).expect("unpublished private root"));
+                Err(RootError::Service(error))
+            }
+        }
     }
     fn insert(
         self: &Arc<Self>,
@@ -387,7 +629,15 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> HeaderR
         })
     }
     fn failed(&self) {
-        self.failure.publish(Failure::AdapterFailed, || {});
+        self.publish_failure(Failure::AdapterFailed);
+    }
+}
+impl<C, A, const N: usize> HeaderRoot<C, A, N> {
+    fn publish_failure(&self, reason: Failure) {
+        self.failure.publish(reason, || {});
+        if let Some(relay) = &self.relay {
+            relay.publish(reason);
+        }
     }
 }
 struct Preparation<'a, C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> {
@@ -424,10 +674,33 @@ impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> Drop
     }
 }
 impl<C, A, const N: usize> HeaderStrong<C, A, N> {
+    /// Same fixed-data atomic failure check as the owning pool; no message read.
+    pub(crate) fn check_failed(&self) -> Result<(), RootError> {
+        match self.root.failure.get() {
+            Some(reason) => Err(RootError::Failed(reason)),
+            None => Ok(()),
+        }
+    }
+
     /// Counted payload identity, not native allocation/namespace equivalence.
     /// Root identity remains opaque; no pointer or acquisition path escapes.
     pub(crate) fn same(left: &Self, right: &Self) -> bool {
         Arc::ptr_eq(&left.root, &right.root) && left.ticket == right.ticket
+    }
+    /// Atoms-only refusal publication under this genuine counted root holder.
+    /// No wake/native call, callback, allocation or detached relay export.
+    /// Failure retains custody; it is never release/terminality authorization.
+    pub(crate) fn publish_failure(&self, reason: Failure) {
+        self.root.publish_failure(reason);
+    }
+    /// Approximate diagnostic count; this holder prevents detachment/recycling.
+    /// Never a substitute for future-use or native terminal custody.
+    pub(crate) fn strong_count(&self) -> usize {
+        self.root
+            .storage
+            .inventory()
+            .strong_count(self.ticket)
+            .expect("genuine strong header ticket")
     }
     pub(crate) fn captures(&self) -> &C {
         // SAFETY: private ticket inseparable from correct counted root; this
@@ -442,6 +715,24 @@ impl<C, A, const N: usize> HeaderStrong<C, A, N> {
             root: self.root.clone(),
             ticket: self.ticket,
         })
+    }
+    /// Checked two-count acquisition used by the concrete physical External
+    /// role. First obtain a genuine header retain; failed alias CAS drops that
+    /// temporary retain, leaving the original and both counts unchanged.
+    /// # Safety
+    /// selector is an atoms-only immutable projection to the external census
+    /// INSIDE this exact C payload, never a counter from another root. Caller
+    /// retains this genuine issuer/source throughout; on success it constructs
+    /// one external owner nonfallibly and releases the alias before header Drop.
+    pub(crate) unsafe fn try_clone_with_external(
+        &self,
+        selector: fn(&C) -> &crate::allocation_alias::AliasPins<()>,
+    ) -> Result<Self, HeaderError> {
+        let retained = self.try_clone()?;
+        if !selector(self.captures()).try_clone_external() {
+            return Err(HeaderError::Count);
+        }
+        Ok(retained)
     }
     pub(crate) fn downgrade(&self) -> Result<HeaderWeak<C, A, N>, HeaderError> {
         self.root.storage.inventory().downgrade(self.ticket)?;
@@ -492,7 +783,7 @@ impl<C, A, const N: usize> Drop for HeaderStrong<C, A, N> {
                 None => Ok(()),
             });
         if result.is_err() {
-            self.root.failure.publish(Failure::AdapterFailed, || {});
+            self.root.publish_failure(Failure::AdapterFailed);
         }
         // Automatic Arc release follows final slot access; service root remains.
     }
@@ -506,7 +797,7 @@ impl<C, A, const N: usize> Drop for HeaderWeak<C, A, N> {
             .release_weak(self.ticket)
             .is_err()
         {
-            self.root.failure.publish(Failure::AdapterFailed, || {});
+            self.root.publish_failure(Failure::AdapterFailed);
         }
     }
 }
@@ -600,6 +891,14 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> 
         self.failure.get().is_none()
             && self.active.lock().is_none()
             && self.storage.inventory().quiescent()
+            && self.relay.as_ref().is_none_or(|relay| relay.quiet())
+    }
+    fn service_notify(&self) {
+        // Actual service invokes after begin_retire/fail returns and outside
+        // active and registry guards, including while genuine strongs live.
+        if let Some(relay) = &self.relay {
+            relay.notify_on_service();
+        }
     }
     fn requires_polling(&self) -> bool {
         true
@@ -611,7 +910,7 @@ unsafe impl<C: Send + Sync + 'static, A: Send + Sync + 'static, const N: usize> 
         self.charge.lock().take()
     }
     fn fail(&self, reason: Failure) {
-        self.failure.publish(reason, || {});
+        self.publish_failure(reason);
     }
 }
 
@@ -643,6 +942,86 @@ mod tests {
             Err(rejected) => panic!("unexpected scalar insert refusal: {:?}", rejected.error),
         }
     }
+    #[test]
+    fn owned_root_actual_free_precedes_same_account_refund() {
+        type Pool = HeaderPool<(), (), 3>;
+        let service = HostRetirementService::manual();
+        let quote = Pool::requested_owned_bytes().unwrap();
+        let storage = Pool::requested_bytes().unwrap();
+        let control =
+            crate::memory_admission::AllocationTicket::requested_charge_control_bytes().unwrap();
+        let root_layout =
+            crate::managed_layout::arc_requested_layout::<HeaderRoot<(), (), 3>>().unwrap();
+        let registration = HostRetirementService::requested_registration_bytes();
+        let domain = ModelDomain::isolated_numeric_fixture(quote);
+        let pass = domain.reserve(quote).unwrap();
+        let context = pass.context();
+        // Arm only around the actual four owned births. Domain/pass/service and
+        // their independently disclosed bootstrap allocations already exist.
+        let report = crate::free_observer::observe(&domain, |observer| {
+            // SAFETY: scalar empty C/A only, no native use/backedge, true readiness;
+            // real manual service owns the actual priced registration/root cleanup.
+            let pool =
+                unsafe { Pool::cold_owned_when_in_service(&context, |_, _| true, None, &service) }
+                    .unwrap();
+            observer.watch();
+            assert_eq!(
+                domain.snapshot(),
+                AccountSnapshot {
+                    pending: 0,
+                    committed: quote
+                }
+            );
+            drop(context);
+            drop(pass); // unrelated allocations, not tracked targets
+            drop(pool); // service still owns root and actual four committed terms
+            assert_eq!(domain.snapshot().committed, quote);
+            service.manual_pass(); // same production unlink/free/final-charge path
+        }); // internal Reset disarms before assertion formatting
+        assert_eq!(
+            report.born, 4,
+            "owned constructor requested birth census drift"
+        );
+        assert!(
+            !report.overflow
+                && !report.reallocated
+                && !report.wrong_layout
+                && !report.duplicate_free
+        );
+        assert_eq!(
+            report.blocks[..4]
+                .iter()
+                .map(|b| b.size)
+                .collect::<Vec<_>>(),
+            vec![storage, control, root_layout.size(), registration]
+        );
+        assert_eq!(report.blocks[2].align, root_layout.align());
+        assert_eq!(
+            report.freed, 4,
+            "every promised owned block must actually free"
+        );
+        for observation in &report.snapshots[..4] {
+            assert_eq!(
+                *observation,
+                Some(AccountSnapshot {
+                    pending: 0,
+                    committed: quote
+                }),
+                "same committed charge must survive actual System free"
+            );
+        }
+        assert_eq!(
+            &report.order[..4],
+            &[3, 0, 2, 1],
+            "node then slab/root then charge-control free"
+        );
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot::default(),
+            "refund only after all four real frees"
+        );
+    }
+
     #[test]
     fn weak_rooted_header_does_not_resurrect_replacement_or_lose_charge() {
         let service = HostRetirementService::manual();
@@ -697,6 +1076,73 @@ mod tests {
         assert!(!service.manual_pass());
         assert_eq!(domain.snapshot().committed, bytes);
         drop(weak_clone);
+        service.manual_pass();
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+
+    #[test]
+    fn checked_external_refusal_restores_real_header_and_original_custody() {
+        let service = HostRetirementService::manual();
+        let domain = process_account().unadmitted_domain(None).unwrap();
+        let pool = scalar_pool::<crate::allocation_alias::AliasPins<()>, (), 3>(
+            &domain,
+            &service,
+            |c, _| !c.has_external(),
+        );
+        let pins = crate::allocation_alias::AliasPins::new();
+        assert!(pins.claim_primary());
+        let original = inserted(&pool, pins, ());
+        let weak = original.downgrade().unwrap();
+        let roots = Arc::strong_count(&original.root);
+        let strongs = original
+            .root
+            .storage
+            .inventory()
+            .test_strong_count(original.ticket)
+            .unwrap();
+        original.captures().test_external_count(isize::MAX as usize);
+        // SAFETY: SAME actual scalar C, immutable atoms-only identity selector.
+        assert!(matches!(
+            unsafe { original.try_clone_with_external(|c| c) },
+            Err(HeaderError::Count)
+        ));
+        assert_eq!(
+            original
+                .root
+                .storage
+                .inventory()
+                .test_strong_count(original.ticket)
+                .unwrap(),
+            strongs
+        );
+        assert_eq!(Arc::strong_count(&original.root), roots);
+        assert_eq!(
+            original.captures().test_current_external_count(),
+            isize::MAX as usize
+        );
+        let upgraded = weak.upgrade().unwrap().unwrap();
+        assert!(HeaderStrong::same(&original, &upgraded));
+        drop(upgraded);
+        assert_eq!(pool.root.storage.inventory().available(), 2);
+        // Synthetic numeric-bound injection has no actual phantom owners.
+        original.captures().test_external_count(0);
+        let counted = unsafe { original.try_clone_with_external(|c| c) }.unwrap();
+        assert_eq!(original.captures().test_current_external_count(), 1);
+        assert!(counted.captures().release_external().is_none());
+        drop(counted);
+        assert_eq!(
+            original
+                .root
+                .storage
+                .inventory()
+                .test_strong_count(original.ticket)
+                .unwrap(),
+            strongs
+        );
+        assert_eq!(original.captures().test_current_external_count(), 0);
+        drop(weak);
+        drop(original);
+        drop(pool);
         service.manual_pass();
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
@@ -1096,7 +1542,10 @@ mod tests {
         let remainder = context.take(bytes).unwrap();
         assert!(matches!(
             context.take(1),
-            Err(AdmissionError::PromiseTooSmall { .. })
+            Err(AllocationError::Refused {
+                domain: crate::memory_admission::RefusalDomain::Promise,
+                ..
+            })
         ));
         drop(remainder); // Returns exactly the remaining demand to open parent.
         assert_eq!(
@@ -1141,7 +1590,10 @@ mod tests {
         };
         assert!(matches!(
             result,
-            Err(RootError::Admission(AdmissionError::PromiseTooSmall { .. }))
+            Err(RootError::Admission(AllocationError::Refused {
+                domain: crate::memory_admission::RefusalDomain::Promise,
+                ..
+            }))
         ));
         assert_eq!(
             domain.snapshot(),
@@ -1183,7 +1635,7 @@ mod tests {
         };
         assert!(matches!(
             result,
-            Err(RootError::Admission(AdmissionError::Cancelled))
+            Err(RootError::Admission(AllocationError::Cancelled))
         ));
         assert_eq!(
             domain.snapshot(),
@@ -1372,9 +1824,10 @@ mod tests {
         assert!(matches!(
             rejected.error,
             crate::host_anchor::AnchorError::Registry(
-                crate::retirement_registry::RegistryError::Admission(
-                    AdmissionError::PromiseTooSmall { .. }
-                )
+                crate::retirement_registry::RegistryError::Admission(AllocationError::Refused {
+                    domain: crate::memory_admission::RefusalDomain::Promise,
+                    ..
+                })
             )
         ));
         assert_eq!(

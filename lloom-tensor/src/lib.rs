@@ -47,6 +47,12 @@
 //! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
 //!
 
+#[cfg(test)]
+mod free_observer;
+#[cfg(test)]
+#[global_allocator]
+static OBSERVED_SYSTEM: free_observer::ObservedSystem = free_observer::ObservedSystem;
+
 #[cfg(feature = "accelerate")]
 mod accelerate;
 #[cfg(any(feature = "metal", test))]
@@ -62,12 +68,16 @@ mod allocation_header_root;
 mod allocation_header_storage;
 #[cfg(any(feature = "metal", test))]
 mod allocation_owner;
+#[cfg(any(feature = "metal", test))]
+mod allocation_physical_ready;
 pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
 #[doc(hidden)]
 pub mod checkout;
+mod cold_box;
+mod cold_bytes;
 mod command_lifecycle;
 mod command_policy;
 mod command_segments;
@@ -84,6 +94,8 @@ pub mod cpu_backend;
 pub mod cuda_backend;
 mod current_command;
 mod custom_op;
+#[cfg(any(feature = "metal", test))]
+mod deferred_failure_relay;
 mod device;
 pub mod display;
 mod dtype;
@@ -97,6 +109,7 @@ mod indexer;
 pub mod isolation;
 pub mod layout;
 pub mod machine;
+mod managed_layout;
 #[cfg(any(feature = "metal", test))]
 mod membership_groups;
 mod memory_accounting;
@@ -108,6 +121,8 @@ pub mod memory_arbitration;
 #[cfg(all(test, not(feature = "metal")))]
 #[path = "kernels/metal/ledger.rs"]
 mod memory_ledger_cpu_tests;
+#[cfg(any(feature = "metal", test))]
+mod native_binding_preflight;
 #[cfg(any(feature = "metal", test))]
 mod native_reuse;
 pub use autorelease::AutoreleaseScope;

@@ -2,6 +2,7 @@
 #![allow(clippy::needless_range_loop)]
 pub mod arms;
 pub mod erf;
+pub mod f16_matmul;
 pub mod kernels;
 
 #[allow(unused)]

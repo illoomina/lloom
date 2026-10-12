@@ -10,7 +10,7 @@ use crate::{
     completion_wake::Wake,
     host_anchor::{AnchorError, HostAnchorPermit, HostAnchorRegistry},
     memory_admission::{
-        AdmissionError, AllocationOrigin, AllocationTicket, DomainKey, ModelDomain, PhysicalCharge,
+        AllocationError, AllocationOrigin, AllocationTicket, DomainKey, ModelDomain, PhysicalCharge,
     },
     retirement_owners::{Failure, FailureSignal},
     retirement_registry::{HostMetadataHandle, MetadataWake, RegistryError},
@@ -29,7 +29,7 @@ impl MembershipSource {
     pub(crate) fn resolve(
         &self,
         owner: Option<DomainKey>,
-    ) -> Result<AllocationOrigin, AdmissionError> {
+    ) -> Result<AllocationOrigin, AllocationError> {
         let actual = owner
             .map(AllocationOrigin::Domain)
             .unwrap_or(AllocationOrigin::Legacy);

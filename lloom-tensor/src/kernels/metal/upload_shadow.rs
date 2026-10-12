@@ -46,7 +46,7 @@ pub fn check_at_release(buffer: &Buffer) {
     if !armed() {
         return;
     }
-    let ptr = buffer.contents() as usize;
+    let ptr = unsafe { buffer.contents() } as usize;
     let recorded = {
         let mut m = map().lock().unwrap_or_else(|e| e.into_inner());
         m.remove(&ptr)

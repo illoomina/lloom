@@ -1064,8 +1064,12 @@ mod admit_tests {
             reserved as u64,
             "admitted inside it, unwidened"
         );
-        // Past the reservation with nothing to give back: refused.
-        let a = m.admit_bytes(2 * reserved, usize::MAX);
+        // Past the reservation with nothing to give back: refused. The room is
+        // the injected `reserved` less this process's reservation not yet held
+        // (`reserved` minus its footprint), so it is at most `reserved`, and how
+        // much less depends on a footprint the test does not control: a growth
+        // past `2 * reserved` exceeds it whatever the footprint is.
+        let a = m.admit_bytes(3 * reserved, usize::MAX);
         assert!(!a.fits, "{a:?}");
         assert!(
             a.machine

@@ -104,6 +104,21 @@ impl Drop for RecordingAdmission<'_> {
     }
 }
 impl PreparedCommandCommit<'_> {
+    pub(super) fn stage_binding_epoch(
+        &self,
+        epoch: crate::retire::Epoch,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        // Exact PREPARED recording admission spans this epoch publication. No
+        // concurrent close/edit/native entry can restage the same generation.
+        match &self.native {
+            Some(PreparedNative::Metal4(prepared)) => prepared.stage_binding_epoch(epoch)?,
+            Some(PreparedNative::Metal3Associated(prepared)) => {
+                prepared.stage_binding_epoch(epoch)?
+            }
+            _ => {} // standalone raw interoperability remains untracked
+        }
+        Ok(())
+    }
     pub(super) fn on_completion_of<F>(
         &self,
         f: F,
@@ -183,6 +198,30 @@ impl<'a> EndingEncoder<'a> {
     }
 }
 impl EncoderAdmission {
+    /// The existing genuine encoder owner already pins the exact native
+    /// generation. Borrow it for one operation; no per-operation Arc clone,
+    /// current-Commands lookup, pointer recovery or additional carrier.
+    pub(super) fn command_buffer(&self) -> &CommandBuffer {
+        &self.buffer
+    }
+    pub(super) fn begin_binding_edit(
+        &self,
+    ) -> Result<crate::command_lifecycle::Ticket, crate::kernels::MetalKernelError> {
+        self.buffer.check_lifecycle_failure()?;
+        let owner =
+            self.ticket
+                .as_ref()
+                .ok_or(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "encoder already closed",
+                ))?;
+        self.buffer
+            .lifecycle()
+            .begin_encoder_edit(owner)
+            .map_err(lifecycle_error)
+    }
+    pub(super) fn same_buffer(&self, buffer: &CommandBuffer) -> bool {
+        std::ptr::eq(self.buffer.lifecycle(), buffer.lifecycle())
+    }
     pub(super) fn notify_lifecycle(&self) {
         self.buffer.notify_lifecycle();
     }
@@ -316,6 +355,34 @@ unsafe impl Send for CommandBuffer {}
 unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
+    pub(super) fn binding_generation(
+        &self,
+    ) -> Result<
+        &super::native_generation_bindings::GenerationBindings,
+        crate::kernels::MetalKernelError,
+    > {
+        match &self.backend {
+            Backend::Metal4(submission) => submission.bindings(),
+            Backend::Metal3Associated(buffer) => buffer.bindings(),
+            _ => Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "standalone raw command buffer has no tracked binding generation",
+            )),
+        }
+    }
+    pub(super) fn finish_binding_edit(
+        &self,
+        ticket: &mut crate::command_lifecycle::Ticket,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.lifecycle()
+            .finish_edit(ticket)
+            .map_err(lifecycle_error)
+    }
+    pub(super) fn abandon_binding_edit(
+        &self,
+        ticket: &mut crate::command_lifecycle::Ticket,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.lifecycle().abandon(ticket).map_err(lifecycle_error)
+    }
     fn lifecycle(&self) -> &crate::command_lifecycle::CommandLifecycle {
         match &self.backend {
             Backend::Metal3(standalone) => &standalone.lifecycle,

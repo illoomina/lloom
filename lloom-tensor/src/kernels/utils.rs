@@ -80,15 +80,31 @@ pub fn get_tile_size(dtype_size: usize) -> usize {
     1.max(8 / dtype_size)
 }
 
-pub fn set_param<P: EncoderParam>(encoder: &ComputeCommandEncoder, position: usize, data: P) {
-    <P as EncoderParam>::set_param(encoder, position, data)
+/// # Safety
+/// This generic legacy lowerer may bind arbitrary bare buffers/raw staging.
+/// Caller must satisfy EncoderParam::set_param native lifetime/reuse obligations.
+/// The closed typed operation is separate; no hidden unsafe macro wrapper.
+pub unsafe fn set_param<P: EncoderParam>(
+    encoder: &ComputeCommandEncoder,
+    position: usize,
+    data: P,
+) {
+    unsafe { <P as EncoderParam>::set_param(encoder, position, data) }
 }
 
 /// Helper functions to create the various objects on the compute command encoder
 /// on a single line.
 /// Prevents getting wrong some arguments number and mixing length and size in bytes.
+/// Existing generic/custom interoperability remains callable but unsafe; safe
+/// typed callers must preflight/install genuine leases for the entire operation.
 pub trait EncoderParam {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self);
+    /// # Safety
+    /// Caller retains originating allocation reuse authority and native/charge
+    /// owners through GPU terminality, native cached references and future
+    /// emission. Bare Buffer views/retained native objects are not that proof.
+    /// Scalar-only instances impose no buffer reuse obligation, but open generic
+    /// lowering cannot assume which instance/capture mode a caller supplied.
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self);
 }
 /// Lowers a primitive to the encoder, as either an inline constant or a field
 /// of a packed params block.
@@ -112,7 +128,7 @@ pub trait EncoderParam {
 macro_rules! primitive {
     ($type:ty) => {
         impl EncoderParam for $type {
-            fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+            unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
                 let bytes = data.to_ne_bytes();
                 if encoder.capture_scalar(&bytes, core::mem::align_of::<Self>()) {
                     return;
@@ -131,7 +147,7 @@ macro_rules! primitive {
 /// No kernel in `reduce.metal` binds a `bool`; this exists so the trait stays
 /// total, and so the width is recorded at the point that decides it.
 impl EncoderParam for bool {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         let bytes = [data as u8];
         if encoder.capture_scalar(&bytes, core::mem::align_of::<Self>()) {
             return;
@@ -175,7 +191,7 @@ impl<'a> BufferOffset<'a> {
 /// under capture these are promoted to a device buffer -- which an ICB *can*
 /// express -- rather than being packed or left inline.
 impl<T> EncoderParam for &[T] {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         if encoder.capture_array(core::mem::size_of_val(data), data.as_ptr().cast()) {
             return;
         }
@@ -184,37 +200,37 @@ impl<T> EncoderParam for &[T] {
 }
 
 impl EncoderParam for &Buffer {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_input_buffer(position, Some(data), 0);
     }
 }
 
 impl EncoderParam for (&Buffer, usize) {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_input_buffer(position, Some(data.0), data.1);
     }
 }
 
 impl EncoderParam for &BufferOffset<'_> {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_input_buffer(position, Some(data.buffer), data.offset_in_bytes);
     }
 }
 
 impl EncoderParam for &mut Buffer {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_output_buffer(position, Some(data), 0);
     }
 }
 
 impl EncoderParam for (&mut Buffer, usize) {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_output_buffer(position, Some(data.0), data.1);
     }
 }
 
 impl EncoderParam for () {
-    fn set_param(_: &ComputeCommandEncoder, _: usize, _: Self) {}
+    unsafe fn set_param(_: &ComputeCommandEncoder, _: usize, _: Self) {}
 }
 
 /// Marks a buffer as a read input in `set_params!` calls, enabling hazard tracking.
@@ -250,7 +266,7 @@ impl<'a> Input<'a> {
 }
 
 impl<'a> EncoderParam for Input<'a> {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_input_buffer(position, Some(data.buffer), data.offset);
     }
 }
@@ -293,7 +309,7 @@ impl<'a> Output<'a> {
 }
 
 impl<'a> EncoderParam for Output<'a> {
-    fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+    unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
         encoder.set_output_buffer(position, Some(data.buffer), data.offset);
     }
 }
@@ -307,6 +323,44 @@ macro_rules! set_params {
             _index += 1;
         )*
     );
+}
+
+/// Already-evaluated originating handle borrow. Bare Buffer views cannot mint
+/// this tuple's authority; the encoder still refuses a legacy Handle before
+/// native retain, page credit or effect. Packed block/array handles are ordinary
+/// members of this SAME tuple, not hidden temporary native users.
+pub(crate) struct TrackedBufferArgument<'a> {
+    pub(crate) index: usize,
+    pub(crate) owner: &'a crate::kernels::metal::BufferHandle,
+    pub(crate) offset: usize,
+    pub(crate) write: bool,
+}
+
+/// Shared complete operation lowerer for kernel families, including preprepared
+/// packed blocks and arrays. No EncoderParam callback/evaluation runs here.
+/// # Safety
+/// Caller validates exact shader schema, scalar/array initialized representation,
+/// all accessed extents and nonzero dispatch geometry. Packed pipelines supply
+/// their genuine block/array handles at exact declared indices, with no inline
+/// scalars. Escaped ICB/replay/IO owners must keep counted leases through terminal
+/// AND future emission closure. This inactive seam does not activate those owners.
+pub(crate) unsafe fn dispatch_prepared_arguments<const N: usize>(
+    encoder: &ComputeCommandEncoder,
+    pipeline: &ComputePipeline,
+    buffers: [TrackedBufferArgument<'_>; N],
+    scalars: &[crate::kernels::metal::encoder::InlineArgument<'_>],
+    groups: MTLSize,
+    threads: MTLSize,
+) -> Result<(), crate::kernels::MetalKernelError> {
+    let bindings =
+        buffers.map(|entry| (entry.index, entry.owner.as_ref(), entry.offset, entry.write));
+    // SAFETY: caller's exact schema/geometry contract above; authenticated
+    // handles remain borrowed for all mints/install/native lowering. One actual
+    // original EDIT covers the complete tuple, including every staged member.
+    unsafe {
+        encoder
+            .dispatch_inline_arguments_tracked::<N>(pipeline, &bindings, scalars, groups, threads)
+    }
 }
 
 /// Scope a Metal debug group around the current dispatch, e.g.

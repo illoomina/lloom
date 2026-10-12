@@ -205,6 +205,45 @@ fn qwen4exp_tiny_is_admitted_on_the_machine_and_refused_without_room() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// With no `memory.machine.reserve_gb`, the load line names the default it
+/// took: what the OS keeps from the Metal device's working set where the
+/// load runs on one, a tenth of the machine on the CPU.
+#[test]
+fn the_default_reserve_names_its_basis_on_each_device() {
+    let dir = scratch("reserve-basis");
+    let model = write::<Lfm2Tiny>(&dir);
+    let registry = scratch("reserve-basis-registry");
+    #[allow(unused_mut)]
+    let mut arms = vec![(&["--cpu"][..], "(10 %)")];
+    #[cfg(feature = "metal")]
+    arms.push((&[][..], "(memsize-working_set)"));
+    for (extra, basis) in arms {
+        let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+            .args(["chat", "--model"])
+            .arg(&model)
+            .args(["--raw", "-p", "Hi", "-n", "4"])
+            .args(extra)
+            .arg("--set")
+            .arg(format!("memory.machine.registry={}", registry.display()))
+            .args(["--set", "memory.machine.available_gb=100"])
+            .output()
+            .expect("lloom runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{extra:?}: not admitted:\n{err}");
+        let verdict = err
+            .lines()
+            .find(|l| l.starts_with("[machine: need="))
+            .unwrap_or_else(|| panic!("{extra:?}: no verdict line:\n{err}"));
+        eprintln!("{extra:?}: {verdict}");
+        assert!(
+            verdict.contains(basis),
+            "{extra:?}: {basis} not in {verdict}"
+        );
+    }
+    std::fs::remove_dir_all(&registry).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `--force` loads what the machine refuses, and still records the
 /// reservation for the other processes to see.
 #[test]

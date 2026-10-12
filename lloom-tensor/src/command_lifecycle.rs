@@ -137,6 +137,29 @@ impl CommandLifecycle {
             active: true,
         })
     }
+    /// Borrow ONLY the exact still-active encoder owner. Unlike begin_edit,
+    /// this cannot let an escaped old wrapper borrow a successor encoder.
+    /// The adapter keeps the original owner and a genuine generation pin alive
+    /// through finish/abandon. It may release its existing EncoderState mutex
+    /// before arbitrary executor hooks; ENDING remains excluded by this atom.
+    pub(crate) fn begin_encoder_edit(&self, owner: &Ticket) -> Result<Ticket, LifecycleError> {
+        if !owner.active || owner.owner != self.identity() || owner.word & MASK != ENCODING {
+            return Err(LifecycleError::StaleOwner);
+        }
+        let next = (owner.word & !MASK) | ENCODING_EDIT;
+        match self
+            .0
+            .compare_exchange(owner.word, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(Ticket {
+                owner: self.identity(),
+                word: next,
+                active: true,
+            }),
+            Err(observed) if observed == next => Err(LifecycleError::Busy),
+            Err(_) => Err(LifecycleError::StaleOwner),
+        }
+    }
     /// Event boundaries require no open native encoder. Callback registration
     /// deliberately uses begin_edit instead, preserving its borrowed subphase.
     pub(crate) fn begin_boundary(&self) -> Result<Ticket, LifecycleError> {
@@ -607,5 +630,101 @@ mod tests {
         gate.finish_edit(&mut next_edit).unwrap();
         gate.begin_end_encoder(&mut successor).unwrap();
         gate.finish_end_encoder(&mut successor).unwrap();
+    }
+
+    #[test]
+    fn exact_encoder_edit_refuses_ended_and_stale_active_predecessor() {
+        let gate = CommandLifecycle::new();
+        let mut old = gate.begin_encoder().unwrap();
+        // Private causal control only: public Ticket cannot be cloned.
+        let stale = Ticket {
+            owner: old.owner,
+            word: old.word,
+            active: true,
+        };
+        gate.begin_end_encoder(&mut old).unwrap();
+        gate.finish_end_encoder(&mut old).unwrap();
+        let mut current = gate.begin_encoder().unwrap();
+        assert!(matches!(
+            gate.begin_encoder_edit(&old),
+            Err(LifecycleError::StaleOwner)
+        ));
+        assert!(
+            matches!(
+                gate.begin_encoder_edit(&stale),
+                Err(LifecycleError::StaleOwner)
+            ),
+            "stale encoder borrowed successor generation"
+        );
+        let mut live = gate.begin_encoder_edit(&current).unwrap();
+        gate.finish_edit(&mut live).unwrap();
+        gate.begin_end_encoder(&mut current).unwrap();
+        gate.finish_end_encoder(&mut current).unwrap();
+        let mut submit = gate.prepare().unwrap();
+        gate.cancel_prepared(&mut submit).unwrap();
+    }
+
+    #[test]
+    fn exact_encoder_edit_excludes_close_and_restores_same_owner() {
+        let gate = CommandLifecycle::new();
+        let mut encoder = gate.begin_encoder().unwrap();
+        let original = encoder.word;
+        let mut edit = gate.begin_encoder_edit(&encoder).unwrap();
+        assert_eq!(
+            gate.begin_end_encoder(&mut encoder),
+            Err(LifecycleError::Busy),
+            "close entered during encoder operation"
+        );
+        assert_eq!(encoder.word, original);
+        assert!(encoder.active);
+        assert!(matches!(
+            gate.begin_encoder_edit(&encoder),
+            Err(LifecycleError::Busy)
+        ));
+        assert!(matches!(gate.begin_edit(), Err(LifecycleError::Busy)));
+        gate.finish_edit(&mut edit).unwrap();
+        assert_eq!(encoder.word, original);
+        let mut second = gate.begin_encoder_edit(&encoder).unwrap();
+        gate.finish_edit(&mut second).unwrap();
+        gate.begin_end_encoder(&mut encoder).unwrap();
+        gate.finish_end_encoder(&mut encoder).unwrap();
+    }
+
+    #[test]
+    fn exact_encoder_edit_refuses_foreign_lifecycle_owner() {
+        let first = CommandLifecycle::new();
+        let second = CommandLifecycle::new();
+        let mut owner = first.begin_encoder().unwrap();
+        let mut other = second.begin_encoder().unwrap();
+        assert!(matches!(
+            second.begin_encoder_edit(&owner),
+            Err(LifecycleError::StaleOwner)
+        ));
+        let mut edit = second.begin_encoder_edit(&other).unwrap();
+        second.finish_edit(&mut edit).unwrap();
+        first.begin_end_encoder(&mut owner).unwrap();
+        first.finish_end_encoder(&mut owner).unwrap();
+        second.begin_end_encoder(&mut other).unwrap();
+        second.finish_end_encoder(&mut other).unwrap();
+    }
+
+    #[test]
+    fn exact_encoder_edit_unknown_exit_keeps_admission_closed() {
+        let gate = CommandLifecycle::new();
+        let mut owner = gate.begin_encoder().unwrap();
+        let mut edit = gate.begin_encoder_edit(&owner).unwrap();
+        gate.abandon(&mut edit).unwrap();
+        assert!(matches!(
+            gate.begin_encoder_edit(&owner),
+            Err(LifecycleError::StaleOwner)
+        ));
+        assert_eq!(
+            gate.begin_end_encoder(&mut owner),
+            Err(LifecycleError::StaleOwner)
+        );
+        assert!(
+            matches!(gate.prepare(), Err(LifecycleError::Abandoned)),
+            "unknown operation became retryable recording"
+        );
     }
 }

@@ -180,10 +180,40 @@ fn footprint_impl(_pid: u32) -> Option<u64> {
     None
 }
 
-/// The reserve kept for the OS, the window server and every non-lloom
-/// process: 10 % of the machine, and never under 4 GiB.
-pub fn default_reserve(total: u64) -> u64 {
-    (total / 10).max(4 * GIB)
+/// Where the reserve kept for the OS, the window server and every non-lloom
+/// process came from (`memory.md` §9.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveBasis {
+    /// `memory.machine.reserve_gb`.
+    Configured,
+    /// `max(4 GiB, hw.memsize − recommendedMaxWorkingSetSize)`: the share of
+    /// the machine the OS keeps back from the GPU's working set.
+    WorkingSet { working_set: u64 },
+    /// `max(4 GiB, 10 %)`, where there is no Metal device to ask.
+    TenthOfMachine,
+}
+
+impl ReserveBasis {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Configured => "memory.machine.reserve_gb",
+            Self::WorkingSet { .. } => "memsize-working_set",
+            Self::TenthOfMachine => "10 %",
+        }
+    }
+}
+
+/// The default reserve on a machine of `total` bytes: what the OS keeps back
+/// from the device's working set when there is one, else 10 %; never under
+/// 4 GiB.
+pub fn default_reserve(total: u64, working_set: Option<u64>) -> (u64, ReserveBasis) {
+    match working_set {
+        Some(ws) => (
+            total.saturating_sub(ws).max(4 * GIB),
+            ReserveBasis::WorkingSet { working_set: ws },
+        ),
+        None => ((total / 10).max(4 * GIB), ReserveBasis::TenthOfMachine),
+    }
 }
 
 /// A load's predicted peak, row by row: what it will hold at its largest
@@ -255,6 +285,9 @@ pub struct GateConfig {
     pub available: Option<u64>,
     /// The machine's size in place of the host's, for the reserve default.
     pub total: Option<u64>,
+    /// The device's `recommendedMaxWorkingSetSize`, for the reserve default;
+    /// `None` where there is no Metal device.
+    pub working_set: Option<u64>,
     /// Admit what does not fit, reserving it anyway so others see it.
     pub force: bool,
     /// Turn the gate off: no reading, no registry.
@@ -274,7 +307,7 @@ pub struct Verdict {
     pub injected: bool,
     pub total: u64,
     pub reserve: u64,
-    pub reserve_is_default: bool,
+    pub reserve_basis: ReserveBasis,
     /// Every other process's reservations still to be taken, by pid:
     /// `(pid, labels, reserved, footprint)`.
     pub others: Vec<Outstanding>,
@@ -330,11 +363,12 @@ impl Verdict {
             );
         }
         format!(
-            "[machine: need={:.2} GB available={:.2} GB{} reserve={:.2} GB other_lloom={:.2} GB in {} process(es) room={:.2} GB {}]",
+            "[machine: need={:.2} GB available={:.2} GB{} reserve={:.2} GB ({}) other_lloom={:.2} GB in {} process(es) room={:.2} GB {}]",
             gb(self.need),
             gb(self.available),
             if self.injected { " (injected)" } else { "" },
             gb(self.reserve),
+            self.reserve_basis.tag(),
             self.other_bytes() as f64 / 1e9,
             self.others.len(),
             self.room() as f64 / 1e9,
@@ -377,17 +411,24 @@ impl Verdict {
             )),
             (None, false) => s.push_str("  available  UNKNOWN (not a zero-byte measurement)\n"),
         }
-        if self.reserve_is_default {
-            s.push_str(&format!(
-                "  reserve    {:.2} GB = max(4 GiB, 10 % of {:.2} GB), for macOS and the UI\n",
+        match self.reserve_basis {
+            ReserveBasis::WorkingSet { working_set } => s.push_str(&format!(
+                "  reserve    {:.2} GB = max(4 GiB, {:.2} GB memory - {:.2} GB GPU working set), \
+                 for macOS and the UI\n",
+                gb(self.reserve),
+                gb(self.total),
+                gb(working_set)
+            )),
+            ReserveBasis::TenthOfMachine => s.push_str(&format!(
+                "  reserve    {:.2} GB = max(4 GiB, 10 % of {:.2} GB) (no Metal working set), \
+                 for macOS and the UI\n",
                 gb(self.reserve),
                 gb(self.total)
-            ));
-        } else {
-            s.push_str(&format!(
+            )),
+            ReserveBasis::Configured => s.push_str(&format!(
                 "  reserve    {:.2} GB (memory.machine.reserve_gb), for macOS and the UI\n",
                 gb(self.reserve)
-            ));
+            )),
         }
         s.push_str(&format!(
             "  other lloom processes {:.2} GB reserved and not yet held{}\n",
@@ -489,6 +530,14 @@ impl Gate {
 
     pub fn config(&self) -> &GateConfig {
         &self.cfg
+    }
+
+    /// This gate with the device's working set as the reserve's basis. An
+    /// injected `working_set` is kept: a test's value outranks the device's.
+    pub fn with_device_working_set(&self, working_set: Option<u64>) -> Self {
+        let mut cfg = self.cfg.clone();
+        cfg.working_set = cfg.working_set.or(working_set);
+        Self { cfg }
     }
 
     /// Admit a load whose predicted peak is `peak`: under the registry's
@@ -623,7 +672,10 @@ impl Gate {
             (None, None) => 0,
         };
         let total = self.cfg.total.or(observation.map(|h| h.total)).unwrap_or(0);
-        let reserve = self.cfg.reserve.unwrap_or_else(|| default_reserve(total));
+        let (reserve, reserve_basis) = match self.cfg.reserve {
+            Some(bytes) => (bytes, ReserveBasis::Configured),
+            None => default_reserve(total, self.cfg.working_set),
+        };
         let me = std::process::id();
         let mut others: Vec<Outstanding> = Vec::new();
         let mut mine = Outstanding {
@@ -658,7 +710,7 @@ impl Gate {
             injected: self.cfg.available.is_some(),
             total,
             reserve,
-            reserve_is_default: self.cfg.reserve.is_none(),
+            reserve_basis,
             others,
             mine,
             fits: false,
@@ -1105,11 +1157,102 @@ mod tests {
         })
     }
 
+    // The development machine's figures: hw.memsize and its Metal device's
+    // recommendedMaxWorkingSetSize (memory.md §9.10).
+    const M1MAX_MEMSIZE: u64 = 68_719_476_736;
+    const M1MAX_WORKING_SET: u64 = 55_662_788_608;
+
     #[test]
-    fn the_default_reserve_is_a_tenth_of_the_machine_and_never_under_4_gib() {
-        assert_eq!(default_reserve(64 * GIB), 64 * GIB / 10);
-        assert_eq!(default_reserve(16 * GIB), 4 * GIB);
-        assert_eq!(default_reserve(0), 4 * GIB);
+    fn the_default_reserve_is_what_the_os_keeps_from_the_working_set_and_never_under_4_gib() {
+        assert_eq!(
+            default_reserve(M1MAX_MEMSIZE, Some(M1MAX_WORKING_SET)),
+            (
+                13_056_688_128,
+                ReserveBasis::WorkingSet {
+                    working_set: M1MAX_WORKING_SET
+                }
+            )
+        );
+        // A working set at or past the machine's size leaves the floor.
+        assert_eq!(default_reserve(16 * GIB, Some(16 * GIB)).0, 4 * GIB);
+        assert_eq!(default_reserve(16 * GIB, Some(20 * GIB)).0, 4 * GIB);
+        // No Metal device: a tenth of the machine, never under 4 GiB.
+        assert_eq!(
+            default_reserve(64 * GIB, None),
+            (64 * GIB / 10, ReserveBasis::TenthOfMachine)
+        );
+        assert_eq!(default_reserve(16 * GIB, None).0, 4 * GIB);
+        assert_eq!(default_reserve(0, None).0, 4 * GIB);
+    }
+
+    /// The state that killed the session on 2026-10-08 (`issue-952-raw/
+    /// crash-report.txt`): 6.92 GB available. A tenth of the machine leaves
+    /// +0.05 GB of room and admits a 0.04 GB load into it; what the OS keeps
+    /// from the working set leaves -6.14 GB and refuses it.
+    #[test]
+    fn the_crash_stackshot_is_admitted_on_a_tenth_and_refused_on_the_working_set() {
+        let dir = tmp_registry("stackshot");
+        let need = Peak::new().with("load", 40_000_000);
+        let config = |working_set| GateConfig {
+            registry: Some(dir.clone()),
+            available: Some(6_920_000_000),
+            total: Some(M1MAX_MEMSIZE),
+            working_set,
+            ..Default::default()
+        };
+
+        let tenth = Gate::new(config(None)).admit("tenth", &need).unwrap();
+        let v = tenth.verdict.as_ref().unwrap();
+        assert_eq!(v.reserve, 6_871_947_673);
+        assert_eq!(v.reserve_basis, ReserveBasis::TenthOfMachine);
+        assert!(v.fits, "{}", v.line());
+        assert!(v.line().contains("reserve=6.87 GB (10 %)"), "{}", v.line());
+        drop(tenth);
+
+        let error = Gate::new(config(Some(M1MAX_WORKING_SET)))
+            .admit("working set", &need)
+            .unwrap_err()
+            .to_string();
+        for want in [
+            "it needs 0.04 GB and the room is -6.14 GB",
+            "reserve    13.06 GB = max(4 GiB, 68.72 GB memory - 55.66 GB GPU working set)",
+            "Nothing was allocated",
+        ] {
+            assert!(error.contains(want), "{want:?} missing from:\n{error}");
+        }
+        assert!(Registry::open(&dir).unwrap().entries().unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_configured_reserve_and_an_injected_working_set_outrank_the_device() {
+        let dir = tmp_registry("reserve-basis");
+        let mut cfg = gate(&dir, 10 * GIB, 5 * GIB).config().clone();
+        let v = Gate::new(cfg.clone())
+            .with_device_working_set(Some(M1MAX_WORKING_SET))
+            .decide(0, None, &[], None)
+            .unwrap();
+        assert_eq!(
+            (v.reserve, v.reserve_basis),
+            (5 * GIB, ReserveBasis::Configured)
+        );
+        assert!(
+            v.line().contains("(memory.machine.reserve_gb)"),
+            "{}",
+            v.line()
+        );
+
+        cfg.reserve = None;
+        cfg.working_set = Some(60 * GIB);
+        let g = Gate::new(cfg).with_device_working_set(Some(M1MAX_WORKING_SET));
+        assert_eq!(g.config().working_set, Some(60 * GIB));
+        let v = g.decide(0, None, &[], None).unwrap();
+        assert_eq!(v.reserve, 4 * GIB, "64 GiB - 60 GiB is the floor");
+        assert!(v.line().contains("(memsize-working_set)"), "{}", v.line());
+
+        let device = Gate::default().with_device_working_set(Some(M1MAX_WORKING_SET));
+        assert_eq!(device.config().working_set, Some(M1MAX_WORKING_SET));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

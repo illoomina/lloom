@@ -30,7 +30,7 @@ pub const COUPLINGS: &[Coupling] = &[
         kind: "resolves",
         when: "decode.readback.kind = auto, and the sampler is host-side (top-k or top-p at a temperature, no device sampler)",
         effect: "the run takes the blocking readback, reported on the turn line",
-        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.device_sampler"],
+        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
         site: "lloom-engine/src/decode.rs ReadbackArm::{ring_admits, resolve}",
         is_static: false,
     },
@@ -39,7 +39,7 @@ pub const COUPLINGS: &[Coupling] = &[
         kind: "refuses",
         when: "decode.readback.kind = ring with the host-side sampler of C1",
         effect: "refused: the ring has no host round trip for the draw; `auto` makes the choice instead",
-        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.device_sampler"],
+        keys: &["decode.readback.kind", "generation.top_k", "generation.top_p", "generation.temperature", "generation.sampling.method"],
         site: "lloom/src/generation/readback.rs Ring::check_sampler; at resolve: couplings::refuse",
         is_static: true,
     },
@@ -47,8 +47,8 @@ pub const COUPLINGS: &[Coupling] = &[
         id: "C3",
         kind: "ignored",
         when: "generation.temperature unset or below 1e-7",
-        effect: "top_k, top_p and the device sampler have no effect: argmax runs",
-        keys: &["generation.top_k", "generation.top_p", "generation.device_sampler", "generation.temperature"],
+        effect: "top_k, top_p and the sampling method have no effect: argmax runs",
+        keys: &["generation.top_k", "generation.top_p", "generation.sampling.method", "generation.temperature"],
         site: "lloom-engine/src/decode.rs DecodeParams::sampling_of",
         is_static: false,
     },
@@ -118,10 +118,10 @@ pub const COUPLINGS: &[Coupling] = &[
     Coupling {
         id: "C11",
         kind: "refuses",
-        when: "speculative.method is a drafter, and a host-side sampler (top-k / top-p), a logits processor or a thinking budget is set; or the drafter is mtp / dflash and a temperature is set",
-        effect: "refused: a verify window draws each position with position-keyed noise (dspark serves argmax, plain temperature and --gumbel), which a host sort cannot take and a processor's history would be corrupted by; the mtp and dflash targets' verifies read an argmax back and draw nothing",
-        keys: &["speculative.method", "generation.temperature", "generation.top_k", "generation.top_p", "generation.min_p", "generation.repetition_penalty", "generation.presence_penalty", "generation.frequency_penalty", "generation.logit_bias", "reasoning.budget"],
-        site: "lloom-engine/src/decode.rs DecodeSession::decode_speculative_until; at resolve and after `auto` resolves: couplings::refuse",
+        when: "speculative.method is a drafter at scheduler.max_sequences > 1, and a temperature, a logits processor or a thinking budget is set",
+        effect: "refused: the batched speculative drivers (the pipelined rows, the pool rows) verify by the argmax; a single sequence's speculative body serves every sampler, processor and budget",
+        keys: &["speculative.method", "scheduler.max_sequences", "generation.temperature", "generation.min_p", "generation.repetition_penalty", "generation.presence_penalty", "generation.frequency_penalty", "generation.logit_bias", "reasoning.budget"],
+        site: "lloom-engine/src/app/lfm2.rs static_dspark_body, lloom/src/nn/batched_spec.rs admit_with_eos; at resolve and after `auto` resolves: couplings::refuse",
         is_static: true,
     },
     Coupling {
@@ -216,24 +216,22 @@ fn host_side(s: &Sampling) -> bool {
 }
 
 const DRAFTERS: [&str; 3] = ["dspark", "mtp", "dflash"];
-/// The drafters whose target verifies by sampling each window position
-/// (`Probes::verify_and_probe_sampled`): LFM2 under DSpark. The Qwen4-exp
-/// and `Decoder` verifies read an argmax back inside the pass and draw
-/// nothing, so a temperature is refused there until a sampled verify is
-/// built for them.
-const SAMPLED_VERIFY: [&str; 1] = ["dspark"];
 
-/// C11 for a resolved speculative method.
-pub fn refuse_speculative(method: &str, sampling: &crate::SamplingConfig) -> Result<(), String> {
-    if !DRAFTERS.contains(&method) {
+/// C11 for a resolved speculative method at `max_sequences` rows: the
+/// single-sequence speculative body draws each window row with the
+/// request's sampler (`Probes::verify_and_probe_sampled`), so only the
+/// batched speculative drivers, which verify by the argmax, refuse.
+pub fn refuse_speculative(
+    method: &str,
+    sampling: &crate::SamplingConfig,
+    max_sequences: usize,
+) -> Result<(), String> {
+    if !DRAFTERS.contains(&method) || max_sequences <= 1 {
         return Ok(());
     }
     let mut why = Vec::new();
-    let s = sampling.sampling();
-    if host_side(&s) {
-        why.push("a host-side sampler (generation.top_k / top_p: a host sort on one running rng, which a verify window cannot key by position)");
-    } else if s != Sampling::ArgMax && !SAMPLED_VERIFY.contains(&method) {
-        why.push("a temperature (generation.temperature: this target's verify reads an argmax back and draws nothing; a sampled verify is built for dspark only)");
+    if sampling.sampling() != Sampling::ArgMax {
+        why.push("a temperature (generation.temperature)");
     }
     if sampling.processors().is_active() {
         why.push("a logits processor (generation.min_p, the penalties, generation.logit_bias)");
@@ -245,7 +243,8 @@ pub fn refuse_speculative(method: &str, sampling: &crate::SamplingConfig) -> Res
         return Ok(());
     }
     Err(format!(
-        "C11: speculative.method = {method} refuses {}",
+        "C11: speculative.method = {method} at scheduler.max_sequences = {max_sequences} refuses \
+         {}: the batched speculative drivers verify by the argmax (serve it at a batch of 1)",
         why.join(", ")
     ))
 }
@@ -267,7 +266,7 @@ pub fn refuse(o: &EngineOptions) -> Result<(), String> {
             o.decode.readback.lookahead
         ));
     }
-    refuse_speculative(&o.speculative.method, s)?;
+    refuse_speculative(&o.speculative.method, s, o.scheduler.max_sequences)?;
     if o.scheduler.max_sequences > 1 && (s.processors().is_active() || s.thinking_budget.is_some())
     {
         return Err(format!(
@@ -302,7 +301,7 @@ pub fn explain(o: &EngineOptions) -> Vec<String> {
         ));
     }
     if sampling == Sampling::ArgMax && (s.top_k.is_some() || s.top_p.is_some() || s.gumbel) {
-        out.push("generation.top_k / top_p / device_sampler ignored <- generation.temperature unset (C3)".into());
+        out.push("generation.top_k / top_p / sampling.method ignored <- generation.temperature unset (C3)".into());
     }
     if let Some(note) = r.adaptive_clamp() {
         out.push(format!(
@@ -407,24 +406,21 @@ pub fn static_rules() -> Value {
                 "generation": {"allOf": [
                     {"properties": {"temperature": hot}, "required": ["temperature"]},
                     host_sampler,
-                    {"not": {"properties": {"device_sampler": {"const": true}}, "required": ["device_sampler"]}}]}},
+                    {"not": {"properties": {"sampling": {"properties": {"method": {"const": "gumbel"}}, "required": ["method"]}}, "required": ["sampling"]}}]}},
                 "required": ["decode", "generation"]},
          "then": false},
         {"$comment": "C10: at most one forward past an unlearned EOS",
          "if": {"properties": {"decode": {"properties": {"readback": {"properties": {"lookahead_forwards": {"type": "integer", "minimum": 2}}, "required": ["lookahead_forwards"]}}, "required": ["readback"]}}, "required": ["decode"]},
          "then": false},
-        {"$comment": "C11: a drafter refuses a host-side sampler, a logits processor and a thinking budget",
-         "if": {"properties": {"speculative": {"properties": {"method": {"enum": DRAFTERS}}, "required": ["method"]}}, "required": ["speculative"]},
+        {"$comment": "C11: a drafter at more than one sequence refuses a temperature, a logits processor and a thinking budget",
+         "if": {"properties": {
+                "speculative": {"properties": {"method": {"enum": DRAFTERS}}, "required": ["method"]},
+                "scheduler": {"properties": {"max_sequences": {"type": "integer", "minimum": 2}}, "required": ["max_sequences"]}},
+                "required": ["speculative", "scheduler"]},
          "then": {"allOf": [
-            {"not": {"properties": {"generation": {"allOf": [
-                {"properties": {"temperature": hot}, "required": ["temperature"]},
-                host_sampler,
-                {"not": {"properties": {"device_sampler": {"const": true}}, "required": ["device_sampler"]}}]}}, "required": ["generation"]}},
+            {"not": {"properties": {"generation": {"properties": {"temperature": hot}, "required": ["temperature"]}}, "required": ["generation"]}},
             {"not": {"properties": {"generation": active}, "required": ["generation"]}},
             {"not": budget}]}},
-        {"$comment": "C11: a drafter whose target's verify draws nothing (mtp, dflash) refuses a temperature",
-         "if": {"properties": {"speculative": {"properties": {"method": {"enum": ["mtp", "dflash"]}}, "required": ["method"]}}, "required": ["speculative"]},
-         "then": {"not": {"properties": {"generation": {"properties": {"temperature": hot}, "required": ["temperature"]}}, "required": ["generation"]}}},
         {"$comment": "C12: the batch scheduler refuses a logits processor and a thinking budget",
          "if": {"properties": {"scheduler": {"properties": {"max_sequences": {"type": "integer", "minimum": 2}}, "required": ["max_sequences"]}}, "required": ["scheduler"]},
          "then": {"allOf": [
@@ -462,6 +458,7 @@ mod tests {
             (
                 &[
                     ("speculative.method", "mtp"),
+                    ("scheduler.max_sequences", "2"),
                     ("generation.temperature", "0.7"),
                 ][..],
                 "C11",
@@ -469,27 +466,17 @@ mod tests {
             (
                 &[
                     ("speculative.method", "dspark"),
+                    ("scheduler.max_sequences", "4"),
                     ("generation.min_p", "0.1"),
                 ][..],
                 "C11",
             ),
             (
                 &[
-                    ("speculative.method", "dspark"),
-                    ("generation.temperature", "0.7"),
-                    ("generation.top_p", "0.9"),
-                ][..],
-                "C11",
-            ),
-            (
-                &[
                     ("speculative.method", "dflash"),
-                    ("generation.temperature", "0.7"),
+                    ("scheduler.max_sequences", "2"),
+                    ("reasoning.budget", "64"),
                 ][..],
-                "C11",
-            ),
-            (
-                &[("speculative.method", "mtp"), ("reasoning.budget", "64")][..],
                 "C11",
             ),
             (
@@ -521,7 +508,7 @@ mod tests {
                 ("decode.readback.kind", "ring"),
                 ("generation.temperature", "0.7"),
                 ("generation.top_p", "0.9"),
-                ("generation.device_sampler", "true"),
+                ("generation.sampling.method", "gumbel"),
             ][..],
             &[
                 ("speculative.method", "auto"),
@@ -535,8 +522,26 @@ mod tests {
             &[
                 ("speculative.method", "dspark"),
                 ("generation.temperature", "0.7"),
-                ("generation.device_sampler", "true"),
+                ("generation.sampling.method", "gumbel"),
             ][..],
+            // The single-sequence speculative body serves every sampler arm,
+            // the processors and the budget, on every drafter.
+            &[
+                ("speculative.method", "mtp"),
+                ("generation.temperature", "0.7"),
+            ][..],
+            &[
+                ("speculative.method", "dflash"),
+                ("generation.temperature", "0.7"),
+                ("generation.top_k", "40"),
+                ("generation.top_p", "0.9"),
+            ][..],
+            &[
+                ("speculative.method", "dspark"),
+                ("generation.min_p", "0.1"),
+                ("generation.repetition_penalty", "1.1"),
+            ][..],
+            &[("speculative.method", "mtp"), ("reasoning.budget", "64")][..],
             &[
                 ("speculative.method", "mtp"),
                 ("generation.repetition_penalty", "1"),

@@ -2591,10 +2591,33 @@ fn a_ring_reader_streams_what_every_arm_returns() -> Result<()> {
             ("argmax", Sampling::ArgMax),
             ("t=0.1", Sampling::All { temperature: 0.1 }),
             ("t=0.6", Sampling::All { temperature: 0.6 }),
+            ("gumbel t=0.6", Sampling::GumbelSoftmax { temperature: 0.6 }),
         ];
         // (start, max): ends on EOS, on length, EOS again, then length.
         let runs: [(u32, usize); 4] = [(1, 64), (0, 24), (1, 64), (0, 24)];
         let model = Chain::new(&device)?;
+        // The blocking arm's run of each (sampler, run) at the seed: what
+        // every ring arm must return. One method is one draw on every arm
+        // (`generation.sampling.method`), keyed by position, so the arm that
+        // reads the token back cannot change the reply.
+        let mut reference = std::collections::HashMap::new();
+        for (sname, sampling) in &samplers {
+            for (i, (start, max)) in runs.into_iter().enumerate() {
+                let mut session = Session::new(&model, 0usize);
+                let mut rb = Blocking::new(&[EOS], &device)?;
+                let mut sampler = LogitsProcessor::from_sampling(805, sampling.clone());
+                let out = session.decode(
+                    &mut IdentityProposer,
+                    &mut rb,
+                    &mut sampler,
+                    &[start],
+                    &DecodeOptions::new(max),
+                    &mut |_: &[u32]| Ok(()),
+                )?;
+                reference.insert((*sname, i), (out.ids, out.eos));
+            }
+        }
+        let mut arms_equal = 0usize;
         let mut failures: Vec<String> = Vec::new();
         let mut checked = 0usize;
         let mut sampled_early_eos = 0usize;
@@ -2646,6 +2669,16 @@ fn a_ring_reader_streams_what_every_arm_returns() -> Result<()> {
                                 out.ids
                             ));
                         }
+                        let want = &reference[&(*sname, i)];
+                        if (&out.ids, out.eos) != (&want.0, want.1) {
+                            failures.push(format!(
+                                "{at}: the ids {:?} (eos {}) against the blocking arm's {:?} \
+                                 (eos {})",
+                                out.ids, out.eos, want.0, want.1
+                            ));
+                        } else {
+                            arms_equal += 1;
+                        }
                         // Per token, not only by the end: under the adaptive
                         // commit the reader's flag is the loop's EOS, and it
                         // is raised in time only off a per-token stamp. The
@@ -2684,6 +2717,11 @@ fn a_ring_reader_streams_what_every_arm_returns() -> Result<()> {
             eprintln!("FAIL {f}");
         }
         assert!(checked >= 150, "{device:?}: only {checked} runs ran");
+        assert_eq!(
+            arms_equal + failures.iter().filter(|f| f.contains("blocking arm")).count(),
+            checked,
+            "every run was compared with the blocking arm's"
+        );
         assert!(
             sampled_early_eos > 0,
             "{device:?}: no sampled run ended on an early EOS under the adaptive commit, so the \

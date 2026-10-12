@@ -818,10 +818,33 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
                 as usize,
         ),
     };
-    let gumbel = v
-        .get("gumbel")
-        .and_then(Value::as_bool)
-        .unwrap_or(shared.sampling.gumbel);
+    // `generation.sampling.method`, by its key's spelling or as the
+    // `gumbel` switch; set both ways they must agree.
+    let method = match v.get("sampling_method") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "multinomial" => Some(false),
+        Some(Value::String(m)) if m == "gumbel" => Some(true),
+        Some(_) => {
+            return Err(bad(
+                "field 'sampling_method' must be \"multinomial\" or \"gumbel\"",
+            ))
+        }
+    };
+    let switch = match v.get("gumbel") {
+        None | Some(Value::Null) => None,
+        Some(b) => Some(
+            b.as_bool()
+                .ok_or_else(|| bad("field 'gumbel' must be a boolean"))?,
+        ),
+    };
+    let gumbel = match (method, switch) {
+        (Some(m), Some(g)) if m != g => {
+            return Err(bad("fields 'sampling_method' and 'gumbel' disagree"))
+        }
+        (Some(m), _) => m,
+        (None, Some(g)) => g,
+        (None, None) => shared.sampling.gumbel,
+    };
     let top_p = match v.get("top_p") {
         None | Some(Value::Null) => shared.sampling.top_p,
         Some(p) => {

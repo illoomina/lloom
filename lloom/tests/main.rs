@@ -125,6 +125,7 @@ mod recurrent_state_metal;
 mod ring_publish_binds;
 mod ring_publish_order;
 mod rnn;
+mod sampled_cells;
 mod scale_synthetic;
 mod sdpa;
 mod sdpa_full_variants;

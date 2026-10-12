@@ -2496,8 +2496,8 @@
   "couplings": "C1,C2,C3"
  },
  {
-  "new": "generation.device_sampler",
-  "status": "advanced",
+  "new": "generation.sampling.method",
+  "status": "stable",
   "flag": "",
   "old_key": "sampling.gumbel",
   "old_flag": "--gumbel",
@@ -2505,7 +2505,7 @@
   "ty": "bool",
   "default": "false",
   "consumer": "lloom_engine SamplingConfig (per request default)",
-  "note": "gumbel-max on device; a sampler arm, not a sampling parameter",
+  "note": "multinomial (the default) or gumbel; a sampler arm, not a sampling parameter",
   "src": "knob",
   "facets": "produce",
   "flows": "token-out",

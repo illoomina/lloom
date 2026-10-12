@@ -1157,6 +1157,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheRewind + CacheReset,
     {
+        self.prepare_with(full, true)
+    }
+
+    /// [`Self::prepare`] for a body that cannot resume from held logits
+    /// (`resume = false`): a request the cache holds whole re-feeds its last
+    /// token — through the rewind horizon or a turn checkpoint, else from a
+    /// fresh prefill — so the body produces its first prediction itself.
+    /// The speculative body takes this: its first round needs the target's
+    /// probe at the last position, which held logits do not carry.
+    pub fn prepare_with(&mut self, full: &[u32], resume: bool) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
         if full.is_empty() {
             lloom_tensor::bail!("Session::prepare: empty sequence");
         }
@@ -1176,7 +1189,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         let lcp = self.seq.common_prefix(full);
 
-        if lcp == full.len() && lcp == cached && self.seq.last_logits.is_some() {
+        if resume && lcp == full.len() && lcp == cached && self.seq.last_logits.is_some() {
             return Ok(Prepared {
                 action: ReuseAction::Resume,
                 reused: lcp,
@@ -1305,7 +1318,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         probe: RoundProbe<'_>,
         verify_key: Option<(&Device, crate::nn::decode::PassShape)>,
         room: usize,
-        sampler: Option<&mut crate::generation::LogitsProcessor>,
+        mut sampler: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
     where
         S: Speculator,
@@ -1356,7 +1369,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         // The sampled verify draws the target's token per row with `sampler`
         // (#943 §2); the greedy one reads the argmax, as before.
-        let verified = match sampler {
+        let verified = match sampler.as_deref_mut() {
             Some(s) => self.model.verify_and_probe_sampled(
                 &drafts,
                 anchors,
@@ -1372,6 +1385,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             crate::nn::decode::end_pass(device)?;
         }
         let (accepted, probe_out) = verified?;
+        // What the round kept is the run's output: the processors' history,
+        // a budget's position and the digest move by it, as a step-by-step
+        // decode's do by its draws — after the planned pass, never inside it.
+        if let Some(s) = sampler {
+            for a in &accepted {
+                s.commit_window(a)?;
+            }
+        }
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;

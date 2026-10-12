@@ -10670,11 +10670,15 @@ impl<P: Profile> Model<P> {
         // `index_pos + i + 1`, and the key is the drawn token's own position
         // — the same key the K=1 loop uses for the token it feeds at
         // `seq.pos` (`Session::decode`), so the two paths draw alike.
-        let drawn = sampler.window_draw(&logits, index_pos as u64 + 1)?;
+        let drawn = sampler
+            .window_draw_device(&logits, index_pos as u64 + 1, Some(&input.flatten_all()?))?
+            .to_vec1::<u32>()?;
         // The proposals come back beside them, as the greedy path's one
         // readback does; the compare is the same host function.
         let proposed_host = proposed.stage_read()?.to_vec1::<u32>()?;
-        let accepted = accept_prefix(&drawn, &proposed_host, eos_ids);
+        // What each row feeds: its draw, or a thinking budget's forced tail.
+        let fed = sampler.window_fed(&drawn);
+        let accepted = accept_prefix(&fed, &proposed_host, eos_ids);
         cache.resolve(tok, accepted.len())?;
         Ok(accepted)
     }

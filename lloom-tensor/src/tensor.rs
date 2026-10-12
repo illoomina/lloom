@@ -2261,6 +2261,60 @@ impl Tensor {
         ))
     }
 
+    /// The multinomial draw by inverse CDF: one token per row of these
+    /// logits (`[.., vocab]`, any float dtype), row `r` the smallest index
+    /// whose cumulative probability under `softmax(z / temperature)` exceeds
+    /// `u[r]` times the row's total, `u` a `[rows]` tensor of uniforms in
+    /// `[0, 1)`. Returns the `[rows]` `U32` ids on this tensor's device.
+    ///
+    /// A token with no mass (a `-inf` logit) is never drawn. On Metal one
+    /// dispatch (`sample_inverse_cdf_f32`), nothing read back; elsewhere the
+    /// host arithmetic of [`inverse_cdf_row`] over the rows, the result put
+    /// back on this tensor's device. Each implementation is deterministic: a
+    /// row's draw is a function of its logits and its uniform.
+    pub fn sample_inverse_cdf(&self, temperature: f64, u: &Tensor) -> Result<Tensor> {
+        if temperature.is_nan() || temperature <= 0.0 {
+            bail!("sample_inverse_cdf: temperature must be > 0, got {temperature}");
+        }
+        let vocab = *self
+            .dims()
+            .last()
+            .ok_or_else(|| Error::Msg("sample_inverse_cdf: a scalar has no vocabulary".into()))?;
+        if vocab == 0 {
+            bail!("sample_inverse_cdf: an empty vocabulary");
+        }
+        let rows = self.elem_count() / vocab;
+        if u.elem_count() != rows {
+            bail!(
+                "sample_inverse_cdf: {rows} rows and {} uniforms",
+                u.elem_count()
+            );
+        }
+        let inv_t = (1.0 / temperature) as f32;
+        let logits = self.to_dtype(DType::F32)?.contiguous()?;
+        let u = u.to_dtype(DType::F32)?.contiguous()?;
+        #[cfg(feature = "metal")]
+        if let (Storage::Metal(z), Storage::Metal(uu)) = (&*logits.storage(), &*u.storage()) {
+            let z_off = logits.layout().start_offset() * DType::F32.size_in_bytes();
+            let u_off = u.layout().start_offset() * DType::F32.size_in_bytes();
+            let storage = z.sample_inverse_cdf(z_off, rows, vocab, inv_t, uu, u_off)?;
+            return Ok(from_storage(
+                Storage::Metal(storage),
+                (rows,),
+                BackpropOp::none(),
+                false,
+            ));
+        }
+        let host = logits.flatten_all()?.to_vec1::<f32>()?;
+        let uh = u.flatten_all()?.to_vec1::<f32>()?;
+        let ids: Vec<u32> = host
+            .chunks(vocab)
+            .zip(uh)
+            .map(|(row, u)| inverse_cdf_row(row, inv_t, u))
+            .collect();
+        Tensor::from_vec(ids, rows, self.device())
+    }
+
     /// Write `src` into this tensor's CPU-mapped Metal buffer at element `index`,
     /// host-side and zero-alloc — **no intermediate `Tensor`, no `slice_set`
     /// upload, no blit** (the write counterpart of [`Self::peek_scalar_ptr`]).
@@ -3471,4 +3525,29 @@ impl<S: Into<Shape>> From<(Storage, S)> for Tensor {
     fn from((storage, shape): (Storage, S)) -> Self {
         from_storage(storage, shape, BackpropOp::none(), false)
     }
+}
+
+/// The host form of [`Tensor::sample_inverse_cdf`] over one row of logits:
+/// the smallest index whose running mass `Σ exp((z - max) · inv_t)`, summed
+/// in index order in f64, exceeds `u` times the row's total; a walk that
+/// rounding keeps from crossing takes the row's last index with mass. A
+/// `-inf` logit has no mass and is never drawn.
+pub fn inverse_cdf_row(row: &[f32], inv_t: f32, u: f32) -> u32 {
+    let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mass = |z: f32| (((z - m) * inv_t) as f64).exp();
+    let total: f64 = row.iter().map(|&z| mass(z)).sum();
+    let target = u as f64 * total;
+    let mut acc = 0f64;
+    let mut last = 0u32;
+    for (i, &z) in row.iter().enumerate() {
+        let e = mass(z);
+        if e > 0.0 {
+            last = i as u32;
+        }
+        acc += e;
+        if acc > target {
+            return i as u32;
+        }
+    }
+    last
 }

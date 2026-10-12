@@ -78,3 +78,48 @@ pub fn call_random_normal(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// The multinomial draw by inverse CDF over `rows` rows of `vocab` f32
+/// logits at temperature `1 / inv_t`, one host-supplied uniform per row in
+/// `u`, the drawn index per row into `out` (`sample_inverse_cdf_f32`). One
+/// threadgroup per row; the width is the kernel's shared arrays' (1024) or
+/// the pipeline's maximum, a power of two either way.
+#[allow(clippy::too_many_arguments)]
+pub fn call_sample_inverse_cdf(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    logits: (&Buffer, usize),
+    rows: usize,
+    vocab: usize,
+    inv_t: f32,
+    u: (&Buffer, usize),
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Random, "sample_inverse_cdf_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "sample_inverse_cdf rows={rows} vocab={vocab}");
+    set_params!(encoder, (logits, vocab as u32, inv_t, u, Output::new(out)));
+    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
+    // The scan and the tree assume a power of two.
+    let width = if max.is_power_of_two() {
+        max
+    } else {
+        max.next_power_of_two() / 2
+    };
+    encoder.dispatch_thread_groups(
+        objc2_metal::MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        },
+        objc2_metal::MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}

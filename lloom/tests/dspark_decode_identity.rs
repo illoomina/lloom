@@ -1889,18 +1889,181 @@ fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile(
     Ok(())
 }
 
-/// **The sampled identity (#943 §2).** At `t > 0`, speculative decode is
-/// byte-identical to non-speculative decode at the same seed: the verify
-/// draws the target's token per window position with noise keyed to that
-/// position, so a rejected row consumes nothing the next position's draw
-/// depends on, and the K=1 loop keys its draws the same way.
+/// A drafter that proposes the reference stream with one token wrong per
+/// round, at an offset that cycles with the round: so rounds keep every
+/// length from one row to the whole window, and the rows a round keeps past
+/// the anchor are the ones whose per-row state (the processors' history, a
+/// budget's count) the window must have built right.
+struct HalfRightDrafter {
+    k: usize,
+    truth: Vec<u32>,
+    produced: usize,
+    round: usize,
+}
+
+impl Speculator for HalfRightDrafter {
+    type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
+
+    fn n_seq(&self) -> usize {
+        1
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        self.produced = 0;
+        self.round = 0;
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let wrong = self.round % (self.k + 1);
+        self.round += 1;
+        let block: Vec<u32> = (0..self.k)
+            .map(|i| {
+                let t = self.truth.get(self.produced + i).copied().unwrap_or(0);
+                if i == wrong {
+                    (t + 1) % 48
+                } else {
+                    t
+                }
+            })
+            .collect();
+        Ok(active.iter().map(|_| Draft::host(block.clone())).collect())
+    }
+
+    fn observe(
+        &mut self,
+        _seq: SeqId,
+        _probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.produced += accepted.len();
+        Ok(())
+    }
+}
+
+/// One request's sampler: an arm, processors, a thinking budget, a digest.
+#[derive(Clone, Debug)]
+struct Cell {
+    sampling: Sampling,
+    processors: lloom::generation::Processors,
+    budget: Option<lloom::generation::ThinkingBudget>,
+    digest: bool,
+}
+
+impl Cell {
+    fn arm(sampling: Sampling) -> Self {
+        Cell {
+            sampling,
+            processors: Default::default(),
+            budget: None,
+            digest: false,
+        }
+    }
+
+    fn sampler(&self, seed: u64) -> LogitsProcessor {
+        LogitsProcessor::from_sampling(seed, self.sampling.clone())
+            .with_processors(self.processors.clone())
+            .with_logits_digest(self.digest)
+    }
+}
+
+/// What a run returned: the ids, whether EOS ended it, and under a digest
+/// the digest and the rows it took.
+type RunOut = (Vec<u32>, bool, Option<(String, usize)>);
+
+/// The non-speculative run: the K=1 body on the blocking arm, its budget
+/// the arm's, every draw keyed to its position.
+fn k1_run(
+    model: &Model<RewindableExact>,
+    cfg: &Config,
+    dev: &Device,
+    cell: &Cell,
+    seed: u64,
+    prompt: &[u32],
+    max_tokens: usize,
+) -> Result<RunOut> {
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    let cache = State::<RewindableExact>::new(true, DType::F32, cfg, dev)?;
+    let mut session = Session::new(model, cache);
+    let mut rb = Blocking::new(&eos_ids, dev)?;
+    use lloom::generation::ReadbackStrategy;
+    rb.set_thinking_budget(cell.budget.as_ref())?;
+    let mut sampler = cell.sampler(seed);
+    sampler.observe_prompt(prompt);
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        &DecodeOptions::new(max_tokens),
+        &mut |_: &[u32]| Ok(()),
+    )?;
+    let digest = sampler.logits_digest().map(|d| (d, sampler.digest_rows()));
+    Ok((out.ids, out.eos, digest))
+}
+
+/// The speculative run of the same request, with `spec` drafting; returns
+/// the run and its number of rounds.
+#[allow(clippy::too_many_arguments)]
+fn spec_run<S: Speculator<Probe = LayerTaps<5>>>(
+    model: &Model<RewindableExact>,
+    cfg: &Config,
+    dev: &Device,
+    cell: &Cell,
+    seed: u64,
+    prompt: &[u32],
+    max_tokens: usize,
+    spec: &mut S,
+) -> Result<(RunOut, usize)> {
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    let cache = State::<RewindableExact>::new(true, DType::F32, cfg, dev)?;
+    let mut session = Session::new(model, cache);
+    let mut rb = Blocking::new(&eos_ids, dev)?;
+    let mut sampler = cell.sampler(seed).with_window_budget(cell.budget.as_ref());
+    sampler.observe_prompt(prompt);
+    let mut streamed = Vec::new();
+    let out = session.decode_speculative(
+        lloom::profile::RewindProof::of(),
+        spec,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        &DecodeOptions::new(max_tokens),
+        &eos_ids,
+        &mut |b: &[u32]| {
+            streamed.extend_from_slice(b);
+            Ok(())
+        },
+    )?;
+    assert_eq!(out.ids, streamed, "the stream must equal the returned ids");
+    let digest = sampler.logits_digest().map(|d| (d, sampler.digest_rows()));
+    Ok(((out.ids, out.eos, digest), out.stats.rounds.len()))
+}
+
+/// **The sampled identity (#943).** Speculative decode is byte-identical to
+/// non-speculative decode at the same seed, for every sampler arm and every
+/// feature the K=1 loop carries: the verify draws the target's token per
+/// window position keyed to that position, row `i` against the history it
+/// has in a step-by-step decode, and feeds what the K=1 loop would feed.
 ///
-/// The garbage drafter is the hardest case for it: every round proposes
-/// wrong tokens, so every round draws `k` rows it then throws away — the
-/// draws a draw-count-keyed stream would be shifted by. N seeds, both
-/// gumbel-max arms (plain temperature and `--gumbel`), and the non-vacuity
-/// arm beside it: the sampled stream must differ from greedy's, or a verify
-/// that ignored the temperature would pass.
+/// - The arms: multinomial (`-t`, the default method), gumbel-max, top-k,
+///   top-p and top-k-then-top-p (the filter, then the inverse CDF).
+/// - The features: the processors (each row's history the output plus the
+///   drafts before it), a thinking budget (each row's fed token the
+///   budget's rule over the rows before it), the logits digest (over the
+///   rows the rounds keep).
+/// - Two drafters: garbage (every round keeps one row and throws `k` away —
+///   the rows a draw-count stream would be shifted by) and half-right
+///   (rounds keep every length, so kept rows past the anchor exercise each
+///   row's own state).
+///
+/// N seeds per cell; every cell must agree, and enough must be informative
+/// (more than one round, a non-greedy stream).
 #[test]
 fn sampled_speculative_decode_is_byte_identical_to_sampled_decode_at_one_seed() -> Result<()> {
     let dev = Device::Cpu;
@@ -1909,174 +2072,371 @@ fn sampled_speculative_decode_is_byte_identical_to_sampled_decode_at_one_seed() 
     let model = build(&cfg, &dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let max_tokens = 40usize;
-    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
 
-    let greedy = {
-        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
-        let mut session = Session::new(&model, cache);
-        let mut rb = Blocking::new(&eos_ids, &dev)?;
-        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-        session
-            .decode(
-                &mut IdentityProposer,
-                &mut rb,
-                &mut sampler,
-                &prompt,
-                &DecodeOptions::new(max_tokens),
-                &mut |_: &[u32]| Ok(()),
-            )?
-            .ids
+    let greedy = k1_run(
+        &model,
+        &cfg,
+        &dev,
+        &Cell::arm(Sampling::ArgMax),
+        0,
+        &prompt,
+        max_tokens,
+    )?
+    .0;
+    let procs = lloom::generation::Processors {
+        repetition_penalty: 1.3,
+        presence_penalty: 0.3,
+        frequency_penalty: 0.4,
+        min_p: 0.05,
+        logit_bias: vec![(9, 1.0)],
     };
-
-    let mut cells = 0usize;
+    // A budget the runs reach: six tokens of thinking, then a transition
+    // and the closing id forced (one of the tiny vocabulary's ids; a run
+    // that emits it first closes the block itself).
+    let budget = lloom::generation::ThinkingBudget::new(6, vec![11], vec![17, 11])?;
+    let cells = vec![
+        Cell::arm(Sampling::All { temperature: 1.2 }),
+        Cell::arm(Sampling::GumbelSoftmax { temperature: 0.9 }),
+        Cell::arm(Sampling::TopK {
+            k: 8,
+            temperature: 1.1,
+        }),
+        Cell::arm(Sampling::TopP {
+            p: 0.85,
+            temperature: 1.0,
+        }),
+        Cell::arm(Sampling::TopKThenTopP {
+            k: 12,
+            p: 0.9,
+            temperature: 1.0,
+        }),
+        Cell {
+            processors: procs.clone(),
+            ..Cell::arm(Sampling::All { temperature: 1.0 })
+        },
+        Cell {
+            processors: procs.clone(),
+            ..Cell::arm(Sampling::ArgMax)
+        },
+        Cell {
+            budget: Some(budget.clone()),
+            ..Cell::arm(Sampling::All { temperature: 1.0 })
+        },
+        Cell {
+            budget: Some(budget.clone()),
+            ..Cell::arm(Sampling::ArgMax)
+        },
+        Cell {
+            digest: true,
+            ..Cell::arm(Sampling::GumbelSoftmax { temperature: 1.0 })
+        },
+        Cell {
+            processors: procs.clone(),
+            budget: Some(budget.clone()),
+            digest: true,
+            ..Cell::arm(Sampling::TopK {
+                k: 10,
+                temperature: 0.9,
+            })
+        },
+    ];
+    let mut compared = 0usize;
     let mut informative = 0usize;
-    // `GumbelSoftmax` is the arm one mechanism serves on both paths: the
-    // identity. `All { temperature }` is the pre-existing asymmetry
-    // (`generation_tests::the_all_arm_draws_by_a_different_mechanism_on_each_path`):
-    // the Blocking arm's `sample` draws it through a host multinomial while
-    // the verify (as the Ring arm) draws gumbel-max, so against the blocking
-    // K=1 arm the two streams DIFFER by mechanism and this test pins that
-    // divergence at the driver level rather than asserting an identity the
-    // tree does not have. Against the Ring arm (Metal) they would agree.
-    for (sampling, expect_identity) in [
-        (Sampling::GumbelSoftmax { temperature: 0.9 }, true),
-        (Sampling::All { temperature: 1.2 }, false),
-    ] {
+    let mut kept_past_anchor = 0usize;
+    for cell in &cells {
+        let mut moved_from_greedy = false;
         for seed in [0u64, 7, 42, 1234] {
-            let non_spec = {
-                let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
-                let mut session = Session::new(&model, cache);
-                let mut rb = Blocking::new(&eos_ids, &dev)?;
-                let mut sampler = LogitsProcessor::from_sampling(seed, sampling.clone());
-                let out = session.decode(
-                    &mut IdentityProposer,
-                    &mut rb,
-                    &mut sampler,
-                    &prompt,
-                    &DecodeOptions::new(max_tokens),
-                    &mut |_: &[u32]| Ok(()),
-                )?;
-                (out.ids, out.eos)
+            let reference = k1_run(&model, &cfg, &dev, cell, seed, &prompt, max_tokens)?;
+            let mut garbage = GarbageDrafter { k, token: 0 };
+            let (g, g_rounds) = spec_run(
+                &model,
+                &cfg,
+                &dev,
+                cell,
+                seed,
+                &prompt,
+                max_tokens,
+                &mut garbage,
+            )?;
+            let mut half = HalfRightDrafter {
+                k,
+                truth: reference.0.clone(),
+                produced: 0,
+                round: 0,
             };
-            let spec = {
-                let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
-                let mut session = Session::new(&model, cache);
-                let mut drafter = GarbageDrafter { k, token: 0 };
-                let mut rb = Blocking::new(&eos_ids, &dev)?;
-                let mut sampler = LogitsProcessor::from_sampling(seed, sampling.clone());
-                let mut streamed = Vec::new();
-                let out = session.decode_speculative(
-                    lloom::profile::RewindProof::of(),
-                    &mut drafter,
-                    &mut rb,
-                    &mut sampler,
-                    &prompt,
-                    &DecodeOptions::new(max_tokens),
-                    &eos_ids,
-                    &mut |b: &[u32]| {
-                        streamed.extend_from_slice(b);
-                        Ok(())
-                    },
-                )?;
-                assert_eq!(out.ids, streamed, "the stream must equal the returned ids");
-                // A run the model ends on EOS inside its first round shows
-                // nothing about rejected rows; such a cell still must agree,
-                // and enough cells must run past one round (below).
-                (out.ids, out.eos, out.stats.rounds.len())
-            };
-            let (spec, rounds) = ((spec.0, spec.1), spec.2);
-            // The cell is informative when the run spans more than one
-            // round, is longer than a block, and is not greedy's stream
-            // (a draw the temperature never reached would agree trivially);
-            // seed 1234 at t = 0.9 draws EOS first and is an empty reply on
-            // both arms. Every cell must agree; enough must be informative.
-            if rounds > 1 && non_spec.0.len() > k && non_spec.0 != greedy {
-                informative += 1;
-            }
-            if expect_identity {
+            let (h, h_rounds) = spec_run(
+                &model, &cfg, &dev, cell, seed, &prompt, max_tokens, &mut half,
+            )?;
+            for (name, got, rounds) in [("garbage", &g, g_rounds), ("half-right", &h, h_rounds)] {
                 assert_eq!(
-                    non_spec, spec,
-                    "{sampling:?} seed {seed}: sampled speculative decode must be byte-identical \
-                     to sampled non-speculative decode at one seed (#943 §2) — a divergence here \
-                     means a rejected row's draw moved a later position's noise"
+                    (&reference.0, reference.1),
+                    (&got.0, got.1),
+                    "{cell:?} seed {seed} ({name} drafter): the speculative run is not the K=1 \
+                     run at one seed"
                 );
-            } else if non_spec.0.len() > k && spec.0.len() > k {
-                assert_ne!(
-                    non_spec, spec,
-                    "{sampling:?} seed {seed}: the blocking K=1 arm's `All` (a host \
-                     multinomial) now equals the verify's gumbel-max draw; if the two \
-                     mechanisms were reconciled deliberately, move this arm to the identity \
-                     set and say so"
+                // The digest hashes the same positions — one row a token,
+                // the EOS step's included. Its bytes are each pass's own: a
+                // verify window's rows come from an `m = k + 1` pass, the
+                // K=1 steps' from `m = 1`, and `deterministic` promises
+                // nothing across a pass split (`profiles-and-memory-design.md`
+                // §3), the CPU's gemm summing in a row-count-dependent order.
+                assert_eq!(
+                    reference.2.as_ref().map(|d| d.1),
+                    got.2.as_ref().map(|d| d.1),
+                    "{cell:?} seed {seed} ({name}): the digest took different rows"
                 );
+                if let Some((_, rows)) = &got.2 {
+                    assert_eq!(
+                        *rows,
+                        got.0.len() + usize::from(got.1),
+                        "{cell:?} seed {seed} ({name}): one digest row a token, EOS included"
+                    );
+                }
+                compared += 1;
+                if rounds > 1 && reference.0.len() > k && reference.0 != greedy {
+                    informative += 1;
+                }
             }
-            cells += 1;
+            // Rounds that kept rows past the anchor: fewer rounds than
+            // tokens.
+            if h_rounds + 1 < h.0.len() {
+                kept_past_anchor += 1;
+            }
+            if cell.digest {
+                assert!(reference.2.is_some(), "{cell:?}: no digest");
+            }
+            moved_from_greedy |= reference.0 != greedy;
         }
+        assert!(
+            moved_from_greedy,
+            "{cell:?}: every seed decoded greedy's stream; the cell exercises nothing"
+        );
     }
-    assert_eq!(cells, 8);
+    eprintln!(
+        "[{compared} runs compared, {informative} informative, {kept_past_anchor} half-right \
+         runs kept rows past the anchor]"
+    );
     assert!(
-        informative >= 5,
-        "only {informative} of 8 cells ran past one round with a non-greedy stream; a \
-         rejected row's effect needs a second round to show"
+        informative >= compared / 2,
+        "only {informative} of {compared} runs ran past one round with a non-greedy stream"
+    );
+    assert!(
+        kept_past_anchor >= cells.len() * 2,
+        "the half-right drafter kept rows past the anchor in only {kept_past_anchor} runs"
     );
     Ok(())
 }
 
-/// The arms the sampled verify cannot serve are refused by name before any
-/// state is touched — the host-sort samplers and active processors — rather
-/// than served as argmax under a sampled label (§7.1a-i).
+/// The window's features move a run: a budget forces its tail, processors
+/// change the draws, a digest differs by seed — so the identity above is
+/// between runs the features act on, not between two runs that ignore them.
 #[test]
-fn decode_speculative_refuses_what_it_cannot_sample_by_name() -> Result<()> {
+fn the_features_under_speculation_move_what_they_should() -> Result<()> {
     let dev = Device::Cpu;
-    let k = 3usize;
+    let k = 4usize;
     let cfg = tiny_config(k);
     let model = build(&cfg, &dev)?;
-    let prompt: Vec<u32> = vec![1, 2, 3];
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let all = Cell::arm(Sampling::All { temperature: 1.0 });
+    let budget = lloom::generation::ThinkingBudget::new(6, vec![11], vec![17, 11])?;
+    let with_budget = Cell {
+        budget: Some(budget.clone()),
+        ..all.clone()
+    };
+    let mut garbage = GarbageDrafter { k, token: 0 };
+    let ((plain, _, _), _) = spec_run(&model, &cfg, &dev, &all, 7, &prompt, 30, &mut garbage)?;
+    let ((forced, _, _), _) = spec_run(
+        &model,
+        &cfg,
+        &dev,
+        &with_budget,
+        7,
+        &prompt,
+        30,
+        &mut garbage,
+    )?;
+    let report = budget.report(&forced);
+    assert!(
+        report.fired || report.closed_by.is_some(),
+        "the budget neither fired nor saw its block close: {forced:?}"
+    );
+    if report.fired {
+        assert_eq!(
+            &forced[6..8],
+            &[17, 11],
+            "the forced tail at the budget: {forced:?}"
+        );
+    }
+    assert_ne!(plain, forced, "the budget moved nothing");
+    let digest = Cell {
+        digest: true,
+        ..all.clone()
+    };
+    let ((_, _, d7), _) = spec_run(&model, &cfg, &dev, &digest, 7, &prompt, 30, &mut garbage)?;
+    let ((_, _, d7b), _) = spec_run(&model, &cfg, &dev, &digest, 7, &prompt, 30, &mut garbage)?;
+    let ((_, _, d8), _) = spec_run(&model, &cfg, &dev, &digest, 8, &prompt, 30, &mut garbage)?;
+    assert!(
+        d7.is_some() && d7 != d8,
+        "the digest did not follow the run: {d7:?} {d8:?}"
+    );
+    assert_eq!(d7, d7b, "the digest of one run differs run to run");
+    Ok(())
+}
+
+/// Proposes the reference stream with a confidence per position that falls
+/// below one half at the third: under `speculative.p_min = 0.5` the driver
+/// cuts every draft to two tokens before the verify.
+struct ConfidentDrafter {
+    k: usize,
+    truth: Vec<u32>,
+    produced: usize,
+    widest: usize,
+}
+
+impl Speculator for ConfidentDrafter {
+    type Probe = LayerTaps<5>;
+    type Family = lloom::nn::speculator::DSpark;
+    fn n_seq(&self) -> usize {
+        1
+    }
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        self.produced = 0;
+        Ok(())
+    }
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let tokens: Vec<u32> = (0..self.k)
+            .map(|i| self.truth.get(self.produced + i).copied().unwrap_or(0))
+            .collect();
+        let confidence: Vec<f32> = (0..self.k).map(|i| if i < 2 { 0.9 } else { 0.2 }).collect();
+        Ok(active
+            .iter()
+            .map(|_| Draft {
+                tokens: DraftTokens::Host(tokens.clone()),
+                confidence: confidence.clone(),
+            })
+            .collect())
+    }
+    fn observe(
+        &mut self,
+        _seq: SeqId,
+        _probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.produced += accepted.len();
+        self.widest = self.widest.max(accepted.len());
+        Ok(())
+    }
+}
+
+/// `speculative.p_min` reaches the window body: drafts are cut at the first
+/// position the drafter is less confident of, so no round keeps more than
+/// the confident prefix and the target's own token — and the stream is the
+/// K=1 run's, at a temperature, as without the cut.
+#[test]
+fn p_min_cuts_the_draft_and_keeps_the_stream() -> Result<()> {
+    let mut t = lloom::tuning::Tuning::default();
+    t.dspark.p_min = 0.5;
+    let _ = lloom::tuning::install(t);
+    assert_eq!(lloom::tuning::tuning().dspark.p_min, 0.5);
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    for cell in [
+        Cell::arm(Sampling::ArgMax),
+        Cell::arm(Sampling::All { temperature: 1.0 }),
+    ] {
+        let reference = k1_run(&model, &cfg, &dev, &cell, 3, &prompt, 30)?;
+        let mut d = ConfidentDrafter {
+            k,
+            truth: reference.0.clone(),
+            produced: 0,
+            widest: 0,
+        };
+        let ((ids, eos, _), rounds) = spec_run(&model, &cfg, &dev, &cell, 3, &prompt, 30, &mut d)?;
+        assert_eq!((&ids, eos), (&reference.0, reference.1), "{cell:?}");
+        assert_eq!(
+            d.widest, 3,
+            "{cell:?}: a round kept {} tokens; the cut keeps two drafts and the target's own",
+            d.widest
+        );
+        assert!(rounds > 4, "{cell:?}: {rounds} rounds");
+    }
+    Ok(())
+}
+
+/// **A prompt the cache holds whole, under speculation.** The K=1 body
+/// resumes from the logits the prefill held (`ReuseAction::Resume`); the
+/// speculative body cannot (its first round needs the target's probe at the
+/// last position) and re-feeds the last token instead
+/// (`Session::prepare_with(.., false)`: one position back through a turn
+/// checkpoint, else a fresh prefill). Both decode the same tokens — greedy
+/// and at a temperature, where the anchor's draw is keyed to the same
+/// position either way.
+#[test]
+fn a_fully_cached_prompt_decodes_under_speculation_as_its_k1_resume() -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
     let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
-    let run = |sampler: &mut LogitsProcessor| -> Result<()> {
-        let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
-        let mut session = Session::new(&model, cache);
-        let mut drafter = GarbageDrafter { k, token: 0 };
-        let mut rb = Blocking::new(&eos_ids, &dev)?;
-        session
-            .decode_speculative(
+    let opts = DecodeOptions::new(30);
+    for cell in [
+        Cell::arm(Sampling::ArgMax),
+        Cell::arm(Sampling::All { temperature: 1.0 }),
+    ] {
+        let k1 = {
+            let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+            let mut session = Session::new(&model, cache);
+            let mut rb = Blocking::new(&eos_ids, &dev)?;
+            session.prefill(&mut rb, &prompt, &opts)?;
+            let prepared = session.prepare(&prompt)?;
+            assert_eq!(prepared.action, ReuseAction::Resume);
+            let mut sampler = cell.sampler(5);
+            sampler.observe_prompt(&prompt);
+            session
+                .decode(
+                    &mut IdentityProposer,
+                    &mut rb,
+                    &mut sampler,
+                    &prepared.suffix,
+                    &opts,
+                    &mut |_: &[u32]| Ok(()),
+                )?
+                .ids
+        };
+        let (spec, action) = {
+            let cache = State::<RewindableExact>::new(true, DType::F32, &cfg, &dev)?;
+            let mut session = Session::new(&model, cache);
+            let mut rb = Blocking::new(&eos_ids, &dev)?;
+            session.prefill(&mut rb, &prompt, &opts)?;
+            let prepared = session.prepare_with(&prompt, false)?;
+            assert_ne!(prepared.action, ReuseAction::Resume);
+            assert!(!prepared.suffix.is_empty(), "nothing re-fed");
+            let mut garbage = GarbageDrafter { k, token: 0 };
+            let mut sampler = cell.sampler(5);
+            sampler.observe_prompt(&prompt);
+            let out = session.decode_speculative(
                 lloom::profile::RewindProof::of(),
-                &mut drafter,
+                &mut garbage,
                 &mut rb,
-                sampler,
-                &prompt,
-                &DecodeOptions::new(8),
+                &mut sampler,
+                &prepared.suffix,
+                &opts,
                 &eos_ids,
                 &mut |_: &[u32]| Ok(()),
-            )
-            .map(|_| ())
-    };
-    for sampling in [
-        Sampling::TopP {
-            p: 0.9,
-            temperature: 0.8,
-        },
-        Sampling::TopK {
-            k: 4,
-            temperature: 0.8,
-        },
-        Sampling::TopKThenTopP {
-            k: 4,
-            p: 0.9,
-            temperature: 0.8,
-        },
-    ] {
-        let err = run(&mut LogitsProcessor::from_sampling(1, sampling.clone()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("host sort"), "{sampling:?}: {err}");
+            )?;
+            (out.ids, prepared.action)
+        };
+        eprintln!("{cell:?}: the speculative body re-fed through {action:?}");
+        assert_eq!(spec, k1, "{cell:?}: not the K=1 resume's tokens");
+        assert!(k1.len() > k, "{cell:?}: too short a run to show anything");
     }
-    let procs = lloom::generation::Processors {
-        repetition_penalty: 1.2,
-        ..Default::default()
-    };
-    let mut p = LogitsProcessor::from_sampling(1, Sampling::GumbelSoftmax { temperature: 0.8 })
-        .with_processors(procs);
-    let err = run(&mut p).unwrap_err().to_string();
-    assert!(err.contains("history"), "processors: {err}");
     Ok(())
 }

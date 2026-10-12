@@ -279,6 +279,14 @@ pub struct DsparkTuning {
         status = "reference"
     )]
     pub eager_attn: bool,
+    /// The draft stops at the first position whose confidence is below this (llama.cpp's `--spec-draft-p-min`); 0 is off. Read from a drafter's confidence head where it has one (LFM2's DSpark); a drafter with none drafts its whole block.
+    #[opt(
+        flag = "spec-p-min",
+        env = "LLOOM_SPEC_P_MIN",
+        path = "speculative.p_min",
+        status = "arm"
+    )]
+    pub p_min: f64,
 }
 
 impl Default for DsparkTuning {
@@ -286,6 +294,7 @@ impl Default for DsparkTuning {
         DsparkTuning {
             ctx_kv: "auto".into(),
             eager_attn: false,
+            p_min: 0.0,
         }
     }
 }

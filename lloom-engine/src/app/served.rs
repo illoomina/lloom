@@ -82,8 +82,10 @@ pub trait Served: Send + Sync {
         None
     }
     /// Why this process's decode path cannot feed a thinking budget's
-    /// forced tokens (`budgets::BATCHED`, `budgets::SPECULATIVE`); `None`
-    /// on the K=1 body, which carries it on every readback arm.
+    /// forced tokens (`budgets::BATCHED`); `None` on the K=1 body, which
+    /// carries it on every readback arm, and on the speculative body, whose
+    /// verify feeds each window row the budget's rule over the rows before
+    /// it.
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         None
     }

@@ -56,6 +56,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// the campaign must not execute bytes it failed to record.
 pub const MAX_INPUT: usize = 64 * 1024;
 
+/// Requested recorder payload/metadata-array quota; not process RSS. Explicit
+/// larger limits retain large-history support without weakening replay checks.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordLimits {
+    pub max_ring_bytes: usize,
+}
+impl Default for RecordLimits {
+    fn default() -> Self {
+        Self {
+            max_ring_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// Logical replay work/metadata quotas, not a process RSS or allocator quota.
 /// Larger old records remain supported through explicit larger limits. These
 /// limits never bypass identity, completion, per-input size or digest checks.
@@ -122,29 +136,79 @@ impl Record {
         n: usize,
         identity: Vec<u8>,
     ) -> std::io::Result<Record> {
+        Self::install_with_identity_and_limits(dir, n, identity, RecordLimits::default())
+    }
+
+    /// Install with an explicit requested ring-layout budget. Increasing it
+    /// recovers larger histories; identity/path/capacity checks still apply.
+    /// Legacy `install` remains first-wins and infallible. Path/identity and
+    /// dump allocations, concurrent setup peak and process RSS are not bounded.
+    pub fn install_with_identity_and_limits(
+        dir: &Path,
+        n: usize,
+        identity: Vec<u8>,
+        limits: RecordLimits,
+    ) -> std::io::Result<Record> {
         if identity.is_empty() || identity.len() > archive::MAX_IDENTITY {
             return Err(std::io::Error::other(
                 "record identity is empty or exceeds its bound",
             ));
         }
-        std::fs::create_dir_all(dir)?;
         let n = n.max(1);
-        let ring = RING.get_or_init(|| Ring {
-            inputs: InputRing::new(n, MAX_INPUT),
+        let requested = InputRing::requested_bytes(n, MAX_INPUT).map_err(std::io::Error::other)?;
+        if requested > limits.max_ring_bytes {
+            return Err(std::io::Error::other(inputs::SetupError::Budget {
+                requested,
+                limit: limits.max_ring_bytes,
+            }));
+        }
+        let matches = |ring: &Ring, identity: &[u8]| {
+            ring.identity.as_deref() == Some(identity)
+                && ring.dir == dir
+                && ring.inputs.capacity() == n
+        };
+        let mismatch = || {
+            std::io::Error::other(
+                "persistent recorder already installed with different identity/path/capacity",
+            )
+        };
+        if let Some(ring) = RING.get() {
+            return if matches(ring, &identity) {
+                Ok(Record)
+            } else {
+                Err(mismatch())
+            };
+        }
+        // Fallible ring birth and full quota refusal precede directory effects.
+        // Setup is cold; no lock/allocator change in push/snapshot hot paths.
+        let inputs = InputRing::try_new(n, MAX_INPUT, limits.max_ring_bytes)
+            .map_err(std::io::Error::other)?;
+        fs::create_dir_all(dir)?;
+        let candidate = Ring {
+            inputs,
             dir: dir.to_path_buf(),
             dumps: AtomicUsize::new(0),
             dumping: AtomicBool::new(false),
-            identity: Some(identity.clone()),
-        });
-        if ring.identity.as_deref() != Some(identity.as_slice())
-            || ring.dir != dir
-            || ring.inputs.capacity() != n
-        {
-            return Err(std::io::Error::other(
-                "persistent recorder already installed with different identity/path/capacity",
-            ));
+            identity: Some(identity),
+        };
+        match RING.set(candidate) {
+            Ok(()) => Ok(Record),
+            Err(candidate) => {
+                // A concurrent installer won. Never replace it or retry births.
+                // Candidate owns all partial allocations and drops on this path.
+                let winner = RING
+                    .get()
+                    .expect("OnceLock set lost to initialized recorder");
+                if matches(
+                    winner,
+                    candidate.identity.as_deref().expect("identified candidate"),
+                ) {
+                    Ok(Record)
+                } else {
+                    Err(mismatch())
+                }
+            }
         }
-        Ok(Record)
     }
 
     /// How many slots the ring holds.

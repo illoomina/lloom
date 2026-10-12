@@ -31,6 +31,121 @@ impl std::fmt::Display for RecordError {
 }
 impl std::error::Error for RecordError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SetupError {
+    InvalidCapacity,
+    Overflow,
+    Budget { requested: usize, limit: usize },
+    HostAllocation,
+    SlotSize,
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCapacity => f.write_str("record capacity must be nonzero"),
+            Self::Overflow => f.write_str("record ring allocation layout overflow"),
+            Self::Budget { requested, limit } => write!(
+                f,
+                "record ring allocation budget exceeded: requested {requested}, limit {limit}"
+            ),
+            Self::HostAllocation => f.write_str("record ring host allocation refused"),
+            Self::SlotSize => f.write_str("record slot allocator returned wrong size"),
+        }
+    }
+}
+impl std::error::Error for SetupError {}
+
+fn zeroed_slot(size: usize) -> Result<Box<[u8]>, SetupError> {
+    if size == 0 {
+        return Ok(Box::default());
+    }
+    let layout = std::alloc::Layout::array::<u8>(size).map_err(|_| SetupError::Overflow)?;
+    // SAFETY: positive validated layout, Global allocation, fully initialized
+    // bytes. A null result is a fallible refusal, never Box::from_raw(null).
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err(SetupError::HostAllocation);
+    }
+    // SAFETY: exact requested slice layout and allocator; Box owns this unique
+    // allocation and deallocates with that same layout. No shrink/reallocation.
+    Ok(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, size)) })
+}
+
+impl InputRing {
+    /// Requested payload and two metadata-array layouts only; not allocator
+    /// rounding, RSS, concurrent setup, path/identity storage or dump workspace.
+    pub(super) fn requested_bytes(capacity: usize, maximum: usize) -> Result<usize, SetupError> {
+        if capacity == 0 {
+            return Err(SetupError::InvalidCapacity);
+        }
+        let slots = std::alloc::Layout::array::<Box<[u8]>>(capacity)
+            .map_err(|_| SetupError::Overflow)?
+            .size();
+        let lengths = std::alloc::Layout::array::<usize>(capacity)
+            .map_err(|_| SetupError::Overflow)?
+            .size();
+        let payload = std::alloc::Layout::array::<u8>(maximum)
+            .map_err(|_| SetupError::Overflow)?
+            .size();
+        capacity
+            .checked_mul(payload)
+            .and_then(|n| n.checked_add(slots))
+            .and_then(|n| n.checked_add(lengths))
+            .ok_or(SetupError::Overflow)
+    }
+
+    pub(super) fn try_new(
+        capacity: usize,
+        maximum: usize,
+        budget: usize,
+    ) -> Result<Self, SetupError> {
+        Self::try_new_with(capacity, maximum, budget, zeroed_slot)
+    }
+
+    fn try_new_with(
+        capacity: usize,
+        maximum: usize,
+        budget: usize,
+        mut allocate: impl FnMut(usize) -> Result<Box<[u8]>, SetupError>,
+    ) -> Result<Self, SetupError> {
+        let requested = Self::requested_bytes(capacity, maximum)?;
+        if requested > budget {
+            return Err(SetupError::Budget {
+                requested,
+                limit: budget,
+            });
+        }
+        // Full quote/refusal precedes any metadata or slot allocation. Both
+        // Vecs reserve once fallibly; resize/push cannot grow inside this loop.
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| SetupError::HostAllocation)?;
+        let mut lengths = Vec::new();
+        lengths
+            .try_reserve_exact(capacity)
+            .map_err(|_| SetupError::HostAllocation)?;
+        lengths.resize(capacity, 0);
+        for _ in 0..capacity {
+            let slot = allocate(maximum)?;
+            if slot.len() != maximum {
+                return Err(SetupError::SlotSize);
+            }
+            slots.push(slot);
+        }
+        Ok(Self {
+            busy: AtomicBool::new(false),
+            entries: UnsafeCell::new(Entries {
+                slots,
+                lengths,
+                total: 0,
+            }),
+            capacity,
+            maximum,
+        })
+    }
+}
+
 struct Entries {
     slots: Vec<Box<[u8]>>,
     lengths: Vec<usize>,
@@ -195,5 +310,77 @@ mod tests {
         }));
         assert!(result.is_err());
         ring.push(b"ok").unwrap();
+    }
+    #[test]
+    fn setup_budget_refuses_before_slot_birth_and_explicit_budget_recovers() {
+        let needed = InputRing::requested_bytes(2, 4).unwrap();
+        let mut births = 0;
+        let result = InputRing::try_new_with(2, 4, needed - 1, |_| {
+            births += 1;
+            zeroed_slot(4)
+        });
+        assert!(
+            matches!(result, Err(SetupError::Budget { requested, limit })
+            if requested == needed && limit == needed - 1)
+        );
+        assert_eq!(births, 0, "quota refusal must precede slot creation");
+        let ring = InputRing::try_new(2, 4, needed).unwrap();
+        for bytes in [b"old".as_slice(), b"", b"last"] {
+            ring.push(bytes).unwrap();
+        }
+        assert_eq!(
+            ring.snapshot().unwrap().inputs().collect::<Vec<_>>(),
+            vec![b"".as_slice(), b"last"]
+        );
+    }
+
+    #[test]
+    fn setup_layout_overflow_and_zero_capacity_precede_allocator() {
+        for (capacity, maximum, expected) in [
+            (usize::MAX, 1, SetupError::Overflow),
+            (1, usize::MAX, SetupError::Overflow),
+            (0, 1, SetupError::InvalidCapacity),
+        ] {
+            let mut births = 0;
+            let result = InputRing::try_new_with(capacity, maximum, usize::MAX, |_| {
+                births += 1;
+                zeroed_slot(1)
+            });
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(births, 0);
+        }
+    }
+
+    #[test]
+    fn setup_partial_slot_refusal_is_fallible_and_retry_preserves_ring() {
+        let needed = InputRing::requested_bytes(3, 2).unwrap();
+        let mut births = 0;
+        let result = InputRing::try_new_with(3, 2, needed, |size| {
+            births += 1;
+            if births == 2 {
+                Err(SetupError::HostAllocation)
+            } else {
+                zeroed_slot(size)
+            }
+        });
+        assert!(matches!(result, Err(SetupError::HostAllocation)));
+        assert_eq!(births, 2);
+        let ring = InputRing::try_new(3, 2, needed).unwrap();
+        ring.push(b"ok").unwrap();
+        assert_eq!(
+            ring.snapshot().unwrap().inputs().next(),
+            Some(b"ok".as_slice())
+        );
+    }
+
+    #[test]
+    fn setup_zero_length_payload_keeps_empty_input_support() {
+        let needed = InputRing::requested_bytes(2, 0).unwrap();
+        let ring = InputRing::try_new(2, 0, needed).unwrap();
+        ring.push(b"").unwrap();
+        assert_eq!(
+            ring.snapshot().unwrap().inputs().next(),
+            Some(b"".as_slice())
+        );
     }
 }

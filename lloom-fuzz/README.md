@@ -177,3 +177,20 @@ require `--replay`. Programmatic callers use `ReplayLimits` with
 override bypass completion, per-input size or v3 content integrity. Allocation
 overheads are bounded by counts but not included in metadata-byte accounting;
 filesystem latency and concurrent file replacement are not bounded by these quotas.
+
+### Recorder setup allocation budget
+
+The campaign installs the existing recorder ring fallibly, with a default
+64 MiB **requested ring-layout** quota (`--record-max-bytes`). This includes
+`N * MAX_INPUT` slot payload bytes and the slot/length metadata-array layouts.
+Checked layouts and the entire quote are validated before any ring allocation;
+metadata uses fallible reservation, and each zeroed slot returns a refusal on
+allocation failure. `--record-max-bytes <larger>` retains larger history support.
+Push/snapshot ordering and their nonblocking atomic permit are unchanged.
+
+This is not a process RSS cap: allocator rounding, concurrent setup attempts,
+identity/path storage and allocating dump I/O are excluded. Legacy `Record::install`
+remains infallible/first-wins; programmatic identified callers can use
+`Record::install_with_identity_and_limits` for explicit recovery. Default identified
+installation uses the same quota. Async-signal-safe dump I/O and complete schedule
+fuzzing remain unresolved; this repair does not diagnose or fix the GPU stall.

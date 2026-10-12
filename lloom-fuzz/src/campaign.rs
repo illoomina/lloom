@@ -70,7 +70,7 @@ use libafl_bolts::{
 };
 use libafl_targets::{std_edges_map_observer, EDGES_MAP_DEFAULT_SIZE, MAX_EDGES_FOUND};
 
-use crate::record::{replay_with_identity_and_limits, Record, ReplayLimits};
+use crate::record::{replay_with_identity_and_limits, Record, RecordLimits, ReplayLimits};
 
 /// Points in the shape map. Sized for the probes' `(site, condition,
 /// outcome)` triples and the census labels with room to spare; a
@@ -173,6 +173,10 @@ pub struct Cli {
     /// How many of the last executed inputs the persistent record keeps.
     #[arg(long, default_value_t = 64)]
     pub record: usize,
+    /// Requested recorder ring-layout budget (default 64 MiB, not process RSS).
+    /// Raise explicitly to retain a larger history; replay checks remain enabled.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub record_max_bytes: usize,
     /// Where records are written on a crash / oracle failure.
     #[arg(long, default_value = "fuzz-out/records")]
     pub record_dir: PathBuf,
@@ -280,7 +284,14 @@ where
     }
     let identity =
         crate::record::identity::campaign(name, arm(), cli.timeout_ms, cli.max_len, target_config)?;
-    let record = Record::install_with_identity(&cli.record_dir, cli.record, identity.clone())?;
+    let record = Record::install_with_identity_and_limits(
+        &cli.record_dir,
+        cli.record,
+        identity.clone(),
+        RecordLimits {
+            max_ring_bytes: cli.record_max_bytes,
+        },
+    )?;
     banner(name)?;
     let (guards, map) = instrumentation();
     if cli.instrumentation {

@@ -59,9 +59,13 @@ fn pread_into_each_target() {
         .with_label("pooled")
         .build()
         .unwrap();
-    time("pooled shared", pooled.contents());
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    time("pooled shared", unsafe { pooled.contents() });
     let shared = m.new_persistent_shared(total).unwrap();
-    time("persistent shared", shared.contents());
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    time("persistent shared", unsafe { shared.contents() });
     let private = m.new_persistent_private(total).unwrap();
     // A Private buffer's `contents()` is invalid on the CPU: the ring arm
     // never writes one. Timed here only through the pooled Shared one.

@@ -209,7 +209,16 @@ impl ResidencySet {
         self.remove_batches.store(0, Ordering::Relaxed);
     }
 
-    pub fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
+    /// Raw Metal interoperability, including allAllocations-derived handles.
+    /// # Safety
+    /// Do not mutate membership outside this owner. Every derived native buffer,
+    /// heap, texture, IO destination or encoding capability must retain the
+    /// corresponding real allocation/reuse custody through actual terminality
+    /// AND future-emission closure. Retaining this set or an SDK allocation alone
+    /// does not close physical reuse pins or establish charge/range ownership.
+    /// Queue installation may borrow this handle while retaining this set; it
+    /// does not authorize borrowing any contained allocation for future work.
+    pub unsafe fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
         self.raw.as_deref()
     }
 
@@ -672,7 +681,7 @@ fn allocation_key(buf: &Buffer) -> usize {
 /// not the pointer value or runtime dispatch.
 fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
     unsafe {
-        &*(buf.as_ref() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
+        &*(buf.raw_unchecked() as *const ProtocolObject<dyn objc2_metal::MTLBuffer>
             as *const ProtocolObject<dyn MTLAllocation>)
     }
 }

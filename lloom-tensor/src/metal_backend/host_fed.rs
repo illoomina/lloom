@@ -118,7 +118,8 @@ impl HostFedRing {
         let mut tensors = Vec::with_capacity(slots);
         for _ in 0..slots {
             let buf = device.new_persistent_shared(bytes)?;
-            if buf.contents().is_null() {
+            // SAFETY: the pointer is only compared with null.
+            if unsafe { buf.contents() }.is_null() {
                 crate::bail!("HostFedRing: a Shared buffer with no CPU mapping")
             }
             let storage = crate::Storage::Metal(super::MetalStorage::new_allocated(

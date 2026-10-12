@@ -388,46 +388,60 @@ fn run_one(
         // nothing else, or the comparison is not one.
         seed: 0x5EED,
     };
-    let dst = params.contents() as *mut ScratchParams;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let dst = unsafe { params.contents() } as *mut ScratchParams;
     anyhow::ensure!(!dst.is_null(), "params buffer has no CPU mapping");
     // SAFETY: shared storage sized for one `ScratchParams`.
     unsafe { dst.write(p) };
 
     {
         let guard = cmds.command_encoder().map_err(anyhow::Error::msg)?;
-        call_scratch_partials(
-            device,
-            &guard,
-            kernels,
-            sizing,
-            &partials,
-            &params,
-            geometry.n_heads as u32,
-            live as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_partials(
+                device,
+                &guard,
+                kernels,
+                sizing,
+                &partials,
+                &params,
+                geometry.n_heads as u32,
+                live as u32,
+            )
+        }
         .map_err(anyhow::Error::msg)?;
         // One barrier before the combine, and none between the partials -- §9.4.
         // It falls out of `auto_barrier` because the combine binds as an input
         // what the stub bound as an output.
-        call_scratch_combine(
-            device,
-            &guard,
-            kernels,
-            sizing,
-            &partials,
-            &out,
-            &params,
-            &order,
-            geometry.n_heads as u32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scratch_combine(
+                device,
+                &guard,
+                kernels,
+                sizing,
+                &partials,
+                &out,
+                &params,
+                &order,
+                geometry.n_heads as u32,
+            )
+        }
         .map_err(anyhow::Error::msg)?;
     }
     cmds.wait_until_completed().map_err(anyhow::Error::msg)?;
 
     let n_out = geometry.n_heads * geometry.head_dim;
     let n_order = geometry.n_heads * live.max(1);
-    let op = out.contents() as *const u32;
-    let rp = order.contents() as *const u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let op = unsafe { out.contents() } as *const u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let rp = unsafe { order.contents() } as *const u32;
     anyhow::ensure!(!op.is_null() && !rp.is_null(), "no CPU mapping");
     // SAFETY: shared storage of the sizes allocated above, and the command
     // buffer has completed.

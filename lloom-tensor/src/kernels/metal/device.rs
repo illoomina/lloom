@@ -1,6 +1,7 @@
 use crate::kernels::{
     Buffer, CommandQueue, ComputePipeline, Function, Library, MTLResourceOptions, MetalKernelError,
 };
+use crate::memory_admission::AllocationError;
 use objc2::{rc::Retained, runtime::AnyObject, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCompileOptions, MTLCopyAllDevices, MTLCreateSystemDefaultDevice, MTLDevice};
@@ -120,13 +121,11 @@ impl Device {
         &self,
         length: usize,
         options: MTLResourceOptions,
-    ) -> Result<Buffer, MetalKernelError> {
+    ) -> Result<Buffer, AllocationError> {
         self.as_ref()
             .newBufferWithLength_options(length, options)
             .map(Buffer::new)
-            .ok_or(MetalKernelError::FailedToCreateResource(
-                "Buffer".to_string(),
-            ))
+            .ok_or(AllocationError::DeviceOom { requested: length })
     }
 
     pub fn new_buffer_with_data(
@@ -134,16 +133,14 @@ impl Device {
         pointer: *const c_void,
         length: usize,
         options: MTLResourceOptions,
-    ) -> Result<Buffer, MetalKernelError> {
+    ) -> Result<Buffer, AllocationError> {
         let pointer = ptr::NonNull::new(pointer as *mut c_void)
-            .ok_or_else(|| MetalKernelError::InvalidInput("Null pointer".to_string()))?;
+            .ok_or(AllocationError::Geometry("null data pointer"))?;
         unsafe {
             self.as_ref()
                 .newBufferWithBytes_length_options(pointer, length, options)
                 .map(Buffer::new)
-                .ok_or(MetalKernelError::FailedToCreateResource(
-                    "Buffer".to_string(),
-                ))
+                .ok_or(AllocationError::DeviceOom { requested: length })
         }
     }
 

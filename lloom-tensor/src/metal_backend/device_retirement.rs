@@ -155,7 +155,9 @@ impl DeviceTeardown {
             MetalKernelError::QueueUnavailable("namespace metadata capacity refused")
         })?;
         // Cold constructor: seed borrow is released before registration/growth.
-        let seed_lease = seed.lock().allocation_lease();
+        let seed_lease = seed.lock().native_baseline_lease().map_err(|_| {
+            MetalKernelError::QueueUnavailable("namespace seed requires native baseline custody")
+        })?;
         let anchors = DeviceAnchors {
             _backings: namespace.backings.clone(),
             _hold: hold,

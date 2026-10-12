@@ -189,7 +189,7 @@ impl ArenaCursor {
 
     /// Write the request sizes the allocator will walk.
     fn write_sizes(&self, sizes: &[u32]) {
-        let dst = self.sizes.contents() as *mut u32;
+        let dst = unsafe { self.sizes.contents() } as *mut u32;
         debug_assert!(!dst.is_null(), "cursor sizes buffer has no CPU mapping");
         for (i, &s) in sizes.iter().enumerate() {
             // SAFETY: `sizes` buffer holds `max(n, 1)` u32 and `i < n`.
@@ -228,7 +228,7 @@ impl ArenaCursor {
     /// is why every caller in this crate reads it after
     /// `wait_until_completed`.
     pub fn cursor_value(&self) -> u32 {
-        let p = self.cursor.contents() as *const u32;
+        let p = unsafe { self.cursor.contents() } as *const u32;
         if p.is_null() {
             return 0;
         }
@@ -242,7 +242,7 @@ impl ArenaCursor {
     /// `arena_reset_cursor` instead, because a host store cannot be ordered
     /// against GPU work still reading the arena (see `call_arena_reset`).
     pub fn store_cursor(&self, v: u32) {
-        let p = self.cursor.contents() as *mut u32;
+        let p = unsafe { self.cursor.contents() } as *mut u32;
         if p.is_null() {
             return;
         }
@@ -255,7 +255,7 @@ impl ArenaCursor {
     /// Only meaningful after the command buffer has completed, as
     /// [`Self::cursor_value`].
     pub fn offsets(&self) -> Vec<u32> {
-        let p = self.offsets.contents() as *const u32;
+        let p = unsafe { self.offsets.contents() } as *const u32;
         if p.is_null() {
             return Vec::new();
         }

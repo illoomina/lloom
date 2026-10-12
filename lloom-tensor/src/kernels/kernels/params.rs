@@ -2042,9 +2042,116 @@ pub(crate) fn finish_packed_params(
         )?,
     };
     // Slot 0, after the capture has closed, so this is not renumbered.
-    encoder.set_input_buffer(0, Some(&params), 0);
+    // SAFETY: `params` was created above for this dispatch alone, or taken
+    // from the constants ring, which rewrites a block only once the epoch
+    // that last bound it has completed (`ConstantsPool::next`); nothing else
+    // writes or recycles it while bound.
+    unsafe {
+        encoder.set_input_buffer(0, Some(&params), 0);
+    }
     staged.push(params);
     Ok(staged)
+}
+
+/// A direct plan position, never a global raw-Device/payer lookup. The caller
+/// owns its writer exclusively (`&mut self`); neither cursor reset nor a native
+/// pointer manufactures old rich header identity. Existing ConstantsPool stays
+/// available while this inactive tracked route is composed.
+pub(crate) struct PreparedParamSlot {
+    slot: crate::kernels::metal::PreparedStagingSlot,
+    memo: Option<crate::kernels::metal::WeakBufferHandle>,
+    initialized: Option<usize>,
+    // Full independently owned initialized shadow, not a mapped Buffer alias.
+    // Exact Layout-owned bytes + charge-control; internal field order frees
+    // storage before both receipts. No Vec overcapacity reconciliation.
+    shadow: crate::cold_bytes::ColdBytes,
+}
+#[derive(Debug)]
+pub(crate) enum PreparedParamError {
+    Staging(crate::kernels::metal::StagingError),
+    Count(crate::memory_admission::AllocationError),
+    Admission(crate::memory_admission::AllocationError),
+    Shadow(crate::cold_bytes::ColdBytesError),
+    ShadowCapacity,
+}
+impl PreparedParamSlot {
+    /// Cold only: partition the supplied SAME promise before host allocation.
+    /// # Safety
+    /// `slot` came from the actual backend namespace/context with closed native,
+    /// IO, raw and escaped-emission custody. The pass prediction includes this
+    /// ColdBytes::requested_bytes(slot.capacity()) term ONCE, including its
+    /// charge-control Layout; other plan/control/service terms remain separate.
+    /// This plan is constructed/refilled/finalized outside engine/EDIT guards.
+    /// Its charge and shadow are not destroyed on any warm error path.
+    pub(crate) unsafe fn new_in(
+        slot: crate::kernels::metal::PreparedStagingSlot,
+        context: &crate::memory_admission::AllocationContext,
+        commands: &crate::kernels::metal::Commands,
+    ) -> Result<Self, PreparedParamError> {
+        slot.check_context(context, commands)
+            .map_err(PreparedParamError::Staging)?;
+        let bytes = slot.capacity();
+        if bytes == 0 {
+            return Err(PreparedParamError::ShadowCapacity);
+        }
+        let shadow = crate::cold_bytes::ColdBytes::zeroed_in(context, bytes)
+            .map_err(PreparedParamError::Shadow)?;
+        Ok(Self {
+            slot,
+            memo: None,
+            initialized: None,
+            shadow,
+        })
+    }
+
+    /// Prepare before acquiring CommandsGuard or the original encoder EDIT.
+    /// Ordinary Busy/Full/count refusal leaves the prior memo/shadow unchanged.
+    /// Caller retains the plan and obtains an admitted cold spill/refill outside
+    /// those guards; there is no permanent magic-cap refusal or warm allocation.
+    pub(crate) fn prepare(
+        &mut self,
+        bytes: &[u8],
+        context: &crate::memory_admission::AllocationContext,
+        commands: &crate::kernels::metal::Commands,
+    ) -> Result<crate::kernels::metal::BufferHandle, PreparedParamError> {
+        self.prepare_under(bytes, &context.operation_context(), commands)
+    }
+    pub(crate) fn prepare_under(
+        &mut self,
+        bytes: &[u8],
+        context: &crate::memory_admission::OperationContext<'_>,
+        commands: &crate::kernels::metal::Commands,
+    ) -> Result<crate::kernels::metal::BufferHandle, PreparedParamError> {
+        self.slot
+            .check_context_under(context, commands)
+            .map_err(PreparedParamError::Staging)?;
+        if bytes.len() > self.shadow.len() {
+            return Err(PreparedParamError::ShadowCapacity);
+        }
+        if self.initialized == Some(bytes.len()) && self.shadow[..bytes.len()] == *bytes {
+            if let Some(memo) = &self.memo {
+                if let Some(handle) = memo.try_upgrade().map_err(PreparedParamError::Count)? {
+                    // Authentic same rich generation; NO CPU read/write or SDK
+                    // lookup. Its native/emission pins can still be outstanding.
+                    return Ok(handle);
+                }
+            }
+        }
+        let handle = self
+            .slot
+            .try_write_under(bytes, context, commands)
+            .map_err(PreparedParamError::Staging)?;
+        let memo = crate::kernels::metal::BufferHandle::try_downgrade(&handle)
+            .map_err(PreparedParamError::Count)?;
+        // Only successful copy+publication+authentic weak mint updates shadow.
+        // A later whole-tuple refusal keeps this truthful prepared state; it
+        // invents neither a native submission nor a completion/reuse epoch.
+        self.shadow[..bytes.len()].copy_from_slice(bytes);
+        self.shadow[bytes.len()..].fill(0);
+        self.initialized = Some(bytes.len());
+        self.memo = Some(memo); // old rich Weak release is rooted metadata only
+        Ok(handle)
+    }
 }
 
 /// Reusable storage for packed-params blocks, so their buffer identity is stable

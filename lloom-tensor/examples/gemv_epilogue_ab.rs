@@ -430,55 +430,67 @@ fn run_slot(
 
         match arm {
             Arm::Unfused => {
-                call_mlx_gemv_with(
-                    device,
-                    &encoder,
-                    kernels,
-                    dtype,
-                    (1, n_out, 1, k),
-                    &[n_out * k, k, 1],
-                    0,
-                    &mat_buf,
-                    &[k, 1, 1],
-                    0,
-                    &vec_buf,
-                    &gate,
-                    ParamStyle::Split,
-                )
+                // SAFETY: the example owns every buffer bound or mapped here and reads them
+                // only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_with(
+                        device,
+                        &encoder,
+                        kernels,
+                        dtype,
+                        (1, n_out, 1, k),
+                        &[n_out * k, k, 1],
+                        0,
+                        &mat_buf,
+                        &[k, 1, 1],
+                        0,
+                        &vec_buf,
+                        &gate,
+                        ParamStyle::Split,
+                    )
+                }
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                call_unary_contiguous(
-                    device,
-                    &encoder,
-                    kernels,
-                    silu_kernel(),
-                    elem_size,
-                    n_out,
-                    BufferOffset {
-                        buffer: &gate,
-                        offset_in_bytes: 0,
-                    },
-                    &out,
-                )
+                // SAFETY: the example owns every buffer bound or mapped here and reads them
+                // only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_unary_contiguous(
+                        device,
+                        &encoder,
+                        kernels,
+                        silu_kernel(),
+                        elem_size,
+                        n_out,
+                        BufferOffset {
+                            buffer: &gate,
+                            offset_in_bytes: 0,
+                        },
+                        &out,
+                    )
+                }
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
             Arm::Fused => {
-                call_mlx_gemv_full(
-                    device,
-                    &encoder,
-                    kernels,
-                    dtype,
-                    (1, n_out, 1, k),
-                    &[n_out * k, k, 1],
-                    0,
-                    &mat_buf,
-                    &[k, 1, 1],
-                    0,
-                    &vec_buf,
-                    &out,
-                    ParamStyle::Split,
-                    None,
-                    GemvEpilogue::Silu,
-                )
+                // SAFETY: the example owns every buffer bound or mapped here and reads them
+                // only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_full(
+                        device,
+                        &encoder,
+                        kernels,
+                        dtype,
+                        (1, n_out, 1, k),
+                        &[n_out * k, k, 1],
+                        0,
+                        &mat_buf,
+                        &[k, 1, 1],
+                        0,
+                        &vec_buf,
+                        &out,
+                        ParamStyle::Split,
+                        None,
+                        GemvEpilogue::Silu,
+                    )
+                }
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
             }
             // The three decomposition arms. Each writes the gemv accumulator
@@ -486,21 +498,25 @@ fn run_slot(
             // byte-for-byte the same work in all four and the differences
             // isolate the second dispatch.
             Arm::GemvOnly | Arm::GemvPlusTiny | Arm::GemvPlusNeg | Arm::GemvPlusNegIndep => {
-                call_mlx_gemv_with(
-                    device,
-                    &encoder,
-                    kernels,
-                    dtype,
-                    (1, n_out, 1, k),
-                    &[n_out * k, k, 1],
-                    0,
-                    &mat_buf,
-                    &[k, 1, 1],
-                    0,
-                    &vec_buf,
-                    &gate,
-                    ParamStyle::Split,
-                )
+                // SAFETY: the example owns every buffer bound or mapped here and reads them
+                // only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_with(
+                        device,
+                        &encoder,
+                        kernels,
+                        dtype,
+                        (1, n_out, 1, k),
+                        &[n_out * k, k, 1],
+                        0,
+                        &mat_buf,
+                        &[k, 1, 1],
+                        0,
+                        &vec_buf,
+                        &gate,
+                        ParamStyle::Split,
+                    )
+                }
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 // `GemvOnly` stops here. The other two add a second dispatch
                 // that differs ONLY in its length, which is what makes the
@@ -517,19 +533,23 @@ fn run_slot(
                     _ => unreachable!("only the four decomposition arms reach here"),
                 };
                 if let Some((len, src, dst)) = second {
-                    call_unary_contiguous(
-                        device,
-                        &encoder,
-                        kernels,
-                        neg_kernel(),
-                        elem_size,
-                        len,
-                        BufferOffset {
-                            buffer: src,
-                            offset_in_bytes: 0,
-                        },
-                        dst,
-                    )
+                    // SAFETY: the example owns every buffer bound or mapped here and reads them
+                    // only after waiting for the command buffer that writes them.
+                    unsafe {
+                        call_unary_contiguous(
+                            device,
+                            &encoder,
+                            kernels,
+                            neg_kernel(),
+                            elem_size,
+                            len,
+                            BufferOffset {
+                                buffer: src,
+                                offset_in_bytes: 0,
+                            },
+                            dst,
+                        )
+                    }
                     .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 }
             }
@@ -578,7 +598,9 @@ fn read_as_f32(
     len: usize,
     dtype: GemmDType,
 ) -> Vec<f32> {
-    let ptr = buffer.contents();
+    // SAFETY: the example owns every buffer bound or mapped here and reads them
+    // only after waiting for the command buffer that writes them.
+    let ptr = unsafe { buffer.contents() };
     // §11.5d / #454: the null check must survive the optimiser, and a bare
     // `assert!` on `contents()` is elided at `opt-level=1` with LTO off.
     assert!(

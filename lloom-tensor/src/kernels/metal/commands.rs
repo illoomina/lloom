@@ -202,7 +202,11 @@ impl BlitCommandsGuard<'_> {
         self.as_ref().set_label(label);
     }
 
-    pub fn copy_from_buffer(
+    /// # Safety
+    /// Legacy/raw interoperability only. Retain authentic originating reuse
+    /// authority, native/accounting owners and all future emission/raw references
+    /// through terminal work. A derived bare Buffer is not that authority.
+    pub unsafe fn copy_from_buffer(
         &mut self,
         src_buffer: &Buffer,
         src_offset: usize,
@@ -210,12 +214,44 @@ impl BlitCommandsGuard<'_> {
         dst_offset: usize,
         size: usize,
     ) {
-        self.as_mut()
-            .copy_from_buffer(src_buffer, src_offset, dst_buffer, dst_offset, size)
+        // SAFETY: this explicitly unsafe guard API preserves the raw setter's
+        // caller obligations; it is not a safe Tensor ownership-tracked route.
+        unsafe {
+            self.as_mut()
+                .copy_from_buffer(src_buffer, src_offset, dst_buffer, dst_offset, size)
+        }
     }
 
-    pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
-        self.as_mut().fill_buffer(buffer, range, value);
+    /// # Safety
+    /// Same originating reuse/terminal/future-emission duties as copy_from_buffer.
+    /// No counted pin is installed by this legacy/raw interoperability API.
+    pub unsafe fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
+        unsafe { self.as_mut().fill_buffer(buffer, range, value) };
+    }
+
+    pub(crate) fn copy_from_handles_aligned(
+        &mut self,
+        source: &super::BufferHandle,
+        source_offset: usize,
+        destination: &super::BufferHandle,
+        destination_offset: usize,
+        size: usize,
+    ) -> Result<(), MetalKernelError> {
+        self.as_mut().copy_from_handles_aligned(
+            source,
+            source_offset,
+            destination,
+            destination_offset,
+            size,
+        )
+    }
+    pub(crate) fn fill_handle_aligned(
+        &mut self,
+        destination: &super::BufferHandle,
+        range: (usize, usize),
+        value: u8,
+    ) -> Result<(), MetalKernelError> {
+        self.as_mut().fill_handle_aligned(destination, range, value)
     }
 }
 
@@ -279,6 +315,9 @@ struct EntryState {
     in_flight: Vec<CommandBuffer>,
     current_encoder: Option<ComputeCommandEncoder>,
     namespace: crate::metal_backend::device_retirement::NamespaceMemo,
+    // Per-call lookahead bound: recovery + one explicit cut can consume TWO.
+    // This is not a global generation/cardinality cap. Untracked Core keeps None.
+    binding_credits: [Option<super::native_generation_bindings::PreparedGeneration>; 2],
 }
 
 // One acquisition can close one compute encoder and construct one replacement.
@@ -304,6 +343,7 @@ impl EntryState {
             in_flight: vec![],
             current_encoder: None,
             namespace: Default::default(),
+            binding_credits: std::array::from_fn(|_| None),
         }
     }
 }
@@ -313,6 +353,8 @@ pub struct Commands {
 }
 
 struct CommandsCore {
+    // Actual control owner; neither Generation/Page C retains this bank/Core.
+    binding_bank: Option<super::native_generation_bindings::BindingBank>,
     // Retain service notification custody independently of installed state and
     // encoder-domain observers. Notifications flow through those observers;
     // this field is an owner, not a notification call site.
@@ -583,6 +625,33 @@ impl Commands {
         command_queue: CommandQueue,
         residency_set: Arc<ResidencySet>,
     ) -> Result<Self, MetalKernelError> {
+        Self::new_impl(command_queue, residency_set, None)
+    }
+    pub(crate) fn requested_binding_metadata_bytes() -> Result<usize, MetalKernelError> {
+        super::native_generation_bindings::BindingBank::requested_bytes()
+    }
+    /// Cold shared-base enrollment. Existing new/new_with remain explicit
+    /// untracked APIs; admitted replacements NEVER fall back to those branches.
+    /// # Safety
+    /// Caller quotes this initial tranche ONCE from its same bootstrap metadata
+    /// domain before construction; full control/native pricing remains separate.
+    /// Generation native/returned/future-emission closure satisfies root contract.
+    pub(crate) unsafe fn new_with_binding_metadata(
+        command_queue: CommandQueue,
+        residency_set: Arc<ResidencySet>,
+        domain: &crate::memory_admission::ModelDomain,
+        context: &crate::memory_admission::AllocationContext,
+    ) -> Result<Self, MetalKernelError> {
+        Self::new_impl(command_queue, residency_set, Some((domain, context)))
+    }
+    fn new_impl(
+        command_queue: CommandQueue,
+        residency_set: Arc<ResidencySet>,
+        binding_metadata: Option<(
+            &crate::memory_admission::ModelDomain,
+            &crate::memory_admission::AllocationContext,
+        )>,
+    ) -> Result<Self, MetalKernelError> {
         let tuning = &crate::tuning::tuning().metal;
         let compute_per_buffer = tuning.compute_per_buffer;
 
@@ -599,13 +668,22 @@ impl Commands {
             _ => CutPolicy::from_env_str(&tuning.cut_policy).unwrap_or_else(|e| panic!("{e}")),
         };
 
-        if let Some(raw) = residency_set.raw() {
+        // SAFETY: queue installation borrows only. This constructor transfers
+        // the SAME Arc into Core; no allAllocations extraction or out-of-band
+        // residency mutation occurs here. This is not an alias terminality proof.
+        if let Some(raw) = unsafe { residency_set.raw() } {
             command_queue.addResidencySet(raw);
         }
 
         let kind = CommandBufferKind::selected();
         let device = Device::new(command_queue.device());
-        let cb = create_command_buffer(&command_queue, kind)?;
+        // Accounted initial route reserves/initializes header credits before
+        // creating its native CB/Slot. Preserve old raw constructor behavior.
+        let cb = if binding_metadata.is_some() {
+            None
+        } else {
+            Some(create_command_buffer(&command_queue, kind)?)
+        };
 
         // `DESIGN.md` §11.5o. Absent -- every run that does not opt in --
         // leaves `Synchronize`, which is the path that ran before this field
@@ -627,6 +705,7 @@ impl Commands {
             completion_wait,
             residency_set,
             kind,
+            binding_metadata,
         )
     }
 
@@ -665,7 +744,10 @@ impl Commands {
         completion_wait: CompletionWait,
         kind: CommandBufferKind,
     ) -> Result<Self, MetalKernelError> {
-        if let Some(raw) = residency_set.raw() {
+        // SAFETY: queue installation borrows only. This constructor transfers
+        // the SAME Arc into Core; no allAllocations extraction or out-of-band
+        // residency mutation occurs here. This is not an alias terminality proof.
+        if let Some(raw) = unsafe { residency_set.raw() } {
             command_queue.addResidencySet(raw);
         }
         let device = Device::new(command_queue.device());
@@ -673,12 +755,13 @@ impl Commands {
         Self::with_parts(
             command_queue,
             device,
-            cb,
+            Some(cb),
             DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
             CutPolicy::DispatchCounter,
             completion_wait,
             residency_set,
             kind,
+            None,
         )
     }
 
@@ -686,12 +769,16 @@ impl Commands {
     fn with_parts(
         command_queue: CommandQueue,
         device: Device,
-        cb: Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+        cb: Option<Retained<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>>,
         compute_per_buffer: usize,
         cut_policy: CutPolicy,
         completion_wait: CompletionWait,
         residency_set: Arc<ResidencySet>,
         kind: CommandBufferKind,
+        binding_metadata: Option<(
+            &crate::memory_admission::ModelDomain,
+            &crate::memory_admission::AllocationContext,
+        )>,
     ) -> Result<Self, MetalKernelError> {
         // The listener is allocated with the event and only for the arm that
         // needs one (#583). Its lifetime is then the engine's, which is the
@@ -731,23 +818,77 @@ impl Commands {
         } else {
             None
         };
+        // Clock identity precedes every actual bound native constructor.
+        let clock = Arc::new(GpuClock::new());
+        let binding_bank = binding_metadata
+            .map(|(domain, context)| unsafe {
+                super::native_generation_bindings::BindingBank::cold_in(
+                    domain.clone(),
+                    context,
+                    modern_queue
+                        .as_ref()
+                        .map(|queue| Arc::as_ptr(queue) as usize)
+                        .unwrap_or_else(|| {
+                            legacy_completions
+                                .as_ref()
+                                .expect("actual M3 core")
+                                .identity()
+                        }),
+                    |context| {
+                        if let Some(queue) = &modern_queue {
+                            queue.cold_binding_inventory(context, clock.clone())
+                        } else {
+                            legacy_completions
+                                .as_ref()
+                                .expect("actual M3 core")
+                                .cold_binding_inventory(context, clock.clone())
+                        }
+                    },
+                )
+            })
+            .transpose()?;
+        let mut credits: [Option<super::native_generation_bindings::PreparedGeneration>; 2] =
+            std::array::from_fn(|_| None);
+        let initial = if let Some(bank) = &binding_bank {
+            for credit in &mut credits {
+                *credit = Some(bank.prepare_before_entry()?);
+            }
+            Some(bank.prepare_before_entry()?)
+        } else {
+            None
+        };
         let cb = if let Some(queue) = &modern_queue {
             eprintln!("[metal] command_api=metal4 reusable_native_buffers=true");
-            CommandBuffer::from_metal4(queue.acquire()?)
+            CommandBuffer::from_metal4(match initial {
+                Some(prepared) => queue.acquire_bound(prepared)?,
+                None => queue.acquire()?,
+            })
         } else {
-            CommandBuffer::from_metal3_associated(super::metal3_retirement::AssociatedBuffer::new(
-                cb,
-                legacy_completions
-                    .as_ref()
-                    .expect("M3 core constructed")
-                    .clone(),
-                None,
-            )?)
+            let raw = match cb {
+                Some(raw) => raw,
+                None => create_command_buffer(&command_queue, kind)?,
+            };
+            let core = legacy_completions
+                .as_ref()
+                .expect("M3 core constructed")
+                .clone();
+            CommandBuffer::from_metal3_associated(match initial {
+                Some(prepared) => super::metal3_retirement::AssociatedBuffer::new_bound(
+                    raw, core, None, prepared,
+                )?,
+                None => super::metal3_retirement::AssociatedBuffer::new(
+                    raw,
+                    legacy_completions
+                        .as_ref()
+                        .expect("M3 core constructed")
+                        .clone(),
+                    None,
+                )?,
+            })
         };
 
         let pipelined_compute_per_buffer =
             crate::tuning::tuning().metal.pipelined_compute_per_buffer;
-        let clock = Arc::new(GpuClock::new());
         let hold = (kind == CommandBufferKind::Unretained)
             .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
         let failure = Arc::default();
@@ -760,10 +901,13 @@ impl Commands {
             .map_err(|_| MetalKernelError::QueueUnavailable("host teardown service unavailable"))?
             .wake();
         let encoder_domain = super::encoder::EncoderDomain::new(retirement_wake.clone());
+        let mut state = EntryState::new(cb);
+        state.binding_credits = credits;
         let core = Arc::new(CommandsCore {
+            binding_bank,
             _retirement_wake: retirement_wake,
             encoder_domain,
-            state: CachePadded::new(Censused::new(parking_lot::Mutex::new(EntryState::new(cb)))),
+            state: CachePadded::new(Censused::new(parking_lot::Mutex::new(state))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             replacement_pending: CachePadded::new(AtomicBool::new(false)),
             command_queue,
@@ -971,11 +1115,16 @@ impl Commands {
                 message: "compute encoder setup exited exceptionally; custody retained",
                 buffer: Some(&enc.command_buffer),
             };
-            enc.set_input_buffer(
-                crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
-                Some(flag),
-                0,
-            );
+            // SAFETY: the flag is the gate's own buffer, held for this queue's life;
+            // the host writes it only in `EosGate::begin`, before a round's first
+            // gated dispatch.
+            unsafe {
+                enc.set_input_buffer(
+                    crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
+                    Some(flag),
+                    0,
+                );
+            }
         }
         Ok(())
     }
@@ -1125,8 +1274,31 @@ impl Commands {
             .map(|guard| DeferredGuard::new(guard, ClosedEncoders::default()))
     }
 
+    fn lock_recording_state(&self) -> Result<EntryGuard<'_>, MetalKernelError> {
+        let Some(bank) = self.core.binding_bank.as_ref() else {
+            return self.lock_state();
+        };
+        loop {
+            let state = self.lock_state()?;
+            if state.binding_credits.iter().all(Option::is_some) {
+                return Ok(state);
+            }
+            drop(state);
+            self.check_failed_atomic()?;
+            // Typed Full/refill BEFORE EntryState/native acquisition. Any
+            // raced unused metadata credit drops only after the guard releases.
+            let mut prepared = Some(bank.prepare_before_entry()?);
+            let mut state = self.lock_state()?;
+            if let Some(credit) = state.binding_credits.iter_mut().find(|slot| slot.is_none()) {
+                *credit = prepared.take();
+            }
+            drop(state);
+            drop(prepared);
+        }
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.lock_state()?;
+        let mut state_guard = self.lock_recording_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
         let count = self.core.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
@@ -1204,11 +1376,16 @@ impl Commands {
             if let Some(flag) = self.core.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
-                enc.set_input_buffer(
-                    crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
-                    Some(flag),
-                    0,
-                );
+                // SAFETY: the flag is the gate's own buffer, held for this queue's life;
+                // the host writes it only in `EosGate::begin`, before a round's first
+                // gated dispatch.
+                unsafe {
+                    enc.set_input_buffer(
+                        crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
+                        Some(flag),
+                        0,
+                    );
+                }
             }
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
@@ -1235,7 +1412,7 @@ impl Commands {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), MetalKernelError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         self.ensure_recording_locked(&mut state)?;
         self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
@@ -1265,7 +1442,7 @@ impl Commands {
         event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
         value: u64,
     ) -> Result<(), MetalKernelError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         self.ensure_recording_locked(&mut state)?;
         self.core.close_compute(&mut state)?;
         if self.core.modern_queue.is_some() {
@@ -1280,7 +1457,7 @@ impl Commands {
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.lock_state()?;
+        let mut state_guard = self.lock_recording_state()?;
         self.ensure_recording_locked(&mut state_guard)?;
         let count = self.core.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
@@ -1328,7 +1505,7 @@ impl Commands {
 
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
         let (to_wait, retained_current, commit_error) = {
-            let mut state = self.lock_state()?;
+            let mut state = self.lock_recording_state()?;
             let commit_error = if state.current.submitted().is_none()
                 && self.core.compute_count.load(Ordering::Acquire) > 0
             {
@@ -1387,7 +1564,7 @@ impl Commands {
     /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
         let (cb, signalled) = {
-            let mut state = self.lock_state()?;
+            let mut state = self.lock_recording_state()?;
             let signalled = self.commit_swap_locked(&mut state, 0)?;
             (state.in_flight.last().cloned(), signalled)
         };
@@ -1431,7 +1608,7 @@ impl Commands {
     /// the reason a readback in one sequence's round stalls behind another
     /// sequence's queued work.
     pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         let signalled = self.commit_swap_locked(&mut state, 0)?;
         let cb = state.in_flight.last().cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
@@ -1458,7 +1635,7 @@ impl Commands {
         {
             return Ok(None);
         }
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         let recovering = state.current.submitted().is_some();
         if !recovering && self.core.compute_count.load(Ordering::Acquire) == 0 {
             return Ok(None);
@@ -1546,7 +1723,7 @@ impl Commands {
     }
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
         {
@@ -1583,7 +1760,7 @@ impl Commands {
     /// anything).
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
         let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
-        let mut state = self.lock_state()?;
+        let mut state = self.lock_recording_state()?;
         if state.current.submitted().is_some()
             || self.core.compute_count.load(Ordering::Acquire) > 0
         {
@@ -1625,9 +1802,140 @@ impl Commands {
         Ok(self.lock_state()?.in_flight.len())
     }
 
-    fn create_replacement(&self) -> Result<CommandBuffer, MetalKernelError> {
+    /// Cold control/plan boundary only. Reuse returned inventory for subsequent
+    /// generation preparation; do not call per CB/token. Complete pricing and
+    /// default constructor enrollment remain explicit prerequisites.
+    pub(crate) unsafe fn cold_binding_inventory(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+    ) -> Result<super::native_generation_bindings::BindingInventory, MetalKernelError> {
+        if let Some(queue) = &self.core.modern_queue {
+            unsafe { queue.cold_binding_inventory(context, self.core.clock.clone()) }
+        } else {
+            let core = self
+                .core
+                .legacy_completions
+                .as_ref()
+                .expect("actual M3 associated core");
+            unsafe { core.cold_binding_inventory(context, self.core.clock.clone()) }
+        }
+    }
+    /// Cold operation capacity from its explicit model/default tranche; bank
+    /// uses only shared queue identity, not first-model payer inference.
+    /// # Safety
+    /// Caller carries complete operation pricing and real native-use closure.
+    pub(crate) unsafe fn cold_binding_capacity(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+    ) -> Result<super::native_generation_bindings::BindingCapacity, MetalKernelError> {
+        let bank = self
+            .core
+            .binding_bank
+            .as_ref()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "operation capacity requires enrolled shared binding control",
+            ))?;
+        unsafe { bank.cold_capacity(context) }
+    }
+    /// Preflight outside EntryState. A racing replacement causes later exact
+    /// encoder/generation refusal, never relabeling the capability as current.
+    pub(crate) fn prepare_tracked_buffer(
+        &self,
+        buffer: &super::Buffer,
+    ) -> Result<super::native_generation_bindings::PreparedBuffer, MetalKernelError> {
+        let current = {
+            let state = self.lock_state()?;
+            state
+                .current
+                .recording()
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "native binding needs recording generation",
+                ))?
+                .clone()
+        };
+        current.binding_generation()?.prepare_buffer(buffer)
+    }
+    /// Recover only an already submitted receipt, preserving no-double-submit
+    /// semantics. Native acquisition/prepared header credit is outside EntryState.
+    /// This additive route is not enabled by legacy/default recovery factories.
+    pub(crate) fn recover_bound_recording(
+        &self,
+        inventory: &super::native_generation_bindings::BindingInventory,
+    ) -> Result<(), MetalKernelError> {
+        let old = {
+            let state = self.lock_state()?;
+            state
+                .current
+                .submitted()
+                .ok_or(MetalKernelError::QueueUnavailable(
+                    "bound recovery needs retained submission receipt",
+                ))?
+                .0
+                .clone()
+        };
+        let prepared = inventory.prepare()?;
+        let candidate = if let Some(queue) = &self.core.modern_queue {
+            CommandBuffer::from_metal4(queue.acquire_bound(prepared)?)
+        } else {
+            // Real default pin clone BEFORE new native object creation. Any
+            // later error retains/returns physical + raw custody off EntryState.
+            let physical = self
+                .core
+                .physical
+                .try_owner(crate::metal_backend::device_retirement::NamespaceOwner::try_clone)?;
+            let raw = create_command_buffer(&self.core.command_queue, self.core.kind)?;
+            CommandBuffer::from_metal3_associated(
+                super::metal3_retirement::AssociatedBuffer::new_bound(
+                    raw,
+                    self.core
+                        .legacy_completions
+                        .as_ref()
+                        .expect("M3 core constructed")
+                        .clone(),
+                    physical,
+                    prepared,
+                )?,
+            )
+        };
+        let mut candidate = Some(candidate);
+        // candidate declared BEFORE guard: every refusal releases guard before
+        // cancellation/Drop of unused prepared native Submission/Slot custody.
+        let mut state = self.lock_state()?;
+        if !state
+            .current
+            .submitted()
+            .is_some_and(|(current, _)| current.identity() == old.identity())
+        {
+            return Err(MetalKernelError::QueueUnavailable(
+                "bound recovery receipt changed",
+            ));
+        }
+        let state = &mut *state;
+        state.current.recover_recording(
+            || Ok::<_, MetalKernelError>(candidate.take().expect("prepared bound replacement")),
+            &mut state.in_flight,
+            &self.core.compute_count,
+            &self.core.replacement_pending,
+            0,
+        )?;
+        state.namespace.reset();
+        Ok(())
+    }
+
+    fn create_replacement(
+        &self,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+    ) -> Result<CommandBuffer, MetalKernelError> {
+        if self.core.binding_bank.is_some() && prepared.is_none() {
+            return Err(MetalKernelError::QueueUnavailable(
+                "bound replacement lacks preflight credit",
+            ));
+        }
         match &self.core.modern_queue {
-            Some(queue) => Ok(CommandBuffer::from_metal4(queue.acquire()?)),
+            Some(queue) => Ok(CommandBuffer::from_metal4(match prepared {
+                Some(prepared) => queue.acquire_bound(prepared)?,
+                None => queue.acquire()?,
+            })),
             None => {
                 // Counted owner refusal precedes raw CB creation. Never create
                 // an unregistered native resource and then drop it on EntryState
@@ -1635,15 +1943,19 @@ impl Commands {
                 let physical = self.core.physical.try_owner(
                     crate::metal_backend::device_retirement::NamespaceOwner::try_clone,
                 )?;
-                super::metal3_retirement::AssociatedBuffer::new(
-                    create_command_buffer(&self.core.command_queue, self.core.kind)?,
-                    self.core
-                        .legacy_completions
-                        .as_ref()
-                        .expect("M3 core constructed")
-                        .clone(),
-                    physical,
-                )
+                let raw = create_command_buffer(&self.core.command_queue, self.core.kind)?;
+                let core = self
+                    .core
+                    .legacy_completions
+                    .as_ref()
+                    .expect("M3 core constructed")
+                    .clone();
+                match prepared {
+                    Some(prepared) => super::metal3_retirement::AssociatedBuffer::new_bound(
+                        raw, core, physical, prepared,
+                    ),
+                    None => super::metal3_retirement::AssociatedBuffer::new(raw, core, physical),
+                }
                 .map(CommandBuffer::from_metal3_associated)
             }
         }
@@ -1653,10 +1965,13 @@ impl Commands {
     fn ensure_recording_locked(&self, state: &mut EntryGuard<'_>) -> Result<(), MetalKernelError> {
         self.core.close_pending_blit(state)?;
         let state = &mut **state;
+        let credit = state.binding_credits.iter_mut().find(|slot| slot.is_some());
+        let mut absent = None;
+        let credit = credit.unwrap_or(&mut absent);
         if state
             .current
             .recover_recording(
-                || self.create_replacement(),
+                || self.create_replacement(credit.take()),
                 &mut state.in_flight,
                 &self.core.compute_count,
                 &self.core.replacement_pending,
@@ -1692,10 +2007,13 @@ impl Commands {
         }
         let created = timed.map(|_| std::time::Instant::now());
         let state = &mut **state;
+        let credit = state.binding_credits.iter_mut().find(|slot| slot.is_some());
+        let mut absent = None;
+        let credit = credit.unwrap_or(&mut absent);
         let recovered = state
             .current
             .recover_recording(
-                || self.create_replacement(),
+                || self.create_replacement(credit.take()),
                 &mut state.in_flight,
                 &self.core.compute_count,
                 &self.core.replacement_pending,
@@ -1876,6 +2194,17 @@ impl Commands {
         }
     }
 
+    /// Fixed-data failure admission for warm metadata/staging preparation.
+    /// Reads only the monotone failure atom; detailed diagnostics stay in the
+    /// existing public check_failed() and are not allocated on this path.
+    pub(crate) fn check_failed_atomic(&self) -> Result<(), MetalKernelError> {
+        if self.core.failure.failed.load(Ordering::Acquire) {
+            Err(MetalKernelError::QueueUnavailable("command queue failed"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// The first command buffer of this queue that ended in error, if any.
     pub fn check_failed(&self) -> Result<(), MetalKernelError> {
         self.core.failure.check()
@@ -2017,6 +2346,7 @@ impl CommandsCore {
         }
         crate::kernels::metal::trace::note_command_buffer();
         let epoch = self.clock.commit_epoch();
+        prepared.stage_binding_epoch(epoch)?;
         let clock = Arc::clone(&self.clock);
         let failure = Arc::clone(&self.failure);
         prepared.on_completion_of(move |error| {

@@ -112,7 +112,7 @@ mod tests {
                 &context,
                 Prediction::heap(8),
                 |_| {
-                    Ok::<_, &str>(Raw {
+                    Some(Raw {
                         domain: domain.clone(),
                         committed: committed.clone(),
                     })
@@ -124,7 +124,7 @@ mod tests {
             let mut staged = Some(staged);
             let mut selected = None;
             if after_commit {
-                selected = Some(staged.take().unwrap().commit::<&str>().unwrap());
+                selected = Some(staged.take().unwrap().commit().unwrap());
                 committed.store(true, Ordering::Relaxed);
             }
             match change {

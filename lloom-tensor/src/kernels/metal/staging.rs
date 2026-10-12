@@ -231,8 +231,7 @@ impl StagingRing {
         // Validate BEFORE overflow cleanup or warm take mutates the ring. An
         // original input device may resolve a different active output payer.
         self.affinity
-            .validate_reuse(&device.id(), &device.allocation_origin()?)
-            .map_err(crate::Error::wrap)?;
+            .validate_reuse(&device.id(), &device.allocation_origin()?)?;
         // A ring entry is the tier's, not a pass's: outside any pass plan.
         let _escape = super::arena::EscapeGuard::new();
         self.free_overflow();

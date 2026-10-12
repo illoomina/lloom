@@ -235,13 +235,15 @@ mod tests {
             let n = shape.iter().product();
             let tensor = Tensor::from_vec(values(seed, n), shape, &Device::Cpu)?;
             dense.insert(safetensors_name(name).unwrap(), tensor.clone());
-            let gguf = if name == "v.patch_embd.weight" && permute_patch {
-                tensor
+            // The converter stores the patch projection 4-D, `[D, C, P, P]`;
+            // the negative control stores it 4-D in the unpermuted order.
+            let gguf = match (name, permute_patch) {
+                ("v.patch_embd.weight", true) => tensor
                     .reshape((HIDDEN, P, P, 3))?
                     .permute((0, 3, 1, 2))?
-                    .contiguous()?
-            } else {
-                tensor
+                    .contiguous()?,
+                ("v.patch_embd.weight", false) => tensor.reshape((HIDDEN, 3, P, P))?,
+                _ => tensor,
             };
             stored.push((name, QTensor::quantize(&gguf, GgmlDType::F32)?));
         }

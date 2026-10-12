@@ -1,11 +1,13 @@
 //! Versioned completion evidence over the existing numbered input files.
 //! This is ordinary allocating filesystem I/O, never a signal-safe writer.
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const FORMAT: &str = "lloom-input-record-v1\n";
-const IDENTIFIED_FORMAT: &str = "lloom-input-record-v2\n";
+const LEGACY_IDENTIFIED_FORMAT: &str = "lloom-input-record-v2\n";
+const IDENTIFIED_FORMAT: &str = "lloom-input-record-v3\n";
 const IDENTITY_FILE: &str = "record.identity";
 pub(super) const MAX_IDENTITY: usize = 64 * 1024;
 const FORMAT_FILE: &str = "record.format";
@@ -55,16 +57,20 @@ pub(super) fn write_identified<'a>(
     let mut lengths = Vec::new();
     for (index, bytes) in inputs.enumerate() {
         write_new(&dir.join(format!("{index:020}.bin")), bytes)?;
-        lengths.push(bytes.len());
+        lengths.push((bytes.len(), Sha256::digest(bytes)));
     }
     if lengths.is_empty() {
         return Err(invalid("record contains no inputs"));
     }
     write_new(&dir.join("reason.txt"), reason)?;
     let mut manifest = format!("{format}{}\n", lengths.len());
-    for length in lengths {
+    for (length, digest) in lengths {
         use std::fmt::Write as _;
-        writeln!(manifest, "{length}").expect("String formatting is infallible");
+        if identity.is_some() {
+            writeln!(manifest, "{length} {digest:x}").expect("String formatting is infallible");
+        } else {
+            writeln!(manifest, "{length}").expect("String formatting is infallible");
+        }
     }
     manifest.push_str("END\n");
     write_new(&dir.join(COMPLETE_FILE), manifest.as_bytes())?;
@@ -126,6 +132,7 @@ pub(super) struct Replay {
     pub(super) lengths: Vec<u64>,
     pub(super) legacy: bool,
     pub(super) identity: Option<Vec<u8>>,
+    digests: Option<Vec<[u8; 32]>>,
 }
 
 /// Validate every directory entry and declared size before executing the first
@@ -136,14 +143,24 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
         let format = optional(&path.join(FORMAT_FILE))?;
         let manifest = optional(&path.join(COMPLETE_FILE))?;
         match (&format, &manifest) {
-            (Some(format), Some(_)) if format == FORMAT || format == IDENTIFIED_FORMAT => {}
+            (Some(format), Some(_))
+                if format == FORMAT
+                    || format == LEGACY_IDENTIFIED_FORMAT
+                    || format == IDENTIFIED_FORMAT => {}
             (None, None) => {}
-            (Some(format), _) if format != FORMAT && format != IDENTIFIED_FORMAT => {
+            (Some(format), _)
+                if format != FORMAT
+                    && format != LEGACY_IDENTIFIED_FORMAT
+                    && format != IDENTIFIED_FORMAT =>
+            {
                 return Err(invalid("unsupported record format"))
             }
             _ => return Err(invalid("incomplete record: format/completion pair missing")),
         }
-        let identity = if format.as_deref() == Some(IDENTIFIED_FORMAT) {
+        let identity = if matches!(
+            format.as_deref(),
+            Some(IDENTIFIED_FORMAT | LEGACY_IDENTIFIED_FORMAT)
+        ) {
             let bytes = read_single(&path.join(IDENTITY_FILE), MAX_IDENTITY).map_err(|error| {
                 io::Error::new(error.kind(), format!("{IDENTITY_FILE}: {error}"))
             })?;
@@ -154,7 +171,7 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
         } else {
             if path.join(IDENTITY_FILE).try_exists()? {
                 return Err(invalid(
-                    "identity without v2 format; refusing silent downgrade",
+                    "identity without identified format; refusing silent downgrade",
                 ));
             }
             None
@@ -169,6 +186,7 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
     for path in &paths {
         lengths.push(input_length(path, maximum)?);
     }
+    let mut digests = (format.as_deref() == Some(IDENTIFIED_FORMAT)).then(Vec::new);
     if let Some(manifest) = manifest {
         let mut lines = manifest.lines();
         if lines.next() != format.as_deref().map(str::trim_end) {
@@ -184,26 +202,84 @@ pub(super) fn prepare(path: &Path, maximum: usize) -> io::Result<Replay> {
             ));
         }
         for length in &lengths {
-            let declared = lines
+            let row = lines
                 .next()
-                .and_then(|n| n.parse::<u64>().ok())
                 .ok_or_else(|| invalid("invalid input length"))?;
+            let (declared, digest) = if digests.is_some() {
+                let (length, digest) = row
+                    .split_once(' ')
+                    .ok_or_else(|| invalid("missing input content digest"))?;
+                (length, Some(parse_digest(digest)?))
+            } else {
+                (row, None)
+            };
+            let declared = declared
+                .parse::<u64>()
+                .map_err(|_| invalid("invalid input length"))?;
             if declared != *length {
                 return Err(invalid(
                     "record input length differs from completion manifest",
                 ));
+            }
+            if let (Some(digests), Some(digest)) = (&mut digests, digest) {
+                digests.push(digest);
             }
         }
         if lines.next() != Some("END") || lines.next().is_some() {
             return Err(invalid("incomplete or extended completion manifest"));
         }
     }
-    Ok(Replay {
+    let replay = Replay {
         paths,
         lengths,
         legacy,
         identity,
-    })
+        digests,
+    };
+    // Validate the entire declared history before any target invocation. Read
+    // again at invocation and verify THOSE owned bytes: preflight is not a
+    // filesystem snapshot, and same-length replacements remain possible.
+    if replay.digests.is_some() {
+        for index in 0..replay.paths.len() {
+            replay.read_input(index, maximum)?;
+        }
+    }
+    Ok(replay)
+}
+
+fn parse_digest(text: &str) -> io::Result<[u8; 32]> {
+    if text.len() != 64 {
+        return Err(invalid("invalid input content digest"));
+    }
+    fn nibble(byte: u8) -> io::Result<u8> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(invalid("invalid input content digest")),
+        }
+    }
+    let mut digest = [0u8; 32];
+    for (out, pair) in digest.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        *out = nibble(pair[0])? * 16 + nibble(pair[1])?;
+    }
+    Ok(digest)
+}
+impl Replay {
+    pub(super) fn read_input(&self, index: usize, maximum: usize) -> io::Result<Vec<u8>> {
+        let bytes = read(&self.paths[index], self.lengths[index], maximum)?;
+        if let Some(digests) = &self.digests {
+            let actual: [u8; 32] = Sha256::digest(&bytes).into();
+            if actual != digests[index] {
+                return Err(invalid(
+                    "input content digest differs from completion manifest",
+                ));
+            }
+        }
+        Ok(bytes)
+    }
+    pub(super) fn content_verified(&self) -> bool {
+        self.digests.is_some()
+    }
 }
 
 pub(super) fn check_identity(
@@ -493,6 +569,139 @@ mod identity_tests {
             .unwrap_err()
             .to_string()
             .contains("incomplete record"));
+    }
+    #[test]
+    fn content_manifest_known_digest_and_empty_roundtrip() {
+        let tmp = Temp::new();
+        write_identified(
+            &tmp.0,
+            [b"B".as_slice(), b""].into_iter(),
+            b"reason",
+            Some(b"identity"),
+        )
+        .unwrap();
+        let manifest = fs::read_to_string(tmp.0.join(COMPLETE_FILE)).unwrap();
+        assert_eq!(
+            manifest,
+            concat!(
+                "lloom-input-record-v3\n2\n",
+                "1 df7e70e5021544f4834bbee64a9e3789febc4be81470df629cad6ddb03320a5c\n",
+                "0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nEND\n"
+            )
+        );
+        let replay = prepare(&tmp.0, 4).unwrap();
+        assert!(replay.content_verified());
+        assert_eq!(replay.read_input(0, 4).unwrap(), b"B");
+        assert!(replay.read_input(1, 4).unwrap().is_empty());
+    }
+    #[test]
+    fn same_length_corruption_refused_before_first_target_even_with_override() {
+        let tmp = Temp::new();
+        write_identified(
+            &tmp.0,
+            [b"B".as_slice(), b"C"].into_iter(),
+            b"reason",
+            Some(b"identity"),
+        )
+        .unwrap();
+        fs::write(tmp.0.join(format!("{:020}.bin", 1)), b"D").unwrap();
+        for allow_mismatch in [false, true] {
+            let mut calls = 0;
+            let error = super::super::replay_with_identity(
+                &tmp.0,
+                Some(b"identity"),
+                allow_mismatch,
+                |_| {
+                    calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(error.1.contains("content digest differs"), "{error:?}");
+            assert_eq!(calls, 0, "corrupt later input executed earlier targets");
+        }
+    }
+    #[test]
+    fn same_length_replacement_after_preflight_refused_on_owned_read() {
+        let tmp = Temp::new();
+        write_identified(
+            &tmp.0,
+            [b"B".as_slice()].into_iter(),
+            b"reason",
+            Some(b"identity"),
+        )
+        .unwrap();
+        let replay = prepare(&tmp.0, 4).unwrap();
+        fs::write(&replay.paths[0], b"X").unwrap();
+        assert_eq!(
+            read(&replay.paths[0], replay.lengths[0], 4).unwrap(),
+            b"X",
+            "size-only control did not read replacement"
+        );
+        assert!(replay
+            .read_input(0, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("content digest differs"));
+    }
+    #[test]
+    fn legacy_v2_identity_keeps_reader_without_claiming_content_verification() {
+        let tmp = Temp::new();
+        fs::create_dir(&tmp.0).unwrap();
+        write_new(
+            &tmp.0.join(FORMAT_FILE),
+            LEGACY_IDENTIFIED_FORMAT.as_bytes(),
+        )
+        .unwrap();
+        write_new(&tmp.0.join(IDENTITY_FILE), b"identity").unwrap();
+        write_new(&tmp.0.join("0000.bin"), b"B").unwrap();
+        write_new(
+            &tmp.0.join(COMPLETE_FILE),
+            b"lloom-input-record-v2\n1\n1\nEND\n",
+        )
+        .unwrap();
+        let replay = prepare(&tmp.0, 4).unwrap();
+        assert!(!replay.content_verified());
+        assert_eq!(replay.identity.as_deref(), Some(b"identity".as_slice()));
+        assert_eq!(replay.read_input(0, 4).unwrap(), b"B");
+        let mut calls = 0;
+        assert_eq!(
+            super::super::replay_with_identity(&tmp.0, Some(b"identity"), false, |bytes| {
+                calls += 1;
+                assert_eq!(bytes, b"B");
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+    }
+    #[test]
+    fn malformed_content_digest_refused_without_silent_legacy_fallback() {
+        let tmp = Temp::new();
+        write_identified(
+            &tmp.0,
+            [b"B".as_slice()].into_iter(),
+            b"reason",
+            Some(b"identity"),
+        )
+        .unwrap();
+        for digest in [
+            String::new(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "G".repeat(64),
+        ] {
+            fs::write(
+                tmp.0.join(COMPLETE_FILE),
+                format!("{IDENTIFIED_FORMAT}1\n1 {digest}\nEND\n"),
+            )
+            .unwrap();
+            assert!(prepare(&tmp.0, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("content digest"));
+        }
     }
     #[test]
     fn identity_refusal_precedes_archive_creation() {

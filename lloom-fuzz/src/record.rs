@@ -283,8 +283,14 @@ where
             "legacy record: numeric order checked; completeness/build/schema metadata unavailable"
         );
     }
-    for (i, (p, length)) in replay.paths.iter().zip(&replay.lengths).enumerate() {
-        let bytes = archive::read(p, *length, MAX_INPUT)
+    if !replay.content_verified() {
+        eprintln!(
+            "UNVERIFIED REPLAY CONTENT: legacy/v1/v2/single input has no recorded content digests"
+        );
+    }
+    for (i, p) in replay.paths.iter().enumerate() {
+        let bytes = replay
+            .read_input(i, MAX_INPUT)
             .map_err(|error| (i, format!("{}: {error}", p.display())))?;
         harness(&bytes).map_err(|m| (i, format!("{}: {m}", p.display())))?;
     }

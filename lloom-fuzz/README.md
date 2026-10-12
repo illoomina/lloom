@@ -101,15 +101,16 @@ Capture is not guaranteed: a busy byte-ring snapshot is refused, filesystem
 errors can prevent a dump, and the signal writer/handler composition still
 needs its separate safety repair. Do not infer successful capture from a crash.
 
-New campaign directories use `lloom-input-record-v2`: numbered `.bin` inputs
+New campaign directories use `lloom-input-record-v3`: numbered `.bin` inputs
 (oldest first), `reason.txt`, `record.format`, required `record.identity`, and a
-final `record.complete` count/length manifest. The low-level legacy recorder
+final `record.complete` count/length/SHA-256 manifest. The low-level legacy recorder
 still writes v1. Failed writes leave inspectable partial evidence, not a
 successful directory result. Filesystem I/O allocates and may block; it is not
-async-signal-safe. Replay validates format, completion, numeric order and sizes
-before executing any input. Missing/oversized v2 identity is an error, including
-under the diagnostic override. Legacy numbered directories and v1 records remain
-readable with an explicit unidentified-replay warning.
+async-signal-safe. Replay validates format, completion, numeric order, sizes and all v3 content digests
+before executing any input. Missing/oversized v2/v3 identity is an error, including
+under the diagnostic override. Legacy numbered directories and v1/v2 records remain readable. Unidentified
+records warn about identity; records without content digests separately warn
+about content verification.
 
 Campaign identity is prepared once at startup: streaming SHA-256 of the file at
 `current_exe()`, target, instrumentation arm, input schema, timeout/max input
@@ -120,8 +121,12 @@ with an explicit warning; it does not bypass format/completion/size checks.
 
 Identity does NOT capture environment tuning, dylibs, hardware, driver or a
 controlled schedule. The executable hash is not an immutable loaded-image
-attestation. Input files have no content hashes; same-length corruption or
-concurrent rewriting remains undetected. Do not modify a record during replay.
+attestation. V3 records verify every input digest before the first target and recheck the
+actual owned bytes at invocation, detecting same-length input replacements.
+This is not authenticated storage or an atomic multi-file snapshot: jointly
+rewriting the manifest and inputs is outside this integrity contract. Directory
+and manifest metadata reads remain unbounded; signal-safe capture and total
+archive-memory admission are still open. Do not modify a record during replay.
 Replay in one fresh process:
 
 ```sh

@@ -55,6 +55,8 @@ struct Origin {
     policy: TransportPolicy,
     cancelled: AtomicBool,
     disposal: Mutex<Disposal>,
+    #[cfg(test)]
+    clock: Mutex<Option<Instant>>,
 }
 
 /// Cloning this handle retains only the exact accepted origin, not a model.
@@ -65,6 +67,14 @@ pub struct ConnectionCancellation {
     origin: Arc<Origin>,
 }
 impl ConnectionCancellation {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.origin.clock.lock() {
+            return now;
+        }
+        Instant::now()
+    }
+
     pub(crate) fn new(socket: &Connection, policy: TransportPolicy) -> io::Result<Self> {
         let policy = policy.validate()?;
         let socket = socket.try_clone()?;
@@ -75,6 +85,8 @@ impl ConnectionCancellation {
                 socket,
                 policy,
                 cancelled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: Mutex::new(None),
                 disposal: Mutex::new(Disposal {
                     users: 0,
                     deadline: None,
@@ -101,7 +113,7 @@ impl ConnectionCancellation {
             .disposal
             .lock()
             .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
+            .is_some_and(|deadline| self.now() >= deadline);
         if expired {
             return Err(self.timeout());
         }
@@ -115,14 +127,14 @@ impl ConnectionCancellation {
         self.check()?;
         let active = self.origin.disposal.lock().deadline;
         let deadline = active.map_or(deadline, |active| active.min(deadline));
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(self.now());
         if remaining.is_zero() {
             return Err(self.timeout());
         }
         Ok(remaining)
     }
     pub(crate) fn prepare_io(&self, read: bool) -> io::Result<()> {
-        let timeout = self.remaining(Instant::now() + self.origin.policy.io_timeout)?;
+        let timeout = self.remaining(self.now() + self.origin.policy.io_timeout)?;
         if read {
             self.origin.socket.set_read_timeout(Some(timeout))
         } else {
@@ -143,7 +155,7 @@ impl ConnectionCancellation {
         }
     }
     pub(crate) fn begin_disposal(&self) -> DisposalGuard {
-        let deadline = Instant::now() + self.origin.policy.disposal_timeout;
+        let deadline = self.now() + self.origin.policy.disposal_timeout;
         let mut state = self.origin.disposal.lock();
         // Concurrent/nested disposal never extends an already active budget.
         state.deadline = Some(state.deadline.map_or(deadline, |old| old.min(deadline)));
@@ -154,7 +166,7 @@ impl ConnectionCancellation {
         }
     }
     pub(crate) fn receive<T>(&self, receiver: &Receiver<T>) -> io::Result<T> {
-        let deadline = Instant::now() + self.origin.policy.io_timeout;
+        let deadline = self.now() + self.origin.policy.io_timeout;
         loop {
             let wait = self.remaining(deadline)?.min(Duration::from_millis(10));
             match receiver.recv_timeout(wait) {
@@ -177,7 +189,7 @@ impl ConnectionCancellation {
         &self,
         mutex: &'a std::sync::Mutex<T>,
     ) -> io::Result<std::sync::MutexGuard<'a, T>> {
-        let deadline = Instant::now() + self.origin.policy.io_timeout;
+        let deadline = self.now() + self.origin.policy.io_timeout;
         loop {
             self.remaining(deadline)?;
             match mutex.try_lock() {
@@ -207,5 +219,336 @@ impl Drop for DisposalGuard {
         if state.users == 0 {
             state.deadline = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod origin_controls {
+    use super::*;
+    use crate::connection::ConnectionProbe;
+    use crate::util::{EqualReader, RefinedTcpStream, SequentialReaderBuilder};
+    use crate::{HTTPVersion, Header, Method};
+    use std::io::{Cursor, Read, Write};
+    use std::sync::atomic::AtomicUsize;
+
+    fn fixture(cap: usize) -> (ConnectionCancellation, Arc<ConnectionProbe>, Instant) {
+        let probe = Arc::new(ConnectionProbe::default());
+        let control = ConnectionCancellation::new(
+            &Connection::Probe(probe.clone()),
+            TransportPolicy {
+                io_timeout: Duration::from_millis(100),
+                disposal_timeout: Duration::from_millis(50),
+                max_discard_bytes: cap,
+            },
+        )
+        .unwrap();
+        let base = Instant::now();
+        *control.origin.clock.lock() = Some(base);
+        (control, probe, base)
+    }
+    fn advance(control: &ConnectionCancellation, time: Instant) {
+        *control.origin.clock.lock() = Some(time);
+    }
+    struct CountReader {
+        input: Cursor<Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+    impl Read for CountReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let count = self.input.read(buf)?;
+            self.bytes.fetch_add(count, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+    fn counted(bytes: Vec<u8>) -> (CountReader, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        (
+            CountReader {
+                input: Cursor::new(bytes),
+                calls: calls.clone(),
+                bytes: count.clone(),
+            },
+            calls,
+            count,
+        )
+    }
+    #[test]
+    fn cancel_refusal_still_gates_same_origin_buffered_and_native_reads() {
+        let (control, probe, _) = fixture(4);
+        assert_eq!(
+            probe.state.lock().read_timeout,
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            probe.state.lock().write_timeout,
+            Some(Duration::from_millis(100))
+        );
+        match &control.origin.socket {
+            Connection::Probe(retained) => assert!(Arc::ptr_eq(retained, &probe)),
+            _ => panic!("fixture must retain the original probe identity"),
+        }
+        probe.state.lock().input = Cursor::new(b"DATA".to_vec());
+        probe.state.lock().refuse_shutdown = true;
+        let (mut reader, writer) =
+            RefinedTcpStream::new_controlled(Connection::Probe(probe.clone()), control.clone());
+        assert_eq!(control.cancel().unwrap_err().kind(), ErrorKind::Other);
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        let mut bytes = [0; 4];
+        assert_eq!(
+            reader.read(&mut bytes).unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            probe.state.lock().reads,
+            0,
+            "cancel refusal must not restore read authority"
+        );
+        assert_eq!(probe.state.lock().shutdowns, vec![Shutdown::Both]);
+        drop(reader);
+        drop(writer);
+        let (buffered_control, buffered_probe, _) = fixture(4);
+        buffered_probe.state.lock().input = Cursor::new(b"DATA".to_vec());
+        let (reader, writer) = RefinedTcpStream::new_controlled(
+            Connection::Probe(buffered_probe.clone()),
+            buffered_control.clone(),
+        );
+        let mut builder = SequentialReaderBuilder::with_control(
+            std::io::BufReader::with_capacity(4, reader),
+            Some(buffered_control.clone()),
+        );
+        let mut sequence = builder.next().unwrap();
+        let mut first = [0];
+        sequence.read_exact(&mut first).unwrap();
+        assert_eq!(first, [b'D']);
+        assert_eq!(
+            buffered_probe.state.lock().input.position(),
+            4,
+            "actual BufReader prefetched all four fixture bytes before cancellation"
+        );
+        assert_eq!(buffered_probe.state.lock().reads, 1);
+        buffered_control.cancel().unwrap();
+        assert_eq!(
+            sequence.read(&mut first).unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            buffered_probe.state.lock().reads,
+            1,
+            "buffered cancellation must not reach the underlying source again"
+        );
+        drop(sequence);
+        drop(writer);
+    }
+    #[test]
+    fn nested_disposal_keeps_earliest_deadline_and_cancellation_after_guard_drop() {
+        let (control, probe, base) = fixture(4);
+        let first = control.begin_disposal();
+        advance(&control, base + Duration::from_millis(20));
+        let second = control.begin_disposal();
+        assert_eq!(
+            control.origin.disposal.lock().deadline,
+            Some(base + Duration::from_millis(50))
+        );
+        assert_eq!(
+            control
+                .remaining(base + Duration::from_millis(100))
+                .unwrap(),
+            Duration::from_millis(30)
+        );
+        drop(first);
+        assert_eq!(control.origin.disposal.lock().users, 1);
+        assert_eq!(
+            control.origin.disposal.lock().deadline,
+            Some(base + Duration::from_millis(50))
+        );
+        advance(&control, base + Duration::from_millis(50));
+        assert_eq!(control.check().unwrap_err().kind(), ErrorKind::TimedOut);
+        assert_eq!(probe.state.lock().shutdowns, vec![Shutdown::Both]);
+        drop(second);
+        assert_eq!(control.origin.disposal.lock().deadline, None);
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        let (fresh, _, base) = fixture(4);
+        drop(fresh.begin_disposal());
+        advance(&fresh, base + Duration::from_secs(1));
+        assert!(
+            fresh.check().is_ok(),
+            "completed guard must not leave an active stale deadline"
+        );
+    }
+    #[test]
+    fn actual_handoff_accepts_ready_value_but_refuses_cancel_and_disconnect() {
+        let (control, _, _) = fixture(4);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(42).unwrap();
+        assert_eq!(control.receive(&rx).unwrap(), 42);
+        tx.send(77).unwrap();
+        control.cancel().unwrap();
+        assert_eq!(
+            control.receive(&rx).unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            77,
+            "cancelled receive must not consume later ownership"
+        );
+        let (fresh, _, _) = fixture(4);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        drop(tx);
+        assert_eq!(
+            fresh.receive(&rx).unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            fresh.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+    }
+    #[test]
+    fn actual_sequential_body_drop_preserves_valid_pipeline_and_revokes_excess_handoff() {
+        let (control, _, _) = fixture(4);
+        let mut builder = SequentialReaderBuilder::with_control(
+            Cursor::new(b"abcNEXT".to_vec()),
+            Some(control.clone()),
+        );
+        let first = builder.next().unwrap();
+        let mut next = builder.next().unwrap();
+        let (mut body, signal) = EqualReader::new_controlled(first, 3, Some(control.clone()));
+        let mut byte = [0];
+        body.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'a']);
+        drop(body);
+        assert!(signal.try_recv().unwrap().is_ok());
+        let mut tail = [0; 4];
+        next.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"NEXT");
+        let (control, _, _) = fixture(2);
+        let (source, calls, bytes) = counted(b"abcNEXT".to_vec());
+        let mut builder = SequentialReaderBuilder::with_control(source, Some(control.clone()));
+        let first = builder.next().unwrap();
+        let mut next = builder.next().unwrap();
+        let (body, signal) = EqualReader::new_controlled(first, 3, Some(control.clone()));
+        drop(body);
+        assert_eq!(
+            signal.try_recv().unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "known excess must refuse before draining"
+        );
+        assert_eq!(bytes.load(Ordering::Relaxed), 0);
+        next.assert_closed_handoff();
+        assert_eq!(
+            next.read(&mut [0; 4]).unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "cancelled next header cannot reuse undrained source"
+        );
+    }
+    #[test]
+    fn actual_request_unknown_body_uses_one_probe_byte_then_cancels() {
+        let (control, _, _) = fixture(3);
+        let (source, calls, bytes) = counted(b"abcdNEXT".to_vec());
+        let mut request = crate::request::new_request_with_control(
+            false,
+            Method::Post,
+            "/".into(),
+            HTTPVersion(1, 1),
+            vec![Header::from_bytes("Connection", "upgrade").unwrap()],
+            None,
+            source,
+            io::sink(),
+            Some(control.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            request.discard_body().unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            4,
+            "unknown length cap permits exactly one excess probe byte"
+        );
+        drop(request);
+        assert_eq!(
+            bytes.load(Ordering::Relaxed),
+            4,
+            "request Drop must not restart canceled disposal"
+        );
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+    }
+    struct LateWriter {
+        control: ConnectionCancellation,
+        time: Instant,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Write for LateWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            advance(&self.control, self.time);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn actual_request_drop_budget_starts_before_error_response_and_field_disposal() {
+        let (control, probe, base) = fixture(2048);
+        let (source, reads, _) = counted(vec![b'x'; 1025]);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer = LateWriter {
+            control: control.clone(),
+            time: base + Duration::from_millis(50),
+            calls: writes.clone(),
+        };
+        let request = crate::request::new_request_with_control(
+            false,
+            Method::Post,
+            "/".into(),
+            HTTPVersion(1, 1),
+            vec![Header::from_bytes("Content-Length", "1025").unwrap()],
+            None,
+            source,
+            writer,
+            Some(control.clone()),
+        )
+        .unwrap();
+        drop(request);
+        assert!(
+            writes.load(Ordering::Relaxed) > 0,
+            "actual automatic error response must reach writer"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "expired outer disposal must prevent hidden field drain"
+        );
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert!(!probe.state.lock().shutdowns.is_empty());
+        assert_eq!(control.origin.disposal.lock().users, 0);
+        assert_eq!(control.origin.disposal.lock().deadline, None);
     }
 }

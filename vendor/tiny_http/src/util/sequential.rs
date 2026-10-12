@@ -134,6 +134,22 @@ impl<W: Write + Send> Iterator for SequentialWriterBuilder<W> {
     }
 }
 
+#[cfg(test)]
+impl<R: Read + Send> SequentialReader<R> {
+    pub(crate) fn assert_closed_handoff(&self) {
+        match &self.inner {
+            SequentialReaderInner::Waiting(receiver) => assert!(
+                matches!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ),
+                "cancelled Drop must destroy, not transfer, undrained reader authority"
+            ),
+            _ => panic!("closed handoff fixture must still be waiting"),
+        }
+    }
+}
+
 impl<R: Read + Send> Read for SequentialReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         if self.control.is_none() {

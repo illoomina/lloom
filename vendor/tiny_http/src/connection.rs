@@ -48,6 +48,8 @@ impl From<unix_net::UnixListener> for Listener {
 #[derive(Debug)]
 pub(crate) enum Connection {
     Tcp(TcpStream),
+    #[cfg(test)]
+    Probe(std::sync::Arc<ConnectionProbe>),
     #[cfg(unix)]
     Unix(unix_net::UnixStream),
 }
@@ -55,6 +57,12 @@ impl std::io::Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Tcp(s) => s.read(buf),
+            #[cfg(test)]
+            Self::Probe(s) => {
+                let mut state = s.state.lock();
+                state.reads += 1;
+                std::io::Read::read(&mut state.input, buf)
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.read(buf),
         }
@@ -64,6 +72,11 @@ impl std::io::Write for Connection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Tcp(s) => s.write(buf),
+            #[cfg(test)]
+            Self::Probe(s) => {
+                s.state.lock().writes += 1;
+                Ok(buf.len())
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.write(buf),
         }
@@ -72,6 +85,8 @@ impl std::io::Write for Connection {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Tcp(s) => s.flush(),
+            #[cfg(test)]
+            Self::Probe(_) => Ok(()),
             #[cfg(unix)]
             Self::Unix(s) => s.flush(),
         }
@@ -82,6 +97,8 @@ impl Connection {
     pub(crate) fn peer_addr(&mut self) -> std::io::Result<Option<SocketAddr>> {
         match self {
             Self::Tcp(s) => s.peer_addr().map(Some),
+            #[cfg(test)]
+            Self::Probe(_) => Ok(None),
             #[cfg(unix)]
             Self::Unix(_) => Ok(None),
         }
@@ -90,6 +107,19 @@ impl Connection {
     pub(crate) fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
         match self {
             Self::Tcp(s) => s.shutdown(how),
+            #[cfg(test)]
+            Self::Probe(s) => {
+                let mut state = s.state.lock();
+                state.shutdowns.push(how);
+                if state.refuse_shutdown {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "inert shutdown refusal",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.shutdown(how),
         }
@@ -101,6 +131,11 @@ impl Connection {
     ) -> std::io::Result<()> {
         match self {
             Self::Tcp(s) => s.set_read_timeout(duration),
+            #[cfg(test)]
+            Self::Probe(s) => {
+                s.state.lock().read_timeout = duration;
+                Ok(())
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.set_read_timeout(duration),
         }
@@ -111,6 +146,11 @@ impl Connection {
     ) -> std::io::Result<()> {
         match self {
             Self::Tcp(s) => s.set_write_timeout(duration),
+            #[cfg(test)]
+            Self::Probe(s) => {
+                s.state.lock().write_timeout = duration;
+                Ok(())
+            }
             #[cfg(unix)]
             Self::Unix(s) => s.set_write_timeout(duration),
         }
@@ -119,6 +159,8 @@ impl Connection {
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         match self {
             Self::Tcp(s) => s.try_clone().map(Self::from),
+            #[cfg(test)]
+            Self::Probe(s) => Ok(Self::Probe(s.clone())),
             #[cfg(unix)]
             Self::Unix(s) => s.try_clone().map(Self::from),
         }
@@ -212,4 +254,21 @@ impl std::fmt::Display for ListenAddr {
             Self::Unix(s) => std::fmt::Debug::fmt(s, f),
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionProbe {
+    pub(crate) state: parking_lot::Mutex<ProbeState>,
+}
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ProbeState {
+    pub(crate) input: std::io::Cursor<Vec<u8>>,
+    pub(crate) reads: usize,
+    pub(crate) writes: usize,
+    pub(crate) shutdowns: Vec<Shutdown>,
+    pub(crate) refuse_shutdown: bool,
+    pub(crate) read_timeout: Option<std::time::Duration>,
+    pub(crate) write_timeout: Option<std::time::Duration>,
 }

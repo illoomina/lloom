@@ -623,19 +623,11 @@ mod signal_delivery_controls {
                 "child must verify actual recorder registration before delivery"
             );
             match termination {
-                Some(signal) => {
-                    assert_eq!(
-                        output.status.signal(),
-                        Some(signal),
-                        "only the intended default signal is acceptance"
-                    );
-                    if mode == "reset" {
-                        assert!(
-                            stdout.contains("RESET_FIRST_DELIVERY=1"),
-                            "first delivery must invoke the original handler before reset"
-                        );
-                    }
-                }
+                Some(signal) => assert_eq!(
+                    output.status.signal(),
+                    Some(signal),
+                    "only the intended default signal is acceptance"
+                ),
                 None => assert!(output.status.success(), "returning delivery child failed"),
             }
             return;
@@ -658,7 +650,6 @@ mod signal_delivery_controls {
         };
         prior.sa_flags = match mode {
             "nodefer" => libc::SA_NODEFER,
-            "reset" => libc::SA_RESETHAND,
             _ => 0,
         };
         // SAFETY: writable mask/action storage and a correct one-argument ABI.
@@ -670,7 +661,7 @@ mod signal_delivery_controls {
             },
             0
         );
-        let expected_mask = if matches!(mode, "one" | "nodefer" | "reset") {
+        let expected_mask = if matches!(mode, "one" | "nodefer") {
             // SAFETY: returning predecessor is registered for this first delivery.
             assert_eq!(unsafe { libc::raise(libc::SIGILL) }, 0);
             assert_eq!(CALLS.load(Ordering::Relaxed), 1);
@@ -720,21 +711,6 @@ mod signal_delivery_controls {
             expected_mask.unwrap(),
             "capture must preserve the SAME unwrapped kernel delivery policy",
         );
-        if mode == "reset" {
-            // SAFETY: querying after first delivery observes the kernel reset.
-            assert_eq!(
-                unsafe { libc::sigaction(libc::SIGILL, std::ptr::null(), &mut installed) },
-                0
-            );
-            assert_eq!(installed.sa_sigaction, libc::SIG_DFL);
-            println!("RESET_FIRST_DELIVERY=1");
-            std::io::stdout().flush().unwrap();
-            // SAFETY: the second intentional delivery must terminate this child.
-            unsafe {
-                libc::raise(libc::SIGILL);
-            }
-            panic!("reset default disposition returned");
-        }
     }
 
     #[test]
@@ -753,19 +729,19 @@ mod signal_delivery_controls {
     fn delivered_default_disposition_terminates() {
         delivered("default", Some(libc::SIGILL));
     }
-    #[test]
-    fn delivered_reset_disposition_terminates_on_second_delivery() {
-        delivered("reset", Some(libc::SIGILL));
-    }
 }
 
-/// SA_RESETHAND is a kernel delivery policy, so the wrapped capture must
-/// reproduce what the kernel does for the predecessor alone, per signal: first
-/// delivery reaches the predecessor once under the same mask, the disposition
-/// left behind is the same class, and the second delivery has the same outcome.
-/// Each arm runs in its own child; the reference child never installs capture.
-/// The absolute level is the macOS sigaction(2) contract: the reset applies to
-/// every recorded signal except SIGILL, for which it is silently ignored.
+/// The recorder carries every delivery policy the `sigaction` query reports.
+/// Darwin's query never reports `SA_RESETHAND` (§15.1l; the register-then-query
+/// probe `query_roundtrip.c`), so a one-shot predecessor stays wrapped after
+/// its first delivery. Each test runs the predecessor alone (reference) and
+/// behind capture (wrapped), each in its own child, and pins both arms at the
+/// level the kernel shows: for SIGILL `sigaction(2)` ignores the flag and the
+/// arms agree; for SIGSEGV, SIGBUS, SIGABRT and SIGFPE the reference reverts
+/// to `SIG_DFL` and dies on the second delivery while the wrapped arm keeps
+/// the capture handler and returns. A query that starts reporting the flag
+/// fails these tests, and the boundary must be measured again. A predecessor
+/// without the flag is identical in both arms on both deliveries.
 #[cfg(test)]
 mod signal_reset_reference {
     use super::*;
@@ -773,6 +749,9 @@ mod signal_reset_reference {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     const CHILD: &str = "LLOOM_RECORD_RESET_REFERENCE_CHILD";
+    const FIRST_KEPT: &str = "RESET_FIRST calls=1 mask=(1,1) post=kept";
+    const FIRST_DEFAULT: &str = "RESET_FIRST calls=1 mask=(1,1) post=default";
+    const SECOND_RETURNED: &str = "RESET_SECOND=returned calls=2";
     static CALLS: AtomicI32 = AtomicI32::new(0);
     static ALARM_MASKED: AtomicI32 = AtomicI32::new(-1);
     static SELF_MASKED: AtomicI32 = AtomicI32::new(-1);
@@ -804,7 +783,7 @@ mod signal_reset_reference {
         action.sa_sigaction
     }
 
-    fn child(arm: &str, signal: libc::c_int) {
+    fn child(arm: &str, signal: libc::c_int, flags: libc::c_int) {
         // SAFETY: cold setup in a disposable child; no core files.
         let zero = libc::rlimit {
             rlim_cur: 0,
@@ -814,7 +793,7 @@ mod signal_reset_reference {
         // SAFETY: the action is fully initialized before registration.
         let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
         prior.sa_sigaction = predecessor as *const () as usize;
-        prior.sa_flags = libc::SA_RESETHAND;
+        prior.sa_flags = flags;
         assert_eq!(
             unsafe {
                 libc::sigemptyset(&mut prior.sa_mask);
@@ -863,110 +842,144 @@ mod signal_reset_reference {
         std::io::stdout().flush().unwrap();
     }
 
-    fn run(arm: &str, signal: libc::c_int) -> (Option<libc::c_int>, bool, String) {
+    /// One child's outcome: the terminating signal, clean exit, and the
+    /// first- and second-delivery lines it printed.
+    struct Arm {
+        killed_by: Option<libc::c_int>,
+        success: bool,
+        first: Option<String>,
+        second: Option<String>,
+    }
+
+    fn line(stdout: &str, prefix: &str) -> Option<String> {
+        stdout
+            .lines()
+            .find_map(|l| l.find(prefix).map(|at| l[at..].to_owned()))
+    }
+
+    fn run(arm: &str, signal: libc::c_int, flags: libc::c_int) -> Arm {
         let name = std::thread::current().name().unwrap().to_owned();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env(CHILD, format!("{arm}:{signal}"))
+            .env(CHILD, format!("{arm}:{signal}:{flags}"))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         eprintln!(
-            "[{arm} signal {signal}] status {:?}\n{stdout}",
+            "[{arm} signal {signal} flags {flags:#x}] status {:?}\n{stdout}",
             output.status
         );
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-        (output.status.signal(), output.status.success(), stdout)
+        let marker = match arm {
+            "reference" => "UNWRAPPED_HANDLER_REGISTERED",
+            _ => "CAPTURE_HANDLER_REGISTERED",
+        };
+        assert!(stdout.contains(marker), "{arm} child did not register");
+        if arm == "reference" {
+            assert!(
+                !stdout.contains("CAPTURE_HANDLER_REGISTERED"),
+                "the reference arm must not install capture"
+            );
+        }
+        Arm {
+            killed_by: output.status.signal(),
+            success: output.status.success(),
+            first: line(&stdout, "RESET_FIRST "),
+            second: line(&stdout, "RESET_SECOND"),
+        }
     }
 
-    fn line<'a>(stdout: &'a str, prefix: &str) -> Option<&'a str> {
-        stdout
-            .lines()
-            .find_map(|l| l.find(prefix).map(|at| &l[at..]))
-    }
-
-    fn reset_matches_reference(signal: libc::c_int) {
+    /// Runs the child when this process is one; otherwise the two arms.
+    fn arms(signal: libc::c_int, flags: libc::c_int) -> Option<(Arm, Arm)> {
         if let Some(mode) = std::env::var_os(CHILD) {
             let mode = mode.into_string().unwrap();
-            let (arm, number) = mode.split_once(':').unwrap();
-            assert_eq!(number.parse::<libc::c_int>().unwrap(), signal);
-            child(arm, signal);
+            let mut fields = mode.split(':');
+            let arm = fields.next().unwrap().to_owned();
+            let number: libc::c_int = fields.next().unwrap().parse().unwrap();
+            let child_flags: libc::c_int = fields.next().unwrap().parse().unwrap();
+            if (number, child_flags) == (signal, flags) {
+                child(&arm, signal, flags);
+            }
+            return None;
+        }
+        Some((
+            run("reference", signal, flags),
+            run("wrapped", signal, flags),
+        ))
+    }
+
+    fn returns_twice(arm: &Arm, label: &str) {
+        assert!(arm.success, "{label}: kept handler must return twice");
+        assert_eq!(arm.first.as_deref(), Some(FIRST_KEPT), "{label}");
+        assert_eq!(arm.second.as_deref(), Some(SECOND_RETURNED), "{label}");
+    }
+
+    fn reset_pinned(signal: libc::c_int) {
+        let Some((reference, wrapped)) = arms(signal, libc::SA_RESETHAND) else {
+            return;
+        };
+        if signal == libc::SIGILL {
+            returns_twice(&reference, "reference SIGILL ignores SA_RESETHAND");
+            returns_twice(&wrapped, "wrapped SIGILL");
             return;
         }
-        let kernel_resets = signal != libc::SIGILL;
-        let reference = run("reference", signal);
-        let wrapped = run("wrapped", signal);
-        assert!(reference.2.contains("UNWRAPPED_HANDLER_REGISTERED"));
-        assert!(
-            !reference.2.contains("CAPTURE_HANDLER_REGISTERED"),
-            "the reference arm must not install capture"
-        );
-        assert!(wrapped.2.contains("CAPTURE_HANDLER_REGISTERED"));
-        let expected_post = if kernel_resets {
-            "post=default"
-        } else {
-            "post=kept"
-        };
-        let reference_first = line(&reference.2, "RESET_FIRST ").expect("reference first delivery");
-        assert!(
-            reference_first.starts_with("RESET_FIRST calls=1 "),
-            "{reference_first}"
-        );
-        assert!(
-            reference_first.ends_with(expected_post),
-            "unwrapped kernel contradicts sigaction(2) for signal {signal}: {reference_first}"
+        assert_eq!(
+            reference.first.as_deref(),
+            Some(FIRST_DEFAULT),
+            "unwrapped kernel no longer resets signal {signal}"
         );
         assert_eq!(
-            line(&wrapped.2, "RESET_FIRST "),
-            Some(reference_first),
-            "capture must leave the same first-delivery policy as the unwrapped kernel"
+            reference.killed_by,
+            Some(signal),
+            "reference second delivery must terminate by the signal"
         );
-        if kernel_resets {
-            for (arm, status) in [("reference", &reference), ("wrapped", &wrapped)] {
-                assert_eq!(
-                    status.0,
-                    Some(signal),
-                    "{arm}: reset default must terminate"
-                );
-                assert!(
-                    line(&status.2, "RESET_SECOND").is_none(),
-                    "{arm} second delivery returned"
-                );
-            }
-        } else {
-            for (arm, status) in [("reference", &reference), ("wrapped", &wrapped)] {
-                assert!(
-                    status.1,
-                    "{arm}: kept handler must return on second delivery"
-                );
-                assert_eq!(
-                    line(&status.2, "RESET_SECOND"),
-                    Some("RESET_SECOND=returned calls=2"),
-                    "{arm} second delivery"
-                );
-            }
-        }
+        assert!(
+            reference.second.is_none(),
+            "reference second delivery returned"
+        );
+        returns_twice(
+            &wrapped,
+            "wrapped: the query hides SA_RESETHAND, so capture stays installed; \
+             a query that reports it moves this boundary",
+        );
     }
 
     #[test]
     fn reset_sigill_matches_unwrapped_kernel() {
-        reset_matches_reference(libc::SIGILL);
+        reset_pinned(libc::SIGILL);
     }
     #[test]
-    fn reset_sigsegv_matches_unwrapped_kernel() {
-        reset_matches_reference(libc::SIGSEGV);
+    fn reset_sigsegv_is_kept_where_the_kernel_resets() {
+        reset_pinned(libc::SIGSEGV);
     }
     #[test]
-    fn reset_sigbus_matches_unwrapped_kernel() {
-        reset_matches_reference(libc::SIGBUS);
+    fn reset_sigbus_is_kept_where_the_kernel_resets() {
+        reset_pinned(libc::SIGBUS);
     }
     #[test]
-    fn reset_sigabrt_matches_unwrapped_kernel() {
-        reset_matches_reference(libc::SIGABRT);
+    fn reset_sigabrt_is_kept_where_the_kernel_resets() {
+        reset_pinned(libc::SIGABRT);
     }
     #[test]
-    fn reset_sigfpe_matches_unwrapped_kernel() {
-        reset_matches_reference(libc::SIGFPE);
+    fn reset_sigfpe_is_kept_where_the_kernel_resets() {
+        reset_pinned(libc::SIGFPE);
+    }
+
+    /// Positive control for the boundary above: without `SA_RESETHAND` the
+    /// wrapped arm is line-for-line the unwrapped kernel on every recorded
+    /// signal, on both deliveries.
+    #[test]
+    fn no_reset_predecessor_matches_unwrapped_kernel() {
+        for signal in signals::SIGNALS {
+            let Some((reference, wrapped)) = arms(signal, 0) else {
+                continue;
+            };
+            returns_twice(&reference, "reference without SA_RESETHAND");
+            returns_twice(&wrapped, "wrapped without SA_RESETHAND");
+            assert_eq!(reference.first, wrapped.first, "signal {signal}");
+            assert_eq!(reference.second, wrapped.second, "signal {signal}");
+            println!("NO_RESET_IDENTICAL signal={signal}");
+        }
     }
 }
 

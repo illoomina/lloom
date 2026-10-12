@@ -118,7 +118,12 @@ disposition — everything a `sigaction` query reports. **Darwin's query does
 not report `SA_RESETHAND`**, so a predecessor registered one-shot stays
 wrapped after its first delivery where the kernel alone would revert it to
 `SIG_DFL` (SIGSEGV, SIGBUS, SIGABRT, SIGFPE; SIGILL ignores the flag). The
-handlers actually replaced — LibAFL's and Rust std's — do not set it.
+handlers actually replaced — LibAFL's and Rust std's — do not set it. The
+recorder's contract is every policy the query reports, and
+`record::signal_reset_reference` pins it: on a Darwin whose query reports the
+flag, its four reset tests fail and the boundary must be measured again. A
+predecessor without the flag is line-for-line the unwrapped kernel on all five
+signals.
 
 New campaign directories use `lloom-input-record-v3`: numbered `.bin` inputs
 (oldest first), `reason.txt`, `record.format`, required `record.identity`, and a

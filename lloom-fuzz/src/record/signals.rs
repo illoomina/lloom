@@ -2,6 +2,26 @@
 //! Installation is a once-only process setup operation, after executor setup.
 use std::sync::OnceLock;
 
+/// Preserve the interrupted thread's errno across capture and predecessor code.
+/// Only TLS getter/setter operations are used; formatting descriptions is forbidden.
+pub(super) struct PreservedErrno(errno::Errno);
+
+impl PreservedErrno {
+    pub(super) fn new() -> Self {
+        Self(errno::errno())
+    }
+
+    pub(super) fn restore(&self) {
+        errno::set_errno(self.0);
+    }
+}
+
+impl Drop for PreservedErrno {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 pub(super) const SIGNALS: [libc::c_int; 5] = [
     libc::SIGSEGV,
     libc::SIGBUS,

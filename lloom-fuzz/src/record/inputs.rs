@@ -236,7 +236,10 @@ pub(super) struct Snapshot<'a> {
     _permit: Permit<'a>,
 }
 impl Snapshot<'_> {
-    pub(super) fn inputs(&self) -> impl Iterator<Item = &[u8]> {
+    // Cloning this borrowed traversal does not clone the permit. Every copy
+    // remains tied to the SAME snapshot, whose exclusive permit excludes push.
+    // The archive writer can count then emit without allocating a second list.
+    pub(super) fn inputs(&self) -> impl Iterator<Item = &[u8]> + Clone {
         let entries = self.entries;
         let capacity = entries.slots.len();
         let oldest = entries.total.saturating_sub(capacity);

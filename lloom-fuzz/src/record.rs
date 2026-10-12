@@ -42,6 +42,8 @@
 mod archive;
 pub(crate) mod identity;
 pub(crate) use archive::read_single;
+#[cfg(test)]
+mod fixed_capture;
 mod inputs;
 mod signals;
 
@@ -258,6 +260,7 @@ impl Record {
 }
 
 extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let interrupted_errno = signals::PreservedErrno::new();
     if let Some(r) = RING.get() {
         let mut reason = *b"signal 00\n";
         reason[7] = b'0' + ((sig / 10) % 10) as u8;
@@ -299,6 +302,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // SAFETY: forward the original kernel delivery to the ABI and policy
     // retained from the predecessor. Allocating dump/backtrace I/O above is
     // still a separate async-signal-safety defect, not repaired by this chain.
+    interrupted_errno.restore();
     unsafe { signals::chain(sig, info, ctx) };
 }
 
@@ -401,4 +405,475 @@ where
         harness(&bytes).map_err(|m| (i, format!("{}: {m}", p.display())))?;
     }
     Ok(replay.paths.len())
+}
+
+#[cfg(test)]
+mod signal_errno_controls {
+    use super::*;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static PREDECESSOR_ERRNO: AtomicI32 = AtomicI32::new(0);
+    static PREDECESSOR_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn predecessor(signal: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        PREDECESSOR_ERRNO.store(errno::errno().0, Ordering::Relaxed);
+        PREDECESSOR_SIGNAL.store(signal, Ordering::Relaxed);
+        errno::set_errno(errno::Errno(libc::EIO));
+    }
+
+    #[test]
+    fn delivered_capture_preserves_errno_before_and_after_predecessor() {
+        const CHILD: &str = "LLOOM_RECORD_ERRNO_CONTROL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "record::signal_errno_controls::delivered_capture_preserves_errno_before_and_after_predecessor",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "isolated delivered-signal child failed"
+            );
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("lloom-record-errno-{}", std::process::id()));
+        let record = Record::install(&path, 1);
+        record.push(b"actual recorded input").unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        // The actual recorder's archive birth will fail with ENOENT. This
+        // deliberately exercises capture changing errno, not a dummy callback.
+        // SAFETY: zeroed C action is initialized before registration below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = predecessor as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO;
+        // SAFETY: initialized action storage; handler has the selected C ABI.
+        assert_eq!(
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(libc::SIGILL, &action, std::ptr::null_mut())
+            },
+            0
+        );
+        Record::install_crash_dump().unwrap();
+        errno::set_errno(errno::Errno(libc::EDOM));
+        // SAFETY: this disposable child installed a returning SIGILL handler.
+        // Delivery occurs outside allocator work; no real fault is generated.
+        let raised = unsafe { libc::raise(libc::SIGILL) };
+        let returned_errno = errno::errno().0;
+        assert_eq!(raised, 0);
+        assert_eq!(PREDECESSOR_SIGNAL.load(Ordering::Relaxed), libc::SIGILL);
+        assert_eq!(
+            PREDECESSOR_ERRNO.load(Ordering::Relaxed),
+            libc::EDOM,
+            "capture I/O must not change the predecessor's interrupted errno"
+        );
+        assert_eq!(
+            returned_errno,
+            libc::EDOM,
+            "returning predecessor must not leak errno into interrupted code"
+        );
+        assert!(!path.exists());
+        record.push(b"after returning signal").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod signal_delivery_controls {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static CALLS: AtomicI32 = AtomicI32::new(0);
+    static SIGNAL: AtomicI32 = AtomicI32::new(0);
+    static ALARM_MASKED: AtomicI32 = AtomicI32::new(0);
+    static SELF_MASKED: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn one_argument(signal: libc::c_int) {
+        // SAFETY: writable sigset initialized by the successful kernel query.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let queried = unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) };
+        if queried == 0 {
+            // SAFETY: query initialized mask storage; membership reads only.
+            ALARM_MASKED.store(
+                unsafe { libc::sigismember(&mask, libc::SIGALRM) },
+                Ordering::Relaxed,
+            );
+            SELF_MASKED.store(
+                unsafe { libc::sigismember(&mask, signal) },
+                Ordering::Relaxed,
+            );
+        }
+        SIGNAL.store(signal, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn delivered(mode: &str, termination: Option<libc::c_int>) {
+        const CHILD: &str = "LLOOM_RECORD_POLICY_CONTROL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            eprintln!("{stdout}");
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                stdout.contains("CAPTURE_HANDLER_REGISTERED"),
+                "child must verify actual recorder registration before delivery"
+            );
+            match termination {
+                Some(signal) => {
+                    assert_eq!(
+                        output.status.signal(),
+                        Some(signal),
+                        "only the intended default signal is acceptance"
+                    );
+                    if mode == "reset" {
+                        assert!(
+                            stdout.contains("RESET_FIRST_DELIVERY=1"),
+                            "first delivery must invoke the original handler before reset"
+                        );
+                    }
+                }
+                None => assert!(output.status.success(), "returning delivery child failed"),
+            }
+            return;
+        }
+        assert_eq!(std::env::var(CHILD).unwrap(), mode);
+        // SAFETY: cold process setup disables cores only in this disposable child.
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) }, 0);
+        // No ring is installed: these tests cover actual delivery/chaining policy,
+        // not capture allocation or successful archive creation.
+        // SAFETY: initialized C actions are fully populated before registration.
+        let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
+        prior.sa_sigaction = match mode {
+            "ignore" => libc::SIG_IGN,
+            "default" => libc::SIG_DFL,
+            _ => one_argument as *const () as usize,
+        };
+        prior.sa_flags = match mode {
+            "nodefer" => libc::SA_NODEFER,
+            "reset" => libc::SA_RESETHAND,
+            _ => 0,
+        };
+        // SAFETY: writable mask/action storage and a correct one-argument ABI.
+        assert_eq!(
+            unsafe {
+                libc::sigemptyset(&mut prior.sa_mask);
+                libc::sigaddset(&mut prior.sa_mask, libc::SIGALRM);
+                libc::sigaction(libc::SIGILL, &prior, std::ptr::null_mut())
+            },
+            0
+        );
+        let expected_mask = if matches!(mode, "one" | "nodefer" | "reset") {
+            // SAFETY: returning predecessor is registered for this first delivery.
+            assert_eq!(unsafe { libc::raise(libc::SIGILL) }, 0);
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+            let reference = (
+                ALARM_MASKED.load(Ordering::Relaxed),
+                SELF_MASKED.load(Ordering::Relaxed),
+            );
+            println!("UNWRAPPED_REFERENCE_MASK={reference:?}");
+            CALLS.store(0, Ordering::Relaxed);
+            SIGNAL.store(0, Ordering::Relaxed);
+            ALARM_MASKED.store(0, Ordering::Relaxed);
+            SELF_MASKED.store(0, Ordering::Relaxed);
+            // SAFETY: reinstall the SAME predecessor after its possible reset.
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGILL, &prior, std::ptr::null_mut()) },
+                0
+            );
+            Some(reference)
+        } else {
+            None
+        };
+        Record::install_crash_dump().unwrap();
+        // SAFETY: successful query initializes the complete registered action.
+        let mut installed: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGILL, std::ptr::null(), &mut installed) },
+            0
+        );
+        assert_eq!(installed.sa_sigaction, on_signal as *const () as usize);
+        assert_ne!(installed.sa_flags & libc::SA_SIGINFO, 0);
+        println!("CAPTURE_HANDLER_REGISTERED");
+        std::io::stdout().flush().unwrap();
+        // SAFETY: intentional delivery to this child; parent validates termination.
+        assert_eq!(unsafe { libc::raise(libc::SIGILL) }, 0);
+        assert_ne!(mode, "default", "default disposition must not return");
+        if mode == "ignore" {
+            assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+            return;
+        }
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(SIGNAL.load(Ordering::Relaxed), libc::SIGILL);
+        assert_eq!(
+            (
+                ALARM_MASKED.load(Ordering::Relaxed),
+                SELF_MASKED.load(Ordering::Relaxed)
+            ),
+            expected_mask.unwrap(),
+            "capture must preserve the SAME unwrapped kernel delivery policy",
+        );
+        if mode == "reset" {
+            // SAFETY: querying after first delivery observes the kernel reset.
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGILL, std::ptr::null(), &mut installed) },
+                0
+            );
+            assert_eq!(installed.sa_sigaction, libc::SIG_DFL);
+            println!("RESET_FIRST_DELIVERY=1");
+            std::io::stdout().flush().unwrap();
+            // SAFETY: the second intentional delivery must terminate this child.
+            unsafe {
+                libc::raise(libc::SIGILL);
+            }
+            panic!("reset default disposition returned");
+        }
+    }
+
+    #[test]
+    fn delivered_one_argument_predecessor_observes_saved_mask() {
+        delivered("one", None);
+    }
+    #[test]
+    fn delivered_nodefer_predecessor_observes_saved_mask() {
+        delivered("nodefer", None);
+    }
+    #[test]
+    fn delivered_ignore_disposition_returns() {
+        delivered("ignore", None);
+    }
+    #[test]
+    fn delivered_default_disposition_terminates() {
+        delivered("default", Some(libc::SIGILL));
+    }
+    #[test]
+    fn delivered_reset_disposition_terminates_on_second_delivery() {
+        delivered("reset", Some(libc::SIGILL));
+    }
+}
+
+/// SA_RESETHAND is a kernel delivery policy, so the wrapped capture must
+/// reproduce what the kernel does for the predecessor alone, per signal: first
+/// delivery reaches the predecessor once under the same mask, the disposition
+/// left behind is the same class, and the second delivery has the same outcome.
+/// Each arm runs in its own child; the reference child never installs capture.
+/// The absolute level is the macOS sigaction(2) contract: the reset applies to
+/// every recorded signal except SIGILL, for which it is silently ignored.
+#[cfg(test)]
+mod signal_reset_reference {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const CHILD: &str = "LLOOM_RECORD_RESET_REFERENCE_CHILD";
+    static CALLS: AtomicI32 = AtomicI32::new(0);
+    static ALARM_MASKED: AtomicI32 = AtomicI32::new(-1);
+    static SELF_MASKED: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn predecessor(signal: libc::c_int) {
+        // SAFETY: writable sigset; the successful query initializes it.
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) } == 0 {
+            // SAFETY: membership reads of the initialized mask only.
+            ALARM_MASKED.store(
+                unsafe { libc::sigismember(&mask, libc::SIGALRM) },
+                Ordering::Relaxed,
+            );
+            SELF_MASKED.store(
+                unsafe { libc::sigismember(&mask, signal) },
+                Ordering::Relaxed,
+            );
+        }
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn disposition(signal: libc::c_int) -> usize {
+        // SAFETY: query only; writable action storage.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+            0
+        );
+        action.sa_sigaction
+    }
+
+    fn child(arm: &str, signal: libc::c_int) {
+        // SAFETY: cold setup in a disposable child; no core files.
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) }, 0);
+        // SAFETY: the action is fully initialized before registration.
+        let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
+        prior.sa_sigaction = predecessor as *const () as usize;
+        prior.sa_flags = libc::SA_RESETHAND;
+        assert_eq!(
+            unsafe {
+                libc::sigemptyset(&mut prior.sa_mask);
+                libc::sigaddset(&mut prior.sa_mask, libc::SIGALRM);
+                libc::sigaction(signal, &prior, std::ptr::null_mut())
+            },
+            0
+        );
+        let kept = match arm {
+            "reference" => {
+                assert_eq!(disposition(signal), predecessor as *const () as usize);
+                println!("UNWRAPPED_HANDLER_REGISTERED");
+                predecessor as *const () as usize
+            }
+            "wrapped" => {
+                Record::install_crash_dump().unwrap();
+                assert_eq!(disposition(signal), on_signal as *const () as usize);
+                println!("CAPTURE_HANDLER_REGISTERED");
+                on_signal as *const () as usize
+            }
+            other => panic!("unknown arm {other}"),
+        };
+        // SAFETY: intentional delivery to this disposable child.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+        let after = disposition(signal);
+        let post = if after == libc::SIG_DFL {
+            "default"
+        } else if after == kept {
+            "kept"
+        } else {
+            "other"
+        };
+        println!(
+            "RESET_FIRST calls={} mask=({},{}) post={post}",
+            CALLS.load(Ordering::Relaxed),
+            ALARM_MASKED.load(Ordering::Relaxed),
+            SELF_MASKED.load(Ordering::Relaxed),
+        );
+        std::io::stdout().flush().unwrap();
+        // SAFETY: second intentional delivery; a reset disposition terminates.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+        println!(
+            "RESET_SECOND=returned calls={}",
+            CALLS.load(Ordering::Relaxed)
+        );
+        std::io::stdout().flush().unwrap();
+    }
+
+    fn run(arm: &str, signal: libc::c_int) -> (Option<libc::c_int>, bool, String) {
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, format!("{arm}:{signal}"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        eprintln!(
+            "[{arm} signal {signal}] status {:?}\n{stdout}",
+            output.status
+        );
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        (output.status.signal(), output.status.success(), stdout)
+    }
+
+    fn line<'a>(stdout: &'a str, prefix: &str) -> Option<&'a str> {
+        stdout
+            .lines()
+            .find_map(|l| l.find(prefix).map(|at| &l[at..]))
+    }
+
+    fn reset_matches_reference(signal: libc::c_int) {
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let mode = mode.into_string().unwrap();
+            let (arm, number) = mode.split_once(':').unwrap();
+            assert_eq!(number.parse::<libc::c_int>().unwrap(), signal);
+            child(arm, signal);
+            return;
+        }
+        let kernel_resets = signal != libc::SIGILL;
+        let reference = run("reference", signal);
+        let wrapped = run("wrapped", signal);
+        assert!(reference.2.contains("UNWRAPPED_HANDLER_REGISTERED"));
+        assert!(
+            !reference.2.contains("CAPTURE_HANDLER_REGISTERED"),
+            "the reference arm must not install capture"
+        );
+        assert!(wrapped.2.contains("CAPTURE_HANDLER_REGISTERED"));
+        let expected_post = if kernel_resets {
+            "post=default"
+        } else {
+            "post=kept"
+        };
+        let reference_first = line(&reference.2, "RESET_FIRST ").expect("reference first delivery");
+        assert!(
+            reference_first.starts_with("RESET_FIRST calls=1 "),
+            "{reference_first}"
+        );
+        assert!(
+            reference_first.ends_with(expected_post),
+            "unwrapped kernel contradicts sigaction(2) for signal {signal}: {reference_first}"
+        );
+        assert_eq!(
+            line(&wrapped.2, "RESET_FIRST "),
+            Some(reference_first),
+            "capture must leave the same first-delivery policy as the unwrapped kernel"
+        );
+        if kernel_resets {
+            for (arm, status) in [("reference", &reference), ("wrapped", &wrapped)] {
+                assert_eq!(
+                    status.0,
+                    Some(signal),
+                    "{arm}: reset default must terminate"
+                );
+                assert!(
+                    line(&status.2, "RESET_SECOND").is_none(),
+                    "{arm} second delivery returned"
+                );
+            }
+        } else {
+            for (arm, status) in [("reference", &reference), ("wrapped", &wrapped)] {
+                assert!(
+                    status.1,
+                    "{arm}: kept handler must return on second delivery"
+                );
+                assert_eq!(
+                    line(&status.2, "RESET_SECOND"),
+                    Some("RESET_SECOND=returned calls=2"),
+                    "{arm} second delivery"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reset_sigill_matches_unwrapped_kernel() {
+        reset_matches_reference(libc::SIGILL);
+    }
+    #[test]
+    fn reset_sigsegv_matches_unwrapped_kernel() {
+        reset_matches_reference(libc::SIGSEGV);
+    }
+    #[test]
+    fn reset_sigbus_matches_unwrapped_kernel() {
+        reset_matches_reference(libc::SIGBUS);
+    }
+    #[test]
+    fn reset_sigabrt_matches_unwrapped_kernel() {
+        reset_matches_reference(libc::SIGABRT);
+    }
+    #[test]
+    fn reset_sigfpe_matches_unwrapped_kernel() {
+        reset_matches_reference(libc::SIGFPE);
+    }
 }

@@ -23,6 +23,7 @@ libafl_bolts = "0.16.1"
 libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts"] }
 anyhow = "1"
 libc = "0.2"
+errno = { version = "=0.3.14", default-features = false }
 objc2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"

@@ -101,6 +101,14 @@ Capture is not guaranteed: a busy byte-ring snapshot is refused, filesystem
 errors can prevent a dump, and the signal writer/handler composition still
 needs its separate safety repair. Do not infer successful capture from a crash.
 
+The signal handler chains to the action it replaced, with that action's
+handler ABI, mask, `SA_NODEFER`, `SA_ONSTACK`, `SA_RESTART` and default/ignore
+disposition — everything a `sigaction` query reports. **Darwin's query does
+not report `SA_RESETHAND`**, so a predecessor registered one-shot stays
+wrapped after its first delivery where the kernel alone would revert it to
+`SIG_DFL` (SIGSEGV, SIGBUS, SIGABRT, SIGFPE; SIGILL ignores the flag). The
+handlers actually replaced — LibAFL's and Rust std's — do not set it.
+
 New campaign directories use `lloom-input-record-v3`: numbered `.bin` inputs
 (oldest first), `reason.txt`, `record.format`, required `record.identity`, and a
 final `record.complete` count/length/SHA-256 manifest. The low-level legacy recorder

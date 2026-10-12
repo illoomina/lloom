@@ -93,6 +93,22 @@ both (`ASAN_OPTIONS=verbosity=1 … --once` prints `AddressSanitizer Init done`,
 so the runtime is live). The Metal harnesses are not built under ASan: the
 engine's own `sanitize` profile covers the device path (§15.1g).
 
+The recorder's library tests run under the same arm:
+
+```sh
+LIBAFL_EDGES_MAP_DEFAULT_SIZE=2097152 LLOOM_FUZZ_ASAN=1 ASAN_OPTIONS=verbosity=1 \
+  cargo +nightly test --profile fuzz-asan --target-dir target-asan \
+  --no-default-features --lib -j1 record:: -- --test-threads=1
+```
+
+`LLOOM_FUZZ_ASAN=1` also sets `--cfg lloom_fuzz_asan`, which compiles
+`record::sanitizer_controls`: a planted heap and stack overflow in this crate
+that ASan must report, so a clean run is read beside two reports from the same
+binary. libmalloc's `malloc_logger`, the capture controls' allocator
+instrument, sees nothing under ASan; those controls pin it at zero there and
+keep every other assertion, and the allocation count is the uninstrumented
+build's.
+
 ## The persistent record
 
 Every client keeps the last `--record N` (default 64) inputs it executed.
@@ -173,6 +189,13 @@ first byte is `0x43` fails iff the previous input's first byte was `0x42`),
 labelled as such because no engine harness carries state across inputs.
 Measured: the campaign's solution replays clean under `--once`; the record
 (9 inputs, `0006.bin` = `42…`, `0007.bin` = `43…`) fails at input 7.
+
+`record_selftest --planted-fault` adds a real fault for the signal route: an
+input starting with `F` loads from a page mapped without access, inside
+`lloom_fuzz::planted` (instrumented). The kernel delivers SIGBUS at a data
+address the harness prints first (`PLANTED_FAULT pid=… addr=…`), so a record's
+`bt.txt` `si_addr=` can be checked against it. A `raise` cannot produce that
+address. The flag is part of the campaign identity.
 
 ## Poisons
 

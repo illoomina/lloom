@@ -917,9 +917,13 @@ mod managed_origins {
         socket: Option<Connection>,
         reservation: OriginReservation,
     }
+    mod workers {
+        include!("managed_workers.rs");
+    }
+    use workers::ManagedClient;
     enum AcceptAttempt {
         Idle,
-        Ready(ClientConnection),
+        Ready(ManagedClient),
     }
     enum AcceptSetupFailure {
         BeforeAccept(io::Error),
@@ -963,6 +967,14 @@ mod managed_origins {
             let control = self.control.take().expect("registered origin retained");
             ClientConnection::new(writer, reader, Some(control))
         }
+        fn into_managed_client(self) -> ManagedClient {
+            let control = self
+                .control
+                .as_ref()
+                .expect("registered origin retained")
+                .clone();
+            ManagedClient::from_registered(self.into_client(), control)
+        }
         fn cancel_retained(&self) -> io::Result<()> {
             match (&self.control, &self.socket) {
                 (Some(control), _) => control.cancel(),
@@ -993,7 +1005,7 @@ mod managed_origins {
         if let Err(error) = setup.prepare(policy) {
             return Err(AcceptSetupFailure::Retained { error, setup });
         }
-        Ok(AcceptAttempt::Ready(setup.into_client()))
+        Ok(AcceptAttempt::Ready(setup.into_managed_client()))
     }
 
     #[cfg(test)]

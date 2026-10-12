@@ -2415,9 +2415,19 @@ impl BackendStorage for MetalStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
-        if src_l.is_contiguous() && self.dtype == dst.dtype() && copy2d_no_blit() {
-            // A/B instrument: the contiguous copy as one compute-kernel row.
+        if src_l.is_contiguous()
+            && self.dtype == dst.dtype()
+            && (self.device.base_mode() || copy2d_no_blit())
+        {
+            // The contiguous copy as one compute-kernel row: under a pass plan
+            // (`MetalDevice::base_mode`) a blit is outside the compute barrier
+            // chain (`pass-plan-design.md` §9), and `scatter_add`'s copy of its
+            // base into a served slot raced the scatter that followed it
+            // (#943). Otherwise the A/B instrument.
             let n = src_l.shape().elem_count();
+            if n == 0 {
+                return Ok(());
+            }
             return self.copy2d(dst, 1, n, n, n, src_l.start_offset(), dst_offset);
         }
         if src_l.is_contiguous() && self.dtype == dst.dtype() {

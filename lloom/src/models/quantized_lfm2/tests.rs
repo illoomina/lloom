@@ -177,6 +177,31 @@ fn malformed_metadata_and_existing_alias_errors_do_not_fall_back() -> Result<()>
     ] {
         assert!(value_to_usize(&value).is_err());
     }
+    // llama.cpp's converter writes head_count_kv as i32 (d1-3B's GGUFs).
+    assert_eq!(value_to_usize(&gguf_file::Value::I32(8))?, 8);
+    let bytes = fixture()?;
+    let mut reader = Cursor::new(&bytes);
+    let mut header = gguf_file::Content::read(&mut reader)?;
+    let signed = match &header.metadata["lfm2.attention.head_count_kv"] {
+        gguf_file::Value::Array(values) => gguf_file::Value::Array(
+            values
+                .iter()
+                .map(|v| Ok(gguf_file::Value::I32(i32::try_from(v.to_u64()?).unwrap())))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        other => gguf_file::Value::I32(i32::try_from(other.to_u64()?).unwrap()),
+    };
+    header
+        .metadata
+        .insert("lfm2.attention.head_count_kv".into(), signed);
+    let model = Model::from_gguf(header, &mut reader, &Device::Cpu)?;
+    let reference = load(&bytes)?;
+    let mut a = model.new_cache()?;
+    let mut b = reference.new_cache()?;
+    close(
+        &run(&model, &mut a, &[1, 2, 3], 3)?,
+        &run(&reference, &mut b, &[1, 2, 3], 3)?,
+    );
     let bytes = fixture()?;
     let mut reader = Cursor::new(&bytes);
     let mut header = gguf_file::Content::read(&mut reader)?;

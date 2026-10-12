@@ -266,17 +266,19 @@ pub struct Model {
 }
 
 fn value_to_usize(v: &gguf_file::Value) -> Result<usize> {
-    // Dimensions are unsigned GGUF integers, not lossy signed/float casts.
-    if !matches!(
-        v,
-        gguf_file::Value::U8(_)
-            | gguf_file::Value::U16(_)
-            | gguf_file::Value::U32(_)
-            | gguf_file::Value::U64(_)
-    ) {
-        bail!("quantized lfm2 dimension must be an unsigned integer")
-    }
-    usize::try_from(v.to_u64()?).map_err(lloom_tensor::Error::wrap)
+    // Dimensions are GGUF integers, not lossy float casts. llama.cpp writes
+    // `head_count_kv` as an i32 array (0 on conv layers); a negative one is
+    // refused.
+    use gguf_file::Value;
+    let value = match v {
+        Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_) => v.to_u64()?,
+        Value::I8(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
+        Value::I16(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
+        Value::I32(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
+        Value::I64(x) => u64::try_from(*x).map_err(lloom_tensor::Error::wrap)?,
+        _ => bail!("quantized lfm2 dimension must be an integer"),
+    };
+    usize::try_from(value).map_err(lloom_tensor::Error::wrap)
 }
 
 fn read_usize_list(v: &gguf_file::Value, len: usize) -> Result<Vec<usize>> {

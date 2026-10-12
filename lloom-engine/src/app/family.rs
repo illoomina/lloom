@@ -157,6 +157,7 @@ pub trait Family: Send + Sync {
 pub struct Lfm2Family;
 pub struct Qwen4ExpFamily;
 pub struct Qwen3_5Family;
+pub struct Lfm2GgufFamily;
 
 pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2",
@@ -232,7 +233,12 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
 /// Every family, in detection order: the GGUF families read the header's
 /// `general.architecture`, so their order does not matter; LFM2 is a
 /// directory with a `config.json`.
-pub static FAMILIES: [&dyn Family; 3] = [&Lfm2Family, &Qwen3_5Family, &Qwen4ExpFamily];
+pub static FAMILIES: [&dyn Family; 4] = [
+    &Lfm2Family,
+    &Qwen3_5Family,
+    &Lfm2GgufFamily,
+    &Qwen4ExpFamily,
+];
 
 /// The GGUF checkpoint `path` names — a shard, or a directory of shards —
 /// as the first shard, with its header's `general.architecture`.
@@ -287,7 +293,7 @@ pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
         anyhow::bail!("{}: no such model", path.display());
     }
     anyhow::bail!(
-        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp, Qwen3.5)",
+        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp, Qwen3.5, LFM2)",
         path.display()
     )
 }
@@ -641,6 +647,38 @@ impl Family for Qwen3_5Family {
                 .flatten(),
             mtp_k: shape.speculative.k.unwrap_or(1),
         })
+    }
+}
+
+impl Family for Lfm2GgufFamily {
+    fn name(&self) -> &'static str {
+        "lfm2-gguf"
+    }
+    fn detect(&self, path: &Path) -> Option<PathBuf> {
+        let (first, arch) = gguf_checkpoint(path)?;
+        (arch == "lfm2").then_some(first)
+    }
+    fn capabilities(&self) -> Capabilities {
+        super::causal_loaded::served::lfm2_gguf_capabilities()
+    }
+    fn resolve(&self, req: &Requested<'_>) -> Result<()> {
+        let cap = self.capabilities();
+        resolve_common(&cap, req)?;
+        if req.model.flash_k.is_some() {
+            anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; lfm2-gguf has no such arm");
+        }
+        if let Some(key) = qwen4exp_key_set(req.model) {
+            anyhow::bail!("`{key}` is Qwen4-exp's; lfm2-gguf has no such arm");
+        }
+        if let Some(mmproj) = &req.model.mmproj {
+            if !mmproj.is_file() {
+                anyhow::bail!("--mmproj {}: no such file", mmproj.display());
+            }
+        }
+        Ok(())
+    }
+    fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
+        super::lfm2_gguf::load(first, req.model, &req.shape)
     }
 }
 
@@ -1083,6 +1121,19 @@ mod tests {
         );
         let (f, _) = detect(&dir.join("qwen/m-00002-of-00002.gguf")).unwrap();
         assert_eq!(f.name(), "qwen4exp");
+        // An LFM2 GGUF (d1-3B's official files) is the lfm2-gguf family's,
+        // by its header, not by its name.
+        let lfm2 = lloom_tensor::quantized::gguf_file::Value::String("lfm2".into());
+        let mut header = std::io::Cursor::new(Vec::new());
+        lloom_tensor::quantized::gguf_file::write(
+            &mut header,
+            &[("general.architecture", &lfm2)],
+            &[],
+        )
+        .unwrap();
+        std::fs::write(dir.join("d1-3B-Q8_0.gguf"), header.into_inner()).unwrap();
+        let (f, p) = detect(&dir.join("d1-3B-Q8_0.gguf")).unwrap();
+        assert_eq!((f.name(), p), ("lfm2-gguf", dir.join("d1-3B-Q8_0.gguf")));
         let err = detect(&dir.join("nope"))
             .err()
             .map(|e| e.to_string())

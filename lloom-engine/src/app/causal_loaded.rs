@@ -133,6 +133,48 @@ impl CausalPolicy {
         .map_err(invalid)
     }
 }
+/// A causal decision template bound at load: the checkpoint's own (a native
+/// d1 checkpoint) or the certified one `decision.template` selects, with
+/// llama.cpp's `lfm2-d1` request limits (255 options, `true`/`false` noul
+/// keys, a null state allowed), and what the load line and `/v1/models` say
+/// of it. `generic` is the front end's strategy, so nothing is bound for it.
+pub struct BoundPolicy {
+    pub policy: CausalPolicy,
+    pub native: Option<binding::DecisionType>,
+    pub origin: String,
+}
+impl BoundPolicy {
+    pub fn resolve(facts: &CheckpointDecision, selection: Option<&str>) -> Result<Option<Self>> {
+        let selection = Selection::parse(selection)?;
+        let resolved = binding::resolve(&selection, facts, SystemOneTemplateKind::D1Causal)
+            .map_err(|error| Error::msg(format!("decision.template: {error}")))?;
+        Ok(match resolved {
+            Some(binding::Binding::Template(binding))
+                if !binding.template.has_causal_certificate() =>
+            {
+                lloom_tensor::bail!(
+                    "decision.template {}: the shared-state renderer reads only the audited \
+                     lfm2-d1 template (its state is rendered before any question), and this one \
+                     is not byte-identical to it",
+                    binding.origin
+                )
+            }
+            Some(binding::Binding::Template(binding)) => Some(Self {
+                policy: CausalPolicy {
+                    template: binding.template,
+                    calibration: binding.calibration,
+                    max_options: 255,
+                    noul_aliases: NoulAliases::TrueFalseOnly,
+                    state_nullability: StateNullability::AllowNull,
+                },
+                native: binding.native,
+                origin: binding.origin,
+            }),
+            Some(binding::Binding::Generic) | None => None,
+        })
+    }
+}
+
 /// `Named` binds the checkpoint's own decision template and calibration
 /// (`decision::binding`): the GGUF must be a native decision checkpoint.
 /// Request limits stay explicit; no API policy is invented.
@@ -187,7 +229,58 @@ pub struct CausalEngine<M: CausalLM> {
     decode: DecodeConfig,
     // None retains the explicitly caller-managed legacy generic contract.
     recovery: Option<Box<dyn Recovery<M>>>,
+    /// The LFM2-VL tower an mmproj supplied, for image decisions.
+    vision: Option<MmprojVision>,
     chat: Mutex<Option<Chat<M::Cache>>>,
+}
+
+/// An mmproj's LFM2-VL tower and projector, loaded with the model: what a
+/// decision request's images are encoded with before their rows splice into
+/// the shared trunk (`lfm2::decision_media`).
+pub struct MmprojVision {
+    encoder: lloom::models::lfm2_vl::VisionEncoder,
+    config: lloom::models::lfm2_vl::Lfm2VlConfig,
+    processor: lloom::models::lfm2_vl::ImageProcessor,
+    dtype: lloom_tensor::DType,
+}
+impl MmprojVision {
+    /// Load `mmproj` for a text model of width `text_hidden` whose tokenizer
+    /// names `<image>`. The image preprocessing is LFM2-VL's
+    /// (`ImageProcessor::lfm2_vl_3b`, d1-3B's `processor_config.json`): the
+    /// mmproj does not carry it.
+    pub fn load(
+        mmproj: &Path,
+        tokenizer: &Tokenizer,
+        text_hidden: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        use lloom_tensor::quantized::gguf_file::Content;
+        let image_token_id = tokenizer.token_to_id("<image>").ok_or_else(|| {
+            Error::msg("the tokenizer has no <image> token for the mmproj's image rows")
+        })?;
+        let mut file = std::fs::File::open(mmproj)?;
+        let content = Content::read(&mut file)?;
+        let config = lloom::models::lfm2_vl::Lfm2VlConfig::from_mmproj(&content, image_token_id)?;
+        let dtype = if device.is_cpu() {
+            lloom_tensor::DType::F32
+        } else {
+            lloom_tensor::DType::F16
+        };
+        let encoder = lloom::models::lfm2_vl::VisionEncoder::from_mmproj(
+            &content,
+            &mut file,
+            &config,
+            text_hidden,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            encoder,
+            config,
+            processor: lloom::models::lfm2_vl::ImageProcessor::lfm2_vl_3b(),
+            dtype,
+        })
+    }
 }
 impl<M: CausalLM> CausalEngine<M>
 where
@@ -246,6 +339,7 @@ where
                 policy,
                 decode,
                 recovery,
+                vision: None,
                 chat: Mutex::new(Some(Chat {
                     sequence: Some(Sequence::new(cache)),
                     rings: Some(RingPool::new()),
@@ -296,17 +390,26 @@ where
         labels: &[String],
     ) -> Result<String> {
         loaded.with_pass(predicted_extra, |engine, _context| {
-            let policy = engine.policy.as_ref().ok_or_else(|| {
-                Error::msg("no named or explicit causal systemone policy was installed")
-            })?;
-            policy.template.render(
-                id,
-                state,
-                question,
-                labels,
-                crate::decision::SystemOneMedia::Text,
-            )
+            engine.render_systemone(id, state, question, labels)
         })
+    }
+    fn render_systemone(
+        &self,
+        id: &str,
+        state: &OrderedJson,
+        question: &crate::decision::Question<OrderedJson>,
+        labels: &[String],
+    ) -> Result<String> {
+        let policy = self.policy.as_ref().ok_or_else(|| {
+            Error::msg("no named or explicit causal systemone policy was installed")
+        })?;
+        policy.template.render(
+            id,
+            state,
+            question,
+            labels,
+            crate::decision::SystemOneMedia::Text,
+        )
     }
 
     /// Ordinary generation remains a first-class caller on the same weights.
@@ -415,9 +518,52 @@ where
                 "no named or explicit causal systemone policy was installed".into(),
             )
         })?;
-        let request = policy.prepare_text(body, self.capacity, |text| self.encode(text, false))?;
-        self.decide(&request)
-            .map_err(|error| SystemOneError::Execution(error.to_string()))
+        use super::lfm2::decision_media::{decide_images, prepare_images, ImageVision, Prepared};
+        let execution = |error: Error| SystemOneError::Execution(error.to_string());
+        let vision = self.vision.as_ref().map(|vision| ImageVision {
+            processor: &vision.processor,
+            config: &vision.config,
+            dtype: vision.dtype,
+        });
+        let prepared = prepare_images(
+            body,
+            policy,
+            self.capacity,
+            self.model.vocab_size(),
+            vision,
+            super::lfm2::SERVED_DECISION_IMAGES,
+            || {
+                "this causal owner has no vision tower: load it with the checkpoint's mmproj \
+                 (model.mmproj) to answer image decisions"
+                    .into()
+            },
+            |text| Ok(self.encode(text, false)?),
+        )?;
+        let (request, images, positions) = match prepared {
+            Prepared::Text(request) => return self.decide(&request).map_err(execution),
+            Prepared::Images {
+                request,
+                images,
+                positions,
+            } => (request, images, positions),
+        };
+        let mmproj = self.vision.as_ref().expect("an image request was prepared");
+        let mut lease = self.checkout().map_err(execution)?;
+        lease.start_external_work();
+        let options = self.decode.options(0, ReadbackArm::Blocking, 0);
+        let response = decide_images(
+            &self.model,
+            &request,
+            &images,
+            positions,
+            vision.expect("checked above"),
+            &mmproj.encoder,
+            &self.device,
+            &options,
+            |model, device| model.new_cache(&self.config, device),
+        )?;
+        lease.mark_complete();
+        Ok(response)
     }
 }
 
@@ -426,6 +572,14 @@ where
 /// downloaded vocabulary. Named checkpoint policy or explicit generic policy is
 /// optional: ordinary generation and prepared decisions remain available without
 /// it. All header/model/tokenizer/initial-chat producers run inside one load scope.
+/// Where an LFM2 GGUF's tokenizer comes from: a `tokenizer.json` the caller
+/// names, or the GGUF's own vocabulary (llama.cpp's source for the same file).
+#[derive(Clone, Copy)]
+pub enum TokenizerSource<'a> {
+    File(&'a Path),
+    Embedded,
+}
+
 pub fn load_lfm2_gguf_admitted(
     checkpoint: &Path,
     tokenizer_path: &Path,
@@ -435,19 +589,26 @@ pub fn load_lfm2_gguf_admitted(
     decode: DecodeConfig,
 ) -> Result<Loaded<CausalEngine<lloom::models::quantized_lfm2::Model>>> {
     Loaded::new(device, load, |device, _context| {
-        produce_lfm2_gguf(checkpoint, tokenizer_path, policy_source, device, decode)
+        produce_lfm2_gguf(
+            checkpoint,
+            TokenizerSource::File(tokenizer_path),
+            policy_source,
+            device,
+            decode,
+        )
     })
 }
 
 fn produce_lfm2_gguf(
     checkpoint: &Path,
-    tokenizer_path: &Path,
+    tokenizer_path: TokenizerSource<'_>,
     policy_source: Option<CausalPolicySource>,
     device: &Device,
     decode: DecodeConfig,
 ) -> Result<CausalEngine<lloom::models::quantized_lfm2::Model>> {
     produce_lfm2_gguf_with(
         checkpoint,
+        None,
         tokenizer_path,
         policy_source,
         device,
@@ -459,7 +620,8 @@ fn produce_lfm2_gguf(
 
 fn produce_lfm2_gguf_with<T>(
     checkpoint: &Path,
-    tokenizer_path: &Path,
+    mmproj: Option<&Path>,
+    tokenizer_path: TokenizerSource<'_>,
     policy_source: Option<CausalPolicySource>,
     device: &Device,
     decode: DecodeConfig,
@@ -483,8 +645,15 @@ fn produce_lfm2_gguf_with<T>(
     let plan = lloom::models::quantized_lfm2::Model::preflight_gguf_content(&content, &mut file)?;
     let config = plan.config();
     let capacity = config.context_length;
-    let tokenizer = Tokenizer::from_file(tokenizer_path)
-        .map_err(|error| Error::msg(format!("loading causal tokenizer: {error}")))?;
+    let tokenizer = match tokenizer_path {
+        TokenizerSource::File(path) => Tokenizer::from_file(path)
+            .map_err(|error| Error::msg(format!("loading causal tokenizer: {error}")))?,
+        TokenizerSource::Embedded => {
+            use lloom_tensor::quantized::tokenizer::TokenizerFromGguf;
+            Tokenizer::from_gguf(&content)
+                .map_err(|error| Error::msg(format!("the GGUF's tokenizer: {error}")))?
+        }
+    };
     let policy = match policy_source {
         Some(CausalPolicySource::Explicit(policy)) => Some(policy),
         Some(CausalPolicySource::Named {
@@ -519,6 +688,9 @@ fn produce_lfm2_gguf_with<T>(
     }
     let prepared = preflight(&config, &tokenizer, policy.as_ref())?;
     let model = plan.materialize(&mut file, device)?;
+    let vision = mmproj
+        .map(|path| MmprojVision::load(path, &tokenizer, config.hidden_size, device))
+        .transpose()?;
     let cache = model.new_cache()?;
     Ok((
         CausalEngine {
@@ -533,6 +705,7 @@ fn produce_lfm2_gguf_with<T>(
             // same supplied Device. Custom generic models opt in separately.
             // Native per-binding/error retirement closure is still unproven.
             recovery: Some(Box::new(AssociatedDeviceRecovery)),
+            vision,
             chat: Mutex::new(Some(Chat {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),

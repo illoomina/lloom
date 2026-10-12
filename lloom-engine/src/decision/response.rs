@@ -18,6 +18,9 @@ pub enum SystemOneError {
 /// This type serializes directly, without a serde_json::Value intermediary.
 #[derive(Debug, Clone)]
 pub struct SystemOneResponse {
+    /// The served model's id, first on the wire as llama.cpp writes it;
+    /// absent from a programmatic (unserved) response.
+    model: Option<String>,
     answers: Vec<(String, Answer<OrderedJson>)>,
     input_tokens: u64,
     /// Per-question read diagnostics, in answer order (the generic strategy).
@@ -41,6 +44,7 @@ impl SystemOneResponse {
             }
         }
         Ok(Self {
+            model: None,
             answers,
             input_tokens,
             diagnostics: None,
@@ -52,6 +56,11 @@ impl SystemOneResponse {
         diagnostics: Vec<(String, super::generic::Diagnostics)>,
     ) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+    /// Name the model that answered (`serve` does, as llama.cpp does).
+    pub fn with_model(mut self, model: &str) -> Self {
+        self.model = Some(model.to_string());
         self
     }
     /// Mark every answer: the request's `instructions` reached no template slot.
@@ -97,8 +106,11 @@ impl Serialize for SystemOneResponse {
         }
         let mut out = serializer.serialize_struct(
             "SystemOneResponse",
-            2 + usize::from(self.diagnostics.is_some()),
+            2 + usize::from(self.model.is_some()) + usize::from(self.diagnostics.is_some()),
         )?;
+        if let Some(model) = &self.model {
+            out.serialize_field("model", model)?;
+        }
         out.serialize_field("answers", &Pairs(&self.answers))?;
         out.serialize_field(
             "usage",

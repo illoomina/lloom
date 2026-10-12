@@ -481,7 +481,10 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
     if let Some(result) = dispatch_systemone_with(path, body.as_bytes(), |body| {
-        shared.decisions.decide(shared.engine.as_ref(), body)
+        shared
+            .decisions
+            .decide(shared.engine.as_ref(), body)
+            .map(|response| response.with_model(&shared.model_name))
     }) {
         return respond_systemone(request, result);
     }

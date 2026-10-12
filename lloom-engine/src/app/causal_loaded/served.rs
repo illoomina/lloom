@@ -157,6 +157,42 @@ impl<P: Predictor, E> Admitted<P, E> {
     }
 }
 
+/// Who scopes the owner's request work. `Admitted`: one model domain and the
+/// caller's prediction per pass. `Unadmitted`: the default `lloom serve`
+/// route, admitted on the machine at load as the other default families are,
+/// with no per-pass domain reservation (no default family has a production
+/// predictor yet). Both run the same owner and the same adapter.
+pub(crate) enum Custody<P, E> {
+    Admitted(Admitted<P, E>),
+    Unadmitted {
+        engine: E,
+        /// The machine reservation the load took, held for the model's life.
+        _machine: lloom_tensor::machine::Admitted,
+    },
+}
+impl<P: Predictor, E> Custody<P, E> {
+    fn pass<T>(&self, request: Request<'_>, run: impl FnOnce(&E) -> Result<T>) -> Result<T> {
+        match self {
+            Self::Admitted(owner) => owner.pass(request, run),
+            Self::Unadmitted { engine, .. } => run(engine),
+        }
+    }
+    fn admission(&self) -> &'static str {
+        match self {
+            Self::Admitted(_) => "caller-supplied coverage; producer enrollment incomplete",
+            Self::Unadmitted { .. } => "machine admission at load; no per-pass domain reservation",
+        }
+    }
+}
+
+/// The predictor type of an unadmitted owner, which asks for none.
+pub struct NoPrediction;
+impl Predictor for NoPrediction {
+    fn predicted_extra(&self, _: Request<'_>) -> Result<usize> {
+        lloom_tensor::bail!("an unadmitted owner takes no per-pass prediction")
+    }
+}
+
 /// Serving facts are explicit checkpoint/caller inputs, not guessed siblings.
 /// They and compiled template/seed are produced within the supplied load scope;
 /// host tickets for these and predictor storage are not implicitly enrolled.
@@ -185,7 +221,10 @@ pub struct Engine<P, M: CausalLM = Model> {
     metadata: Metadata,
     warnings: Vec<LoadWarning>,
     decisions: Option<DecisionDispatch<M>>,
-    owner: Admitted<P, CausalEngine<M>>,
+    /// The template binding the decision route renders with, for the load
+    /// line and `/v1/models` (`Served::decision_binding`).
+    binding: Option<(Option<crate::decision::binding::DecisionType>, String)>,
+    owner: Custody<P, CausalEngine<M>>,
 }
 
 /// Explicit family embedding factory returning a real HTTP/REPL implementor.
@@ -209,18 +248,78 @@ pub fn load_lfm2_gguf<P: Predictor>(
         config,
         decode,
         capabilities: lfm2_gguf_capabilities(),
-        predictor,
     };
     let owner_decode = serving.decode.clone();
     load_from_factory(
         device,
-        load,
+        Admission::Domain { load, predictor },
         serving,
         Some(DecisionDispatch::retained()),
+        None,
         |device, preflight| {
             produce_lfm2_gguf_with(
                 files.checkpoint,
-                files.tokenizer,
+                None,
+                TokenizerSource::File(files.tokenizer),
+                policy,
+                device,
+                owner_decode,
+                |resolved, tokenizer, policy| {
+                    preflight(
+                        FamilyFacts {
+                            vocab_size: resolved.vocab_size,
+                            capacity: resolved.context_length,
+                        },
+                        tokenizer,
+                        policy,
+                    )
+                },
+            )
+            .map(|(engine, ())| engine)
+        },
+    )
+}
+
+/// The default `lloom serve` route for an LFM2 GGUF: the same producer and
+/// adapter as [`load_lfm2_gguf`], admitted on the machine at load (`machine`,
+/// taken by the family before any weight is read) instead of in a model
+/// domain. `binding` is the template `decision.template` and the checkpoint
+/// resolved to; `None` serves chat only.
+#[allow(clippy::too_many_arguments)]
+pub fn load_lfm2_gguf_unadmitted(
+    checkpoint: &Path,
+    mmproj: Option<&Path>,
+    tokenizer: TokenizerSource<'_>,
+    binding: Option<BoundPolicy>,
+    device: &Device,
+    machine: lloom_tensor::machine::Admitted,
+    decode: DecodeConfig,
+    config: Config,
+) -> Result<Engine<NoPrediction>> {
+    let serving = Serving {
+        config,
+        decode,
+        capabilities: lfm2_gguf_capabilities(),
+    };
+    let owner_decode = serving.decode.clone();
+    let (policy, described) = match binding {
+        Some(bound) => (
+            Some(CausalPolicySource::Explicit(bound.policy)),
+            Some((bound.native, bound.origin)),
+        ),
+        None => (None, None),
+    };
+    load_from_factory(
+        device,
+        Admission::Machine(machine),
+        serving,
+        Some(DecisionDispatch::retained()),
+        described,
+        |device, preflight| {
+            produce_lfm2_gguf_with(
+                checkpoint,
+                mmproj,
+                tokenizer,
                 policy,
                 device,
                 owner_decode,
@@ -247,21 +346,17 @@ struct DecisionDispatch<M: CausalLM> {
     prepared: Option<PreparedDecision<M>>,
     raw: Option<RawDecision<M>>,
 }
-type PreparedDecision<M> =
-    fn(&Loaded<CausalEngine<M>>, usize, &CausalRequest) -> Result<SystemOneResponse>;
-type RawDecision<M> = fn(
-    &Loaded<CausalEngine<M>>,
-    usize,
-    &OrderedJson,
-) -> std::result::Result<SystemOneResponse, SystemOneError>;
+type PreparedDecision<M> = fn(&CausalEngine<M>, &CausalRequest) -> Result<SystemOneResponse>;
+type RawDecision<M> =
+    fn(&CausalEngine<M>, &OrderedJson) -> std::result::Result<SystemOneResponse, SystemOneError>;
 impl<M: CausalLM> DecisionDispatch<M>
 where
     M::Cache: CacheReset + CacheRewind + RetainState,
 {
     fn retained() -> Self {
         Self {
-            prepared: Some(CausalEngine::<M>::decide_admitted),
-            raw: Some(CausalEngine::<M>::systemone_admitted),
+            prepared: Some(CausalEngine::<M>::decide),
+            raw: Some(CausalEngine::<M>::systemone),
         }
     }
 }
@@ -272,11 +367,16 @@ struct FamilyFacts {
     vocab_size: usize,
     capacity: usize,
 }
-struct Serving<P> {
+struct Serving {
     config: Config,
     decode: DecodeConfig,
     capabilities: Capabilities,
-    predictor: P,
+}
+/// What scopes the load: a supplied model domain and its predictor, or the
+/// machine reservation the family already took.
+enum Admission<P> {
+    Domain { load: LoadContext, predictor: P },
+    Machine(lloom_tensor::machine::Admitted),
 }
 
 /// Shared supplied-domain factory route. The actual LFM2 GGUF caller above
@@ -284,9 +384,10 @@ struct Serving<P> {
 /// do the same. This does not register a family or infer complete admission.
 fn load_from_factory<P: Predictor, M: CausalLM>(
     device: &Device,
-    load: LoadContext,
-    serving: Serving<P>,
+    admission: Admission<P>,
+    serving: Serving,
     decisions: Option<DecisionDispatch<M>>,
+    binding: Option<(Option<crate::decision::binding::DecisionType>, String)>,
     produce: impl FnOnce(
         &Device,
         &mut dyn FnMut(FamilyFacts, &Tokenizer, Option<&CausalPolicy>) -> Result<()>,
@@ -298,7 +399,6 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         config,
         decode,
         mut capabilities,
-        predictor,
     } = serving;
     // This is a one-sequence text adapter, not a replacement for incumbent
     // batch/speculation/media family owners. Refuse overclaimed embedding facts.
@@ -314,7 +414,7 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
         lloom_tensor::bail!("generic causal adapter requires one-sequence text capabilities without unimplemented family mechanisms")
     }
     let mut inputs = Some((config, decode));
-    let loaded = Loaded::new(device, load, |device, _context| {
+    let produce_checked = |device: &Device| -> Result<CausalEngine<M>> {
         let mut preflight =
             |facts: FamilyFacts, tokenizer: &Tokenizer, policy: Option<&CausalPolicy>| {
                 let (config, decode) = inputs
@@ -341,12 +441,23 @@ fn load_from_factory<P: Predictor, M: CausalLM>(
             lloom_tensor::bail!("family materialization differs from serving preflight")
         }
         Ok(engine)
-    })?;
+    };
+    let owner = match admission {
+        Admission::Domain { load, predictor } => Custody::Admitted(Admitted::new(
+            Loaded::new(device, load, |device, _context| produce_checked(device))?,
+            predictor,
+        )),
+        Admission::Machine(machine) => Custody::Unadmitted {
+            engine: produce_checked(device)?,
+            _machine: machine,
+        },
+    };
     Ok(Engine {
-        owner: Admitted::new(loaded, predictor),
+        owner,
         metadata: metadata.expect("successful preflight installed serving facts"),
         warnings: Vec::new(),
         decisions,
+        binding,
     })
 }
 
@@ -440,13 +551,14 @@ where
     /// Preserve explicit generic prepared decisions when named raw rendering is
     /// absent or uncertified. The adapter never exposes an unscoped inner owner.
     pub fn decide_prepared(&self, request: &CausalRequest) -> Result<SystemOneResponse> {
-        let predicted = self.owner.predict(Request::PreparedDecisions(request))?;
         let execute = self
             .decisions
             .as_ref()
             .and_then(|route| route.prepared)
             .ok_or_else(|| Error::msg("family supplied no retained decision operation"))?;
-        execute(&self.owner.loaded, predicted, request)
+        self.pass(Request::PreparedDecisions(request), |engine| {
+            execute(engine, request)
+        })
     }
     /// Ordinary generic policy rendering does not require a shared-state
     /// certificate. Its tokens can feed an explicit prepared request; the
@@ -458,19 +570,14 @@ where
         question: &crate::decision::Question<OrderedJson>,
         labels: &[String],
     ) -> Result<String> {
-        let predicted = self.owner.predict(Request::SystemOneRender {
-            id,
-            state,
-            question,
-            labels,
-        })?;
-        CausalEngine::render_systemone_admitted(
-            &self.owner.loaded,
-            predicted,
-            id,
-            state,
-            question,
-            labels,
+        self.pass(
+            Request::SystemOneRender {
+                id,
+                state,
+                question,
+                labels,
+            },
+            |engine| engine.render_systemone(id, state, question, labels),
         )
     }
     fn pass<T>(
@@ -488,7 +595,7 @@ where
     }
     pub fn health_checked(&self) -> Result<Value> {
         self.pass(Request::Metadata(MetadataRequest::Health), |_| {
-            Ok(json!({"capacity": self.metadata.capacity, "capabilities": self.metadata.capabilities.json(), "admission": "caller-supplied coverage; producer enrollment incomplete"}))
+            Ok(json!({"capacity": self.metadata.capacity, "capabilities": self.metadata.capabilities.json(), "admission": self.owner.admission()}))
         })
     }
     pub fn describe_checked(&self) -> Result<String> {
@@ -505,15 +612,15 @@ where
         })
     }
     pub fn note_load_warnings_checked(&mut self, warnings: Vec<LoadWarning>) -> Result<()> {
-        let predicted =
-            self.owner
-                .predict(Request::Metadata(MetadataRequest::NoteLoadWarnings(
-                    &warnings,
-                )))?;
-        self.owner.loaded.with_pass(predicted, |_, _context| {
-            self.warnings.splice(0..0, warnings);
-            Ok(())
-        })
+        let incoming = &warnings;
+        let held = &mut self.warnings;
+        self.owner.pass(
+            Request::Metadata(MetadataRequest::NoteLoadWarnings(incoming)),
+            |_| {
+                held.splice(0..0, incoming.iter().cloned());
+                Ok(())
+            },
+        )
     }
     fn seed(&self, n: usize, row: usize) -> Vec<u32> {
         (0..n)
@@ -593,10 +700,6 @@ where
         &self,
         body: &OrderedJson,
     ) -> std::result::Result<SystemOneResponse, SystemOneError> {
-        let predicted = self
-            .owner
-            .predict(Request::Decisions(body))
-            .map_err(|e| SystemOneError::Execution(e.to_string()))?;
         let execute = self
             .decisions
             .as_ref()
@@ -604,7 +707,11 @@ where
             .ok_or_else(|| {
                 SystemOneError::Unsupported("family supplied no retained decision operation".into())
             })?;
-        execute(&self.owner.loaded, predicted, body)
+        self.pass(Request::Decisions(body), |engine| Ok(execute(engine, body)))
+            .map_err(|e| SystemOneError::Execution(e.to_string()))?
+    }
+    fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
+        self.binding.clone()
     }
     fn encode(&self, text: &str, add_special: bool) -> anyhow::Result<Vec<u32>> {
         Ok(self.encode_admitted(text, add_special)?)
@@ -841,7 +948,7 @@ where
     fn shutdown(&self) {} // No owner worker threads are launched by this adapter.
 }
 
-fn lfm2_gguf_capabilities() -> Capabilities {
+pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
     Capabilities {
         family: "lfm2-gguf",
         generation: true,
@@ -865,8 +972,9 @@ fn lfm2_gguf_capabilities() -> Capabilities {
         kv_dense: &["f32"],
         kv_quant_missing: "quantized GGUF weights do not install quantized KV stores",
         vision: false,
-        vision_missing:
-            "this text owner has no media encoder; other family media paths remain available",
+        vision_missing: "chat takes text only on this owner; decisions read images through \
+            the mmproj's tower (model.mmproj), and the safetensors checkpoint's lfm2 family chats \
+            with images",
         eos_gate: false,
         eos_gate_missing: "generic GGUF forward has no gated kernels",
     }

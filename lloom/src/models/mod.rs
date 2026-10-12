@@ -60,6 +60,7 @@ pub mod lfm2_dspark;
 pub mod lfm2_presets;
 pub mod lfm2_testing;
 pub mod lfm2_vl;
+pub mod lfm2_vl_mmproj;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;

@@ -196,18 +196,21 @@ impl Generic {
         };
         let first = render("lloom decision probe")?;
         let second = render("another probe, 7")?;
+        // Refused only when the reply opens inside a thinking block: a template
+        // that knows the tags but writes no block at the generation prompt
+        // (LFM2.5's: it keeps past turns' thinking) has nothing to turn off,
+        // and `label_mass` reports a model that thinks anyway.
         if let Some(tags) = engine.think_tags() {
-            if !kwargs.contains_key(super::template::ENABLE_THINKING) {
-                anyhow::bail!(
-                    "{}: the chat template writes a thinking block and does not read enable_thinking, \
-                     so thinking cannot be turned off for a first-token read",
-                    engine.model_name()
-                )
-            }
             if tags.open_at_end(&first).is_some() {
                 anyhow::bail!(
-                    "{}: the chat template leaves a thinking block open with enable_thinking=false",
-                    engine.model_name()
+                    "{}: the chat template leaves a thinking block open at the reply ({}), so \
+                     thinking cannot be turned off for a first-token read",
+                    engine.model_name(),
+                    if kwargs.contains_key(super::template::ENABLE_THINKING) {
+                        "with enable_thinking=false"
+                    } else {
+                        "and does not read enable_thinking"
+                    }
                 )
             }
         }
@@ -313,6 +316,9 @@ mod tests {
         thinking: Option<bool>,
         prompts: Mutex<Vec<String>>,
         binding: Option<(Option<DecisionType>, String)>,
+        /// The template knows the thinking tags (past turns) but writes no
+        /// block at the reply, as LFM2.5's does.
+        tags_only: bool,
     }
 
     fn toy() -> Toy {
@@ -322,6 +328,7 @@ mod tests {
             thinking: None,
             prompts: Mutex::new(Vec::new()),
             binding: None,
+            tags_only: false,
         }
     }
 
@@ -441,7 +448,7 @@ mod tests {
             Some(name == "enable_thinking" && self.thinking == Some(true))
         }
         fn think_tags(&self) -> Option<ThinkTags> {
-            self.thinking.map(|_| ThinkTags {
+            (self.thinking.is_some() || self.tags_only).then_some(ThinkTags {
                 start: THINK,
                 end: UNTHINK,
                 tool_call: None,
@@ -560,6 +567,11 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("thinking cannot be turned off"), "{error}");
+        // Knowing the tags is not writing a block: nothing to turn off.
+        let mut tags_only = toy();
+        tags_only.tags_only = true;
+        assert!(tags_only.think_tags().is_some());
+        Decisions::resolve(Some("generic"), &tags_only, None).unwrap();
     }
 
     #[test]
@@ -608,6 +620,12 @@ mod tests {
             .unwrap()
             .get("diagnostics")
             .is_none());
+        // `serve` names the model first, as llama.cpp's response does.
+        let served = serde_json::to_string(&plain.with_model("d1")).unwrap();
+        assert!(
+            served.starts_with(r#"{"model":"d1","answers":{"q":"#),
+            "{served}"
+        );
         let ignored = selected
             .decide(
                 &engine,

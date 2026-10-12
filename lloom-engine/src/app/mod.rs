@@ -14,6 +14,7 @@ pub mod decision_endpoint;
 mod decisions;
 pub mod family;
 pub mod lfm2;
+pub mod lfm2_gguf;
 pub mod modes;
 pub mod omni;
 pub mod qwen3_5;
@@ -89,6 +90,8 @@ pub enum Family {
     Qwen4Exp(PathBuf),
     /// A GGUF's first shard (`qwen35` / `qwen35moe`).
     Qwen3_5(PathBuf),
+    /// An LFM2 GGUF (`general.architecture = lfm2`, d1-3B's official files).
+    Lfm2Gguf(PathBuf),
 }
 
 /// The family from the path: a `.gguf` file, or a directory holding GGUF
@@ -104,6 +107,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     Ok(match f.name() {
         "lfm2" => Family::Lfm2(checkpoint),
         "qwen3_5" => Family::Qwen3_5(checkpoint),
+        "lfm2-gguf" => Family::Lfm2Gguf(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),
     })
 }

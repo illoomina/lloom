@@ -216,6 +216,25 @@ fn check_thinking_budget(
     Ok(())
 }
 
+/// One `/decide` line: a `/v1/systemone` request body inline (`{…}`) or
+/// in a file, answered as `serve` answers it. The conversation is untouched:
+/// a decision reads a fresh sequence, never the chat's.
+fn decide(
+    decisions: &super::decisions::Decisions,
+    engine: &dyn Served,
+    request: &str,
+) -> Result<String> {
+    let text = if request.starts_with('{') {
+        request.to_string()
+    } else {
+        std::fs::read_to_string(request).with_context(|| format!("reading {request}"))?
+    };
+    let body = crate::decision::OrderedJson::from_slice(text.as_bytes())
+        .map_err(|e| anyhow::anyhow!("the request is not JSON: {e}"))?;
+    let response = decisions.decide(engine, &body)?;
+    Ok(serde_json::to_string(&response)?)
+}
+
 pub fn run(args: ChatArgs) -> Result<()> {
     let options = super::resolve_options(&args.common, &|o| args.front(o))?;
     let want = options.reasoning.enabled;
@@ -269,6 +288,16 @@ pub fn run(args: ChatArgs) -> Result<()> {
         lloom::load_warning::LoadWarning::line(&engine.load_warnings_checked()?),
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
+    // `/decide` answers `/v1/systemone` requests on the same loaded model,
+    // with the binding `serve` would resolve.
+    let decisions = super::decisions::Decisions::resolve(
+        options.load.decision_template.as_deref(),
+        engine.as_ref(),
+        Some(path.as_path()),
+    )?;
+    if let Some(line) = decisions.describe() {
+        eprintln!("[{line}]");
+    }
     sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
@@ -337,6 +366,13 @@ pub fn run(args: ChatArgs) -> Result<()> {
         }
         if user == "/quit" || user == "/exit" {
             break;
+        }
+        if let Some(request) = user.strip_prefix("/decide ") {
+            match decide(&decisions, engine.as_ref(), request.trim()) {
+                Ok(response) => println!("{response}"),
+                Err(e) => eprintln!("[decision refused: {e:#}]"),
+            }
+            continue;
         }
         if let Some(path) = user.strip_prefix("/image ") {
             if args.raw {

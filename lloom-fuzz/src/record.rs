@@ -988,6 +988,9 @@ mod signal_reset_reference {
 /// every malloc and free from arming (just before the raise) to the
 /// predecessor's entry — the whole capture — so "no allocation" is measured
 /// at the allocator, below Rust's, with a positive control on the instrument.
+/// ASan replaces malloc below that hook, so under ASan the instrument is blind
+/// (pinned at zero) and the allocation count belongs to the uninstrumented
+/// build; delivery, replay, refusal and the backtrace are asserted under both.
 #[cfg(test)]
 mod signal_capture_controls {
     use super::*;
@@ -1005,6 +1008,19 @@ mod signal_capture_controls {
     }
 
     static HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    fn asan_runtime() -> bool {
+        // SAFETY: dlsym of an exported function name; null if absent.
+        !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__asan_init".as_ptr()) }.is_null()
+    }
+
+    fn instrument_marker() -> &'static str {
+        if asan_runtime() {
+            "INSTRUMENT_BLIND_UNDER_ASAN"
+        } else {
+            "INSTRUMENT_POSITIVE_CONTROL"
+        }
+    }
 
     /// Resolve libmalloc's `malloc_logger` variable once, before anything is
     /// measured: dlsym itself takes dyld's lock and may allocate.
@@ -1082,18 +1098,31 @@ mod signal_capture_controls {
         drop(std::hint::black_box(vec![0u8; 64]));
         logger(false);
         let control = EVENTS.load(Ordering::Relaxed);
-        assert!(
-            control >= 2,
-            "instrument blind: {control} events for one allocation"
-        );
-        println!("INSTRUMENT_POSITIVE_CONTROL events={control}");
+        let asan = asan_runtime();
+        if asan {
+            assert_eq!(
+                control, 0,
+                "ASan's allocator now reaches malloc_logger: assert the allocation count here too"
+            );
+        } else {
+            assert!(
+                control >= 2,
+                "instrument blind: {control} events for one allocation"
+            );
+        }
+        println!("{} events={control}", instrument_marker());
+        let allocation_free = |during: usize| {
+            if !asan {
+                assert_eq!(during, 0, "the signal route reached the allocator");
+            }
+        };
         let pid = std::process::id();
         match mode {
             "capture" => {
                 let during = deliver();
                 println!("CAPTURE_ALLOCATOR_EVENTS={during}");
                 assert_eq!(CALLS.load(Ordering::Relaxed), 1);
-                assert_eq!(during, 0, "the signal route reached the allocator");
+                allocation_free(during);
                 let archive = dir.join(format!("record-{pid}-0"));
                 let mut replayed = Vec::new();
                 let n = replay_with_identity(&archive, Some(IDENTITY), false, |bytes| {
@@ -1128,7 +1157,7 @@ mod signal_capture_controls {
                 let during = deliver();
                 println!("BUSY_ALLOCATOR_EVENTS={during}");
                 assert_eq!(CALLS.load(Ordering::Relaxed), 1);
-                assert_eq!(during, 0);
+                allocation_free(during);
                 drop(held);
                 assert!(
                     records(&dir).is_empty(),
@@ -1136,7 +1165,7 @@ mod signal_capture_controls {
                 );
                 let during = deliver();
                 assert_eq!(CALLS.load(Ordering::Relaxed), 2);
-                assert_eq!(during, 0);
+                allocation_free(during);
                 assert_eq!(
                     records(&dir),
                     [format!("record-{pid}-0")],
@@ -1164,7 +1193,7 @@ mod signal_capture_controls {
         eprintln!("{stdout}");
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success(), "delivered capture child failed");
-        assert!(stdout.contains("INSTRUMENT_POSITIVE_CONTROL"));
+        assert!(stdout.contains(instrument_marker()));
         assert!(stdout.contains(marker), "child did not reach {marker}");
     }
 
@@ -1205,5 +1234,82 @@ mod signal_capture_controls {
     #[test]
     fn delivered_signal_refuses_a_held_snapshot_without_blocking() {
         run("busy", "BUSY_REFUSED_THEN_CAPTURED");
+    }
+}
+
+/// The ASan arm's positive controls: planted overflows in this crate, built
+/// with the arm's instrumentation, must be reported, or a clean record suite
+/// under ASan says nothing. Compiled only into that arm (`lloom_fuzz_asan`,
+/// set by `sancov-wrapper.sh`), so no other build can pass them vacuously.
+#[cfg(all(test, lloom_fuzz_asan))]
+mod sanitizer_controls {
+    const CHILD: &str = "LLOOM_RECORD_ASAN_CONTROL_CHILD";
+
+    #[inline(never)]
+    fn read_at(base: *const u8, at: usize) -> u8 {
+        // SAFETY: none; the out-of-bounds read is the planted defect.
+        unsafe { std::ptr::read_volatile(base.add(at)) }
+    }
+
+    fn planted(kind: &str) {
+        match kind {
+            "heap" => {
+                let heap = std::hint::black_box(vec![7u8; 32]);
+                println!(
+                    "UNREPORTED={}",
+                    read_at(heap.as_ptr(), std::hint::black_box(32))
+                );
+            }
+            "stack" => {
+                let stack = std::hint::black_box([7u8; 32]);
+                println!(
+                    "UNREPORTED={}",
+                    read_at(stack.as_ptr(), std::hint::black_box(32))
+                );
+            }
+            other => panic!("unknown control {other}"),
+        }
+    }
+
+    fn reported(kind: &str, report: &str) {
+        if let Some(mode) = std::env::var_os(CHILD) {
+            planted(mode.to_str().unwrap());
+            return;
+        }
+        // SAFETY: dlsym of an exported function name; null if absent.
+        let runtime =
+            !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__asan_init".as_ptr()) }.is_null();
+        assert!(runtime, "lloom_fuzz_asan build without the ASan runtime");
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, kind)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("[{kind}] status {:?}\n{stdout}\n{stderr}", output.status);
+        assert!(
+            !output.status.success(),
+            "planted {kind} overflow ran clean"
+        );
+        assert!(
+            !stdout.contains("UNREPORTED="),
+            "planted {kind} overflow returned"
+        );
+        assert!(
+            stderr.contains(&format!("ERROR: AddressSanitizer: {report}")),
+            "no {report} report"
+        );
+        println!("ASAN_POSITIVE_CONTROL={report}");
+    }
+
+    #[test]
+    fn asan_reports_a_planted_heap_overflow() {
+        reported("heap", "heap-buffer-overflow");
+    }
+    #[test]
+    fn asan_reports_a_planted_stack_overflow() {
+        reported("stack", "stack-buffer-overflow");
     }
 }

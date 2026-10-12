@@ -4,6 +4,8 @@
 //! every link target of this package binds its imports at load instead.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Set by sancov-wrapper.sh on the ASan arm only.
+    println!("cargo::rustc-check-cfg=cfg(lloom_fuzz_asan)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-bind_at_load");
     }

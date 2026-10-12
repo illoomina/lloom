@@ -1,10 +1,8 @@
-//! Fixed-storage archive writer proposal. Not yet installed in the signal route.
-//! Uses the existing v1/v3 directory format; ordinary archive replay is unchanged.
-//! The caller supplies an already-open parent directory, exclusive coherent
-//! snapshot, immutable identity and unique dump sequence. No pathname allocation,
-//! Vec, String, std filesystem API or backtrace is used in this writer.
-//! Full async-signal acceptance still requires dependency/instrumentation audit
-//! and actual delivered-signal controls; Rust unit success alone is insufficient.
+//! The signal route's archive writer: the existing v1/v3 directory format,
+//! read by the ordinary replay reader, written with descriptor-relative
+//! syscalls and fixed stack buffers only. The caller supplies an already-open
+//! parent directory, an exclusive coherent snapshot, the immutable identity
+//! and a unique dump sequence. No allocation, std filesystem API or lock.
 
 use sha2::{Digest, Sha256};
 
@@ -45,6 +43,16 @@ impl<const N: usize> Text<N> {
             }
         }
         self.append(&digits[start..])
+    }
+    fn hex(&mut self, value: usize) -> bool {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut digits = [0u8; 2 + 2 * std::mem::size_of::<usize>()];
+        digits[..2].copy_from_slice(b"0x");
+        for (i, digit) in digits[2..].iter_mut().enumerate() {
+            let shift = 4 * (2 * std::mem::size_of::<usize>() - 1 - i);
+            *digit = HEX[(value >> shift) & 15];
+        }
+        self.append(&digits)
     }
     fn data(&self) -> &[u8] {
         &self.bytes[..self.len]
@@ -97,11 +105,70 @@ fn new_file(dir: libc::c_int, name: *const libc::c_char) -> Option<Descriptor> {
     (fd >= 0).then_some(Descriptor(fd))
 }
 
-fn fixed_file(dir: libc::c_int, name: &'static [u8], contents: &[u8]) -> bool {
-    let Some(fd) = new_file(dir, name.as_ptr().cast()) else {
+fn fixed_file(dir: libc::c_int, name: &'static std::ffi::CStr, contents: &[u8]) -> bool {
+    let Some(fd) = new_file(dir, name.as_ptr()) else {
         return false;
     };
     write_bytes(fd.0, contents) && unsafe { libc::fsync(fd.0) } == 0
+}
+
+fn record_name(pid: u64, sequence: u64) -> Option<Text<64>> {
+    let mut name = Text::<64>::new();
+    (name.append(b"record-") && name.decimal(pid) && name.append(b"-") && name.decimal(sequence))
+        .then_some(name)
+}
+
+/// Crash context beside a completed record: `bt.txt` with the faulting
+/// address, the handler image's base and path, and one raw `pc=` line per
+/// frame, innermost first. Best effort; the record does not depend on it.
+pub(super) fn context(
+    parent: libc::c_int,
+    pid: u64,
+    sequence: u64,
+    si_addr: usize,
+    image_base: usize,
+    image_path: &[u8],
+    frames: &[*mut libc::c_void],
+) -> bool {
+    let Some(mut path) = record_name(pid, sequence) else {
+        return false;
+    };
+    if !path.append(b"/bt.txt") {
+        return false;
+    }
+    let Some(path) = path.c_path() else {
+        return false;
+    };
+    let Some(fd) = new_file(parent, path) else {
+        return false;
+    };
+    let mut head = Text::<96>::new();
+    if !(head.append(b"si_addr=")
+        && head.hex(si_addr)
+        && head.append(b"\nimage_base=")
+        && head.hex(image_base)
+        && head.append(b"\nimage_path="))
+    {
+        return false;
+    }
+    if !(write_bytes(fd.0, head.data())
+        && write_bytes(fd.0, image_path)
+        && write_bytes(fd.0, b"\n"))
+    {
+        return false;
+    }
+    for &frame in frames {
+        let mut line = Text::<32>::new();
+        if !(line.append(b"pc=")
+            && line.hex(frame as usize)
+            && line.append(b"\n")
+            && write_bytes(fd.0, line.data()))
+        {
+            return false;
+        }
+    }
+    // SAFETY: freshly opened descriptor owned by `fd`.
+    unsafe { libc::fsync(fd.0) == 0 }
 }
 
 /// On failure all already-written artifacts remain inspectable. The completion
@@ -122,14 +189,9 @@ where
     if count == 0 || identity.is_some_and(|id| id.is_empty() || id.len() > 65536) {
         return false;
     }
-    let mut name = Text::<64>::new();
-    if !(name.append(b"record-")
-        && name.decimal(pid)
-        && name.append(b"-")
-        && name.decimal(sequence))
-    {
+    let Some(mut name) = record_name(pid, sequence) else {
         return false;
-    }
+    };
     let Some(name) = name.c_path() else {
         return false;
     };
@@ -153,23 +215,24 @@ where
     } else {
         FORMAT_V1
     };
-    if !fixed_file(dir.0, b"record.format\0", format) {
+    if !fixed_file(dir.0, c"record.format", format) {
         return false;
     }
     if let Some(id) = identity {
-        if !fixed_file(dir.0, b"record.identity\0", id) {
+        if !fixed_file(dir.0, c"record.identity", id) {
             return false;
         }
     }
     // Manifest staging is one file, not an allocation-sized metadata vector.
     // A .pending filename cannot be mistaken for replay completion evidence.
-    let Some(manifest) = new_file(dir.0, b"record.pending\0".as_ptr().cast()) else {
+    let Some(manifest) = new_file(dir.0, c"record.pending".as_ptr()) else {
         return false;
     };
     let mut count_line = Text::<24>::new();
-    if !(count_line.decimal(count as u64) && count_line.append(b"\n"))
-        || !write_bytes(manifest.0, format)
-        || !write_bytes(manifest.0, count_line.data())
+    if !(count_line.decimal(count as u64)
+        && count_line.append(b"\n")
+        && write_bytes(manifest.0, format)
+        && write_bytes(manifest.0, count_line.data()))
     {
         return false;
     }
@@ -207,8 +270,8 @@ where
             if !line.append(b" ") {
                 return false;
             }
-            // Dependencies require an independent fixed-storage/call-graph audit
-            // before this function may be described as async-signal-safe.
+            // sha2 builds with {default, std} only, which on aarch64 is its
+            // portable compressor: no feature detection, no allocation.
             let digest = Sha256::digest(bytes);
             const HEX: &[u8; 16] = b"0123456789abcdef";
             for byte in digest {
@@ -221,7 +284,7 @@ where
             return false;
         }
     }
-    if !fixed_file(dir.0, b"reason.txt\0", reason)
+    if !fixed_file(dir.0, c"reason.txt", reason)
         || !write_bytes(manifest.0, b"END\n")
         || unsafe { libc::fsync(manifest.0) } != 0
     {
@@ -232,9 +295,9 @@ where
     if unsafe {
         libc::linkat(
             dir.0,
-            b"record.pending\0".as_ptr().cast(),
+            c"record.pending".as_ptr(),
             dir.0,
-            b"record.complete\0".as_ptr().cast(),
+            c"record.complete".as_ptr(),
             0,
         )
     } != 0

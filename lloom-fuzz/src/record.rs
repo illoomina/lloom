@@ -24,9 +24,11 @@
 //! 2. a Rust panic anywhere under the harness — the hook installed by
 //!    [`Record::install_crash_dump`];
 //! 3. a signal (`SIGSEGV`, `SIGBUS`, `SIGABRT`, `SIGILL`, `SIGFPE`) — the
-//!    handlers installed by the same function, which write the ring with
-//!    `write(2)` and re-raise. LibAFL's own in-process handlers run too; ours are
-//!    chained ahead of them so the record exists before the fuzzer's report.
+//!    handlers installed by the same function, which write the ring through
+//!    a fixed-storage writer on a directory descriptor opened at install, then
+//!    chain to the action they replaced. LibAFL's own in-process handlers run
+//!    too; ours are chained ahead of them so the record exists before the
+//!    fuzzer's report.
 //!
 //! The dump is a directory `record-<pid>-<seq>/` holding `0000.bin … NNNN.bin`
 //! (oldest first, the dying input last), `reason.txt`, and a versioned
@@ -36,13 +38,13 @@
 //! The ring lives in a global because the signal path cannot take a lock or
 //! allocate: the slot buffers are pre-allocated at [`Record::install`] and a
 //! push is a `memcpy` under a nonblocking atomic permit. Contention refuses
-//! recording rather than racing the payload. Signal-safe I/O and handler
-//! composition remain separate obligations: the current dump still allocates.
+//! recording rather than racing the payload. The signal route uses only
+//! descriptor syscalls, fixed stack buffers and atomics; [`Record::dump`] and
+//! the panic hook keep the allocating writer, which is not a signal context.
 
 mod archive;
 pub(crate) mod identity;
 pub(crate) use archive::read_single;
-#[cfg(test)]
 mod fixed_capture;
 mod inputs;
 mod signals;
@@ -50,6 +52,7 @@ mod signals;
 use inputs::InputRing;
 pub use inputs::RecordError;
 use std::fs;
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -96,9 +99,39 @@ impl Default for ReplayLimits {
 struct Ring {
     inputs: InputRing,
     dir: PathBuf,
+    /// `dir` opened at install for the signal route; negative when it could
+    /// not be opened, in which case a signal writes no record.
+    dir_fd: libc::c_int,
     dumps: AtomicUsize,
     dumping: AtomicBool,
     identity: Option<Vec<u8>>,
+}
+
+impl Drop for Ring {
+    // Only a candidate that lost the install race is ever dropped; the
+    // installed ring is process-lifetime and keeps its descriptor.
+    fn drop(&mut self) {
+        if self.dir_fd >= 0 {
+            // SAFETY: the descriptor was opened by open_parent for this ring
+            // alone and was never published.
+            unsafe { libc::close(self.dir_fd) };
+        }
+    }
+}
+
+/// Open the record directory for descriptor-relative writes. Cold setup only.
+fn open_parent(dir: &Path) -> libc::c_int {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return -1;
+    };
+    // SAFETY: NUL-terminated path; the returned descriptor is owned by a Ring.
+    unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    }
 }
 
 static RING: std::sync::OnceLock<Ring> = std::sync::OnceLock::new();
@@ -123,6 +156,7 @@ impl Record {
             Ring {
                 inputs: InputRing::new(n, MAX_INPUT),
                 dir: dir.to_path_buf(),
+                dir_fd: open_parent(dir),
                 dumps: AtomicUsize::new(0),
                 dumping: AtomicBool::new(false),
                 identity: None,
@@ -186,9 +220,14 @@ impl Record {
         let inputs = InputRing::try_new(n, MAX_INPUT, limits.max_ring_bytes)
             .map_err(std::io::Error::other)?;
         fs::create_dir_all(dir)?;
+        let dir_fd = open_parent(dir);
+        if dir_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         let candidate = Ring {
             inputs,
             dir: dir.to_path_buf(),
+            dir_fd,
             dumps: AtomicUsize::new(0),
             dumping: AtomicBool::new(false),
             identity: Some(identity),
@@ -230,8 +269,8 @@ impl Record {
     /// Allocates, formats and synchronizes files; this can block on filesystem
     /// I/O. Returns a directory only after the completion manifest is written.
     /// Returns no directory if a writer or another dump
-    /// owns the history. The signal path currently shares this allocating I/O;
-    /// async-signal safety is not claimed by the payload ownership repair.
+    /// owns the history. Not for signal context: the signal route has its own
+    /// fixed-storage writer.
     pub fn dump(self, reason: &str) -> Option<PathBuf> {
         let r = RING.get()?;
         let dir = dump_raw(r, reason.as_bytes())?;
@@ -243,6 +282,7 @@ impl Record {
     /// returned before target execution; partial installs attempt rollback.
     /// Disposition replacement must remain serialized with process setup.
     pub fn install_crash_dump() -> std::io::Result<()> {
+        IMAGE.get_or_init(Image::of_handler);
         signals::install(on_signal).map_err(std::io::Error::other)?;
         static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
         PANIC_HOOK.call_once(|| {
@@ -259,56 +299,102 @@ impl Record {
     }
 }
 
-extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
-    let interrupted_errno = signals::PreservedErrno::new();
-    if let Some(r) = RING.get() {
-        let mut reason = *b"signal 00\n";
-        reason[7] = b'0' + ((sig / 10) % 10) as u8;
-        reason[8] = b'0' + (sig % 10) as u8;
-        if let Some(dir) = dump_raw(r, &reason) {
-            // The faulting address and the native backtrace, through
-            // `backtrace_symbols_fd` (libSystem's, writes straight to the fd).
-            // Not strictly async-signal-safe -- it is the last thing this
-            // handler does before chaining, and a crash here loses only the
-            // backtrace, never the record written above.
-            if let Ok(f) = fs::File::create(dir.join("bt.txt")) {
-                use std::os::unix::io::AsRawFd;
-                let fd = f.as_raw_fd();
-                // SAFETY: `info` is the kernel's siginfo for this delivery.
-                let addr = if info.is_null() {
-                    0usize
-                } else {
-                    unsafe { (*info).si_addr as usize }
-                };
-                let mut line = *b"si_addr=0x0000000000000000\n";
-                for i in 0..16 {
-                    let nib = ((addr >> (4 * (15 - i))) & 0xf) as u8;
-                    line[10 + i] = if nib < 10 {
-                        b'0' + nib
-                    } else {
-                        b'a' + nib - 10
-                    };
-                }
-                let _ = (&f).write_all(&line);
-                let mut frames = [std::ptr::null_mut::<libc::c_void>(); 96];
-                // SAFETY: a fixed-size frame buffer; libSystem walks the stack.
-                unsafe {
-                    let n = libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int);
-                    libc::backtrace_symbols_fd(frames.as_ptr(), n, fd);
+/// The image holding the capture handler, recorded at install so a signal-time
+/// backtrace can be written as raw addresses and symbolized offline
+/// (`atos -o <image_path> -l <image_base> <pc>...`): symbolizing in the handler
+/// would take dyld's lock.
+struct Image {
+    base: usize,
+    path: [u8; 1024],
+    len: usize,
+}
+
+impl Image {
+    fn of_handler() -> Self {
+        let mut image = Image {
+            base: 0,
+            path: [0; 1024],
+            len: 0,
+        };
+        // SAFETY: dladdr fills the zeroed Dl_info on success; dli_fname is a
+        // NUL-terminated string owned by dyld for the image's lifetime.
+        unsafe {
+            let mut found: libc::Dl_info = std::mem::zeroed();
+            if libc::dladdr(on_signal as *const libc::c_void, &mut found) != 0 {
+                image.base = found.dli_fbase as usize;
+                if !found.dli_fname.is_null() {
+                    let name = std::ffi::CStr::from_ptr(found.dli_fname).to_bytes();
+                    image.len = name.len().min(image.path.len());
+                    image.path[..image.len].copy_from_slice(&name[..image.len]);
                 }
             }
         }
+        image
+    }
+}
+
+static IMAGE: std::sync::OnceLock<Image> = std::sync::OnceLock::new();
+
+extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let interrupted_errno = signals::PreservedErrno::new();
+    if let Some(r) = RING.get() {
+        capture_signal(r, sig, info);
     }
     // SAFETY: forward the original kernel delivery to the ABI and policy
-    // retained from the predecessor. Allocating dump/backtrace I/O above is
-    // still a separate async-signal-safety defect, not repaired by this chain.
+    // retained from the predecessor.
     interrupted_errno.restore();
     unsafe { signals::chain(sig, info, ctx) };
 }
 
-/// Write a coherent ring snapshot. This still allocates and is NOT yet an
-/// async-signal-safe I/O implementation. Busy snapshots return no directory.
-fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
+/// The signal route: descriptor syscalls, fixed stack storage and atomics only.
+/// The record is complete before the backtrace is attempted, so a fault while
+/// walking the stack loses the backtrace, never the record.
+fn capture_signal(r: &Ring, sig: libc::c_int, info: *mut libc::siginfo_t) {
+    if r.dir_fd < 0 {
+        return;
+    }
+    let mut reason = *b"signal 00\n";
+    reason[7] = b'0' + ((sig / 10) % 10) as u8;
+    reason[8] = b'0' + (sig % 10) as u8;
+    // SAFETY: getpid has no failure mode and is async-signal-safe.
+    let pid = unsafe { libc::getpid() } as u64;
+    let written = with_history(r, |snapshot, seq| {
+        fixed_capture::capture(
+            r.dir_fd,
+            pid,
+            seq as u64,
+            snapshot.inputs(),
+            r.identity.as_deref(),
+            &reason,
+        )
+        .then_some(seq)
+    });
+    let Some(seq) = written else {
+        return;
+    };
+    // SAFETY: `info` is the kernel's siginfo for this delivery, or null.
+    let addr = if info.is_null() {
+        0
+    } else {
+        unsafe { (*info).si_addr as usize }
+    };
+    let mut frames = [std::ptr::null_mut::<libc::c_void>(); 96];
+    // SAFETY: a fixed-size frame buffer; the count written is bounded by it.
+    let n = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int) };
+    let frames = &frames[..(n.max(0) as usize).min(frames.len())];
+    let (base, path) = IMAGE
+        .get()
+        .map_or((0, &[][..]), |image| (image.base, &image.path[..image.len]));
+    fixed_capture::context(r.dir_fd, pid, seq as u64, addr, base, path, frames);
+}
+
+/// Run `f` on a coherent snapshot with a fresh dump sequence number, or not at
+/// all when another dump, a writer or a reader owns the history. Never blocks:
+/// the caller may have interrupted the owner.
+fn with_history<T>(
+    r: &Ring,
+    f: impl FnOnce(&inputs::Snapshot<'_>, usize) -> Option<T>,
+) -> Option<T> {
     if r.dumping.swap(true, Ordering::AcqRel) {
         return None; // re-entrant (a crash inside a dump): leave the first one
     }
@@ -320,17 +406,23 @@ fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
         }
     }
     let _dump_guard = DumpGuard(&r.dumping);
-    // The hook can interrupt a writer or another thread can be recording.
-    // Never read racing bytes or block waiting for the interrupted thread.
     let snapshot = r.inputs.snapshot().ok()?;
     snapshot.inputs().next()?;
     let seq = r
         .dumps
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
         .ok()?;
-    let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));
-    archive::write_identified(&dir, snapshot.inputs(), reason, r.identity.as_deref()).ok()?;
-    Some(dir)
+    f(&snapshot, seq)
+}
+
+/// Write a coherent ring snapshot through the allocating archive writer, for
+/// the oracle and panic exits. Busy snapshots return no directory.
+fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
+    with_history(r, |snapshot, seq| {
+        let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));
+        archive::write_identified(&dir, snapshot.inputs(), reason, r.identity.as_deref()).ok()?;
+        Some(dir)
+    })
 }
 
 /// Replay a record directory (or a single input file) through `harness`, in
@@ -875,5 +967,230 @@ mod signal_reset_reference {
     #[test]
     fn reset_sigfpe_matches_unwrapped_kernel() {
         reset_matches_reference(libc::SIGFPE);
+    }
+}
+
+/// The installed signal route under real delivery. A returning predecessor lets
+/// the child inspect what capture wrote. libmalloc's `malloc_logger` counts
+/// every malloc and free from arming (just before the raise) to the
+/// predecessor's entry — the whole capture — so "no allocation" is measured
+/// at the allocator, below Rust's, with a positive control on the instrument.
+#[cfg(test)]
+mod signal_capture_controls {
+    use super::*;
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    const CHILD: &str = "LLOOM_RECORD_SIGNAL_CAPTURE_CHILD";
+    const IDENTITY: &[u8] = b"signal-capture-control";
+    static EVENTS: AtomicUsize = AtomicUsize::new(0);
+    static EVENTS_AT_PREDECESSOR: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ERRNO_AT_PREDECESSOR: AtomicI32 = AtomicI32::new(-1);
+    static CALLS: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn count(_: u32, _: usize, _: usize, _: usize, _: usize, _: u32) {
+        EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    /// Resolve libmalloc's `malloc_logger` variable once, before anything is
+    /// measured: dlsym itself takes dyld's lock and may allocate.
+    fn resolve_logger() {
+        // SAFETY: dlsym of an exported data symbol; null if absent.
+        let hook = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc_logger".as_ptr()) };
+        assert!(!hook.is_null(), "libmalloc's malloc_logger is not exported");
+        HOOK.store(hook as usize, Ordering::Relaxed);
+    }
+
+    fn logger(on: bool) {
+        let value = if on { count as *const () as usize } else { 0 };
+        // SAFETY: HOOK is libmalloc's function-pointer variable (resolved and
+        // checked non-null); a volatile store of null or a matching C function
+        // is how its own tools arm it.
+        unsafe { std::ptr::write_volatile(HOOK.load(Ordering::Relaxed) as *mut usize, value) };
+    }
+
+    extern "C" fn predecessor(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        logger(false);
+        EVENTS_AT_PREDECESSOR.store(EVENTS.load(Ordering::Relaxed), Ordering::Relaxed);
+        ERRNO_AT_PREDECESSOR.store(errno::errno().0, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn deliver() -> usize {
+        EVENTS.store(0, Ordering::Relaxed);
+        EVENTS_AT_PREDECESSOR.store(usize::MAX, Ordering::Relaxed);
+        errno::set_errno(errno::Errno(libc::EDOM));
+        logger(true);
+        // SAFETY: a returning predecessor is registered behind capture.
+        assert_eq!(unsafe { libc::raise(libc::SIGILL) }, 0);
+        assert_eq!(errno::errno().0, libc::EDOM, "interrupted errno leaked");
+        assert_eq!(ERRNO_AT_PREDECESSOR.load(Ordering::Relaxed), libc::EDOM);
+        EVENTS_AT_PREDECESSOR.load(Ordering::Relaxed)
+    }
+
+    fn records(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("record-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn child(mode: &str) {
+        // SAFETY: cold setup in a disposable child; no core files.
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) }, 0);
+        let dir = std::env::temp_dir().join(format!("lloom-signal-capture-{}", std::process::id()));
+        let record = Record::install_with_identity(&dir, 4, IDENTITY.to_vec()).unwrap();
+        for input in [b"first".as_slice(), b"", b"dying input"] {
+            record.push(input).unwrap();
+        }
+        // SAFETY: the action is fully initialized before registration.
+        let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
+        prior.sa_sigaction = predecessor as *const () as usize;
+        prior.sa_flags = libc::SA_SIGINFO;
+        assert_eq!(
+            unsafe {
+                libc::sigemptyset(&mut prior.sa_mask);
+                libc::sigaction(libc::SIGILL, &prior, std::ptr::null_mut())
+            },
+            0
+        );
+        Record::install_crash_dump().unwrap();
+        resolve_logger();
+        logger(true);
+        EVENTS.store(0, Ordering::Relaxed);
+        drop(std::hint::black_box(vec![0u8; 64]));
+        logger(false);
+        let control = EVENTS.load(Ordering::Relaxed);
+        assert!(
+            control >= 2,
+            "instrument blind: {control} events for one allocation"
+        );
+        println!("INSTRUMENT_POSITIVE_CONTROL events={control}");
+        let pid = std::process::id();
+        match mode {
+            "capture" => {
+                let during = deliver();
+                println!("CAPTURE_ALLOCATOR_EVENTS={during}");
+                assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+                assert_eq!(during, 0, "the signal route reached the allocator");
+                let archive = dir.join(format!("record-{pid}-0"));
+                let mut replayed = Vec::new();
+                let n = replay_with_identity(&archive, Some(IDENTITY), false, |bytes| {
+                    replayed.push(bytes.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(n, 3);
+                assert_eq!(
+                    replayed,
+                    [b"first".to_vec(), Vec::new(), b"dying input".to_vec()]
+                );
+                assert_eq!(
+                    fs::read(archive.join("reason.txt")).unwrap(),
+                    b"signal 04\n"
+                );
+                let bt = fs::read_to_string(archive.join("bt.txt")).unwrap();
+                let image = std::env::current_exe().unwrap();
+                assert!(bt.starts_with("si_addr=0x"), "{bt}");
+                assert!(!bt.contains("image_base=0x0000000000000000"), "{bt}");
+                assert!(
+                    bt.contains(&format!("image_path={}\n", image.display())),
+                    "{bt}"
+                );
+                let pcs = bt.lines().filter(|l| l.starts_with("pc=0x")).count();
+                assert!(pcs > 0, "{bt}");
+                print!("BT_TXT_BEGIN\n{bt}BT_TXT_END\n");
+                println!("SIGNAL_CAPTURE_REPLAYED inputs={n} pcs={pcs}");
+            }
+            "busy" => {
+                let held = RING.get().unwrap().inputs.snapshot().unwrap();
+                let during = deliver();
+                println!("BUSY_ALLOCATOR_EVENTS={during}");
+                assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+                assert_eq!(during, 0);
+                drop(held);
+                assert!(
+                    records(&dir).is_empty(),
+                    "a held snapshot must refuse capture"
+                );
+                let during = deliver();
+                assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+                assert_eq!(during, 0);
+                assert_eq!(
+                    records(&dir),
+                    [format!("record-{pid}-0")],
+                    "a refused capture must not consume the dump sequence"
+                );
+                println!("BUSY_REFUSED_THEN_CAPTURED");
+            }
+            other => panic!("unknown mode {other}"),
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn run(mode: &str, marker: &str) {
+        if std::env::var_os(CHILD).is_some() {
+            child(mode);
+            return;
+        }
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, mode)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("{stdout}");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "delivered capture child failed");
+        assert!(stdout.contains("INSTRUMENT_POSITIVE_CONTROL"));
+        assert!(stdout.contains(marker), "child did not reach {marker}");
+    }
+
+    /// The handler's libSystem calls must not reach dyld's lazy binder: this
+    /// image (the one the delivered controls run in) carries no lazy binds.
+    #[test]
+    fn this_image_binds_every_import_at_load() {
+        const LC_DYLD_INFO: u32 = 0x22;
+        const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+        const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+        let image = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            word(0),
+            0xfeed_facf,
+            "expected a thin 64-bit Mach-O test binary"
+        );
+        let (mut at, mut lazy, mut chained) = (32, None, false);
+        for _ in 0..word(16) {
+            let (cmd, size) = (word(at), word(at + 4) as usize);
+            if cmd == LC_DYLD_INFO || cmd == LC_DYLD_INFO_ONLY {
+                lazy = Some(word(at + 36));
+            }
+            chained |= cmd == LC_DYLD_CHAINED_FIXUPS;
+            at += size;
+        }
+        println!("LAZY_BIND_SIZE={lazy:?} CHAINED_FIXUPS={chained}");
+        assert!(
+            chained || lazy == Some(0),
+            "lazy binds present ({lazy:?} bytes): the signal route's first libSystem \
+             call would run dyld's stub binder inside the handler"
+        );
+    }
+    #[test]
+    fn delivered_signal_writes_a_replayable_record_without_allocating() {
+        run("capture", "SIGNAL_CAPTURE_REPLAYED inputs=3");
+    }
+    #[test]
+    fn delivered_signal_refuses_a_held_snapshot_without_blocking() {
+        run("busy", "BUSY_REFUSED_THEN_CAPTURED");
     }
 }

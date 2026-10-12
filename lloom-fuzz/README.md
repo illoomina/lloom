@@ -97,9 +97,20 @@ engine's own `sanitize` profile covers the device path (§15.1g).
 
 Every client keeps the last `--record N` (default 64) inputs it executed.
 Oracle failure, panic and signal paths attempt capture under `--record-dir`.
-Capture is not guaranteed: a busy byte-ring snapshot is refused, filesystem
-errors can prevent a dump, and the signal writer/handler composition still
-needs its separate safety repair. Do not infer successful capture from a crash.
+Capture is not guaranteed: a busy byte-ring snapshot is refused and
+filesystem errors can prevent a dump. Do not infer successful capture from a
+crash.
+
+The signal path writes through its own fixed-storage writer: descriptor-
+relative syscalls on the record directory opened at install, stack buffers
+and atomics, no allocation and no std filesystem API (the oracle and panic
+exits keep the allocating writer). Its `bt.txt` holds `si_addr=`,
+`image_base=`, `image_path=` and one raw `pc=` per frame, innermost first;
+symbolize offline with `atos -o <image_path> -l <image_base> <pc>...`, since
+symbolizing in the handler would take dyld's lock. `build.rs` links every
+target of this package with `-bind_at_load`, so the handler's libSystem calls
+never reach dyld's lazy binder. `backtrace(3)` itself is not on POSIX's
+async-signal-safe list and is called only after the record is complete.
 
 The signal handler chains to the action it replaced, with that action's
 handler ABI, mask, `SA_NODEFER`, `SA_ONSTACK`, `SA_RESTART` and default/ignore
@@ -113,8 +124,8 @@ New campaign directories use `lloom-input-record-v3`: numbered `.bin` inputs
 (oldest first), `reason.txt`, `record.format`, required `record.identity`, and a
 final `record.complete` count/length/SHA-256 manifest. The low-level legacy recorder
 still writes v1. Failed writes leave inspectable partial evidence, not a
-successful directory result. Filesystem I/O allocates and may block; it is not
-async-signal-safe. Replay validates format, completion, numeric order, sizes and all v3 content digests
+successful directory result. The oracle/panic writer allocates; both writers
+may block on filesystem I/O. Replay validates format, completion, numeric order, sizes and all v3 content digests
 before executing any input. Missing/oversized v2/v3 identity is an error, including
 under the diagnostic override. Legacy numbered directories and v1/v2 records remain readable. Unidentified
 records warn about identity; records without content digests separately warn
@@ -134,8 +145,8 @@ actual owned bytes at invocation, detecting same-length input replacements.
 This is not authenticated storage or an atomic multi-file snapshot: jointly
 rewriting the manifest and inputs is outside this integrity contract. Replay bounds directory traversal, input count,
 aggregate metadata and total declared input bytes with configurable limits.
-These are logical work limits, not an RSS or allocator quota. Signal-safe capture,
-record-ring allocation admission and writer-side archive bounds remain open. Do not modify a record during replay.
+These are logical work limits, not an RSS or allocator quota. Record-ring
+allocation admission and writer-side archive bounds remain open. Do not modify a record during replay.
 Replay in one fresh process:
 
 ```sh
@@ -200,5 +211,5 @@ This is not a process RSS cap: allocator rounding, concurrent setup attempts,
 identity/path storage and allocating dump I/O are excluded. Legacy `Record::install`
 remains infallible/first-wins; programmatic identified callers can use
 `Record::install_with_identity_and_limits` for explicit recovery. Default identified
-installation uses the same quota. Async-signal-safe dump I/O and complete schedule
-fuzzing remain unresolved; this repair does not diagnose or fix the GPU stall.
+installation uses the same quota. Complete schedule fuzzing remains
+unresolved; this repair does not diagnose or fix the GPU stall.

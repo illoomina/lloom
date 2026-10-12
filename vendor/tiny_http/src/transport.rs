@@ -552,3 +552,165 @@ mod origin_controls {
         assert_eq!(control.origin.disposal.lock().deadline, None);
     }
 }
+
+// Proposed ignored controls only. No socket execution is authorized by this file.
+#[cfg(test)]
+mod controlled_loopback {
+    use super::*;
+    use crate::client::ClientConnection;
+    use crate::connection::Connection;
+    use crate::util::RefinedTcpStream;
+    use crate::Response;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn pair(cap: usize) -> (ClientConnection, TcpStream, ConnectionCancellation) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(1);
+        let accepted = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "owned localhost acceptance bound");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("owned localhost accept failed: {}", error),
+            }
+        };
+        // The bounded accept loop needs a nonblocking listener, but controlled
+        // origin I/O uses blocking sockets with finite read/write timeouts.
+        let blocking = accepted.set_nonblocking(false);
+        eprintln!("actual accepted socket set_nonblocking(false) receipt={blocking:?}");
+        blocking.unwrap();
+        let connection = Connection::from(accepted);
+        let control = ConnectionCancellation::new(
+            &connection,
+            TransportPolicy {
+                io_timeout: Duration::from_millis(200),
+                disposal_timeout: Duration::from_millis(100),
+                max_discard_bytes: cap,
+            },
+        )
+        .unwrap();
+        let (read, write) = RefinedTcpStream::new_controlled(connection, control.clone());
+        (
+            ClientConnection::new(write, read, Some(control.clone())),
+            client,
+            control,
+        )
+    }
+    // Failure observation only: one bounded peer read, preserving the original expectation.
+    fn observed_next(
+        origin: &mut ClientConnection,
+        peer: &mut TcpStream,
+        control: &ConnectionCancellation,
+        expectation: &str,
+    ) -> crate::Request {
+        let result = origin.next();
+        if result.is_none() {
+            let mut response = [0u8; 8193];
+            let receipt = peer.read(&mut response);
+            eprintln!(
+                "actual failed origin expectation={expectation}; gate={:?}; peer read={receipt:?}",
+                control.check()
+            );
+            if let Ok(count) = receipt {
+                eprintln!("bounded peer bytes={:?}", &response[..count]);
+            }
+        }
+        result.expect(expectation)
+    }
+    #[test]
+    #[ignore = "socket fixture requires separate bounded execution review"]
+    fn actual_origin_small_body_retains_two_request_pipeline() {
+        let (mut origin, mut peer, control) = pair(4096);
+        peer.write_all(b"POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabcGET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut first = observed_next(&mut origin, &mut peer, &control, "first actual request");
+        assert_eq!(first.url(), "/one");
+        let mut body = [0; 3];
+        first.as_reader().read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"abc");
+        first.respond(Response::from_string("one")).unwrap();
+        let second = observed_next(&mut origin, &mut peer, &control, "second actual request");
+        assert_eq!(second.url(), "/two");
+        second.respond(Response::from_string("two")).unwrap();
+        assert!(origin.next().is_none());
+        drop(origin);
+        let mut wire = Vec::new();
+        Read::by_ref(&mut peer)
+            .take(8193)
+            .read_to_end(&mut wire)
+            .unwrap();
+        assert!(wire.len() <= 8192);
+        let wire = String::from_utf8(wire).unwrap();
+        assert_eq!(wire.matches("HTTP/1.1 200 OK").count(), 2);
+        assert!(wire.contains("\r\n\r\noneHTTP/1.1 200 OK"));
+        assert!(wire.ends_with("\r\n\r\ntwo"));
+        assert!(
+            control.check().is_ok(),
+            "successful pipeline must not cancel the retained origin gate"
+        );
+    }
+    #[test]
+    #[ignore = "socket fixture requires separate bounded execution review"]
+    fn actual_origin_incomplete_body_drop_cancels_with_absolute_disposal() {
+        let (mut origin, mut peer, control) = pair(16);
+        peer.write_all(b"POST /held HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2048\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        let request = observed_next(
+            &mut origin,
+            &mut peer,
+            &control,
+            "large unprebuffered request",
+        );
+        assert_eq!(request.url(), "/held");
+        let started = Instant::now();
+        drop(request);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "coarse retained bound, not latency claim"
+        );
+        assert_eq!(
+            control.check().unwrap_err().kind(),
+            ErrorKind::ConnectionAborted
+        );
+        assert!(origin.next().is_none());
+        drop(origin);
+        let mut wire = Vec::new();
+        Read::by_ref(&mut peer)
+            .take(8193)
+            .read_to_end(&mut wire)
+            .unwrap();
+        assert!(wire.len() <= 8192);
+        assert!(String::from_utf8(wire)
+            .unwrap()
+            .starts_with("HTTP/1.1 500 Internal Server Error"));
+    }
+    #[test]
+    #[ignore = "socket fixture requires separate bounded execution review"]
+    fn actual_origin_cancel_refuses_following_header_without_prefetch_claim() {
+        let (mut origin, mut peer, control) = pair(4096);
+        peer.write_all(b"GET /first HTTP/1.1\r\nHost: localhost\r\n\r\nGET /never HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let request = observed_next(&mut origin, &mut peer, &control, "first actual request");
+        assert_eq!(request.url(), "/first");
+        let request_control = request
+            .cancellation_handle()
+            .expect("actual accepted origin control");
+        assert!(Arc::ptr_eq(&request_control.origin, &control.origin));
+        request_control.cancel().unwrap();
+        drop(request);
+        assert!(
+            origin.next().is_none(),
+            "canceled origin cannot produce another request"
+        );
+        drop(origin);
+    }
+}

@@ -116,7 +116,11 @@ impl ClientConnection {
         let (method, path, version, headers) = {
             // reading the request line
             let (method, path, version) = {
-                let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                let line = self.read_next_line().map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!("actual ClientConnection request-line read error: {error:?}");
+                    ReadError::ReadIoError(error)
+                })?;
 
                 parse_request_line(
                     line.as_str().trim(), // TODO: remove this conversion
@@ -127,7 +131,11 @@ impl ClientConnection {
             let headers = {
                 let mut headers = Vec::new();
                 loop {
-                    let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
+                    let line = self.read_next_line().map_err(|error| {
+                        #[cfg(test)]
+                        eprintln!("actual ClientConnection header read error: {error:?}");
+                        ReadError::ReadIoError(error)
+                    })?;
 
                     if line.is_empty() {
                         break;
@@ -165,6 +173,8 @@ impl ClientConnection {
             self.control.clone(),
         )
         .map_err(|e| {
+            #[cfg(test)]
+            eprintln!("actual ClientConnection Request creation error: {e:?}");
             use crate::request;
             match e {
                 request::RequestCreationError::CreationIoError(e) => ReadError::ReadIoError(e),
@@ -194,7 +204,15 @@ impl Iterator for ClientConnection {
         }
 
         loop {
-            let rq = match self.read() {
+            let result = self.read();
+            #[cfg(test)]
+            if let Err(error) = &result {
+                eprintln!(
+                    "actual ClientConnection iterator ReadError={error:?}; origin gate={:?}",
+                    self.control.as_ref().map(|control| control.check())
+                );
+            }
+            let rq = match result {
                 Err(ReadError::WrongRequestLine) => {
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(400));

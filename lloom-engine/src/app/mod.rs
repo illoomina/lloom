@@ -622,16 +622,19 @@ pub enum Command {
     Options(OptionsCmdArgs),
 }
 
-/// The `lloom` binary's entry.
+/// The `lloom` binary's entry. The HTTP retirement service owns whatever a
+/// dropped server left running, so the process joins it before it exits.
 pub fn main(argv: Vec<String>) -> Result<()> {
     let cli = Cli::parse_from(argv);
-    match cli.command {
+    let result = match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Bench(args) => serve::bench(args),
         Command::Config(args) => print_config(&args),
         Command::Options(args) => print_options(&args),
-    }
+    };
+    serve::join_http_retirement();
+    result
 }
 
 /// The `lloom-serve` binary's entry: `lloom serve` with the same flags, so

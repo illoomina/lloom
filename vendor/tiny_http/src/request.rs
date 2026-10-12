@@ -97,7 +97,8 @@ impl<R: Write> Write for NotifyOnDrop<R> {
 }
 impl<R> Drop for NotifyOnDrop<R> {
     fn drop(&mut self) {
-        self.sender.send(()).unwrap();
+        // The serving thread stops listening once the server shuts down.
+        self.sender.send(()).ok();
     }
 }
 
@@ -518,7 +519,7 @@ impl Request {
             Ok(())
         };
         if let Some(sender) = self.notify_when_responded.take() {
-            sender.send(()).unwrap();
+            sender.send(()).ok();
         }
         res.and(disposal)
     }
@@ -583,11 +584,7 @@ impl Drop for Request {
             let response = Response::empty(500);
             let _ = self.respond_impl(response); // ignoring any potential error
             if let Some(sender) = self.notify_when_responded.take() {
-                if control.is_some() {
-                    sender.send(()).ok();
-                } else {
-                    sender.send(()).unwrap();
-                }
+                sender.send(()).ok();
             }
         }
         if control.is_some() {

@@ -13,8 +13,15 @@ of proceeding with poisoned writes. New disposal metadata uses parking_lot.
 
 Changes: fixed EqualReader destructor workspace; opt-in plain HTTP exact-origin
 cancellation, finite per-I/O/handoff wait, explicit unread-body time/work policy.
-See TransportPolicy docs. Header/chunk parser storage, thread cardinality/join,
+See TransportPolicy docs. Header/chunk parser storage, thread cardinality,
 application producer execution and model/native retirement are NOT bounded here.
+
+Server lifecycle (`src/lifecycle.rs`): `Server::shutdown(deadline) ->
+ShutdownReport`, `shutdown_blocking`, a `Drop` that queues the same retirement
+on a joined service thread instead of blocking, and `join_retirement` for
+process exit. The pool retains every thread's handle; each accepted connection
+is registered so it can be read-closed at shutdown and cut at the deadline.
+Report and controls: design/measurements/issue-947-http-shutdown.md.
 
 ## Offline library controls versus preserved legacy development
 

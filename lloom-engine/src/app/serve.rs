@@ -115,6 +115,35 @@ struct Shared {
     sampling: crate::SamplingConfig,
 }
 
+/// How long a server's in-flight requests get to answer once serving stops,
+/// before their connections are cut.
+const HTTP_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stops `server` within [`HTTP_SHUTDOWN_BUDGET`] and says so when it had to
+/// cut a connection or leave a thread to the retirement service.
+fn shutdown_http(server: &Server) {
+    let report = server.shutdown(Instant::now() + HTTP_SHUTDOWN_BUDGET);
+    if !report.completed && !report.already_shut_down {
+        eprintln!(
+            "[http shutdown: cut {} connection(s) at the {}s budget, {} thread(s) left to the retirement service]",
+            report.cut.len(),
+            HTTP_SHUTDOWN_BUDGET.as_secs(),
+            report.threads_retiring,
+        );
+    }
+}
+
+/// Joins tiny_http's retirement service before the process exits.
+pub(crate) fn join_http_retirement() {
+    let joined = tiny_http::join_retirement(Instant::now() + HTTP_SHUTDOWN_BUDGET);
+    if !joined.completed {
+        eprintln!(
+            "[http retirement: {} server(s) and {} thread(s) still retiring at exit]",
+            joined.pending_servers, joined.threads_retiring,
+        );
+    }
+}
+
 fn listener<A: std::net::ToSocketAddrs>(
     addr: A,
     policy: Option<tiny_http::TransportPolicy>,
@@ -295,9 +324,11 @@ fn run_owner(
             }
         }
     }
-    // A request thread still decoding holds the sequence, and the batch
-    // thread holds the pool; wait for both so the model is not dropped under
-    // a running command buffer.
+    // In-flight requests answer within the budget; then their connections
+    // are cut. A request thread still decoding holds the sequence, and the
+    // batch thread holds the pool; wait for both so the model is not dropped
+    // under a running command buffer.
+    shutdown_http(&shared.server);
     shared.engine.shutdown();
     Ok(())
 }
@@ -413,10 +444,10 @@ fn run_decisions_configured(
             }
         }
     }
-    // Our loop spawned no request threads and its last synchronous call returned.
-    // tiny_http owns separate listener/connection machinery; this does NOT
-    // establish its thread/drain/socket shutdown closure.
+    // Our loop spawned no request threads and its last synchronous call
+    // returned; the server's own threads and connections retire here.
     // Worker-stop only: no native DATA/callback/retirement certificate.
+    shutdown_http(&server);
     endpoint.shutdown();
     Ok(())
 }

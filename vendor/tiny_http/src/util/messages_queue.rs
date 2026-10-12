@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,9 @@ where
 {
     queue: Mutex<VecDeque<Control<T>>>,
     condvar: Condvar,
+    // Written only under `queue`'s lock: after close nothing enters and
+    // every pop returns None.
+    closed: AtomicBool,
     #[cfg(test)]
     timeout_observer: parking_lot::Mutex<Option<std::sync::mpsc::SyncSender<Duration>>>,
 }
@@ -25,16 +29,42 @@ where
         Arc::new(MessagesQueue {
             queue: Mutex::new(VecDeque::with_capacity(capacity)),
             condvar: Condvar::new(),
+            closed: AtomicBool::new(false),
             #[cfg(test)]
             timeout_observer: parking_lot::Mutex::new(None),
         })
     }
 
-    /// Pushes an element to the queue.
+    /// Pushes an element to the queue. After `close` the value is dropped.
     pub fn push(&self, value: T) {
+        let _ = self.try_push(value);
+    }
+
+    /// Pushes an element, or hands it back if the queue is closed.
+    pub fn try_push(&self, value: T) -> Result<(), T> {
         let mut queue = self.queue.lock().unwrap();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(value);
+        }
         queue.push_back(Control::Elem(value));
         self.condvar.notify_one();
+        Ok(())
+    }
+
+    /// Refuses every later push, wakes every waiting pop, and returns what
+    /// was queued so the caller decides when it is dropped.
+    pub fn close_and_take(&self) -> Vec<T> {
+        let mut queue = self.queue.lock().unwrap();
+        self.closed.store(true, Ordering::Relaxed);
+        let taken = queue
+            .drain(..)
+            .filter_map(|control| match control {
+                Control::Elem(value) => Some(value),
+                Control::Unblock => None,
+            })
+            .collect();
+        self.condvar.notify_all();
+        taken
     }
 
     /// Unblock one thread stuck in pop loop.
@@ -50,6 +80,9 @@ where
         let mut queue = self.queue.lock().unwrap();
 
         loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
             match queue.pop_front() {
                 Some(Control::Elem(value)) => return Some(value),
                 Some(Control::Unblock) => return None,
@@ -58,6 +91,11 @@ where
 
             queue = self.condvar.wait(queue).unwrap();
         }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
     }
 
     /// Tries to pop an element without blocking.
@@ -95,6 +133,9 @@ where
         let mut queue = self.queue.lock().unwrap();
         let mut duration = timeout;
         loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
             match queue.pop_front() {
                 Some(Control::Elem(value)) => return Some(value),
                 Some(Control::Unblock) => return None,

@@ -98,24 +98,27 @@ use std::error::Error;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::ClientConnection;
-use connection::Connection;
 use util::MessagesQueue;
 
 pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
 pub use connection::{ConfigListenAddr, ListenAddr, Listener};
+pub use lifecycle::{
+    join_retirement, CutConnection, RetirementReport, ShutdownReport, DROP_RETIREMENT_BUDGET,
+};
 pub use request::{ReadWrite, Request};
 pub use response::{Response, ResponseBox};
 pub use test::TestRequest;
 
+mod lifecycle;
 mod transport;
 pub use transport::{ConnectionCancellation, TransportPolicy};
 mod client;
@@ -129,12 +132,17 @@ mod util;
 
 /// The main class of this library.
 ///
-/// Destroying this object will immediately close the listening socket and the reading
-///  part of all the client's connections. Requests that have already been returned by
-///  the `recv()` function will not close and the responses will be transferred to the client.
+/// [`Server::shutdown`] retires the server within a deadline: no new
+/// connection is accepted, the reading part of every client connection is
+/// closed, queued requests are answered by their drop, and requests already
+/// returned by `recv()` may still respond until the deadline. Connections
+/// still in use at the deadline are closed in both directions and named in
+/// the report. Dropping the server does the same on the retirement service
+/// with [`DROP_RETIREMENT_BUDGET`], without blocking the dropping thread; call
+/// [`join_retirement`] before the process exits.
 pub struct Server {
     // should be false as long as the server exists
-    // when set to true, all the subtasks will close within a few hundreds ms
+    // when set to true, the accept thread stops accepting
     close: Arc<AtomicBool>,
 
     // queue for messages received by child threads
@@ -142,9 +150,14 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: ListenAddr,
+
+    connections: Arc<lifecycle::Connections>,
+
+    // taken by the first shutdown, or by Drop
+    lifecycle: parking_lot::Mutex<Option<lifecycle::Lifecycle>>,
 }
 
-enum Message {
+pub(crate) enum Message {
     Error(IoError),
     NewRequest(Request),
 }
@@ -302,96 +315,112 @@ impl Server {
         // creating a task where server.accept() is continuously called
         // and ClientConnection objects are pushed in the messages queue
         let messages = MessagesQueue::with_capacity(8);
+        let pool = Arc::new(util::TaskPool::new());
+        let connections = Arc::new(lifecycle::Connections::default());
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
-        thread::spawn(move || {
-            // a tasks pool is used to dispatch the connections into threads
-            let tasks_pool = util::TaskPool::new();
-
-            log::debug!("Running accept thread");
-            while !inside_close_trigger.load(Relaxed) {
-                let new_client = match server.accept() {
-                    Ok((sock, _)) => {
-                        use util::RefinedTcpStream;
-                        let control = match policy {
-                            Some(policy) => match ConnectionCancellation::new(&sock, policy) {
-                                Ok(control) => Some(control),
+        let inside_pool = pool.clone();
+        let inside_connections = connections.clone();
+        let accept = thread::Builder::new()
+            .name("tiny-http-accept".into())
+            .spawn(move || {
+                log::debug!("Running accept thread");
+                while !inside_close_trigger.load(SeqCst) {
+                    let new_client = match server.accept() {
+                        Ok((sock, peer)) => {
+                            if inside_close_trigger.load(SeqCst) {
+                                break;
+                            }
+                            use util::RefinedTcpStream;
+                            // A connection the server cannot reach at shutdown
+                            // is not accepted.
+                            let live = match inside_connections.register(&sock, peer) {
+                                Ok(live) => live,
                                 Err(error) => {
-                                    inside_messages.push(error.into());
+                                    log::error!("Error registering new client: {}", error);
                                     continue;
                                 }
-                            },
-                            None => None,
-                        };
-                        let (read_closable, write_closable) = match ssl {
-                            None => match &control {
-                                Some(control) => {
-                                    RefinedTcpStream::new_controlled(sock, control.clone())
-                                }
-                                None => RefinedTcpStream::new(sock),
-                            },
-                            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-                            Some(ref ssl) => {
-                                // trying to apply SSL over the connection
-                                // if an error occurs, we just close the socket and resume listening
-                                let sock = match ssl.accept(sock) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-
-                                RefinedTcpStream::new(sock)
-                            }
-                            #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
-                            Some(ref _ssl) => unreachable!(),
-                        };
-
-                        Ok(ClientConnection::new(
-                            write_closable,
-                            read_closable,
-                            control,
-                        ))
-                    }
-                    Err(e) => Err(e),
-                };
-
-                match new_client {
-                    Ok(client) => {
-                        let messages = inside_messages.clone();
-                        let mut client = Some(client);
-                        tasks_pool.spawn(Box::new(move || {
-                            if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
+                            };
+                            let control = match policy {
+                                Some(policy) => match ConnectionCancellation::new(&sock, policy) {
+                                    Ok(control) => Some(control),
+                                    Err(error) => {
+                                        inside_messages.push(error.into());
+                                        continue;
                                     }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
+                                },
+                                None => None,
+                            };
+                            let (mut read_closable, mut write_closable) = match ssl {
+                                None => match &control {
+                                    Some(control) => {
+                                        RefinedTcpStream::new_controlled(sock, control.clone())
                                     }
-                                }
-                            }
-                        }));
-                    }
+                                    None => RefinedTcpStream::new(sock),
+                                },
+                                #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                                Some(ref ssl) => {
+                                    // trying to apply SSL over the connection
+                                    // if an error occurs, we just close the socket and resume listening
+                                    let sock = match ssl.accept(sock) {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
 
-                    Err(e) => {
-                        log::error!("Error accepting new client: {}", e);
-                        inside_messages.push(e.into());
-                        break;
+                                    RefinedTcpStream::new(sock)
+                                }
+                                #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
+                                Some(ref _ssl) => unreachable!(),
+                            };
+                            read_closable.attach_live(live.clone());
+                            write_closable.attach_live(live);
+
+                            Ok(ClientConnection::new(
+                                write_closable,
+                                read_closable,
+                                control,
+                            ))
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    match new_client {
+                        Ok(client) => {
+                            let messages = inside_messages.clone();
+                            let close = inside_close_trigger.clone();
+                            let mut client = Some(client);
+                            inside_pool.spawn(Box::new(move || {
+                                if let Some(client) = client.take() {
+                                    serve_connection(client, &messages, &close);
+                                }
+                            }));
+                        }
+
+                        Err(e) => {
+                            log::error!("Error accepting new client: {}", e);
+                            inside_messages.push(e.into());
+                            break;
+                        }
                     }
                 }
-            }
-            log::debug!("Terminating accept thread");
-        });
+                log::debug!("Terminating accept thread");
+            })?;
 
         // result
         Ok(Server {
-            messages,
-            close: close_trigger,
-            listening_addr: local_addr,
+            messages: messages.clone(),
+            close: close_trigger.clone(),
+            listening_addr: local_addr.clone(),
+            connections: connections.clone(),
+            lifecycle: parking_lot::Mutex::new(Some(lifecycle::Lifecycle {
+                close: close_trigger,
+                messages,
+                listening_addr: local_addr,
+                accept,
+                pool,
+                connections,
+            })),
         })
     }
 
@@ -409,10 +438,31 @@ impl Server {
         self.listening_addr.clone()
     }
 
-    /// Returns the number of clients currently connected to the server.
+    /// Returns the number of client connections still in use: by a worker,
+    /// a request not yet answered, or a stream taken out of a request.
     pub fn num_connections(&self) -> usize {
-        unimplemented!()
-        //self.requests_receiver.lock().len()
+        self.connections.live_count()
+    }
+
+    /// Retires the server by `deadline` and reports what that took.
+    ///
+    /// Stops accepting, closes the reading part of every connection, drops
+    /// the requests never received (each answers its client), and waits for
+    /// the accept and worker threads and for every request or stream still
+    /// using a connection. At the deadline the remaining connections are
+    /// closed in both directions and listed in [`ShutdownReport::cut`];
+    /// threads still running are then joined by the retirement service.
+    /// Returns no later than the deadline plus one socket shutdown per
+    /// remaining connection. Later calls, and `recv()` after this one, find
+    /// the server closed.
+    pub fn shutdown(&self, deadline: Instant) -> ShutdownReport {
+        lifecycle::shutdown(self.lifecycle.lock().take(), deadline)
+    }
+
+    /// [`Server::shutdown`], then waits until every thread it left running
+    /// has been joined.
+    pub fn shutdown_blocking(&self, deadline: Instant) -> ShutdownReport {
+        self.shutdown(deadline).wait()
     }
 
     /// Blocks until an HTTP request has been submitted and returns it.
@@ -457,28 +507,45 @@ impl Iterator for IncomingRequests<'_> {
     }
 }
 
+/// Feeds one connection's requests to the queue until the client stops, the
+/// queue closes, or (HTTPS) the server closes while a response is pending.
+fn serve_connection(
+    client: ClientConnection,
+    messages: &MessagesQueue<Message>,
+    close: &AtomicBool,
+) {
+    // Synchronization is needed for HTTPS requests to avoid a deadlock
+    if client.secure() {
+        let (sender, receiver) = mpsc::channel();
+        for rq in client {
+            if messages
+                .try_push(rq.with_notify_sender(sender.clone()).into())
+                .is_err()
+            {
+                return;
+            }
+            loop {
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) if !close.load(SeqCst) => (),
+                    Err(_) => return,
+                }
+            }
+        }
+    } else {
+        for rq in client {
+            if messages.try_push(rq.into()).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.close.store(true, Relaxed);
-        // Connect briefly to ourselves to unblock the accept thread
-        let maybe_stream = match &self.listening_addr {
-            ListenAddr::IP(addr) => TcpStream::connect(addr).map(Connection::from),
-            #[cfg(unix)]
-            ListenAddr::Unix(addr) => {
-                // TODO: use connect_addr when its stabilized.
-                let path = addr.as_pathname().unwrap();
-                std::os::unix::net::UnixStream::connect(path).map(Connection::from)
-            }
-        };
-        if let Ok(stream) = maybe_stream {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-
-        #[cfg(unix)]
-        if let ListenAddr::Unix(addr) = &self.listening_addr {
-            if let Some(path) = addr.as_pathname() {
-                let _ = std::fs::remove_file(path);
-            }
+        if let Some(lifecycle) = self.lifecycle.get_mut().take() {
+            lifecycle::retire_in_background(lifecycle);
         }
     }
 }

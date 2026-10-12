@@ -91,6 +91,9 @@ pub struct RefinedTcpStream {
     close_read: bool,
     close_write: bool,
     control: Option<crate::ConnectionCancellation>,
+    // Keeps the server's registry entry for this connection alive for as long
+    // as any half, request or escaped stream still uses it.
+    live: Option<std::sync::Arc<crate::lifecycle::LiveConnection>>,
 }
 
 impl RefinedTcpStream {
@@ -112,12 +115,14 @@ impl RefinedTcpStream {
                 close_read: true,
                 close_write: false,
                 control: control.clone(),
+                live: None,
             },
             Self {
                 stream,
                 close_read: false,
                 close_write: true,
                 control,
+                live: None,
             },
         ))
     }
@@ -134,6 +139,10 @@ impl RefinedTcpStream {
         control: crate::ConnectionCancellation,
     ) -> (Self, Self) {
         Self::try_new_controlled(socket, control).unwrap()
+    }
+
+    pub(crate) fn attach_live(&mut self, live: std::sync::Arc<crate::lifecycle::LiveConnection>) {
+        self.live = Some(live);
     }
 
     /// Returns true if this struct wraps around a secure connection.

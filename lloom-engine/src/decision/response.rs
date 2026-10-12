@@ -20,6 +20,8 @@ pub enum SystemOneError {
 pub struct SystemOneResponse {
     answers: Vec<(String, Answer<OrderedJson>)>,
     input_tokens: u64,
+    /// Per-question read diagnostics, in answer order (the generic strategy).
+    diagnostics: Option<Vec<(String, super::generic::Diagnostics)>>,
 }
 impl SystemOneResponse {
     pub fn new(
@@ -41,7 +43,19 @@ impl SystemOneResponse {
         Ok(Self {
             answers,
             input_tokens,
+            diagnostics: None,
         })
+    }
+    /// Attach one diagnostics entry per answer, serialized after `usage`.
+    pub fn with_diagnostics(
+        mut self,
+        diagnostics: Vec<(String, super::generic::Diagnostics)>,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+    pub fn diagnostics(&self) -> Option<&[(String, super::generic::Diagnostics)]> {
+        self.diagnostics.as_deref()
     }
     pub fn answers(&self) -> &[(String, Answer<OrderedJson>)] {
         &self.answers
@@ -57,7 +71,10 @@ impl Serialize for SystemOneResponse {
             input_tokens: u64,
             output_tokens: u64,
         }
-        let mut out = serializer.serialize_struct("SystemOneResponse", 2)?;
+        let mut out = serializer.serialize_struct(
+            "SystemOneResponse",
+            2 + usize::from(self.diagnostics.is_some()),
+        )?;
         out.serialize_field("answers", &Pairs(&self.answers))?;
         out.serialize_field(
             "usage",
@@ -66,6 +83,9 @@ impl Serialize for SystemOneResponse {
                 output_tokens: 0,
             },
         )?;
+        if let Some(diagnostics) = &self.diagnostics {
+            out.serialize_field("diagnostics", &Pairs(diagnostics))?;
+        }
         out.end()
     }
 }

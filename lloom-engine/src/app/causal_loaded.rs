@@ -5,6 +5,7 @@
 //! request metadata and async native producers still require complete enrollment
 //! and aggregate prediction. Existing app families/legacy loaders stay available.
 use super::common::{check_context_capacity, NEVER_EOS};
+use crate::decision::binding::{self, Calibration, CheckpointDecision, Selection};
 use crate::decision::{
     parse_systemone_questions, parse_systemone_state, CausalRequest, NoulAliases, OrderedJson,
     StateNullability, SystemOneError, SystemOneResponse, SystemOneTemplate, SystemOneTemplateKind,
@@ -19,18 +20,51 @@ use parking_lot::Mutex;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-/// Explicit caller policy remains available for generic causal models. No
-/// guessed systemone template, implicit calibration or unknown-source state
-/// certificate is installed. Arbitrary sources retain normal template rendering
-/// via SystemOneTemplate; only certified sources enter the shared-trunk renderer.
+/// A template binding and its request limits. A native checkpoint's binding
+/// carries its own calibration (`CausalPolicySource::Named`); an explicit
+/// caller policy states one. Arbitrary sources retain normal template
+/// rendering; only certified sources enter the shared-trunk renderer.
 pub struct CausalPolicy {
     pub template: SystemOneTemplate,
-    pub temperature: Temperature,
+    pub calibration: Calibration,
     pub max_options: usize,
     pub noul_aliases: NoulAliases,
     pub state_nullability: StateNullability,
 }
 impl CausalPolicy {
+    /// The checkpoint's own binding, when it is a native causal decision model:
+    /// a GGUF file's metadata, or a safetensors directory's `config.json` with
+    /// the engine-shipped template. `Ok(None)` for a plain checkpoint.
+    pub fn native(
+        checkpoint: &Path,
+        max_options: usize,
+        noul_aliases: NoulAliases,
+        state_nullability: StateNullability,
+    ) -> Result<Option<Self>> {
+        let facts = if checkpoint.is_dir() {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)
+                    .map_err(Error::wrap)?;
+            CheckpointDecision::from_config(&config)?
+        } else {
+            let mut file = std::fs::File::open(checkpoint)?;
+            let content = lloom_tensor::quantized::gguf_file::Content::read(&mut file)?;
+            CheckpointDecision::from_gguf(&content.metadata)?
+        };
+        Ok(
+            match binding::resolve(&Selection::Auto, &facts, SystemOneTemplateKind::D1Causal)? {
+                Some(binding::Binding::Template(binding)) => Some(Self {
+                    template: binding.template,
+                    calibration: binding.calibration,
+                    max_options,
+                    noul_aliases,
+                    state_nullability,
+                }),
+                _ => None,
+            },
+        )
+    }
+
     /// Shared ordered text preparation. Media execution remains a distinct family
     /// integration; no encoded payload is decoded or silently replaced here.
     pub(crate) fn prepare_text(
@@ -68,7 +102,10 @@ impl CausalPolicy {
             .map(|questions| {
                 questions
                     .into_iter()
-                    .map(|(id, question)| (id, question, self.temperature))
+                    .map(|(id, question)| {
+                        let temperature = self.calibration.temperature(&question);
+                        (id, question, temperature)
+                    })
                     .collect()
             })
             .map_err(|error| SystemOneError::InvalidRequest(error.to_string()))
@@ -96,12 +133,12 @@ impl CausalPolicy {
         .map_err(invalid)
     }
 }
-/// Calibration/limits remain explicit even for a named checkpoint template.
-/// Selecting a named source never invents its option temperature or API policy.
+/// `Named` binds the checkpoint's own decision template and calibration
+/// (`decision::binding`): the GGUF must be a native decision checkpoint.
+/// Request limits stay explicit; no API policy is invented.
 pub enum CausalPolicySource {
     Explicit(CausalPolicy),
     Named {
-        temperature: Temperature,
         max_options: usize,
         noul_aliases: NoulAliases,
         state_nullability: StateNullability,
@@ -451,21 +488,19 @@ fn produce_lfm2_gguf_with<T>(
     let policy = match policy_source {
         Some(CausalPolicySource::Explicit(policy)) => Some(policy),
         Some(CausalPolicySource::Named {
-            temperature,
             max_options,
             noul_aliases,
             state_nullability,
         }) => {
-            let source = content
-                .metadata
-                .get("tokenizer.chat_template.systemone")
-                .ok_or_else(|| Error::msg("checkpoint has no named systemone template"))?;
+            let facts = CheckpointDecision::from_gguf(&content.metadata)?;
+            let Some(binding::Binding::Template(binding)) =
+                binding::resolve(&Selection::Auto, &facts, SystemOneTemplateKind::D1Causal)?
+            else {
+                lloom_tensor::bail!("checkpoint is not a native decision model: it has no decision type and systemone template")
+            };
             Some(CausalPolicy {
-                template: SystemOneTemplate::compile(
-                    source.to_string()?,
-                    SystemOneTemplateKind::D1Causal,
-                )?,
-                temperature,
+                template: binding.template,
+                calibration: binding.calibration,
                 max_options,
                 noul_aliases,
                 state_nullability,

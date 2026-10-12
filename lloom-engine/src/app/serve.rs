@@ -102,6 +102,8 @@ fn seed_text(file: Option<&std::path::Path>) -> Result<String> {
 /// State shared by every request thread.
 struct Shared {
     engine: Box<dyn Served>,
+    /// What `/v1/systemone` answers with, resolved at load.
+    decisions: super::decisions::Decisions,
     /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
     aborts: Mutex<HashSet<String>>,
     /// Bumped after every insert into `aborts`: the decode thread's
@@ -256,6 +258,16 @@ fn run_owner(
         );
     }
     eprintln!("[capabilities: {}]", engine.capabilities().line());
+    // A loaded owner's path is a provenance label, never opened.
+    let checkpoint = load_facts.is_some().then_some(model_path.as_path());
+    let decisions = super::decisions::Decisions::resolve(
+        options.load.decision_template.as_deref(),
+        engine.as_ref(),
+        checkpoint,
+    )?;
+    if let Some(line) = decisions.describe() {
+        eprintln!("[{line}]");
+    }
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
     let (host, port) = (options.server.host.clone(), options.server.port);
 
@@ -268,6 +280,7 @@ fn run_owner(
     };
     let shared = Arc::new(Shared {
         engine,
+        decisions,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,
@@ -294,7 +307,11 @@ fn run_owner(
                 let _ = respond_metadata(request, result);
             }
             (Method::Get, "/v1/models") => {
-                let result = models_body(&shared.model_name, shared.engine.as_ref());
+                let result = models_body(
+                    &shared.model_name,
+                    shared.engine.as_ref(),
+                    &shared.decisions,
+                );
                 let _ = respond_metadata(request, result);
             }
             (Method::Post, "/eval/abort") => {
@@ -399,7 +416,8 @@ fn run_decisions_configured(
             (Method::Get, "/v1/models") => {
                 // Caller provenance label; outer metadata formatting is not
                 // silently claimed paid by the model's inner request pass.
-                let body = json!({"object":"list","data":[{"id":endpoint.model_name(),"object":"model","generation":false,"decisions":true}]});
+                let body = json!({"object":"list","data":[{"id":endpoint.model_name(),"object":"model","generation":false,"decisions":true,
+                    "architecture":{"input_modalities":["text"],"output_modalities":["decisions"]}}]});
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Post, "/shutdown") => {
@@ -462,7 +480,9 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         .context("reading the request body")?;
     // This branch consumes the original bytes exactly once. Parsing through
     // Value first would reorder question/options/legend objects.
-    if let Some(result) = dispatch_systemone(shared.engine.as_ref(), path, body.as_bytes()) {
+    if let Some(result) = dispatch_systemone_with(path, body.as_bytes(), |body| {
+        shared.decisions.decide(shared.engine.as_ref(), body)
+    }) {
         return respond_systemone(request, result);
     }
     let value: Value = if body.trim().is_empty() {
@@ -498,6 +518,7 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
 }
 
 /// The actual ordered route: return None without parsing other endpoints.
+#[cfg(test)]
 fn dispatch_systemone(
     engine: &dyn Served,
     path: &str,
@@ -2391,7 +2412,16 @@ fn health_body(engine: &dyn Served) -> Result<Value> {
     Ok(body)
 }
 
-fn models_body(model_name: &str, engine: &dyn Served) -> Result<Value> {
+fn models_body(
+    model_name: &str,
+    engine: &dyn Served,
+    decisions: &super::decisions::Decisions,
+) -> Result<Value> {
+    let capabilities = engine.capabilities();
+    let mut input = vec!["text"];
+    if capabilities.vision {
+        input.push("image");
+    }
     Ok(json!({
         "object": "list",
         "data": [{
@@ -2399,6 +2429,10 @@ fn models_body(model_name: &str, engine: &dyn Served) -> Result<Value> {
             "object": "model",
             "created": now(),
             "owned_by": "lloom",
+            "architecture": {
+                "input_modalities": input,
+                "output_modalities": decisions.output_modalities(capabilities.generation),
+            },
             "load_warnings": load_warnings_json(engine)?,
         }],
     }))
@@ -2553,6 +2587,9 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let server = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("binding: {e}"))?;
     let shared = Shared {
         engine,
+        decisions: super::decisions::Decisions::Refused(
+            "the benchmark cells do not take decisions".into(),
+        ),
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,
@@ -3236,7 +3273,13 @@ mod metadata_consumer_tests {
             "actual health body must propagate refusal, not successful metadata",
         );
         assert_eq!(
-            models_body("bounded", &engine).unwrap_err().to_string(),
+            models_body(
+                "bounded",
+                &engine,
+                &crate::app::decisions::Decisions::Refused(String::new())
+            )
+            .unwrap_err()
+            .to_string(),
             "bounded metadata warning refusal",
             "actual model card must propagate warning refusal, not an empty list",
         );
@@ -3247,9 +3290,19 @@ mod metadata_consumer_tests {
     fn actual_model_card_reads_current_warnings_on_each_request() {
         let engine = NoVision::dynamic_metadata();
         engine.warning_epoch.store(1, Ordering::Relaxed);
-        let first = models_body("bounded", &engine).unwrap();
+        let first = models_body(
+            "bounded",
+            &engine,
+            &crate::app::decisions::Decisions::Refused(String::new()),
+        )
+        .unwrap();
         engine.warning_epoch.store(2, Ordering::Relaxed);
-        let second = models_body("bounded", &engine).unwrap();
+        let second = models_body(
+            "bounded",
+            &engine,
+            &crate::app::decisions::Decisions::Refused(String::new()),
+        )
+        .unwrap();
         let warnings =
             |body: &serde_json::Value| body["data"][0]["load_warnings"].as_array().unwrap().clone();
         assert_eq!(warnings(&first).len(), 1);

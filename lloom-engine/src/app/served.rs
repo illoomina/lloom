@@ -250,6 +250,29 @@ pub trait Served: Send + Sync {
         batch: usize,
     ) -> Result<DecodeTiming>;
     fn next_token_logprobs(&self, prompt_ids: &[u32], k: usize) -> Result<(u32, Vec<(u32, f32)>)>;
+    /// The full-vocabulary log-probability of each of `labels` as the token
+    /// after `prompt_ids`, in their order, and the most likely token there.
+    /// This default reads the whole distribution through
+    /// [`Self::next_token_logprobs`]; a family may read only the labels.
+    fn first_token_label_read(
+        &self,
+        prompt_ids: &[u32],
+        labels: &[u32],
+    ) -> Result<(Vec<f32>, u32)> {
+        let (argmax, all) = self.next_token_logprobs(prompt_ids, usize::MAX)?;
+        let mut out = vec![f32::NAN; labels.len()];
+        for (id, logprob) in all {
+            for (slot, &label) in out.iter_mut().zip(labels) {
+                if label == id {
+                    *slot = logprob;
+                }
+            }
+        }
+        if out.iter().any(|value| value.is_nan()) {
+            anyhow::bail!("the next-token distribution has no entry for a decision label")
+        }
+        Ok((out, argmax))
+    }
     /// A cell's `batch` must fit what the process was started with.
     fn check_batch(&self, batch: usize) -> Result<()>;
     /// Stop whatever the engine runs on its own threads.

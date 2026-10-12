@@ -11,7 +11,7 @@ fn policy(
 ) -> Result<CausalPolicy> {
     Ok(CausalPolicy {
         template: SystemOneTemplate::compile(source, SystemOneTemplateKind::D1Causal)?,
-        temperature: Temperature::try_from(2.5)?,
+        calibration: crate::decision::binding::Calibration::uniform(Temperature::try_from(2.5)?),
         max_options,
         noul_aliases: NoulAliases::TrueFalseOnly,
         state_nullability,
@@ -75,7 +75,11 @@ fn certified_preparation_preserves_ordered_whole_prompts_and_usage() -> Result<(
     assert!(request
         .trunk_tokens()
         .starts_with(&prefix.bytes().map(u32::from).collect::<Vec<_>>()));
-    assert_eq!(f64::from(policy.temperature), 2.5); // Caller policy, not execution calibration proof.
+    let question: crate::decision::Question<()> = crate::decision::Question::Noul {
+        instructions: (),
+        criteria: None,
+    };
+    assert_eq!(f64::from(policy.calibration.temperature(&question)), 2.5); // Caller policy, not execution calibration proof.
     Ok(())
 }
 
@@ -162,5 +166,24 @@ fn uncertified_template_keeps_ordinary_rendering_without_invented_certificate() 
             .contains("no audited state-prefix certificate"),
         "{error}"
     );
+    Ok(())
+}
+
+#[test]
+fn native_policy_binds_a_d1_checkpoint_and_nothing_else() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("lloom-causal-native-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let limits = (4, NoulAliases::TrueFalseOnly, StateNullability::AllowNull);
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type":"lfm2_vl","auto_map":{"AutoModel":"modeling_d1.D1Model"}}"#,
+    )?;
+    let policy = CausalPolicy::native(&dir, limits.0, limits.1, limits.2)?
+        .expect("d1-3B safetensors binds its engine-shipped template");
+    assert!(policy.template.has_causal_certificate());
+    assert_eq!(policy.max_options, 4);
+    std::fs::write(dir.join("config.json"), r#"{"model_type":"lfm2_vl"}"#)?;
+    assert!(CausalPolicy::native(&dir, limits.0, limits.1, limits.2)?.is_none());
+    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }

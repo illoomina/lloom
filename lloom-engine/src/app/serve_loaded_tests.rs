@@ -230,7 +230,6 @@ fn exercise(device: &Device) -> anyhow::Result<()> {
             tokenizer: &tokenizer_path,
         },
         Some(CausalPolicySource::Named {
-            temperature: 1.0.try_into()?,
             max_options: 2,
             noul_aliases: NoulAliases::TrueFalseOnly,
             state_nullability: StateNullability::AllowNull,

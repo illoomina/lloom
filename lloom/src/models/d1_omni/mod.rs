@@ -29,5 +29,6 @@ mod loaded;
 pub use loaded::{LoadedOmni, OmniMetadata, OmniPass};
 
 mod gguf;
+pub use gguf::decision_temperatures;
 
 mod weights;

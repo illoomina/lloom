@@ -3,7 +3,10 @@
 //! Option order is part of the model input. Constructors take ordered vectors;
 //! adapters must not round-trip request objects through an unordered map.
 
+#[cfg(feature = "serve")]
+pub mod binding;
 mod causal;
+pub mod generic;
 mod json;
 mod omni;
 mod omni_readout;

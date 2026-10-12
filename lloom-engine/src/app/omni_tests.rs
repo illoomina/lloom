@@ -319,3 +319,29 @@ fn actual_recovery_entry_refusal_unwind_retry_and_success_keep_marker_custody() 
     assert_eq!(recovery.calls, 3);
     Ok(())
 }
+
+#[test]
+fn native_policy_takes_the_omni_template_from_the_checkpoint() {
+    let dir = std::env::temp_dir().join(format!("lloom-omni-native-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"model_type":"d1_omni"}"#).unwrap();
+    let policy = Policy::native(
+        &dir,
+        8,
+        NoulAliases::TrueFalseOnly,
+        StateNullability::AllowNull,
+        "<image>".into(),
+    )
+    .unwrap();
+    assert_eq!(policy.template.kind(), SystemOneTemplateKind::D1Omni);
+    std::fs::write(dir.join("config.json"), r#"{"model_type":"lfm2"}"#).unwrap();
+    let refused = Policy::native(
+        &dir,
+        8,
+        NoulAliases::TrueFalseOnly,
+        StateNullability::AllowNull,
+        "<image>".into(),
+    );
+    assert!(refused.is_err(), "a plain checkpoint is not d1-omni");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

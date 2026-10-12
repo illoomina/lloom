@@ -1556,6 +1556,14 @@ pub struct LoadConfig {
         cli = "mmproj"
     )]
     pub mmproj: Option<std::path::PathBuf>,
+    /// The template `/v1/systemone` answers with. Unset (or `auto`): a native decision checkpoint's own binding (d1-3B, d1-omni), else decisions are refused by name. `generic`: one label token per option through the model's own chat template, thinking off, uncalibrated (every answer reports its label mass). `lfm2-d1` | `lfm2-d1-omni`: the engine-shipped d1 template. A path: that systemone Jinja template.
+    #[opt(
+        flag = "decision-template",
+        path = "decision.template",
+        status = "advanced",
+        cli = "decision-template"
+    )]
+    pub decision_template: Option<String>,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]
     pub warmup: bool,
@@ -1608,6 +1616,7 @@ impl Default for LoadConfig {
             model_name: None,
             tokenizer: None,
             mmproj: None,
+            decision_template: None,
             warmup: true,
             device: "auto".into(),
             experts: "stream".into(),

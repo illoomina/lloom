@@ -26,6 +26,43 @@ pub struct Policy {
     pub media_marker: String,
 }
 impl Policy {
+    /// d1-omni's own template: the GGUF's `systemone` template, or for a
+    /// safetensors directory the engine-shipped one (`decision::binding`).
+    /// Calibration comes with the loaded model's configuration.
+    pub fn native(
+        checkpoint: &Path,
+        max_options: usize,
+        noul_aliases: NoulAliases,
+        state_nullability: StateNullability,
+        media_marker: String,
+    ) -> Result<Self> {
+        use crate::decision::binding::{self, CheckpointDecision, Selection};
+        let facts = if checkpoint.is_dir() {
+            let config: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(checkpoint.join("config.json"))?)
+                    .map_err(Error::wrap)?;
+            CheckpointDecision::from_config(&config)?
+        } else {
+            let mut file = std::fs::File::open(checkpoint)?;
+            let content = lloom_tensor::quantized::gguf_file::Content::read(&mut file)?;
+            CheckpointDecision::from_gguf(&content.metadata)?
+        };
+        let Some(binding::Binding::Template(binding)) =
+            binding::resolve(&Selection::Auto, &facts, SystemOneTemplateKind::D1Omni)?
+        else {
+            lloom_tensor::bail!("checkpoint is not a d1-omni decision model")
+        };
+        let policy = Self {
+            template: binding.template,
+            max_options,
+            noul_aliases,
+            state_nullability,
+            media_marker,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     fn validate(&self) -> Result<()> {
         if self.template.kind() != SystemOneTemplateKind::D1Omni || self.max_options == 0 {
             lloom_tensor::bail!("omni needs its explicit template kind and positive option bound")

@@ -76,6 +76,8 @@ pub(crate) fn fixture(named_template: Option<&str>) -> Result<Vec<u8>> {
         ("lfm2.shortconv.l_cache", V::U32(3)),
     ];
     if let Some(source) = named_template {
+        // llama.cpp's converter writes the decision type beside the template.
+        metadata.push(("lfm2.decision.type", V::String("lfm2-d1".into())));
         metadata.push((
             "tokenizer.chat_template.systemone",
             V::String(source.into()),

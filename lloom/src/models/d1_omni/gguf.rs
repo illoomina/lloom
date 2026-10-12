@@ -83,6 +83,33 @@ fn real(value: &Value) -> Result<f64> {
         _ => lloom_tensor::bail!("omni GGUF coefficient must be floating point"),
     }
 }
+/// A decision checkpoint's `<arch>.decision.temperature.*` keys, under the
+/// `config.json` names the reference fits them by (`choice:3-5`, `noul:2`,
+/// `score`). The converter's finite bucket vocabulary has an unambiguous
+/// inverse; no other punctuation is normalized and other keys are ignored.
+pub fn decision_temperatures(
+    metadata: &std::collections::HashMap<String, Value>,
+    arch: &str,
+) -> Result<BTreeMap<String, f64>> {
+    let mut temperatures = BTreeMap::new();
+    for kind in ["choice", "score", "noul"] {
+        for (suffix, original) in [
+            ("", ""),
+            (".2", ":2"),
+            (".3_5", ":3-5"),
+            (".6_10", ":6-10"),
+            (".11", ":11+"),
+        ] {
+            if let Some(value) =
+                metadata.get(&format!("{arch}.decision.temperature.{kind}{suffix}"))
+            {
+                temperatures.insert(format!("{kind}{original}"), real(value)?);
+            }
+        }
+    }
+    Ok(temperatures)
+}
+
 fn equal_number(h: &Header<'_>, key: &str, expected: usize) -> Result<()> {
     if h.number(key)? != expected {
         lloom_tensor::bail!("omni GGUF {key} must be {expected}")
@@ -222,25 +249,7 @@ pub(crate) fn resolve(main: &Content, media: &Content) -> Result<ResolvedOmniCon
         conv_kernel_size: kernel,
         residual_width: residual,
     };
-    let mut temperatures = BTreeMap::new();
-    // The reference's finite bucket vocabulary has an unambiguous inverse.
-    // No arbitrary punctuation normalization is applied to other metadata.
-    for kind in ["choice", "score", "noul"] {
-        for (suffix, original) in [
-            ("", ""),
-            (".2", ":2"),
-            (".3_5", ":3-5"),
-            (".6_10", ":6-10"),
-            (".11", ":11+"),
-        ] {
-            if let Some(value) = main
-                .metadata
-                .get(&format!("lfm2.decision.temperature.{kind}{suffix}"))
-            {
-                temperatures.insert(format!("{kind}{original}"), real(value)?);
-            }
-        }
-    }
+    let temperatures = decision_temperatures(&main.metadata, "lfm2")?;
     // These are converter-enforced constants, not inferred text model limits.
     let cfg = ResolvedOmniConfig {
         core: ResolvedDecisionCoreConfig {

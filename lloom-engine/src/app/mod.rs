@@ -11,6 +11,7 @@ pub mod causal_loaded;
 pub mod chat;
 pub mod common;
 pub mod decision_endpoint;
+mod decisions;
 pub mod family;
 pub mod lfm2;
 pub mod modes;

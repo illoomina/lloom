@@ -115,7 +115,30 @@ struct Shared {
     sampling: crate::SamplingConfig,
 }
 
+fn listener<A: std::net::ToSocketAddrs>(
+    addr: A,
+    policy: Option<tiny_http::TransportPolicy>,
+) -> std::result::Result<Server, Box<dyn std::error::Error + Send + Sync>> {
+    match policy {
+        Some(policy) => Server::http_with_policy(addr, policy),
+        None => Server::http(addr),
+    }
+}
+
 pub fn run(args: ServeArgs) -> Result<()> {
+    run_configured(args, None)
+}
+
+/// Explicit HTTP transport policy; no model/native cancellation is implied.
+/// Validate cheap limits before constructing a model. Defaults remain unchanged.
+pub fn run_with_transport_policy(
+    args: ServeArgs,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_configured(args, Some(policy))
+}
+fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>) -> Result<()> {
     let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
     let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
     let batched = options.scheduler.max_sequences > 1;
@@ -133,6 +156,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         engine,
         model_path,
         Some((load_start, reuse_prefix)),
+        transport,
     )
 }
 
@@ -151,7 +175,18 @@ pub fn run_loaded(
     engine: Box<dyn Served>,
     model_path: std::path::PathBuf,
 ) -> Result<()> {
-    run_owner(options, engine, model_path, None)
+    run_owner(options, engine, model_path, None, None)
+}
+/// Supplied SAME owner, with explicit plain-HTTP I/O/disposal limits. See
+/// tiny_http::TransportPolicy for pipeline timeouts; not an application timeout.
+pub fn run_loaded_with_transport_policy(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_owner(options, engine, model_path, None, Some(policy))
 }
 
 fn run_owner(
@@ -159,6 +194,7 @@ fn run_owner(
     engine: Box<dyn Served>,
     model_path: std::path::PathBuf,
     load_facts: Option<(Instant, bool)>,
+    transport: Option<tiny_http::TransportPolicy>,
 ) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
@@ -194,7 +230,7 @@ fn run_owner(
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
     let (host, port) = (options.server.host.clone(), options.server.port);
 
-    let server = Server::http((host.as_str(), port))
+    let server = listener((host.as_str(), port), transport)
         .map_err(|e| anyhow::anyhow!("binding {host}:{port}: {e}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
@@ -281,6 +317,25 @@ pub fn run_decisions_loaded(
     endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
     max_body_bytes: usize,
 ) -> Result<()> {
+    run_decisions_configured(options, endpoint, max_body_bytes, None)
+}
+/// Same narrow endpoint and dispatcher, with explicit dependency disposal/I/O
+/// limits. Header/JSON/queue allocations and thread joining remain separate.
+pub fn run_decisions_loaded_with_transport_policy(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy))
+}
+fn run_decisions_configured(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+    transport: Option<tiny_http::TransportPolicy>,
+) -> Result<()> {
     let read_bound = max_body_bytes
         .checked_add(1)
         .filter(|_| max_body_bytes != 0)
@@ -288,7 +343,7 @@ pub fn run_decisions_loaded(
             anyhow::anyhow!("decision transport body bound must be finite and nonzero")
         })?;
     let host = options.server.host;
-    let server = Server::http((host.as_str(), options.server.port))
+    let server = listener((host.as_str(), options.server.port), transport)
         .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),

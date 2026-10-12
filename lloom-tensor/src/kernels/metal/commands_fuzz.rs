@@ -547,9 +547,9 @@ mod proptests {
     /// `pool_counters_holds_accumulators_only` (#507) and `Buffer`'s
     /// `black_box` guard (#454).
     ///
-    /// Mutation-tested: adding a `state.in_flight.push(..)` outside
-    /// `commit_swap_locked`, or removing the `retain` from `flush_and_prune`, makes
-    /// this fail.
+    /// Mutation-tested: adding a `state.in_flight.push(..)` in `commands.rs` or a
+    /// second push beside `CurrentCommand::recover_recording`'s, or removing the
+    /// `retain` from `flush_and_prune`, makes this fail.
     ///
     /// # It reads the whole file, and that is a correction
     ///
@@ -591,14 +591,38 @@ mod proptests {
 
         // Growth: `push` onto `in_flight`. The fuzzer's bound counts commits, so it
         // is only meaningful if a commit is the only thing that can grow the queue.
-        let pushes = sites("in_flight.push");
+        // The one push is `CurrentCommand::recover_recording`'s, which moves the
+        // submitted buffer it replaces into the queue; `commands.rs` reaches it
+        // only by handing that method `&mut state.in_flight`.
+        let current = include_str!("../../current_command.rs");
+        assert!(
+            current.contains("pub fn recover_recording"),
+            "current_command.rs does not contain recover_recording: the push census \
+             below would be vacuous"
+        );
+        let pushes: Vec<(usize, &str)> = current
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("in_flight.push"))
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
         assert_eq!(
-        pushes.len(),
-        1,
-        "expected exactly one site pushing onto in_flight (commit_swap_locked's), found {:#?}. \
-         A second growth site invalidates the fuzzer's bound.",
-        pushes
-    );
+            pushes.len(),
+            1,
+            "expected exactly one site pushing onto in_flight (recover_recording's), found \
+             {pushes:#?}. A second growth site invalidates the fuzzer's bound."
+        );
+        assert_eq!(
+            sites("in_flight.push"),
+            vec![],
+            "commands.rs pushes onto in_flight directly: a second growth site"
+        );
+        let handed = sites("&mut state.in_flight,");
+        assert_eq!(
+            handed.len(),
+            sites(".recover_recording(").len(),
+            "every route to the queue's growth must be a recover_recording call: {handed:#?}"
+        );
 
         // Shrink, counted per mechanism rather than per line, so a repair that
         // removes the prune -- #513's own mutation, which read 63 in flight at
@@ -623,21 +647,24 @@ mod proptests {
             1,
             "expected exactly one retain on in_flight (prune_in_flight's), found {retains:#?}"
         );
+        // `wait_marker_prefix_data` is the fourth; the fuzzer's model does not
+        // drive it, and a shrink path it does not drive cannot loosen the bound.
         let prunes = sites("self.prune_in_flight(&mut state,");
         assert_eq!(
             prunes.len(),
-            3,
-            "expected exactly three retain-based shrink sites on in_flight \
-         (flush_and_wait_current's, flush_and_prune's and wait_marker's), found {prunes:#?}. \
-         Losing one is the unbounded-queue defect #493 repaired."
+            4,
+            "expected exactly four retain-based shrink sites on in_flight \
+         (flush_and_wait_current's, wait_marker's, wait_marker_prefix_data's and \
+         flush_and_prune's), found {prunes:#?}. Losing one is the unbounded-queue \
+         defect #493 repaired."
         );
 
         // The asymmetry §17's prediction rests on, stated as the number a reader
-        // can check: one unconditional push against four conditional removals, of
+        // can check: one unconditional push against five conditional removals, of
         // which exactly one does not block.
         assert_eq!(
             pushes.len() + takes.len() + prunes.len(),
-            5,
+            6,
             "the growth/shrink census moved; the fuzzer's model is written against it"
         );
     }

@@ -19,7 +19,7 @@ use lloom_tensor::Device;
 /// `name`'s committed table: the derived step's listing, then its remarks.
 /// Rewritten under `LLOOM_BLESS_LISTINGS=1`, as the walk listings are.
 fn remarks_gate(name: &str, derived: &Graph, r: &Remarks) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/remarks");
+    let dir = std::path::PathBuf::from(lloom_manifest_dir()).join("tests/remarks");
     for (suffix, now) in [
         ("derived.txt", listing(derived)),
         ("remarks.txt", r.to_string()),
@@ -259,4 +259,15 @@ fn the_qwen4exp_mtp_head_remarks() {
     eprintln!("plan: {}", d.plan);
     no_undeclared(&r);
     remarks_gate("qwen4exp-iq3xxs-mtp-head", &d.graph, &r);
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

@@ -100,7 +100,7 @@ fn every_test_file_is_a_module() {
         "metal_cb_failure_tests",
         "allocation_refusal_alloc_free",
     ];
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let dir = format!("{}/tests", lloom_manifest_dir());
     let me = include_str!("main.rs");
     let mut missing = Vec::new();
     let mut files = 0;
@@ -126,4 +126,15 @@ fn every_test_file_is_a_module() {
         missing.is_empty(),
         "test files that are not modules of tests/main.rs (add `mod <name>;`): {missing:?}"
     );
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

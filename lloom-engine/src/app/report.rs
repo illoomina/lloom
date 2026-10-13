@@ -815,6 +815,7 @@ struct ChurnSnapshot {
     res_added: u64,
     res_removed: u64,
     res_commits: u64,
+    res_listed_at_release: u64,
     to_cpu_fast: u64,
     to_cpu_blit: u64,
     to_cpu_null: u64,
@@ -838,6 +839,7 @@ fn churn_snapshot(m: &lloom_tensor::MetalDevice) -> ChurnSnapshot {
         res_added: res.added,
         res_removed: res.removed,
         res_commits: res.commits,
+        res_listed_at_release: res.listed_at_release,
         to_cpu_fast: fast,
         to_cpu_blit: blit,
         to_cpu_null: lloom_tensor::metal_backend::to_cpu_null_after_wait(),
@@ -856,7 +858,7 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
     let after = churn_snapshot(m);
     eprintln!(
         "[churn over the run: pool lookups={} hits={} allocations={} evicted={} \
-         trims={} | residency adds={} removes={} commits={} | to_cpu fast={} blit={} \
+         trims={} | residency adds={} removes={} commits={} listed_at_release={} | to_cpu fast={} blit={} \
          null_after_wait={} staged={} staged_readback={} slot={} staging_allocs={} | \
          barriers={} encoder_sessions={} command_buffers={}]",
         after.lookups - before.lookups,
@@ -867,6 +869,7 @@ fn print_churn(m: &lloom_tensor::MetalDevice, before: &ChurnSnapshot) {
         after.res_added - before.res_added,
         after.res_removed - before.res_removed,
         after.res_commits - before.res_commits,
+        after.res_listed_at_release - before.res_listed_at_release,
         after.to_cpu_fast - before.to_cpu_fast,
         after.to_cpu_blit - before.to_cpu_blit,
         after.to_cpu_null - before.to_cpu_null,

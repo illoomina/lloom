@@ -7,11 +7,14 @@
 //! (the paged pool, never fuzzed before) and [`cb_liveness`] (command-buffer
 //! liveness under retained and unretained command buffers, with the pool's
 //! free poison as the detector). [`geometry`] is the shape campaign over a
-//! tiny model's geometry (`docs/porting-models.md` §21.8).
+//! tiny model's geometry (`docs/porting-models.md` §21.8). [`planted`] holds
+//! the recorder's planted real fault, reached only by `record_selftest`.
 
 pub mod campaign;
 pub mod decode;
+pub mod planted;
 pub mod record;
+pub mod schedule;
 
 mod cmp_stubs;
 

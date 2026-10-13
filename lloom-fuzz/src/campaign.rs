@@ -70,7 +70,7 @@ use libafl_bolts::{
 };
 use libafl_targets::{std_edges_map_observer, EDGES_MAP_DEFAULT_SIZE, MAX_EDGES_FOUND};
 
-use crate::record::{replay, Record};
+use crate::record::{replay_with_identity_and_limits, Record, RecordLimits, ReplayLimits};
 
 /// Points in the shape map. Sized for the probes' `(site, condition,
 /// outcome)` triples and the census labels with room to spare; a
@@ -173,6 +173,10 @@ pub struct Cli {
     /// How many of the last executed inputs the persistent record keeps.
     #[arg(long, default_value_t = 64)]
     pub record: usize,
+    /// Requested recorder ring-layout budget (default 64 MiB, not process RSS).
+    /// Raise explicitly to retain a larger history; replay checks remain enabled.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub record_max_bytes: usize,
     /// Where records are written on a crash / oracle failure.
     #[arg(long, default_value = "fuzz-out/records")]
     pub record_dir: PathBuf,
@@ -188,6 +192,22 @@ pub struct Cli {
     /// Replay a record directory (or one input) in order in this process.
     #[arg(long)]
     pub replay: Option<PathBuf>,
+    /// Diagnose an old record with a different build/configuration. This does
+    /// not certify exact replay and never bypasses format/size/completion checks.
+    #[arg(long, requires = "replay")]
+    pub replay_unchecked_identity: bool,
+    /// Override the replay input-count budget (default 4096).
+    #[arg(long, requires = "replay")]
+    pub replay_max_inputs: Option<usize>,
+    /// Override all visited directory entries, including non-input files (default 8192).
+    #[arg(long, requires = "replay")]
+    pub replay_max_entries: Option<usize>,
+    /// Override aggregate format/manifest/identity/path bytes (default 8 MiB).
+    #[arg(long, requires = "replay")]
+    pub replay_max_metadata_bytes: Option<usize>,
+    /// Override total declared input bytes across the record (default 256 MiB).
+    #[arg(long, requires = "replay")]
+    pub replay_max_total_input_bytes: Option<u64>,
     /// Print the instrumentation readout (guards, map size) and exit.
     #[arg(long)]
     pub instrumentation: bool,
@@ -240,7 +260,38 @@ pub fn run<H>(cli: &Cli, name: &str, harness: H) -> anyhow::Result<()>
 where
     H: FnMut(&[u8]) -> Result<(), String> + 'static,
 {
-    let record = Record::install(&cli.record_dir, cli.record);
+    run_with_config(cli, name, &serde_json::Value::Null, harness)
+}
+
+/// Targets with extra options provide their explicit configuration here. It is
+/// compared before replay; directories/log destinations are not target inputs.
+/// Environment/driver/hardware and actual schedules remain separate obligations.
+pub fn run_with_config<H>(
+    cli: &Cli,
+    name: &str,
+    target_config: &serde_json::Value,
+    harness: H,
+) -> anyhow::Result<()>
+where
+    H: FnMut(&[u8]) -> Result<(), String> + 'static,
+{
+    if cli.max_len > crate::record::MAX_INPUT {
+        return Err(anyhow!(
+            "--max-len {} exceeds persistent record capacity {}",
+            cli.max_len,
+            crate::record::MAX_INPUT
+        ));
+    }
+    let identity =
+        crate::record::identity::campaign(name, arm(), cli.timeout_ms, cli.max_len, target_config)?;
+    let record = Record::install_with_identity_and_limits(
+        &cli.record_dir,
+        cli.record,
+        identity.clone(),
+        RecordLimits {
+            max_ring_bytes: cli.record_max_bytes,
+        },
+    )?;
     banner(name)?;
     let (guards, map) = instrumentation();
     if cli.instrumentation {
@@ -263,11 +314,12 @@ where
     let harness = Rc::new(RefCell::new(harness));
 
     if cli.once.is_some() || cli.replay.is_some() {
-        Record::install_crash_dump();
+        Record::install_crash_dump()?;
     }
     if let Some(path) = &cli.once {
-        let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
-        record.push(&bytes);
+        let bytes = crate::record::read_single(path, crate::record::MAX_INPUT)
+            .with_context(|| path.display().to_string())?;
+        record.push(&bytes)?;
         return match (harness.borrow_mut())(&bytes) {
             Ok(()) => {
                 println!("ok: {} ({} bytes)", path.display(), bytes.len());
@@ -284,10 +336,31 @@ where
     }
     if let Some(path) = &cli.replay {
         let h = Rc::clone(&harness);
-        return match replay(path, move |bytes| {
-            record.push(bytes);
-            (h.borrow_mut())(bytes)
-        }) {
+        let defaults = ReplayLimits::default();
+        let limits = ReplayLimits {
+            max_inputs: cli.replay_max_inputs.unwrap_or(defaults.max_inputs),
+            max_directory_entries: cli
+                .replay_max_entries
+                .unwrap_or(defaults.max_directory_entries),
+            max_metadata_bytes: cli
+                .replay_max_metadata_bytes
+                .unwrap_or(defaults.max_metadata_bytes),
+            max_total_input_bytes: cli
+                .replay_max_total_input_bytes
+                .unwrap_or(defaults.max_total_input_bytes),
+        };
+        return match replay_with_identity_and_limits(
+            path,
+            Some(&identity),
+            cli.replay_unchecked_identity,
+            limits,
+            move |bytes| {
+                record
+                    .push(bytes)
+                    .map_err(|e| format!("recorder failure: {e}"))?;
+                (h.borrow_mut())(bytes)
+            },
+        ) {
             Ok(n) => {
                 println!("replayed {n} input(s) from {}: all clean", path.display());
                 Ok(())
@@ -300,6 +373,26 @@ where
     }
 
     fuzz(cli, name, harness)
+}
+
+/// Every executor invocation changes the same persistent harness, including
+/// comparison tracing. Record before entering it so replay keeps that order.
+fn execute_recorded<H>(record: Record, harness: &RefCell<H>, name: &str, bytes: &[u8]) -> ExitKind
+where
+    H: FnMut(&[u8]) -> Result<(), String>,
+{
+    if let Err(error) = record.push(bytes) {
+        eprintln!("[{name}] recorder failure (harness not executed): {error}");
+        return ExitKind::Crash;
+    }
+    match (harness.borrow_mut())(bytes) {
+        Ok(()) => ExitKind::Ok,
+        Err(message) => {
+            let directory = record.dump(&message);
+            eprintln!("[{name}] oracle failure: {message}\n[{name}] record: {directory:?}");
+            ExitKind::Crash
+        }
+    }
 }
 
 fn fuzz<H>(cli: &Cli, name: &str, harness: Rc<RefCell<H>>) -> anyhow::Result<()>
@@ -360,19 +453,10 @@ where
             let h = Rc::clone(&harness);
             let mut exec_harness = |input: &BytesInput| -> ExitKind {
                 let bytes = input.target_bytes();
-                let bytes: &[u8] = &bytes;
-                record.push(bytes);
-                match (h.borrow_mut())(bytes) {
-                    Ok(()) => ExitKind::Ok,
-                    Err(m) => {
-                        let dir = record.dump(&m);
-                        eprintln!("[{name}] oracle failure: {m}\n[{name}] record: {dir:?}");
-                        ExitKind::Crash
-                    }
-                }
+                execute_recorded(record, &h, name, &bytes)
             };
             #[allow(deprecated)]
-            let mut executor = InProcessExecutor::with_timeout(
+            let executor = InProcessExecutor::with_timeout(
                 &mut exec_harness,
                 tuple_list!(edges_observer, shape_observer, time_observer),
                 &mut fuzzer,
@@ -380,9 +464,18 @@ where
                 &mut mgr,
                 timeout,
             )?;
-            // After the executor: LibAFL has installed its crash handlers and its
-            // panic hook, and ours must run first and chain to them.
-            Record::install_crash_dump();
+            // Comparison tracing shares the one in-process executor: separate
+            // typed panic hooks would cast the same global executor pointer.
+            #[cfg(feature = "cmplog")]
+            let mut executor = libafl::executors::ShadowExecutor::new(
+                executor,
+                tuple_list!(libafl_targets::CmpLogObserver::new("cmplog", true)),
+            );
+            #[cfg(not(feature = "cmplog"))]
+            let mut executor = executor;
+            // The recorder wraps the final executor-installed panic/signal hooks
+            // before the first target invocation, including corpus seeding.
+            Record::install_crash_dump()?;
 
             if state.must_load_initial_inputs() {
                 match &cli.seeds {
@@ -391,7 +484,7 @@ where
                             &mut fuzzer,
                             &mut executor,
                             &mut mgr,
-                            &[dir.clone()],
+                            std::slice::from_ref(dir),
                         )?;
                     }
                     _ => {
@@ -416,28 +509,9 @@ where
             #[cfg(feature = "cmplog")]
             {
                 use libafl::mutators::token_mutations::I2SRandReplace;
-                use libafl::stages::TracingStage;
-                use libafl_targets::CmpLogObserver;
+                use libafl::stages::ShadowTracingStage;
 
-                let cmplog_observer = CmpLogObserver::new("cmplog", true);
-                let h2 = Rc::clone(&harness);
-                let mut trace_harness = |input: &BytesInput| -> ExitKind {
-                    let bytes = input.target_bytes();
-                    match (h2.borrow_mut())(&bytes) {
-                        Ok(()) => ExitKind::Ok,
-                        Err(_) => ExitKind::Crash,
-                    }
-                };
-                #[allow(deprecated)]
-                let tracer = InProcessExecutor::with_timeout(
-                    &mut trace_harness,
-                    tuple_list!(cmplog_observer),
-                    &mut fuzzer,
-                    &mut state,
-                    &mut mgr,
-                    timeout,
-                )?;
-                let tracing = TracingStage::new(tracer);
+                let tracing = ShadowTracingStage::new();
                 let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
                     I2SRandReplace::new()
                 )));
@@ -536,5 +610,45 @@ fn remove_stale_shmem_server_socket() {
             "removed a stale {} (nothing was listening on it)",
             path.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_cli_tests {
+    use super::*;
+    #[test]
+    fn replay_limit_overrides_require_replay_without_changing_old_spellings() {
+        let old = Cli::try_parse_from(["fuzz", "--replay", "record", "--record", "2"]).unwrap();
+        assert_eq!(old.replay, Some(PathBuf::from("record")));
+        assert!(old.replay_max_inputs.is_none());
+        for flag in [
+            "--replay-max-inputs",
+            "--replay-max-entries",
+            "--replay-max-metadata-bytes",
+            "--replay-max-total-input-bytes",
+        ] {
+            assert!(
+                Cli::try_parse_from(["fuzz", flag, "1"]).is_err(),
+                "{flag} accepted without replay"
+            );
+        }
+        let raised = Cli::try_parse_from([
+            "fuzz",
+            "--replay",
+            "record",
+            "--replay-max-inputs",
+            "5",
+            "--replay-max-entries",
+            "9",
+            "--replay-max-metadata-bytes",
+            "1024",
+            "--replay-max-total-input-bytes",
+            "20",
+        ])
+        .unwrap();
+        assert_eq!(raised.replay_max_inputs, Some(5));
+        assert_eq!(raised.replay_max_entries, Some(9));
+        assert_eq!(raised.replay_max_metadata_bytes, Some(1024));
+        assert_eq!(raised.replay_max_total_input_bytes, Some(20));
     }
 }

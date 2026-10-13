@@ -1375,51 +1375,55 @@ where
         }
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &self.device {
+            use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
             let gb = |b: usize| b as f64 / 1e9;
             if grow.total() > 0 {
                 let quota = m.ledger().quota();
                 let budget = if quota == 0 { usize::MAX } else { quota };
                 let a = m.admit_bytes(grow.total(), budget);
                 if !a.fits {
-                    if let Some(why) = &a.machine {
-                        lloom_tensor::bail!(
-                            "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
-                             is refused before anything is written: {why}",
+                    let refusal = a.machine.unwrap_or(AllocationError::Refused {
+                        requested: grow.total(),
+                        available: budget.saturating_sub(a.committed),
+                        domain: RefusalDomain::Model,
+                    });
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, \
+                             recurrent {:.3}); the ledger holds {:.2} GB of the {:.2} GB quota \
+                             after giving back {:.3} GB of free lists; the pass stops here, before \
+                             anything is written (DESIGN.md 9.5): a shorter context, \
+                             --memory-fraction, or bound the run",
                             self.family,
                             cache.pos,
                             gb(grow.total()),
                             gb(grow.kv),
-                            gb(grow.recurrent)
-                        );
-                    }
-                    lloom_tensor::bail!(
-                        "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
-                         {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
-                         giving back {:.3} GB of free lists; the pass stops here, before anything is \
-                         written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
-                        self.family,
-                        cache.pos,
-                        gb(grow.total()),
-                        gb(grow.kv),
-                        gb(grow.recurrent),
-                        gb(a.committed),
-                        gb(budget),
-                        gb(a.reclaimed),
+                            gb(grow.recurrent),
+                            gb(a.committed),
+                            gb(budget),
+                            gb(a.reclaimed),
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
                 if let Some(t) = &cache.ledger {
                     t.note(self.held_bytes(cache) + grow);
                 }
             }
             if pass > 0 {
-                if let Some(why) = m.admit_bytes(pass, usize::MAX).machine {
-                    lloom_tensor::bail!(
-                        "{}: the {seq_len}-position pass at position {} ({:.2} GB of working set) \
-                         is refused before it runs: {why}",
-                        self.family,
-                        cache.pos,
-                        gb(pass)
+                if let Some(refusal) = m.admit_bytes(pass, usize::MAX).machine {
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the {seq_len}-position pass at position {} ({:.2} GB of working \
+                             set) is refused before it runs",
+                            self.family,
+                            cache.pos,
+                            gb(pass)
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
             }
         }

@@ -141,6 +141,29 @@ impl EscapeGuard {
         Self(())
     }
 }
+/// Waits, before the process exits, for every dropped Metal device to finish
+/// retiring on the host retirement service (`tuning.md` §6.3m).
+#[cfg(feature = "metal")]
+pub use kernels::metal::{join_device_retirement, DeviceRetirementReport};
+/// No backend but Metal retires a device asynchronously.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRetirementReport {
+    pub completed: bool,
+    pub sets_retiring: usize,
+    pub records_pending: usize,
+    pub devices_live: usize,
+    pub worker_stopped: bool,
+    pub listed_at_release: u64,
+}
+#[cfg(not(feature = "metal"))]
+pub fn join_device_retirement(_deadline: std::time::Instant) -> DeviceRetirementReport {
+    DeviceRetirementReport {
+        completed: true,
+        worker_stopped: true,
+        ..Default::default()
+    }
+}
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 // Merged from candle-metal-kernels (RESTRUCTURING §7.1): the Metal kernel layer
@@ -186,6 +209,7 @@ mod retirement_service;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
+pub mod schedule_hook;
 pub mod shape_probe;
 mod sort;
 mod storage;

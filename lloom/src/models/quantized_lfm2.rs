@@ -104,12 +104,26 @@ impl AttentionLayer {
         kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        let (b_sz, seq_len, n_embd) = xs.dims3()?;
-
         let q = self.wq.forward(xs)?;
         let k = self.wk.forward(xs)?;
         let v = self.wv.forward(xs)?;
+        let y = self.attend(&q, &k, &v, mask, index_pos, kv_cache)?;
+        self.wo.forward(&y)
+    }
 
+    /// One sequence's attention over its projected `q`, `k`, `v`
+    /// (`[b, seq, heads · head_dim]`) against its KV, before `wo`.
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _) = q.dims3()?;
+        let n_embd = self.n_head * self.head_dim;
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?;
@@ -155,8 +169,7 @@ impl AttentionLayer {
         let att = crate::nn::ops::softmax_last_dim(&att)?;
         let y = att.matmul(&v.contiguous()?)?;
 
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
-        self.wo.forward(&y)
+        y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])
     }
 }
 
@@ -167,8 +180,22 @@ impl ShortConvLayer {
         cache: &mut Option<Tensor>,
         continuation: bool,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, hidden) = xs.dims3()?;
         let bcx = self.in_proj.forward(xs)?.transpose(1, 2)?;
+        let conv_out = self.convolve(&bcx, cache, continuation)?;
+        self.out_proj.forward(&conv_out)
+    }
+
+    /// One sequence's gated short convolution over its projected `bcx`
+    /// (`[b, 3 · hidden, seq]`) against its history, before `out_proj`;
+    /// returns `[b, seq, hidden]`.
+    fn convolve(
+        &self,
+        bcx: &Tensor,
+        cache: &mut Option<Tensor>,
+        continuation: bool,
+    ) -> Result<Tensor> {
+        let (b_sz, channels, seq_len) = bcx.dims3()?;
+        let hidden = channels / 3;
         let b = bcx.narrow(1, 0, hidden)?;
         let c = bcx.narrow(1, hidden, hidden)?;
         let x = bcx.narrow(1, 2 * hidden, hidden)?;
@@ -249,8 +276,7 @@ impl ShortConvLayer {
         };
 
         conv_out = (c * &conv_out)?;
-        let conv_out = conv_out.transpose(1, 2)?.contiguous()?;
-        self.out_proj.forward(&conv_out)
+        conv_out.transpose(1, 2)?.contiguous()
     }
 }
 
@@ -502,18 +528,7 @@ impl Model {
         {
             bail!("quantized lfm2 invalid sequence geometry, owner or cache position")
         }
-        let mask = if seq_len == 1 {
-            None
-        } else {
-            let key = (seq_len, end);
-            if !cache.masks.contains_key(&key) {
-                cache.masks.insert(
-                    key,
-                    crate::utils::build_causal_mask(seq_len, index_pos, hidden.device())?,
-                );
-            }
-            Some(cache.masks[&key].clone())
-        };
+        let mask = cache.causal_mask(seq_len, index_pos, hidden.device())?;
         cache.failed = true;
         let _enter = self.span.enter();
         for (layer, state) in self.layers.iter().zip(cache.layers.iter_mut()) {
@@ -542,6 +557,167 @@ impl Model {
         cache.pos = end;
         cache.failed = false;
         Ok(logits)
+    }
+
+    /// [`BatchedCausalLM::forward_ragged`]: `hidden` is `[1, T, width]`, the
+    /// rows' runs end to end. The norms, every projection, the MLP and the
+    /// head run once over all `T` tokens (one weight sweep for every row);
+    /// attention and the convolution run per row, over that row's tokens
+    /// against its own cache, through the bodies [`Self::forward_hidden`]
+    /// runs. Returns `[rows, vocab]`, each row's logits at its last token.
+    fn forward_ragged_hidden(
+        &self,
+        mut hidden: Tensor,
+        rows: &mut [crate::nn::RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let (batch, total, width) = hidden.dims3()?;
+        let lens: usize = rows.iter().map(|r| r.len).sum();
+        if batch != 1 || rows.is_empty() || lens != total || width != self.config.hidden_size {
+            bail!("quantized lfm2 ragged: {total} tokens for rows {:?}", {
+                rows.iter().map(|r| r.len).collect::<Vec<_>>()
+            })
+        }
+        let mut masks = crate::nn::branch::retained_vec(rows.len())?;
+        for row in rows.iter_mut() {
+            let cache = &mut *row.cache;
+            let end = row
+                .pos
+                .checked_add(row.len)
+                .ok_or_else(|| lloom_tensor::Error::msg("quantized lfm2 position overflow"))?;
+            if row.len == 0
+                || end > self.config.context_length
+                || !Arc::ptr_eq(&cache.owner, &self.owner)
+                || cache.layers.len() != self.layers.len()
+                || cache.failed
+                || row.pos != cache.pos
+            {
+                bail!("quantized lfm2 ragged: invalid row geometry, owner or cache position")
+            }
+            masks.push(cache.causal_mask(row.len, row.pos, hidden.device())?);
+        }
+        for row in rows.iter_mut() {
+            row.cache.failed = true;
+        }
+        let _enter = self.span.enter();
+        for (l, layer) in self.layers.iter().enumerate() {
+            let residual = hidden.clone();
+            let normed = layer.operator_norm.forward(&hidden)?;
+            let mut outs = crate::nn::branch::retained_vec(rows.len())?;
+            let mut off = 0;
+            hidden = match &layer.kind {
+                LayerKind::Attention(attn) => {
+                    let _enter = attn.span_attn.enter();
+                    let q = attn.wq.forward(&normed)?;
+                    let k = attn.wk.forward(&normed)?;
+                    let v = attn.wv.forward(&normed)?;
+                    for (row, mask) in rows.iter_mut().zip(&masks) {
+                        let LayerState::Attention(kv) = &mut row.cache.layers[l] else {
+                            bail!("quantized lfm2 cache layer kind mismatch")
+                        };
+                        outs.push(attn.attend(
+                            &q.narrow(1, off, row.len)?,
+                            &k.narrow(1, off, row.len)?,
+                            &v.narrow(1, off, row.len)?,
+                            mask.as_ref(),
+                            row.pos,
+                            kv,
+                        )?);
+                        off += row.len;
+                    }
+                    attn.wo.forward(&Tensor::cat(&outs, 1)?)?
+                }
+                LayerKind::ShortConv(conv) => {
+                    let bcx = conv.in_proj.forward(&normed)?.transpose(1, 2)?;
+                    for row in rows.iter_mut() {
+                        let continuation = row.cache.continuation;
+                        let LayerState::ShortConv(history) = &mut row.cache.layers[l] else {
+                            bail!("quantized lfm2 cache layer kind mismatch")
+                        };
+                        outs.push(conv.convolve(
+                            &bcx.narrow(2, off, row.len)?,
+                            history,
+                            continuation,
+                        )?);
+                        off += row.len;
+                    }
+                    conv.out_proj.forward(&Tensor::cat(&outs, 1)?)?
+                }
+            };
+            hidden = (hidden + residual)?;
+            let residual = hidden.clone();
+            let ff = layer.ffn_norm.forward(&hidden)?;
+            let _enter = layer.span_mlp.enter();
+            let ff = layer.mlp.forward(&ff)?;
+            hidden = (ff + residual)?;
+        }
+        let hidden = self.norm.forward(&hidden)?;
+        let mut last = crate::nn::branch::retained_vec(rows.len())?;
+        let mut off = 0u32;
+        for row in rows.iter() {
+            off += row.len as u32;
+            last.push(off - 1);
+        }
+        let idx = Tensor::new(last.as_slice(), hidden.device())?;
+        let hidden = hidden.squeeze(0)?.index_select(&idx, 0)?.contiguous()?;
+        let _enter = self.span_output.enter();
+        let logits = self.output.forward(&hidden)?;
+        for row in rows.iter_mut() {
+            row.cache.pos = row.pos + row.len;
+            row.cache.failed = false;
+        }
+        Ok(logits)
+    }
+}
+
+impl Cache {
+    /// The additive causal mask of a pass of `seq_len` tokens at `index_pos`,
+    /// kept per shape; `None` for one token.
+    fn causal_mask(
+        &mut self,
+        seq_len: usize,
+        index_pos: usize,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        if seq_len == 1 {
+            return Ok(None);
+        }
+        let key = (seq_len, index_pos + seq_len);
+        if !self.masks.contains_key(&key) {
+            self.masks.insert(
+                key,
+                crate::utils::build_causal_mask(seq_len, index_pos, device)?,
+            );
+        }
+        Ok(Some(self.masks[&key].clone()))
+    }
+}
+
+impl crate::nn::BatchedCausalLM for Model {
+    /// A decode step for every row: a ragged pass of one token each.
+    fn forward_rows(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [crate::nn::Row<'_, Cache>],
+    ) -> Result<Tensor> {
+        let ids = tokens.flatten_all()?.unsqueeze(0)?;
+        let mut ragged = crate::nn::branch::retained_vec(rows.len())?;
+        for row in rows.iter_mut() {
+            ragged.push(crate::nn::RaggedRow {
+                pos: row.pos,
+                len: 1,
+                cache: &mut *row.cache,
+            });
+        }
+        self.forward_ragged(&ids, &mut ragged)
+    }
+
+    fn forward_ragged(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [crate::nn::RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let hidden = self.tok_embeddings.embedding(tokens)?;
+        self.forward_ragged_hidden(hidden, rows)
     }
 }
 
@@ -712,7 +888,14 @@ impl crate::nn::branch::RetainState for Cache {
         {
             bail!("quantized lfm2 foreign, reset or failed retained cache")
         }
-        // All writes replace their handles; none mutates retained tensors.
+        self.take_layers(saved);
+        Ok(())
+    }
+}
+
+impl Cache {
+    /// All writes replace their handles; none mutates retained tensors.
+    fn take_layers(&mut self, saved: &Retained) {
         for (target, source) in self.layers.iter_mut().zip(&saved.layers) {
             *target = match source {
                 LayerState::Attention(kv) => LayerState::Attention(kv.clone()),
@@ -720,6 +903,21 @@ impl crate::nn::branch::RetainState for Cache {
             };
         }
         self.pos = saved.pos;
+    }
+}
+
+/// Another fresh cache of the same model continues a retained trunk: its
+/// layers take the trunk's handles, which no later write mutates.
+impl crate::nn::branch::AdoptRetained for Cache {
+    fn adopt_retained(&mut self, saved: &Retained) -> Result<()> {
+        if self.failed
+            || self.pos != 0
+            || !Arc::ptr_eq(&self.owner, &saved.owner)
+            || saved.layers.len() != self.layers.len()
+        {
+            bail!("quantized lfm2: only a fresh cache of the same model adopts a retained trunk")
+        }
+        self.take_layers(saved);
         Ok(())
     }
 }

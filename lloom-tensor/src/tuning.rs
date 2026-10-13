@@ -81,7 +81,12 @@ impl Contract {
     /// - `decision-pack`: `/v1/systemone` requests that wait together are read
     ///   as one tree, so an answer's prefill partition depends on what else
     ///   arrived (`lloom-engine`'s `decide_together`).
-    pub const FAST_ARMS: &'static [&'static str] = &["moe-act-f16", "decision-pack"];
+    /// - `decision-ragged`: a `/v1/systemone` request's questions are read as
+    ///   one ragged batch over its state, which is kept for the next request
+    ///   over it, so an answer's pass partition depends on the batch and on
+    ///   what came before (`lloom-engine`'s `CausalRequest::execute_ragged`).
+    pub const FAST_ARMS: &'static [&'static str] =
+        &["moe-act-f16", "decision-pack", "decision-ragged"];
 
     /// `profile=<name> arms=<list> cpu_f16_accum=<type>/<promote_every>:<instruction>`,
     /// for the report lines that say which contract a run held and which
@@ -1283,7 +1288,7 @@ mod tests {
         );
         assert_eq!(
             Contract::Fast.report(),
-            format!("profile=fast arms=moe-act-f16,decision-pack cpu_f16_accum={accum}")
+            format!("profile=fast arms=moe-act-f16,decision-pack,decision-ragged cpu_f16_accum={accum}")
         );
     }
 

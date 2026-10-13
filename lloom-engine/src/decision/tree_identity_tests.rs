@@ -2,9 +2,12 @@
 //! each question a branch restored to it), against N single-question
 //! requests, on the tiny quantized LFM2 (attention and conv layers both
 //! carry state a branch could leak through). CPU, F32, no checkpoint.
-use super::{Answer, CausalLabels, CausalRequest, CausalTask, OrderedJson, Question};
+use super::{
+    Answer, CausalLabels, CausalRequest, CausalTask, OrderedJson, Question, SystemOneResponse,
+    TrunkCache,
+};
 use crate::{DecodeConfig, ReadbackArm};
-use lloom::models::quantized_lfm2::Model;
+use lloom::models::quantized_lfm2::{Model, Retained};
 use lloom_tensor::quantized::gguf_file;
 use lloom_tensor::{Device, Result};
 use std::io::Cursor;
@@ -245,5 +248,119 @@ fn a_batch_packs_only_when_asked_and_keeps_each_answer_in_place() -> Result<()> 
             }
         }
     }
+    Ok(())
+}
+
+fn run_ragged(
+    model: &Model,
+    request: &CausalRequest,
+    trunks: Option<&TrunkCache<Retained>>,
+) -> Result<SystemOneResponse> {
+    let device = Device::Cpu;
+    let mut readback = lloom::generation::Blocking::new(&[u32::MAX], &device)?;
+    let options = DecodeConfig::default().options(0, ReadbackArm::Blocking, 0);
+    request.execute_ragged(
+        model,
+        model,
+        &mut readback,
+        &options,
+        |m, _| m.new_cache(),
+        trunks,
+    )
+}
+
+fn all_p_a(response: &SystemOneResponse) -> Vec<f64> {
+    response
+        .answers()
+        .iter()
+        .map(|(_, answer)| match answer {
+            Answer::Choice { probabilities, .. } => probabilities[0].1,
+            other => panic!("a choice question answered {other:?}"),
+        })
+        .collect()
+}
+
+/// The ragged read (the state prefilled once, the three questions' rows in
+/// one pass over it) equals the tree and three single requests within F32
+/// tolerance: the three partition the work differently, so bits are not
+/// promised. The answers differ from each other, so a row reading another
+/// row's tokens or state would move them.
+#[test]
+fn n_questions_as_ragged_rows_equal_the_tree_and_n_single_requests() -> Result<()> {
+    let model = model()?;
+    let request = || CausalRequest::new((0..3).map(task).collect::<Result<_>>()?, &STATE, 32);
+    let ragged = all_p_a(&run_ragged(&model, &request()?, None)?);
+    let tree = all_p_a(&run(&model, &request()?)?);
+    let single = (0..3)
+        .map(|i| Ok(p_a(&run(&model, &single_request(i)?)?)))
+        .collect::<Result<Vec<_>>>()?;
+    eprintln!("ragged P(A) = {ragged:?}");
+    eprintln!("tree   P(A) = {tree:?}");
+    eprintln!("single P(A) = {single:?}");
+    for i in 0..3 {
+        assert!(
+            (ragged[i] - tree[i]).abs() < 1e-5 && (ragged[i] - single[i]).abs() < 1e-5,
+            "question {i}: ragged P(A) {} against tree {} and single {}",
+            ragged[i],
+            tree[i],
+            single[i]
+        );
+    }
+    let spread = single.iter().cloned().fold(f64::MIN, f64::max)
+        - single.iter().cloned().fold(f64::MAX, f64::min);
+    assert!(spread > 1e-3, "answers too close to tell apart: {single:?}");
+    Ok(())
+}
+
+/// A ragged read keeps its state; the next requests over the same state start
+/// from it (one question each, no state prefill) and answer as they would
+/// alone; a request over another state does not take it, and a ragged read
+/// over that state replaces it.
+#[test]
+fn a_kept_state_serves_the_requests_over_it_and_no_other() -> Result<()> {
+    let model = model()?;
+    let trunks = TrunkCache::<Retained>::default();
+    let multi = CausalRequest::new((0..3).map(task).collect::<Result<_>>()?, &STATE, 32)?;
+    let multi = all_p_a(&run_ragged(&model, &multi, Some(&trunks))?);
+    assert_eq!(trunks.kept_tokens(), STATE.len());
+    assert_eq!(trunks.hits(), 0);
+    for i in 0..3 {
+        let kept = p_a(&run_ragged(&model, &single_request(i)?, Some(&trunks))?);
+        let alone = p_a(&run(&model, &single_request(i)?)?);
+        assert_eq!(
+            trunks.hits(),
+            i as u64 + 1,
+            "request {i} did not start from the kept state"
+        );
+        assert!(
+            (kept - alone).abs() < 1e-5 && (kept - multi[i]).abs() < 1e-5,
+            "request {i}: from the kept state P(A) {kept}, alone {alone}, in the batch {}",
+            multi[i]
+        );
+    }
+    // Another state: the same suffix lengths, one state token changed.
+    let other: [u32; 5] = [2, 5, 3, 7, 6];
+    let elsewhere = |i: usize| {
+        let mut prompt = other.to_vec();
+        prompt.extend_from_slice(SUFFIXES[i]);
+        task_as(&format!("q{i}"), prompt)
+    };
+    let one = CausalRequest::new(vec![elsewhere(0)?], &other, 32)?;
+    let got = p_a(&run_ragged(&model, &one, Some(&trunks))?);
+    let alone = p_a(&run(&model, &one)?);
+    assert_eq!(
+        trunks.hits(),
+        3,
+        "a request over another state took the kept one"
+    );
+    assert!(
+        (got - alone).abs() < 1e-5,
+        "another state: {got} != alone {alone}"
+    );
+    let two = CausalRequest::new(vec![elsewhere(0)?, elsewhere(1)?], &other, 32)?;
+    run_ragged(&model, &two, Some(&trunks))?;
+    assert_eq!(trunks.hits(), 3);
+    run_ragged(&model, &single_request(0)?, Some(&trunks))?;
+    assert_eq!(trunks.hits(), 3, "the replaced state was still served");
     Ok(())
 }

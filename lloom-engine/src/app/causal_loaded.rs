@@ -231,7 +231,99 @@ pub struct CausalEngine<M: CausalLM> {
     recovery: Option<Box<dyn Recovery<M>>>,
     /// The LFM2-VL tower an mmproj supplied, for image decisions.
     vision: Option<MmprojVision>,
+    /// The `decision-ragged` arm, installed by a family whose model batches
+    /// ragged rows (`install_ragged`); taken under `fast` only.
+    ragged: Option<Ragged<M>>,
     chat: Mutex<Option<Chat<M::Cache>>>,
+}
+
+/// The ragged decision read (`CausalRequest::execute_ragged`) for this
+/// owner's model, and the state the last read kept. Function pointers, as
+/// the served adapter's decision dispatch: the generic owner does not take
+/// the bounds the read needs.
+struct Ragged<M: CausalLM> {
+    text: RaggedText<M>,
+    images: RaggedImages<M>,
+    /// A `TrunkCache` of the model's retained state.
+    trunks: Box<dyn std::any::Any + Send + Sync>,
+}
+type RaggedText<M> = fn(
+    &CausalEngine<M>,
+    &CausalRequest,
+    &mut lloom::generation::Blocking,
+    &lloom::nn::DecodeOptions,
+) -> Result<SystemOneResponse>;
+type RaggedImages<M> = for<'a> fn(
+    &CausalEngine<M>,
+    &super::vision::ImageRows<'a, M>,
+    &CausalRequest,
+    &mut lloom::generation::Blocking,
+    &lloom::nn::DecodeOptions,
+) -> Result<SystemOneResponse>;
+
+impl<M> CausalEngine<M>
+where
+    M: lloom::nn::BatchedCausalLM + 'static,
+    M::Cache: lloom::nn::branch::AdoptRetained,
+    <M::Cache as RetainState>::Retained: Send + Sync + 'static,
+{
+    /// Take the `decision-ragged` arm (`scheduler.decision_ragged`).
+    pub(crate) fn install_ragged(&mut self) {
+        self.ragged = Some(Ragged {
+            text: Self::ragged_text,
+            images: Self::ragged_images,
+            trunks: Box::new(crate::decision::TrunkCache::<
+                <M::Cache as RetainState>::Retained,
+            >::default()),
+        });
+    }
+
+    fn trunks(&self) -> Option<&crate::decision::TrunkCache<<M::Cache as RetainState>::Retained>> {
+        self.ragged.as_ref()?.trunks.downcast_ref()
+    }
+
+    fn ragged_text(
+        &self,
+        request: &CausalRequest,
+        readback: &mut lloom::generation::Blocking,
+        options: &lloom::nn::DecodeOptions,
+    ) -> Result<SystemOneResponse> {
+        request.execute_ragged(
+            &self.model,
+            &self.model,
+            readback,
+            options,
+            |model, device| model.new_cache(&self.config, device),
+            self.trunks(),
+        )
+    }
+
+    /// A trunk with image rows is not kept: its tokens do not name its pixels.
+    fn ragged_images(
+        &self,
+        rows: &super::vision::ImageRows<'_, M>,
+        request: &CausalRequest,
+        readback: &mut lloom::generation::Blocking,
+        options: &lloom::nn::DecodeOptions,
+    ) -> Result<SystemOneResponse> {
+        request.execute_ragged(
+            rows,
+            &self.model,
+            readback,
+            options,
+            |model, device| model.new_cache(&self.config, device),
+            None,
+        )
+    }
+}
+
+impl<M: CausalLM> CausalEngine<M> {
+    /// The ragged arm when it is installed and the contract is `fast`.
+    fn ragged_arm(&self) -> Option<&Ragged<M>> {
+        self.ragged
+            .as_ref()
+            .filter(|_| lloom_tensor::tuning::contract().is_fast())
+    }
 }
 
 /// An mmproj's LFM2-VL tower and projector, loaded with the model: what a
@@ -340,6 +432,7 @@ where
                 decode,
                 recovery,
                 vision: None,
+                ragged: None,
                 chat: Mutex::new(Some(Chat {
                     sequence: Some(Sequence::new(cache)),
                     rings: Some(RingPool::new()),
@@ -440,6 +533,19 @@ where
         {
             lloom_tensor::bail!("chat prompt token is outside loaded vocabulary")
         }
+        // A text prompt must not reach the image positions a previous image
+        // request left in the held sequence.
+        if let Some(vision) = &self.vision {
+            let n = prompt
+                .iter()
+                .filter(|&&id| id == vision.config.image_token_id)
+                .count();
+            if n > 0 {
+                lloom_tensor::bail!(
+                    "the prompt holds {n} image position(s) (`<image>`) and no image is attached"
+                )
+            }
+        }
         let mut lease = self.checkout()?;
         lease.start_decode(&self.model, &self.device, self.decode.clone());
         let tokenizer = &self.tokenizer;
@@ -457,6 +563,109 @@ where
             lease.mark_complete();
         }
         result
+    }
+
+    /// The expansion of one image's `<image>` through the mmproj tower's
+    /// processor: its layout's delimiters and token runs.
+    pub(crate) fn image_placeholder(&self, image: &super::vision::DecodedImage) -> Result<String> {
+        let vision = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| Error::msg("this causal owner has no vision tower"))?;
+        let layout = vision.processor.layout(image.height, image.width);
+        Ok(vision
+            .processor
+            .placeholder(&layout, vision.config.use_image_special_tokens))
+    }
+
+    /// Chat whose prompt's image positions take `images`' rows, in order:
+    /// every image encoded by the mmproj tower, then the whole prompt
+    /// prefilled through [`super::vision::ImageRows`] on the held sequence
+    /// (reset first: a kept prefix would hold another request's image rows)
+    /// and decoded from there, as the safetensors family does.
+    pub(crate) fn complete_images(
+        &self,
+        prompt: &[u32],
+        images: &[super::vision::DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (impl FnMut(&str) -> bool + Send),
+    ) -> Result<Decoded> {
+        if images.is_empty() {
+            return self.complete(prompt, params, on_fragment);
+        }
+        let vision = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| Error::msg("this causal owner has no vision tower"))?;
+        check_context_capacity(self.capacity, prompt.len(), params.max_tokens, 0)
+            .map_err(Error::wrap)?;
+        if prompt
+            .iter()
+            .any(|&id| id as usize >= self.model.vocab_size())
+        {
+            lloom_tensor::bail!("chat prompt token is outside loaded vocabulary")
+        }
+        let image_token = vision.config.image_token_id;
+        let total = images.iter().try_fold(0usize, |sum, image| {
+            let layout = vision.processor.layout(image.height, image.width);
+            sum.checked_add(vision.processor.image_tokens(&layout))
+        });
+        let total = total.ok_or_else(|| Error::msg("image position count overflow"))?;
+        let reserved = prompt.iter().filter(|&&id| id == image_token).count();
+        if reserved != total {
+            lloom_tensor::bail!(
+                "the prompt reserves {reserved} image position(s) and its {} image(s) take {total}",
+                images.len()
+            )
+        }
+        let mut lease = self.checkout()?;
+        lease.start_external_work();
+        let mut parts = Vec::with_capacity(images.len());
+        for image in images {
+            let prepared = vision.processor.prepare_rgb8(
+                &image.rgb,
+                image.height,
+                image.width,
+                &self.device,
+                vision.dtype,
+            )?;
+            parts.push(vision.encoder.encode_image(&prepared)?);
+        }
+        let features = if parts.len() == 1 {
+            parts.pop().expect("one encoded image")
+        } else {
+            lloom_tensor::Tensor::cat(&parts, 0)?
+        };
+        let rows = super::vision::ImageRows::try_new(
+            &self.model,
+            prompt.to_vec(),
+            image_token,
+            features,
+            0,
+        )?;
+        let tokenizer = &self.tokenizer;
+        let decoded =
+            lease.with_model(&rows, &self.device, self.decode.clone(), |session, _| {
+                session.reset();
+                session.decode_until(
+                    prompt,
+                    |ids| {
+                        tokenizer.decode(ids, false).map_err(|error| {
+                            Error::msg(format!("detokenizing causal output: {error}"))
+                        })
+                    },
+                    params,
+                    |fragment| on_fragment(fragment),
+                )
+            })?;
+        if rows.spliced() != total {
+            lloom_tensor::bail!(
+                "image prefill placed {} image rows; the prompt holds {total}",
+                rows.spliced()
+            )
+        }
+        lease.mark_complete();
+        Ok(decoded)
     }
 
     /// Fully prepared programmatic requests preserve explicit renderer/certificate
@@ -482,7 +691,10 @@ where
         lease.start_external_work();
         let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.device)?;
         let options = self.decode.options(0, ReadbackArm::Blocking, 0);
-        let result = request.execute(&self.model, &self.config, &mut readback, &options);
+        let result = match self.ragged_arm() {
+            Some(ragged) => (ragged.text)(self, request, &mut readback, &options),
+            None => request.execute(&self.model, &self.config, &mut readback, &options),
+        };
         if result.is_ok() {
             lease.mark_complete();
         }
@@ -559,7 +771,7 @@ where
             super::lfm2::SERVED_DECISION_IMAGES,
             || {
                 "this causal owner has no vision tower: load it with the checkpoint's mmproj \
-                 (model.mmproj) to answer image decisions"
+                 (model.mmproj), and without model.text_only, to answer image decisions"
                     .into()
             },
             |text| Ok(self.encode(text, false)?),
@@ -600,8 +812,14 @@ where
             vision,
             &mmproj.encoder,
             &self.device,
-            &options,
-            |model, device| model.new_cache(&self.config, device),
+            |rows, readback| match self.ragged_arm() {
+                Some(ragged) => (ragged.images)(self, rows, &request, readback, &options),
+                None => {
+                    request.execute_with_cache_factory(rows, readback, &options, |_, device| {
+                        self.model.new_cache(&self.config, device)
+                    })
+                }
+            },
         )?;
         lease.mark_complete();
         Ok(response)
@@ -747,6 +965,7 @@ fn produce_lfm2_gguf_with<T>(
             // Native per-binding/error retirement closure is still unproven.
             recovery: Some(Box::new(AssociatedDeviceRecovery)),
             vision,
+            ragged: None,
             chat: Mutex::new(Some(Chat {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),

@@ -179,7 +179,8 @@ pub(crate) fn prepare_images(
 
 /// The model half of an image request, inside the caller's request lease:
 /// every image encoded by `encoder` in order, its rows spliced into the
-/// trunk's reserved positions, and the questions read as branches of it.
+/// trunk's reserved positions, and the questions read by `run` (the tree or
+/// the ragged read) with that splicing view of the model.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decide_images<M: CausalLM>(
     model: &M,
@@ -189,12 +190,11 @@ pub(crate) fn decide_images<M: CausalLM>(
     vision: ImageVision<'_>,
     encoder: &lloom::models::lfm2_vl::VisionEncoder,
     device: &Device,
-    options: &lloom::nn::DecodeOptions,
-    make_cache: impl FnOnce(&M, &Device) -> lloom_tensor::Result<M::Cache>,
-) -> std::result::Result<SystemOneResponse, SystemOneError>
-where
-    M::Cache: lloom::nn::branch::RetainState,
-{
+    run: impl FnOnce(
+        &ImageRows<'_, M>,
+        &mut lloom::generation::Blocking,
+    ) -> lloom_tensor::Result<SystemOneResponse>,
+) -> std::result::Result<SystemOneResponse, SystemOneError> {
     let mut parts = Vec::with_capacity(images.len());
     for image in images {
         let prepared = vision
@@ -213,20 +213,18 @@ where
             "encoded image feature count differs from reserved positions",
         ));
     }
+    // The longest prompt the view may see image chunks of: a single question
+    // is one plain pass over its whole prompt, which tiles may cut anywhere.
     let rows = ImageRows::try_new(
         model,
-        request.trunk_tokens().to_vec(),
+        request.splice_prompt().to_vec(),
         vision.config.image_token_id,
         features,
         0,
     )
     .map_err(execution)?;
     let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, device).map_err(execution)?;
-    let response = request
-        .execute_with_cache_factory(&rows, &mut readback, options, |_rows, device| {
-            make_cache(model, device)
-        })
-        .map_err(execution)?;
+    let response = run(&rows, &mut readback).map_err(execution)?;
     if rows.spliced() != positions {
         return Err(execution(
             "causal image prefill did not consume every encoded row",
@@ -376,19 +374,31 @@ impl<P: Lfm2Shape> Engine<P> {
         let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
         let device = &self.core.device;
         let encoder = vision_state.encoder(device).map_err(execution)?;
+        let model = &self.core.model;
         let response = decide_images(
-            &self.core.model,
+            model,
             &request,
             &images,
             positions,
             vision,
             &encoder,
             device,
-            &options,
-            |_model, device| {
-                self.private_cache
-                    .create::<P>(&self.config, self.dtype, device)
-                    .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+            |rows, readback| match self.ragged_config() {
+                // A trunk with image rows is not kept: its tokens do not name
+                // its pixels.
+                Some(config) => request.execute_ragged(
+                    rows,
+                    model,
+                    readback,
+                    &options,
+                    |_model, device| self.decision_cache(&config, device),
+                    None,
+                ),
+                None => {
+                    request.execute_with_cache_factory(rows, readback, &options, |_, device| {
+                        self.decision_cache(&self.config, device)
+                    })
+                }
             },
         )?;
         lease.mark_complete();

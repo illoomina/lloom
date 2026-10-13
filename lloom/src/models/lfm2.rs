@@ -3538,6 +3538,40 @@ impl<P: Profile> crate::nn::branch::RetainState for State<P> {
             }
             (_, None) => self.rewind_kv(self.kv_len() - saved.kv_len)?,
         }
+        self.restore_retained_conv(saved)
+    }
+}
+
+/// A fresh cache adopts a trunk on the Cat arm only: Cat replaces a layer's
+/// KV on every append and never writes into the retained tensors, so rows
+/// continuing one trunk share its prefix. An in-place slab is one buffer a
+/// row would write its own tokens into.
+impl<P: Profile> crate::nn::branch::AdoptRetained for State<P> {
+    fn adopt_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.speculative
+            || !self.use_kv_cache
+            || self.kv_len() != 0
+            || saved.conv.len() != self.conv_states.len()
+        {
+            lloom_tensor::bail!("lfm2 adoption: the cache is not a fresh one of this model")
+        }
+        match (self.kv.arm_mut(), &saved.cat) {
+            (ArmMut::One(OwnKv::Cat(kv)), Some(cat)) if kv.len() == cat.len() => {
+                kv.clone_from_slice(cat);
+            }
+            _ => lloom_tensor::bail!(
+                "lfm2 adoption: rows share a retained trunk on the Cat KV arm only \
+                 (kv_append = cat on both the trunk and the row)"
+            ),
+        }
+        self.restore_retained_conv(saved)
+    }
+}
+
+impl<P: Profile> State<P> {
+    /// The conv rings, their phase and the per-pass marks [`RetainedState`]
+    /// carries, put back after the KV was.
+    fn restore_retained_conv(&mut self, saved: &RetainedState) -> Result<()> {
         for (l, t) in saved.conv.iter().enumerate() {
             match t {
                 Some(t) => {

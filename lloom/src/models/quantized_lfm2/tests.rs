@@ -168,6 +168,77 @@ fn public_cache_refuses_before_writes_and_invalidates_failed_state() -> Result<(
     Ok(())
 }
 
+/// A ragged pass computes, for every row, what that row computes alone: rows
+/// of different lengths, each continuing a trunk its cache adopted, in one
+/// weight sweep. The logits at each row's last token match one pass over the
+/// row's whole sequence, the step after the pass matches too (the row's KV
+/// and conv history are its own), and the trunk stays as retained: a later
+/// adopter reads it unchanged.
+#[test]
+fn a_ragged_pass_computes_each_rows_own_logits_and_state() -> Result<()> {
+    use crate::nn::branch::AdoptRetained;
+    use crate::nn::{BatchedCausalLM, RaggedRow};
+    let model = load(&fixture()?)?;
+    let trunk = [1u32, 2, 3];
+    let mut source = model.new_cache()?;
+    run(&model, &mut source, &trunk, 2)?;
+    let saved = source.retain_state()?;
+    let suffixes: [&[u32]; 3] = [&[4, 5], &[6], &[7, 2, 6, 1, 5]];
+    let adopt = || -> Result<Cache> {
+        let mut cache = model.new_cache()?;
+        cache.adopt_retained(&saved)?;
+        Ok(cache)
+    };
+    let mut caches = vec![adopt()?, adopt()?, adopt()?];
+    let ids = suffixes.concat();
+    let tokens = Tensor::new(ids.as_slice(), &Device::Cpu)?.unsqueeze(0)?;
+    let mut rows = caches
+        .iter_mut()
+        .zip(&suffixes)
+        .map(|(cache, s)| RaggedRow {
+            pos: trunk.len(),
+            len: s.len(),
+            cache,
+        })
+        .collect::<Vec<_>>();
+    let logits = BatchedCausalLM::forward_ragged(&model, &tokens, &mut rows)?;
+    drop(rows);
+    assert_eq!(logits.dims(), &[3, 8]);
+    let mut spread = Vec::new();
+    for (r, s) in suffixes.iter().enumerate() {
+        let all = trunk.iter().chain(s.iter()).copied().collect::<Vec<_>>();
+        let mut alone = model.new_cache()?;
+        let expected = run(&model, &mut alone, &all, all.len())?;
+        let got = logits.get(r)?.to_vec1::<f32>()?;
+        close(&got, &expected);
+        spread.push(got[0]);
+        assert_eq!(caches[r].pos, all.len());
+        close(
+            &run(&model, &mut caches[r], &[3], 1)?,
+            &run(&model, &mut alone, &[3], 1)?,
+        );
+    }
+    let (lo, hi) = spread
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+    assert!(
+        hi - lo > 1e-3,
+        "the rows' logits are too close ({spread:?}) for a row reading another's to show"
+    );
+    let mut late = adopt()?;
+    close(
+        &run(&model, &mut late, &[4, 5], 2)?,
+        &logits.get(0)?.to_vec1::<f32>()?,
+    );
+    // Only a fresh cache of the same model adopts.
+    let mut used = model.new_cache()?;
+    run(&model, &mut used, &[1], 1)?;
+    assert!(used.adopt_retained(&saved).is_err());
+    let other = load(&fixture()?)?;
+    assert!(other.new_cache()?.adopt_retained(&saved).is_err());
+    Ok(())
+}
+
 #[test]
 fn malformed_metadata_and_existing_alias_errors_do_not_fall_back() -> Result<()> {
     for value in [

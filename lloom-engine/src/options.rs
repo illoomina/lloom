@@ -1565,6 +1565,9 @@ pub struct LoadConfig {
         cli = "decision-template"
     )]
     pub decision_template: Option<String>,
+    /// Load no vision or audio tower (a GGUF's mmproj, a VL checkpoint's tower): for text workloads, at the tower's memory. Image requests are then refused by name, and `/v1/models` lists text input only.
+    #[opt(bool, flag = "text-only", path = "model.text_only", status = "advanced", cli = "text-only")]
+    pub text_only: bool,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]
     pub warmup: bool,
@@ -1618,6 +1621,7 @@ impl Default for LoadConfig {
             tokenizer: None,
             mmproj: None,
             decision_template: None,
+            text_only: false,
             warmup: true,
             device: "auto".into(),
             experts: "stream".into(),
@@ -1657,6 +1661,9 @@ pub struct SchedulerConfig {
     /// Read `/v1/systemone` requests that wait together for the model as one tree, the reference's packing of single-question requests (the `fast` contract only: under `deterministic` each request is read alone).
     #[opt(bool, flag = "decision-pack", path = "scheduler.decision_pack", status = "advanced", switches = ["no-decision-pack=false"])]
     pub decision_pack: bool,
+    /// Read a `/v1/systemone` request's questions as one ragged batch over its state, the state prefilled once and kept for the next request over it (the `fast` contract only: under `deterministic` the questions are read one after another from a restore of the state).
+    #[opt(bool, flag = "decision-ragged", path = "scheduler.decision_ragged", status = "advanced", switches = ["no-decision-ragged=false"])]
+    pub decision_ragged: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -1665,6 +1672,7 @@ impl Default for SchedulerConfig {
             max_sequences: 1,
             rows: "auto".into(),
             decision_pack: true,
+            decision_ragged: true,
         }
     }
 }

@@ -475,6 +475,8 @@ impl Family for Lfm2Family {
             memory: shape.memory.clone(),
             flash_k: model.flash_k,
             decision_template: model.decision_template.clone(),
+            decision_ragged: shape.decision_ragged,
+            text_only: model.text_only,
         })
     }
 }
@@ -823,6 +825,7 @@ mod tests {
             mem_sample: false,
             rows: "auto".into(),
             share_prefix: false,
+            decision_ragged: true,
         }
     }
 

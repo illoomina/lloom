@@ -1,8 +1,10 @@
 //! One loaded causal model, one retained state prefix, many answer-slot suffixes.
 use super::{CausalReadout, OrderedJson, Question, SystemOneResponse, Temperature};
 use lloom::generation::ReadbackStrategy;
-use lloom::nn::branch::{BranchSession, RetainState};
-use lloom::nn::{CausalLM, DecodeOptions};
+use lloom::nn::branch::{
+    prefill_trunk, ragged_suffixes, AdoptRetained, BranchSession, RetainState, RetainedTrunk,
+};
+use lloom::nn::{BatchedCausalLM, CausalLM, DecodeOptions};
 use lloom_tensor::{DType, Error, Result, Tensor};
 
 /// A fully tokenized prompt and its selected-token readout, in option order.
@@ -59,6 +61,9 @@ impl CausalTask {
 pub struct CausalRequest {
     tasks: Vec<CausalTask>,
     trunk: usize,
+    /// The certified state prefix's length: what the questions share by
+    /// construction, where `trunk` is what they happen to share.
+    state: usize,
     input_tokens: u64,
 }
 impl CausalRequest {
@@ -100,6 +105,7 @@ impl CausalRequest {
         Ok(Self {
             tasks,
             trunk,
+            state: state_prefix.len(),
             input_tokens,
         })
     }
@@ -107,11 +113,24 @@ impl CausalRequest {
     pub fn trunk_tokens(&self) -> &[u32] {
         &self.tasks[0].prompt[..self.trunk]
     }
-    /// Media rows must be consumed entirely by the retained shared trunk.
-    /// Every full task is checked too: no branch may introduce another row.
+
+    /// The whole first prompt: every image position lies in it (in the
+    /// state, which all prompts share), whichever pass reads it.
+    pub(crate) fn splice_prompt(&self) -> &[u32] {
+        &self.tasks[0].prompt
+    }
+
+    /// The certified state prefix: the trunk a ragged read prefills and
+    /// keeps, the same for any questions asked over the same state.
+    pub fn state_tokens(&self) -> &[u32] {
+        &self.tasks[0].prompt[..self.state]
+    }
+    /// Media rows must be consumed entirely by the certified state prefix,
+    /// which every trunk (the tree's and the ragged read's) holds. Every full
+    /// task is checked too: no branch may introduce another row.
     pub(crate) fn validate_shared_token_positions(&self, token: u32, count: usize) -> Result<()> {
         if self
-            .trunk_tokens()
+            .state_tokens()
             .iter()
             .filter(|&&id| id == token)
             .count()
@@ -207,34 +226,183 @@ impl CausalRequest {
         let device = readback.device().clone();
         let cache = make_cache(model, &device)?;
         let mut session = BranchSession::from_cache(model, cache);
+        if let [task] = self.tasks.as_slice() {
+            let logits = session.plain(readback, &task.prompt, opts)?;
+            answers.push(task.answer(logits, vocab, &device)?);
+            return SystemOneResponse::new(answers, self.input_tokens).map_err(Error::wrap);
+        }
         session.begin(readback, self.trunk_tokens(), opts)?;
         for task in &self.tasks {
             let logits = session.suffix(readback, &task.prompt[self.trunk..], opts)?;
-            if logits.dims() != [vocab] {
-                lloom_tensor::bail!("causal answer slot has unexpected logit shape")
-            }
-            let indices = Tensor::new(task.selected.as_slice(), &device)?;
-            let values = logits
-                .index_select(&indices, 0)?
-                .to_dtype(DType::F32)?
-                .to_vec1::<f32>()?;
-            let probabilities = task.readout.probabilities(
-                |id| {
-                    let i = task
-                        .selected
-                        .iter()
-                        .position(|other| *other == id)
-                        .ok_or_else(|| Error::Msg("causal readout omitted a label".into()))?;
-                    Ok(f64::from(values[i]))
-                },
-                f64::from(task.temperature),
-            )?;
-            answers.push((
-                task.id.clone(),
-                task.question.systemone_answer(&probabilities)?,
-            ));
+            answers.push(task.answer(logits, vocab, &device)?);
         }
         SystemOneResponse::new(answers, self.input_tokens).map_err(Error::wrap)
+    }
+
+    /// The `decision-ragged` arm (`fast` only; `docs/models/d1.md`): the
+    /// certified state prefilled once as the trunk (or taken from `trunks`
+    /// when its tokens are the kept ones) and every question's remainder one
+    /// row of a ragged batch over it ([`ragged_suffixes`]), where
+    /// [`Self::execute_with_cache_factory`] prefills the suffixes one after
+    /// another, each from a restore of the trunk. A single question whose
+    /// state is not kept is one plain pass, as there.
+    ///
+    /// `trunk_model` prefills the trunk (a view that splices image rows into
+    /// it); `model` runs the rows, which carry no media. `trunks` is `None`
+    /// for a trunk that must not be kept (one with image rows: its tokens do
+    /// not name its pixels). The caller holds the same request exclusion and
+    /// admission as for the tree.
+    pub fn execute_ragged<T, M, R>(
+        &self,
+        trunk_model: &T,
+        model: &M,
+        readback: &mut R,
+        opts: &DecodeOptions,
+        mut make_cache: impl FnMut(&M, &lloom_tensor::Device) -> Result<M::Cache>,
+        trunks: Option<&TrunkCache<<M::Cache as RetainState>::Retained>>,
+    ) -> Result<SystemOneResponse>
+    where
+        T: CausalLM<Cache = M::Cache>,
+        M: BatchedCausalLM,
+        M::Cache: AdoptRetained,
+        R: ReadbackStrategy,
+    {
+        let vocab = model.vocab_size();
+        self.validate_tokens(vocab)?;
+        std::alloc::Layout::array::<(String, super::Answer<OrderedJson>)>(self.tasks.len())
+            .map_err(Error::wrap)?;
+        let mut answers = Vec::new();
+        answers
+            .try_reserve_exact(self.tasks.len())
+            .map_err(Error::wrap)?;
+        let device = readback.device().clone();
+        let kept = trunks.and_then(|t| t.get(self.state_tokens()));
+        if let ([task], None) = (self.tasks.as_slice(), &kept) {
+            let cache = make_cache(model, &device)?;
+            let mut session = BranchSession::from_cache(trunk_model, cache);
+            let logits = session.plain(readback, &task.prompt, opts)?;
+            answers.push(task.answer(logits, vocab, &device)?);
+            return SystemOneResponse::new(answers, self.input_tokens).map_err(Error::wrap);
+        }
+        let trunk = match kept {
+            Some(trunk) => trunk,
+            None => {
+                let cache = make_cache(model, &device)?;
+                let trunk = std::sync::Arc::new(prefill_trunk(
+                    trunk_model,
+                    cache,
+                    readback,
+                    self.state_tokens(),
+                    opts,
+                )?);
+                if let Some(trunks) = trunks {
+                    trunks.put(trunk.clone());
+                }
+                trunk
+            }
+        };
+        let mut suffixes = Vec::new();
+        suffixes
+            .try_reserve_exact(self.tasks.len())
+            .map_err(Error::wrap)?;
+        suffixes.extend(self.tasks.iter().map(|task| &task.prompt[self.state..]));
+        let logits = ragged_suffixes(
+            model,
+            &trunk,
+            || make_cache(model, &device),
+            readback,
+            &suffixes,
+            opts,
+        )?;
+        for (task, logits) in self.tasks.iter().zip(&logits) {
+            answers.push(task.answer(logits, vocab, &device)?);
+        }
+        SystemOneResponse::new(answers, self.input_tokens).map_err(Error::wrap)
+    }
+}
+
+impl CausalTask {
+    /// This task's answer from its answer slot's `[vocab]` logits.
+    fn answer(
+        &self,
+        logits: &Tensor,
+        vocab: usize,
+        device: &lloom_tensor::Device,
+    ) -> Result<(String, super::Answer<OrderedJson>)> {
+        if logits.dims() != [vocab] {
+            lloom_tensor::bail!("causal answer slot has unexpected logit shape")
+        }
+        let indices = Tensor::new(self.selected.as_slice(), device)?;
+        let values = logits
+            .index_select(&indices, 0)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let probabilities = self.readout.probabilities(
+            |id| {
+                let i = self
+                    .selected
+                    .iter()
+                    .position(|other| *other == id)
+                    .ok_or_else(|| Error::Msg("causal readout omitted a label".into()))?;
+                Ok(f64::from(values[i]))
+            },
+            f64::from(self.temperature),
+        )?;
+        Ok((
+            self.id.clone(),
+            self.question.systemone_answer(&probabilities)?,
+        ))
+    }
+}
+
+/// The last trunk a ragged read prefilled, kept for the next request over
+/// the same tokens: N single-question requests over one state, and a
+/// multi-question one after them, prefill that state once. One entry, so it
+/// holds at most one trunk's KV and conv state; a request over another
+/// state replaces it.
+pub struct TrunkCache<S> {
+    entry: parking_lot::Mutex<Option<std::sync::Arc<RetainedTrunk<S>>>>,
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl<S> Default for TrunkCache<S> {
+    fn default() -> Self {
+        Self {
+            entry: parking_lot::Mutex::new(None),
+            hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl<S> TrunkCache<S> {
+    /// The kept trunk when its tokens are `tokens`. An empty trunk is never
+    /// kept: there is nothing to save.
+    fn get(&self, tokens: &[u32]) -> Option<std::sync::Arc<RetainedTrunk<S>>> {
+        let entry = self.entry.lock();
+        let hit = entry
+            .as_ref()
+            .filter(|trunk| !tokens.is_empty() && trunk.tokens() == tokens)
+            .cloned();
+        if hit.is_some() {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        hit
+    }
+
+    fn put(&self, trunk: std::sync::Arc<RetainedTrunk<S>>) {
+        if !trunk.tokens().is_empty() {
+            *self.entry.lock() = Some(trunk);
+        }
+    }
+
+    /// Requests that started from the kept trunk.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The kept trunk's length in tokens, 0 when none is kept.
+    pub fn kept_tokens(&self) -> usize {
+        self.entry.lock().as_ref().map_or(0, |trunk| trunk.pos())
     }
 }
 
@@ -300,7 +468,15 @@ impl CausalRequest {
         if !Self::packable(&parts) {
             lloom_tensor::bail!("decision requests that share no trunk cannot be packed")
         }
-        let common = Self::common_trunk(&parts).to_vec();
+        let common = Self::common_trunk(&parts);
+        // The packed state is what every part's certified state starts with.
+        let state = parts
+            .iter()
+            .map(|part| part.state)
+            .min()
+            .unwrap_or(0)
+            .min(common.len());
+        let common = common[..state].to_vec();
         let max_prompt_tokens = parts
             .iter()
             .map(CausalRequest::max_prompt_tokens)
@@ -580,7 +756,12 @@ mod tests {
             })?;
         assert_eq!(calls.get(), 1);
         assert_eq!(model.cache_count.get(), 1);
-        assert_eq!(model.captures.get(), 1);
+        assert_eq!(
+            model.captures.get(),
+            0,
+            "a single question is one plain pass: nothing is retained"
+        );
+        assert_eq!(model.tokens_fed.get(), 2, "the whole prompt, once");
         assert_eq!(response.answers().len(), 1);
         Ok(())
     }

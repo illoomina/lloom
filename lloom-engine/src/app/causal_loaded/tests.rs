@@ -96,6 +96,7 @@ pub(super) fn engine() -> Result<CausalEngine<Tiny>> {
         decode: DecodeConfig::default(),
         recovery: None,
         vision: None,
+        ragged: None,
         chat: Mutex::new(Some(Chat {
             sequence: Some(Sequence::new(cache)),
             rings: Some(RingPool::new()),

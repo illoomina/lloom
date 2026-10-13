@@ -134,7 +134,14 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
     } else {
         open_device()?
     };
-    let mmproj = match &model.mmproj {
+    let (mmproj_path, vision_missing) = media(model.mmproj.as_deref(), model.text_only);
+    if let (Some(path), None) = (&model.mmproj, mmproj_path) {
+        eprintln!(
+            "[lfm2-gguf: text only: the mmproj {} is not loaded]",
+            path.display()
+        );
+    }
+    let mmproj = match mmproj_path {
         Some(path) => {
             let mut file = std::fs::File::open(path)
                 .with_context(|| format!("opening the mmproj {}", path.display()))?;
@@ -182,13 +189,42 @@ pub fn load(first: PathBuf, model: &LoadConfig, shape: &Shape) -> Result<Box<dyn
     );
     let engine = served::load_lfm2_gguf_unadmitted(
         &first,
-        model.mmproj.as_deref(),
+        mmproj_path,
         source,
         binding,
         &device,
         machine,
         shape.decode.clone(),
         config,
+        shape.decision_ragged,
+        vision_missing,
     )?;
     Ok(Box::new(engine))
+}
+
+/// The mmproj a load reads and, when it reads none, why images are refused:
+/// `model.text_only` loads no tower whatever `model.mmproj` names.
+fn media(mmproj: Option<&Path>, text_only: bool) -> (Option<&Path>, Option<&'static str>) {
+    match (mmproj, text_only) {
+        (Some(path), false) => (Some(path), None),
+        (_, true) => (None, Some(served::TEXT_ONLY)),
+        (None, false) => (None, Some(served::NO_MMPROJ)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--text-only` loads no tower even when an mmproj is named, and each
+    /// missing tower is refused for its own reason.
+    #[test]
+    fn text_only_loads_no_tower_and_says_why() {
+        let path = Path::new("mmproj.gguf");
+        assert_eq!(media(Some(path), false), (Some(path), None));
+        assert_eq!(media(Some(path), true), (None, Some(served::TEXT_ONLY)));
+        assert_eq!(media(None, true), (None, Some(served::TEXT_ONLY)));
+        assert_eq!(media(None, false), (None, Some(served::NO_MMPROJ)));
+        assert_ne!(served::TEXT_ONLY, served::NO_MMPROJ);
+    }
 }

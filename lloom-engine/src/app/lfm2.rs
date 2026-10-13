@@ -328,6 +328,9 @@ pub struct Engine<P: Profile> {
     /// `/v1/systemone`'s executor binding: a native d1 checkpoint's own, or
     /// the template `decision.template` selected; `None` refuses by name.
     decisions: Option<ServedDecisions>,
+    /// `scheduler.decision_ragged`, and the state the last ragged read kept.
+    decision_ragged: bool,
+    trunks: crate::decision::TrunkCache<lloom::models::lfm2::RetainedState>,
     single: parking_lot::Mutex<Option<RequestState<State<P>, SingleExtra>>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -379,6 +382,11 @@ pub struct LoadOptions {
     /// renders, when the checkpoint is not a native decision model or a
     /// different template is wanted (`decision::binding::Selection`).
     pub decision_template: Option<String>,
+    /// `scheduler.decision_ragged`: read a request's questions as one ragged
+    /// batch over its state (`CausalRequest::execute_ragged`), under `fast`.
+    pub decision_ragged: bool,
+    /// `model.text_only`: build no vision tower on a VL checkpoint.
+    pub text_only: bool,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -774,20 +782,44 @@ impl<P: Lfm2Shape> Engine<P> {
         lease.start_external_work();
         let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
         let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.core.device)?;
-        let result = request.execute_with_cache_factory(
-            &self.core.model,
-            &mut readback,
-            &options,
-            |_model, device| {
-                self.private_cache
-                    .create::<P>(&self.config, self.dtype, device)
-                    .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
-            },
-        );
+        let result = match self.ragged_config() {
+            Some(config) => request.execute_ragged(
+                &self.core.model,
+                &self.core.model,
+                &mut readback,
+                &options,
+                |_model, device| self.decision_cache(&config, device),
+                Some(&self.trunks),
+            ),
+            None => request.execute_with_cache_factory(
+                &self.core.model,
+                &mut readback,
+                &options,
+                |_model, device| self.decision_cache(&self.config, device),
+            ),
+        };
         if result.is_ok() {
             lease.mark_complete();
         }
         result
+    }
+
+    /// The decision caches' config when the `decision-ragged` arm is taken
+    /// (`scheduler.decision_ragged` under `fast`): the served config with
+    /// Cat KV, the arm whose appends never write into the trunk the rows
+    /// share (`AdoptRetained`).
+    fn ragged_config(&self) -> Option<Config> {
+        (self.decision_ragged && lloom_tensor::tuning::contract().is_fast()).then(|| {
+            let mut config = self.config.clone();
+            config.kv_append = lloom::models::lfm2::KvAppend::Cat;
+            config
+        })
+    }
+
+    fn decision_cache(&self, config: &Config, device: &Device) -> lloom_tensor::Result<State<P>> {
+        self.private_cache
+            .create::<P>(config, self.dtype, device)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
     }
 
     fn load_on(opts: LoadOptions, device: Device, admission: LoadAdmission) -> Result<Self> {
@@ -1172,7 +1204,10 @@ impl<P: Lfm2Shape> Engine<P> {
         };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         load_warnings.splice(0..0, model.load_warnings().iter().cloned());
-        let vision = if vl {
+        if vl && opts.text_only {
+            eprintln!("[lfm2: text only: the vision tower is not built]");
+        }
+        let vision = if vl && !opts.text_only {
             let vl_config: Lfm2VlConfig = serde_json::from_value(root.clone())
                 .context("parsing config.json's vision half")?;
             Some(Vision {
@@ -1244,6 +1279,8 @@ impl<P: Lfm2Shape> Engine<P> {
             machine,
             private_cache,
             decisions,
+            decision_ragged: opts.decision_ragged,
+            trunks: Default::default(),
             single: parking_lot::Mutex::new(Some(RequestState {
                 sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -3088,6 +3125,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     fn capabilities(&self) -> super::family::Capabilities {
         super::family::Capabilities {
             decisions: self.decisions.is_some(),
+            vision: self.vision.is_some(),
+            vision_missing: "no vision tower is built: the checkpoint names no vision_config, \
+                or it was loaded text only (model.text_only, --text-only)",
             ..super::family::LFM2_CAPABILITIES
         }
     }

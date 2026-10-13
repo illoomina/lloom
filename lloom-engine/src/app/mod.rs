@@ -58,6 +58,8 @@ pub struct Shape {
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
+    /// `scheduler.decision_ragged`; taken only under the `fast` contract.
+    pub decision_ragged: bool,
 }
 
 impl Shape {
@@ -77,6 +79,7 @@ impl Shape {
             mem_sample: o.report.memory_sample,
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
+            decision_ragged: o.scheduler.decision_ragged,
         }
     }
 }
@@ -830,6 +833,7 @@ mod option_layer_tests {
                 mem_sample: false,
                 rows: "auto".into(),
                 share_prefix: false,
+                decision_ragged: true,
             }
         };
         let mut s = shape(&["--replay"]);

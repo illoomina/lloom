@@ -295,11 +295,17 @@ pub fn load_lfm2_gguf_unadmitted(
     machine: lloom_tensor::machine::Admitted,
     decode: DecodeConfig,
     config: Config,
+    ragged: bool,
+    vision_missing: Option<&'static str>,
 ) -> Result<Engine<NoPrediction>> {
     let serving = Serving {
         config,
         decode,
-        capabilities: lfm2_gguf_capabilities(),
+        capabilities: Capabilities {
+            vision: vision_missing.is_none(),
+            vision_missing: vision_missing.unwrap_or(""),
+            ..lfm2_gguf_capabilities()
+        },
     };
     let owner_decode = serving.decode.clone();
     let (policy, described) = match binding {
@@ -334,7 +340,12 @@ pub fn load_lfm2_gguf_unadmitted(
                     )
                 },
             )
-            .map(|(engine, ())| engine)
+            .map(|(mut engine, ())| {
+                if ragged {
+                    engine.install_ragged();
+                }
+                engine
+            })
         },
     )
 }
@@ -822,6 +833,36 @@ where
     ) -> anyhow::Result<Decoded> {
         Ok(self.complete_admitted(prompt, params, |text| on_fragment(text))?)
     }
+    fn image_placeholder(
+        &self,
+        image: &super::super::vision::DecodedImage,
+    ) -> anyhow::Result<String> {
+        if !self.metadata.capabilities.vision {
+            return Err(self.no_vision());
+        }
+        Ok(self.pass(Request::ImagePlaceholder(image), |engine| {
+            engine.image_placeholder(image)
+        })?)
+    }
+    fn complete_images_until(
+        &self,
+        prompt: &[u32],
+        images: &[super::super::vision::DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+    ) -> anyhow::Result<Decoded> {
+        if !self.metadata.capabilities.vision {
+            return Err(self.no_vision());
+        }
+        Ok(self.pass(
+            Request::Images {
+                prompt,
+                images,
+                params,
+            },
+            |engine| engine.complete_images(prompt, images, params, &mut |t| on_fragment(t)),
+        )?)
+    }
     fn prefill_throughput(&self, n: usize, batch: usize) -> anyhow::Result<PrefillTiming> {
         self.check_batch(batch)?;
         check_context_capacity(self.kv_capacity(), n, 1, 0)?;
@@ -966,6 +1007,13 @@ where
     fn shutdown(&self) {} // No owner worker threads are launched by this adapter.
 }
 
+/// Why an LFM2 GGUF loaded without its mmproj reads no images.
+pub const NO_MMPROJ: &str =
+    "no vision tower is loaded: name the checkpoint's mmproj (model.mmproj, --mmproj)";
+/// Why one loaded under `model.text_only` reads none.
+pub const TEXT_ONLY: &str =
+    "loaded text only (model.text_only, --text-only): the mmproj's tower is not loaded";
+
 pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
     Capabilities {
         family: "lfm2-gguf",
@@ -990,9 +1038,7 @@ pub(crate) fn lfm2_gguf_capabilities() -> Capabilities {
         kv_dense: &["f32"],
         kv_quant_missing: "quantized GGUF weights do not install quantized KV stores",
         vision: false,
-        vision_missing: "chat takes text only on this owner; decisions read images through \
-            the mmproj's tower (model.mmproj), and the safetensors checkpoint's lfm2 family chats \
-            with images",
+        vision_missing: NO_MMPROJ,
         eos_gate: false,
         eos_gate_missing: "generic GGUF forward has no gated kernels",
     }

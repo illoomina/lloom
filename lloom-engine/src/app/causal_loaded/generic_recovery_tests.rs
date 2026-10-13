@@ -144,6 +144,7 @@ fn engine(recovery: bool) -> Result<(CausalEngine<FaultModel>, Arc<Counts>)> {
             Box::new(FamilyRecovery(Arc::clone(&counts))) as Box<dyn Recovery<FaultModel>>
         }),
         vision: None,
+        ragged: None,
         chat: Mutex::new(Some(Chat {
             sequence: Some(Sequence::new(cache)),
             rings: Some(RingPool::new()),

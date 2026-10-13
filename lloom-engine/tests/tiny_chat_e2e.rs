@@ -1988,6 +1988,11 @@ fn lfm2_tiny_serves_decisions_and_chat_on_one_model() {
         models["data"][0]["architecture"]["output_modalities"],
         json!(["text"])
     );
+    // A text checkpoint builds no tower: no image input is listed.
+    assert_eq!(
+        models["data"][0]["architecture"]["input_modalities"],
+        json!(["text"])
+    );
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }

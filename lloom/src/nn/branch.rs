@@ -1,7 +1,9 @@
 //! Request-owned causal branching over the incumbent paced prefill loop.
 
-use super::decode::{DecodeOptions, PrefillOut};
-use super::model::{CacheReset, CausalLM};
+use super::decode::{
+    begin_pass, end_executor_step, end_pass, ragged_layout, DecodeOptions, PassShape, PrefillOut,
+};
+use super::model::{BatchedCausalLM, CacheReset, CausalLM, RaggedRow};
 use super::speculator::Session;
 use crate::generation::ReadbackStrategy;
 use lloom_tensor::{Device, Result, Tensor};
@@ -25,6 +27,175 @@ pub trait RetainState {
     }
     fn retain_state(&mut self) -> Result<Self::Retained>;
     fn restore_retained(&mut self, retained: &Self::Retained) -> Result<()>;
+}
+
+/// A fresh cache of the same loaded model that takes a retained state as its
+/// own prefix, so that several sequences continue one trunk at once (the rows
+/// of a ragged branch batch). The retained state stays valid for the next
+/// adopter: nothing an adopter writes reaches it.
+pub trait AdoptRetained: RetainState {
+    /// Called after [`RetainState::prepare_branching`] on a fresh cache.
+    fn adopt_retained(&mut self, retained: &Self::Retained) -> Result<()>;
+}
+
+/// A prefilled trunk owned outside any session: its tokens and the state the
+/// cache held after them. It outlives the request that prefilled it, so the
+/// next request over the same tokens starts from it.
+pub struct RetainedTrunk<S> {
+    tokens: Vec<u32>,
+    state: S,
+}
+
+impl<S> RetainedTrunk<S> {
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+    /// The position the trunk's continuations start at.
+    pub fn pos(&self) -> usize {
+        self.tokens.len()
+    }
+}
+
+/// Prefill `tokens` into a fresh `cache` (tiled and paced as any prefill)
+/// and retain the state after them. `model` may be a view of the model that
+/// rows continue with (image rows spliced into the trunk).
+pub fn prefill_trunk<T, R>(
+    model: &T,
+    cache: T::Cache,
+    readback: &mut R,
+    tokens: &[u32],
+    opts: &DecodeOptions,
+) -> Result<RetainedTrunk<<T::Cache as RetainState>::Retained>>
+where
+    T: CausalLM,
+    T::Cache: RetainState,
+    R: ReadbackStrategy,
+{
+    let mut session = Session::new(model, cache);
+    session.seq.cache.prepare_branching()?;
+    if !tokens.is_empty() {
+        session.prefill(readback, tokens, opts)?;
+    }
+    model.settle_pending(&mut session.seq.cache)?;
+    let state = session.seq.cache.retain_state()?;
+    let mut owned = retained_vec(tokens.len())?;
+    owned.extend_from_slice(tokens);
+    Ok(RetainedTrunk {
+        tokens: owned,
+        state,
+    })
+}
+
+/// Continue `trunk` with each of `suffixes` as its own sequence and return
+/// each suffix's final-position logits (`[vocab]`), in order.
+///
+/// The suffixes ride one ragged forward ([`BatchedCausalLM::forward_ragged`])
+/// per group of at most `opts.prefill_tile` tokens (the per-request memory
+/// guard), so a group's weights are read once for all its rows. A suffix
+/// longer than the tile is prefilled alone, tile by tile. Each row's cache
+/// adopts the trunk, so a row attends to the trunk and to itself, never to
+/// another row.
+pub fn ragged_suffixes<M, R>(
+    model: &M,
+    trunk: &RetainedTrunk<<M::Cache as RetainState>::Retained>,
+    mut make_cache: impl FnMut() -> Result<M::Cache>,
+    readback: &mut R,
+    suffixes: &[&[u32]],
+    opts: &DecodeOptions,
+) -> Result<Vec<Tensor>>
+where
+    M: BatchedCausalLM,
+    M::Cache: AdoptRetained,
+    R: ReadbackStrategy,
+{
+    if suffixes.iter().any(|s| s.is_empty()) {
+        lloom_tensor::bail!("ragged branches: an answer-slot suffix must be nonempty")
+    }
+    let device = readback.device().clone();
+    let tile = if opts.prefill_tile == 0 {
+        usize::MAX
+    } else {
+        opts.prefill_tile
+    };
+    let mut adopt = || -> Result<M::Cache> {
+        let mut cache = make_cache()?;
+        cache.prepare_branching()?;
+        cache.adopt_retained(&trunk.state)?;
+        Ok(cache)
+    };
+    let mut out = retained_vec(suffixes.len())?;
+    let mut start = 0;
+    while start < suffixes.len() {
+        if suffixes[start].len() > tile {
+            let mut session = Session::with_pos(model, adopt()?, trunk.pos());
+            session.prefill(readback, suffixes[start], opts)?;
+            model.settle_pending(&mut session.seq.cache)?;
+            let logits = session.last_logits().ok_or_else(|| {
+                lloom_tensor::Error::msg("ragged branches: a long suffix produced no logits")
+            })?;
+            out.push(logits.flatten_all()?.copy()?);
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        let mut total = 0usize;
+        while end < suffixes.len()
+            && suffixes[end].len() <= tile
+            && total + suffixes[end].len() <= tile
+        {
+            total += suffixes[end].len();
+            end += 1;
+        }
+        let group = &suffixes[start..end];
+        // Drains this pass's autoreleased encoders when the group ends.
+        let _pool = lloom_tensor::AutoreleaseScope::new();
+        let mut caches = retained_vec(group.len())?;
+        for _ in group {
+            caches.push(adopt()?);
+        }
+        let mut ids = retained_vec(total)?;
+        for s in group {
+            ids.extend_from_slice(s);
+        }
+        let tokens = Tensor::from_vec(ids, (1, total), &device)?;
+        // Session grows before the bracket, per row, as the batched driver's.
+        for (cache, s) in caches.iter_mut().zip(group) {
+            model.prepare_pass(cache, s.len())?;
+        }
+        let mut rows = retained_vec(group.len())?;
+        for (cache, s) in caches.iter_mut().zip(group) {
+            rows.push(RaggedRow {
+                pos: trunk.pos(),
+                len: s.len(),
+                cache,
+            });
+        }
+        let shape = PassShape::Ragged {
+            live: 0,
+            pieces: u16::try_from(group.len()).map_err(lloom_tensor::Error::wrap)?,
+            layout: ragged_layout(group.iter().map(|s| (s.len(), trunk.pos() == 0))),
+        };
+        begin_pass(&device, shape)?;
+        let logits = model.forward_ragged(&tokens, &mut rows)?;
+        end_pass(&device)?;
+        drop(rows);
+        for cache in &mut caches {
+            model.settle_pending(cache)?;
+        }
+        if logits.dims() != [group.len(), model.vocab_size()] {
+            lloom_tensor::bail!(
+                "ragged branches: logits {:?} for {} rows",
+                logits.dims(),
+                group.len()
+            )
+        }
+        for r in 0..group.len() {
+            out.push(logits.get(r)?);
+        }
+        start = end;
+    }
+    end_executor_step(&device)?;
+    Ok(out)
 }
 
 struct Trunk<S> {
@@ -99,6 +270,34 @@ where
         self.session.seq.last_logits = None;
         self.failed = false;
         Ok(out)
+    }
+
+    /// One pass over a whole prompt, its final logits borrowed: nothing is
+    /// retained. A single question is read this way, the reference's and
+    /// llama.cpp's shape (`docs/models/d1.md`). The session must be fresh.
+    pub fn plain<R: ReadbackStrategy>(
+        &mut self,
+        readback: &mut R,
+        tokens: &[u32],
+        opts: &DecodeOptions,
+    ) -> Result<&Tensor> {
+        if self.failed || self.trunk.is_some() || self.session.pos() != 0 {
+            lloom_tensor::bail!("branch session: a plain pass needs a fresh session")
+        }
+        if tokens.is_empty() {
+            lloom_tensor::bail!("branch session: a plain pass needs a nonempty prompt")
+        }
+        self.failed = true;
+        self.session.seq.cache.prepare_branching()?;
+        self.session.prefill(readback, tokens, opts)?;
+        self.session
+            .model
+            .settle_pending(&mut self.session.seq.cache)?;
+        if self.session.last_logits().is_none() {
+            lloom_tensor::bail!("branch session: plain pass produced no answer-slot logits")
+        }
+        self.failed = false;
+        Ok(self.session.last_logits().expect("checked above"))
     }
 
     /// Append one nonempty answer-slot suffix and borrow its final logits.

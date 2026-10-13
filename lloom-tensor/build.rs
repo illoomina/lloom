@@ -77,7 +77,8 @@ const SOURCE_CHECKS: &[(&str, usize, u64)] = &[
 ];
 
 // Each exact official distribution entry has independently retrieved matching
-// source audit; unknown commits/targets never inherit this table by version.
+// source audit (memory.md §9.10a); unknown commits/targets never inherit this
+// table by version.
 const AUDITED_COMPILERS: &[(&str, &str)] = &[
     (
         "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96",
@@ -86,5 +87,9 @@ const AUDITED_COMPILERS: &[(&str, &str)] = &[
     (
         "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd",
         "x86_64-unknown-linux-gnu",
+    ),
+    (
+        "31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd",
+        "aarch64-unknown-linux-gnu",
     ),
 ];

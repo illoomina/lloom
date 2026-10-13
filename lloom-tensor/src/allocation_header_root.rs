@@ -942,6 +942,42 @@ mod tests {
             Err(rejected) => panic!("unexpected scalar insert refusal: {:?}", rejected.error),
         }
     }
+    /// Where std's Arc layout is not audited (`build.rs`), the owned quote
+    /// refuses by policy, and the owned constructor refuses with it before it
+    /// draws on the promise or allocates.
+    #[cfg(not(lloom_audited_arc_layout))]
+    #[test]
+    fn owned_root_actual_free_precedes_same_account_refund() {
+        type Pool = HeaderPool<(), (), 3>;
+        assert!(matches!(
+            Pool::requested_owned_bytes(),
+            Err(RootError::Admission(AllocationError::UnsupportedLayout))
+        ));
+        let service = HostRetirementService::manual();
+        let domain = ModelDomain::isolated_numeric_fixture(4096);
+        let pass = domain.reserve(4096).unwrap();
+        let context = pass.context();
+        // SAFETY: scalar empty C/A only, no native use/backedge, true readiness;
+        // the constructor refuses before any root or registration exists.
+        let result =
+            unsafe { Pool::cold_owned_when_in_service(&context, |_, _| true, None, &service) };
+        assert!(matches!(
+            result,
+            Err(RootError::Admission(AllocationError::UnsupportedLayout))
+        ));
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: 4096,
+                committed: 0
+            },
+            "the refusal draws nothing on the promise"
+        );
+        drop(context);
+        drop(pass);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+    #[cfg(lloom_audited_arc_layout)]
     #[test]
     fn owned_root_actual_free_precedes_same_account_refund() {
         type Pool = HeaderPool<(), (), 3>;

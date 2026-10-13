@@ -617,15 +617,60 @@ pub enum Command {
     Options(OptionsCmdArgs),
 }
 
-/// The `lloom` binary's entry.
+/// How long a dropped device's retirement may take at exit before the
+/// process leaves it to the OS.
+const DEVICE_RETIREMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `lloom` binary's entry. A dropped device retires on the host
+/// retirement service, so the process joins that retirement before it exits.
 pub fn main(argv: Vec<String>) -> Result<()> {
     let cli = Cli::parse_from(argv);
-    match cli.command {
+    let result = match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Bench(args) => serve::bench(args),
         Command::Config(args) => print_config(&args),
         Command::Options(args) => print_options(&args),
+    };
+    let joined = join_device_retirement();
+    result.and(joined)
+}
+
+/// Joins the retirement of every dropped device, says so when one is still
+/// retiring at the budget, and judges the release witness's count.
+fn join_device_retirement() -> Result<()> {
+    let joined =
+        lloom_tensor::join_device_retirement(std::time::Instant::now() + DEVICE_RETIREMENT_BUDGET);
+    if !joined.completed {
+        eprintln!(
+            "[device retirement: {} set(s) with {} record(s) still retiring at the {}s budget]",
+            joined.sets_retiring,
+            joined.records_pending,
+            DEVICE_RETIREMENT_BUDGET.as_secs(),
+        );
+    }
+    retirement_verdict(&joined, lloom_tensor::tuning::contract().is_fast())
+}
+
+/// An allocation still listed when its record released it is an ordering
+/// defect the witness turned into a kept allocation (`tuning.md` §6.3m). It
+/// is printed whenever it happened; under `deterministic` it fails the run,
+/// under `fast` the line is the report.
+fn retirement_verdict(joined: &lloom_tensor::DeviceRetirementReport, fast: bool) -> Result<()> {
+    if joined.listed_at_release == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "[device retirement: {} allocation(s) still in the residency set when their record released them; kept, never freed]",
+        joined.listed_at_release
+    );
+    if fast {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} allocation(s) were released while the residency set still listed them (the deterministic contract fails on it)",
+            joined.listed_at_release
+        )
     }
 }
 
@@ -638,6 +683,32 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
 }
 #[cfg(test)]
 mod spellings_tests;
+
+#[cfg(test)]
+mod retirement_verdict_tests {
+    use super::retirement_verdict;
+    use lloom_tensor::DeviceRetirementReport;
+
+    fn report(listed_at_release: u64) -> DeviceRetirementReport {
+        DeviceRetirementReport {
+            completed: true,
+            worker_stopped: true,
+            listed_at_release,
+            ..Default::default()
+        }
+    }
+
+    /// A kept allocation fails a deterministic run and is only reported
+    /// under fast; none passes both.
+    #[test]
+    fn a_listed_release_fails_deterministic_and_is_reported_under_fast() {
+        assert!(retirement_verdict(&report(0), false).is_ok());
+        assert!(retirement_verdict(&report(0), true).is_ok());
+        let refused = retirement_verdict(&report(3), false).expect_err("deterministic fails");
+        assert!(refused.to_string().contains("3 allocation(s)"), "{refused}");
+        assert!(retirement_verdict(&report(3), true).is_ok());
+    }
+}
 
 #[cfg(test)]
 mod option_layer_tests {

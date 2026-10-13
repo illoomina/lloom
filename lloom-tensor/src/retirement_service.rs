@@ -396,8 +396,11 @@ pub(crate) struct HostRetirementService {
     // unmeasured latency/idle-cost tradeoff, not an optimum or deadline promise.
     polling: AtomicBool,
     polling_interval: Duration,
-    #[cfg(test)]
-    test_stop: AtomicBool,
+    // The worker returns at its next loop top once this is set, and marks
+    // `exited` as it leaves (`stop_worker`).
+    stop: AtomicBool,
+    exited: Mutex<bool>,
+    exit_signal: parking_lot::Condvar,
     #[cfg(test)]
     test_idle_parks: std::sync::atomic::AtomicUsize,
     // An arbitrary destructor panic can itself carry owned values. Keep those
@@ -408,14 +411,46 @@ pub(crate) struct HostRetirementService {
     active_metadata_charge: Mutex<Option<PhysicalCharge>>,
 }
 
+static SHARED_SERVICE: OnceLock<Result<Arc<HostRetirementService>, ServiceError>> = OnceLock::new();
+
+/// Stops the shared worker, if it was ever started, and waits until
+/// `deadline` for it to leave its loop. `None` when no worker was started;
+/// otherwise whether it stopped in time. For process exit only: records
+/// published after this are never serviced (their custody stays rooted).
+#[cfg(feature = "metal")]
+pub(crate) fn stop_shared_worker(deadline: Instant) -> Option<bool> {
+    match SHARED_SERVICE.get() {
+        Some(Ok(service)) => Some(service.stop_worker(deadline)),
+        _ => None,
+    }
+}
+
 impl HostRetirementService {
+    /// Asks the worker to leave its loop at its next check, and waits until
+    /// `deadline` for it to have left. A pass in progress finishes first;
+    /// no pass starts after the worker has seen the request.
+    #[cfg(feature = "metal")]
+    pub(crate) fn stop_worker(&self, deadline: Instant) -> bool {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify();
+        let mut exited = self.exited.lock();
+        while !*exited {
+            if self
+                .exit_signal
+                .wait_until(&mut exited, deadline)
+                .timed_out()
+            {
+                return *exited;
+            }
+        }
+        true
+    }
+
     /// Setup-only. Start failure is returned before any inbox/owner can be
     /// registered. The immutable static retains successful service custody even
     /// if its worker exits unexpectedly. No mandatory worker until first use.
     pub(crate) fn shared() -> Result<&'static Arc<Self>, ServiceError> {
-        static SERVICE: OnceLock<Result<Arc<HostRetirementService>, ServiceError>> =
-            OnceLock::new();
-        match SERVICE.get_or_init(|| {
+        match SHARED_SERVICE.get_or_init(|| {
             let service = Arc::new(Self {
                 registry: Mutex::new(InboxRegistry::default()),
                 passing: AtomicBool::new(false),
@@ -423,8 +458,9 @@ impl HostRetirementService {
                 failure: FailureSignal::default(),
                 polling: AtomicBool::new(false),
                 polling_interval: Duration::from_millis(10),
-                #[cfg(test)]
-                test_stop: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+                exited: Mutex::new(false),
+                exit_signal: parking_lot::Condvar::new(),
                 #[cfg(test)]
                 test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
                 panic_payloads: Mutex::new(Vec::new()),
@@ -451,8 +487,9 @@ impl HostRetirementService {
             failure: FailureSignal::default(),
             polling: AtomicBool::new(false),
             polling_interval: Duration::from_millis(10),
-            #[cfg(test)]
-            test_stop: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            exited: Mutex::new(false),
+            exit_signal: parking_lot::Condvar::new(),
             #[cfg(test)]
             test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
             panic_payloads: Mutex::new(Vec::new()),
@@ -703,9 +740,8 @@ impl HostRetirementService {
             // Snapshot before examining inboxes, including RETURNED and final
             // reader notifications; the shared Wake closes check -> park.
             let seen = self.wake.snapshot();
-            // Test stop uses the same snapshot -> check -> park handshake.
-            #[cfg(test)]
-            if self.test_stop.load(Ordering::Acquire) {
+            // A stop uses the same snapshot -> check -> park handshake.
+            if self.stop.load(Ordering::Acquire) {
                 return;
             }
             #[cfg(feature = "metal")]
@@ -749,6 +785,8 @@ impl HostRetirementService {
             schedule_point!(RetireFailed);
             self.fail_inboxes(Failure::WorkerFailed);
         }
+        *self.exited.lock() = true;
+        self.exit_signal.notify_all();
     }
 }
 
@@ -1371,7 +1409,7 @@ mod polling_tests {
     }
     impl Drop for RunningWorker {
         fn drop(&mut self) {
-            self.service.test_stop.store(true, Ordering::Release);
+            self.service.stop.store(true, Ordering::Release);
             self.service.wake.notify();
             self.thread.take().unwrap().join().unwrap();
         }

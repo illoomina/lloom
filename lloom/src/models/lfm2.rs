@@ -2819,10 +2819,11 @@ fn grow_bytes_of(plans: &[Option<GrowPlan>]) -> usize {
     private + shared
 }
 
-impl GrowPlan {
-    /// Where the grow was asked for, for the refusal's message.
-    pub(crate) fn describe(&self) -> String {
-        format!(
+/// Where the grow was asked for, for the refusal's line.
+impl std::fmt::Display for GrowPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "at {} + {} positions, widening the slab from {} to {} tokens",
             self.kv_len, self.seq_len, self.from, self.slab
         )
@@ -4644,7 +4645,7 @@ impl<P: Profile> State<P> {
     pub(crate) fn prepare_pass(&mut self, seq_len: usize) -> Result<()> {
         self.apply_layer_grant()?;
         if let Some(plan) = self.plan_pass(seq_len)? {
-            self.admit_grow(plan.bytes, &plan.describe())?;
+            self.admit_grow(plan.bytes, &plan)?;
             self.apply_grow(&plan)?;
         }
         // The planes allocate at the first append, at the slab's width: the
@@ -4809,8 +4810,12 @@ impl<P: Profile> State<P> {
     /// — which is exactly the figure admission's prediction cannot see and the
     /// one a grow has to fit beside. The comparison is [`kv_grow_fits`], kept
     /// pure so the arithmetic is tested without a device.
+    ///
+    /// A refusal is `Error::Allocation(Refused { .. })`: the machine gate's
+    /// when the machine refused, else the budget's, with the grow and the
+    /// room. Its line (what, and the arithmetic) goes to stderr once.
     #[cfg(feature = "metal")]
-    pub(crate) fn admit_grow(&self, grow: usize, what: &str) -> Result<()> {
+    pub(crate) fn admit_grow(&self, grow: usize, what: &dyn std::fmt::Display) -> Result<()> {
         let Ok(metal) = self.device.as_metal_device() else {
             return Ok(());
         };
@@ -4838,36 +4843,41 @@ impl<P: Profile> State<P> {
             ));
             return Ok(());
         }
-        if let Some(why) = &a.machine {
-            lloom_tensor::bail!(
-                "lfm2 KV grow refused {what}: {why}; pledged={} yield_contended={}",
-                a.pledged,
-                a.yield_contended
-            );
-        }
+        let budget = kv_grow_budget(working_set, self.kv_grow_fraction);
+        let refusal =
+            a.machine
+                .unwrap_or(lloom_tensor::memory_admission::AllocationError::Refused {
+                    requested: grow,
+                    available: budget.saturating_sub(a.committed),
+                    domain: lloom_tensor::memory_admission::RefusalDomain::Budget,
+                });
         let gb = |b: usize| b as f64 / 1e9;
-        lloom_tensor::bail!(
-            "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the ledger already \
-             holds {:.2} GB of the {:.2} GB it may ({:.2} x recommendedMaxWorkingSetSize \
-             {:.2} GB) after giving back {:.3} GB of free lists. The reply stops here, \
-             before anything is written, rather than risk \
-             the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
-             free memory, or bound the run. pledged={} yield_contended={} (at most one yield retry).",
-            gb(grow),
-            gb(a.committed),
-            gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
-            self.kv_grow_fraction,
-            gb(working_set),
-            gb(a.reclaimed),
-            a.pledged,
-            a.yield_contended,
-        )
+        metal.report_refusal(
+            &format_args!(
+                "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the ledger holds \
+                 {:.2} GB of the {:.2} GB it may ({:.2} x recommendedMaxWorkingSetSize {:.2} GB) \
+                 after giving back {:.3} GB of free lists. The reply stops here, before anything \
+                 is written (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
+                 free memory, or bound the run. pledged={} yield_contended={} (at most one \
+                 yield retry)",
+                gb(grow),
+                gb(a.committed),
+                gb(budget),
+                self.kv_grow_fraction,
+                gb(working_set),
+                gb(a.reclaimed),
+                a.pledged,
+                a.yield_contended,
+            ),
+            &refusal,
+        );
+        Err(refusal.into())
     }
 
     /// No Metal, no `recommendedMaxWorkingSetSize`, nothing to check against —
     /// `admit_memory_budget`'s stance (§9.5c).
     #[cfg(not(feature = "metal"))]
-    pub(crate) fn admit_grow(&self, _grow: usize, _what: &str) -> Result<()> {
+    pub(crate) fn admit_grow(&self, _grow: usize, _what: &dyn std::fmt::Display) -> Result<()> {
         Ok(())
     }
 
@@ -9968,7 +9978,7 @@ impl<P: Profile> Model<P> {
             self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
-                &format!("for a batched step over {} rows", rows.len()),
+                &format_args!("for a batched step over {} rows", rows.len()),
             )?;
         }
         for (row, plan) in rows.iter_mut().zip(&plans) {
@@ -10079,7 +10089,7 @@ impl<P: Profile> Model<P> {
             self.attach_layer_tier(rows[0].cache);
             rows[0].cache.admit_grow(
                 bytes,
-                &format!("for a ragged batched pass over {} rows", rows.len()),
+                &format_args!("for a ragged batched pass over {} rows", rows.len()),
             )?;
         }
         for (row, plan) in rows.iter_mut().zip(&plans) {

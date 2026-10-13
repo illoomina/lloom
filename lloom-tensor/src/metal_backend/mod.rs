@@ -3324,6 +3324,7 @@ impl BackendDevice for MetalDevice {
         command_queue.setLabel(Some(&NSString::from_str("candle-metal")));
         let kernels = Arc::new(Kernels::new());
         let residency_set = Arc::new(ResidencySet::new(&device));
+        residency_set.register_device_set();
         // SAFETY: cold shared-base metadata domain/context quoted once above;
         // no model supplied promise pays this queue/control storage again.
         let commands = unsafe {

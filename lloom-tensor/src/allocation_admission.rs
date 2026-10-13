@@ -223,6 +223,51 @@ mod tests {
     fn predicted(bytes: usize) -> Prediction {
         Prediction::standalone(bytes, bytes, 1).unwrap()
     }
+    /// Where std's Arc layout is not audited (`build.rs`), the owned quote
+    /// refuses by policy: `stage_owned` returns `UnsupportedLayout` before it
+    /// draws on the promise and before any native create.
+    #[cfg(not(lloom_audited_arc_layout))]
+    fn unaudited_stage_refuses_before_create(bytes: usize) {
+        assert_eq!(
+            AllocationTicket::requested_charge_control_bytes(),
+            Err(AllocationError::UnsupportedLayout)
+        );
+        let domain = ModelDomain::isolated_numeric_fixture(bytes);
+        let pass = domain.reserve(bytes).unwrap();
+        let context = pass.context();
+        let called = Cell::new(false);
+        let result = stage_owned(
+            &context,
+            predicted(bytes),
+            |_| {
+                called.set(true);
+                Some(0usize)
+            },
+            |_| bytes,
+        );
+        assert!(
+            matches!(result, Err(AllocationError::UnsupportedLayout)),
+            "{:?}",
+            result.err()
+        );
+        assert!(!called.get(), "the refusal precedes any native create");
+        assert_eq!(
+            domain.snapshot(),
+            AccountSnapshot {
+                pending: bytes,
+                committed: 0
+            },
+            "the refusal draws nothing on the promise"
+        );
+        drop(pass);
+        assert_eq!(domain.snapshot(), AccountSnapshot::default());
+    }
+    #[cfg(not(lloom_audited_arc_layout))]
+    #[test]
+    fn owned_native_control_success_reconciles_same_promise() {
+        unaudited_stage_refuses_before_create(16);
+    }
+    #[cfg(lloom_audited_arc_layout)]
     #[test]
     fn owned_native_control_success_reconciles_same_promise() {
         let control = AllocationTicket::requested_charge_control_bytes().unwrap();
@@ -273,6 +318,12 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
+    #[cfg(not(lloom_audited_arc_layout))]
+    #[test]
+    fn owned_native_control_missing_promise_refuses_before_creator() {
+        unaudited_stage_refuses_before_create(8);
+    }
+    #[cfg(lloom_audited_arc_layout)]
     #[test]
     fn owned_native_control_missing_promise_refuses_before_creator() {
         let domain = ModelDomain::isolated_numeric_fixture(8);
@@ -309,6 +360,12 @@ mod tests {
         drop(pass);
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
+    #[cfg(not(lloom_audited_arc_layout))]
+    #[test]
+    fn owned_native_control_overrun_keeps_full_ticket_through_raw_drop() {
+        unaudited_stage_refuses_before_create(8);
+    }
+    #[cfg(lloom_audited_arc_layout)]
     #[test]
     fn owned_native_control_overrun_keeps_full_ticket_through_raw_drop() {
         let control = AllocationTicket::requested_charge_control_bytes().unwrap();
@@ -343,6 +400,12 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
+    #[cfg(not(lloom_audited_arc_layout))]
+    #[test]
+    fn owned_native_control_unused_stage_returns_original_total() {
+        unaudited_stage_refuses_before_create(16);
+    }
+    #[cfg(lloom_audited_arc_layout)]
     #[test]
     fn owned_native_control_unused_stage_returns_original_total() {
         let control = AllocationTicket::requested_charge_control_bytes().unwrap();

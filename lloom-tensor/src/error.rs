@@ -290,6 +290,18 @@ impl Error {
             context: Box::new(c),
         }
     }
+
+    /// The allocation refusal this error carries, under any context, path or
+    /// backtrace it gained on the way up.
+    pub fn allocation(&self) -> Option<crate::memory_admission::AllocationError> {
+        match self {
+            Self::Allocation(refusal) => Some(*refusal),
+            Self::Context { inner, .. }
+            | Self::WithPath { inner, .. }
+            | Self::WithBacktrace { inner, .. } => inner.allocation(),
+            _ => None,
+        }
+    }
 }
 
 #[macro_export]

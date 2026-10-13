@@ -412,6 +412,17 @@ fn commit_loop(kind: CommandBufferKind, subscriber: bool, commits: u64) -> (u64,
     run_commits(&device, &cmds, subscriber, commits)
 }
 
+/// As [`commit_loop`], on the queue a `MetalDevice` builds: the one
+/// production decodes on, whose every command buffer is bound to a binding
+/// generation that stages its epoch at commit and refills its credit after.
+fn bound_commit_loop(commits: u64) -> (u64, u64, CommandBufferKind) {
+    let gpu = lloom_tensor::Device::new_metal(0).expect("no Metal device");
+    let metal = gpu.as_metal_device().expect("a Metal device");
+    let cmds = metal.commands();
+    let (events, encode) = run_commits(metal.metal_device(), cmds, false, commits);
+    (events, encode, cmds.kind())
+}
+
 fn run_commits(device: &Device, cmds: &Commands, subscriber: bool, commits: u64) -> (u64, u64) {
     // Production registers no subscriber (the pools drain on the host); the
     // other arm registers one, to price the subscriber path itself.
@@ -524,5 +535,28 @@ fn allocations_per_commit_on_the_encoding_thread() {
                 );
             }
         }
+    }
+    // The bound queue production runs, in the kind the process selects
+    // (`LLOOM_CB_UNRETAINED`): the same zero, with the generation's staging and
+    // its credit refill inside the window.
+    let (events, encode, kind) = bound_commit_loop(commits);
+    let api = api();
+    println!(
+        "COMMIT api={api} kind={kind:?} bound=1 subscribers=0 control={control} \
+         commits={commits} allocations={events} per_commit={:.2} \
+         encode_per_dispatch={encode}",
+        events as f64 / commits as f64
+    );
+    let ours = print_sites(
+        &format!("api={api} kind={kind:?} bound=1 subscribers=0"),
+        events,
+        commits,
+    );
+    if api == "metal3" {
+        assert_eq!(
+            ours, 0,
+            "{ours} allocations of ours over {commits} bound commits (kind {kind:?}): \
+             see the SITES table above"
+        );
     }
 }

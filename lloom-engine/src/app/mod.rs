@@ -617,15 +617,37 @@ pub enum Command {
     Options(OptionsCmdArgs),
 }
 
-/// The `lloom` binary's entry.
+/// How long a dropped device's retirement may take at exit before the
+/// process leaves it to the OS.
+const DEVICE_RETIREMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `lloom` binary's entry. A dropped device retires on the host
+/// retirement service, so the process joins that retirement before it exits.
 pub fn main(argv: Vec<String>) -> Result<()> {
     let cli = Cli::parse_from(argv);
-    match cli.command {
+    let result = match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Bench(args) => serve::bench(args),
         Command::Config(args) => print_config(&args),
         Command::Options(args) => print_options(&args),
+    };
+    join_device_retirement();
+    result
+}
+
+/// Joins the retirement of every dropped device, and says so when one is
+/// still retiring at the budget.
+fn join_device_retirement() {
+    let joined =
+        lloom_tensor::join_device_retirement(std::time::Instant::now() + DEVICE_RETIREMENT_BUDGET);
+    if !joined.completed {
+        eprintln!(
+            "[device retirement: {} set(s) with {} record(s) still retiring at the {}s budget]",
+            joined.sets_retiring,
+            joined.records_pending,
+            DEVICE_RETIREMENT_BUDGET.as_secs(),
+        );
     }
 }
 

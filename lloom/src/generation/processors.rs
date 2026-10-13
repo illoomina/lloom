@@ -196,37 +196,104 @@ impl Stage {
     /// draw's (`None` for argmax, where min-p cannot change the answer).
     pub(crate) fn apply(&mut self, logits: &Tensor, temperature: Option<f64>) -> Result<Tensor> {
         let dims = logits.dims().to_vec();
-        let mut x = logits.flatten_all()?.to_dtype(DType::F32)?;
+        let x = logits.flatten_all()?.to_dtype(DType::F32)?;
+        let vocab = x.elem_count();
+        let x = x.reshape((1, vocab))?;
+        let counts = self
+            .state(vocab, logits.device())?
+            .counts
+            .reshape((1, vocab))?;
+        self.process(x, &counts, temperature)?.reshape(dims)
+    }
+
+    /// [`Self::apply`] over the `t` rows of a verify window `[t, vocab]`,
+    /// row `i` against the history it would have in a step-by-step decode:
+    /// the output so far plus the window's inputs `1..=i` (`inputs`, the
+    /// `[t]` ids `[anchor, d1…]`; the anchor is the output's last token and
+    /// counted already). The history itself does not move.
+    pub(crate) fn apply_rows(
+        &mut self,
+        rows: &Tensor,
+        inputs: &Tensor,
+        temperature: Option<f64>,
+    ) -> Result<Tensor> {
+        let (t, vocab) = rows.dims2()?;
+        if inputs.elem_count() != t {
+            lloom_tensor::bail!(
+                "logits processors: a window of {t} rows with {} inputs",
+                inputs.elem_count()
+            );
+        }
+        let x = rows.to_dtype(DType::F32)?;
+        let reads = self.cfg.reads_history();
+        let dev = rows.device().clone();
+        let d = self.state(vocab, &dev)?;
+        let counts = if reads && t > 1 {
+            // One count at (i, inputs[i]) for every row past the anchor,
+            // then each row the sum of the rows up to it: small integers,
+            // exact in f32 whatever the summation order.
+            let ids = inputs
+                .flatten_all()?
+                .to_dtype(DType::U32)?
+                .reshape((t, 1))?;
+            let past_anchor: Vec<f32> = (0..t).map(|i| if i == 0 { 0.0 } else { 1.0 }).collect();
+            let ones = Tensor::from_vec(past_anchor, (t, 1), &dev)?;
+            let fed = Tensor::zeros((t, vocab), DType::F32, &dev)?.scatter_add(&ids, &ones, 1)?;
+            let mut tril = vec![0f32; t * t];
+            for i in 0..t {
+                for j in 0..=i {
+                    tril[i * t + j] = 1.0;
+                }
+            }
+            let tril = Tensor::from_vec(tril, (t, t), &dev)?;
+            tril.matmul(&fed)?.broadcast_add(&d.counts)?
+        } else {
+            d.counts.reshape((1, vocab))?
+        };
+        self.process(x, &counts, temperature)
+    }
+
+    /// The processors over `x` `[r, vocab]` against the per-row output
+    /// counts `counts` (`[r, vocab]`, or `[1, vocab]` for every row).
+    fn process(
+        &mut self,
+        mut x: Tensor,
+        counts: &Tensor,
+        temperature: Option<f64>,
+    ) -> Result<Tensor> {
         let cfg = self.cfg.clone();
-        let d = self.state(x.elem_count(), logits.device())?;
+        let vocab = x.dim(1)?;
+        let d = self.state(vocab, &x.device().clone())?;
         if let Some(bias) = &d.bias {
-            x = (x + bias)?;
+            x = x.broadcast_add(bias)?;
         }
         if cfg.repetition_penalty != 1.0 {
             let seen = match &d.prompt_seen {
-                Some(p) => (p + &d.counts)?.gt(0.0)?,
-                None => d.counts.gt(0.0)?,
+                Some(p) => counts.broadcast_add(p)?.gt(0.0)?,
+                None => counts.gt(0.0)?,
             };
             let r = cfg.repetition_penalty;
             let scaled = x
                 .gt(0.0)?
                 .where_cond(&x.affine(1.0 / r, 0.0)?, &x.affine(r, 0.0)?)?;
-            x = seen.where_cond(&scaled, &x)?;
+            x = seen.broadcast_as(x.shape())?.where_cond(&scaled, &x)?;
         }
         if cfg.frequency_penalty != 0.0 {
-            x = (x - d.counts.affine(cfg.frequency_penalty, 0.0)?)?;
+            x = x.broadcast_sub(&counts.affine(cfg.frequency_penalty, 0.0)?)?;
         }
         if cfg.presence_penalty != 0.0 {
-            let present = d.counts.gt(0.0)?.to_dtype(DType::F32)?;
-            x = (x - present.affine(cfg.presence_penalty, 0.0)?)?;
+            let present = counts.gt(0.0)?.to_dtype(DType::F32)?;
+            x = x.broadcast_sub(&present.affine(cfg.presence_penalty, 0.0)?)?;
         }
         if let (Some(t), Some(neg_inf)) = (temperature, &d.neg_inf) {
             // p_i >= min_p * p_max  <=>  z_i >= z_max + T * ln(min_p), over
             // p = softmax(z / T): the threshold needs no softmax.
-            let threshold = x.max_keepdim(0)?.affine(1.0, t * cfg.min_p.ln())?;
-            x = x.broadcast_ge(&threshold)?.where_cond(&x, neg_inf)?;
+            let threshold = x.max_keepdim(1)?.affine(1.0, t * cfg.min_p.ln())?;
+            x = x
+                .broadcast_ge(&threshold)?
+                .where_cond(&x, &neg_inf.broadcast_as(x.shape())?)?;
         }
-        x.reshape(dims)
+        Ok(x)
     }
 
     /// Count the drawn token, a device `U32` of one element, into the history.

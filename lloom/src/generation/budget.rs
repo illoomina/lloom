@@ -119,6 +119,7 @@ impl ThinkingBudget {
 }
 
 /// The blocking arm's budget: the rule on host ids.
+#[derive(Clone)]
 pub(crate) struct HostForcing {
     cfg: ThinkingBudget,
     step: usize,

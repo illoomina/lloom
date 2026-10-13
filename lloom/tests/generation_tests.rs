@@ -1,5 +1,13 @@
-use lloom::generation::LogitsProcessor;
+use lloom::generation::{LogitsProcessor, Sampling};
 use lloom_tensor::{DType, Device, Result, Tensor};
+
+/// The CPU, and the Metal device when the feature is on.
+fn devices() -> Vec<Device> {
+    let mut v = vec![Device::Cpu];
+    #[cfg(feature = "metal")]
+    v.push(Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"));
+    v
+}
 
 /// The `ArgMax` arm returns the same index over f16 as over f32 (lloom #351).
 ///
@@ -59,17 +67,19 @@ fn an_argmax_tie_breaks_to_the_lowest_index_at_both_dtypes() -> Result<()> {
     Ok(())
 }
 
-/// A temperature arm still sees f32, which is what bounds #351's claim.
+/// A host-sort arm still sees f32, which is what bounds #351's claim.
 ///
 /// Only `ArgMax` skips the cast. `sample_f`'s closure receives the f32
-/// probabilities, and this asserts the slice it is handed is the full
-/// vocabulary at f32 -- so a future change extending the skip to a
-/// temperature arm fails here rather than silently degrading the sampler.
+/// probabilities a host-sort arm (top-k, top-p) draws from, and this asserts
+/// the slice it is handed is the full vocabulary at f32 -- so a future change
+/// extending the skip to such an arm fails here rather than silently
+/// degrading the sampler. (Plain temperature is a device draw on every arm
+/// and hands the host no probabilities.)
 #[test]
 fn a_temperature_arm_still_receives_f32_probabilities() -> Result<()> {
     let dev = Device::Cpu;
     let logits = Tensor::new(&[0.1f32, 0.2, 0.3, 0.4], &dev)?.to_dtype(DType::F16)?;
-    let mut p = LogitsProcessor::new(42, Some(0.9), None);
+    let mut p = LogitsProcessor::new(42, Some(0.9), Some(0.95));
     let mut seen = 0usize;
     let _ = p.sample_f(&logits, |prs| {
         seen = prs.len();
@@ -79,6 +89,44 @@ fn a_temperature_arm_still_receives_f32_probabilities() -> Result<()> {
         assert!((sum - 1.0).abs() < 1e-5, "not a distribution: {sum}");
     })?;
     assert_eq!(seen, 4, "the closure did not see the whole vocabulary");
+    Ok(())
+}
+
+/// `sample_f`'s hook reaches plain temperature's draw, as it did before the
+/// draw moved to the device (#943): a hook that leaves one token's mass draws
+/// that token at every position, and a hook that changes nothing draws what
+/// `sample` draws at the same seed and positions (a four-token vocabulary,
+/// where the host and device sums agree).
+#[test]
+fn a_hook_over_the_probabilities_reaches_the_temperature_draw() -> Result<()> {
+    let dev = Device::Cpu;
+    let logits = Tensor::new(&[0.1f32, 0.2, 0.3, 0.4], &dev)?;
+    let mut hooked = LogitsProcessor::from_sampling(7, Sampling::All { temperature: 1.0 });
+    for pos in 0..32u64 {
+        hooked.at_position(Some(pos));
+        let id = hooked.sample_f(&logits, |prs| {
+            for (i, p) in prs.iter_mut().enumerate() {
+                if i != 1 {
+                    *p = 0.0;
+                }
+            }
+        })?;
+        assert_eq!(id, 1, "position {pos}: the hook's mask was not drawn from");
+    }
+    let mut plain = LogitsProcessor::from_sampling(7, Sampling::All { temperature: 1.0 });
+    let mut noop = LogitsProcessor::from_sampling(7, Sampling::All { temperature: 1.0 });
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for pos in 0..64u64 {
+        plain.at_position(Some(pos));
+        noop.at_position(Some(pos));
+        a.push(plain.sample(&logits)?);
+        b.push(noop.sample_f(&logits, |_| {})?);
+    }
+    assert_eq!(a, b, "a hook that changes nothing moved the stream");
+    assert!(
+        a.iter().any(|&t| t != a[0]),
+        "too few distinct draws to show anything"
+    );
     Ok(())
 }
 
@@ -129,10 +177,19 @@ fn sample_with_top_k() -> Result<()> {
         },
     );
     let logits = Tensor::new(&[0.1, 0.2, 0.3, 0.4], &Device::Cpu)?;
-    let token = logits_process.sample(&logits)?;
-    assert_eq!(token, 3);
-    let token = logits_process.sample(&logits)?;
-    assert_eq!(token, 2);
+    // k = 2 draws from {2, 3} only, and from both: the support, not one
+    // seed's first two tokens (the draw is the filter, then the inverse CDF).
+    let drawn: Vec<u32> = (0..64)
+        .map(|_| logits_process.sample(&logits))
+        .collect::<Result<_>>()?;
+    assert!(
+        drawn.iter().all(|t| *t == 2 || *t == 3),
+        "top-k 2 drew outside the top two: {drawn:?}"
+    );
+    assert!(
+        drawn.contains(&2) && drawn.contains(&3),
+        "top-k 2 drew one token only: {drawn:?}"
+    );
     Ok(())
 }
 
@@ -478,36 +535,13 @@ fn a_sampled_windows_rows_ignore_the_windows_drawn_before_them() -> Result<()> {
     Ok(())
 }
 
-/// `window_draw` refuses what it cannot serve position-keyed, rather than
-/// serving it on one running stream under a sampled label (§7.1a-i: report
-/// the arm that ran, never the one that was asked for).
+/// `window_draw` refuses what it cannot serve: processors without the
+/// window's inputs (each row's history is the output plus the drafts before
+/// it, which the logits alone do not carry), and a batched window.
 #[test]
 fn window_draw_refuses_the_arms_it_cannot_key() -> Result<()> {
     let dev = Device::Cpu;
     let window = Tensor::from_vec(vec![0.1f32; 3 * 8], (1, 3, 8), &dev)?;
-    for sampling in [
-        lloom::generation::Sampling::TopP {
-            p: 0.9,
-            temperature: 0.8,
-        },
-        lloom::generation::Sampling::TopK {
-            k: 4,
-            temperature: 0.8,
-        },
-        lloom::generation::Sampling::TopKThenTopP {
-            k: 4,
-            p: 0.9,
-            temperature: 0.8,
-        },
-    ] {
-        let mut p = LogitsProcessor::from_sampling(7, sampling.clone());
-        let err = p.window_draw(&window, 0).unwrap_err().to_string();
-        assert!(
-            err.contains("host sort"),
-            "{sampling:?} was not refused by name: {err}"
-        );
-    }
-    // Processors have per-token history a rejected row would corrupt.
     let procs = lloom::generation::Processors {
         repetition_penalty: 1.1,
         ..Default::default()
@@ -526,70 +560,351 @@ fn window_draw_refuses_the_arms_it_cannot_key() -> Result<()> {
     Ok(())
 }
 
-/// **A pre-existing asymmetry, pinned here because #943 depends on it.**
-///
-/// `Sampling::All { temperature }` draws by a DIFFERENT MECHANISM on each
-/// path: the host draw (`sample`, what the `Blocking` readback arm calls)
-/// takes a softmax and `sample_multinomial` over the running rng, while the
-/// device draw (`sample_argmax_on_device`, what every `Ring` arm calls, and
-/// what `window_draw` takes) is gumbel-max. `Sampling::GumbelSoftmax` is
-/// gumbel-max on both.
-///
-/// So at one seed, a `t > 0` request's reply depends on which readback arm
-/// served it — and `ReadbackArm::Auto` picks the ring for `All` but falls to
-/// `Blocking` whenever `diagnostics.logits_digest` is on or the sampler is a
-/// host-sort arm (`lloom-engine/src/decode.rs`). Nothing in the tree compares
-/// one arm's SAMPLED ids to another's: `decode_driver_tests.rs`'s multi-arm
-/// sweep checks its sampled arms for self-consistency (the reader's stream
-/// equals the returned ids) and compares against an expected chain only for
-/// `ArgMax`, which is `CONTRIBUTING.md` §3.1b's "looks like a comparison and
-/// is not."
-///
-/// Recorded rather than changed: making the two agree means choosing which
-/// mechanism `All` means, which moves either the ring arms' or the blocking
-/// arm's recorded digests at `t > 0`, and that is its own argued decision
-/// (§7.1a). What #943 needs from it is narrower and is satisfied: the arm it
-/// samples a verify window with is gumbel-max on both paths.
+/// The window draws, row for row, what step-by-step draws at the same
+/// positions, on the arms #943 part 1 refused: multinomial (the default
+/// `-t`) and the host-sort arms (top-k, top-p: the filter, then the
+/// inverse CDF from the position's uniform). CPU and Metal.
 #[test]
-fn the_all_arm_draws_by_a_different_mechanism_on_each_path() -> Result<()> {
-    let dev = Device::Cpu;
-    let logits = Tensor::new(
-        &[
-            0.1f32, 0.9, -0.3, 0.4, 0.0, 0.7, -1.0, 0.2, 0.5, 0.3, -0.2, 0.8,
-        ],
-        &dev,
-    )?;
-    let host = |sampling: lloom::generation::Sampling| -> Result<Vec<u32>> {
-        let mut p = LogitsProcessor::from_sampling(5, sampling);
-        (0..12).map(|_| p.sample(&logits)).collect()
-    };
-    let device = |sampling: lloom::generation::Sampling| -> Result<Vec<u32>> {
-        let mut p = LogitsProcessor::from_sampling(5, sampling);
-        (0..12)
-            .map(|_| {
-                Ok(p.sample_argmax_on_device(&logits)?
-                    .flatten_all()?
-                    .to_vec1::<u32>()?[0])
-            })
-            .collect()
-    };
-    let all = lloom::generation::Sampling::All { temperature: 1.0 };
-    let gumbel = lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 };
-    let (all_host, all_dev) = (host(all.clone())?, device(all)?);
-    let (g_host, g_dev) = (host(gumbel.clone())?, device(gumbel)?);
-    eprintln!("All    host {all_host:?}\nAll    dev  {all_dev:?}");
-    eprintln!("Gumbel host {g_host:?}\nGumbel dev  {g_dev:?}");
-    assert_eq!(
-        g_host, g_dev,
-        "GumbelSoftmax must draw one stream on both paths — it is the arm a \
-         sampled verify is served by, and #943's identity rests on it"
-    );
-    assert_ne!(
-        all_host, all_dev,
-        "the `All` arm's two paths now agree: if that was made true \
-         deliberately, this test has served its purpose and the §7.1a \
-         decision it records has been taken — delete it and say so. If it \
-         became true by accident, a recorded t > 0 digest has moved."
-    );
+fn every_temperature_arm_draws_a_window_as_a_step_by_step_decode_does() -> Result<()> {
+    use lloom::generation::Sampling;
+    for dev in devices() {
+        let (vocab, t, first_pos) = (40usize, 7usize, 23u64);
+        let mut v = Vec::with_capacity(t * vocab);
+        for row in 0..t {
+            for c in 0..vocab {
+                v.push(((row * 11 + c * 5) % 17) as f32 * 0.19 - 1.4);
+            }
+        }
+        let window = Tensor::from_vec(v, (1, t, vocab), &dev)?;
+        for sampling in [
+            Sampling::All { temperature: 0.9 },
+            Sampling::TopK {
+                k: 6,
+                temperature: 0.8,
+            },
+            Sampling::TopP {
+                p: 0.7,
+                temperature: 1.1,
+            },
+            Sampling::TopKThenTopP {
+                k: 9,
+                p: 0.8,
+                temperature: 0.7,
+            },
+        ] {
+            let mut w = LogitsProcessor::from_sampling(31, sampling.clone());
+            let windowed = w.window_draw(&window, first_pos)?;
+            let mut stepwise = Vec::with_capacity(t);
+            for row in 0..t {
+                let mut s = LogitsProcessor::from_sampling(31, sampling.clone());
+                s.at_position(Some(first_pos + row as u64));
+                stepwise.push(s.sample(&window.narrow(1, row, 1)?.flatten_all()?)?);
+            }
+            assert_eq!(windowed, stepwise, "{dev:?} {sampling:?}");
+            let greedy = LogitsProcessor::from_sampling(31, Sampling::ArgMax)
+                .window_draw(&window, first_pos)?;
+            assert_ne!(
+                windowed, greedy,
+                "{dev:?} {sampling:?}: the sampled window is greedy's"
+            );
+        }
+    }
     Ok(())
 }
+
+/// Processors under a window: row `i` is processed against the output so
+/// far plus the drafts `1..=i` the rows before it were fed, exactly the
+/// history a step-by-step decode has when it reaches that position along
+/// the drafted path; the history moves only by what the round kept
+/// (`commit_window`). CPU and Metal.
+#[test]
+fn a_windows_rows_read_the_processor_history_of_their_position() -> Result<()> {
+    use lloom::generation::Sampling;
+    for dev in devices() {
+        let (vocab, t, first_pos) = (24usize, 5usize, 60u64);
+        let mut v = Vec::with_capacity(t * vocab);
+        for row in 0..t {
+            for c in 0..vocab {
+                v.push(((row * 7 + c * 3) % 13) as f32 * 0.31 - 1.9);
+            }
+        }
+        let window = Tensor::from_vec(v, (1, t, vocab), &dev)?;
+        let prompt = [1u32, 4, 9, 4];
+        let output = [9u32, 2, 2];
+        // The window's inputs: the anchor (the output's last token) and
+        // drafts that repeat tokens the penalties see.
+        let inputs = [2u32, 9, 9, 17, 4];
+        let procs = lloom::generation::Processors {
+            repetition_penalty: 1.3,
+            presence_penalty: 0.4,
+            frequency_penalty: 0.6,
+            min_p: 0.05,
+            logit_bias: vec![(3, 1.5)],
+        };
+        for sampling in [
+            Sampling::ArgMax,
+            Sampling::All { temperature: 0.9 },
+            Sampling::GumbelSoftmax { temperature: 0.9 },
+            Sampling::TopK {
+                k: 7,
+                temperature: 0.9,
+            },
+        ] {
+            let one = window.narrow(1, 0, 1)?.flatten_all()?;
+            let primed = || -> Result<LogitsProcessor> {
+                let mut p = LogitsProcessor::from_sampling(8, sampling.clone())
+                    .with_processors(procs.clone());
+                p.observe_prompt(&prompt);
+                // The output so far, recorded as a decode records its draws.
+                for &id in &output {
+                    let _ = p.sample_fed(&one, |_| id)?;
+                }
+                Ok(p)
+            };
+            let ids = Tensor::new(&inputs, &dev)?;
+            let mut w = primed()?;
+            let windowed = w
+                .window_draw_device(&window, first_pos, Some(&ids))?
+                .to_vec1::<u32>()?;
+            let mut stepwise = Vec::with_capacity(t);
+            for row in 0..t {
+                let mut s = primed()?;
+                // The drafts the rows before this one were fed are output.
+                for &id in &inputs[1..=row] {
+                    let _ = s.sample_fed(&one, |_| id)?;
+                }
+                s.at_position(Some(first_pos + row as u64));
+                stepwise.push(s.sample(&window.narrow(1, row, 1)?.flatten_all()?)?);
+            }
+            assert_eq!(windowed, stepwise, "{dev:?} {sampling:?}");
+            // Without the processors the same window draws differently, or
+            // the fixture does not exercise them.
+            let bare = LogitsProcessor::from_sampling(8, sampling.clone())
+                .window_draw(&window, first_pos)?;
+            assert_ne!(
+                windowed, bare,
+                "{dev:?} {sampling:?}: the processors moved nothing"
+            );
+            // The draw moved no history: a second window draws the same rows.
+            let again = w
+                .window_draw_device(&window, first_pos, Some(&ids))?
+                .to_vec1::<u32>()?;
+            assert_eq!(
+                windowed, again,
+                "{dev:?} {sampling:?}: the draw moved the history"
+            );
+            // The round's kept tokens move it as a step-by-step decode would.
+            w.commit_window(&inputs[1..3])?;
+            let mut s = primed()?;
+            for &id in &inputs[1..3] {
+                let _ = s.sample_fed(&one, |_| id)?;
+            }
+            s.at_position(Some(first_pos));
+            let row0 = window.narrow(1, 0, 1)?;
+            let w0 = w
+                .window_draw_device(&row0, first_pos, Some(&Tensor::new(&[9u32], &dev)?))?
+                .to_vec1::<u32>()?;
+            assert_eq!(
+                w0,
+                vec![s.sample(&one)?],
+                "{dev:?} {sampling:?}: commit_window"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `Sampling::All` (multinomial) draws ONE stream on both paths: the host
+/// draw (`sample`, the blocking arm's) and the device draw
+/// (`sample_argmax_on_device`, every ring arm's) are the same inverse-CDF
+/// draw from the same uniform, so the readback arm never changes a seeded
+/// reply. Until `generation.sampling.method` the host path was a softmax and
+/// a multinomial on the running rng and the device path gumbel-max, two
+/// streams at one seed (`speculation.md` §10.2z-viii). Unkeyed (the running
+/// stream) and keyed by position both; CPU and Metal.
+#[test]
+fn the_all_arm_draws_one_stream_on_both_paths() -> Result<()> {
+    for dev in devices() {
+        let logits = Tensor::new(
+            &[
+                0.1f32, 0.9, -0.3, 0.4, 0.0, 0.7, -1.0, 0.2, 0.5, 0.3, -0.2, 0.8,
+            ],
+            &dev,
+        )?;
+        for keyed in [false, true] {
+            let host = |sampling: lloom::generation::Sampling| -> Result<Vec<u32>> {
+                let mut p = LogitsProcessor::from_sampling(5, sampling);
+                (0..48)
+                    .map(|i| {
+                        if keyed {
+                            p.at_position(Some(100 + i));
+                        }
+                        p.sample(&logits)
+                    })
+                    .collect()
+            };
+            let device = |sampling: lloom::generation::Sampling| -> Result<Vec<u32>> {
+                let mut p = LogitsProcessor::from_sampling(5, sampling);
+                (0..48)
+                    .map(|i| {
+                        if keyed {
+                            p.at_position(Some(100 + i));
+                        }
+                        Ok(p.sample_argmax_on_device(&logits)?
+                            .flatten_all()?
+                            .to_vec1::<u32>()?[0])
+                    })
+                    .collect()
+            };
+            for sampling in [
+                lloom::generation::Sampling::All { temperature: 1.0 },
+                lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+            ] {
+                let (h, d) = (host(sampling.clone())?, device(sampling.clone())?);
+                assert_eq!(
+                    h, d,
+                    "{dev:?} {sampling:?} keyed={keyed}: host {h:?} against device {d:?}"
+                );
+                let distinct = h.iter().collect::<std::collections::BTreeSet<_>>().len();
+                assert!(distinct > 4, "{sampling:?}: a degenerate stream {h:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The multinomial draw samples `softmax(z / T)`: over 16 000 position-keyed
+/// draws its frequencies meet the distribution (χ², 7 d.f.), at two
+/// temperatures — a draw that ignored the temperature fails the second.
+#[test]
+fn the_multinomial_draw_samples_the_tempered_distribution() -> Result<()> {
+    let z = [0.5f32, -0.2, 1.1, 0.0, -1.3, 0.8, 0.3, -0.6];
+    let logits = Tensor::new(&z, &Device::Cpu)?;
+    for t in [1.0f64, 0.5] {
+        let mut p =
+            LogitsProcessor::from_sampling(42, lloom::generation::Sampling::All { temperature: t });
+        let draws = 16_000usize;
+        let mut counts = [0usize; 8];
+        for pos in 0..draws {
+            p.at_position(Some(pos as u64));
+            counts[p.sample(&logits)? as usize] += 1;
+        }
+        let m = z.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let e: Vec<f64> = z.iter().map(|&x| ((x as f64 - m) / t).exp()).collect();
+        let total: f64 = e.iter().sum();
+        let chi2: f64 = counts
+            .iter()
+            .zip(&e)
+            .map(|(&c, &ei)| {
+                let want = draws as f64 * ei / total;
+                (c as f64 - want).powi(2) / want
+            })
+            .sum();
+        eprintln!("T={t}: chi2(7) = {chi2:.2}, counts {counts:?}");
+        // 7 d.f., p = 0.001 critical 24.32.
+        assert!(
+            chi2 < 24.32,
+            "T={t}: chi2(7) = {chi2:.2}, counts {counts:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The per-row processor history at a real vocabulary (128 000) and a
+/// window of ten rows, on the CPU and Metal: the window's draws are the
+/// step-by-step draws with the same history, multinomial and greedy, with
+/// drafts that repeat tokens the penalties and min-p act on.
+#[test]
+fn a_real_vocabulary_window_reads_each_rows_processor_history() -> Result<()> {
+    use lloom::generation::Sampling;
+    let (vocab, t, first_pos) = (128_000usize, 10usize, 300u64);
+    let mut s = 0x1234_5678u32;
+    let host: Vec<f32> = (0..t * vocab)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) as f32 / (1u32 << 24) as f32) * 12.0 - 6.0
+        })
+        .collect();
+    // The rows' top tokens repeated among the drafts, so the penalties move
+    // the draws.
+    let top = |r: usize| -> u32 {
+        let row = &host[r * vocab..(r + 1) * vocab];
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    };
+    let inputs: Vec<u32> = (0..t).map(|r| top((r + 3) % t)).collect();
+    let prompt: Vec<u32> = vec![top(0), top(1), 5, 77, 1024];
+    let output: Vec<u32> = vec![top(2), 9, top(2)];
+    let procs = lloom::generation::Processors {
+        repetition_penalty: 1.3,
+        presence_penalty: 0.8,
+        frequency_penalty: 0.5,
+        min_p: 0.02,
+        logit_bias: vec![(top(4), 2.0)],
+    };
+    for dev in devices() {
+        let window = Tensor::from_vec(host.clone(), (1, t, vocab), &dev)?;
+        let ids = Tensor::new(inputs.as_slice(), &dev)?;
+        for sampling in [Sampling::All { temperature: 0.7 }, Sampling::ArgMax] {
+            let one = window.narrow(1, 0, 1)?.flatten_all()?;
+            let primed = || -> Result<LogitsProcessor> {
+                let mut p = LogitsProcessor::from_sampling(11, sampling.clone())
+                    .with_processors(procs.clone());
+                p.observe_prompt(&prompt);
+                for &id in &output {
+                    let _ = p.sample_fed(&one, |_| id)?;
+                }
+                Ok(p)
+            };
+            let windowed = primed()?
+                .window_draw_device(&window, first_pos, Some(&ids))?
+                .to_vec1::<u32>()?;
+            let mut stepwise = Vec::with_capacity(t);
+            for row in 0..t {
+                let mut p = primed()?;
+                for &id in &inputs[1..=row] {
+                    let _ = p.sample_fed(&one, |_| id)?;
+                }
+                p.at_position(Some(first_pos + row as u64));
+                stepwise.push(p.sample(&window.narrow(1, row, 1)?.flatten_all()?)?);
+            }
+            assert_eq!(windowed, stepwise, "{dev:?} {sampling:?}");
+            let bare = LogitsProcessor::from_sampling(11, sampling.clone())
+                .window_draw(&window, first_pos)?;
+            assert_ne!(
+                windowed, bare,
+                "{dev:?} {sampling:?}: the processors moved nothing"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The keyed uniform's derivation, pinned by value: a change to the stream
+/// key or to how a position's generator yields its uniform moves every
+/// multinomial stream, and fails here first.
+#[test]
+fn the_keyed_uniform_is_pinned() {
+    let got: Vec<f32> = [(42u64, 0u64), (42, 1), (42, 1000), (7, 0)]
+        .iter()
+        .map(|&(s, p)| LogitsProcessor::uniform_at(s, p))
+        .collect();
+    eprintln!("uniform_at: {got:?}");
+    for u in &got {
+        assert!((0.0..1.0).contains(u), "{got:?}");
+    }
+    assert_eq!(
+        got.iter().map(|u| u.to_bits()).collect::<Vec<_>>(),
+        PINNED_UNIFORMS.to_vec(),
+        "uniform_at moved: {got:?}"
+    );
+}
+
+/// `uniform_at` at (42, 0), (42, 1), (42, 1000), (7, 0), as bits: 0.34492636,
+/// 0.85419625, 0.6753466, 0.75972766 — and what an independent replica of
+/// the derivation computes (`measurements/issue-943-raw/part2/procs/keyed_uniform.py`:
+/// the stream key, rand_core's PCG32 seed expansion, ChaCha12's first word).
+const PINNED_UNIFORMS: [u32; 4] = [1051761200, 1062907035, 1059906436, 1061322115];

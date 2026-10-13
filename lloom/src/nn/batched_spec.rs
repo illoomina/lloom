@@ -419,12 +419,16 @@ where
         eos_ids: &[u32],
         max_tokens: usize,
     ) -> Result<RowId> {
-        if sampling != Sampling::ArgMax {
-            lloom_tensor::bail!(
-                "decode_spec_batched: the speculative body decodes greedily (the verify accepts \
-                 the target's argmax); a temperature is refused rather than served as argmax"
-            );
-        }
+        crate::nn::decode::refuse(
+            crate::nn::decode::Body::BatchedWindow,
+            &crate::nn::decode::Asks {
+                sampling: &sampling,
+                processors: false,
+                budget: false,
+                digest: false,
+            },
+        )
+        .map_err(|e| lloom_tensor::Error::Msg(format!("decode_spec_batched: {e}")))?;
         if eos_ids.is_empty() {
             lloom_tensor::bail!("decode_spec_batched: an empty EOS set; the row would never end");
         }

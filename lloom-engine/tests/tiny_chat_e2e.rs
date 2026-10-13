@@ -420,8 +420,10 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
         }
     }
     // The logits digest (`--logits-digest`): the same tokens as the run
-    // without it, a digest the same on a second run, and refused by the
-    // speculative body.
+    // without it, a digest the same on a second run — and under the
+    // speculative body the same digest: on the CPU the generic decoder's
+    // window runs position by position through the decode step, so the rows
+    // a round keeps are the K=1 steps' logits, bit for bit.
     let mut args = vec![
         "--tokenizer",
         tok,
@@ -443,27 +445,16 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
         a["readback"], "blocking",
         "the digest reads the logits on the host"
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
-        .args(["chat", "--model"])
-        .arg(&model)
-        .args([
-            "--raw",
-            "-p",
-            PROMPT,
-            "-n",
-            "4",
-            "--cpu",
-            "--tokenizer",
-            tok,
-        ])
-        .args(["--speculate", "mtp", "--logits-digest"])
-        .output()
-        .expect("lloom runs");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success() && stderr.contains("logits_digest"),
-        "{stderr}"
-    );
+    for k in ["1", "2"] {
+        let mut spec_args = args.clone();
+        spec_args.extend_from_slice(&["--speculate", "mtp", "--spec-tokens", k]);
+        let s = chat(&model, &spec_args);
+        assert_eq!(s["tokens_sha256"], greedy["tokens_sha256"], "k={k}");
+        assert_eq!(
+            s["logits_sha256"], a["logits_sha256"],
+            "k={k}: the speculative body's digest over the kept rows is not the K=1 run's"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 
     // Without the block, the method is refused by name.

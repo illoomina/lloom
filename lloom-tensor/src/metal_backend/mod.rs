@@ -2604,9 +2604,19 @@ impl BackendStorage for MetalStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
-        if src_l.is_contiguous() && self.dtype == dst.dtype() && copy2d_no_blit() {
-            // A/B instrument: the contiguous copy as one compute-kernel row.
+        if src_l.is_contiguous()
+            && self.dtype == dst.dtype()
+            && (self.device.base_mode() || copy2d_no_blit())
+        {
+            // The contiguous copy as one compute-kernel row: under a pass plan
+            // (`MetalDevice::base_mode`) a blit is outside the compute barrier
+            // chain (`pass-plan-design.md` §9), and `scatter_add`'s copy of its
+            // base into a served slot raced the scatter that followed it
+            // (#943). Otherwise the A/B instrument.
             let n = src_l.shape().elem_count();
+            if n == 0 {
+                return Ok(());
+            }
             return self.copy2d(dst, 1, n, n, n, src_l.start_offset(), dst_offset);
         }
         if src_l.is_contiguous() && self.dtype == dst.dtype() {
@@ -2770,6 +2780,50 @@ impl MetalStorage {
         }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
+    }
+
+    /// The multinomial draw by inverse CDF (`sample_inverse_cdf_f32`): over
+    /// `rows` rows of `vocab` contiguous f32 logits starting `offset` bytes
+    /// in, one index per row into a fresh `[rows]` `U32` storage, each row
+    /// drawn with its uniform from `u` (`rows` contiguous f32 at `u_offset`
+    /// bytes). Device-resident result; nothing is read back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_inverse_cdf(
+        &self,
+        offset: usize,
+        rows: usize,
+        vocab: usize,
+        inv_t: f32,
+        u: &Self,
+        u_offset: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::F32 || u.dtype != DType::F32 {
+            crate::bail!(
+                "sample_inverse_cdf expects f32 logits and f32 uniforms, got {:?}/{:?}",
+                self.dtype,
+                u.dtype
+            );
+        }
+        let device = self.device().clone();
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(rows.max(1), DType::U32)
+            .with_label("sample_inverse_cdf")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        crate::kernels::call_sample_inverse_cdf(
+            &device.device,
+            &encoder,
+            &device.kernels,
+            (self.buffer(), offset),
+            rows,
+            vocab,
+            inv_t,
+            (u.buffer(), u_offset),
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        Ok(Self::new(buffer, device.clone(), rows, DType::U32))
     }
 
     pub fn buffer(&self) -> &Buffer {

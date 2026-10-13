@@ -2495,11 +2495,16 @@ fn static_dspark_body<'a, 'm, P: Profile>(
         .first()
         .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
     for (i, s) in specs.iter().enumerate() {
-        if s.sampling != Sampling::ArgMax {
-            lloom_tensor::bail!(
-                "row {i}: the speculative body decodes greedily; a temperature is refused"
-            );
-        }
+        lloom::nn::refuse(
+            lloom::nn::Body::BatchedWindow,
+            &lloom::nn::Asks {
+                sampling: &s.sampling,
+                processors: false,
+                budget: false,
+                digest: false,
+            },
+        )
+        .map_err(|e| lloom_tensor::Error::Msg(format!("row {i}: {e}")))?;
         if s.eos_ids != first.eos_ids {
             lloom_tensor::bail!(
                 "row {i}: a static speculative batch runs one EOS set; this row's differs from \
@@ -2831,13 +2836,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
-        if self.sched.is_some() {
-            Some(super::budgets::BATCHED)
-        } else if self.dspark_k.is_some() {
-            Some(super::budgets::SPECULATIVE)
-        } else {
-            None
-        }
+        self.sched.is_some().then_some(super::budgets::BATCHED)
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         Engine::seed_prompt_row(self, n, row)

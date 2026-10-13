@@ -764,3 +764,195 @@ fn a_lane_is_cut_back_to_a_reused_prefix_it_was_keyed_from() -> Result<()> {
     assert_eq!(mtp.lane_resets(), 1);
     Ok(())
 }
+
+/// The sampled identity on Qwen4-exp under MTP (#943): at every cell of
+/// `sampled_cells` and three seeds, the speculative run — the real MTP
+/// drafter at k = 1 and 2 on the sequential verify and on the phase rings
+/// (the window's rows drawn together, accepted by phase), the oracle on the
+/// sampled stream, garbage — is the K=1 run.
+#[test]
+fn sampled_mtp_speculative_decode_is_the_k1_run() -> Result<()> {
+    use crate::sampled_cells::{cells, k1, spec};
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
+    let max = 20;
+    let (prompt, greedy_ids, _) = long_prompt(&model, &cfg, max)?;
+    let eos = [cfg.eos_token_id];
+    let cache = |ring: Option<usize>| -> Result<State<RewindableExact>> {
+        let mut c: State<RewindableExact> = match ring {
+            Some(k) => State::<RewindableExact>::in_ring(&cfg, &model.spec_pools(1, k, &dev))?,
+            None => RewindableExact::single(&model, &dev, 8)?,
+        };
+        c.want_nextn = true;
+        Ok(c)
+    };
+    let (mut compared, mut kept, mut moved) = (0usize, 0usize, 0usize);
+    for cell in cells(5, 9) {
+        for seed in [0u64, 7, 42] {
+            let reference = k1(
+                &model,
+                RewindableExact::single(&model, &dev, 8)?,
+                &dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+            )?;
+            moved += usize::from(reference.0 != greedy_ids);
+            let mut runs: Vec<crate::sampled_cells::LabelledRun> = Vec::new();
+            for k in [1usize, 2] {
+                for ring in [None, Some(k)] {
+                    let head = testing::mtp_head::<CrownExact, _>(
+                        &cfg,
+                        &dev,
+                        testing::resident_experts(&cfg, 7, &dev),
+                    );
+                    let mut mtp =
+                        MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev)
+                            .with_k(k);
+                    let got = spec(
+                        &model,
+                        cache(ring)?,
+                        &dev,
+                        &eos,
+                        &cell,
+                        seed,
+                        &prompt,
+                        max,
+                        &mut mtp,
+                    )?;
+                    runs.push((format!("mtp k={k} ring={ring:?}"), got));
+                }
+            }
+            let mut oracle = Oracle {
+                stream: reference.0.clone(),
+                produced: 0,
+            };
+            let got = spec(
+                &model,
+                cache(None)?,
+                &dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+                &mut oracle,
+            )?;
+            runs.push(("oracle".into(), got));
+            let token = (0..cfg.vocab_size as u32)
+                .find(|t| !reference.0.contains(t) && *t != cfg.eos_token_id)
+                .expect("a vocabulary id the stream never emits");
+            let mut garbage = Garbage { token };
+            let got = spec(
+                &model,
+                cache(Some(1))?,
+                &dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+                &mut garbage,
+            )?;
+            runs.push(("garbage on the rings".into(), got));
+            for (name, got) in runs {
+                assert_eq!(
+                    (&got.0, got.1),
+                    (&reference.0, reference.1),
+                    "{cell:?} seed {seed}: the {name} run is not the K=1 run"
+                );
+                kept += got.2;
+                compared += 1;
+            }
+        }
+    }
+    println!("QWEN4EXP-MTP-SAMPLED runs={compared} kept_drafts={kept} sampled_moved={moved}");
+    assert!(kept > compared, "the drafts were rarely kept ({kept})");
+    assert!(moved > 10, "the cells rarely left greedy's stream");
+    Ok(())
+}
+
+/// Drafts nothing: every round is the window of the anchor alone.
+struct ZeroDraft;
+
+impl Speculator for ZeroDraft {
+    type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
+    fn n_seq(&self) -> usize {
+        1
+    }
+    fn max_draft(&self) -> usize {
+        0
+    }
+    fn begin(&mut self, _: SeqId, _: &[u32]) -> Result<()> {
+        Ok(())
+    }
+    fn draft(&mut self, _: &[SeqId]) -> Result<Vec<Draft>> {
+        Ok(vec![Draft::host(Vec::new())])
+    }
+    fn observe(&mut self, _: SeqId, _: &Tensor, _: &[u32]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The zero-draft window on Qwen4-exp — the sequential window and the one
+/// over the phase rings — is the K=1 run at every `sampled_cells` cell and
+/// greedy.
+#[test]
+fn the_zero_draft_window_is_the_non_speculative_run() -> Result<()> {
+    use crate::sampled_cells::{cells, k1, spec, Cell};
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model::<RewindableExact>(&cfg, &dev);
+    let max = 20;
+    let (prompt, _, _) = long_prompt(&model, &cfg, max)?;
+    let eos = [cfg.eos_token_id];
+    let mut all = cells(5, 9);
+    all.push(Cell {
+        sampling: Sampling::ArgMax,
+        processors: Default::default(),
+        budget: None,
+    });
+    for cell in all {
+        for seed in [0u64, 7, 42] {
+            let reference = k1(
+                &model,
+                RewindableExact::single(&model, &dev, 8)?,
+                &dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+            )?;
+            for ring in [false, true] {
+                let mut c: State<RewindableExact> = if ring {
+                    State::<RewindableExact>::in_ring(&cfg, &model.spec_pools(1, 1, &dev))?
+                } else {
+                    RewindableExact::single(&model, &dev, 8)?
+                };
+                c.want_nextn = true;
+                let got = spec(
+                    &model,
+                    c,
+                    &dev,
+                    &eos,
+                    &cell,
+                    seed,
+                    &prompt,
+                    max,
+                    &mut ZeroDraft,
+                )?;
+                assert_eq!(
+                    (&got.0, got.1),
+                    (&reference.0, reference.1),
+                    "{cell:?} seed {seed} ring={ring}: the zero-draft window is not the K=1 run"
+                );
+            }
+        }
+    }
+    Ok(())
+}

@@ -711,8 +711,12 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
     let mut shape = shape;
     if let Some(note) = resolve_auto_speculation(family.name(), &mut shape) {
         eprintln!("[speculate: {note}]");
-        crate::couplings::refuse_speculative(&shape.speculative.method, &shape.sampling)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::couplings::refuse_speculative(
+            &shape.speculative.method,
+            &shape.sampling,
+            shape.batch,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
     if let Some(note) = &clamp {

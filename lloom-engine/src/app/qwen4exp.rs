@@ -1284,13 +1284,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
-        if self.sched.is_some() {
-            Some(super::budgets::BATCHED)
-        } else if self.mtp || self.dflash.is_some() {
-            Some(super::budgets::SPECULATIVE)
-        } else {
-            None
-        }
+        self.sched.is_some().then_some(super::budgets::BATCHED)
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;

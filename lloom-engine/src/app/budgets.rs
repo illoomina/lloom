@@ -14,8 +14,6 @@ pub const NO_THINKING_BLOCK: &str = "the chat template writes no thinking block"
 pub const NOT_THINKING: &str = "the prompt leaves no thinking block open";
 pub const BATCHED: &str =
     "this process decodes through the batch scheduler (--batch N), which feeds no forced token";
-pub const SPECULATIVE: &str =
-    "this process decodes through the speculative body (--dspark, --mtp), whose verify feeds no forced token";
 
 /// The budget of `budget` tokens for `prompt`, or why it does not apply:
 /// the decode path cannot feed it (`refused`), the template writes no block,

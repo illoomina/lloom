@@ -613,13 +613,6 @@ where
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
     }
-    fn thinking_budget_refused(&self) -> Option<&'static str> {
-        if self.mtp.is_some() {
-            Some(super::budgets::SPECULATIVE)
-        } else {
-            None
-        }
-    }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;
         (0..n).map(|i| seed[(i + row * 7) % seed.len()]).collect()

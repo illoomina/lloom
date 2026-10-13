@@ -490,7 +490,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} sampling={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -520,6 +520,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.readback.eos_index_late,
             st.prefill_units,
             report::param_style_arm(),
+            params.sampling().name(),
             think.map_or("none", Thinking::name),
             think.map_or("none", |t| t.by.name()),
             opt(sampling.thinking_budget),

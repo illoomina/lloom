@@ -5619,7 +5619,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     pub fn verify_window(&self, tokens: &[u32], cache: &mut State<P>) -> Result<Vec<u32>> {
         let t = tokens.len();
         let pass = self.verify_window_run(tokens, cache)?;
-        let v = self.verify_window_settle(pass, |_| t, false, cache)?;
+        let v = self.verify_window_settle(pass, |_| t, false, cache, None)?;
         Ok(v.argmax)
     }
 
@@ -5631,6 +5631,18 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
     /// flags a draft row's instead of loading it (`QWEN4EXP_MTP_DRAFT_LOADS`
     /// loads those too, the A/B arm).
     pub fn verify_window_run(&self, tokens: &[u32], cache: &mut State<P>) -> Result<VerifyPass<P>> {
+        self.verify_window_run_drawn(tokens, cache, None)
+    }
+
+    /// [`Self::verify_window_run`] where each row's token is `draw`'s keyed
+    /// draw rather than the row's argmax ([`window_tokens`]): the sampled
+    /// verify. `None` is the argmax.
+    pub(crate) fn verify_window_run_drawn(
+        &self,
+        tokens: &[u32],
+        cache: &mut State<P>,
+        mut draw: Option<&mut crate::generation::LogitsProcessor>,
+    ) -> Result<VerifyPass<P>> {
         let t = tokens.len();
         if t == 0 {
             lloom_tensor::bail!("qwen4exp verify_window: no tokens")
@@ -5655,7 +5667,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             // the row count, so a rows pass would not be the sequential
             // math there); the ring channels take the writes phase by phase.
             let drafts = cache.window_loads_drafts();
-            let (argmax, records) = self.verify_rows_reference(tokens, cache, false, drafts)?;
+            let (argmax, records) =
+                self.verify_rows_reference(tokens, cache, false, drafts, draw.as_deref_mut())?;
             return Ok(VerifyPass {
                 argmax,
                 records,
@@ -5683,15 +5696,30 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 loaded_rows: if drafts { t } else { 1 },
             }
         };
+        // The pass advances the position by `t`; row 0 draws the token
+        // after the anchor.
+        let first_pos = cache.pos as u64 + 1;
         let (logits, plans, carries) = self.verify_pass(&h, cache, kind)?;
-        let argmax = logits.argmax(D::Minus1)?; // [T]
+        let argmax = window_tokens(&logits, tokens, first_pos, draw.as_deref_mut())?; // [T]
         let run = self.fold_head(&carries, &argmax, t)?;
         let extras: Vec<&Tensor> = run.as_ref().map_or_else(Vec::new, |r| r.read_tensors());
-        let (argmax, records, read) = self.window_read(argmax, plans, t, &extras)?;
-        let fold = match run {
+        let (mut argmax, records, read) = self.window_read(argmax, plans, t, &extras)?;
+        let mut fold = match run {
             Some(r) => Some(r.read(read, self.mtp_topk())?),
             None => None,
         };
+        if let Some(s) = draw {
+            // What each row feeds (a thinking budget's forced tail where it
+            // applies); the head's folded rows were keyed from the draws, so
+            // a row whose fed token differs from its draw cannot stand.
+            let fed = s.window_fed(&argmax);
+            if fed != argmax {
+                if let Some(f) = fold.as_mut() {
+                    f.invalidate();
+                }
+            }
+            argmax = fed;
+        }
         Ok(VerifyPass {
             argmax,
             records,
@@ -5799,6 +5827,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         accept: impl Fn(&[u32]) -> usize,
         truncate: bool,
         cache: &mut State<P>,
+        mut draw: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<WindowVerdict> {
         let VerifyPass {
             mut argmax,
@@ -5849,6 +5878,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             }
             let all_loaded = !truncate || cache.window_loads_drafts();
             drafts_loaded = all_loaded;
+            let first_pos = cache.pos as u64 + 1;
             let (am, recs) = match &h {
                 Some(h) => {
                     let kind = WindowPlanKind::Host {
@@ -5856,11 +5886,15 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                         loaded_rows: if all_loaded { t } else { 1 },
                     };
                     let (logits, plans, _) = self.verify_pass(h, cache, kind)?;
-                    let (am, recs, _) =
-                        self.window_read(logits.argmax(D::Minus1)?, plans, t, &[])?;
+                    let drawn = window_tokens(&logits, &tokens, first_pos, draw.as_deref_mut())?;
+                    let (am, recs, _) = self.window_read(drawn, plans, t, &[])?;
+                    let am = match draw.as_deref() {
+                        Some(s) => s.window_fed(&am),
+                        None => am,
+                    };
                     (am, recs)
                 }
-                None => self.verify_rows_reference(&tokens, cache, !truncate, all_loaded)?,
+                None => self.verify_rows_reference(&tokens, cache, !truncate, all_loaded, draw)?,
             };
             argmax = am;
             records = recs;
@@ -5944,12 +5978,16 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         cache: &mut State<P>,
         all_real: bool,
         all_loaded: bool,
+        draw: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<(Vec<u32>, Vec<(usize, WindowRecord)>)> {
         #[cfg(feature = "metal")]
         self.settle_trailing(Some(cache))?;
         let dev = self.device();
         let t = tokens.len();
+        let first_pos = cache.pos as u64 + 1;
         let mut argmax = Vec::with_capacity(t);
+        // Under a draw the rows' logits, drawn together once every row ran.
+        let mut rows: Vec<Tensor> = Vec::new();
         let mut kv_after = Vec::with_capacity(t);
         let mut per_layer: Vec<Vec<WindowRecord>> = vec![Vec::new(); self.layers.len()];
         for (p, &tok) in tokens.iter().enumerate() {
@@ -5960,12 +5998,16 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
             };
             let (logits, recs) =
                 self.decode_embed_pass(&self.embed(&input)?, cache, &mut (), plan)?;
-            argmax.push(
-                logits
-                    .flatten_all()?
-                    .argmax(D::Minus1)?
-                    .to_scalar::<u32>()?,
-            );
+            if draw.is_some() {
+                rows.push(logits.flatten_all()?);
+            } else {
+                argmax.push(
+                    logits
+                        .flatten_all()?
+                        .argmax(D::Minus1)?
+                        .to_scalar::<u32>()?,
+                );
+            }
             kv_after.push(cache.kv.iter().map(|k| k.lens()).collect::<Vec<_>>());
             for (l, r) in recs {
                 match r {
@@ -5980,6 +6022,11 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         }
         if let Some(w) = &mut cache.window {
             w.kv_after = kv_after;
+        }
+        if let Some(s) = draw {
+            let drawn = window_tokens(&Tensor::stack(&rows, 0)?, tokens, first_pos, Some(&mut *s))?
+                .to_vec1::<u32>()?;
+            argmax = s.window_fed(&drawn);
         }
         let mut records = Vec::new();
         for (l, recs) in per_layer.into_iter().enumerate() {
@@ -6350,6 +6397,26 @@ impl<P: Profile> crate::nn::model::CacheRewind for State<P> {
     }
     fn restore(&mut self, pos: usize) -> Result<()> {
         State::<P>::restore(self, pos)
+    }
+}
+
+/// A verify window's token per row from its logits `[T, vocab]`: the argmax,
+/// or `draw`'s draw with row `i` keyed to `first_pos + i` (the position of
+/// the token it draws) and processed against the history the window's
+/// `tokens` give it (`LogitsProcessor::window_draw_device`). A `[T]` `U32`
+/// device tensor either way.
+pub(crate) fn window_tokens(
+    logits: &Tensor,
+    tokens: &[u32],
+    first_pos: u64,
+    draw: Option<&mut crate::generation::LogitsProcessor>,
+) -> Result<Tensor> {
+    match draw {
+        None => logits.argmax(D::Minus1),
+        Some(s) => {
+            let inputs = Tensor::from_vec(tokens.to_vec(), tokens.len(), logits.device())?;
+            s.window_draw_device(logits, first_pos, Some(&inputs))
+        }
     }
 }
 

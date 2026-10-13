@@ -3,8 +3,8 @@
 //! Functionality for modeling sampling strategies and logits processing in text generation
 //! with support for temperature-based sampling, top-k filtering, nucleus sampling (top-p),
 //! and combinations thereof.
-use lloom_tensor::{DType, Error, Result, Tensor};
-use rand::{distr::Distribution, SeedableRng};
+use lloom_tensor::{DType, Result, Tensor};
+use rand::SeedableRng;
 
 pub mod budget;
 pub mod hot_thread;
@@ -25,9 +25,19 @@ pub use readback::{
     Ring, RingLap, RingReader, WAKE_LIVE_EVERY_DEFAULT,
 };
 
+/// The draw a sampler makes. Every temperature arm is keyed by the seed and
+/// the absolute position of the token it draws when the caller arms one
+/// ([`LogitsProcessor::at_position`]), so a draw does not depend on how many
+/// draws preceded it — a speculative window and a step-by-step decode land
+/// on the same tokens at one seed.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
     ArgMax,
+    /// Multinomial at the temperature, by inverse CDF: ONE uniform per
+    /// position, the smallest token whose cumulative probability under
+    /// `softmax(z / T)` passes it ([`Tensor::sample_inverse_cdf`], a device
+    /// draw on every readback arm). `generation.sampling.method =
+    /// multinomial`, the default.
     All {
         temperature: f64,
     },
@@ -44,10 +54,28 @@ pub enum Sampling {
         p: f64,
         temperature: f64,
     },
-    /// Gumbel-max at the temperature, its noise from the processor's seeded rng.
+    /// Gumbel-max at the temperature: `argmax(z + T·G)`, one Gumbel variate
+    /// per vocabulary entry, from the processor's seeded host noise
+    /// (`generation.sampling.method = gumbel`, `--gumbel`).
     GumbelSoftmax {
         temperature: f64,
     },
+}
+
+impl Sampling {
+    /// The arm as a report line names it: the method and its parameters.
+    pub fn name(&self) -> String {
+        match self {
+            Sampling::ArgMax => "argmax".into(),
+            Sampling::All { temperature } => format!("multinomial:t={temperature}"),
+            Sampling::GumbelSoftmax { temperature } => format!("gumbel:t={temperature}"),
+            Sampling::TopK { k, temperature } => format!("top-k:k={k}:t={temperature}"),
+            Sampling::TopP { p, temperature } => format!("top-p:p={p}:t={temperature}"),
+            Sampling::TopKThenTopP { k, p, temperature } => {
+                format!("top-k-top-p:k={k}:p={p}:t={temperature}")
+            }
+        }
+    }
 }
 
 pub struct LogitsProcessor {
@@ -77,6 +105,14 @@ pub struct LogitsProcessor {
     /// A running SHA-256 over every step's raw logits
     /// ([`Self::with_logits_digest`]): a diagnostic, off by default.
     digest: Option<sha2::Sha256>,
+    /// The raw logits of the last verify window drawn while digesting, so
+    /// the rows the round keeps are hashed ([`Self::commit_window`]).
+    window_logits: Option<Tensor>,
+    /// The thinking budget a verify window's draws are fed through
+    /// ([`Self::with_window_budget`]); the K=1 loop's is its readback arm's.
+    window_forcing: Option<budget::HostForcing>,
+    /// Rows of logits the digest has taken.
+    digest_rows: usize,
 }
 
 /// A [`LogitsProcessor`]'s state before a draw ([`LogitsProcessor::mark`]).
@@ -99,6 +135,9 @@ impl LogitsProcessor {
             #[cfg(feature = "metal")]
             draw_slot: None,
             digest: None,
+            window_logits: None,
+            window_forcing: None,
+            digest_rows: 0,
         }
     }
 
@@ -112,8 +151,49 @@ impl LogitsProcessor {
         self
     }
 
+    /// Feed a verify window's draws through a thinking budget: what a row
+    /// FEEDS is the budget's rule over the draws before it
+    /// ([`Self::window_fed`]), as the K=1 loop's readback arm feeds a
+    /// forced token in place of a draw. `None` removes it.
+    pub fn with_window_budget(mut self, budget: Option<&ThinkingBudget>) -> Self {
+        self.window_forcing = budget.cloned().map(budget::HostForcing::new);
+        self
+    }
+
+    /// The tokens a verify window's rows feed, given their draws: the draws
+    /// themselves, or under a thinking budget its rule applied row by row
+    /// from the run's position in it — the forced tail where the budget is
+    /// spent and the block still open. Moves nothing: the run's position
+    /// in the budget advances by what the round keeps
+    /// ([`Self::commit_window`]).
+    pub fn window_fed(&self, drawn: &[u32]) -> Vec<u32> {
+        match &self.window_forcing {
+            None => drawn.to_vec(),
+            Some(f) => {
+                let mut f = f.clone();
+                drawn.iter().map(|&d| f.feed(d)).collect()
+            }
+        }
+    }
+
+    /// Whether a verify window must draw its rows with this sampler rather
+    /// than read their raw argmax: a temperature, processors, a thinking
+    /// budget or a logits digest each need the rows' logits.
+    pub fn draws_windows(&self) -> bool {
+        self.sampling != Sampling::ArgMax
+            || self.stage.is_some()
+            || self.window_forcing.is_some()
+            || self.digest.is_some()
+    }
+
     pub fn digests(&self) -> bool {
         self.digest.is_some()
+    }
+
+    /// Rows of logits the digest has taken: one a step on the K=1 loop, one
+    /// a kept row under speculation, the EOS step's included either way.
+    pub fn digest_rows(&self) -> usize {
+        self.digest_rows
     }
 
     /// The digest so far, hex; `None` unless [`Self::with_logits_digest`].
@@ -133,6 +213,10 @@ impl LogitsProcessor {
             .flatten_all()?
             .to_dtype(DType::F32)?
             .to_vec1::<f32>()?;
+        self.digest_rows += logits.dims()[..logits.rank().saturating_sub(1)]
+            .iter()
+            .product::<usize>()
+            .max(1);
         let mut bytes = Vec::with_capacity(v.len() * 4);
         for x in &v {
             bytes.extend_from_slice(&x.to_bits().to_le_bytes());
@@ -181,10 +265,9 @@ impl LogitsProcessor {
     /// it was rejected, and a sampled speculative decode reproduces a
     /// sampled non-speculative one at one seed.
     ///
-    /// `None` returns to the running stream. Only the gumbel-max arms read
-    /// the noise (`Sampling::{All, GumbelSoftmax}`); the host-sort arms draw
-    /// through `sample_multinomial` on the running `rng` and are unaffected,
-    /// which is why the speculative body refuses them.
+    /// `None` returns to the running stream. Every temperature arm reads
+    /// the key: gumbel-max its noise, multinomial and the host-sort arms
+    /// (top-k, top-p: the filter, then the inverse CDF) their one uniform.
     pub fn at_position(&mut self, position: Option<u64>) {
         self.position = position;
     }
@@ -304,6 +387,26 @@ impl LogitsProcessor {
         }
     }
 
+    /// A device draw's id on the host: through the session's draw slot on
+    /// Metal (one copy into a Shared slot the step already commits, read in
+    /// place — [`Self::draw_and_read`]'s read), else read back.
+    fn read_drawn(&mut self, draw: &Tensor) -> Result<u32> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = draw.device().as_metal_device() {
+            if !matches!(&self.draw_slot, Some(s) if s.cap() >= 1) {
+                self.draw_slot = Some(lloom_tensor::metal_backend::HostSlot::new(
+                    m,
+                    1,
+                    DType::U32,
+                )?);
+            }
+            let slot = self.draw_slot.as_ref().expect("made above");
+            slot.write_from(&draw.flatten_all()?)?;
+            return Ok(slot.read_committed::<u32>(1)?[0]);
+        }
+        Ok(draw.flatten_all()?.to_vec1::<u32>()?[0])
+    }
+
     /// The draw as a `U32` **device** tensor, never read back: the ring
     /// writes it into the next step's input and its history slot, so nothing
     /// comes down and nothing goes up again (§11.5g).
@@ -340,7 +443,15 @@ impl LogitsProcessor {
     }
 
     /// One drawn token per row of a verify window's logits — the target's own
-    /// token at each of the `t` positions `[anchor, draft…]` covers.
+    /// token at each of the `t` positions `[anchor, draft…]` covers — read
+    /// back to the host ([`Self::window_draw_device`] with no window inputs).
+    pub fn window_draw(&mut self, logits: &Tensor, first_pos: u64) -> Result<Vec<u32>> {
+        self.window_draw_device(logits, first_pos, None)?
+            .to_vec1::<u32>()
+    }
+
+    /// One drawn token per row of a verify window's logits, left on the
+    /// device as a `[t]` `U32` tensor.
     ///
     /// This is what a sampled verify compares the draft against, in place of
     /// the single `logits.argmax(D::Minus1)` the greedy verify takes. The
@@ -351,22 +462,29 @@ impl LogitsProcessor {
     /// rather than its mode.
     ///
     /// `logits` is `[1, t, vocab]` or `[t, vocab]`; `first_pos` is the
-    /// ABSOLUTE position of row 0. Row `i` draws with its noise keyed to
-    /// `first_pos + i`, so the token at a position does not depend on how
-    /// many rows before it were drawn and then rejected — which is what makes
-    /// the sampled window reproduce a sampled step-by-step decode at one seed.
+    /// ABSOLUTE position of the token row 0 draws. Row `i` draws keyed to
+    /// `first_pos + i` (its noise, or its uniform), so the token at a
+    /// position does not depend on how many rows before it were drawn and
+    /// then rejected — which is what makes the sampled window reproduce a
+    /// sampled step-by-step decode at one seed. The rows of every arm are
+    /// drawn together: the gumbel arm's noise filled in parallel and
+    /// uploaded once, the multinomial's uniforms as one `[t]` upload and one
+    /// inverse-CDF dispatch over the rows; the host-sort arms (top-k, top-p)
+    /// read the rows' probabilities back once and draw each row on the host.
     ///
-    /// Returns the `[t]` U32 ids on the host. The rows are drawn on the
-    /// device (one gumbel-max per row) and read back together, inside the one
-    /// readback the verify already pays.
-    ///
-    /// Refuses the host-sort arms (`TopK`, `TopP`, `TopKThenTopP`): those draw
-    /// through a host multinomial on the running rng, which has no
-    /// position-keyed form, so serving them here would advance one shared
-    /// stream per discarded row — the defect this method exists to avoid.
-    /// Processors are refused for the same reason: their history advances per
-    /// recorded token, and a rejected row's token is not one the run emitted.
-    pub fn window_draw(&mut self, logits: &Tensor, first_pos: u64) -> Result<Vec<u32>> {
+    /// Processors read a per-row history: row `i` counts the run's output
+    /// so far and the window's inputs `1..=i` — the drafts the rows before
+    /// it were fed, which are the run's output whenever row `i` is read at
+    /// all (a row past a rejection is discarded). `inputs` is the window's
+    /// `[t]` `U32` input ids `[anchor, d1…]`; without it a sampler with
+    /// processors is refused by name. The history itself does not move:
+    /// the caller counts what the round kept ([`Self::commit_window`]).
+    pub fn window_draw_device(
+        &mut self,
+        logits: &Tensor,
+        first_pos: u64,
+        inputs: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let rows = match logits.rank() {
             3 => {
                 let (b, _t, _v) = logits.dims3()?;
@@ -380,49 +498,87 @@ impl LogitsProcessor {
             2 => logits.contiguous()?,
             r => lloom_tensor::bail!("window_draw: expected [1, t, vocab] or [t, vocab], rank {r}"),
         };
-        let (t, _vocab) = rows.dims2()?;
+        let (t, vocab) = rows.dims2()?;
         if t == 0 {
             lloom_tensor::bail!("window_draw: an empty window");
         }
-        if self.stage.is_some() {
-            lloom_tensor::bail!(
+        if self.digest.is_some() {
+            self.window_logits = Some(rows.clone());
+        }
+        let temperature = self.temperature();
+        let rows = match (self.stage.as_mut(), inputs) {
+            (None, _) => rows,
+            (Some(_), None) => lloom_tensor::bail!(
                 "window_draw: logits processors (logit_bias, repetition/presence/frequency \
-                 penalties, min_p) have per-token history, and a verify window draws rows it \
-                 may reject — their history would count a token the run never emitted"
-            );
-        }
-        match self.sampling {
-            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
-            ref other => lloom_tensor::bail!(
-                "window_draw: {other:?} draws through a host sort on one running rng, which has \
-                 no position-keyed form; a window would advance it per rejected row"
+                 penalties, min_p) have per-token history, and this window carries no inputs \
+                 to build each row's from"
             ),
-        }
-        // One draw for the whole window: the rows' noise is generated in
-        // parallel (each row's stream is its own position's and shares no
-        // state with another's), uploaded once, and reduced by one argmax
-        // over the last dimension with one readback — the per-row arithmetic
-        // of `gumbel_max_host_noise`, element for element.
-        let _ = t;
-        let ids = match self.sampling {
-            Sampling::ArgMax => rows.argmax(lloom_tensor::D::Minus1)?.to_vec1::<u32>()?,
-            Sampling::All { temperature } | Sampling::GumbelSoftmax { temperature } => {
+            (Some(stage), Some(inputs)) => stage.apply_rows(&rows, inputs, temperature)?,
+        };
+        let dev = rows.device().clone();
+        let seed = self.seed;
+        Ok(match self.sampling.clone() {
+            Sampling::ArgMax => rows.argmax(lloom_tensor::D::Minus1)?,
+            Sampling::GumbelSoftmax { temperature } => {
                 use rayon::prelude::*;
                 let rows = rows.to_dtype(DType::F32)?;
-                let (t, vocab) = rows.dims2()?;
-                let seed = self.seed;
                 let mut g = vec![0f32; t * vocab];
                 g.par_chunks_mut(vocab)
                     .enumerate()
                     .for_each(|(i, row)| Self::fill_gumbel(seed, first_pos + i as u64, row));
-                let noise = Tensor::from_vec(g, (t, vocab), rows.device())?;
-                (rows + noise.affine(temperature, 0.0)?)?
-                    .argmax(lloom_tensor::D::Minus1)?
-                    .to_vec1::<u32>()?
+                let noise = Tensor::from_vec(g, (t, vocab), &dev)?;
+                (rows + noise.affine(temperature, 0.0)?)?.argmax(lloom_tensor::D::Minus1)?
             }
-            _ => unreachable!("refused above"),
-        };
-        Ok(ids)
+            Sampling::All { temperature } => {
+                let u: Vec<f32> = (0..t as u64)
+                    .map(|i| Self::uniform_at(seed, first_pos + i))
+                    .collect();
+                rows.sample_inverse_cdf(temperature, &Tensor::from_vec(u, t, &dev)?)?
+            }
+            ref arm @ (Sampling::TopK { temperature, .. }
+            | Sampling::TopP { temperature, .. }
+            | Sampling::TopKThenTopP { temperature, .. }) => {
+                let scaled = (rows.to_dtype(DType::F32)? / temperature)?;
+                let prs = crate::nn::ops::softmax_last_dim(&scaled)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let mut ids = Vec::with_capacity(t);
+                for (i, row) in prs.chunks(vocab).enumerate() {
+                    let mut row = row.to_vec();
+                    let u = Self::uniform_at(seed, first_pos + i as u64);
+                    ids.push(Self::host_sort_draw(arm, &mut row, u)?);
+                }
+                Tensor::from_vec(ids, t, &dev)?
+            }
+        })
+    }
+
+    /// Count the tokens a verify round kept into the processors' history,
+    /// in order — each is the run's output, as a step-by-step decode counts
+    /// its draws. A no-op without processors.
+    ///
+    /// Under a thinking budget the run's position in it advances by the
+    /// kept tokens (each a fed token, which the rule returns unchanged), and
+    /// under a logits digest the kept rows of the last window drawn are
+    /// hashed, as the K=1 loop hashes each step's logits.
+    pub fn commit_window(&mut self, accepted: &[u32]) -> Result<()> {
+        if let Some(stage) = self.stage.as_mut() {
+            for &id in accepted {
+                stage.record_id(id)?;
+            }
+        }
+        if let Some(f) = self.window_forcing.as_mut() {
+            for &id in accepted {
+                f.feed(id);
+            }
+        }
+        if let Some(rows) = self.window_logits.take() {
+            let kept = accepted.len().min(rows.dim(0)?);
+            if kept > 0 {
+                self.digest_step(&rows.narrow(0, 0, kept)?)?;
+            }
+        }
+        Ok(())
     }
 
     /// Fill `out` with the Gumbel variates of `(seed, pos)`'s stream: the
@@ -448,9 +604,12 @@ impl LogitsProcessor {
             // sampler feeds `inp_uniforms` the same way (host `std::uniform_real`
             // -> a GPU input tensor). The device then does only `logits/T + G ->
             // argmax`, one add over the reduction it was already going to run.
-            Sampling::All { temperature } | Sampling::GumbelSoftmax { temperature } => {
+            Sampling::GumbelSoftmax { temperature } => {
                 self.gumbel_max_host_noise(logits, temperature)
             }
+            // Multinomial by inverse CDF: one host uniform uploaded, the
+            // draw on the device, so the token never comes down here either.
+            Sampling::All { temperature } => self.multinomial_on_device(logits, temperature),
             // top-k / top-p need a host sort (§11.2c) -- fall back to the plain
             // argmax on the device, and let the caller's blocking `sample` path
             // handle the nucleus. (These arms disable the ring in the harness.)
@@ -508,6 +667,44 @@ impl LogitsProcessor {
         }
     }
 
+    /// The multinomial draw on the logits' device: the uniform of this draw
+    /// ([`Self::next_uniform`]) uploaded, one inverse-CDF dispatch, the id
+    /// left on the device in the shape an argmax over the last dimension
+    /// gives.
+    fn multinomial_on_device(&mut self, logits: &Tensor, temperature: f64) -> Result<Tensor> {
+        let u = self.next_uniform();
+        let ut = Tensor::new(&[u], logits.device())?;
+        let dims = logits.dims();
+        let out = &dims[..dims.len().saturating_sub(1)];
+        let rows: usize = out.iter().product();
+        if rows != 1 {
+            lloom_tensor::bail!(
+                "multinomial draw: one row per draw, got logits {:?} (a window draws through \
+                 `window_draw_device`)",
+                dims
+            );
+        }
+        logits.sample_inverse_cdf(temperature, &ut)?.reshape(out)
+    }
+
+    /// The uniform in `[0, 1)` one draw takes: the position's
+    /// ([`Self::uniform_at`]) when one is armed, else the running stream's
+    /// next.
+    fn next_uniform(&mut self) -> f32 {
+        use rand::Rng;
+        match self.position {
+            Some(pos) => Self::uniform_at(self.seed, pos),
+            None => self.rng.random::<f32>(),
+        }
+    }
+
+    /// The uniform of `(seed, pos)`'s stream: the first `f32` of the
+    /// position's own generator, as [`Self::fill_gumbel`] derives its noise.
+    pub fn uniform_at(seed: u64, pos: u64) -> f32 {
+        use rand::{Rng, SeedableRng};
+        rand::rngs::StdRng::seed_from_u64(Self::stream_key(seed, pos)).random::<f32>()
+    }
+
     /// The per-position stream key: splitmix64 over `seed + pos·φ`.
     ///
     /// What is MEASURED is the key's two-halves property — a stream is a
@@ -550,16 +747,31 @@ impl LogitsProcessor {
         Ok(slot.as_ref())
     }
 
-    fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
-        let distr = rand::distr::weighted::WeightedIndex::new(prs).map_err(Error::wrap)?;
-        let next_token = distr.sample(&mut self.rng) as u32;
-        Ok(next_token)
+    /// The inverse CDF over host probabilities (not necessarily normalised):
+    /// the smallest index whose running sum, in index order and in f64,
+    /// passes `u` times the total; a walk that rounding keeps from crossing
+    /// takes the last index with mass. A zero entry is never drawn.
+    fn pick(prs: &[f32], u: f32) -> u32 {
+        let total: f64 = prs.iter().map(|&p| p as f64).sum();
+        let target = u as f64 * total;
+        let mut acc = 0f64;
+        let mut last = 0u32;
+        for (i, &p) in prs.iter().enumerate() {
+            if p > 0.0 {
+                last = i as u32;
+            }
+            acc += p as f64;
+            if acc > target {
+                return i as u32;
+            }
+        }
+        last
     }
 
     /// top-p sampling (or "nucleus sampling") samples from the smallest set of tokens that exceed
     /// probability top_p. This way we never sample tokens that have very low probabilities and are
     /// less likely to go "off the rails".
-    fn sample_topp(&mut self, prs: &mut Vec<f32>, top_p: f32) -> Result<u32> {
+    fn sample_topp(prs: &mut [f32], top_p: f32, u: f32) -> u32 {
         let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
 
         // Sort by descending probability.
@@ -575,61 +787,92 @@ impl LogitsProcessor {
             }
         }
         // Sample with clamped probabilities.
-        self.sample_multinomial(prs)
+        Self::pick(prs, u)
+    }
+
+    /// The `k` most probable tokens, in index order, with their
+    /// probabilities: the draw over them is then the inverse CDF in token
+    /// order, as over the whole vocabulary.
+    fn top_k_set(prs: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
+        let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
+        let (indices, _, _) =
+            argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        let kept = indices.iter().map(|&i| prs[i]).collect();
+        (indices, kept)
     }
 
     // top-k sampling samples from the k tokens with the largest probabilities.
-    fn sample_topk(&mut self, prs: &mut Vec<f32>, top_k: usize) -> Result<u32> {
+    fn sample_topk(prs: &mut [f32], top_k: usize, u: f32) -> u32 {
         if top_k >= prs.len() {
-            self.sample_multinomial(prs)
+            Self::pick(prs, u)
         } else {
-            let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
-            let (indices, _, _) =
-                argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
-            let prs = indices.iter().map(|&i| prs[i]).collect::<Vec<_>>();
-            let index = self.sample_multinomial(&prs)?;
-            Ok(indices[index as usize] as u32)
+            let (indices, kept) = Self::top_k_set(prs, top_k);
+            indices[Self::pick(&kept, u) as usize] as u32
         }
     }
 
     // top-k sampling samples from the k tokens with the largest probabilities.
     // then top-p sampling.
-    fn sample_topk_topp(&mut self, prs: &mut Vec<f32>, top_k: usize, top_p: f32) -> Result<u32> {
+    fn sample_topk_topp(prs: &mut [f32], top_k: usize, top_p: f32, u: f32) -> u32 {
         if top_k >= prs.len() {
-            self.sample_topp(prs, top_p)
+            Self::sample_topp(prs, top_p, u)
         } else {
-            let mut argsort_indices = (0..prs.len()).collect::<Vec<_>>();
-            let (indices, _, _) =
-                argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
-            let mut prs = indices.iter().map(|&i| prs[i]).collect::<Vec<_>>();
-            let sum_p = prs.iter().sum::<f32>();
+            let (indices, mut kept) = Self::top_k_set(prs, top_k);
+            let sum_p = kept.iter().sum::<f32>();
             let index = if top_p <= 0.0 || top_p >= sum_p {
-                self.sample_multinomial(&prs)?
+                Self::pick(&kept, u)
             } else {
-                self.sample_topp(&mut prs, top_p)?
+                Self::sample_topp(&mut kept, top_p, u)
             };
-            Ok(indices[index as usize] as u32)
+            indices[index as usize] as u32
         }
     }
 
-    pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
-        self.sample_f(logits, |_| {})
+    /// The host-sort arms' draw over probabilities `prs` with the uniform
+    /// `u`: the filter, then the inverse CDF.
+    fn host_sort_draw(sampling: &Sampling, prs: &mut [f32], u: f32) -> Result<u32> {
+        Ok(match sampling {
+            Sampling::TopP { p, .. } => {
+                if *p <= 0.0 || *p >= 1.0 {
+                    // simply sample from the predicted probability distribution
+                    Self::pick(prs, u)
+                } else {
+                    // top-p (nucleus) sampling, clamping the least likely tokens to zero
+                    Self::sample_topp(prs, *p as f32, u)
+                }
+            }
+            Sampling::TopK { k, .. } => Self::sample_topk(prs, *k, u),
+            Sampling::TopKThenTopP { k, p, .. } => Self::sample_topk_topp(prs, *k, *p as f32, u),
+            other => lloom_tensor::bail!("host_sort_draw: {other:?} is not a host-sort arm"),
+        })
     }
 
+    pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        self.sample_f_fed(logits, None::<fn(&mut [f32])>, |id| id)
+    }
+
+    /// [`Self::sample`] with `f` over the probabilities the draw reads, on
+    /// the arms that draw from probabilities: plain temperature and the
+    /// host-sort arms (argmax and gumbel-max read none, and never called it).
+    /// Plain temperature then draws on the host — the same keyed uniform's
+    /// inverse CDF over the probabilities `f` left — since the device draw
+    /// reads the logits, never the probabilities.
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
-        self.sample_f_fed(logits, f, |id| id)
+        self.sample_f_fed(logits, Some(f), |id| id)
     }
 
     /// [`Self::sample`], with the step's fed token `feed(draw)` in place of
     /// the draw, as [`Self::sample_argmax_on_device_fed`].
     pub fn sample_fed(&mut self, logits: &Tensor, feed: impl FnOnce(u32) -> u32) -> Result<u32> {
-        self.sample_f_fed(logits, |_| {}, feed)
+        self.sample_f_fed(logits, None::<fn(&mut [f32])>, feed)
     }
 
     fn sample_f_fed(
         &mut self,
         logits: &Tensor,
-        f: impl FnOnce(&mut [f32]),
+        f: Option<impl FnOnce(&mut [f32])>,
         feed: impl FnOnce(u32) -> u32,
     ) -> Result<u32> {
         self.digest_step(logits)?;
@@ -645,7 +888,7 @@ impl LogitsProcessor {
         Ok(id)
     }
 
-    fn draw(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
+    fn draw(&mut self, logits: &Tensor, f: Option<impl FnOnce(&mut [f32])>) -> Result<u32> {
         // The `ArgMax` arm takes its own path over the UNCAST logits.
         //
         // `to_dtype(F32)` below is one `cast_f16_f32` dispatch over the whole
@@ -668,6 +911,7 @@ impl LogitsProcessor {
         if self.sampling == Sampling::ArgMax {
             return self.sample_argmax(logits.clone());
         }
+        let hooked = f.is_some();
         let logits = logits.to_dtype(DType::F32)?;
         // The probabilities through a host-read slot where there is one: the
         // softmax writes it and the host reads the mapping, so the whole
@@ -694,7 +938,9 @@ impl LogitsProcessor {
                 let _ = (&slot, n);
                 crate::nn::ops::softmax_last_dim(&scaled)?.to_vec1()?
             };
-            f(&mut prs);
+            if let Some(f) = f {
+                f(&mut prs);
+            }
             Ok(prs)
         };
 
@@ -704,30 +950,29 @@ impl LogitsProcessor {
             Sampling::ArgMax => self.sample_argmax(logits)?,
             // The device draw's gumbel-max, from the processor's seeded host
             // noise, so `--seed` reproduces on this path as on the ring.
-            Sampling::GumbelSoftmax { temperature } => self
-                .gumbel_max_host_noise(&logits, *temperature)?
-                .to_scalar::<u32>()?,
+            Sampling::GumbelSoftmax { temperature } => {
+                let draw = self.gumbel_max_host_noise(&logits, *temperature)?;
+                self.read_drawn(&draw)?
+            }
+            // The device draw every ring arm takes, read back: one
+            // mechanism on every arm, so an arm never changes the reply.
+            Sampling::All { temperature } if !hooked => {
+                let draw = self.multinomial_on_device(&logits, *temperature)?;
+                self.read_drawn(&draw)?
+            }
+            // A caller's hook over the probabilities (`sample_f`): the same
+            // uniform's inverse CDF, over what the hook left.
             Sampling::All { temperature } => {
                 let prs = prs(*temperature)?;
-                self.sample_multinomial(&prs)?
+                let u = self.next_uniform();
+                Self::pick(&prs, u)
             }
-            Sampling::TopP { p, temperature } => {
+            Sampling::TopP { temperature, .. }
+            | Sampling::TopK { temperature, .. }
+            | Sampling::TopKThenTopP { temperature, .. } => {
                 let mut prs = prs(*temperature)?;
-                if *p <= 0.0 || *p >= 1.0 {
-                    // simply sample from the predicted probability distribution
-                    self.sample_multinomial(&prs)?
-                } else {
-                    // top-p (nucleus) sampling, clamping the least likely tokens to zero
-                    self.sample_topp(&mut prs, *p as f32)?
-                }
-            }
-            Sampling::TopK { k, temperature } => {
-                let mut prs = prs(*temperature)?;
-                self.sample_topk(&mut prs, *k)?
-            }
-            Sampling::TopKThenTopP { k, p, temperature } => {
-                let mut prs = prs(*temperature)?;
-                self.sample_topk_topp(&mut prs, *k, *p as f32)?
+                let u = self.next_uniform();
+                Self::host_sort_draw(&self.sampling, &mut prs, u)?
             }
         };
         Ok(next_token)

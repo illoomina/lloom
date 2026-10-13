@@ -78,8 +78,37 @@ impl<P: Profile, R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qw
                 anchors.len()
             )
         }
-        let pending = self.window_enqueue::<LayerTaps<N>>(&drafts[0], &anchors[0], cache)?;
-        let (accepted, probe) = self.window_complete::<LayerTaps<N>>(pending, cache, eos_ids)?;
+        let pending = self.window_enqueue::<LayerTaps<N>>(&drafts[0], &anchors[0], cache, None)?;
+        let (accepted, probe) =
+            self.window_complete::<LayerTaps<N>>(pending, cache, eos_ids, None)?;
+        Ok((vec![accepted], probe))
+    }
+
+    /// The window's rows drawn by `sampler` (the sampled verify), as the
+    /// MTP target's ([`Qwen4Exp::window_enqueue`]).
+    fn verify_and_probe_sampled(
+        &self,
+        drafts: &[Draft],
+        anchors: &[Anchor],
+        cache: &mut State<P>,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
+            lloom_tensor::bail!(
+                "qwen4exp verify_and_probe_sampled: one sequence; got {} drafts and {} anchors",
+                drafts.len(),
+                anchors.len()
+            )
+        }
+        let pending = self.window_enqueue::<LayerTaps<N>>(
+            &drafts[0],
+            &anchors[0],
+            cache,
+            Some(&mut *sampler),
+        )?;
+        let (accepted, probe) =
+            self.window_complete::<LayerTaps<N>>(pending, cache, eos_ids, Some(sampler))?;
         Ok((vec![accepted], probe))
     }
 
@@ -91,7 +120,7 @@ impl<P: Profile, R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qw
         rows: &mut [VerifyRowRef<'_, State<P>>],
     ) -> Result<Vec<WindowPending<P>>> {
         rows.iter_mut()
-            .map(|r| self.window_enqueue::<LayerTaps<N>>(r.draft, &r.anchor, r.cache))
+            .map(|r| self.window_enqueue::<LayerTaps<N>>(r.draft, &r.anchor, r.cache, None))
             .collect()
     }
 
@@ -113,7 +142,7 @@ impl<P: Profile, R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qw
             .into_iter()
             .zip(caches.iter_mut())
             .zip(eos_sets)
-            .map(|((p, c), eos)| self.window_complete::<LayerTaps<N>>(p, c, eos))
+            .map(|((p, c), eos)| self.window_complete::<LayerTaps<N>>(p, c, eos, None))
             .collect()
     }
 
@@ -123,7 +152,7 @@ impl<P: Profile, R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qw
         anchor: &Anchor,
         cache: &mut State<P>,
     ) -> Result<WindowPending<P>> {
-        self.window_enqueue::<LayerTaps<N>>(draft, anchor, cache)
+        self.window_enqueue::<LayerTaps<N>>(draft, anchor, cache, None)
     }
 
     fn verify_complete(
@@ -132,7 +161,7 @@ impl<P: Profile, R: ExpertResidency, const N: usize> Probes<LayerTaps<N>> for Qw
         cache: &mut State<P>,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
-        self.window_complete::<LayerTaps<N>>(pending, cache, eos_ids)
+        self.window_complete::<LayerTaps<N>>(pending, cache, eos_ids, None)
     }
 
     /// The taps the last forwards left, every position they ran; none is an

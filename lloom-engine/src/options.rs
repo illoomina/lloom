@@ -508,7 +508,7 @@ pub struct DecodeConfig {
     /// Diagnostic, perturbs what it measures: drain the GPU per phase of a speculative round.
     #[opt(bool, path = "diagnostics.phase_sync", status = "instrument", cli = "phase-sync", facets = ["wait"], flows = ["commands-out"])]
     pub phase_sync: bool,
-    /// Diagnostic, perturbs what it measures: hash every decode step's logits (each value's f32 bits, little-endian, one SHA-256 over the run — the harnesses' `logits_sha256`) and report it beside the tokens' digest; runs the blocking readback, refused by the speculative body.
+    /// Diagnostic, perturbs what it measures: hash every decode step's logits (each value's f32 bits, little-endian, one SHA-256 over the run — the harnesses' `logits_sha256`) and report it beside the tokens' digest; runs the blocking readback, and under the speculative body hashes the rows each round keeps.
     #[opt(bool, path = "diagnostics.logits_digest", status = "instrument", cli = "logits-digest", facets = ["consume"], flows = ["token-out"])]
     pub logits_digest: bool,
     /// The prefill's shape.
@@ -956,8 +956,8 @@ pub struct SamplingConfig {
         cli = "top-k"
     )]
     pub top_k: Option<usize>,
-    /// Device gumbel-max sampling at the temperature (rides the ring).
-    #[opt(bool, path = "generation.device_sampler", status = "advanced", facets = ["produce"], flows = ["token-out"])]
+    /// How a temperature draws: `multinomial` (one uniform per position and the inverse CDF; the default) or `gumbel` (gumbel-max, one noise variate per vocabulary entry). Each is keyed by the seed and the position of the token it draws, so every readback arm and a speculative run draw the same tokens at one seed.
+    #[opt(bool, path = "generation.sampling.method", values = ["gumbel=true", "multinomial=false"], variants = ["multinomial", "gumbel"], legacy_keys = ["generation.device_sampler"], status = "stable", facets = ["produce"], flows = ["token-out"])]
     pub gumbel: bool,
     /// The seed; none draws a fresh one per run (repeats explore), a value reproduces.
     #[opt(

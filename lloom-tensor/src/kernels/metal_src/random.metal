@@ -301,3 +301,115 @@ RANDOM_OPS(f16, half)
 #if __METAL_VERSION__ >= 310
 RANDOM_OPS(bf16, bfloat)
 #endif
+
+// The multinomial draw by inverse CDF: one token per row of `logits`
+// `[rows, vocab]`, row `r` the smallest index whose cumulative tempered
+// probability exceeds `u[r] · total`, `u[r]` in [0, 1) supplied by the host.
+//
+// One threadgroup per row, every step in a fixed order, so a row's draw is
+// a function of its logits and its uniform alone (no atomics, no order that
+// depends on scheduling):
+//   1. the row's max, a lane-strided pass and a tree;
+//   2. each lane's CONTIGUOUS chunk of `exp((z - max) / T)`, summed in index
+//      order, so the chunks tile the row in order;
+//   3. an inclusive scan over the lanes' sums (Hillis–Steele);
+//   4. the one lane whose interval [excl, incl) holds the target walks its
+//      chunk again, the same expression, and takes the first index whose
+//      running mass passes it.
+// A walk that rounding keeps from crossing takes its chunk's last index with
+// mass; a target at or past the total (u·total rounded up) takes the row's
+// last index with mass. A token whose logit is -inf has no mass and is never
+// drawn.
+kernel void sample_inverse_cdf_f32(
+    device const float *logits [[buffer(0)]],
+    constant uint      &vocab  [[buffer(1)]],
+    constant float     &inv_t  [[buffer(2)]],
+    device const float *u      [[buffer(3)]],
+    device uint        *out    [[buffer(4)]],
+    uint row   [[threadgroup_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]]
+) {
+    threadgroup float red[1024];
+    threadgroup float part[1024];
+    threadgroup uint pick;
+    device const float *z = logits + (ulong)row * vocab;
+
+    float m = -INFINITY;
+    for (uint i = tid; i < vocab; i += width) {
+        m = max(m, z[i]);
+    }
+    red[tid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = width / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    m = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint chunk = (vocab + width - 1) / width;
+    uint lo = min(tid * chunk, vocab);
+    uint hi = min(lo + chunk, vocab);
+    float mass = 0.0f;
+    for (uint i = lo; i < hi; ++i) {
+        mass += exp((z[i] - m) * inv_t);
+    }
+    part[tid] = mass;
+    red[tid] = mass;
+    if (tid == 0) {
+        pick = vocab;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 1; off < width; off <<= 1) {
+        float add = tid >= off ? red[tid - off] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] += add;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float incl = red[tid];
+    float excl = tid == 0 ? 0.0f : red[tid - 1];
+    float target = u[row] * red[width - 1];
+
+    if (excl <= target && target < incl) {
+        float acc = excl;
+        uint last = lo;
+        uint found = hi;
+        for (uint i = lo; i < hi; ++i) {
+            float e = exp((z[i] - m) * inv_t);
+            if (e > 0.0f) {
+                last = i;
+            }
+            acc += e;
+            if (acc > target) {
+                found = i;
+                break;
+            }
+        }
+        pick = found == hi ? last : found;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint p = pick;
+        if (p == vocab) {
+            p = 0;
+            for (int l = int(width) - 1; l >= 0; --l) {
+                if (part[l] > 0.0f) {
+                    uint llo = min(uint(l) * chunk, vocab);
+                    uint lhi = min(llo + chunk, vocab);
+                    for (uint i = lhi; i > llo; --i) {
+                        if (exp((z[i - 1] - m) * inv_t) > 0.0f) {
+                            p = i - 1;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        out[row] = p;
+    }
+}

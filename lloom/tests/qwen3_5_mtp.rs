@@ -662,3 +662,258 @@ fn the_drafters_lane_follows_a_reused_prefix_and_resets_otherwise() -> Result<()
     assert_eq!(d.rows_seen(), 0);
     Ok(())
 }
+
+/// The sampled identity on the generic decoder (#943): at every cell of
+/// `sampled_cells` (multinomial, gumbel-max, top-k, top-p, processors, a
+/// thinking budget) and three seeds, the speculative run is the K=1 run,
+/// whichever drafter drafts — the real MTP drafter at k = 1 and 2, an
+/// oracle on the sampled stream (every round kept whole), garbage (every
+/// round kept to the anchor).
+fn sampled_identity_on<M: Target>(
+    model: &M,
+    head: &NextnHead<M::Mtp>,
+    cfg: &Config,
+    dev: &Device,
+    tag: &str,
+) -> Result<()> {
+    use crate::sampled_cells::{cells, k1, spec};
+    let max = 20;
+    let (prompt, greedy_ids, _) = long_prompt(model, cfg, dev, max)?;
+    let eos = [cfg.eos_token_id];
+    let mut compared = 0usize;
+    let mut kept_drafts = 0usize;
+    let mut sampled_moved = 0usize;
+    for cell in cells(5, 9) {
+        for seed in [0u64, 7, 42] {
+            let reference = k1(
+                model,
+                model.new_cache(cfg, dev)?,
+                dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+            )?;
+            sampled_moved += usize::from(reference.0 != greedy_ids);
+            let armed = || -> Result<M::Cache> {
+                let mut c = model.new_cache(cfg, dev)?;
+                M::arm_nextn(&mut c);
+                Ok(c)
+            };
+            let mut runs: Vec<crate::sampled_cells::LabelledRun> = Vec::new();
+            for k in [1usize, 2] {
+                let mut mtp = NextnDrafter::new(
+                    head,
+                    model.embed_table(),
+                    model.lm_head(),
+                    dev,
+                    model.capacity(),
+                )?
+                .with_k(k);
+                let got = spec(
+                    model,
+                    armed()?,
+                    dev,
+                    &eos,
+                    &cell,
+                    seed,
+                    &prompt,
+                    max,
+                    &mut mtp,
+                )?;
+                runs.push((format!("mtp k={k}"), got));
+            }
+            let mut oracle = Oracle {
+                stream: reference.0.clone(),
+                produced: 0,
+            };
+            let got = spec(
+                model,
+                armed()?,
+                dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+                &mut oracle,
+            )?;
+            runs.push(("oracle".into(), got));
+            let token = (0..cfg.vocab_size as u32)
+                .find(|t| !reference.0.contains(t) && *t != cfg.eos_token_id)
+                .expect("a vocabulary id the stream never emits");
+            let mut garbage = Garbage { token };
+            let got = spec(
+                model,
+                armed()?,
+                dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+                &mut garbage,
+            )?;
+            runs.push(("garbage".into(), got));
+            for (name, got) in runs {
+                assert_eq!(
+                    (&got.0, got.1),
+                    (&reference.0, reference.1),
+                    "{tag} {cell:?} seed {seed}: the {name} drafter's run is not the K=1 run"
+                );
+                kept_drafts += got.2;
+                compared += 1;
+            }
+        }
+    }
+    println!("QWEN35MTP-SAMPLED {tag} runs={compared} kept_drafts={kept_drafts} sampled_moved={sampled_moved}");
+    assert!(
+        kept_drafts > compared,
+        "{tag}: the drafts were rarely kept ({kept_drafts})"
+    );
+    assert!(
+        sampled_moved > 10,
+        "{tag}: the cells rarely left greedy's stream"
+    );
+    Ok(())
+}
+
+#[test]
+fn sampled_mtp_on_the_decoder_is_the_k1_run_on_the_cpu() -> Result<()> {
+    pin();
+    let dev = Device::Cpu;
+    let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+    let (model, head) = load_dense(&dense, &dev)?;
+    sampled_identity_on(&model, &head, &dense.cfg, &dev, "dense-cpu")?;
+    let moe = TinyCheckpoint::<Qwen3_5MoeTiny>::new(moe_cfg(), Weights::default());
+    let (model, head) = load_moe(&moe, &dev)?;
+    sampled_identity_on(&model, &head, &moe.cfg, &dev, "moe-cpu")?;
+    Ok(())
+}
+
+/// On Metal: the sequential verify (the cache holds no rings) is the
+/// decode step's own math row for row.
+#[cfg(feature = "metal")]
+#[test]
+fn sampled_mtp_on_the_decoder_is_the_k1_run_on_metal() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+    let (model, head) = load_dense(&dense, &dev)?;
+    sampled_identity_on(&model, &head, &dense.cfg, &dev, "dense-metal")?;
+    Ok(())
+}
+
+/// The one-pass verify over the phase rings, sampled: each window's rows
+/// drawn together from the window's logits (`LogitsProcessor::window_draw_device`)
+/// and accepted by phase. The window's rows are an `m = k + 1` pass and the
+/// K=1 steps `m = 1`, so `deterministic` does not promise this identity at a
+/// near-tie (`profiles-and-memory-design.md` §3); on these fixtures and
+/// seeds no row is one, and the identity is asserted as the greedy ring
+/// test asserts it.
+#[cfg(feature = "metal")]
+#[test]
+fn sampled_mtp_on_the_rings_is_the_k1_run_on_metal() -> Result<()> {
+    pin();
+    let dev = Device::new_metal(0)?;
+    let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+    let bytes = gguf_bytes(&dense, None)?;
+    let mut r = std::io::Cursor::new(bytes);
+    let content = Content::read(&mut r)?;
+    let (m, h) = Qwen3_5::<RewindableExact>::from_gguf_with_mtp(
+        content,
+        &mut r,
+        &dev,
+        &LoadOptions {
+            mtp: true,
+            window: 3,
+            ..Default::default()
+        },
+    )?;
+    let h = h.expect("the block");
+    assert!(m.new_cache(&dense.cfg, &dev)?.ring_holds(3));
+    sampled_identity_on(&m, &h, &dense.cfg, &dev, "dense-ring-metal")
+}
+
+/// Drafts nothing: every round is the window of the anchor alone.
+struct ZeroDraft;
+
+impl Speculator for ZeroDraft {
+    type Probe = NextnHidden;
+    type Family = lloom::nn::speculator::Mtp;
+    fn n_seq(&self) -> usize {
+        1
+    }
+    fn max_draft(&self) -> usize {
+        0
+    }
+    fn begin(&mut self, _: SeqId, _: &[u32]) -> Result<()> {
+        Ok(())
+    }
+    fn draft(&mut self, _: &[SeqId]) -> Result<Vec<Draft>> {
+        Ok(vec![Draft::host(Vec::new())])
+    }
+    fn observe(&mut self, _: SeqId, _: &Tensor, _: &[u32]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// **The one loop's zero-draft window is the non-speculative run.** Through
+/// the window body, a proposer that drafts nothing makes every round the
+/// anchor alone: one position, verified, kept — a decode step. Its stream
+/// is the K=1 body's at every `sampled_cells` cell and greedy, three seeds,
+/// one round per token.
+#[test]
+fn the_zero_draft_window_is_the_non_speculative_run() -> Result<()> {
+    use crate::sampled_cells::{cells, k1, spec, Cell};
+    pin();
+    for dev in [Device::Cpu] {
+        let dense = TinyCheckpoint::<Qwen3_5Tiny>::new(dense_cfg(), Weights::default());
+        let (model, _head) = load_dense(&dense, &dev)?;
+        let cfg = &dense.cfg;
+        let max = 20;
+        let (prompt, _, _) = long_prompt(&model, cfg, &dev, max)?;
+        let eos = [cfg.eos_token_id];
+        let mut all = cells(5, 9);
+        all.push(Cell {
+            sampling: Sampling::ArgMax,
+            processors: Default::default(),
+            budget: None,
+        });
+        for cell in all {
+            for seed in [0u64, 7, 42] {
+                let reference = k1(
+                    &model,
+                    model.new_cache(cfg, &dev)?,
+                    &dev,
+                    &eos,
+                    &cell,
+                    seed,
+                    &prompt,
+                    max,
+                )?;
+                let mut cache = model.new_cache(cfg, &dev)?;
+                <Qwen3_5<RewindableExact> as Target>::arm_nextn(&mut cache);
+                let got = spec(
+                    &model,
+                    cache,
+                    &dev,
+                    &eos,
+                    &cell,
+                    seed,
+                    &prompt,
+                    max,
+                    &mut ZeroDraft,
+                )?;
+                assert_eq!(
+                    (&got.0, got.1),
+                    (&reference.0, reference.1),
+                    "{cell:?} seed {seed}: the zero-draft window is not the K=1 run"
+                );
+                assert_eq!(got.2, 0, "a zero-draft round kept a draft");
+            }
+        }
+    }
+    Ok(())
+}

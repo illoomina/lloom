@@ -302,29 +302,21 @@ impl DecodeParams {
             .with_logits_digest(self.logits_digest)
     }
 
-    /// Refuse the processors on a path that draws without this request's
-    /// sampler — `path` names it and `why` says what it draws with.
-    pub fn refuse_processors(&self, path: &str, why: &str) -> Result<()> {
-        if self.processors.is_active() {
-            lloom_tensor::bail!(
-                "{path} does not run logits processors (logit_bias, repetition/presence/\
-                 frequency penalties, min_p): {why}; got {:?}",
-                self.processors
-            );
-        }
-        Ok(())
-    }
-
-    /// Refuse the thinking budget on a path that cannot feed its forced
-    /// tokens — `path` names it and `why` says what it feeds instead.
-    pub fn refuse_thinking_budget(&self, path: &str, why: &str) -> Result<()> {
-        if let Some(b) = &self.thinking {
-            lloom_tensor::bail!(
-                "{path} does not carry a thinking budget ({} tokens): {why}",
-                b.budget()
-            );
-        }
-        Ok(())
+    /// Refuse what `body` cannot serve of this request, by name — the one
+    /// table every body asks (`lloom::nn::decode::refuse`); `path` names the
+    /// caller in the message.
+    pub fn refuse_on(&self, body: lloom::nn::Body, path: &str) -> Result<()> {
+        let sampling = self.sampling();
+        lloom::nn::refuse(
+            body,
+            &lloom::nn::Asks {
+                sampling: &sampling,
+                processors: self.processors.is_active(),
+                budget: self.thinking.is_some(),
+                digest: self.logits_digest,
+            },
+        )
+        .map_err(|e| lloom_tensor::Error::Msg(format!("{path}: {e}")))
     }
 }
 
@@ -954,15 +946,14 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// [`Self::decode_until`] through the speculative body: `spec` drafts a
     /// block per round and the target verifies it
     /// ([`Session::decode_speculative`], `design/docs/speculation.md`
-    /// §10.2t). At `t > 0` the verify samples the target's token per window
-    /// position with the request's sampler, position-keyed, so the run is
-    /// byte-identical to the non-speculative one at the same seed (#943 §2);
-    /// the host-sort arms (top-k, top-p) are refused by name rather than
-    /// served as argmax under a sampled label. The fragment hook's `false` ends the
-    /// run after the round in flight (`DecodeOptions::stop`), reported as
-    /// [`Stop::Cancelled`]; a fully cached prompt cannot be resumed by this
-    /// body (its verify holds no per-position logits) and is refused, which
-    /// a caller that resets between requests never meets.
+    /// §10.2t). The verify draws the target's token per window position with
+    /// the request's sampler, keyed by position, so the run is the
+    /// non-speculative one at the same seed whatever the drafter proposed:
+    /// every sampler arm, the processors, the thinking budget and the logits
+    /// digest. The fragment hook's `false` ends the run after the round in
+    /// flight (`DecodeOptions::stop`), reported as [`Stop::Cancelled`]; a
+    /// prompt the cache holds whole re-feeds its last token
+    /// (`Session::prepare_with`).
     pub fn decode_speculative_until<S>(
         &mut self,
         rewind: lloom::profile::RewindProof<M::Profile>,
@@ -980,44 +971,19 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        params.refuse_processors(
-            "DecodeSession::decode_speculative",
-            "the verify accepts the target's raw argmax",
-        )?;
-        params.refuse_thinking_budget(
-            "the speculative body (--dspark, --mtp)",
-            "its verify accepts the target's argmax over a drafted block, so a forced token \
-             cannot be fed in place of a draw",
-        )?;
-        if params.logits_digest {
-            lloom_tensor::bail!(
-                "DecodeSession::decode_speculative: the speculative body keeps no per-position \
-                 logits (its verify reads the argmax back), so diagnostics.logits_digest has \
-                 nothing to hash"
-            );
-        }
-        let mut sampler = params.sampler();
-        // The verify samples the target's token per window position at
-        // `t > 0` (`Session::decode_speculative`, #943 §2) on the arms whose
-        // draw can be keyed by position — argmax and the gumbel-max arms
-        // (plain temperature, `--gumbel`). The host-sort arms (top-k, top-p)
-        // are refused by name rather than served as argmax under their label.
-        match sampler.sampling() {
-            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
-            other => lloom_tensor::bail!(
-                "DecodeSession::decode_speculative: {other:?} draws through a host sort on one \
-                 running rng, which a verify window cannot key by position; the speculative \
-                 body serves argmax, plain temperature and --gumbel"
-            ),
-        }
-        let prepared = self.session.prepare(prompt_ids)?;
-        if prepared.suffix.is_empty() {
-            lloom_tensor::bail!(
-                "DecodeSession::decode_speculative: the prompt is entirely cached ({:?}) and the \
-                 speculative body cannot resume from held logits; reset the session first",
-                prepared.action
-            );
-        }
+        // The window draws every row with the request's sampler, keyed by
+        // the position of the token it draws: any sampler arm, the
+        // processors (each row against its own history), the thinking
+        // budget (each row's fed token the budget's rule over the rows
+        // before it) and the logits digest (over the rows the round keeps)
+        // are the K=1 loop's, row for row (`LogitsProcessor::window_draw_device`).
+        let mut sampler = params
+            .sampler()
+            .with_window_budget(params.thinking.as_ref());
+        sampler.observe_prompt(prompt_ids);
+        // A prompt the cache holds whole re-feeds its last token: the first
+        // round needs the target's probe there, which held logits lack.
+        let prepared = self.session.prepare_with(prompt_ids, false)?;
         self.hint_checkpoint(&prepared, params.turn_tail)?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -1074,6 +1040,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Stop::Length
         };
         let (text, _) = stream.finish(&params.stop_strings);
+        let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
         Ok(Decoded {
             text,
             tokens: out.ids,
@@ -1082,9 +1049,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             readback: ReadbackArm::Speculative { k },
-            logits_sha256: None,
+            logits_sha256: sampler.logits_digest(),
             stats: out.stats,
-            thinking: None,
+            thinking,
         })
     }
 }
@@ -1735,26 +1702,62 @@ mod tests {
             Ok(())
         }
 
-        /// The refusal a path that draws without the request's sampler gives
-        /// (`decode_speculative_until`'s first check): it names the path, and
-        /// neutral processors pass. The call site itself is not driven here —
-        /// that needs a `Speculator` + `Probes` fixture.
+        /// The one table, through a request: each body refuses what it
+        /// cannot serve by name, the window serves everything, and a
+        /// request asking nothing passes every body.
         #[test]
-        fn the_processor_refusal_names_the_path() {
-            let mut params = DecodeParams::default();
-            params.processors.min_p = 0.1;
-            let e = params
-                .refuse_processors(
-                    "DecodeSession::decode_speculative",
-                    "the verify accepts the target's raw argmax",
-                )
+        fn each_body_refuses_by_name_and_the_window_serves_everything() {
+            use lloom::nn::Body;
+            let mut procs = DecodeParams {
+                temperature: Some(0.7),
+                ..DecodeParams::default()
+            };
+            procs.processors.min_p = 0.1;
+            let e = procs
+                .refuse_on(Body::BatchedStep, "the batch scheduler")
                 .unwrap_err()
                 .to_string();
             assert!(
-                e.starts_with("DecodeSession::decode_speculative does not run logits processors"),
+                e.starts_with("the batch scheduler: a batched body does not run logits processors"),
                 "{e}"
             );
-            assert!(DecodeParams::default().refuse_processors("x", "y").is_ok());
+            let hot = DecodeParams {
+                temperature: Some(0.7),
+                ..DecodeParams::default()
+            };
+            let e = hot
+                .refuse_on(Body::BatchedWindow, "row 0")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("verifies by the argmax"), "{e}");
+            let sort = DecodeParams {
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                ..DecodeParams::default()
+            };
+            let e = sort
+                .refuse_on(Body::Step { ring: true }, "ring")
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("host sort"), "{e}");
+            let digest = DecodeParams {
+                logits_digest: true,
+                ..DecodeParams::default()
+            };
+            assert!(digest.refuse_on(Body::Step { ring: true }, "ring").is_err());
+            for p in [&procs, &hot, &sort, &digest] {
+                p.refuse_on(Body::Window, "window").unwrap();
+                p.refuse_on(Body::Step { ring: false }, "blocking").unwrap();
+            }
+            for body in [
+                Body::Step { ring: true },
+                Body::Step { ring: false },
+                Body::Window,
+                Body::BatchedStep,
+                Body::BatchedWindow,
+            ] {
+                DecodeParams::default().refuse_on(body, "x").unwrap();
+            }
         }
 
         /// One request on a fresh session at `temperature` (and `top_p`), on

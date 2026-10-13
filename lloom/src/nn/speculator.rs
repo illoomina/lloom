@@ -25,6 +25,42 @@
 use crate::nn::model::{CacheReset, CacheRewind, CacheShare, CausalLM};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
+/// Checked positions/phases for a speculative window, before creating its pools.
+///
+/// `drafts` is already resolved by the caller: this helper does not normalize
+/// zero or clamp a configured limit. `extra` names the anchor/retained phases.
+/// This checks addition only, not the window's tensor products or admission.
+pub fn checked_window_width(drafts: usize, extra: usize) -> Result<usize> {
+    drafts.checked_add(extra).ok_or_else(|| {
+        lloom_tensor::Error::msg(format!(
+            "speculative window width overflow: {drafts} drafts + {extra} extra positions"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod window_width_tests {
+    #[test]
+    fn checked_width_preserves_zero_and_rejects_overflow_without_allocating_pools() {
+        use super::checked_window_width;
+        for (drafts, extra, expected) in [
+            (0, 0, 0),
+            (0, 2, 2),
+            (0_usize.max(1), 1, 2),
+            (0_usize.max(1), 2, 3),
+            (usize::MAX - 2, 2, usize::MAX),
+        ] {
+            assert_eq!(checked_window_width(drafts, extra).unwrap(), expected);
+        }
+        for (drafts, extra) in [(usize::MAX, 1), (usize::MAX, 2), (usize::MAX - 1, 2)] {
+            assert!(checked_window_width(drafts, extra)
+                .unwrap_err()
+                .to_string()
+                .contains("speculative window width overflow"));
+        }
+    }
+}
+
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
 /// fixed number of these (server slots), and per-seq state lives *inside* the
 /// impl keyed by this id — never on the public surface.
@@ -1030,6 +1066,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
         &self.seq
     }
 
+    /// The held logits of the last consumed position, not every prompt position.
+    /// Available after successful prefill or a settled resumable decode; absent
+    /// after reset, invalidating prepare, or failed nonempty prefill. Empty
+    /// prefill preserves them. The borrow cannot outlive a mutable session call;
+    /// a cloned Tensor may alias reusable hold storage and is NOT a snapshot.
+    /// Read or copy selected values before the next session operation. Device
+    /// work may still be pending: use the tensor's ordinary staged readback.
+    pub fn last_logits(&self) -> Option<&Tensor> {
+        self.seq.last_logits.as_ref()
+    }
+
     /// Positions currently in the cache.
     pub fn pos(&self) -> usize {
         self.seq.pos
@@ -1150,11 +1197,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// fresh request are the same operation at different prefix lengths —
     /// nothing here knows which client sent `full`.
     ///
-    /// An unreconciled overrun is discarded first, or the sequence is reset if
-    /// it cannot be. When `full` is entirely cached, the last id must still be
+    /// An unreconciled overrun is discarded first; one the cache cannot take
+    /// back puts the state back at the latest turn checkpoint inside the log,
+    /// and the sequence is reset only when there is none. When `full` is
+    /// entirely cached, the last id must still be
     /// re-fed to produce a prediction unless the run that cached it left its
     /// logits behind ([`ReuseAction::Resume`]).
     pub fn prepare(&mut self, full: &[u32]) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        self.prepare_with(full, true)
+    }
+
+    /// [`Self::prepare`] for a body that cannot resume from held logits
+    /// (`resume = false`): a request the cache holds whole re-feeds its last
+    /// token — through the rewind horizon or a turn checkpoint, else from a
+    /// fresh prefill — so the body produces its first prediction itself.
+    /// The speculative body takes this: its first round needs the target's
+    /// probe at the last position, which held logits do not carry.
+    pub fn prepare_with(&mut self, full: &[u32], resume: bool) -> Result<Prepared>
     where
         M::Cache: CacheRewind + CacheReset,
     {
@@ -1199,7 +1261,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         let lcp = self.seq.common_prefix(full);
 
-        if lcp == full.len() && lcp == cached && self.seq.last_logits.is_some() {
+        if resume && lcp == full.len() && lcp == cached && self.seq.last_logits.is_some() {
             return Ok(Prepared {
                 action: ReuseAction::Resume,
                 reused: lcp,
@@ -1334,7 +1396,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         probe: RoundProbe<'_>,
         verify_key: Option<(&Device, crate::nn::decode::PassShape)>,
         room: usize,
-        sampler: Option<&mut crate::generation::LogitsProcessor>,
+        mut sampler: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
     where
         S: Speculator,
@@ -1359,15 +1421,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // (`speculative.cpp:796`), and a family with no confidence signal leaves
         // `confidence` empty, so `position` finds nothing and the whole block
         // stands — uniform across families (§3.4.4).
+        // A target whose verify cannot run the anchor alone (LFM2) keeps one
+        // draft however unconfident: the cut, like the room's, stops at the
+        // floor (#943: a cut at the first position fed LFM2's verify nothing).
+        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
         if p_min > 0.0 {
             for d in drafts.iter_mut() {
                 if let Some(cut) = d.confidence.iter().position(|&p| p < p_min) {
-                    d.tokens.truncate(cut)?;
-                    d.confidence.truncate(cut);
+                    let cut = cut.max(floor);
+                    if cut < d.tokens.len() {
+                        d.tokens.truncate(cut)?;
+                        d.confidence.truncate(cut);
+                    }
                 }
             }
         }
-        let floor = usize::from(!Probes::<S::Probe>::verifies_anchor_alone(self.model));
         for d in drafts.iter_mut() {
             fit_to_room(d, room, floor)?;
         }
@@ -1385,7 +1453,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         // The sampled verify draws the target's token per row with `sampler`
         // (#943 §2); the greedy one reads the argmax, as before.
-        let verified = match sampler {
+        let verified = match sampler.as_deref_mut() {
             Some(s) => self.model.verify_and_probe_sampled(
                 &drafts,
                 anchors,
@@ -1401,6 +1469,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             crate::nn::decode::end_pass(device)?;
         }
         let (accepted, probe_out) = verified?;
+        // What the round kept is the run's output: the processors' history,
+        // a budget's position and the digest move by it, as a step-by-step
+        // decode's do by its draws — after the planned pass, never inside it.
+        if let Some(s) = sampler {
+            for a in &accepted {
+                s.commit_window(a)?;
+            }
+        }
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;

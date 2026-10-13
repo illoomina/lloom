@@ -1,7 +1,7 @@
 //! The positive control for the KV grow's memory refusal (lloom #696): a grow
 //! that would take the process past its fraction of
-//! `recommendedMaxWorkingSetSize` is refused — an `Err` naming the numbers,
-//! not a panic and not a truncation — and it moves nothing, so the same call
+//! `recommendedMaxWorkingSetSize` is refused — a typed `Refused` naming the
+//! bytes, not a panic and not a truncation — and it moves nothing, so the same call
 //! succeeds once the memory is back and produces the stream an unrefused run
 //! does.
 //!
@@ -130,6 +130,20 @@ fn argmax(v: &[f32]) -> u32 {
     best as u32
 }
 
+/// The grow's refusal, typed: the budget's (nothing here reserves on the
+/// machine), with what it asked for and the room it had.
+fn budget_refusal(err: &lloom_tensor::Error) -> (usize, usize) {
+    use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
+    match err.allocation() {
+        Some(AllocationError::Refused {
+            requested,
+            available,
+            domain: RefusalDomain::Budget,
+        }) => (requested, available),
+        _ => panic!("not a typed budget refusal: {err}"),
+    }
+}
+
 fn step(
     model: &Model<RewindableExact>,
     cache: &mut State<RewindableExact>,
@@ -193,12 +207,11 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     );
     let err = step(&model, &mut cache, next2, pos, &dev)
         .err()
-        .expect("a grow past the fraction was admitted with 256 MiB held")
-        .to_string();
-    assert!(err.contains("KV grow refused"), "{err}");
+        .expect("a grow past the fraction was admitted with 256 MiB held");
+    let (requested, available) = budget_refusal(&err);
     assert!(
-        err.contains("from 6 to 8 tokens"),
-        "the message names the slab it could not widen: {err}"
+        available < requested,
+        "a refusal must name less room than it asked for: {err}"
     );
     assert_eq!(
         cache.conv_phase(),
@@ -207,11 +220,14 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     );
     assert_eq!(cache.kv_report(), before, "the slab moved on a refusal");
     // And again: the refusal is idempotent while the memory is held.
-    let err = step(&model, &mut cache, next2, pos, &dev)
+    let again = step(&model, &mut cache, next2, pos, &dev)
         .err()
-        .expect("a second attempt was admitted with the memory still held")
-        .to_string();
-    assert!(err.contains("KV grow refused"), "{err}");
+        .expect("a second attempt was admitted with the memory still held");
+    assert_eq!(
+        budget_refusal(&again).0,
+        requested,
+        "the same grow is refused for the same bytes"
+    );
     assert_eq!(cache.kv_report(), before);
 
     // Free the memory: the same call is admitted, and the slab is 8.
@@ -224,6 +240,15 @@ fn a_grow_past_the_fraction_is_refused_without_moving_state_and_admitted_once_me
     let step2 = step(&model, &mut cache, next2, pos, &dev)?;
     assert_eq!(cache.kv_report().slab, 8);
     assert_eq!(cache.kv_report().grows, before.grows + 1);
+    eprintln!(
+        "REFUSED requested={requested} available={available} grown={}",
+        cache.kv_report().bytes - before.bytes
+    );
+    assert_eq!(
+        requested,
+        cache.kv_report().bytes - before.bytes,
+        "the refusal asked for exactly the bytes the admitted grow from 6 to 8 tokens took"
+    );
 
     // The control: the same model and tokens with nothing ever held. The
     // refused-then-admitted run emitted exactly its stream — the refusal left

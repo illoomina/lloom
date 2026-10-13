@@ -209,36 +209,45 @@ fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
         None => None,
     };
     let name = format!("geometry-{}", F::NAME);
-    lloom_fuzz::campaign::run(&args.cli, &name, move |bytes| {
-        let (g, o) = exec(bytes);
-        if let Some(f) = log.as_mut() {
-            use std::io::Write;
-            let (d, s) = match &o {
-                Outcome::Agree { maxdiff, scale } => (*maxdiff, *scale),
-                _ => (f32::NAN, f32::NAN),
-            };
-            let what = match &o {
-                Outcome::CpuRefused(m) | Outcome::MetalRefused(m) | Outcome::Defect(m) => {
-                    m.replace(['\n', '\t'], " ")
-                }
-                _ => String::new(),
-            };
-            let ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |t| t.as_millis());
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            let _ = writeln!(
-                f,
-                "{}\t{d:e}\t{s:e}\t{}\t{what}\t{ms}\t{hex}",
-                o.class(),
-                g.describe::<F>()
-            );
-        }
-        match o {
-            Outcome::Defect(m) => Err(format!("{m}\ngeometry: {}", g.describe::<F>())),
-            _ => Ok(()),
-        }
-    })
+    lloom_fuzz::campaign::run_with_config(
+        &args.cli,
+        &name,
+        &serde_json::json!({
+            "family": F::NAME, "law": args.law, "weight_seed": args.weight_seed,
+            "tol_bits": args.tol.to_bits(), "hc_mix": args.hc_mix,
+            "metal_reference": args.metal_reference
+        }),
+        move |bytes| {
+            let (g, o) = exec(bytes);
+            if let Some(f) = log.as_mut() {
+                use std::io::Write;
+                let (d, s) = match &o {
+                    Outcome::Agree { maxdiff, scale } => (*maxdiff, *scale),
+                    _ => (f32::NAN, f32::NAN),
+                };
+                let what = match &o {
+                    Outcome::CpuRefused(m) | Outcome::MetalRefused(m) | Outcome::Defect(m) => {
+                        m.replace(['\n', '\t'], " ")
+                    }
+                    _ => String::new(),
+                };
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |t| t.as_millis());
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                let _ = writeln!(
+                    f,
+                    "{}\t{d:e}\t{s:e}\t{}\t{what}\t{ms}\t{hex}",
+                    o.class(),
+                    g.describe::<F>()
+                );
+            }
+            match o {
+                Outcome::Defect(m) => Err(format!("{m}\ngeometry: {}", g.describe::<F>())),
+                _ => Ok(()),
+            }
+        },
+    )
 }
 
 /// A geometry's size, for "smallest": its weight elements, then its tokens.

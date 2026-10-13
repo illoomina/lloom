@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub family: &'static str,
+    /// Token-generation support (distinct from non-generating decisions).
+    pub generation: bool,
+    /// An installed decision executor, not merely an HTTP route.
+    pub decisions: bool,
     /// The profiles the family ships, as a bound over the eight
     /// (`lloom::profile`, design §3: "a bound, not a list"; #892 B1). The
     /// boundary (§7.4) matches `(--profile, rewind, rows)` against it.
@@ -72,6 +76,8 @@ impl Capabilities {
     pub fn json(&self) -> Value {
         json!({
             "family": self.family,
+            "generation": self.generation,
+            "decisions": self.decisions,
             "lookahead_max": self.lookahead_max,
             "ring": self.ring,
             "batch": self.batch,
@@ -89,7 +95,9 @@ impl Capabilities {
 
     pub fn line(&self) -> String {
         format!(
-            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
+            "generation={} decisions={} lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} eos_gate={} rewind={:?}",
+            self.generation,
+            self.decisions,
             self.lookahead_max,
             self.ring,
             self.batch,
@@ -149,9 +157,12 @@ pub trait Family: Send + Sync {
 pub struct Lfm2Family;
 pub struct Qwen4ExpFamily;
 pub struct Qwen3_5Family;
+pub struct Lfm2GgufFamily;
 
 pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     family: "lfm2",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::LFM2,
     lookahead_max: 1,
     ring: "full",
@@ -173,6 +184,8 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen4exp",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN4EXP,
     lookahead_max: 1,
     ring: "full: the PLE fed by the driver's host fill where the arm stamps each token (Metal); the fed id read back on a deferred read at the fixed cadence",
@@ -196,6 +209,8 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
 
 pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
     family: "qwen3_5",
+    generation: true,
+    decisions: false, // Transitional until retained-trunk execution is installed.
     profiles: lloom::profile::QWEN3_5,
     lookahead_max: 1,
     ring: "by-name: the decoder keeps no standing window, so a forward past an unlearned EOS is not undone",
@@ -218,7 +233,12 @@ pub const QWEN3_5_CAPABILITIES: Capabilities = Capabilities {
 /// Every family, in detection order: the GGUF families read the header's
 /// `general.architecture`, so their order does not matter; LFM2 is a
 /// directory with a `config.json`.
-pub static FAMILIES: [&dyn Family; 3] = [&Lfm2Family, &Qwen3_5Family, &Qwen4ExpFamily];
+pub static FAMILIES: [&dyn Family; 4] = [
+    &Lfm2Family,
+    &Qwen3_5Family,
+    &Lfm2GgufFamily,
+    &Qwen4ExpFamily,
+];
 
 /// The GGUF checkpoint `path` names — a shard, or a directory of shards —
 /// as the first shard, with its header's `general.architecture`.
@@ -273,7 +293,7 @@ pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
         anyhow::bail!("{}: no such model", path.display());
     }
     anyhow::bail!(
-        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp, Qwen3.5)",
+        "{}: neither a checkpoint directory (config.json — LFM2) nor a GGUF shard or a directory of shards (Qwen4-exp, Qwen3.5, LFM2)",
         path.display()
     )
 }
@@ -454,6 +474,9 @@ impl Family for Lfm2Family {
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
             flash_k: model.flash_k,
+            decision_template: model.decision_template.clone(),
+            decision_ragged: shape.decision_ragged,
+            text_only: model.text_only,
         })
     }
 }
@@ -629,6 +652,38 @@ impl Family for Qwen3_5Family {
     }
 }
 
+impl Family for Lfm2GgufFamily {
+    fn name(&self) -> &'static str {
+        "lfm2-gguf"
+    }
+    fn detect(&self, path: &Path) -> Option<PathBuf> {
+        let (first, arch) = gguf_checkpoint(path)?;
+        (arch == "lfm2").then_some(first)
+    }
+    fn capabilities(&self) -> Capabilities {
+        super::causal_loaded::served::lfm2_gguf_capabilities()
+    }
+    fn resolve(&self, req: &Requested<'_>) -> Result<()> {
+        let cap = self.capabilities();
+        resolve_common(&cap, req)?;
+        if req.model.flash_k.is_some() {
+            anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; lfm2-gguf has no such arm");
+        }
+        if let Some(key) = qwen4exp_key_set(req.model) {
+            anyhow::bail!("`{key}` is Qwen4-exp's; lfm2-gguf has no such arm");
+        }
+        if let Some(mmproj) = &req.model.mmproj {
+            if !mmproj.is_file() {
+                anyhow::bail!("--mmproj {}: no such file", mmproj.display());
+            }
+        }
+        Ok(())
+    }
+    fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
+        super::lfm2_gguf::load(first, req.model, &req.shape)
+    }
+}
+
 /// Turn the EOS gate off on a family whose decode kernels carry no gated
 /// variant (`Capabilities::eos_gate`). The gate defaults on, so this is a
 /// clamp, not a refusal; the note is returned only where the configured arm
@@ -702,6 +757,7 @@ fn resolve_auto_speculation(family: &str, shape: &mut Shape) -> Option<String> {
 
 /// Detect, resolve, load — the one entry `serve` and `chat` call.
 pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    lloom_tensor::memory_admission::begin_model_load();
     let path = match &model.model {
         Some(p) => p.clone(),
         None => lfm2::default_model_dir()
@@ -711,8 +767,12 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
     let mut shape = shape;
     if let Some(note) = resolve_auto_speculation(family.name(), &mut shape) {
         eprintln!("[speculate: {note}]");
-        crate::couplings::refuse_speculative(&shape.speculative.method, &shape.sampling)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::couplings::refuse_speculative(
+            &shape.speculative.method,
+            &shape.sampling,
+            shape.batch,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
     if let Some(note) = &clamp {
@@ -723,7 +783,7 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
         .resolve(&req)
         .map_err(|e| anyhow::anyhow!("{} cannot serve this shape: {e}", family.name()))?;
     let mut engine = family.load(checkpoint.clone(), req)?;
-    engine.note_load_warnings(
+    engine.note_load_warnings_checked(
         clamp
             .into_iter()
             .map(|n| {
@@ -733,7 +793,7 @@ pub fn load(model: &LoadConfig, shape: Shape) -> Result<(Box<dyn Served>, PathBu
                 )
             })
             .collect(),
-    );
+    )?;
     Ok((engine, checkpoint))
 }
 
@@ -769,6 +829,7 @@ mod tests {
             mem_sample: false,
             rows: "auto".into(),
             share_prefix: false,
+            decision_ragged: true,
         }
     }
 
@@ -1067,6 +1128,19 @@ mod tests {
         );
         let (f, _) = detect(&dir.join("qwen/m-00002-of-00002.gguf")).unwrap();
         assert_eq!(f.name(), "qwen4exp");
+        // An LFM2 GGUF (d1-3B's official files) is the lfm2-gguf family's,
+        // by its header, not by its name.
+        let lfm2 = lloom_tensor::quantized::gguf_file::Value::String("lfm2".into());
+        let mut header = std::io::Cursor::new(Vec::new());
+        lloom_tensor::quantized::gguf_file::write(
+            &mut header,
+            &[("general.architecture", &lfm2)],
+            &[],
+        )
+        .unwrap();
+        std::fs::write(dir.join("d1-3B-Q8_0.gguf"), header.into_inner()).unwrap();
+        let (f, p) = detect(&dir.join("d1-3B-Q8_0.gguf")).unwrap();
+        assert_eq!((f.name(), p), ("lfm2-gguf", dir.join("d1-3B-Q8_0.gguf")));
         let err = detect(&dir.join("nope"))
             .err()
             .map(|e| e.to_string())

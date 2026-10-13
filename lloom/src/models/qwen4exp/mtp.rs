@@ -147,6 +147,14 @@ pub(crate) struct Folded<P: Profile> {
     valid: bool,
 }
 
+impl<P: Profile> Folded<P> {
+    /// The rows the head drafted on are not the window's (a fed token
+    /// differs from the draw it was keyed with): the observe falls back.
+    pub(crate) fn invalidate(&mut self) {
+        self.valid = false;
+    }
+}
+
 impl<P: Profile, R: ExpertResidency> MtpHead<P, R> {
     /// The head layer's routed-expert tier (the loader warms it when the
     /// head's experts are held resident, `qwen4exp.mtp_experts`).
@@ -1295,8 +1303,38 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
                 anchors.len()
             )
         }
-        let pending = self.window_enqueue::<NextnHidden>(&drafts[0], &anchors[0], cache)?;
-        let (accepted, probe) = self.window_complete::<NextnHidden>(pending, cache, eos_ids)?;
+        let pending = self.window_enqueue::<NextnHidden>(&drafts[0], &anchors[0], cache, None)?;
+        let (accepted, probe) =
+            self.window_complete::<NextnHidden>(pending, cache, eos_ids, None)?;
+        Ok((vec![accepted], probe))
+    }
+
+    /// The window's rows drawn by `sampler`, each keyed to the position of
+    /// the token it draws, in place of their argmax (the sampled verify);
+    /// the pass, the accept and the settle are the greedy verify's.
+    fn verify_and_probe_sampled(
+        &self,
+        drafts: &[Draft],
+        anchors: &[Anchor],
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<(Vec<Vec<u32>>, Tensor)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
+            lloom_tensor::bail!(
+                "qwen4exp verify_and_probe_sampled: one sequence; got {} drafts and {} anchors",
+                drafts.len(),
+                anchors.len()
+            )
+        }
+        let pending = self.window_enqueue::<NextnHidden>(
+            &drafts[0],
+            &anchors[0],
+            cache,
+            Some(&mut *sampler),
+        )?;
+        let (accepted, probe) =
+            self.window_complete::<NextnHidden>(pending, cache, eos_ids, Some(sampler))?;
         Ok((vec![accepted], probe))
     }
 
@@ -1333,7 +1371,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
             lloom_tensor::bail!("qwen4exp verify_rows_enqueue: no rows")
         }
         rows.iter_mut()
-            .map(|r| self.window_enqueue::<NextnHidden>(r.draft, &r.anchor, r.cache))
+            .map(|r| self.window_enqueue::<NextnHidden>(r.draft, &r.anchor, r.cache, None))
             .collect()
     }
 
@@ -1355,7 +1393,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
             .into_iter()
             .zip(caches.iter_mut())
             .zip(eos_sets)
-            .map(|((p, c), eos)| self.window_complete::<NextnHidden>(p, c, eos))
+            .map(|((p, c), eos)| self.window_complete::<NextnHidden>(p, c, eos, None))
             .collect()
     }
 
@@ -1367,7 +1405,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         anchor: &Anchor,
         cache: &mut Self::Cache,
     ) -> Result<WindowPending<P>> {
-        self.window_enqueue::<NextnHidden>(draft, anchor, cache)
+        self.window_enqueue::<NextnHidden>(draft, anchor, cache, None)
     }
 
     /// Accept the longest agreeing prefix; on a partial accept rewind the
@@ -1383,7 +1421,7 @@ impl<P: Profile, R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<P, R> {
         cache: &mut Self::Cache,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Tensor)> {
-        self.window_complete::<NextnHidden>(pending, cache, eos_ids)
+        self.window_complete::<NextnHidden>(pending, cache, eos_ids, None)
     }
 
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Tensor> {
@@ -1416,6 +1454,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         draft: &Draft,
         anchor: &Anchor,
         cache: &mut State<P>,
+        draw: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<WindowPending<P>> {
         // A verify window plans its own rows: a trailing fetching settle
         // closes the plan before it.
@@ -1441,15 +1480,35 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         // the sequential steps with the replay on a partial accept.
         let by_phase = cache.ring_holds(tokens.len(), self.has_ple());
         let (argmax, pass) = if by_phase {
-            let pass = self.verify_window_run(&tokens, cache)?;
+            let pass = self.verify_window_run_drawn(&tokens, cache, draw)?;
             (pass.argmax.clone(), Some(pass))
         } else {
             cache.open_window()?;
-            let mut argmaxes = Vec::with_capacity(tokens.len());
-            for &t in &tokens {
-                argmaxes.push(self.step_argmax(t, cache)?);
+            match draw {
+                None => {
+                    let mut argmaxes = Vec::with_capacity(tokens.len());
+                    for &t in &tokens {
+                        argmaxes.push(self.step_argmax(t, cache)?);
+                    }
+                    (Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?, None)
+                }
+                Some(s) => {
+                    // The rows' logits step by step, drawn together.
+                    let first_pos = cache.pos as u64 + 1;
+                    let mut rows = Vec::with_capacity(tokens.len());
+                    for &t in &tokens {
+                        let input = Tensor::from_vec(vec![t], (1, 1), &self.device())?;
+                        rows.push(
+                            CausalLM::forward(self, &input, cache.pos, cache)?.flatten_all()?,
+                        );
+                    }
+                    let logits = Tensor::stack(&rows, 0)?;
+                    let drawn =
+                        super::model::window_tokens(&logits, &tokens, first_pos, Some(&mut *s))?
+                            .to_vec1::<u32>()?;
+                    (s.window_fed(&drawn), None)
+                }
             }
-            (Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?, None)
         };
         Ok(WindowPending {
             argmax,
@@ -1465,6 +1524,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
         pending: WindowPending<P>,
         cache: &mut State<P>,
         eos_ids: &[u32],
+        draw: Option<&mut crate::generation::LogitsProcessor>,
     ) -> Result<(Vec<u32>, W::Output)> {
         let WindowPending {
             argmax,
@@ -1481,6 +1541,7 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                     |argmax| accept_prefix(argmax, proposed, eos_ids).len(),
                     true,
                     cache,
+                    draw,
                 )?;
                 if let (Some(mut f), Some(head)) = (fold, self.mtp_head()) {
                     // A redone window's argmax is the redo's; the head's rows

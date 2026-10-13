@@ -610,3 +610,115 @@ fn the_released_dflash_config_reads_as_its_checkpoint() -> Result<()> {
     assert_eq!(drafter_params(&c), 498_106_880);
     Ok(())
 }
+
+/// The sampled identity under DFlash (#943): at every cell of
+/// `sampled_cells` and three seeds, the speculative run — the drafter at
+/// k = 4 and 2, the sequential verify and the phase rings, the oracle on the
+/// sampled stream, garbage — is the K=1 run. On Metal the ring verify is
+/// one pass whose rows are an `m = k + 1` pass against the K=1 steps'
+/// `m = 1`; `deterministic` promises nothing there at a near-tie, and on
+/// these fixtures and seeds no row is one.
+fn sampled_identity_on(dev: &Device) -> Result<()> {
+    use crate::sampled_cells::{cells, k1, spec};
+    let cfg = config();
+    let dev = dev.clone();
+    let model: Qwen4Exp<RewindableExact, Resident> = testing::resident_model(&cfg, &dev);
+    let max = 20;
+    let (prompt, greedy_ids) = long_prompt(&model, &cfg, &dev, max)?;
+    let eos = [cfg.eos_token_id];
+    let taps: Vec<usize> = TARGET_IDS.iter().map(|l| l + 1).collect();
+    let cache = |ring: Option<usize>| -> Result<State<RewindableExact>> {
+        let mut c: State<RewindableExact> = match ring {
+            Some(k) => State::<RewindableExact>::in_ring(&cfg, &model.spec_pools(1, k, &dev))?,
+            None => RewindableExact::single(&model, &dev, 8)?,
+        };
+        c.set_tap_layers(&taps)?;
+        Ok(c)
+    };
+    let (mut compared, mut kept, mut moved) = (0usize, 0usize, 0usize);
+    for cell in cells(5, 9) {
+        for seed in [0u64, 7, 42] {
+            let reference = k1(
+                &model,
+                RewindableExact::single(&model, &dev, 8)?,
+                &dev,
+                &eos,
+                &cell,
+                seed,
+                &prompt,
+                max,
+            )?;
+            moved += usize::from(reference.0 != greedy_ids);
+            let mut runs: Vec<crate::sampled_cells::LabelledRun> = Vec::new();
+            for k in [4usize, 2] {
+                for ring in [None, Some(k)] {
+                    let drafter = tiny_drafter(drafter_cfg(&cfg, 4), &dev, 3)?;
+                    let mut d = DSparkSpeculator::with_head_ctx(
+                        drafter,
+                        QwenHead::of(&model),
+                        1,
+                        CtxKv::Contiguous,
+                    )?;
+                    d.set_max_draft(k);
+                    let got = spec(
+                        &model,
+                        cache(ring)?,
+                        &dev,
+                        &eos,
+                        &cell,
+                        seed,
+                        &prompt,
+                        max,
+                        &mut d,
+                    )?;
+                    runs.push((format!("dflash k={k} ring={ring:?}"), got));
+                }
+            }
+            for (name, stream) in [("oracle", Some(reference.0.clone())), ("garbage", None)] {
+                let mut s = Scripted {
+                    stream,
+                    k: 3,
+                    produced: 0,
+                    rows: 0,
+                    seeded: false,
+                };
+                let got = spec(
+                    &model,
+                    cache(Some(3))?,
+                    &dev,
+                    &eos,
+                    &cell,
+                    seed,
+                    &prompt,
+                    max,
+                    &mut s,
+                )?;
+                runs.push((name.into(), got));
+            }
+            for (name, got) in runs {
+                assert_eq!(
+                    (&got.0, got.1),
+                    (&reference.0, reference.1),
+                    "{dev:?} {cell:?} seed {seed}: the {name} run is not the K=1 run"
+                );
+                kept += got.2;
+                compared += 1;
+            }
+        }
+    }
+    println!("DFLASH-SAMPLED {dev:?} runs={compared} kept_drafts={kept} sampled_moved={moved}");
+    assert!(kept > compared / 2, "the drafts were rarely kept ({kept})");
+    assert!(moved > 10, "the cells rarely left greedy's stream");
+    Ok(())
+}
+
+#[test]
+fn sampled_dflash_on_qwen_is_the_k1_run() -> Result<()> {
+    sampled_identity_on(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn sampled_dflash_on_qwen_is_the_k1_run_on_metal() -> Result<()> {
+    sampled_identity_on(&Device::new_metal(0)?)
+}

@@ -2115,16 +2115,18 @@ impl ReadbackStrategy for Ring {
 
     fn check_sampler(&self, sampling: &Sampling) -> Result<()> {
         // The ring is built on `sample_argmax_on_device` leaving the token on
-        // the device; that holds for argmax and plain-temperature gumbel-max
-        // and NOT for the top-{k,p} arms, which need a host sort (§11.2c). A
-        // ring run on those would take the host path and report the ring arm.
-        match sampling {
-            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => Ok(()),
-            other => lloom_tensor::bail!(
-                "the ring needs a device-resident sampler (argmax, or plain temperature via \
-                 gumbel-max); {other:?} takes a host sort and cannot ride it (DESIGN.md §11.2c)"
-            ),
-        }
+        // the device: the body's table (`nn::decode::refuse`) says which
+        // samplers that holds for.
+        crate::nn::decode::refuse(
+            crate::nn::decode::Body::Step { ring: true },
+            &crate::nn::decode::Asks {
+                sampling,
+                processors: false,
+                budget: false,
+                digest: false,
+                logprobs: false,
+            },
+        )
     }
 
     fn sample_and_feed(

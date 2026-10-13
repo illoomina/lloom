@@ -889,6 +889,22 @@ pub struct NgramWindow {
     prev: Vec<Option<u32>>,
 }
 
+impl crate::nn::branch::RetainState for NgramWindow {
+    type Retained = Vec<Option<u32>>;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        let mut saved = crate::nn::branch::retained_vec(self.prev.len())?;
+        saved.extend_from_slice(&self.prev);
+        Ok(saved)
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.prev.len() != saved.len() {
+            lloom_tensor::bail!("retained n-gram state has incompatible context length")
+        }
+        self.prev.copy_from_slice(saved);
+        Ok(())
+    }
+}
+
 impl NgramWindow {
     pub fn new(context_len: usize) -> Self {
         Self {

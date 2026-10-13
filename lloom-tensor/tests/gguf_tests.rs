@@ -124,7 +124,15 @@ fn rejects_tensor_size_exceeding_file() {
         .tensor(&mut cursor, "t", &Device::Cpu)
         .expect_err("expected Err from oversized tensor load");
     let msg = format!("{err}");
+    // Both hosts inspect the metadata. 64-bit reaches the file-range check;
+    // on 32-bit the 4-GiB byte count cannot be materialized even before I/O.
+    #[cfg(target_pointer_width = "64")]
     assert!(msg.contains("remaining"), "unexpected error: {msg}");
+    #[cfg(target_pointer_width = "32")]
+    assert!(
+        msg.contains("tensor byte size exceeds host usize"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]
@@ -195,4 +203,285 @@ fn write_is_its_header_then_each_tensor_at_its_offset() -> lloom_tensor::Result<
     let back = content.tensor(&mut Cursor::new(&whole), "b", &dev)?;
     assert_eq!(back.data()?, b.data()?);
     Ok(())
+}
+
+// All adversarial geometry below is metadata only. No huge tensor, sparse file,
+// native device or raw-data conversion is needed to exercise these guards.
+fn tensor_header(dims: &[u64], dtype: u32, offset: u64) -> Vec<u8> {
+    let mut buf = header(1, 0);
+    buf.extend(length_prefixed(b"t"));
+    buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+    for dim in dims.iter().rev() {
+        buf.extend_from_slice(&dim.to_le_bytes());
+    }
+    buf.extend_from_slice(&dtype.to_le_bytes());
+    buf.extend_from_slice(&offset.to_le_bytes());
+    buf
+}
+
+fn alignment_header(alignment: u32) -> Vec<u8> {
+    let mut buf = header(0, 1);
+    buf.extend(length_prefixed(b"general.alignment"));
+    buf.extend_from_slice(&4u32.to_le_bytes()); // U32
+    buf.extend_from_slice(&alignment.to_le_bytes());
+    buf
+}
+
+#[test]
+fn rejects_zero_alignment_preserves_positive_non_power_of_two() {
+    assert_rejects(alignment_header(0), "alignment must be nonzero");
+    for alignment in [1, 8, 24, 32] {
+        let buf = alignment_header(alignment);
+        let expected = (buf.len() as u64).div_ceil(alignment as u64) * alignment as u64;
+        let content = Content::read(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(content.tensor_data_offset, expected);
+    }
+}
+
+#[test]
+fn rejects_tensor_element_and_byte_overflow_before_payload() {
+    // On 32-bit these dimensions themselves do not fit Shape; on 64-bit
+    // parsing reaches the checked u64 product/byte calculations.
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_rejects(
+            tensor_header(&[u64::MAX, 2], 0, 0),
+            "element count overflow",
+        );
+        assert_rejects(
+            tensor_header(&[u64::MAX / 4 + 1], 0, 0),
+            "byte size overflow",
+        );
+    }
+    #[cfg(target_pointer_width = "32")]
+    assert_rejects(tensor_header(&[u32::MAX as u64 + 1], 0, 0), "dimension");
+}
+
+#[test]
+fn large_header_remains_inspectable_but_materialization_refuses() {
+    // Each dimension fits usize on both 32/64-bit; bytes exceed isize::MAX
+    // but fit u64 including header offset. No tensor payload is present.
+    let dims = [(isize::MAX as u64) / 4 + 1];
+    let mut cursor = Cursor::new(tensor_header(&dims, 0, 0));
+    let content = Content::read(&mut cursor).expect("inspection is not allocation");
+    let err = content
+        .tensor(&mut cursor, "t", &Device::Cpu)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("host allocation limit"), "{err}");
+}
+
+#[test]
+fn preserves_scalar_zero_axis_and_header_only_tensor_metadata() {
+    // Existing header inspection accepts these shapes. Materializing a scalar
+    // QTensor is a separate unsupported operation; do not convert these here.
+    for dims in [vec![], vec![0], vec![2, 0, 3], vec![1024]] {
+        let mut cursor = Cursor::new(tensor_header(&dims, 0, 0));
+        let content = Content::read(&mut cursor).unwrap();
+        assert_eq!(
+            content.tensor_infos["t"].shape.dims(),
+            dims.iter().map(|&d| d as usize).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn rejects_tensor_absolute_start_and_end_overflow() {
+    assert_rejects(
+        tensor_header(&[1], 0, u64::MAX),
+        "byte range offset overflow",
+    );
+    // This header is 57 bytes, aligned to 64. Start = MAX-2 is representable,
+    // but adding the four-byte F32 payload is not.
+    assert_eq!(tensor_header(&[1], 0, 0).len(), 57);
+    assert_rejects(
+        tensor_header(&[1], 0, u64::MAX - 66),
+        "byte range offset overflow",
+    );
+}
+
+#[test]
+fn direct_tensor_info_read_revalidates_geometry_and_file_range() {
+    use lloom_tensor::quantized::{gguf_file::TensorInfo, GgmlDType};
+    for (dims, offset, base, expected) in [
+        (vec![usize::MAX, 2], 0, 0, "element count overflow"),
+        (vec![usize::MAX / 4 + 1], 0, 0, "byte size"),
+        (vec![1], u64::MAX, 1, "start offset overflow"),
+        (vec![0], 1, 0, "exceeds file size"),
+        (vec![1], 0, 0, "remaining"),
+    ] {
+        let info = TensorInfo {
+            ggml_dtype: GgmlDType::F32,
+            shape: dims.into(),
+            offset,
+        };
+        let err = info
+            .read(&mut Cursor::new(Vec::<u8>::new()), base, &Device::Cpu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "expected {expected}, got {err}");
+    }
+}
+
+#[test]
+fn rejects_alignment_roundup_overflow_with_tiny_virtual_header() {
+    use std::io::{Read, Seek, SeekFrom};
+    // A positioned reader can start near u64::MAX without storing a giant
+    // prefix. All reads consume only the ordinary 24-byte empty header.
+    struct Positioned {
+        bytes: Cursor<Vec<u8>>,
+        base: u64,
+    }
+    impl Read for Positioned {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.bytes.read(out)
+        }
+    }
+    impl Seek for Positioned {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            let relative = match pos {
+                SeekFrom::Start(n) => SeekFrom::Start(
+                    n.checked_sub(self.base)
+                        .ok_or_else(|| std::io::Error::other("before virtual header"))?,
+                ),
+                other => other,
+            };
+            self.bytes
+                .seek(relative)?
+                .checked_add(self.base)
+                .ok_or_else(|| std::io::Error::other("virtual position overflow"))
+        }
+    }
+    let mut reader = Positioned {
+        bytes: Cursor::new(header(0, 0)),
+        base: u64::MAX - 31,
+    };
+    let err = Content::read(&mut reader).unwrap_err().to_string();
+    assert!(err.contains("aligned tensor data offset overflow"), "{err}");
+}
+
+/// Seek-only virtual extents prove preflight does not read payload or construct
+/// Tensor storage. Extra eager entries are checked even if no model asks for them.
+#[test]
+fn eager_payload_preflight_checks_extras_without_reading_or_allocating_tensors() {
+    use lloom_tensor::quantized::gguf_file::{TensorInfo, VersionedMagic};
+    use lloom_tensor::quantized::GgmlDType;
+    use lloom_tensor::Shape;
+    use std::collections::HashMap;
+    use std::io::{Seek, SeekFrom};
+    struct Extent(u64);
+    impl Seek for Extent {
+        fn seek(&mut self, at: SeekFrom) -> std::io::Result<u64> {
+            assert_eq!(at, SeekFrom::End(0), "preflight only observes extent");
+            Ok(self.0)
+        }
+    }
+    let mut content = Content {
+        magic: VersionedMagic::GgufV3,
+        metadata: HashMap::new(),
+        tensor_infos: HashMap::from([
+            (
+                "required".into(),
+                TensorInfo {
+                    shape: Shape::from(4),
+                    ggml_dtype: GgmlDType::F32,
+                    offset: 0,
+                },
+            ),
+            (
+                "extra".into(),
+                TensorInfo {
+                    shape: Shape::from(4),
+                    ggml_dtype: GgmlDType::F32,
+                    offset: 48,
+                },
+            ),
+        ]),
+        tensor_data_offset: 0,
+    };
+    content.validate_payloads(&mut Extent(64)).unwrap();
+    for dtype in [GgmlDType::Q8_1, GgmlDType::Q8K] {
+        let extra = content.tensor_infos.get_mut("extra").unwrap();
+        extra.ggml_dtype = dtype;
+        extra.shape = Shape::from(dtype.block_size());
+        let error = content
+            .validate_payloads(&mut Extent(u64::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported yet"), "{error}");
+        // The direct shared reader must select the same refusal before it can
+        // inspect these deliberately empty raw bytes or attempt conversion.
+        let error = lloom_tensor::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &[],
+            vec![dtype.block_size()],
+            &Device::Cpu,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not supported yet"), "{error}");
+    }
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.ggml_dtype = GgmlDType::F32;
+    extra.shape = Shape::from(4);
+
+    let error = content
+        .validate_payloads(&mut Extent(63))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("only 15 remaining"), "{error}");
+    // Preserve zero-element header semantics at EOF, not a blanket positive cap.
+    content.tensor_infos.get_mut("extra").unwrap().shape = Shape::from(0);
+    content.tensor_infos.get_mut("extra").unwrap().offset = 64;
+    content.validate_payloads(&mut Extent(64)).unwrap();
+    content.tensor_data_offset = 1;
+    content.tensor_infos.get_mut("extra").unwrap().offset = u64::MAX;
+    assert!(content
+        .validate_payloads(&mut Extent(u64::MAX))
+        .unwrap_err()
+        .to_string()
+        .contains("offset overflow"));
+    content.tensor_data_offset = 0;
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.offset = 0;
+    extra.shape = Shape::from(31);
+    extra.ggml_dtype = GgmlDType::Q4_0;
+    assert!(content
+        .validate_payloads(&mut Extent(64))
+        .unwrap_err()
+        .to_string()
+        .contains("not divisible"));
+    let extra = content.tensor_infos.get_mut("extra").unwrap();
+    extra.shape = Shape::from(isize::MAX as usize / 4 + 1);
+    extra.ggml_dtype = GgmlDType::F32;
+    assert!(content
+        .validate_payloads(&mut Extent(u64::MAX))
+        .unwrap_err()
+        .to_string()
+        .contains("host allocation limit"));
+}
+
+/// A count reads from any integer width (llama.cpp writes `head_count_kv` as
+/// `i32`), and is refused when negative, a bool or a float.
+#[test]
+fn a_count_is_any_non_negative_integer() {
+    use lloom_tensor::quantized::gguf_file::Value;
+    for (value, want) in [
+        (Value::U8(7), 7),
+        (Value::U32(8), 8),
+        (Value::U64(u64::MAX), u64::MAX),
+        (Value::I8(0), 0),
+        (Value::I32(8), 8),
+        (Value::I64(i64::MAX), i64::MAX as u64),
+    ] {
+        assert_eq!(value.to_count().unwrap(), want, "{value:?}");
+    }
+    for value in [
+        Value::I32(-1),
+        Value::I64(i64::MIN),
+        Value::Bool(true),
+        Value::F32(2.),
+    ] {
+        assert!(value.to_count().is_err(), "{value:?} read as a count");
+    }
 }

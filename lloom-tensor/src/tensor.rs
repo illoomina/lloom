@@ -619,12 +619,14 @@ impl Tensor {
         let lhs = self.shape();
         let rhs = rhs.shape();
         if lhs != rhs {
-            Err(Error::ShapeMismatchBinaryOp {
-                lhs: lhs.clone(),
-                rhs: rhs.clone(),
-                op,
-            }
-            .bt())
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    op,
+                }))
+                .bt(),
+            )
         } else {
             Ok(lhs)
         }
@@ -857,11 +859,11 @@ impl Tensor {
 
     pub(crate) fn check_dim(&self, dim: usize, op: &'static str) -> Result<()> {
         if dim >= self.dims().len() {
-            Err(Error::DimOutOfRange {
+            Err(Error::DimOutOfRange(Box::new(crate::error::DimOutOfRange {
                 shape: self.shape().clone(),
                 dim: dim as i32,
                 op,
-            }
+            }))
             .bt())?
         } else {
             Ok(())
@@ -925,13 +927,13 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "narrow")?;
         let err = |msg| {
             Err::<(), _>(
-                Error::NarrowInvalidArgs {
+                Error::NarrowInvalidArgs(Box::new(crate::error::NarrowInvalidArgs {
                     shape: self.shape().clone(),
                     dim,
                     start,
                     len,
                     msg,
-                }
+                }))
                 .bt(),
             )
         };
@@ -1469,11 +1471,13 @@ impl Tensor {
     /// ```
     pub fn dot(&self, rhs: &Self) -> Result<Self> {
         if self.dims().len() != 1 || rhs.dims().len() != 1 {
-            return Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: rhs.shape().clone(),
-                op: "dot",
-            });
+            return Err(Error::ShapeMismatchBinaryOp(Box::new(
+                crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: rhs.shape().clone(),
+                    op: "dot",
+                },
+            )));
         }
 
         (self * rhs).and_then(|ret| ret.sum_all())
@@ -1518,11 +1522,13 @@ impl Tensor {
         let lhs_dims = self.dims();
         let rhs_dims = rhs.dims();
         if lhs_dims.len() != 2 || rhs_dims.len() != 1 || lhs_dims[1] != rhs_dims[0] {
-            return Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: rhs.shape().clone(),
-                op: "mv",
-            });
+            return Err(Error::ShapeMismatchBinaryOp(Box::new(
+                crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: rhs.shape().clone(),
+                    op: "mv",
+                },
+            )));
         }
 
         // Direct matmul after ensuring rhs is column vector
@@ -1544,12 +1550,14 @@ impl Tensor {
         let dim = a_dims.len();
 
         if dim < 2 || b_dims.len() != dim {
-            Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: rhs.shape().clone(),
-                op: "matmul",
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: rhs.shape().clone(),
+                    op: "matmul",
+                }))
+                .bt(),
+            )?
         }
 
         let m = a_dims[dim - 2];
@@ -1561,12 +1569,14 @@ impl Tensor {
         let batching: usize = a_dims[..dim - 2].iter().product();
         let batching_b: usize = b_dims[..dim - 2].iter().product();
         if k != k2 || batching != batching_b {
-            Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: rhs.shape().clone(),
-                op: "matmul",
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: rhs.shape().clone(),
+                    op: "matmul",
+                }))
+                .bt(),
+            )?
         }
         if c_shape.elem_count() == 0 || k == 0 {
             {
@@ -1666,12 +1676,14 @@ impl Tensor {
     /// ```
     pub fn embedding(&self, ids: &Self) -> Result<Self> {
         if self.rank() != 2 || ids.rank() != 1 {
-            Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: ids.shape().clone(),
-                op: "embedding",
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: ids.shape().clone(),
+                    op: "embedding",
+                }))
+                .bt(),
+            )?
         }
         self.index_select(ids, 0)
     }
@@ -1692,20 +1704,24 @@ impl Tensor {
             mismatch
         };
         if mismatch {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "scatter (self, src)",
-                lhs: self.shape().clone(),
-                rhs: source.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "scatter (self, src)",
+                    lhs: self.shape().clone(),
+                    rhs: source.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         if indexes.dims() != source.dims() {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "scatter (indexes, src)",
-                lhs: indexes.shape().clone(),
-                rhs: source.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "scatter (indexes, src)",
+                    lhs: indexes.shape().clone(),
+                    rhs: source.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         Ok(())
     }
@@ -1812,12 +1828,14 @@ impl Tensor {
             .bt())?
         }
         if self.device().location() != src.device.location() {
-            Err(Error::DeviceMismatchBinaryOp {
-                lhs: self.device().location(),
-                rhs: src.device().location(),
-                op: "slice-scatter",
-            }
-            .bt())?
+            Err(
+                Error::DeviceMismatchBinaryOp(Box::new(crate::error::DeviceMismatchBinaryOp {
+                    lhs: self.device().location(),
+                    rhs: src.device().location(),
+                    op: "slice-scatter",
+                }))
+                .bt(),
+            )?
         }
         if self.rank() != src.rank() {
             Err(Error::UnexpectedNumberOfDims {
@@ -1840,12 +1858,14 @@ impl Tensor {
                     }
                 });
         if !shape_ok {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "slice-scatter (self, src)",
-                lhs: self.shape().clone(),
-                rhs: src.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "slice-scatter (self, src)",
+                    lhs: self.shape().clone(),
+                    rhs: src.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let mut storage = unsafe { self.device().alloc_uninit(self.shape(), self.dtype())? };
         self.storage()
@@ -1875,24 +1895,28 @@ impl Tensor {
             mismatch
         };
         if mismatch {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "index-add (self, source)",
-                lhs: self.shape().clone(),
-                rhs: source.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "index-add (self, source)",
+                    lhs: self.shape().clone(),
+                    rhs: source.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         // The number of element in indexes must match the dimension on which the add is
         // performed on the source tensor (and the index values from `indexes` are taken from
         // the target tensor self)
         let indexes_len = indexes.dims1()?;
         if source_dims[dim] != indexes_len {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "index-add (ids, source))",
-                lhs: indexes.shape().clone(),
-                rhs: source.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "index-add (ids, source))",
+                    lhs: indexes.shape().clone(),
+                    rhs: source.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let storage = self.storage().index_add(
             self.layout(),
@@ -1937,12 +1961,14 @@ impl Tensor {
             mismatch
         };
         if mismatch {
-            Err(Error::ShapeMismatchBinaryOp {
-                op: "gather",
-                lhs: self.shape().clone(),
-                rhs: indexes.shape().clone(),
-            }
-            .bt())?
+            Err(
+                Error::ShapeMismatchBinaryOp(Box::new(crate::error::ShapeMismatchBinaryOp {
+                    op: "gather",
+                    lhs: self.shape().clone(),
+                    rhs: indexes.shape().clone(),
+                }))
+                .bt(),
+            )?
         }
         let storage =
             self.storage()
@@ -1962,11 +1988,13 @@ impl Tensor {
         let dim = dim.to_index(self.shape(), "index-select")?;
         let indexes_len = match indexes.dims() {
             [l] => *l,
-            _ => Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: indexes.shape().clone(),
-                op: "index-select",
-            }
+            _ => Err(Error::ShapeMismatchBinaryOp(Box::new(
+                crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: indexes.shape().clone(),
+                    op: "index-select",
+                },
+            ))
             .bt())?,
         };
         let storage = self.storage().index_select(
@@ -2259,6 +2287,60 @@ impl Tensor {
             BackpropOp::none(),
             false,
         ))
+    }
+
+    /// The multinomial draw by inverse CDF: one token per row of these
+    /// logits (`[.., vocab]`, any float dtype), row `r` the smallest index
+    /// whose cumulative probability under `softmax(z / temperature)` exceeds
+    /// `u[r]` times the row's total, `u` a `[rows]` tensor of uniforms in
+    /// `[0, 1)`. Returns the `[rows]` `U32` ids on this tensor's device.
+    ///
+    /// A token with no mass (a `-inf` logit) is never drawn. On Metal one
+    /// dispatch (`sample_inverse_cdf_f32`), nothing read back; elsewhere the
+    /// host arithmetic of [`inverse_cdf_row`] over the rows, the result put
+    /// back on this tensor's device. Each implementation is deterministic: a
+    /// row's draw is a function of its logits and its uniform.
+    pub fn sample_inverse_cdf(&self, temperature: f64, u: &Tensor) -> Result<Tensor> {
+        if temperature.is_nan() || temperature <= 0.0 {
+            bail!("sample_inverse_cdf: temperature must be > 0, got {temperature}");
+        }
+        let vocab = *self
+            .dims()
+            .last()
+            .ok_or_else(|| Error::Msg("sample_inverse_cdf: a scalar has no vocabulary".into()))?;
+        if vocab == 0 {
+            bail!("sample_inverse_cdf: an empty vocabulary");
+        }
+        let rows = self.elem_count() / vocab;
+        if u.elem_count() != rows {
+            bail!(
+                "sample_inverse_cdf: {rows} rows and {} uniforms",
+                u.elem_count()
+            );
+        }
+        let inv_t = (1.0 / temperature) as f32;
+        let logits = self.to_dtype(DType::F32)?.contiguous()?;
+        let u = u.to_dtype(DType::F32)?.contiguous()?;
+        #[cfg(feature = "metal")]
+        if let (Storage::Metal(z), Storage::Metal(uu)) = (&*logits.storage(), &*u.storage()) {
+            let z_off = logits.layout().start_offset() * DType::F32.size_in_bytes();
+            let u_off = u.layout().start_offset() * DType::F32.size_in_bytes();
+            let storage = z.sample_inverse_cdf(z_off, rows, vocab, inv_t, uu, u_off)?;
+            return Ok(from_storage(
+                Storage::Metal(storage),
+                (rows,),
+                BackpropOp::none(),
+                false,
+            ));
+        }
+        let host = logits.flatten_all()?.to_vec1::<f32>()?;
+        let uh = u.flatten_all()?.to_vec1::<f32>()?;
+        let ids: Vec<u32> = host
+            .chunks(vocab)
+            .zip(uh)
+            .map(|(row, u)| inverse_cdf_row(row, inv_t, u))
+            .collect();
+        Tensor::from_vec(ids, rows, self.device())
     }
 
     /// Write `src` into this tensor's CPU-mapped Metal buffer at element `index`,
@@ -2888,11 +2970,13 @@ impl Tensor {
     pub fn reshape<S: ShapeWithOneHole>(&self, s: S) -> Result<Tensor> {
         let shape = s.into_shape(self.elem_count())?;
         if shape.elem_count() != self.elem_count() {
-            return Err(Error::ShapeMismatchBinaryOp {
-                lhs: self.shape().clone(),
-                rhs: shape,
-                op: "reshape",
-            }
+            return Err(Error::ShapeMismatchBinaryOp(Box::new(
+                crate::error::ShapeMismatchBinaryOp {
+                    lhs: self.shape().clone(),
+                    rhs: shape,
+                    op: "reshape",
+                },
+            ))
             .bt());
         }
         let op = BackpropOp::new1(self, Op::Reshape);
@@ -3478,4 +3562,29 @@ impl<S: Into<Shape>> From<(Storage, S)> for Tensor {
     fn from((storage, shape): (Storage, S)) -> Self {
         from_storage(storage, shape, BackpropOp::none(), false)
     }
+}
+
+/// The host form of [`Tensor::sample_inverse_cdf`] over one row of logits:
+/// the smallest index whose running mass `Σ exp((z - max) · inv_t)`, summed
+/// in index order in f64, exceeds `u` times the row's total; a walk that
+/// rounding keeps from crossing takes the row's last index with mass. A
+/// `-inf` logit has no mass and is never drawn.
+pub fn inverse_cdf_row(row: &[f32], inv_t: f32, u: f32) -> u32 {
+    let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mass = |z: f32| (((z - m) * inv_t) as f64).exp();
+    let total: f64 = row.iter().map(|&z| mass(z)).sum();
+    let target = u as f64 * total;
+    let mut acc = 0f64;
+    let mut last = 0u32;
+    for (i, &z) in row.iter().enumerate() {
+        let e = mass(z);
+        if e > 0.0 {
+            last = i as u32;
+        }
+        acc += e;
+        if acc > target {
+            return i as u32;
+        }
+    }
+    last
 }

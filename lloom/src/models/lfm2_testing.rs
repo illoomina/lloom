@@ -239,7 +239,7 @@ pub const SCALE_GEOMETRY: &str = "lfm2.5-2.6b.json";
 
 /// Where [`SCALE_GEOMETRY`] is in this source tree.
 pub fn scale_geometry_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/scale_manifests")
         .join(SCALE_GEOMETRY)
 }
@@ -311,4 +311,15 @@ pub fn load_recorded<P: Profile>(
         dev.clone(),
     );
     Ok((Model::new(&cfg, vb)?, record))
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

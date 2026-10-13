@@ -937,3 +937,22 @@ fn a_reply_that_closes_its_block_twice_is_stripped_past_the_last_marker() {
         }
     }
 }
+
+/// `session.keep_logprobs` is refused at load by the body the process
+/// decodes through, from the one refusal table: the K=1 body serves it on
+/// either readback arm (a logprobs run takes the blocking one); the
+/// speculative body and the batch scheduler refuse it, each by name.
+#[test]
+fn the_keep_logprobs_refusal_follows_the_decode_body() {
+    use lloom::nn::Body;
+    assert_eq!(super::logprobs_refused_on(Body::Step { ring: true }), None);
+    assert_eq!(super::logprobs_refused_on(Body::Step { ring: false }), None);
+    for (body, says) in [
+        (Body::Window, "this process decodes through the speculative body (--dspark, --mtp): the window reads back"),
+        (Body::BatchedStep, "this process decodes through the batch scheduler (--batch N): a batched body does not keep per-token logprobs"),
+        (Body::BatchedWindow, "this process decodes through the batch scheduler (--batch N): a batched body does not keep per-token logprobs"),
+    ] {
+        let why = super::logprobs_refused_on(body).unwrap_or_default();
+        assert!(why.starts_with(says), "{body:?}: {why}");
+    }
+}

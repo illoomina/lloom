@@ -616,12 +616,19 @@ fn teardown_guard_is_shared_by_every_device_clone() -> Result<()> {
     Ok(())
 }
 
-/// Dropping the last handle empties the residency set.
+/// How long a dropped device may take to retire before a test calls it stuck.
+/// Measured at about 15 ms; the bound is for a loaded machine.
+const RETIREMENT_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Dropping the last handle empties the residency set, once the device has
+/// retired.
 ///
-/// This is the ordering the panic came from, asserted from the outside: after
-/// the device is gone, the set holds nothing, so the later teardown of the
-/// Metal object has nothing to remove and cannot ask the kernel to remove an
-/// absent allocation.
+/// The set is emptied by the device's membership records on the host
+/// retirement service, after the last handle drops, never inside a drop
+/// (`tuning.md` §6.3m). So the observation is taken at the moment the design
+/// makes it true: when the set's retirement signal says every device root and
+/// record naming it has been released. Before the drop the signal must say
+/// otherwise, or the wait below would prove nothing.
 ///
 /// It is observed through an `Arc` the test keeps to the set itself, because
 /// after the device drops there is no device left to ask.
@@ -650,16 +657,210 @@ fn dropping_the_last_device_handle_empties_the_residency_set() -> Result<()> {
         !set.is_empty(),
         "dropping tensors must not empty the set (issue #166)"
     );
+    let live = set.wait_retired(std::time::Instant::now());
+    assert!(
+        live.devices >= 1 && live.records >= 1,
+        "a live device must hold the set's retirement open, read {live:?}"
+    );
 
     // The last handle goes here. `set` outlives it deliberately, which is the
     // whole point: once the device is gone there is nothing left to ask.
     drop(device);
 
+    let retired = set.wait_retired(std::time::Instant::now() + RETIREMENT_BOUND);
+    eprintln!(
+        "RETIREMENT live={live:?} retired={retired:?} set_len={}",
+        set.len()
+    );
+    assert!(
+        retired.complete(),
+        "the device did not finish retiring within {RETIREMENT_BOUND:?}: {retired:?}"
+    );
     assert_eq!(
         set.len(),
         0,
-        "the last device handle dropping must empty the residency set before \
-         the pools free the buffers it lists (`DESIGN.md` §6.3c)"
+        "the retired device's records must have emptied the residency set \
+         (`DESIGN.md` §6.3c)"
+    );
+    Ok(())
+}
+
+/// Every allocation leaves the set before its membership record releases it.
+///
+/// §6.3c's defect is an allocation freed while the set still lists it. Each
+/// membership record removes its allocations from the set in its cleanup and
+/// releases its own retains after; the release witness checks the set at the
+/// release, keeps (never frees) anything still listed, and counts it. The
+/// absolute reference is the enrolment count: every retain a record took must
+/// come back through the witness, and none of them listed.
+#[test]
+fn every_allocation_leaves_the_set_before_its_record_releases_it() -> Result<()> {
+    let _guard = lock();
+    let Some(device) = metal_device() else {
+        return Ok(());
+    };
+    let Device::Metal(metal) = &device else {
+        return Ok(());
+    };
+    let set = metal.residency_set_handle();
+
+    // Shared and private pools, an upload, and an eviction round while the
+    // device is alive, so records release both before and at teardown.
+    let kept = Tensor::ones((96, 96), DType::F32, &device)?;
+    for i in 1..=6 {
+        let t = Tensor::zeros((256, 256 + i), DType::F32, &device)?;
+        let u = (&t + 1.0)?;
+        drop((t, u));
+    }
+    let upload = Tensor::new(&[1f32, 2., 3., 4.], &device)?;
+    let sum = (&kept.sum_all()? + upload.sum_all()?)?.to_scalar::<f32>()?;
+    assert_eq!(sum, 96.0 * 96.0 + 10.0);
+    metal.wait_until_completed()?;
+    metal.set_free_budget(0);
+    drop((kept, upload));
+
+    let enrolled = set.release_witness().enrolled;
+    assert!(
+        enrolled >= 4,
+        "expected the allocations above to enrol membership records, read {enrolled}"
+    );
+
+    drop(device);
+    let retired = set.wait_retired(std::time::Instant::now() + RETIREMENT_BOUND);
+    assert!(
+        retired.complete(),
+        "the device did not finish retiring within {RETIREMENT_BOUND:?}: {retired:?}"
+    );
+    let witness = set.release_witness();
+    eprintln!(
+        "WITNESS {witness:?} retired={retired:?} set_len={}",
+        set.len()
+    );
+    assert_eq!(
+        witness.listed_at_release, 0,
+        "a record released an allocation the set still listed: {witness:?}"
+    );
+    assert_eq!(
+        witness.released, witness.enrolled,
+        "every retain a membership record took must come back through the \
+         witness: {witness:?}"
+    );
+    assert_eq!(set.len(), 0);
+    Ok(())
+}
+
+const EXIT_CHILD: &str = "LLOOM_DEVICE_EXIT_JOIN_CHILD";
+
+/// Dropping the last handle and exiting at once, after the exit join, leaves
+/// the set empty and exits cleanly.
+///
+/// `lloom`'s exits call [`lloom_tensor::join_device_retirement`] so the
+/// process does not leave while the retirement service is still removing a
+/// dropped device's allocations from its set (`tuning.md` §6.3m). The child
+/// allocates, drops its last handle, joins, prints what it saw and exits with
+/// `process::exit`, which runs no destructor; the parent reads the child's
+/// status and its line. After a completed join the service's worker is
+/// stopped, so a device the child drops after the join is never retired:
+/// that is the observation that no pass can start during teardown.
+#[test]
+fn exiting_at_once_after_the_exit_join_leaves_the_set_empty() -> Result<()> {
+    if std::env::var_os(EXIT_CHILD).is_some() {
+        let Some(device) = metal_device() else {
+            println!("EXIT-CHILD no-device");
+            std::process::exit(0);
+        };
+        let Device::Metal(metal) = &device else {
+            std::process::exit(0);
+        };
+        let set = metal.residency_set_handle();
+        let t = (Tensor::ones((128, 128), DType::F32, &device)? + 1.0)?;
+        let before = set.len();
+        drop((t, device));
+        let joined = lloom_tensor::join_device_retirement(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
+        let set_len = set.len();
+        let late = metal_device().expect("a second device after the join");
+        let Device::Metal(late_metal) = &late else {
+            std::process::exit(0);
+        };
+        let late_set = late_metal.residency_set_handle();
+        drop((Tensor::ones((64, 64), DType::F32, &late)?, late));
+        let late_end = late_set
+            .wait_retired(std::time::Instant::now() + std::time::Duration::from_millis(300));
+        println!(
+            "EXIT-CHILD listed_before={before} completed={} sets_retiring={} \
+             records_pending={} set_len={set_len} listed_at_release={} worker_stopped={} \
+             late_records={}",
+            joined.completed,
+            joined.sets_retiring,
+            joined.records_pending,
+            joined.listed_at_release,
+            joined.worker_stopped,
+            late_end.records,
+        );
+        std::process::exit(0);
+    }
+    let _guard = lock();
+    if metal_device().is_none() {
+        return Ok(());
+    }
+    let name = std::thread::current()
+        .name()
+        .expect("a test harness thread")
+        .to_string();
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([name.as_str(), "--exact", "--nocapture"])
+        .env(EXIT_CHILD, "1")
+        .output()
+        .expect("the child ran");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("EXIT-CHILD"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the child printed no EXIT-CHILD line; status {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    eprintln!("{line} status={:?}", out.status);
+    assert!(
+        out.status.success(),
+        "the child did not exit cleanly: {:?}; {line}",
+        out.status
+    );
+    if line.contains("no-device") {
+        return Ok(());
+    }
+    let field = |key: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .to_string()
+    };
+    assert_ne!(
+        field("listed_before"),
+        "0",
+        "the child's set was never populated: {line}"
+    );
+    assert_eq!(field("completed"), "true", "{line}");
+    assert_eq!(
+        field("set_len"),
+        "0",
+        "the set was not empty at exit: {line}"
+    );
+    assert_eq!(field("listed_at_release"), "0", "{line}");
+    assert_eq!(
+        field("worker_stopped"),
+        "true",
+        "a completed join must stop the retirement worker: {line}"
+    );
+    assert_ne!(
+        field("late_records"),
+        "0",
+        "a device dropped after the join was retired: a pass ran after the worker was stopped: {line}"
     );
     Ok(())
 }

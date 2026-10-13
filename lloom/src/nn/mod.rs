@@ -21,6 +21,8 @@ pub mod batch_norm;
 pub mod batched;
 mod batched_spec;
 pub mod blocks;
+pub mod branch;
+pub mod channel_affine;
 #[cfg(any(feature = "metal", test))]
 mod checkout;
 pub mod conv;
@@ -37,6 +39,7 @@ pub mod expert_stream;
 pub mod func;
 pub mod fusion;
 pub mod gdn;
+pub(crate) mod gguf_weights;
 pub mod group_norm;
 pub mod group_tenant;
 pub mod init;
@@ -62,6 +65,7 @@ pub mod row_log;
 pub mod sampling;
 pub mod sequential;
 pub mod short_conv;
+pub mod signal;
 pub mod slab;
 pub mod slot_cache;
 pub mod speculator;
@@ -79,15 +83,16 @@ pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
 pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
 pub use batched_spec::SpecBatchDecoder;
+pub use channel_affine::ChannelAffine;
 pub use conv::{
     conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, conv_transpose1d, conv_transpose1d_no_bias,
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, FeedStep, FeedWait,
-    HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut, RoundStats,
-    StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED,
+    ladder_width, ragged_layout, refuse, Asks, Body, DecodeOptions, DecodeOut, DecodeStats,
+    FeedStep, FeedWait, HostFeedReport, HostFeedTrace, IdentityProposer, PassWidths, PrefillOut,
+    RoundStats, StepPhases, FEED_PARK_MS, FEED_SPIN_BOUND, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
 pub use expert_stream::{

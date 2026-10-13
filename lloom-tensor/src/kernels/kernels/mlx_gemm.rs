@@ -889,11 +889,13 @@ unsafe fn gemv_dispatch(
     } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
         (m as i32, true)
     } else {
-        return Err(MetalKernelError::MatMulNonContiguous {
-            lhs_stride: lhs_stride.to_vec(),
-            rhs_stride: rhs_stride.to_vec(),
-            mnk: (m, n, k),
-        }
+        return Err(MetalKernelError::MatMulNonContiguous(Box::new(
+            crate::kernels::err::MatMulNonContiguous {
+                lhs_stride: lhs_stride.to_vec(),
+                rhs_stride: rhs_stride.to_vec(),
+                mnk: (m, n, k),
+            },
+        ))
         .bt())?;
     };
 
@@ -902,11 +904,13 @@ unsafe fn gemv_dispatch(
     } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
         (k as i32, true)
     } else {
-        return Err(MetalKernelError::MatMulNonContiguous {
-            lhs_stride: lhs_stride.to_vec(),
-            rhs_stride: rhs_stride.to_vec(),
-            mnk: (m, n, k),
-        }
+        return Err(MetalKernelError::MatMulNonContiguous(Box::new(
+            crate::kernels::err::MatMulNonContiguous {
+                lhs_stride: lhs_stride.to_vec(),
+                rhs_stride: rhs_stride.to_vec(),
+                mnk: (m, n, k),
+            },
+        ))
         .bt())?;
     };
 
@@ -1568,11 +1572,13 @@ pub unsafe fn call_mlx_gemm_out(
     } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
         (m as i32, true)
     } else {
-        return Err(MetalKernelError::MatMulNonContiguous {
-            lhs_stride: lhs_stride.to_vec(),
-            rhs_stride: rhs_stride.to_vec(),
-            mnk: (m, n, k),
-        }
+        return Err(MetalKernelError::MatMulNonContiguous(Box::new(
+            crate::kernels::err::MatMulNonContiguous {
+                lhs_stride: lhs_stride.to_vec(),
+                rhs_stride: rhs_stride.to_vec(),
+                mnk: (m, n, k),
+            },
+        ))
         .bt())?;
     };
     // rhs has shape b, k, n
@@ -1581,11 +1587,13 @@ pub unsafe fn call_mlx_gemm_out(
     } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
         (k as i32, true)
     } else {
-        return Err(MetalKernelError::MatMulNonContiguous {
-            lhs_stride: lhs_stride.to_vec(),
-            rhs_stride: rhs_stride.to_vec(),
-            mnk: (m, n, k),
-        }
+        return Err(MetalKernelError::MatMulNonContiguous(Box::new(
+            crate::kernels::err::MatMulNonContiguous {
+                lhs_stride: lhs_stride.to_vec(),
+                rhs_stride: rhs_stride.to_vec(),
+                mnk: (m, n, k),
+            },
+        ))
         .bt())?;
     };
 

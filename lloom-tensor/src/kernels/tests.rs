@@ -6860,7 +6860,7 @@ fn sdpa_vector_declares_variants_the_name_table_cannot_reach() {
          -- update it rather than relaxing it",
     );
     assert!(
-        matches!(err, MetalKernelError::SdpaHeadSizeMismatch { got: 72, .. }),
+        matches!(&err, MetalKernelError::SdpaHeadSizeMismatch(m) if m.got == 72),
         "expected the head-size mismatch that records the gap, got {err:?}"
     );
 }
@@ -11430,6 +11430,220 @@ fn a_blit_copy_extends_the_recorded_interval_of_both_buffers() {
         "the blit's write was not recorded: {write:?} < {at_least}"
     );
     assert_eq!(read_to_vec::<u32>(&dst, 64)[0], 1);
+}
+
+// ---- sample_inverse_cdf: the multinomial draw by inverse CDF ----------------
+//
+// One threadgroup per row returns the smallest index whose cumulative tempered
+// probability exceeds `u · total`. The reference is the same definition in
+// f64; a uniform within 1e-6 of a CDF boundary is skipped, since the two sums
+// round differently there. The stratified test asserts the DISTRIBUTION: `n`
+// uniforms evenly spaced in [0, 1) land on token `i` within one of `n · p_i`
+// times — exact for any correct inverse CDF, and wrong for a draw that drops
+// the temperature, shifts a row, or walks a chunk off by one.
+
+fn run_inverse_cdf(logits: &[f32], vocab: usize, inv_t: f32, u: &[f32]) -> Vec<u32> {
+    let rows = logits.len() / vocab;
+    assert_eq!(rows, u.len());
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let z = new_buffer(&device, logits);
+    let ub = new_buffer(&device, u);
+    let out = new_buffer(&device, &vec![u32::MAX; rows]);
+    // SAFETY: the three buffers outlive the wait below and no ICB captures them.
+    unsafe {
+        crate::kernels::kernels::call_sample_inverse_cdf(
+            &device,
+            &encoder,
+            &kernels,
+            (&z, 0),
+            rows,
+            vocab,
+            inv_t,
+            (&ub, 0),
+            &out,
+        )
+    }
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, rows)
+}
+
+/// The f64 CDF of `softmax(z · inv_t)`, normalised to 1.
+fn inverse_cdf_reference_cdf(row: &[f32], inv_t: f32) -> Vec<f64> {
+    let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let e: Vec<f64> = row
+        .iter()
+        .map(|&z| ((z as f64 - m) * inv_t as f64).exp())
+        .collect();
+    let total: f64 = e.iter().sum();
+    let mut acc = 0.0;
+    e.iter()
+        .map(|x| {
+            acc += x / total;
+            acc
+        })
+        .collect()
+}
+
+/// The reference draw, or `None` when `u` is within `eps` of a boundary.
+fn inverse_cdf_reference(cdf: &[f64], u: f64, eps: f64) -> Option<u32> {
+    if cdf.iter().any(|&c| (c - u).abs() < eps) {
+        return None;
+    }
+    Some(cdf.iter().position(|&c| c > u).unwrap_or(cdf.len() - 1) as u32)
+}
+
+/// Logits from a fixed LCG in [-8, 8), with every `mask_every`-th token at
+/// -inf when it is nonzero.
+fn inverse_cdf_logits(vocab: usize, seed: u32, mask_every: usize) -> Vec<f32> {
+    let mut s = seed;
+    (0..vocab)
+        .map(|i| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if mask_every > 0 && i % mask_every == 3 {
+                f32::NEG_INFINITY
+            } else {
+                ((s >> 8) as f32 / (1u32 << 24) as f32) * 16.0 - 8.0
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn sample_inverse_cdf_matches_the_f64_definition() {
+    let mut checked = 0;
+    for (vocab, inv_t) in [
+        (37usize, 1.0f32),
+        (1000, 1.0 / 0.7),
+        (4101, 1.0 / 1.3),
+        (128000, 1.0 / 0.7),
+    ] {
+        let base = inverse_cdf_logits(vocab, 0x9e37 + vocab as u32, 0);
+        let us: Vec<f32> = (0..64).map(|k| (k as f32 + 0.37) / 64.0).collect();
+        // Every uniform its own row of one dispatch, and every row its own
+        // logits (the base rotated by 7k): a row read at another row's
+        // offset, or with another row's uniform, draws the wrong token.
+        let row_of = |k: usize| -> Vec<f32> {
+            let r = (7 * k) % vocab;
+            base[r..].iter().chain(&base[..r]).copied().collect()
+        };
+        let rows: Vec<f32> = (0..us.len()).flat_map(row_of).collect();
+        let got = run_inverse_cdf(&rows, vocab, inv_t, &us);
+        for (k, &u) in us.iter().enumerate() {
+            let cdf = inverse_cdf_reference_cdf(&row_of(k), inv_t);
+            if let Some(want) = inverse_cdf_reference(&cdf, u as f64, 1e-6) {
+                assert_eq!(
+                    got[k], want,
+                    "vocab {vocab} inv_t {inv_t} row {k} u {u}: the kernel drew {} against the definition's {want}",
+                    got[k]
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 200,
+        "only {checked} draws compared — a vacuous fixture"
+    );
+}
+
+#[test]
+fn sample_inverse_cdf_draws_each_token_in_proportion() {
+    // A small vocabulary with a wide spread of masses, 4096 stratified
+    // uniforms: token i is drawn n·p_i times, within one.
+    let vocab = 23;
+    let row: Vec<f32> = (0..vocab).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let inv_t = 1.0 / 0.8;
+    let n = 4096;
+    let us: Vec<f32> = (0..n).map(|k| (k as f32 + 0.5) / n as f32).collect();
+    let rows: Vec<f32> = us.iter().flat_map(|_| row.iter().copied()).collect();
+    let got = run_inverse_cdf(&rows, vocab, inv_t, &us);
+    let cdf = inverse_cdf_reference_cdf(&row, inv_t);
+    let mut counts = vec![0usize; vocab];
+    for &g in &got {
+        counts[g as usize] += 1;
+    }
+    let mut prev = 0.0;
+    for i in 0..vocab {
+        let want = (cdf[i] - prev) * n as f64;
+        prev = cdf[i];
+        assert!(
+            (counts[i] as f64 - want).abs() <= 1.0 + 1e-6,
+            "token {i}: drawn {} times against n·p = {want:.2}",
+            counts[i]
+        );
+    }
+}
+
+#[test]
+fn sample_inverse_cdf_never_draws_a_masked_token() {
+    let vocab = 2053;
+    let row = inverse_cdf_logits(vocab, 77, 5);
+    let n = 512;
+    let us: Vec<f32> = (0..n).map(|k| (k as f32 + 0.5) / n as f32).collect();
+    let rows: Vec<f32> = us.iter().flat_map(|_| row.iter().copied()).collect();
+    let got = run_inverse_cdf(&rows, vocab, 1.0, &us);
+    for &g in &got {
+        assert!(
+            row[g as usize].is_finite(),
+            "drew token {g}, whose logit is -inf"
+        );
+    }
+    // The extremes: u at 0 and just below 1 land on the first and the last
+    // tokens with mass.
+    let ends = run_inverse_cdf(
+        &[row.clone(), row.clone()].concat(),
+        vocab,
+        1.0,
+        &[0.0, 0.999_999_9],
+    );
+    let first = row.iter().position(|z| z.is_finite()).unwrap() as u32;
+    let last = row.iter().rposition(|z| z.is_finite()).unwrap() as u32;
+    assert_eq!(ends[0], first, "u = 0 must draw the first token with mass");
+    assert_eq!(ends[1], last, "u -> 1 must draw the last token with mass");
+}
+
+#[test]
+fn sample_inverse_cdf_is_deterministic() {
+    let vocab = 128000;
+    let row = inverse_cdf_logits(vocab, 4242, 0);
+    let us: Vec<f32> = (0..8).map(|k| (k as f32 * 0.123 + 0.05) % 1.0).collect();
+    let rows: Vec<f32> = us.iter().flat_map(|_| row.iter().copied()).collect();
+    let first = run_inverse_cdf(&rows, vocab, 1.0 / 0.7, &us);
+    for _ in 0..10 {
+        assert_eq!(
+            run_inverse_cdf(&rows, vocab, 1.0 / 0.7, &us),
+            first,
+            "sample_inverse_cdf must be deterministic"
+        );
+    }
+}
+
+/// The host form (`inverse_cdf_row`, every non-Metal backend's draw) meets
+/// the same definition.
+#[test]
+fn inverse_cdf_row_matches_the_f64_definition() {
+    let mut checked = 0;
+    for (vocab, inv_t) in [(37usize, 1.0f32), (4101, 1.0 / 1.3), (128000, 1.0 / 0.7)] {
+        let row = inverse_cdf_logits(vocab, 31 + vocab as u32, 7);
+        let cdf = inverse_cdf_reference_cdf(&row, inv_t);
+        for k in 0..64 {
+            let u = (k as f32 + 0.37) / 64.0;
+            if let Some(want) = inverse_cdf_reference(&cdf, u as f64, 1e-6) {
+                assert_eq!(
+                    crate::inverse_cdf_row(&row, inv_t, u),
+                    want,
+                    "vocab {vocab} u {u}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 150, "only {checked} draws compared");
 }
 
 /// Tensor slices are element-aligned, including odd f16/bf16 and u8 offsets.

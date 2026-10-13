@@ -2066,10 +2066,18 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             q_head,
             is_f32 = q.dtype() == DType::F32
         );
-        let supports_sdpa_full =
-            q_seq > 1 && supported_head_dim && supports_sdpa_full_mask && supports_sdpa_dtype;
-        let supports_sdpa_vector =
-            q_seq == 1 && supported_head_dim && supports_sdpa_dtype && q_seq <= k_seq;
+        // The vector bindings have no additive-mask input. Even one query
+        // must use the full kernel when masked; its partial-query tile handles
+        // q_seq == 1. Keep the unmasked decode fast path (including softcap).
+        let supports_sdpa_full = (q_seq > 1 || (q_seq == 1 && self.mask.is_some()))
+            && supported_head_dim
+            && supports_sdpa_full_mask
+            && supports_sdpa_dtype;
+        let supports_sdpa_vector = q_seq == 1
+            && self.mask.is_none()
+            && supported_head_dim
+            && supports_sdpa_dtype
+            && q_seq <= k_seq;
 
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
 
@@ -2269,7 +2277,8 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
 
             let mask_s_l = self.mask.as_ref().map(|m| m.storage_and_layout());
 
-            let (mask_type, mask_buffer, mask_strides) = if let Some(mask) = &self.mask {
+            let (mask_type, mask_buffer, mask_offset, mask_strides) = if let Some(mask) = &self.mask
+            {
                 let (mask_s, mask_l) = mask_s_l.as_ref().unwrap();
 
                 let mask_buffer = match &**mask_s {
@@ -2298,10 +2307,11 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                 (
                     Some(mask_type),
                     Some(mask_buffer),
+                    mask_l.start_offset() * mask.dtype().size_in_bytes(),
                     Some(mask_l.stride().to_vec()),
                 )
             } else {
-                (None, None, None)
+                (None, None, 0, None)
             };
 
             // A pool is one row read by every sequence through its table: the
@@ -2364,7 +2374,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
             // SAFETY: the op binds storages, constant-cache blocks and uploads made
             // for it (binding authority, `lloom_tensor::metal_backend` module docs).
             unsafe {
-                lloom_tensor::kernels::call_sdpa_full_with(
+                lloom_tensor::kernels::call_sdpa_full_with_mask_offset(
                     q.device().device(),
                     &encoder,
                     q.device().kernels(),
@@ -2381,6 +2391,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
                     &v_stride,
                     mask_type,
                     mask_buffer,
+                    mask_offset,
                     mask_strides.as_deref(),
                     &output,
                     out_layout.stride(),
@@ -2461,12 +2472,12 @@ pub fn sdpa_vector_two_pass(k_seq: usize, head_dim: usize, dtype: DType) -> bool
 /// Note: For Grouped Query Attention and Multi-Query Attention, the k and v inputs should not be pre-tiled to match q.
 ///
 /// ## On Metal:
-/// - If `seq` == 1:
+/// - If `seq` == 1 and no explicit mask is supplied:
 ///     - Use a vectorized kernel
 ///     - Supports `seq` != `kv_seq` (cross attn. support)
 ///     - Supports GQA when `qhead` is a multiple of `kv_head`
-/// - Otherwise:
-///     - Masking is supported
+/// - Otherwise (including a masked single query):
+///     - Use the full kernel; additive masking is supported
 ///     - Supports `seq` != `kv_seq` (cross attn. support)
 ///     - Supports GQA when `qhead` is a multiple of `kv_head`
 ///     - Softcapping is not supported.

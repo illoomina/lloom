@@ -131,3 +131,153 @@ fn the_counter_sees_a_formatted_refusal() {
     let (_, n) = counted(|| lloom_tensor::Error::Msg(format!("{}", AllocationError::Cancelled)));
     assert!(n > 0, "the counting allocator did not observe format!");
 }
+
+/// One value of every `AllocationError` variant. The `match` has no wildcard,
+/// so a variant added to the enum fails to compile here until it is listed.
+fn every_allocation_refusal() -> Vec<AllocationError> {
+    use lloom_tensor::memory_admission::{MachineFailure, PredictionBasis};
+    let all = vec![
+        AllocationError::Refused {
+            requested: 9,
+            available: 8,
+            domain: RefusalDomain::Budget,
+        },
+        AllocationError::CountExhausted,
+        AllocationError::Cancelled,
+        AllocationError::DeviceOom { requested: 4096 },
+        AllocationError::HostAllocation,
+        AllocationError::Overflow,
+        AllocationError::Geometry("geometry"),
+        AllocationError::PredictionExceeded {
+            predicted: 1,
+            actual: 2,
+            basis: PredictionBasis::HeapSizeAndAlignEstimate,
+        },
+        AllocationError::Unsupported("unsupported"),
+        AllocationError::Retirement("retirement"),
+        AllocationError::InvalidCustody,
+        AllocationError::UnsupportedLayout,
+        AllocationError::DifferentDomain,
+        AllocationError::DifferentAllocationDevice,
+        AllocationError::UnboundAllocationDevice,
+        AllocationError::ReuseDomainMismatch {
+            expected: "a",
+            actual: "b",
+        },
+        AllocationError::Machine(MachineFailure::Unavailable),
+        AllocationError::ConfigurationConflict {
+            active: Some(1),
+            requested: None,
+        },
+    ];
+    for e in &all {
+        match e {
+            AllocationError::Refused { .. }
+            | AllocationError::CountExhausted
+            | AllocationError::Cancelled
+            | AllocationError::DeviceOom { .. }
+            | AllocationError::HostAllocation
+            | AllocationError::Overflow
+            | AllocationError::Geometry(_)
+            | AllocationError::PredictionExceeded { .. }
+            | AllocationError::Unsupported(_)
+            | AllocationError::Retirement(_)
+            | AllocationError::InvalidCustody
+            | AllocationError::UnsupportedLayout
+            | AllocationError::DifferentDomain
+            | AllocationError::DifferentAllocationDevice
+            | AllocationError::UnboundAllocationDevice
+            | AllocationError::ReuseDomainMismatch { .. }
+            | AllocationError::Machine(_)
+            | AllocationError::ConfigurationConflict { .. } => {}
+        }
+    }
+    all
+}
+
+/// Every allocation refusal widens into `Error::Allocation` through `?`
+/// without a host allocation, and arrives unchanged.
+#[test]
+fn every_allocation_refusal_widens_into_error_without_allocating() {
+    for refusal in every_allocation_refusal() {
+        let (widened, n) = counted(|| widen::<()>(Err(refusal)));
+        assert_eq!(n, 0, "{refusal:?} allocated {n} times widening into Error");
+        let widened = widened.unwrap_err();
+        assert_eq!(widened.allocation(), Some(refusal), "{widened}");
+        assert!(
+            matches!(widened, lloom_tensor::Error::Allocation(r) if r == refusal),
+            "{refusal:?} did not arrive as Error::Allocation: {widened}"
+        );
+    }
+}
+
+/// The kernel layer's refusals reach `Error` through `MetalKernelError` and
+/// `MetalError`, as the device's `?` writes it; none of those hops allocates.
+#[cfg(feature = "metal")]
+mod kernel_layer {
+    use super::*;
+    use lloom_tensor::kernels::{err::CommandLifecycleError, MetalKernelError};
+    use lloom_tensor::MetalError;
+
+    fn widen_kernel<T>(r: Result<T, MetalKernelError>) -> lloom_tensor::Result<T> {
+        Ok(r.map_err(MetalError::from)?)
+    }
+
+    fn every_recording_refusal() -> [CommandLifecycleError; 6] {
+        let all = [
+            CommandLifecycleError::NotSubmitted,
+            CommandLifecycleError::Busy,
+            CommandLifecycleError::Submitted,
+            CommandLifecycleError::Abandoned,
+            CommandLifecycleError::Exhausted,
+            CommandLifecycleError::StaleOwner,
+        ];
+        for e in all {
+            match e {
+                CommandLifecycleError::NotSubmitted
+                | CommandLifecycleError::Busy
+                | CommandLifecycleError::Submitted
+                | CommandLifecycleError::Abandoned
+                | CommandLifecycleError::Exhausted
+                | CommandLifecycleError::StaleOwner => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn a_recording_refusal_widens_into_error_without_allocating() {
+        for refusal in every_recording_refusal() {
+            let (widened, n) = counted(|| widen_kernel::<()>(Err(MetalKernelError::from(refusal))));
+            assert_eq!(n, 0, "{refusal:?} allocated {n} times widening into Error");
+            let widened = widened.unwrap_err();
+            assert!(
+                matches!(
+                    widened,
+                    lloom_tensor::Error::Metal(MetalError::KernelError(
+                        MetalKernelError::RecordingAdmission(r)
+                    )) if r == refusal
+                ),
+                "{refusal:?} did not arrive as a recording refusal: {widened}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kernel_layer_allocation_refusal_widens_into_error_without_allocating() {
+        for refusal in every_allocation_refusal() {
+            let (widened, n) = counted(|| widen_kernel::<()>(Err(MetalKernelError::from(refusal))));
+            assert_eq!(n, 0, "{refusal:?} allocated {n} times widening into Error");
+            let widened = widened.unwrap_err();
+            assert!(
+                matches!(
+                    widened,
+                    lloom_tensor::Error::Metal(MetalError::KernelError(
+                        MetalKernelError::Allocation(r)
+                    )) if r == refusal
+                ),
+                "{refusal:?} did not arrive as a kernel-layer refusal: {widened}"
+            );
+        }
+    }
+}

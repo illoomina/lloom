@@ -39,8 +39,16 @@ pub trait Served: Send + Sync {
     /// The family-specific half of `/health` (tile, chunk, rows, the pool,
     /// the streamed tier's counters …).
     fn health(&self) -> Value;
+    /// Fallible allocating metadata seam. Incumbent families retain their
+    /// behavior; admitted adapters override before any request producer.
+    fn health_checked(&self) -> Result<Value> {
+        Ok(self.health())
+    }
     /// The family-specific tail of the `[loaded …]` line.
     fn describe(&self) -> String;
+    fn describe_checked(&self) -> Result<String> {
+        Ok(self.describe())
+    }
     /// What the family can do (`family.rs`): the loaded line and `/health` say it.
     fn capabilities(&self) -> super::family::Capabilities;
     /// Every load-time degradation, in the order found: the notes recorded
@@ -48,17 +56,66 @@ pub trait Served: Send + Sync {
     /// the device has admitted (`lloom::load_warning`). The loaded line,
     /// `/health` and the model card render it.
     fn load_warnings(&self) -> Vec<LoadWarning>;
+    fn load_warnings_checked(&self) -> Result<Vec<LoadWarning>> {
+        Ok(self.load_warnings())
+    }
     /// Record the warnings found before the family loaded (the readback
     /// clamps `load_engine` applies), ahead of the family's own.
     fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>);
+    fn note_load_warnings_checked(&mut self, warnings: Vec<LoadWarning>) -> Result<()> {
+        self.note_load_warnings(warnings);
+        Ok(())
+    }
     /// The checkpoint's `generation_config.json`, when it carries one (the
     /// sampling defaults under `--sampling-defaults checkpoint`).
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
         None
     }
+    fn generation_config_checked(&self) -> Result<Option<lloom::hub::GenerationConfig>> {
+        Ok(self.generation_config())
+    }
+
+    /// Decide without generating tokens, using this already-loaded model.
+    /// Raw ordered state/questions reach the shared decision frontend; families
+    /// supply execution, not copies of rendering/readout. The default refusal is
+    /// transitional until every causal family implements retained-trunk execution.
+    fn systemone(
+        &self,
+        _body: &crate::decision::OrderedJson,
+    ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+    {
+        Err(crate::decision::SystemOneError::Unsupported(format!(
+            "{} has no installed decision executor",
+            self.model_name()
+        )))
+    }
+
+    /// [`Self::systemone`] for requests that arrived together (`serve`'s
+    /// decision group). A family that reads single-question requests as one
+    /// tree packs them; the default answers them one by one.
+    fn systemone_batch(
+        &self,
+        bodies: &[&crate::decision::OrderedJson],
+    ) -> Vec<std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>>
+    {
+        bodies.iter().map(|body| self.systemone(body)).collect()
+    }
+
+    /// The template binding this family's decision executor was built with:
+    /// the native decision type the checkpoint is (`None` for a template
+    /// `decision.template` selected) and where the template came from.
+    /// `None` where the family does not say (an owner bound elsewhere).
+    fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
+        None
+    }
 
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;
+    /// Fallible request seam for admitted adapters; existing families preserve
+    /// their incumbent behavior through this compatibility default.
+    fn token_str_checked(&self, id: u32) -> Result<String> {
+        Ok(self.token_str(id))
+    }
     /// Render `messages` through the checkpoint's own chat template with the
     /// generation prompt appended, `kwargs` laid over its variables and each
     /// of `checked` tested against it (`template::Template::render_checked`).
@@ -88,6 +145,16 @@ pub trait Served: Send + Sync {
     fn generation_prompt(&self, _kwarg: Option<bool>, _want: Option<bool>) -> Option<Vec<u32>> {
         None
     }
+    /// Fallible prompt-copy seam for admitted adapters. None denotes actual
+    /// absent/unreadable metadata, never an admission refusal. Existing families
+    /// retain their incumbent load-time cache through this default.
+    fn generation_prompt_checked(
+        &self,
+        kwarg: Option<bool>,
+        want: Option<bool>,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(self.generation_prompt(kwarg, want))
+    }
     /// The renders the chat template has run, for a per-turn count.
     fn template_renders(&self) -> u64 {
         0
@@ -100,13 +167,27 @@ pub trait Served: Send + Sync {
         None
     }
     /// Why this process's decode path cannot feed a thinking budget's
-    /// forced tokens (`budgets::BATCHED`, `budgets::SPECULATIVE`); `None`
-    /// on the K=1 body, which carries it on every readback arm.
+    /// forced tokens (`budgets::BATCHED`); `None` on the K=1 body, which
+    /// carries it on every readback arm, and on the speculative body, whose
+    /// verify feeds each window row the budget's rule over the rows before
+    /// it.
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         None
     }
+    /// The body this process decodes a request through, for the one table
+    /// of what each body refuses (`lloom::nn::refuse`): the K=1 loop unless
+    /// the family was loaded with a drafter or the batch scheduler.
+    fn decode_body(&self) -> lloom::nn::Body {
+        lloom::nn::Body::Step {
+            ring: matches!(self.readback(), ReadbackArm::Ring(_)),
+        }
+    }
     /// The benchmark seed tiled to `n` ids, `row` seed tokens in.
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32>;
+    /// Admission refusal must not masquerade as successful empty prompt data.
+    fn seed_prompt_row_checked(&self, n: usize, row: usize) -> Result<Vec<u32>> {
+        Ok(self.seed_prompt_row(n, row))
+    }
 
     /// One decode over the whole token sequence, streaming fragments; the
     /// hook's `false` ends the run (`Stop::Cancelled`).
@@ -155,6 +236,9 @@ pub trait Served: Send + Sync {
     fn vision_report(&self) -> Value {
         Value::Null
     }
+    fn vision_report_checked(&self) -> Result<Value> {
+        Ok(self.vision_report())
+    }
 
     /// The refusal a family without vision gives, by the family's own reason.
     fn no_vision(&self) -> anyhow::Error {
@@ -178,6 +262,9 @@ pub trait Served: Send + Sync {
     fn diagnostics(&self) -> Vec<String> {
         Vec::new()
     }
+    fn diagnostics_checked(&self) -> Result<Vec<String>> {
+        Ok(self.diagnostics())
+    }
 
     /// The multi-sequence measurement modes (`lloom bench --mode reuse |
     /// concurrent`): built where the family can drive several sequences of
@@ -199,6 +286,29 @@ pub trait Served: Send + Sync {
         batch: usize,
     ) -> Result<DecodeTiming>;
     fn next_token_logprobs(&self, prompt_ids: &[u32], k: usize) -> Result<(u32, Vec<(u32, f32)>)>;
+    /// The full-vocabulary log-probability of each of `labels` as the token
+    /// after `prompt_ids`, in their order, and the most likely token there.
+    /// This default reads the whole distribution through
+    /// [`Self::next_token_logprobs`]; a family may read only the labels.
+    fn first_token_label_read(
+        &self,
+        prompt_ids: &[u32],
+        labels: &[u32],
+    ) -> Result<(Vec<f32>, u32)> {
+        let (argmax, all) = self.next_token_logprobs(prompt_ids, usize::MAX)?;
+        let mut out = vec![f32::NAN; labels.len()];
+        for (id, logprob) in all {
+            for (slot, &label) in out.iter_mut().zip(labels) {
+                if label == id {
+                    *slot = logprob;
+                }
+            }
+        }
+        if out.iter().any(|value| value.is_nan()) {
+            anyhow::bail!("the next-token distribution has no entry for a decision label")
+        }
+        Ok((out, argmax))
+    }
     /// A cell's `batch` must fit what the process was started with.
     fn check_batch(&self, batch: usize) -> Result<()>;
     /// Stop whatever the engine runs on its own threads.
@@ -206,17 +316,78 @@ pub trait Served: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::app::family::QWEN4EXP_CAPABILITIES;
 
     /// A family with no vision, reached only through the seam: every method
     /// the image path could call past the refusal panics.
-    struct NoVision(Device);
+    pub(crate) struct NoVision {
+        device: Device,
+        metadata_mode: u8,
+        pub(crate) warning_epoch: std::sync::atomic::AtomicUsize,
+        pub(crate) metadata_calls: std::sync::atomic::AtomicUsize,
+        pub(crate) calls: std::sync::atomic::AtomicUsize,
+        handler: Option<
+            fn(
+                &crate::decision::OrderedJson,
+            ) -> std::result::Result<
+                crate::decision::SystemOneResponse,
+                crate::decision::SystemOneError,
+            >,
+        >,
+    }
+    impl NoVision {
+        pub(crate) fn new(
+            handler: Option<
+                fn(
+                    &crate::decision::OrderedJson,
+                ) -> std::result::Result<
+                    crate::decision::SystemOneResponse,
+                    crate::decision::SystemOneError,
+                >,
+            >,
+        ) -> Self {
+            Self {
+                device: Device::Cpu,
+                metadata_mode: 0,
+                warning_epoch: std::sync::atomic::AtomicUsize::new(0),
+                metadata_calls: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                handler,
+            }
+        }
+        /// Same inert fixture; nonzero modes make any legacy metadata call
+        /// fail so the actual consumer must select the fallible seam.
+        pub(crate) fn refusing_metadata() -> Self {
+            let mut engine = Self::new(None);
+            engine.metadata_mode = 1;
+            engine
+        }
+        pub(crate) fn dynamic_metadata() -> Self {
+            let mut engine = Self::new(None);
+            engine.metadata_mode = 2;
+            engine
+        }
+    }
 
     impl Served for NoVision {
+        fn systemone(
+            &self,
+            body: &crate::decision::OrderedJson,
+        ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+        {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.handler {
+                Some(handler) => handler(body),
+                None => Err(crate::decision::SystemOneError::Unsupported(
+                    "stub has no installed decision executor".into(),
+                )),
+            }
+        }
         fn device(&self) -> &Device {
-            &self.0
+            &self.device
         }
         fn model_name(&self) -> &str {
             "stub"
@@ -240,7 +411,16 @@ mod tests {
             None
         }
         fn health(&self) -> Value {
+            assert_eq!(self.metadata_mode, 0, "legacy health fallback reached");
             Value::Null
+        }
+        fn health_checked(&self) -> Result<Value> {
+            if self.metadata_mode == 0 {
+                return Ok(self.health());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("bounded metadata health refusal")
         }
         fn describe(&self) -> String {
             String::new()
@@ -249,7 +429,40 @@ mod tests {
             QWEN4EXP_CAPABILITIES
         }
         fn load_warnings(&self) -> Vec<LoadWarning> {
+            assert_eq!(self.metadata_mode, 0, "legacy warning fallback reached");
             Vec::new()
+        }
+        fn load_warnings_checked(&self) -> Result<Vec<LoadWarning>> {
+            if self.metadata_mode == 0 {
+                return Ok(self.load_warnings());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.metadata_mode == 1 {
+                anyhow::bail!("bounded metadata warning refusal");
+            }
+            let epoch = self
+                .warning_epoch
+                .load(std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![LoadWarning::new(
+                lloom::load_warning::LoadWarningKind::EmulatedType,
+                format!("bounded dynamic warning epoch {epoch}"),
+            )])
+        }
+        fn vision_report(&self) -> Value {
+            assert_eq!(
+                self.metadata_mode, 0,
+                "legacy vision metadata fallback reached"
+            );
+            Value::Null
+        }
+        fn vision_report_checked(&self) -> Result<Value> {
+            if self.metadata_mode == 0 {
+                return Ok(self.vision_report());
+            }
+            self.metadata_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("bounded metadata vision refusal")
         }
         fn note_load_warnings(&mut self, _: Vec<LoadWarning>) {}
         fn encode(&self, _: &str, _: bool) -> Result<Vec<u32>> {
@@ -299,7 +512,7 @@ mod tests {
     /// reason, before anything is rendered or decoded.
     #[test]
     fn a_family_without_vision_refuses_an_image_by_name() {
-        let engine = NoVision(Device::Cpu);
+        let engine = NoVision::new(None);
         let image = DecodedImage::from_rgb8(1, 1, vec![0, 0, 0]);
         let want = "qwen4exp does not take image input: no vision tower is built for Qwen4-exp";
         let err = engine.image_placeholder(&image).unwrap_err().to_string();

@@ -1,3 +1,4 @@
+pub mod bounded;
 pub mod cpu_flash;
 pub mod varlen;
 

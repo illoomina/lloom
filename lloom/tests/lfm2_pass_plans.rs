@@ -834,14 +834,15 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
 }
 
 /// A base grow the machine cannot take is REFUSED before it is allocated
-/// (`DESIGN.md` §9.5, the KV grow's gate): the run stops with a message
-/// naming the key, nothing was allocated, and no plan was cached — so the
+/// (`DESIGN.md` §9.5, the KV grow's gate): the run stops with a typed
+/// budget refusal, nothing was allocated, and no plan was cached — so the
 /// pass would have run on the pool as it did before the cache existed.
 ///
 /// Driven by setting the admitted fraction to a value the process is already
 /// over, which is the same shape as a real machine being out of room.
 #[test]
 fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
+    use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
     let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
@@ -857,15 +858,18 @@ fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
     m.set_pass_plan_admit_fraction(1e-9);
     let err = run_prompt::<RewindableExact>(&model, &cfg, &dev, &prompt, 0, 3)
         .expect_err("the grow must be refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("pass plan base grow refused"),
-        "the refusal must name itself: {msg}"
-    );
-    assert!(
-        msg.contains("Nothing was allocated"),
-        "the refusal must say the run is intact: {msg}"
-    );
+    eprintln!("REFUSED {:?}", err.allocation());
+    match err.allocation() {
+        Some(AllocationError::Refused {
+            requested,
+            available,
+            domain: RefusalDomain::Budget,
+        }) => assert!(
+            requested > 0 && available < requested,
+            "the base grow's refusal names its bytes and less room: {err}"
+        ),
+        _ => panic!("not a typed budget refusal of the base grow: {err}"),
+    }
     let c = m.pass_plan_counters().unwrap();
     assert_eq!(c.plans, 0, "a plan was cached over a refused base: {c:?}");
     assert_eq!(c.base_grows, 0, "the base grew after the refusal: {c:?}");
@@ -1230,5 +1234,105 @@ fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> R
         (4 + turn_ring, 0),
         "the unfused shuffle asked the pools for state per step"
     );
+    Ok(())
+}
+
+/// A SAMPLED speculative run under the plan cache, with processors: the
+/// window's draw runs inside the verify's planned pass and the round's kept
+/// tokens move the processors' history, and neither may let the plan serve
+/// a buffer still in use. The stream under plans is the pool path's, over a
+/// recording round and served ones, for a greedy and a multinomial sampler
+/// that both read a per-row history; and it is the K=1 run's.
+#[test]
+fn a_planned_sampled_verify_with_processors_keeps_the_stream() -> Result<()> {
+    use lloom::generation::{Blocking, LogitsProcessor, Processors, Sampling};
+    use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+    let _serial = SERIAL.lock();
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let k = 3usize;
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: k + 1 });
+    cfg.tap_layers = vec![0, 1, 2, 0, 1];
+    cfg.tap_dtype = DType::F32;
+    let model = build::<RewindableExact>(&cfg, &dev)?;
+    let prompt: Vec<u32> = (1..=10).collect();
+    let eos: Vec<u32> = vec![u32::MAX];
+    let procs = Processors {
+        repetition_penalty: 1.2,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.3,
+        min_p: 0.05,
+        logit_bias: vec![(3, 1.0)],
+    };
+    let sampler = |sampling: &Sampling| {
+        let mut s =
+            LogitsProcessor::from_sampling(4, sampling.clone()).with_processors(procs.clone());
+        s.observe_prompt(&prompt);
+        s
+    };
+    let spec_run = |sampling: &Sampling| -> Result<Vec<u32>> {
+        let mut session = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+        );
+        let mut spec = GarbageDrafter {
+            k,
+            token: 0,
+            seen: Vec::new(),
+        };
+        let mut rb = Blocking::new(&eos, &dev)?;
+        let mut s = sampler(sampling);
+        Ok(session
+            .decode_speculative(
+                lloom::profile::RewindProof::of(),
+                &mut spec,
+                &mut rb,
+                &mut s,
+                &prompt,
+                &DecodeOptions::new(12),
+                &eos,
+                &mut |_: &[u32]| Ok(()),
+            )?
+            .ids)
+    };
+    let k1_run = |sampling: &Sampling| -> Result<Vec<u32>> {
+        let mut session = Session::new(
+            &model,
+            State::<RewindableExact>::new(true, DType::F16, &cfg, &dev)?,
+        );
+        let mut rb = Blocking::new(&eos, &dev)?;
+        let mut s = sampler(sampling);
+        Ok(session
+            .decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut s,
+                &prompt,
+                &DecodeOptions::new(12),
+                &mut |_: &[u32]| Ok(()),
+            )?
+            .ids)
+    };
+    let cells = [Sampling::ArgMax, Sampling::All { temperature: 0.9 }];
+    let pool: Vec<Vec<u32>> = cells.iter().map(&spec_run).collect::<Result<_>>()?;
+    let k1: Vec<Vec<u32>> = cells.iter().map(&k1_run).collect::<Result<_>>()?;
+    m.enable_pass_plans(ArenaLayout::Packed);
+    for round in 0..3 {
+        for (i, sampling) in cells.iter().enumerate() {
+            let ids = spec_run(sampling)?;
+            assert_eq!(
+                ids, pool[i],
+                "round {round} {sampling:?}: the planned sampled verify moved the stream"
+            );
+        }
+    }
+    let c = m.pass_plan_counters().unwrap();
+    eprintln!("[sampled+procs] {c:?} pool={pool:?} k1={k1:?}");
+    assert_eq!(c.evicted, 0, "a verify drifted under its own plan: {c:?}");
+    // The pool path is the K=1 run's (the window's rows are an m = k + 1
+    // pass and the K=1 steps m = 1; on this fixture no row is a near-tie).
+    assert_eq!(pool, k1, "the speculative stream is not the K=1 run's");
     Ok(())
 }

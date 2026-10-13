@@ -508,7 +508,7 @@ pub struct DecodeConfig {
     /// Diagnostic, perturbs what it measures: drain the GPU per phase of a speculative round.
     #[opt(bool, path = "diagnostics.phase_sync", status = "instrument", cli = "phase-sync", facets = ["wait"], flows = ["commands-out"])]
     pub phase_sync: bool,
-    /// Diagnostic, perturbs what it measures: hash every decode step's logits (each value's f32 bits, little-endian, one SHA-256 over the run — the harnesses' `logits_sha256`) and report it beside the tokens' digest; runs the blocking readback, refused by the speculative body.
+    /// Diagnostic, perturbs what it measures: hash every decode step's logits (each value's f32 bits, little-endian, one SHA-256 over the run — the harnesses' `logits_sha256`) and report it beside the tokens' digest; runs the blocking readback, and under the speculative body hashes the rows each round keeps.
     #[opt(bool, path = "diagnostics.logits_digest", status = "instrument", cli = "logits-digest", facets = ["consume"], flows = ["token-out"])]
     pub logits_digest: bool,
     /// The prefill's shape.
@@ -956,8 +956,8 @@ pub struct SamplingConfig {
         cli = "top-k"
     )]
     pub top_k: Option<usize>,
-    /// Device gumbel-max sampling at the temperature (rides the ring).
-    #[opt(bool, path = "generation.device_sampler", status = "advanced", facets = ["produce"], flows = ["token-out"])]
+    /// How a temperature draws: `multinomial` (one uniform per position and the inverse CDF; the default) or `gumbel` (gumbel-max, one noise variate per vocabulary entry). Each is keyed by the seed and the position of the token it draws, so every readback arm and a speculative run draw the same tokens at one seed.
+    #[opt(bool, path = "generation.sampling.method", values = ["gumbel=true", "multinomial=false"], variants = ["multinomial", "gumbel"], legacy_keys = ["generation.device_sampler"], status = "stable", facets = ["produce"], flows = ["token-out"])]
     pub gumbel: bool,
     /// The seed; none draws a fresh one per run (repeats explore), a value reproduces.
     #[opt(
@@ -1550,6 +1550,25 @@ pub struct LoadConfig {
         cli = "tokenizer"
     )]
     pub tokenizer: Option<std::path::PathBuf>,
+    /// Explicit GGUF media companion (d1-omni vision/audio). No sidecar variant is guessed. Safetensors checkpoints keep media in their checkpoint and do not consume this option.
+    #[opt(
+        flag = "mmproj",
+        path = "model.mmproj",
+        status = "advanced",
+        cli = "mmproj"
+    )]
+    pub mmproj: Option<std::path::PathBuf>,
+    /// The template `/v1/systemone` answers with. Unset (or `auto`): a native decision checkpoint's own binding (d1-3B, d1-omni), else decisions are refused by name. `generic`: one label token per option through the model's own chat template, thinking off, uncalibrated (every answer reports its label mass). `lfm2-d1` | `lfm2-d1-omni`: the engine-shipped d1 template. A path: that systemone Jinja template.
+    #[opt(
+        flag = "decision-template",
+        path = "decision.template",
+        status = "advanced",
+        cli = "decision-template"
+    )]
+    pub decision_template: Option<String>,
+    /// Load no vision or audio tower (a GGUF's mmproj, a VL checkpoint's tower): for text workloads, at the tower's memory. Image requests are then refused by name, and `/v1/models` lists text input only.
+    #[opt(bool, flag = "text-only", path = "model.text_only", status = "advanced", cli = "text-only")]
+    pub text_only: bool,
     /// Compile the prefill pipelines at load (off: the first prompt compiles them inside its own time to first token).
     #[opt(bool, flag = "warmup", path = "model.warmup", status = "advanced", switches = ["no-warmup=false"])]
     pub warmup: bool,
@@ -1601,6 +1620,9 @@ impl Default for LoadConfig {
             model: None,
             model_name: None,
             tokenizer: None,
+            mmproj: None,
+            decision_template: None,
+            text_only: false,
             warmup: true,
             device: "auto".into(),
             experts: "stream".into(),
@@ -1637,6 +1659,12 @@ pub struct SchedulerConfig {
     /// How the rows of a batch hold their state: `auto` (`pool` at a batch), `pool` (one shared paged pool, the batch in one dispatch per kernel), `pool-per-row` (the same pool, the per-row loop) or `private` (a cache per row).
     #[opt(flag = "rows", parser = "parse_rows", variants = ["auto", "pool", "pool-per-row", "private"], path = "scheduler.rows", status = "advanced")]
     pub rows: String,
+    /// Read `/v1/systemone` requests that wait together for the model as one tree, the reference's packing of single-question requests (the `fast` contract only: under `deterministic` each request is read alone).
+    #[opt(bool, flag = "decision-pack", path = "scheduler.decision_pack", status = "advanced", switches = ["no-decision-pack=false"])]
+    pub decision_pack: bool,
+    /// Read a `/v1/systemone` request's questions as one ragged batch over its state, the state prefilled once and kept for the next request over it (the `fast` contract only: under `deterministic` the questions are read one after another from a restore of the state).
+    #[opt(bool, flag = "decision-ragged", path = "scheduler.decision_ragged", status = "advanced", switches = ["no-decision-ragged=false"])]
+    pub decision_ragged: bool,
 }
 
 impl Default for SchedulerConfig {
@@ -1644,6 +1672,8 @@ impl Default for SchedulerConfig {
         SchedulerConfig {
             max_sequences: 1,
             rows: "auto".into(),
+            decision_pack: true,
+            decision_ragged: true,
         }
     }
 }

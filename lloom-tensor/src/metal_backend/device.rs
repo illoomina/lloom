@@ -154,8 +154,10 @@ pub struct PassAdmission {
     pub fits: bool,
     /// The machine gate's refusal (`machine.rs`), when the pass fit the
     /// quota but the bytes past what the process reserved on the machine
-    /// did not fit the machine: the arithmetic, for the caller's message.
-    pub machine: Option<String>,
+    /// did not fit the machine: `Refused { domain: Machine }` with the
+    /// growth and the room. The arithmetic is the ledger's
+    /// (`Ledger::last_machine_refusal`).
+    pub machine: Option<crate::memory_admission::AllocationError>,
 }
 
 impl PassAdmission {
@@ -1068,7 +1070,7 @@ impl MetalDevice {
     /// still wait on their command buffers, bytes the next pass reuses once
     /// those complete, so a refusal read on the first figure would refuse a
     /// pass the reservation holds. Still past it, the pass is refused with
-    /// the gate's arithmetic (`PassAdmission::machine`). Inside the
+    /// the gate's refusal (`PassAdmission::machine`). Inside the
     /// reservation all of this is one comparison.
     pub fn admit_bytes(&self, need: usize, budget: usize) -> PassAdmission {
         let mut a = self.admit_quota(need, budget);
@@ -1101,6 +1103,27 @@ impl MetalDevice {
             a.machine = Some(why);
         }
         a
+    }
+
+    /// One stderr line for a pass-level refusal, on its cold path: what was
+    /// refused, and the machine gate's arithmetic when the machine refused.
+    /// The refusal itself travels as the `Copy` error.
+    pub fn report_refusal(
+        &self,
+        what: &dyn std::fmt::Display,
+        refusal: &crate::memory_admission::AllocationError,
+    ) {
+        use crate::memory_admission::{AllocationError, RefusalDomain};
+        eprintln!("[{what}: {refusal}]");
+        if let AllocationError::Refused {
+            domain: RefusalDomain::Machine,
+            ..
+        } = refusal
+        {
+            if let Some(verdict) = self.ledger.last_machine_refusal() {
+                eprintln!("{}", verdict.describe());
+            }
+        }
     }
 
     fn admit_quota(&self, need: usize, budget: usize) -> PassAdmission {
@@ -2718,14 +2741,25 @@ impl MetalDevice {
             if transaction.fraction > 0.0 {
                 let working_set = self.device.recommended_max_working_set_size();
                 let budget = (working_set as f64 * transaction.fraction) as usize;
-                let a = self.admit_bytes(needed.saturating_sub(transaction.have), budget);
-                if let Some(why) = a.machine {
-                    return Err(
-                        MetalError::Message(format!("pass plan base grow refused: {why}")).into(),
-                    );
-                }
+                let grow = needed.saturating_sub(transaction.have);
+                let a = self.admit_bytes(grow, budget);
                 if !a.fits {
-                    return Err(MetalError::Message(format!("pass plan base grow refused: {} B committed, {} B budget, {} B net grow; no plan cached", a.committed, budget, needed.saturating_sub(transaction.have))).into());
+                    let refusal =
+                        a.machine
+                            .unwrap_or(crate::memory_admission::AllocationError::Refused {
+                                requested: grow,
+                                available: budget.saturating_sub(a.committed),
+                                domain: crate::memory_admission::RefusalDomain::Budget,
+                            });
+                    self.report_refusal(
+                        &format_args!(
+                            "pass plan base grow refused: {} B committed, {} B budget, \
+                             {} B net grow; no plan cached, nothing allocated",
+                            a.committed, budget, grow
+                        ),
+                        &refusal,
+                    );
+                    return Err(refusal.into());
                 }
             }
             Some(self.backings.resident_private.stage(needed, context)?)

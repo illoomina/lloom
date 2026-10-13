@@ -35,7 +35,6 @@ fn a_host_sort_draw_reads_its_probabilities_from_a_slot() -> Result<()> {
         .map(|s| step_logits(s, &device))
         .collect::<Result<_>>()?;
     for sampling in [
-        Sampling::All { temperature: 0.8 },
         Sampling::TopP {
             p: 0.9,
             temperature: 0.7,
@@ -128,5 +127,60 @@ fn the_greedy_draw_reads_its_id_from_the_slot_it_wrote() -> Result<()> {
         seen.len() > 20,
         "the steps did not exercise distinct ids: {seen:?}"
     );
+    Ok(())
+}
+
+/// The device draws a blocking arm makes at a temperature — multinomial (the
+/// inverse-CDF dispatch) and gumbel-max — hand the host their id through the
+/// draw slot, as the greedy draw does: one slot read a draw, nothing read
+/// back, nothing blitted. The reference is the device draw read back
+/// directly, at the same positions.
+#[test]
+fn a_device_draw_at_a_temperature_reads_its_id_from_the_slot() -> Result<()> {
+    let _serial = SERIAL.lock();
+    let device = Device::new_metal(0)?;
+    let inputs: Vec<Tensor> = (0..32)
+        .map(|s| step_logits(s, &device))
+        .collect::<Result<_>>()?;
+    for sampling in [
+        Sampling::All { temperature: 0.8 },
+        Sampling::GumbelSoftmax { temperature: 0.8 },
+    ] {
+        let mut sampler = LogitsProcessor::from_sampling(7, sampling.clone());
+        device.synchronize()?;
+        let before = lloom_tensor::metal_backend::readback_counts();
+        let got: Vec<u32> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                sampler.at_position(Some(i as u64));
+                sampler.sample(x)
+            })
+            .collect::<Result<_>>()?;
+        let r = lloom_tensor::metal_backend::readback_counts().since(&before);
+        eprintln!("[draw slot] {sampling:?}: {r:?}");
+        assert_eq!(
+            (r.slot, r.fast, r.blit, r.staging_allocs),
+            (inputs.len() as u64, 0, 0, 0),
+            "{sampling:?}: {r:?}"
+        );
+        let mut reference = LogitsProcessor::from_sampling(7, sampling.clone());
+        let want: Vec<u32> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                reference.at_position(Some(i as u64));
+                Ok(reference
+                    .sample_argmax_on_device(x)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?[0])
+            })
+            .collect::<Result<_>>()?;
+        assert_eq!(got, want, "{sampling:?}: the slot moved the draw");
+        assert!(
+            got.iter().collect::<std::collections::BTreeSet<_>>().len() > 8,
+            "{sampling:?}: a degenerate stream {got:?}"
+        );
+    }
     Ok(())
 }

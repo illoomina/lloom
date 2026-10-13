@@ -548,6 +548,97 @@ fn each_row_of_a_ragged_pass_is_its_own_forward_on_the_cpu() -> Result<()> {
     Ok(())
 }
 
+/// Rows continuing one retained trunk (`AdoptRetained`, the decision
+/// executor's ragged read, `docs/models/d1.md`): the trunk prefilled once and
+/// retained, three fresh caches adopting it and running ONE ragged pass of
+/// their own tokens, each row's logits those of one pass over its whole
+/// prompt (the conv's left context is the trunk's), and the trunk unchanged
+/// for a late adopter. On the Cat arm only: an in-place slab refuses adoption.
+#[test]
+fn rows_adopting_a_retained_trunk_continue_it_on_the_cpu() -> Result<()> {
+    knobs();
+    for conv_state in [ConvState::Shuffle, ConvState::RotatingRing { k: 2 }] {
+        let mut cfg = tiny_config_on(conv_state);
+        cfg.kv_append = KvAppend::Cat;
+        let key = cfg.profile_key();
+        lloom::profile::dispatch!(key, lloom::profile::LFM2, P => adopted_rows_at::<P>(cfg, true))?;
+    }
+    let cfg = tiny_config();
+    let key = cfg.profile_key();
+    lloom::profile::dispatch!(key, lloom::profile::LFM2, P => adopted_rows_at::<P>(cfg, false))?;
+    Ok(())
+}
+
+/// `adopts`: the arm takes adoption (Cat), else it must refuse it.
+fn adopted_rows_at<P: Lfm2Shape>(cfg: Config, adopts: bool) -> Result<()> {
+    use lloom::nn::branch::{AdoptRetained, RetainState};
+    let dev = Device::Cpu;
+    let model = build::<P>(&cfg, DType::F32, &dev)?;
+    let trunk: Vec<u32> = vec![7, 22, 13, 4, 35];
+    let suffixes: [&[u32]; 3] = [&[18, 9], &[26], &[2, 41, 30, 11]];
+    let mut source = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+    source.prepare_branching()?;
+    let input = Tensor::new(trunk.as_slice(), &dev)?.unsqueeze(0)?;
+    let _ = model.forward(&input, 0, &mut source)?;
+    let saved = source.retain_state()?;
+    let adopt = || -> Result<State<P>> {
+        let mut cache = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+        cache.prepare_branching()?;
+        cache.adopt_retained(&saved)?;
+        Ok(cache)
+    };
+    if !adopts {
+        assert!(
+            adopt().is_err(),
+            "an in-place cache adopted a retained trunk"
+        );
+        return Ok(());
+    }
+    let mut caches = vec![adopt()?, adopt()?, adopt()?];
+    let ids = suffixes.concat();
+    let input = Tensor::new(ids.as_slice(), &dev)?.unsqueeze(0)?;
+    let mut rows: Vec<RaggedRow<'_, State<P>>> = caches
+        .iter_mut()
+        .zip(&suffixes)
+        .map(|(cache, s)| RaggedRow {
+            pos: trunk.len(),
+            len: s.len(),
+            cache,
+        })
+        .collect();
+    let logits = model.forward_ragged(&input, &mut rows)?;
+    drop(rows);
+    let mut got = Vec::new();
+    for (r, s) in suffixes.iter().enumerate() {
+        let all: Vec<u32> = trunk.iter().chain(s.iter()).copied().collect();
+        let mut alone = State::<P>::new(true, DType::F32, &cfg, &dev)?;
+        let input = Tensor::new(all.as_slice(), &dev)?.unsqueeze(0)?;
+        let want = model
+            .forward(&input, 0, &mut alone)?
+            .i(0)?
+            .to_vec1::<f32>()?;
+        let row = logits.i(r)?.to_vec1::<f32>()?;
+        let d = max_abs_diff(&want, &row);
+        eprintln!(
+            "{:?} adopted row {r}: max |one pass - ragged| = {d:e}",
+            cfg.conv_state
+        );
+        assert!(d < TOL, "row {r}: max |one pass - ragged| = {d}");
+        assert_eq!(argmax(&want), argmax(&row), "row {r}: the argmax moved");
+        got.push(row);
+    }
+    assert_rows_differ(&got);
+    let mut late = adopt()?;
+    let input = Tensor::new(suffixes[0], &dev)?.unsqueeze(0)?;
+    let again = model
+        .forward(&input, trunk.len(), &mut late)?
+        .i(0)?
+        .to_vec1::<f32>()?;
+    let d = max_abs_diff(&again, &got[0]);
+    assert!(d < TOL, "a late adopter read another trunk: {d}");
+    Ok(())
+}
+
 /// Metal, f16, under the forced GEMM: every row of the ragged pass is
 /// bit-identical to its own forward, the piece row's to one pass over its
 /// whole prompt.

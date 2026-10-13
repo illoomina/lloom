@@ -2027,6 +2027,19 @@ using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
 template <int val>
 using Int = integral_constant<int, val>;
 
+// MSL integral_constant does not implicitly convert in int * constant.
+// Preserve compile-time unit strides while accepting the mask's runtime stride.
+template <typename T>
+METAL_FUNC constexpr T attn_stride_value(T value) {
+  return value;
+}
+
+template <typename T, T value>
+METAL_FUNC constexpr T attn_stride_value(integral_constant<T, value>) {
+  return value;
+}
+
+
 ///////////////////////////////////////////////////////////////////////////////
 // Binary Operators on Integral constants
 ///////////////////////////////////////////////////////////////////////////////
@@ -2222,7 +2235,8 @@ struct BaseMMAFrag<T, 8, 8> {
       for (short j = 0; j < kElemCols; j++) {
         if ((off_x + i) < lim_x && (off_y + j) < lim_y) {
           dst[i * kElemCols + j] =
-              static_cast<T>(src[(off_x + i) * str_x + (off_y + j) * str_y.value]);
+              static_cast<T>(src[(off_x + i) * str_x +
+                                 (off_y + j) * attn_stride_value(str_y)]);
         } else {
           dst[i * kElemCols + j] = T(0);
         }
@@ -2885,7 +2899,7 @@ struct AttnParams {
 };
 
 struct AttnMaskParams {
-  int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
+  int64_t M_strides[4]; ///< Mask strides (B, H, qL, kL); zero denotes broadcast
 };
 
 /// The page-walking K/V address (`is_paged`): K and V are one pool,
@@ -2913,6 +2927,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool is_paged [[function_constant(302)]];
+constant bool mask_k_contiguous [[function_constant(303)]];
 
 template <typename T>
 struct TransformScale {
@@ -3280,15 +3295,29 @@ template <
 
           frag_t mfrag;
 
-          MMAFrag_mask_t::load_safe(
-              mfrag,
-              mask,
-              int(mask_params->M_strides[2]),
-              Int<1>{},
-              params->qL,
-              kL,
-              row_pos,
-              col_pos);
+          // Pipeline specialization keeps the existing unit-stride path;
+          // strided tensor views use their actual key stride (including 0).
+          if (mask_k_contiguous) {
+            MMAFrag_mask_t::load_safe(
+                mfrag,
+                mask,
+                int(mask_params->M_strides[2]),
+                Int<1>{},
+                params->qL,
+                kL,
+                row_pos,
+                col_pos);
+          } else {
+            MMAFrag_mask_t::load_safe(
+                mfrag,
+                mask,
+                mask_params->M_strides[2],
+                mask_params->M_strides[3],
+                params->qL,
+                kL,
+                row_pos,
+                col_pos);
+          }
 
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemsPerFrag; jj++) {

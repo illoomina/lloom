@@ -68,12 +68,14 @@ fn affine_then_wait(device: &Device, cmds: &Commands) -> Result<Vec<f32>, MetalK
 }
 
 /// Encode a blit copy whose source the host releases before the command
-/// buffer is committed, and commit it. Returns the marker for that buffer.
+/// buffer is committed, and commit it. Returns the marker for that buffer, or
+/// the latched failure when Metal failed the buffer before the commit had
+/// registered its replacement.
 fn commit_a_copy_of_a_released_buffer(
     device: &Device,
     cmds: &Commands,
     len: usize,
-) -> CommandMarker {
+) -> Result<CommandMarker, MetalKernelError> {
     let src = filled(device, len, 0x5a);
     let dst = filled(device, len, 0);
     {
@@ -84,7 +86,17 @@ fn commit_a_copy_of_a_released_buffer(
         unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, len) };
     }
     drop(src);
-    cmds.flush_marker().unwrap()
+    cmds.flush_marker()
+}
+
+/// The latch, after the injected buffer failed: the failure is Metal's, and
+/// the queue reports it at every later commit and wait.
+fn assert_latched(device: &Device, cmds: &Commands, failure: &MetalKernelError, attempt: usize) {
+    let msg = failure.to_string();
+    assert!(msg.contains("Invalid Resource"), "attempt {attempt}: {msg}");
+    assert!(cmds.check_failed().is_err());
+    assert!(affine_then_wait(device, cmds).is_err());
+    assert!(cmds.flush_and_wait().is_err());
 }
 
 /// **The injected failure.** Under the unretained kind, a command buffer whose
@@ -92,6 +104,13 @@ fn commit_a_copy_of_a_released_buffer(
 /// with an invalid-resource error. The wait that follows names a LATER,
 /// healthy buffer, which completes cleanly; it must fail exactly when the
 /// earlier one did, and every wait and commit after it must fail too.
+///
+/// The failure can also surface one step earlier, at the commit of the
+/// failing buffer itself: the commit registers the buffer that replaces it,
+/// and that registration reads the queue's latch, so when Metal has failed the
+/// copy before it, `flush_marker` returns the failure instead of a marker.
+/// That is the latch reporting at a later commit, and it is held to the same
+/// assertions.
 ///
 /// Metal does not fail the released read every time: alone in a process it
 /// failed 4 of 4 copies, beside other GPU tests most completed. So the
@@ -102,10 +121,21 @@ fn commit_a_copy_of_a_released_buffer(
 fn a_failed_command_buffer_fails_the_next_wait_whichever_buffer_it_names() {
     let device = Device::system_default().expect("no Metal device");
     let len = 64 << 20;
-    let mut injected = 0;
+    let (mut at_wait, mut at_commit, mut attempts) = (0, 0, 0);
     for attempt in 0..16 {
+        attempts += 1;
         let cmds = commands(&device, CommandBufferKind::Unretained);
-        let first = commit_a_copy_of_a_released_buffer(&device, &cmds, len);
+        let first = match commit_a_copy_of_a_released_buffer(&device, &cmds, len) {
+            Ok(marker) => marker,
+            Err(failure) => {
+                assert_latched(&device, &cmds, &failure, attempt);
+                at_commit += 1;
+                if at_wait + at_commit == 2 {
+                    break;
+                }
+                continue;
+            }
+        };
         let waited = affine_then_wait(&device, &cmds);
         let first_failed = cmds.marker_failed(&first);
         assert_eq!(
@@ -116,27 +146,24 @@ fn a_failed_command_buffer_fails_the_next_wait_whichever_buffer_it_names() {
             if first_failed { "had" } else { "had not" }
         );
         if first_failed {
-            let msg = waited.unwrap_err().to_string();
-            assert!(msg.contains("Invalid Resource"), "{msg}");
-            // Latched: the queue reports it at every later commit and wait.
-            assert!(cmds.check_failed().is_err());
-            assert!(affine_then_wait(&device, &cmds).is_err());
-            assert!(cmds.flush_and_wait().is_err());
-            injected += 1;
-            if injected == 2 {
+            assert_latched(&device, &cmds, &waited.unwrap_err(), attempt);
+            at_wait += 1;
+            if at_wait + at_commit == 2 {
                 break;
             }
         }
     }
+    eprintln!("INJECTED attempts={attempts} at_wait={at_wait} at_commit={at_commit}");
     assert!(
-        injected > 0,
+        at_wait + at_commit > 0,
         "Metal failed none of the 16 injected command buffers: the test injected nothing"
     );
 
     // The retaining kind is the control: the command buffer holds the source
     // itself, so the same sequence is clean and the copy lands.
     let cmds = commands(&device, CommandBufferKind::Retaining);
-    let first = commit_a_copy_of_a_released_buffer(&device, &cmds, len);
+    let first = commit_a_copy_of_a_released_buffer(&device, &cmds, len)
+        .expect("the retaining kind holds the source");
     let out = affine_then_wait(&device, &cmds).expect("the retaining kind holds the source");
     assert_eq!(out[3], 7.0);
     assert!(!cmds.marker_failed(&first));

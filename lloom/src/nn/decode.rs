@@ -113,6 +113,113 @@ impl Speculator for IdentityProposer {
     }
 }
 
+/// The bodies a decode runs through — one loop, arms by what a round feeds
+/// (`docs/decode-driver-design.md`, the one loop). A round is a verify
+/// window: the anchor and the drafts behind it. Non-speculative decoding is
+/// the window of the anchor alone, and [`Body::Step`] is that window's own
+/// arm: the drawn token fed on the device, never read back on a ring arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Body {
+    /// The anchor alone a step (`Session::decode_until`); `ring` when the
+    /// token rides the device-resident ring rather than the blocking
+    /// readback.
+    Step { ring: bool },
+    /// The anchor and its drafts a round (`Session::decode_speculative`;
+    /// with a proposer that drafts nothing, the zero-draft window).
+    Window,
+    /// Several sequences' steps in one forward (`Session::decode_batched`,
+    /// the batch scheduler).
+    BatchedStep,
+    /// Several sequences' windows (`Session::decode_speculative_pipelined`,
+    /// the pool rows' `SpecBatchDecoder`).
+    BatchedWindow,
+}
+
+/// What a request asks of the body that serves it.
+#[derive(Debug, Clone, Copy)]
+pub struct Asks<'a> {
+    pub sampling: &'a Sampling,
+    /// Logits processors (bias, penalties, min-p).
+    pub processors: bool,
+    /// A thinking budget.
+    pub budget: bool,
+    /// The logits digest.
+    pub digest: bool,
+    /// Each drawn id's log-probability (a host read of every step's row).
+    pub logprobs: bool,
+}
+
+impl<'a> Asks<'a> {
+    /// What `sampler` asks, with or without a thinking budget.
+    pub fn of(sampler: &'a LogitsProcessor, budget: bool) -> Self {
+        Asks {
+            sampling: sampler.sampling(),
+            processors: sampler.processors().is_some(),
+            budget,
+            digest: sampler.digests(),
+            logprobs: false,
+        }
+    }
+}
+
+/// The ONE table of what a body cannot serve, refused by name before any
+/// state moves. Every driver asks it; nothing is served under a label it
+/// does not run.
+///
+/// - The ring step draws on the device: the host-sort arms (top-k, top-p)
+///   sort on the host, and the digest reads every step's logits there.
+/// - The window serves every sampler arm and feature: each row is drawn
+///   keyed to its position against the history its position has
+///   (`LogitsProcessor::window_draw_device`). It reads back the ids a round
+///   keeps, never a row, so the per-token logprobs are the K=1 body's.
+/// - The batched bodies draw per row without processors, feed no forced
+///   token and keep no logprobs; the batched windows verify by the argmax.
+pub fn refuse(body: Body, asks: &Asks<'_>) -> Result<()> {
+    let host_sort = matches!(
+        asks.sampling,
+        Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. }
+    );
+    match body {
+        Body::Step { ring: true } if host_sort => lloom_tensor::bail!(
+            "the ring needs a device-resident sampler (argmax, multinomial or gumbel-max); \
+             {:?} takes a host sort and cannot ride it (DESIGN.md §11.2c)",
+            asks.sampling
+        ),
+        Body::Step { ring: true } if asks.digest => lloom_tensor::bail!(
+            "the ring draws on the device and the logits digest reads every step's logits on \
+             the host: the digest runs on the blocking arm"
+        ),
+        Body::Step { ring: true } if asks.logprobs => lloom_tensor::bail!(
+            "the ring draws on the device and the per-token logprobs read every step's row on \
+             the host: they run on the blocking arm"
+        ),
+        Body::Window if asks.logprobs => lloom_tensor::bail!(
+            "the window reads back the ids a round keeps, never a row of logits: the per-token \
+             logprobs are the non-speculative body's"
+        ),
+        Body::Step { .. } | Body::Window => Ok(()),
+        Body::BatchedStep | Body::BatchedWindow if asks.processors => lloom_tensor::bail!(
+            "a batched body does not run logits processors (logit_bias, repetition/presence/\
+             frequency penalties, min_p): its rows draw through the batched driver's per-row \
+             sampler or one device argmax over the batch (serve them at a batch of 1)"
+        ),
+        Body::BatchedStep | Body::BatchedWindow if asks.budget => lloom_tensor::bail!(
+            "a batched body does not carry a thinking budget: its rows feed no forced token \
+             (serve it at a batch of 1)"
+        ),
+        Body::BatchedStep | Body::BatchedWindow if asks.logprobs => lloom_tensor::bail!(
+            "a batched body does not keep per-token logprobs: its rows draw on the device and \
+             read the ids back (serve it at a batch of 1)"
+        ),
+        Body::BatchedWindow if *asks.sampling != Sampling::ArgMax => lloom_tensor::bail!(
+            "a batched speculative body verifies by the argmax: {:?} is refused rather than \
+             served as argmax (serve it at a batch of 1, where the window draws each row)",
+            asks.sampling
+        ),
+        Body::BatchedStep | Body::BatchedWindow => Ok(()),
+    }
+}
+
 /// The knobs of one decode run.
 // Not `Copy`: `prefill_schedule` is an owned `Vec`. `DecodeOptions` is passed
 // by reference everywhere (`opts: &DecodeOptions`), so this costs the hot path
@@ -2813,6 +2920,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if prompt.is_empty() {
             return Ok(PrefillOut::default());
         }
+        // A failed forward may already mutate the cache. Previous logits no
+        // longer describe it; failure requires caller recovery/reset, not a
+        // stale prediction. This invalidates the result, not the transaction.
+        self.seq.last_logits = None;
         let device = readback.device().clone();
         // The prefill's own in-flight bound when one is set, as `decode` runs
         // its prefill block at (`prefill_pacer_depth`); else the decode depth.
@@ -2999,37 +3110,23 @@ impl<'m, M: CausalLM> Session<'m, M> {
         M: Probes<S::Probe> + crate::profile::Shaped,
         R: ReadbackStrategy,
     {
-        // The verify samples the target's token per window position with
-        // this sampler at `t > 0` (`Probes::verify_and_probe_sampled`, #943
-        // §2) and reads the argmax at `t = 0`, as it always has. What it
-        // cannot draw position-keyed is refused here, by name, before any
-        // state is touched: the host-sort arms draw through one running
-        // multinomial, and processors keep a per-token history a rejected
-        // row would corrupt.
-        let sampled = !matches!(sampler.sampling(), Sampling::ArgMax);
-        if sampled {
-            match sampler.sampling() {
-                Sampling::All { .. } | Sampling::GumbelSoftmax { .. } => {}
-                other => lloom_tensor::bail!(
-                    "Session::decode_speculative: {other:?} draws through a host sort on one \
-                     running rng, which a verify window cannot key by position; the \
-                     speculative body serves argmax and the gumbel-max arms (plain \
-                     temperature, --gumbel)"
-                ),
-            }
-            if sampler.processors().is_some() {
-                lloom_tensor::bail!(
-                    "Session::decode_speculative: logits processors keep a per-token history, \
-                     and a verify window draws rows it may reject; not served under a sampled \
-                     verify"
-                );
-            }
-        }
-        if spec.max_draft() == 0 {
+        // The verify draws the target's token per window position with
+        // this sampler whenever it does more than read the raw argmax
+        // (`Probes::verify_and_probe_sampled`): a temperature on any arm, or
+        // processors on any arm (each row against its own history,
+        // `LogitsProcessor::window_draw_device`). Every draw is keyed by the
+        // position of the token it draws, so a rejected row moves nothing.
+        let sampled = sampler.draws_windows();
+        // A proposer that drafts nothing runs the zero-draft window: the
+        // anchor alone a round, which is a decode step on a target whose
+        // verify runs that window. The device-resident K=1 body
+        // (`Session::decode_until`) is that same window's own arm, the token
+        // fed on the device instead of read back.
+        if spec.max_draft() == 0 && !Probes::<S::Probe>::verifies_anchor_alone(self.model) {
             lloom_tensor::bail!(
-                "Session::decode_speculative: the proposer has max_draft 0 (the K=1 identity); \
-                 it belongs on `Session::decode`, which has the device-resident ring path this \
-                 method deliberately does not."
+                "Session::decode_speculative: the proposer drafts nothing and this target's \
+                 verify needs a draft; its zero-draft window is the K=1 body \
+                 (`Session::decode_until`)"
             );
         }
         if eos_ids.is_empty() {
@@ -3055,6 +3152,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         let device = readback.device().clone();
         let seq = SeqId(0);
+        // The draft's early stop on the drafter's confidence
+        // (`speculative.p_min`, the driver's knob, §3.4.4); 0 is off.
+        let p_min = crate::tuning::tuning().dspark.p_min as f32;
         let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
             step_ns: Vec::with_capacity(opts.max_tokens),
@@ -3074,11 +3174,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
         stats.prefill_units = prefill_units;
 
-        // The prefill's token: the argmax, or at `t > 0` the draw for the
-        // token at `seq.pos`, keyed exactly as the K=1 loop keys its first.
+        // The prefill's step closes before its token is drawn, as the K=1
+        // loop's does: the draw's allocations are not the prefill pass's.
+        end_executor_step(&device)?;
+        // The prefill's token: the argmax, or the draw for the token at
+        // `seq.pos`, keyed exactly as the K=1 loop keys its first; a window
+        // of the one row, whose input the prompt's last token is.
         let mut anchor_tok = if sampled {
-            let drawn = sampler.window_draw(&logits, self.seq.pos as u64)?;
-            drawn[0]
+            let last = [*prompt.last().expect("checked non-empty above")];
+            let input = Tensor::new(&last, logits.device())?;
+            let drawn = sampler
+                .window_draw_device(&logits, self.seq.pos as u64, Some(&input))?
+                .flatten_all()?
+                .to_vec1::<u32>()?;
+            let fed = sampler.window_fed(&drawn);
+            sampler.commit_window(&fed)?;
+            fed[0]
         } else {
             logits
                 .squeeze(0)?
@@ -3124,12 +3235,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.steps += 1;
             let step_start = std::time::Instant::now();
 
-            // One speculative round: draft → verify (accept longest argmax-match
-            // prefix + bonus, roll back) → observe (re-key drafter from the
-            // accepted rows). `p_min = 0.0` disables the confidence early-exit
-            // (`speculative.cpp:796`; the driver owns the knob). `speculative_step`
-            // returns the accepted tokens, INCLUDING the bonus, and has already
-            // advanced the drafter's own anchor via `observe`.
+            // One speculative round: draft → verify (accept the longest prefix
+            // the target's token agrees with + its own at the first
+            // disagreement, roll back) → observe (re-key the drafter from the
+            // accepted rows). `p_min` cuts the draft at the first position
+            // the drafter is less confident of (`speculative.cpp:796`; 0 is
+            // off). The round returns the accepted tokens, the target's own
+            // included, and has advanced the drafter's anchor via `observe`.
             let anchor = Anchor {
                 last: anchor_tok,
                 pos: self.seq.pos,
@@ -3170,7 +3282,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 spec,
                 &[seq],
                 &[anchor],
-                0.0,
+                p_min,
                 eos_ids,
                 probe,
                 Some((&device, PassShape::Verify { k: k as usize })),

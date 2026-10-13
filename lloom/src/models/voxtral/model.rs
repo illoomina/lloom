@@ -782,11 +782,13 @@ impl VoxtralForConditionalGeneration {
 
         // Verify the division is exact
         if total_elements % self.audio_config.intermediate_size != 0 {
-            return Err(lloom_tensor::Error::DimOutOfRange {
-                shape: lloom_tensor::Shape::from_dims(&[batch_size, seq_len, hidden_size]),
-                dim: 0,
-                op: "reshape",
-            });
+            return Err(lloom_tensor::Error::DimOutOfRange(Box::new(
+                lloom_tensor::error::DimOutOfRange {
+                    shape: lloom_tensor::Shape::from_dims(&[batch_size, seq_len, hidden_size]),
+                    dim: 0,
+                    op: "reshape",
+                },
+            )));
         }
 
         let audio_hidden =

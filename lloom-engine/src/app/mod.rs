@@ -7,15 +7,21 @@
 //! binary name for the pipette runner and is `lloom serve` verbatim.
 
 pub mod budgets;
+pub mod causal_loaded;
 pub mod chat;
 pub mod common;
+pub mod decision_endpoint;
+mod decisions;
 pub mod family;
 pub mod front;
 pub mod lfm2;
+pub mod lfm2_gguf;
 pub mod modes;
+pub mod omni;
 pub mod qwen3_5;
 pub mod qwen4exp;
 pub mod report;
+mod request_slot;
 pub mod serve;
 pub mod served;
 pub mod template;
@@ -53,6 +59,8 @@ pub struct Shape {
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
+    /// `scheduler.decision_ragged`; taken only under the `fast` contract.
+    pub decision_ragged: bool,
 }
 
 impl Shape {
@@ -72,6 +80,7 @@ impl Shape {
             mem_sample: o.report.memory_sample,
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
+            decision_ragged: o.scheduler.decision_ragged,
         }
     }
 }
@@ -85,6 +94,8 @@ pub enum Family {
     Qwen4Exp(PathBuf),
     /// A GGUF's first shard (`qwen35` / `qwen35moe`).
     Qwen3_5(PathBuf),
+    /// An LFM2 GGUF (`general.architecture = lfm2`, d1-3B's official files).
+    Lfm2Gguf(PathBuf),
 }
 
 /// The family from the path: a `.gguf` file, or a directory holding GGUF
@@ -100,6 +111,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     Ok(match f.name() {
         "lfm2" => Family::Lfm2(checkpoint),
         "qwen3_5" => Family::Qwen3_5(checkpoint),
+        "lfm2-gguf" => Family::Lfm2Gguf(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),
     })
 }
@@ -109,6 +121,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 /// an EOS gate the executor arms cannot run, are named here with their
 /// reasons, beside the arm the loaded line renders.
 pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::load_warning::{LoadWarning, LoadWarningKind};
     let mut notes = Vec::new();
     if let Some(note) = shape.decode.readback.adaptive_clamp() {
@@ -120,7 +133,7 @@ pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Serve
         notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
     let (mut engine, path) = family::load(load, shape)?;
-    engine.note_load_warnings(notes);
+    engine.note_load_warnings_checked(notes)?;
     Ok((engine, path))
 }
 
@@ -625,15 +638,63 @@ pub enum Command {
     Options(OptionsCmdArgs),
 }
 
-/// The `lloom` binary's entry.
+/// How long a dropped device's retirement may take at exit before the
+/// process leaves it to the OS.
+const DEVICE_RETIREMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `lloom` binary's entry. The HTTP retirement service owns whatever a
+/// dropped server left running, so the process joins it before it exits; a
+/// dropped device retires on the host retirement service, so the process
+/// joins that retirement too, after the HTTP one.
 pub fn main(argv: Vec<String>) -> Result<()> {
     let cli = Cli::parse_from(argv);
-    match cli.command {
+    let result = match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Bench(args) => serve::bench(args),
         Command::Config(args) => print_config(&args),
         Command::Options(args) => print_options(&args),
+    };
+    serve::join_http_retirement();
+    let joined = join_device_retirement();
+    result.and(joined)
+}
+
+/// Joins the retirement of every dropped device, says so when one is still
+/// retiring at the budget, and judges the release witness's count.
+fn join_device_retirement() -> Result<()> {
+    let joined =
+        lloom_tensor::join_device_retirement(std::time::Instant::now() + DEVICE_RETIREMENT_BUDGET);
+    if !joined.completed {
+        eprintln!(
+            "[device retirement: {} set(s) with {} record(s) still retiring at the {}s budget]",
+            joined.sets_retiring,
+            joined.records_pending,
+            DEVICE_RETIREMENT_BUDGET.as_secs(),
+        );
+    }
+    retirement_verdict(&joined, lloom_tensor::tuning::contract().is_fast())
+}
+
+/// An allocation still listed when its record released it is an ordering
+/// defect the witness turned into a kept allocation (`tuning.md` §6.3m). It
+/// is printed whenever it happened; under `deterministic` it fails the run,
+/// under `fast` the line is the report.
+fn retirement_verdict(joined: &lloom_tensor::DeviceRetirementReport, fast: bool) -> Result<()> {
+    if joined.listed_at_release == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "[device retirement: {} allocation(s) still in the residency set when their record released them; kept, never freed]",
+        joined.listed_at_release
+    );
+    if fast {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} allocation(s) were released while the residency set still listed them (the deterministic contract fails on it)",
+            joined.listed_at_release
+        )
     }
 }
 
@@ -646,6 +707,32 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
 }
 #[cfg(test)]
 mod spellings_tests;
+
+#[cfg(test)]
+mod retirement_verdict_tests {
+    use super::retirement_verdict;
+    use lloom_tensor::DeviceRetirementReport;
+
+    fn report(listed_at_release: u64) -> DeviceRetirementReport {
+        DeviceRetirementReport {
+            completed: true,
+            worker_stopped: true,
+            listed_at_release,
+            ..Default::default()
+        }
+    }
+
+    /// A kept allocation fails a deterministic run and is only reported
+    /// under fast; none passes both.
+    #[test]
+    fn a_listed_release_fails_deterministic_and_is_reported_under_fast() {
+        assert!(retirement_verdict(&report(0), false).is_ok());
+        assert!(retirement_verdict(&report(0), true).is_ok());
+        let refused = retirement_verdict(&report(3), false).expect_err("deterministic fails");
+        assert!(refused.to_string().contains("3 allocation(s)"), "{refused}");
+        assert!(retirement_verdict(&report(3), true).is_ok());
+    }
+}
 
 #[cfg(test)]
 mod option_layer_tests {
@@ -825,6 +912,7 @@ mod option_layer_tests {
                 mem_sample: false,
                 rows: "auto".into(),
                 share_prefix: false,
+                decision_ragged: true,
             }
         };
         let mut s = shape(&["--replay"]);
@@ -887,6 +975,26 @@ mod model_group_tests {
         let mut full = vec!["t"];
         full.extend_from_slice(argv);
         T::parse_from(full).common
+    }
+
+    #[test]
+    fn explicit_mmproj_uses_existing_option_layers_and_roundtrips() {
+        assert!(crate::LoadConfig::default().mmproj.is_none());
+        for args in [
+            vec!["--mmproj", "/one/mmproj.gguf"],
+            vec!["--set", "model.mmproj=/one/mmproj.gguf"],
+            vec!["--model-config", r#"{"mmproj":"/one/mmproj.gguf"}"#],
+        ] {
+            let options = resolve_options_uninstalled(&common(&args), &no_front).unwrap();
+            assert_eq!(
+                options.load.mmproj.as_deref(),
+                Some(std::path::Path::new("/one/mmproj.gguf"))
+            );
+            let dump = serde_json::to_value(&options).unwrap();
+            let mut restored = crate::EngineOptions::default();
+            restored.merge_json(&dump).unwrap();
+            assert_eq!(restored, options);
+        }
     }
 
     #[test]

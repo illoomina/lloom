@@ -626,6 +626,106 @@ pub struct DecoderState<L: Layer> {
     ckpt: CheckpointRing,
 }
 
+/// Owned layer snapshots and the logical end of a privately owned sequence.
+pub struct DecoderRetained<S> {
+    layers: Vec<S>,
+    pos: usize,
+}
+
+impl<L: Layer> crate::nn::branch::RetainState for DecoderState<L>
+where
+    L::State: crate::nn::branch::RetainState,
+{
+    type Retained = DecoderRetained<<L::State as crate::nn::branch::RetainState>::Retained>;
+
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("decoder retention requires a settled window")
+        }
+        let mut layers = crate::nn::branch::retained_vec(self.layers.len())?;
+        for layer in &mut self.layers {
+            layers.push(layer.retain_state()?);
+        }
+        Ok(DecoderRetained {
+            layers,
+            pos: self.pos,
+        })
+    }
+
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.window.is_some() || saved.pos > self.pos || saved.layers.len() != self.layers.len()
+        {
+            lloom_tensor::bail!("decoder retention: invalid window, position or layer count")
+        }
+        for (layer, retained) in self.layers.iter_mut().zip(&saved.layers) {
+            layer.restore_retained(retained)?;
+        }
+        self.pos = saved.pos;
+        self.nextn.clear();
+        self.ckpt.forget_past(saved.pos);
+        Ok(())
+    }
+}
+
+impl<MS: crate::nn::branch::RetainState> crate::nn::branch::RetainState for PreNormState<MS, ()> {
+    type Retained = MS::Retained;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        self.mixer.retain_state()
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.mixer.restore_retained(saved)
+    }
+}
+
+impl<SA: crate::nn::branch::RetainState, SB: crate::nn::branch::RetainState>
+    crate::nn::branch::RetainState for HybridState<SA, SB>
+{
+    type Retained = HybridState<SA::Retained, SB::Retained>;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        Ok(match self {
+            Self::A(a) => HybridState::A(a.retain_state()?),
+            Self::B(b) => HybridState::B(b.retain_state()?),
+        })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        match (self, saved) {
+            (Self::A(a), HybridState::A(saved)) => a.restore_retained(saved),
+            (Self::B(b), HybridState::B(saved)) => b.restore_retained(saved),
+            _ => lloom_tensor::bail!("retained hybrid state belongs to the other mixer"),
+        }
+    }
+}
+
+impl crate::nn::branch::RetainState for crate::models::qwen4exp::GdnState {
+    type Retained = (
+        crate::nn::recurrent::RecurrentRetained,
+        crate::nn::recurrent::RecurrentRetained,
+    );
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        Ok((self.s.retain_state()?, self.conv.retain_state()?))
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        self.s.restore_retained(&saved.0)?;
+        self.conv.restore_retained(&saved.1)
+    }
+}
+
+impl crate::nn::branch::RetainState for crate::models::qwen4exp::KvCache {
+    type Retained = WindowMark;
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        let (tokens, blocks) = self.lens();
+        Ok(WindowMark { tokens, blocks })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        let (tokens, blocks) = self.lens();
+        if saved.tokens > tokens || saved.blocks > blocks {
+            lloom_tensor::bail!("retained KV prefix was truncated")
+        }
+        self.truncate(saved.tokens, saved.blocks);
+        Ok(())
+    }
+}
+
 /// A decoder state's two ledger rows.
 #[cfg(feature = "metal")]
 #[derive(Debug)]
@@ -1288,51 +1388,55 @@ where
         }
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &self.device {
+            use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
             let gb = |b: usize| b as f64 / 1e9;
             if grow.total() > 0 {
                 let quota = m.ledger().quota();
                 let budget = if quota == 0 { usize::MAX } else { quota };
                 let a = m.admit_bytes(grow.total(), budget);
                 if !a.fits {
-                    if let Some(why) = &a.machine {
-                        lloom_tensor::bail!(
-                            "{}: the state's growth at position {} ({:.3} GB: KV {:.3}, recurrent {:.3}) \
-                             is refused before anything is written: {why}",
+                    let refusal = a.machine.unwrap_or(AllocationError::Refused {
+                        requested: grow.total(),
+                        available: budget.saturating_sub(a.committed),
+                        domain: RefusalDomain::Model,
+                    });
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, \
+                             recurrent {:.3}); the ledger holds {:.2} GB of the {:.2} GB quota \
+                             after giving back {:.3} GB of free lists; the pass stops here, before \
+                             anything is written (DESIGN.md 9.5): a shorter context, \
+                             --memory-fraction, or bound the run",
                             self.family,
                             cache.pos,
                             gb(grow.total()),
                             gb(grow.kv),
-                            gb(grow.recurrent)
-                        );
-                    }
-                    lloom_tensor::bail!(
-                        "{}: the state's growth at position {} needs {:.3} GB (KV {:.3}, recurrent \
-                         {:.3}) and the ledger already holds {:.2} GB of the {:.2} GB quota after \
-                         giving back {:.3} GB of free lists; the pass stops here, before anything is \
-                         written (DESIGN.md 9.5): a shorter context, --memory-fraction, or bound the run.",
-                        self.family,
-                        cache.pos,
-                        gb(grow.total()),
-                        gb(grow.kv),
-                        gb(grow.recurrent),
-                        gb(a.committed),
-                        gb(budget),
-                        gb(a.reclaimed),
+                            gb(grow.recurrent),
+                            gb(a.committed),
+                            gb(budget),
+                            gb(a.reclaimed),
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
                 if let Some(t) = &cache.ledger {
                     t.note(self.held_bytes(cache) + grow);
                 }
             }
             if pass > 0 {
-                if let Some(why) = m.admit_bytes(pass, usize::MAX).machine {
-                    lloom_tensor::bail!(
-                        "{}: the {seq_len}-position pass at position {} ({:.2} GB of working set) \
-                         is refused before it runs: {why}",
-                        self.family,
-                        cache.pos,
-                        gb(pass)
+                if let Some(refusal) = m.admit_bytes(pass, usize::MAX).machine {
+                    m.report_refusal(
+                        &format_args!(
+                            "{}: the {seq_len}-position pass at position {} ({:.2} GB of working \
+                             set) is refused before it runs",
+                            self.family,
+                            cache.pos,
+                            gb(pass)
+                        ),
+                        &refusal,
                     );
+                    return Err(refusal.into());
                 }
             }
         }
@@ -1447,75 +1551,31 @@ where
         anchor: &Anchor,
         cache: &mut Self::Cache,
     ) -> Result<DecoderPending> {
-        if anchor.pos != cache.pos {
+        self.window_enqueue(draft, anchor, cache, None)
+    }
+
+    /// The window's rows drawn by `sampler`, each keyed to the position of
+    /// the token it draws, in place of their argmax (the sampled verify);
+    /// the pass and the accept are the greedy verify's.
+    fn verify_and_probe_sampled(
+        &self,
+        drafts: &[Draft],
+        anchors: &[Anchor],
+        cache: &mut Self::Cache,
+        eos_ids: &[u32],
+        sampler: &mut crate::generation::LogitsProcessor,
+    ) -> Result<(Vec<Vec<u32>>, Tensor)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
             lloom_tensor::bail!(
-                "{} verify: anchor pos {} != the state's position {}",
+                "{} verify_and_probe_sampled: one sequence; got {} drafts and {} anchors",
                 self.family,
-                anchor.pos,
-                cache.pos
+                drafts.len(),
+                anchors.len()
             )
         }
-        let proposed: Vec<u32> = match &draft.tokens {
-            DraftTokens::Host(v) => v.clone(),
-            DraftTokens::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
-        };
-        let mut tokens = Vec::with_capacity(proposed.len() + 1);
-        tokens.push(anchor.last);
-        tokens.extend_from_slice(&proposed);
-        // Anything retained untaken is a dropped probe; the window retains
-        // its own rows.
-        cache.drop_nextn();
-        let want_was = cache.set_want_nextn(true);
-        let dev = self.device_of(cache)?;
-        let t = tokens.len();
-        // A state on rings rewinds by phase: a window longer than its rings
-        // cannot be stepped through and put back (the rings are sized to
-        // the drafter's `k + 1`, `StateCapacity::window`).
-        if cache.pooled() && !cache.ring_holds(t) {
-            cache.set_want_nextn(want_was);
-            lloom_tensor::bail!(
-                "{} verify: a window of {t} positions on rings built for a shorter one \
-                 (`StateCapacity::window` must be >= {t})",
-                self.family
-            )
-        }
-        cache.open_window()?;
-        if dev.is_metal() && cache.ring_holds(t) {
-            let input = Tensor::from_vec(tokens.clone(), (t, 1), &dev)?;
-            let mut h = self.embed.embed(&input)?; // [T, 1, hidden]
-            let mut after: Vec<Vec<WindowMark>> = Vec::with_capacity(self.layers.len());
-            for (l, layer) in self.layers.iter().enumerate() {
-                let mut marks = Vec::with_capacity(t);
-                h = layer.execute_window(&h, &mut cache.layers[l], &mut marks)?;
-                after.push(marks);
-            }
-            cache.pos += t;
-            let n = self.head.normed(&h)?; // [T, 1, hidden]
-            cache.keep_nextn(n.reshape((1, t, self.hidden))?);
-            let mut argmaxes = Vec::with_capacity(t);
-            for p in 0..t {
-                let logits = self.head.project(&n.narrow(0, p, 1)?)?;
-                argmaxes.push(logits.flatten_all()?.argmax(D::Minus1)?.reshape(1)?);
-            }
-            let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
-            return Ok(DecoderPending {
-                argmax,
-                tokens,
-                want_was,
-                after: Some(after),
-            });
-        }
-        let mut argmaxes = Vec::with_capacity(t);
-        for &tok in &tokens {
-            argmaxes.push(self.step_argmax(tok, cache, &dev)?);
-        }
-        let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
-        Ok(DecoderPending {
-            argmax,
-            tokens,
-            want_was,
-            after: None,
-        })
+        let pending = self.window_enqueue(&drafts[0], &anchors[0], cache, Some(sampler))?;
+        let (accepted, probe) = self.verify_complete(pending, cache, eos_ids)?;
+        Ok((vec![accepted], probe))
     }
 
     fn verify_complete(
@@ -1577,6 +1637,129 @@ where
     /// The window `[anchor]` is a decode step.
     fn verifies_anchor_alone(&self) -> bool {
         true
+    }
+}
+
+impl<P, C, E, L, H> Decoder<P, C, E, L, H>
+where
+    P: Profile,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    E: Embed,
+    L: Layer,
+    H: Head,
+{
+    /// The window `[anchor, proposed…]` run inside an open window on every
+    /// layer's state, each row's token read back once: the argmax, or
+    /// `draw`'s keyed draw over the rows' logits (the sampled verify).
+    fn window_enqueue(
+        &self,
+        draft: &Draft,
+        anchor: &Anchor,
+        cache: &mut DecoderState<L>,
+        draw: Option<&mut crate::generation::LogitsProcessor>,
+    ) -> Result<DecoderPending> {
+        if anchor.pos != cache.pos {
+            lloom_tensor::bail!(
+                "{} verify: anchor pos {} != the state's position {}",
+                self.family,
+                anchor.pos,
+                cache.pos
+            )
+        }
+        let proposed: Vec<u32> = match &draft.tokens {
+            DraftTokens::Host(v) => v.clone(),
+            DraftTokens::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
+        };
+        let mut tokens = Vec::with_capacity(proposed.len() + 1);
+        tokens.push(anchor.last);
+        tokens.extend_from_slice(&proposed);
+        // Anything retained untaken is a dropped probe; the window retains
+        // its own rows.
+        cache.drop_nextn();
+        let want_was = cache.set_want_nextn(true);
+        let dev = self.device_of(cache)?;
+        let t = tokens.len();
+        // Row 0 draws the token after the anchor.
+        let first_pos = anchor.pos as u64 + 1;
+        // A state on rings rewinds by phase: a window longer than its rings
+        // cannot be stepped through and put back (the rings are sized to
+        // the drafter's `k + 1`, `StateCapacity::window`).
+        if cache.pooled() && !cache.ring_holds(t) {
+            cache.set_want_nextn(want_was);
+            lloom_tensor::bail!(
+                "{} verify: a window of {t} positions on rings built for a shorter one \
+                 (`StateCapacity::window` must be >= {t})",
+                self.family
+            )
+        }
+        cache.open_window()?;
+        if dev.is_metal() && cache.ring_holds(t) {
+            let input = Tensor::from_vec(tokens.clone(), (t, 1), &dev)?;
+            let mut h = self.embed.embed(&input)?; // [T, 1, hidden]
+            let mut after: Vec<Vec<WindowMark>> = Vec::with_capacity(self.layers.len());
+            for (l, layer) in self.layers.iter().enumerate() {
+                let mut marks = Vec::with_capacity(t);
+                h = layer.execute_window(&h, &mut cache.layers[l], &mut marks)?;
+                after.push(marks);
+            }
+            cache.pos += t;
+            let n = self.head.normed(&h)?; // [T, 1, hidden]
+            cache.keep_nextn(n.reshape((1, t, self.hidden))?);
+            let argmax = match draw {
+                None => {
+                    let mut argmaxes = Vec::with_capacity(t);
+                    for p in 0..t {
+                        let logits = self.head.project(&n.narrow(0, p, 1)?)?;
+                        argmaxes.push(logits.flatten_all()?.argmax(D::Minus1)?.reshape(1)?);
+                    }
+                    Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?
+                }
+                Some(s) => {
+                    let mut rows = Vec::with_capacity(t);
+                    for p in 0..t {
+                        rows.push(self.head.project(&n.narrow(0, p, 1)?)?.flatten_all()?);
+                    }
+                    let inputs = Tensor::from_vec(tokens.clone(), t, &dev)?;
+                    let drawn = s
+                        .window_draw_device(&Tensor::stack(&rows, 0)?, first_pos, Some(&inputs))?
+                        .to_vec1::<u32>()?;
+                    s.window_fed(&drawn)
+                }
+            };
+            return Ok(DecoderPending {
+                argmax,
+                tokens,
+                want_was,
+                after: Some(after),
+            });
+        }
+        let argmax = match draw {
+            None => {
+                let mut argmaxes = Vec::with_capacity(t);
+                for &tok in &tokens {
+                    argmaxes.push(self.step_argmax(tok, cache, &dev)?);
+                }
+                Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?
+            }
+            Some(s) => {
+                let mut rows = Vec::with_capacity(t);
+                for &tok in &tokens {
+                    let input = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+                    rows.push(CausalLM::forward(self, &input, cache.pos, cache)?.flatten_all()?);
+                }
+                let inputs = Tensor::from_vec(tokens.clone(), t, &dev)?;
+                let drawn = s
+                    .window_draw_device(&Tensor::stack(&rows, 0)?, first_pos, Some(&inputs))?
+                    .to_vec1::<u32>()?;
+                s.window_fed(&drawn)
+            }
+        };
+        Ok(DecoderPending {
+            argmax,
+            tokens,
+            want_was,
+            after: None,
+        })
     }
 }
 

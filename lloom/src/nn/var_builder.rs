@@ -315,11 +315,13 @@ impl SimpleBackend for HashMap<String, Tensor> {
             })?
             .clone();
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {name}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {name}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         tensor.to_device(dev)?.to_dtype(dtype)
@@ -390,11 +392,13 @@ impl SimpleBackend for SafeTensorWithRouting<'_> {
             .load(dev)?
             .to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {path}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {path}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)
@@ -437,11 +441,13 @@ impl SimpleBackend for lloom_tensor::npy::NpzTensors {
         };
         let tensor = tensor.to_device(dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {path}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {path}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)
@@ -482,11 +488,13 @@ impl SimpleBackend for lloom_tensor::pickle::PthTensors {
         };
         let tensor = tensor.to_device(dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {path}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {path}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)
@@ -520,11 +528,13 @@ impl SimpleBackend for lloom_tensor::safetensors::MmapedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {name}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {name}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)
@@ -550,11 +560,13 @@ impl SimpleBackend for lloom_tensor::safetensors::BufferedSafetensors {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {name}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {name}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)
@@ -580,11 +592,13 @@ impl SimpleBackend for lloom_tensor::safetensors::SliceSafetensors<'_> {
     ) -> Result<Tensor> {
         let tensor = self.load(name, dev)?.to_dtype(dtype)?;
         if tensor.shape() != &s {
-            Err(lloom_tensor::Error::UnexpectedShape {
-                msg: format!("shape mismatch for {name}"),
-                expected: s,
-                got: tensor.shape().clone(),
-            }
+            Err(lloom_tensor::Error::UnexpectedShape(Box::new(
+                lloom_tensor::error::UnexpectedShape {
+                    msg: format!("shape mismatch for {name}"),
+                    expected: s,
+                    got: tensor.shape().clone(),
+                },
+            ))
             .bt())?
         }
         Ok(tensor)

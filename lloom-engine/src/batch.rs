@@ -516,20 +516,8 @@ where
         if req.prompt_ids.is_empty() {
             lloom_tensor::bail!("batch scheduler: empty prompt");
         }
-        req.params.refuse_processors(
-            "the batch scheduler",
-            "its rows draw through the batched driver's per-row sampler or one device argmax \
-             over the batch (serve them at --batch 1)",
-        )?;
-        req.params.refuse_thinking_budget(
-            "the batch scheduler",
-            "its rows draw through the batched driver, which feeds no forced token (serve it at \
-             --batch 1)",
-        )?;
-        req.params.refuse_logprobs(
-            "the batch scheduler",
-            "its rows draw on the device and read the ids back (serve it at --batch 1)",
-        )?;
+        req.params
+            .refuse_on(lloom::nn::Body::BatchedStep, "the batch scheduler")?;
         let (routed, seq) = self
             .pool
             .acquire(&req.prompt_ids)
@@ -1315,7 +1303,7 @@ mod tests {
         });
         match rx.recv_timeout(Duration::from_secs(30)).expect("an event") {
             BatchEvent::Error(e) => assert!(
-                e.contains("the batch scheduler does not run logits processors"),
+                e.starts_with("the batch scheduler: a batched body does not run logits processors"),
                 "{e}"
             ),
             BatchEvent::Tokens(_) | BatchEvent::Done(_) => panic!("served with processors"),

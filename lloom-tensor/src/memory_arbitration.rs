@@ -242,11 +242,17 @@ pub(crate) fn reclaim_target(committed: usize, need: usize, budget: usize) -> us
     shortfall.min(usize::MAX as u128) as usize
 }
 
-pub(crate) fn machine_target(committed: usize, need: usize) -> Result<u64, String> {
-    let total = committed.checked_add(need).ok_or_else(|| {
-        format!("pass demand overflow: committed {committed} + need {need}; no machine target")
-    })?;
-    u64::try_from(total).map_err(|_| format!("pass demand {total} exceeds machine u64 target"))
+/// What the process would hold on the machine with `need` admitted: an
+/// overflow refuses rather than wraps.
+pub(crate) fn machine_target(
+    committed: usize,
+    need: usize,
+) -> Result<u64, crate::memory_admission::AllocationError> {
+    use crate::memory_admission::AllocationError;
+    let total = committed
+        .checked_add(need)
+        .ok_or(AllocationError::Overflow)?;
+    u64::try_from(total).map_err(|_| AllocationError::Overflow)
 }
 
 #[cfg(test)]
@@ -630,7 +636,10 @@ mod tests {
         assert!(fits_budget(max - 1, 1, max));
         assert_eq!(machine_target(max - 1, 1).unwrap(), max as u64);
         assert!(!fits_budget(max, 1, max));
-        assert!(machine_target(max, 1).unwrap_err().contains("overflow"));
+        assert_eq!(
+            machine_target(max, 1),
+            Err(crate::memory_admission::AllocationError::Overflow)
+        );
         assert_eq!(reclaim_target(max, 1, max), 1);
         // After actual release, not a pledge, the same request can fit.
         assert!(fits_budget(max - 1, 1, max));

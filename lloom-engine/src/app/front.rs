@@ -1,7 +1,7 @@
 //! The request front end: a chat request rendered and tokenized once, the
 //! replies of ours its history carries given the ids the model sampled, and
 //! the thinking switch, the turn checkpoint and the prompt budget acting on
-//! spans found from constants read at load (`sequence-reuse-design.md` §2.3c).
+//! spans found from constants read at load (`sequence-reuse-design.md` §2.3d).
 //!
 //! Everything here runs on the request's thread before the ids reach
 //! `Served::complete_until`: the engine and the batch thread see token ids
@@ -825,7 +825,7 @@ impl Front {
                 ids.extend_from_slice(&m.gen);
                 if m.thinking.by == By::Engine {
                     for &id in &m.gen[m.template.len()..] {
-                        shown_text.push_str(&engine.token_str(id));
+                        shown_text.push_str(&engine.token_str_checked(id)?);
                     }
                 }
                 (m.thinking, Some(m))
@@ -838,7 +838,7 @@ impl Front {
                 let th = thinking::apply(req.want, c.tags.as_ref(), &mut ids)
                     .map_err(|why| cannot_think(engine, why))?;
                 for &id in &ids[before..] {
-                    shown_text.push_str(&engine.token_str(id));
+                    shown_text.push_str(&engine.token_str_checked(id)?);
                 }
                 (th, None)
             }
@@ -935,9 +935,9 @@ impl Front {
         let th = thinking::apply(req.want, tags.as_ref(), &mut ids)
             .map_err(|why| cannot_think(engine, why))?;
         for &id in &ids[before..] {
-            shown.push_str(&engine.token_str(id));
+            shown.push_str(&engine.token_str_checked(id)?);
         }
-        let turn_tail = thinking::checkpoint_tail(engine, &req.kwargs, req.want, &ids);
+        let turn_tail = thinking::checkpoint_tail_checked(engine, &req.kwargs, req.want, &ids)?;
         Ok(Prompt {
             ids,
             text: shown,
@@ -1133,19 +1133,32 @@ fn cannot_think(engine: &dyn Served, why: &str) -> anyhow::Error {
     )))
 }
 
-/// Why this process cannot keep per-token logprobs: its decode path reads
-/// no row of logits on the host.
-pub fn logprobs_refused(engine: &dyn Served) -> Option<&'static str> {
-    match engine.thinking_budget_refused()? {
-        super::budgets::BATCHED => Some(
-            "this process decodes through the batch scheduler (--batch N), whose rows draw on the \
-             device and read the ids back",
-        ),
-        _ => Some(
-            "this process decodes through the speculative body (--dspark, --mtp), whose verify \
-             reads the drawn ids back",
-        ),
-    }
+/// Why this process cannot keep per-token logprobs: the body it decodes
+/// through reads no row of logits on the host (`lloom::nn::refuse`). On the
+/// K=1 body a logprobs run takes the blocking arm, so only the speculative
+/// body and the batch scheduler refuse.
+pub fn logprobs_refused(engine: &dyn Served) -> Option<String> {
+    logprobs_refused_on(engine.decode_body())
+}
+
+/// [`logprobs_refused`] for a process decoding through `body`.
+pub fn logprobs_refused_on(body: lloom::nn::Body) -> Option<String> {
+    use lloom::nn::Body;
+    let (body, name) = match body {
+        Body::Step { .. } => (Body::Step { ring: false }, "the K=1 body"),
+        Body::Window => (Body::Window, "the speculative body (--dspark, --mtp)"),
+        b @ (Body::BatchedStep | Body::BatchedWindow) => (b, "the batch scheduler (--batch N)"),
+    };
+    let asks = lloom::nn::Asks {
+        sampling: &lloom::generation::Sampling::ArgMax,
+        processors: false,
+        budget: false,
+        digest: false,
+        logprobs: true,
+    };
+    lloom::nn::refuse(body, &asks)
+        .err()
+        .map(|e| format!("this process decodes through {name}: {e}"))
 }
 
 fn decode(text: &Text, ids: &[u32]) -> Option<String> {

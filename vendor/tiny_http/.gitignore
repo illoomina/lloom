@@ -1,0 +1,2 @@
+# Genuine fork-only dependency graph; root lock policy stays unchanged.
+!Cargo.lock

@@ -422,8 +422,10 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
         }
     }
     // The logits digest (`--logits-digest`): the same tokens as the run
-    // without it, a digest the same on a second run, and refused by the
-    // speculative body.
+    // without it, a digest the same on a second run — and under the
+    // speculative body the same digest: on the CPU the generic decoder's
+    // window runs position by position through the decode step, so the rows
+    // a round keeps are the K=1 steps' logits, bit for bit.
     let mut args = vec![
         "--tokenizer",
         tok,
@@ -445,27 +447,16 @@ fn qwen3_5_tiny_mtp_is_byte_identical_to_greedy_through_chat() {
         a["readback"], "blocking",
         "the digest reads the logits on the host"
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
-        .args(["chat", "--model"])
-        .arg(&model)
-        .args([
-            "--raw",
-            "-p",
-            PROMPT,
-            "-n",
-            "4",
-            "--cpu",
-            "--tokenizer",
-            tok,
-        ])
-        .args(["--speculate", "mtp", "--logits-digest"])
-        .output()
-        .expect("lloom runs");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success() && stderr.contains("logits_digest"),
-        "{stderr}"
-    );
+    for k in ["1", "2"] {
+        let mut spec_args = args.clone();
+        spec_args.extend_from_slice(&["--speculate", "mtp", "--spec-tokens", k]);
+        let s = chat(&model, &spec_args);
+        assert_eq!(s["tokens_sha256"], greedy["tokens_sha256"], "k={k}");
+        assert_eq!(
+            s["logits_sha256"], a["logits_sha256"],
+            "k={k}: the speculative body's digest over the kept rows is not the K=1 run's"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 
     // Without the block, the method is refused by name.
@@ -1882,6 +1873,205 @@ fn serve_answers_a_template_failure_on_client_data_with_a_400() {
     let (status, err) = server.call("POST", "/v1/chat/completions", &bad);
     assert_eq!(status, 400, "{err}");
     drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A `/v1/systemone` body the tiny byte-level tokenizer can answer: one
+/// choice between `A` and `B` (single byte tokens; `yes`/`no` are not).
+fn tiny_decision() -> Value {
+    json!({
+        "state": "The loom threads warp and weft.",
+        "questions": {"pick": {"type": "choice", "instructions": "Which one?",
+                               "criteria": {"A": "the first", "B": "the second"}}}
+    })
+}
+
+fn assert_tiny_answer(response: &Value) {
+    let answer = &response["answers"]["pick"];
+    let probabilities = answer["probabilities"].as_object().unwrap();
+    let total: f64 = probabilities.values().map(|p| p.as_f64().unwrap()).sum();
+    assert!((total - 1.0).abs() < 1e-9, "{response}");
+    assert!(
+        matches!(answer["choice"].as_str(), Some("A" | "B")),
+        "{response}"
+    );
+    assert_eq!(response["usage"]["output_tokens"], 0, "{response}");
+}
+
+/// `lloom chat -p "/decide {…}"` on a plain tiny LFM2 with the shipped d1
+/// template selected (`decision.template = lfm2-d1`, installable on the
+/// default family now that it has an executor): one answer on stdout, and
+/// the process ends: a command line given as `--prompt` is read once, not
+/// again for a turn it never ran.
+#[test]
+fn lfm2_tiny_chat_answers_one_decide_line_and_exits() {
+    let dir = scratch("decide-chat-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let line = format!("/decide {}", tiny_decision());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--cpu", "--decision-template", "lfm2-d1", "-p", &line])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("`lloom chat -p \"/decide …\"` did not exit: the prompt was read again");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "exited {status:?}:\n{stderr}");
+    assert!(
+        stderr.contains("[decision template: lfm2-d1 (engine-shipped, sha256 b47201d7"),
+        "{stderr}"
+    );
+    let lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with('{')).collect();
+    assert_eq!(lines.len(), 1, "one answer, once:\n{stdout}");
+    assert_tiny_answer(&serde_json::from_str(lines[0]).unwrap());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `lloom serve` on the same plain tiny LFM2 with the d1 template selected:
+/// a decision, a chat, the decision again on the one loaded model (equal,
+/// on the CPU's deterministic arithmetic); the response names the model
+/// first, and `/v1/models` does not advertise decisions for a selected
+/// (not native) template.
+#[test]
+fn lfm2_tiny_serves_decisions_and_chat_on_one_model() {
+    let dir = scratch("decide-serve-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu", "--decision-template", "lfm2-d1"]);
+    let (status, first) = server.call("POST", "/v1/systemone", &tiny_decision());
+    assert_eq!(status, 200, "{first}");
+    assert_tiny_answer(&first);
+    assert!(first["model"].is_string(), "{first}");
+    let (status, body) = server.chat(json!({}));
+    assert_eq!(status, 200, "{body}");
+    let (status, again) = server.call("POST", "/v1/systemone", &tiny_decision());
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(
+        first, again,
+        "a chat between two decisions moved the second"
+    );
+    let (status, models) = server.call("GET", "/v1/models", &json!({}));
+    assert_eq!(status, 200, "{models}");
+    assert_eq!(
+        models["data"][0]["architecture"]["output_modalities"],
+        json!(["text"])
+    );
+    // A text checkpoint builds no tower: no image input is listed.
+    assert_eq!(
+        models["data"][0]["architecture"]["input_modalities"],
+        json!(["text"])
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A decision over its own state (`n` picks the wording).
+fn tiny_decision_over(n: usize) -> Value {
+    let mut body = tiny_decision();
+    body["state"] = json!(format!(
+        "Thread {n}: the loom threads warp and weft, row {n}."
+    ));
+    body
+}
+
+/// `lloom serve` on the tiny LFM2 with eight requests started at once — six
+/// decisions over different states and two chats, three bursts — answers
+/// every one: requests that find the model busy wait their turn rather than
+/// being refused. Each decision equals its answer alone: bit for bit under
+/// `deterministic`, within F32 tolerance under `fast`, where decisions that
+/// waited together are read as one tree.
+#[test]
+fn lfm2_tiny_serve_queues_concurrent_requests_and_answers_each_as_alone() {
+    let dir = scratch("decide-concurrent-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    for profile in ["deterministic", "fast"] {
+        let server = Server::start(
+            &model,
+            &[
+                "--cpu",
+                "--decision-template",
+                "lfm2-d1",
+                "--profile",
+                profile,
+            ],
+        );
+        let alone: Vec<Value> = (0..6)
+            .map(|n| {
+                let (status, body) = server.call("POST", "/v1/systemone", &tiny_decision_over(n));
+                assert_eq!(status, 200, "{body}");
+                body
+            })
+            .collect();
+        for burst in 0..3 {
+            let gate = std::sync::Barrier::new(8);
+            let replies: Vec<(usize, u16, Value)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (server, gate) = (&server, &gate);
+                        scope.spawn(move || {
+                            gate.wait();
+                            let (status, body) = if i < 6 {
+                                server.call("POST", "/v1/systemone", &tiny_decision_over(i))
+                            } else {
+                                server.chat(json!({"max_tokens": 16}))
+                            };
+                            (i, status, body)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, status, body) in replies {
+                assert_eq!(status, 200, "{profile} burst {burst} request {i}: {body}");
+                if i >= 6 {
+                    continue;
+                }
+                let (got, want) = (&body["answers"]["pick"], &alone[i]["answers"]["pick"]);
+                assert_eq!(body["usage"], alone[i]["usage"], "{profile} request {i}");
+                assert_eq!(got["choice"], want["choice"], "{profile} request {i}");
+                if profile == "deterministic" {
+                    assert_eq!(body, alone[i], "{profile} burst {burst} request {i} moved");
+                } else {
+                    for label in ["A", "B"] {
+                        let (g, w) = (
+                            got["probabilities"][label].as_f64().unwrap(),
+                            want["probabilities"][label].as_f64().unwrap(),
+                        );
+                        assert!(
+                            (g - w).abs() < 1e-5,
+                            "{profile} request {i} {label}: {g} != {w}"
+                        );
+                    }
+                }
+            }
+        }
+        drop(server);
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

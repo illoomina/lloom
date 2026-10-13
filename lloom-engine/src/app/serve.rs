@@ -45,11 +45,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+mod turns;
 
 /// The seed passage the throughput cells tile into their prompt when no
 /// `--prompt-seed-file` and no seed environment variable is given.
@@ -108,6 +110,13 @@ fn seed_text(file: Option<&std::path::Path>) -> Result<String> {
 /// State shared by every request thread.
 struct Shared {
     engine: Box<dyn Served>,
+    /// What `/v1/systemone` answers with, resolved at load.
+    decisions: super::decisions::Decisions,
+    /// Request threads queue here for the family's single request slot.
+    turns: turns::Turns,
+    /// Decisions that wait together join one group (`scheduler.decision_pack`,
+    /// and the `fast` contract).
+    decision_pack: bool,
     /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
     aborts: Mutex<HashSet<String>>,
     /// Bumped after every insert into `aborts`: the decode thread's
@@ -123,7 +132,63 @@ struct Shared {
     front: Front,
 }
 
+/// The largest `/v1/systemone` body a decision-only owner reads: eight
+/// images or one clip, base64-encoded, with room for the state.
+const DECISION_BODY_BYTES: usize = 64 << 20;
+
+/// How long a server's in-flight requests get to answer once serving stops,
+/// before their connections are cut.
+const HTTP_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stops `server` within [`HTTP_SHUTDOWN_BUDGET`] and says so when it had to
+/// cut a connection or leave a thread to the retirement service.
+fn shutdown_http(server: &Server) {
+    let report = server.shutdown(Instant::now() + HTTP_SHUTDOWN_BUDGET);
+    if !report.completed && !report.already_shut_down {
+        eprintln!(
+            "[http shutdown: cut {} connection(s) at the {}s budget, {} thread(s) left to the retirement service]",
+            report.cut.len(),
+            HTTP_SHUTDOWN_BUDGET.as_secs(),
+            report.threads_retiring,
+        );
+    }
+}
+
+/// Joins tiny_http's retirement service before the process exits.
+pub(crate) fn join_http_retirement() {
+    let joined = tiny_http::join_retirement(Instant::now() + HTTP_SHUTDOWN_BUDGET);
+    if !joined.completed {
+        eprintln!(
+            "[http retirement: {} server(s) and {} thread(s) still retiring at exit]",
+            joined.pending_servers, joined.threads_retiring,
+        );
+    }
+}
+
+fn listener<A: std::net::ToSocketAddrs>(
+    addr: A,
+    policy: Option<tiny_http::TransportPolicy>,
+) -> std::result::Result<Server, Box<dyn std::error::Error + Send + Sync>> {
+    match policy {
+        Some(policy) => Server::http_with_policy(addr, policy),
+        None => Server::http(addr),
+    }
+}
+
 pub fn run(args: ServeArgs) -> Result<()> {
+    run_configured(args, None)
+}
+
+/// Explicit HTTP transport policy; no model/native cancellation is implied.
+/// Validate cheap limits before constructing a model. Defaults remain unchanged.
+pub fn run_with_transport_policy(
+    args: ServeArgs,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_configured(args, Some(policy))
+}
+fn run_configured(args: ServeArgs, transport: Option<tiny_http::TransportPolicy>) -> Result<()> {
     let mut options = super::resolve_options(&args.common, &|o| args.front(o))?;
     let seed_text = seed_text(options.server.pipette.prompt_seed_file.as_deref())?;
     let batched = options.scheduler.max_sequences > 1;
@@ -135,25 +200,98 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let load_start = Instant::now();
     let shape = super::Shape::of(&options, false, seed_text);
     let reuse_prefix = shape.reuse_prefix;
+    // A non-generating decision model is served by the decision-only listener.
+    if let Some(endpoint) = super::omni::serving::load(&options.load, &shape)? {
+        return run_decisions_configured(options, endpoint, DECISION_BODY_BYTES, transport);
+    }
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
+    run_owner(
+        options,
+        engine,
+        model_path,
+        Some((load_start, reuse_prefix)),
+        transport,
+    )
+}
+
+/// Serve an already-loaded owner without creating a device, tokenizer, model or
+/// admission domain. The caller creates its device, configures the same process
+/// account, and completes the genuine load before entering this frontend.
+///
+/// Only `options.server.host`, `options.server.port`, `options.sampling` and
+/// `options.session` (the request front end's) are honored; the remaining
+/// options do not reconfigure this owner. Shape, decode,
+/// cache, seed, prefix reuse, batch and memory policy are the already-loaded
+/// owner's contract, not inferred from these options. `model_path` is a caller-
+/// supplied provenance label, never opened or used to load another model.
+/// This route does not activate default registration or complete admission.
+pub fn run_loaded(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+) -> Result<()> {
+    run_owner(options, engine, model_path, None, None)
+}
+/// Supplied SAME owner, with explicit plain-HTTP I/O/disposal limits. See
+/// tiny_http::TransportPolicy for pipeline timeouts; not an application timeout.
+pub fn run_loaded_with_transport_policy(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_owner(options, engine, model_path, None, Some(policy))
+}
+
+fn run_owner(
+    options: crate::EngineOptions,
+    engine: Box<dyn Served>,
+    model_path: std::path::PathBuf,
+    load_facts: Option<(Instant, bool)>,
+    transport: Option<tiny_http::TransportPolicy>,
+) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
-    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
-    eprintln!(
-        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
-        model_name,
-        model_path.display(),
-        load_start.elapsed().as_secs_f64(),
-        engine.device(),
-        engine.kv_capacity(),
-        engine.readback().name(),
-        reuse_prefix,
-        engine.describe(),
-    );
+    let description = engine.describe_checked()?;
+    if let Some((load_start, reuse_prefix)) = load_facts {
+        eprintln!(
+            "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
+            model_name,
+            model_path.display(),
+            load_start.elapsed().as_secs_f64(),
+            engine.device(),
+            engine.kv_capacity(),
+            engine.readback().name(),
+            reuse_prefix,
+            description,
+        );
+    } else {
+        eprintln!(
+            "[serving existing {} from {} on {:?}; kv_capacity={} readback={} {}]",
+            model_name,
+            model_path.display(),
+            engine.device(),
+            engine.kv_capacity(),
+            engine.readback().name(),
+            description,
+        );
+    }
     eprintln!("[capabilities: {}]", engine.capabilities().line());
+    // A loaded owner's path is a provenance label, never opened.
+    let checkpoint = load_facts.is_some().then_some(model_path.as_path());
+    let decisions = super::decisions::Decisions::resolve(
+        options.load.decision_template.as_deref(),
+        engine.as_ref(),
+        checkpoint,
+    )?;
+    if let Some(line) = decisions.describe() {
+        eprintln!("[{line}]");
+    }
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
     let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
     eprintln!("[session: {}]", front.line());
@@ -171,7 +309,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     }
     let (host, port) = (options.server.host.clone(), options.server.port);
 
-    let server = Server::http((host.as_str(), port))
+    let server = listener((host.as_str(), port), transport)
         .map_err(|e| anyhow::anyhow!("binding {host}:{port}: {e}"))?;
     let port = match server.server_addr() {
         tiny_http::ListenAddr::IP(addr) => addr.port(),
@@ -180,6 +318,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
     };
     let shared = Arc::new(Shared {
         engine,
+        decisions,
+        turns: turns::Turns::default(),
+        decision_pack: options.scheduler.decision_pack
+            && lloom_tensor::tuning::contract().is_fast(),
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,
@@ -203,39 +345,16 @@ pub fn run(args: ServeArgs) -> Result<()> {
         let method = request.method().clone();
         match (method, path.as_str()) {
             (Method::Get, "/health") => {
-                // The memory gauges, read once: what the process holds now,
-                // beside the family's own state.
-                let mut body = shared.engine.health();
-                body["mem"] = MemSnapshot::read(shared.engine.device()).json();
-                body["capabilities"] = shared.engine.capabilities().json();
-                body["load_warnings"] = load_warnings_json(shared.engine.as_ref());
-                // The request front end's passes so far: a chat request
-                // renders its template once and tokenizes the result once.
-                body["template_renders"] = json!(shared.engine.template_renders());
-                body["tokenizations"] = json!(shared.front.tokenizations());
-                body["session_log"] = json!(shared.front.logged());
-                body["chat_template_reads"] = ENGINE_KWARGS
-                    .iter()
-                    .map(|&k| (k.to_string(), json!(shared.engine.template_reads(k))))
-                    .collect::<Map<String, Value>>()
-                    .into();
-                // The thinking budget's markers, as the template writes them.
-                let engine = shared.engine.as_ref();
-                body["reasoning_tags"] = engine.think_tags().map_or(Value::Null, |t| {
-                    json!({
-                        "start": engine.token_str(t.start),
-                        "end": engine.token_str(t.end),
-                        "tool_call": t.tool_call.map(|id| engine.token_str(id)),
-                    })
-                });
-                let _ = respond_json(request, 200, &body);
+                let result = health_body(shared.engine.as_ref(), &shared.front);
+                let _ = respond_metadata(request, result);
             }
             (Method::Get, "/v1/models") => {
-                let _ = respond_json(
-                    request,
-                    200,
-                    &models_body(&shared.model_name, shared.engine.as_ref()),
+                let result = models_body(
+                    &shared.model_name,
+                    shared.engine.as_ref(),
+                    &shared.decisions,
                 );
+                let _ = respond_metadata(request, result);
             }
             (Method::Post, "/eval/abort") => {
                 let _ = handle_abort(&shared, request);
@@ -264,10 +383,135 @@ pub fn run(args: ServeArgs) -> Result<()> {
             }
         }
     }
-    // A request thread still decoding holds the sequence, and the batch
-    // thread holds the pool; wait for both so the model is not dropped under
-    // a running command buffer.
+    // In-flight requests answer within the budget; then their connections
+    // are cut. A request thread still decoding holds the sequence, and the
+    // batch thread holds the pool; wait for both so the model is not dropped
+    // under a running command buffer.
+    shutdown_http(&shared.server);
     shared.engine.shutdown();
+    Ok(())
+}
+
+/// Serve a decision-only owner using the SAME ordered dispatcher/status mapper.
+/// This loop spawns no request worker threads and invents no generation/KV/seed API.
+/// Only host/port are honored from options. max_body_bytes bounds the bytes
+/// retained by this application reader, NOT dependency header/body allocations,
+/// unread-body Drop draining, read time, or complete model prediction. tiny_http
+/// owns listener/connection threads and may drain unread Content-Length with a
+/// remaining-body-sized allocation; this is not a hostile-input transport bound.
+/// Socket/parsing/serialization/metadata buffers remain enrollment obligations.
+/// Default family registration is unchanged; encoded-media capability is the
+/// installed endpoint's actual contract, not inferred from its model name.
+pub fn run_decisions_loaded(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+) -> Result<()> {
+    run_decisions_configured(options, endpoint, max_body_bytes, None)
+}
+/// Same narrow endpoint and dispatcher, with explicit dependency disposal/I/O
+/// limits. Header/JSON/queue allocations and thread joining remain separate.
+pub fn run_decisions_loaded_with_transport_policy(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+    policy: tiny_http::TransportPolicy,
+) -> Result<()> {
+    policy.validate()?;
+    run_decisions_configured(options, endpoint, max_body_bytes, Some(policy))
+}
+fn run_decisions_configured(
+    options: crate::EngineOptions,
+    endpoint: Box<dyn super::decision_endpoint::DecisionEndpoint>,
+    max_body_bytes: usize,
+    transport: Option<tiny_http::TransportPolicy>,
+) -> Result<()> {
+    let read_bound = max_body_bytes
+        .checked_add(1)
+        .filter(|_| max_body_bytes != 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("decision transport body bound must be finite and nonzero")
+        })?;
+    let host = options.server.host;
+    let server = listener((host.as_str(), options.server.port), transport)
+        .map_err(|error| anyhow::anyhow!("binding decision listener: {error}"))?;
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(addr) => addr.port(),
+        #[allow(unreachable_patterns)]
+        _ => options.server.port,
+    };
+    println!(
+        "{}",
+        json!({"kind":"ready","host":host,"port":port,"generation":false,"decisions":true})
+    );
+    std::io::stdout().flush()?;
+    loop {
+        let mut request = match server.recv() {
+            Ok(request) => request,
+            Err(_) => break,
+        };
+        let path = request.url().split('?').next().unwrap_or("").to_owned();
+        match (request.method().clone(), path.as_str()) {
+            (Method::Get, "/health") => {
+                let _ = respond_metadata(request, endpoint.health_checked());
+            }
+            (Method::Get, "/v1/models") => {
+                // Caller provenance label; outer metadata formatting is not
+                // silently claimed paid by the model's inner request pass.
+                let body = json!({"object":"list","data":[{"id":endpoint.model_name(),"object":"model","generation":false,"decisions":true,
+                    "architecture":{"input_modalities":endpoint.input_modalities(),"output_modalities":["decisions"]}}]});
+                let _ = respond_json(request, 200, &body);
+            }
+            (Method::Post, "/shutdown") => {
+                let _ = respond_json(request, 200, &json!({}));
+                break;
+            }
+            (Method::Post, "/v1/systemone") => {
+                let mut body = Vec::new();
+                let read = request
+                    .as_reader()
+                    .take(read_bound as u64)
+                    .read_to_end(&mut body);
+                match read {
+                    Err(error) => {
+                        let _ =
+                            respond_error(request, 400, &format!("reading request body: {error}"));
+                    }
+                    Ok(_) if body.len() > max_body_bytes => {
+                        let _ = respond_error(
+                            request,
+                            413,
+                            "decision request body exceeds supplied byte limit",
+                        );
+                    }
+                    Ok(_) => {
+                        let result = dispatch_systemone_with(&path, &body, |body| {
+                            endpoint
+                                .systemone(body)
+                                .map(|response| response.with_model(endpoint.model_name()))
+                        })
+                        .expect("SystemOne route selected above");
+                        let _ = respond_systemone(request, result);
+                    }
+                }
+            }
+            (Method::Post, "/v1/completions" | "/v1/chat/completions") => {
+                let _ = respond_error(
+                    request,
+                    501,
+                    "this decision-only owner does not generate tokens",
+                );
+            }
+            _ => {
+                let _ = respond_error(request, 404, &format!("unknown decision endpoint: {path}"));
+            }
+        }
+    }
+    // Our loop spawned no request threads and its last synchronous call
+    // returned; the server's own threads and connections retire here.
+    // Worker-stop only: no native DATA/callback/retirement certificate.
+    shutdown_http(&server);
+    endpoint.shutdown();
     Ok(())
 }
 
@@ -279,6 +523,25 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         .as_reader()
         .read_to_string(&mut body)
         .context("reading the request body")?;
+    // This branch consumes the original bytes exactly once. Parsing through
+    // Value first would reorder question/options/legend objects.
+    // Decisions that wait together are answered as one group; under `fast`
+    // the family packs them (`turns`).
+    if let Some(result) = dispatch_systemone_with(path, body.as_bytes(), |body| {
+        shared
+            .turns
+            .decide(body, shared.decision_pack, |bodies| {
+                shared
+                    .decisions
+                    .decide_batch(shared.engine.as_ref(), bodies)
+            })
+            .map(|response| response.with_model(&shared.model_name))
+    }) {
+        return respond_systemone(request, result);
+    }
+    // A single-sequence engine's model requests take the request slot one at
+    // a time; a batched engine schedules its own rows.
+    let _turn = (path != "/tokenize" && shared.engine.batch() <= 1).then(|| shared.turns.take());
     let value: Value = if body.trim().is_empty() {
         json!({})
     } else {
@@ -309,6 +572,53 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
         Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
     }
+}
+
+/// The actual ordered route: return None without parsing other endpoints.
+#[cfg(test)]
+fn dispatch_systemone(
+    engine: &dyn Served,
+    path: &str,
+    body: &[u8],
+) -> Option<std::result::Result<String, crate::decision::SystemOneError>> {
+    dispatch_systemone_with(path, body, |body| engine.systemone(body))
+}
+
+fn respond_systemone(
+    request: Request,
+    result: std::result::Result<String, crate::decision::SystemOneError>,
+) -> Result<()> {
+    use crate::decision::SystemOneError;
+    match result {
+        Ok(text) => respond_json_text(request, 200, text),
+        Err(SystemOneError::InvalidRequest(message)) => respond_error(request, 400, &message),
+        Err(SystemOneError::Unsupported(message)) => respond_error(request, 501, &message),
+        Err(SystemOneError::Execution(message)) => respond_error(request, 500, &message),
+    }
+}
+
+/// Shared actual ordered parser/invocation/serializer for both installed shapes.
+fn dispatch_systemone_with(
+    path: &str,
+    body: &[u8],
+    execute: impl FnOnce(
+        &crate::decision::OrderedJson,
+    ) -> std::result::Result<
+        crate::decision::SystemOneResponse,
+        crate::decision::SystemOneError,
+    >,
+) -> Option<std::result::Result<String, crate::decision::SystemOneError>> {
+    use crate::decision::{OrderedJson, SystemOneError};
+    if path != "/v1/systemone" {
+        return None;
+    }
+    Some((|| {
+        let ordered = OrderedJson::from_slice(body).map_err(|e| {
+            SystemOneError::InvalidRequest(format!("request body is not JSON: {e}"))
+        })?;
+        let response = execute(&ordered)?;
+        serde_json::to_string(&response).map_err(|e| SystemOneError::Execution(e.to_string()))
+    })())
 }
 
 enum Reply {
@@ -512,7 +822,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             "index": 0,
             "text": decoded.text,
             "logprobs": match want_logprobs {
-                Some(_) => completion_logprobs(shared.engine.as_ref(), &decoded),
+                Some(_) => completion_logprobs(shared.engine.as_ref(), &decoded)?,
                 None => Value::Null,
             },
             "finish_reason": finish_reason(decoded.stop),
@@ -529,11 +839,15 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
 
 /// OpenAI's completions `logprobs`: per returned id its token, its
 /// log-probability, the top tokens asked for, and its text's offset.
-fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Value {
+fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    let tokens: Vec<String> = d.tokens.iter().map(|&t| engine.token_str(t)).collect();
+    let tokens = d
+        .tokens
+        .iter()
+        .map(|&t| engine.token_str_checked(t))
+        .collect::<Result<Vec<String>>>()?;
     let mut offset = 0usize;
     let offsets: Vec<usize> = tokens
         .iter()
@@ -543,17 +857,17 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Value {
             o
         })
         .collect();
-    let top: Vec<Value> = lp
+    let top = lp
         .top
         .iter()
         .map(|t| {
-            Value::Object(
+            Ok(Value::Object(
                 t.iter()
-                    .map(|&(id, l)| (engine.token_str(id), json!(l)))
-                    .collect(),
-            )
+                    .map(|&(id, l)| Ok((engine.token_str_checked(id)?, json!(l))))
+                    .collect::<Result<_>>()?,
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<Value>>>()?;
     // OpenAI's `top_logprobs` keys by the token's text, and two ids can
     // share one (the halves of a character); `top_ids` keeps the ids.
     let top_ids: Vec<Value> = lp
@@ -561,13 +875,13 @@ fn completion_logprobs(engine: &dyn Served, d: &Decoded) -> Value {
         .iter()
         .map(|t| json!(t.iter().map(|&(id, l)| json!([id, l])).collect::<Vec<_>>()))
         .collect();
-    json!({
+    Ok(json!({
         "tokens": tokens,
         "token_logprobs": lp.sampled,
         "top_logprobs": top,
         "top_ids": top_ids,
         "text_offset": offsets,
-    })
+    }))
 }
 
 // ---- /v1/chat/completions ----------------------------------------------------
@@ -795,7 +1109,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         };
         let (argmax, all) = engine.next_token_logprobs(&prompt_ids, want)?;
         let top = &all[..top_k.min(all.len())];
-        let content = engine.token_str(argmax);
+        let content = engine.token_str_checked(argmax)?;
         let token_lp = top
             .iter()
             .find(|(t, _)| *t == argmax)
@@ -803,8 +1117,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             .unwrap_or(f32::NEG_INFINITY);
         let top_entries: Vec<Value> = top
             .iter()
-            .map(|(t, lp)| json!({ "token": engine.token_str(*t), "logprob": lp }))
-            .collect();
+            .map(|(t, lp)| Ok(json!({ "token": engine.token_str_checked(*t)?, "logprob": lp })))
+            .collect::<Result<_>>()?;
         let decision = if options.is_empty() {
             Value::Null
         } else {
@@ -826,7 +1140,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 }
                 scored.push(json!({
                     "text": text,
-                    "token": engine.token_str(first),
+                    "token": engine.token_str_checked(first)?,
                     "token_id": first,
                     "tokens": ids.len(),
                     "logprob": lp,
@@ -919,7 +1233,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         "choices": [{
             "index": 0,
             "message": { "role": "assistant", "content": decoded.text },
-            "logprobs": if want_logprobs { chat_logprobs(engine, &decoded) } else { Value::Null },
+            "logprobs": if want_logprobs { chat_logprobs(engine, &decoded)? } else { Value::Null },
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
@@ -938,7 +1252,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             body["choices"][0]["token_logprobs"] = json!(lp.sampled);
         }
     }
-    attach_vision(shared, &mut body);
+    attach_vision(shared, &mut body)?;
     Ok(Reply::Json(body))
 }
 
@@ -979,29 +1293,34 @@ fn logprob_request(
 
 /// OpenAI's chat `logprobs.content`: per returned id, its token, its
 /// log-probability and the `top_logprobs` asked for.
-fn chat_logprobs(engine: &dyn Served, d: &Decoded) -> Value {
+fn chat_logprobs(engine: &dyn Served, d: &Decoded) -> Result<Value> {
     let Some(lp) = &d.logprobs else {
-        return Value::Null;
+        return Ok(Value::Null);
     };
-    let content: Vec<Value> = d
+    let content = d
         .tokens
         .iter()
         .zip(&lp.sampled)
         .enumerate()
         .map(|(i, (&id, &l))| {
-            let top: Vec<Value> = lp
-                .top
-                .get(i)
-                .map(|t| {
-                    t.iter()
-                        .map(|&(t, l)| json!({ "token": engine.token_str(t), "id": t, "logprob": l }))
-                        .collect()
-                })
-                .unwrap_or_default();
-            json!({ "token": engine.token_str(id), "id": id, "logprob": l, "top_logprobs": top })
+            let top = match lp.top.get(i) {
+                Some(t) => t
+                    .iter()
+                    .map(|&(t, l)| {
+                        Ok(json!({ "token": engine.token_str_checked(t)?, "id": t, "logprob": l }))
+                    })
+                    .collect::<Result<Vec<Value>>>()?,
+                None => Vec::new(),
+            };
+            Ok(json!({
+                "token": engine.token_str_checked(id)?,
+                "id": id,
+                "logprob": l,
+                "top_logprobs": top,
+            }))
         })
-        .collect();
-    json!({ "content": content })
+        .collect::<Result<Vec<Value>>>()?;
+    Ok(json!({ "content": content }))
 }
 
 /// The token budgets a request asks for, over the process's defaults
@@ -1094,10 +1413,33 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
                 as usize,
         ),
     };
-    let gumbel = v
-        .get("gumbel")
-        .and_then(Value::as_bool)
-        .unwrap_or(shared.sampling.gumbel);
+    // `generation.sampling.method`, by its key's spelling or as the
+    // `gumbel` switch; set both ways they must agree.
+    let method = match v.get("sampling_method") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "multinomial" => Some(false),
+        Some(Value::String(m)) if m == "gumbel" => Some(true),
+        Some(_) => {
+            return Err(bad(
+                "field 'sampling_method' must be \"multinomial\" or \"gumbel\"",
+            ))
+        }
+    };
+    let switch = match v.get("gumbel") {
+        None | Some(Value::Null) => None,
+        Some(b) => Some(
+            b.as_bool()
+                .ok_or_else(|| bad("field 'gumbel' must be a boolean"))?,
+        ),
+    };
+    let gumbel = match (method, switch) {
+        (Some(m), Some(g)) if m != g => {
+            return Err(bad("fields 'sampling_method' and 'gumbel' disagree"))
+        }
+        (Some(m), _) => m,
+        (None, Some(g)) => g,
+        (None, None) => shared.sampling.gumbel,
+    };
     let top_p = match v.get("top_p") {
         None | Some(Value::Null) => shared.sampling.top_p,
         Some(p) => {
@@ -1284,7 +1626,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             },
         )
     };
-    let (mut w, write_err) = sw.finish()?;
+    let (w, write_err) = sw.finish()?;
     let decoded = decoded?;
     if let Some(thinking) = run.record {
         shared
@@ -1319,10 +1661,24 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         }),
     };
     let mut last = last;
-    if let StreamKind::Chat = run.kind {
-        attach_vision(shared, &mut last);
-    }
-    w.event(&last)?;
+    write_stream_trailer(w, &mut last, |body| {
+        if let StreamKind::Chat = run.kind {
+            attach_vision(shared, body)?;
+        }
+        Ok(())
+    })
+}
+
+/// Post-header completion: checked metadata refusal propagates as a stream
+/// error; neither a successful final event nor [DONE] is written. The status
+/// already sent by ChunkedWriter::start cannot become a retroactive HTTP 500.
+fn write_stream_trailer(
+    mut w: ChunkedWriter,
+    last: &mut Value,
+    prepare: impl FnOnce(&mut Value) -> Result<()>,
+) -> Result<()> {
+    prepare(last)?;
+    w.event(last)?;
     w.raw("data: [DONE]\n\n")?;
     w.finish()
 }
@@ -1504,8 +1860,8 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
-        .map(|r| engine.seed_prompt_row(prompt_tokens, r))
-        .collect();
+        .map(|r| engine.seed_prompt_row_checked(prompt_tokens, r))
+        .collect::<Result<_>>()?;
     let decoded = concurrent_rows(shared, prompts, &params)?;
     let completion: usize = decoded.iter().map(|d| d.tokens.len()).sum();
     eprintln!(
@@ -1853,7 +2209,10 @@ fn handle_abort(shared: &Shared, mut request: Request) -> Result<()> {
 // ---- responses ---------------------------------------------------------------
 
 fn respond_json(request: Request, status: u16, body: &Value) -> Result<()> {
-    let text = body.to_string();
+    respond_json_text(request, status, body.to_string())
+}
+
+fn respond_json_text(request: Request, status: u16, text: String) -> Result<()> {
     let response = Response::from_string(text)
         .with_status_code(StatusCode(status))
         .with_header(header("Content-Type", "application/json"));
@@ -2109,12 +2468,13 @@ fn short_id() -> String {
 /// The per-request vision report (`Served::vision_report`: the model's
 /// tensors, whether the tower is loaded, the image census) as a `vision`
 /// field beside `timings`, and on stderr. Nothing for a family without vision.
-fn attach_vision(shared: &Shared, body: &mut Value) {
-    let report = shared.engine.vision_report();
+fn attach_vision(shared: &Shared, body: &mut Value) -> Result<()> {
+    let report = shared.engine.vision_report_checked()?;
     if !report.is_null() {
         eprintln!("[vision: {report}]");
         body["vision"] = report;
     }
+    Ok(())
 }
 
 fn finish_reason(stop: Stop) -> &'static str {
@@ -2343,26 +2703,74 @@ fn front_failure(endpoint: &str, e: anyhow::Error) -> Failure {
     template_failure(e)
 }
 
-fn models_body(model_name: &str, engine: &dyn Served) -> Value {
-    json!({
+/// Propagate admitted metadata refusal as an HTTP error, never successful
+/// empty metadata. Outer response assembly/serialization enrollment stays open.
+fn respond_metadata(request: Request, result: Result<Value>) -> Result<()> {
+    match result {
+        Ok(body) => respond_json(request, 200, &body),
+        Err(error) => respond_error(request, 500, &format!("{error:#}")),
+    }
+}
+
+fn health_body(engine: &dyn Served, front: &Front) -> Result<Value> {
+    let mut body = engine.health_checked()?;
+    body["mem"] = MemSnapshot::read(engine.device()).json();
+    body["capabilities"] = engine.capabilities().json();
+    body["load_warnings"] = load_warnings_json(engine)?;
+    // The request front end's passes so far: a chat request renders its
+    // template once and tokenizes the result once.
+    body["template_renders"] = json!(engine.template_renders());
+    body["tokenizations"] = json!(front.tokenizations());
+    body["session_log"] = json!(front.logged());
+    body["chat_template_reads"] = ENGINE_KWARGS
+        .iter()
+        .map(|&k| (k.to_string(), json!(engine.template_reads(k))))
+        .collect::<Map<String, Value>>()
+        .into();
+    body["reasoning_tags"] = match engine.think_tags() {
+        Some(t) => json!({
+            "start": engine.token_str_checked(t.start)?,
+            "end": engine.token_str_checked(t.end)?,
+            "tool_call": t.tool_call.map(|id| engine.token_str_checked(id)).transpose()?,
+        }),
+        None => Value::Null,
+    };
+    Ok(body)
+}
+
+fn models_body(
+    model_name: &str,
+    engine: &dyn Served,
+    decisions: &super::decisions::Decisions,
+) -> Result<Value> {
+    let capabilities = engine.capabilities();
+    let mut input = vec!["text"];
+    if capabilities.vision {
+        input.push("image");
+    }
+    Ok(json!({
         "object": "list",
         "data": [{
             "id": model_name,
             "object": "model",
             "created": now(),
             "owned_by": "lloom",
-            "load_warnings": load_warnings_json(engine),
+            "architecture": {
+                "input_modalities": input,
+                "output_modalities": decisions.output_modalities(capabilities.generation),
+            },
+            "load_warnings": load_warnings_json(engine)?,
         }],
-    })
+    }))
 }
 
 /// The load's degradations as `[{kind, message}]` (`Served::load_warnings`).
-fn load_warnings_json(engine: &dyn Served) -> Value {
-    engine
-        .load_warnings()
+fn load_warnings_json(engine: &dyn Served) -> Result<Value> {
+    Ok(engine
+        .load_warnings_checked()?
         .iter()
         .map(|w| json!({ "kind": w.kind.name(), "message": w.message }))
-        .collect()
+        .collect())
 }
 
 // ---- `lloom bench` ---------------------------------------------------------------
@@ -2485,7 +2893,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let (engine, model_path) = super::load_engine(&options.load, shape)?;
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
-    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling.apply_checkpoint(engine.generation_config_checked()?.as_ref());
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
@@ -2497,7 +2905,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         engine.device(),
         engine.kv_capacity(),
         engine.readback().name(),
-        engine.describe(),
+        engine.describe_checked()?,
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     // The cells are the server's handlers; they read the engine through
@@ -2506,6 +2914,11 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
     let shared = Shared {
         engine,
+        decisions: super::decisions::Decisions::Refused(
+            "the benchmark cells do not take decisions".into(),
+        ),
+        turns: turns::Turns::default(),
+        decision_pack: false,
         aborts: Mutex::new(HashSet::new()),
         abort_epoch: AtomicU64::new(0),
         server,
@@ -2532,8 +2945,12 @@ pub fn bench(args: BenchArgs) -> Result<()> {
                 Cell::EndToEnd { p, d } => {
                     // The seed tiled to `p` tokens, as text: what the sidecar
                     // posts as `prompt`.
-                    let ids = shared.engine.seed_prompt_row(*p, 0);
-                    let prompt: String = ids.iter().map(|&t| shared.engine.token_str(t)).collect();
+                    let ids = shared.engine.seed_prompt_row_checked(*p, 0)?;
+                    let prompt: String = ids
+                        .iter()
+                        .map(|&t| shared.engine.token_str_checked(t))
+                        .collect::<Result<Vec<_>>>()?
+                        .concat();
                     end_to_end_latency(
                         &shared,
                         &json!({ "prompt": prompt, "decode_tokens": d, "batch": batch }),
@@ -2571,7 +2988,7 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         model_name,
         shared.engine.readback().name(),
         batch,
-        shared.engine.describe(),
+        shared.engine.describe_checked()?,
         shared.engine.capabilities().line(),
     );
     shared.engine.shutdown();
@@ -2601,7 +3018,7 @@ fn bench_mode(
         model_path.display(),
         load_start.elapsed().as_secs_f64(),
         engine.device(),
-        engine.describe(),
+        engine.describe_checked()?,
     );
     let gauge = super::common::MemGauge::start(engine.device(), mem_sample);
     let out = engine.run_mode(&spec);
@@ -3044,5 +3461,273 @@ mod stream_writer_tests {
             .map(|(_, s)| s)
             .collect();
         assert_eq!(body, "ctl<ab>mid<c>", "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod systemone_dispatch_tests {
+    use super::dispatch_systemone;
+    use crate::app::served::tests::NoVision;
+    use crate::decision::{
+        parse_systemone_questions, NoulAliases, OrderedJson, SystemOneError, SystemOneResponse,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn answer(body: &OrderedJson) -> std::result::Result<SystemOneResponse, SystemOneError> {
+        assert_eq!(
+            serde_json::to_string(body.get("state").unwrap()).unwrap(),
+            r#"{"z":"雪\n","a":false}"#
+        );
+        let questions = parse_systemone_questions(body, 255, NoulAliases::TrueFalseOnly)
+            .map_err(|e| SystemOneError::InvalidRequest(e.to_string()))?;
+        let answers = questions
+            .into_iter()
+            .map(|(id, question)| {
+                question
+                    .systemone_answer(&[0.25, 0.75])
+                    .map(|answer| (id, answer))
+                    .map_err(|e| SystemOneError::Execution(e.to_string()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        SystemOneResponse::new(answers, 123)
+    }
+
+    #[test]
+    fn actual_narrow_dispatch_keeps_incumbent_bytes_and_refusal_classification() {
+        use super::dispatch_systemone_with;
+        let engine = NoVision::new(Some(answer));
+        let body=br#"{"state":{"z":"\u96ea\n","a":false},"questions":{"z":{"type":"score","instructions":"rate","criteria":[{"z":null,"a":false},17]},"a":{"type":"choice","instructions":"pick","criteria":{"Z":null,"A":true}}}}"#;
+        let incumbent = dispatch_systemone(&engine, "/v1/systemone", body)
+            .unwrap()
+            .unwrap();
+        let mut calls = 0;
+        let narrow = dispatch_systemone_with("/v1/systemone", body, |body| {
+            calls += 1;
+            answer(body)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(narrow, incumbent);
+        assert_eq!(calls, 1);
+        assert!(
+            narrow.contains(r#""legend":{"0":{"z":null,"a":false},"1":17}},"a":{"type":"choice""#)
+        );
+        assert!(narrow.ends_with(r#""usage":{"input_tokens":123,"output_tokens":0}}"#));
+        assert!(
+            dispatch_systemone_with("/v1/chat/completions", b"not json", |_| panic!(
+                "unrelated route called endpoint"
+            ))
+            .is_none()
+        );
+        assert!(matches!(
+            dispatch_systemone_with("/v1/systemone", b"not json", |_| panic!(
+                "invalid JSON called endpoint"
+            )),
+            Some(Err(SystemOneError::InvalidRequest(_)))
+        ));
+        assert!(
+            matches!(dispatch_systemone_with("/v1/systemone",b"{}",|_|Err(SystemOneError::Unsupported("not installed".into()))),Some(Err(SystemOneError::Unsupported(message))) if message=="not installed")
+        );
+        assert!(
+            matches!(dispatch_systemone_with("/v1/systemone",b"{}",|_|Err(SystemOneError::Execution("refused admission".into()))),Some(Err(SystemOneError::Execution(message))) if message=="refused admission")
+        );
+    }
+
+    #[test]
+    fn actual_ordered_route_calls_loaded_executor_once_and_serializes_without_value() {
+        let engine = NoVision::new(Some(answer));
+        let body = br#"{"state":{"z":"\u96ea\n","a":false},"questions":{"z":{"type":"score","instructions":"rate","criteria":[{"z":null,"a":false},17]},"a":{"type":"choice","instructions":"pick","criteria":{"Z":null,"A":true}}}}"#;
+        let text = dispatch_systemone(&engine, "/v1/systemone", body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 1);
+        assert!(
+            text.starts_with(r#"{"answers":{"z":{"type":"score""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""legend":{"0":{"z":null,"a":false},"1":17}},"a":{"type":"choice""#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""probabilities":{"Z":0.25,"A":0.75}"#),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(r#""usage":{"input_tokens":123,"output_tokens":0}}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unrelated_routes_and_invalid_json_do_not_enter_executor() {
+        let engine = NoVision::new(Some(answer));
+        assert!(dispatch_systemone(&engine, "/v1/chat/completions", b"not json").is_none());
+        assert!(matches!(
+            dispatch_systemone(&engine, "/v1/systemone", b"not json"),
+            Some(Err(SystemOneError::InvalidRequest(_)))
+        ));
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn missing_executor_stays_explicit_and_duplicate_answers_are_refused() {
+        let engine = NoVision::new(None);
+        assert!(matches!(
+            dispatch_systemone(&engine, "/v1/systemone", b"{}"),
+            Some(Err(SystemOneError::Unsupported(_)))
+        ));
+        assert_eq!(engine.calls.load(Ordering::Relaxed), 1);
+        let answer = crate::decision::Answer::Noul { probability: 0.5 };
+        assert!(SystemOneResponse::new(vec![], 0).is_err());
+        assert!(SystemOneResponse::new(
+            vec![("q".into(), answer.clone()), ("q".into(), answer)],
+            0
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod metadata_consumer_tests {
+    use super::{health_body, models_body, Front};
+    use crate::app::served::tests::NoVision;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn actual_metadata_bodies_propagate_refusal_without_legacy_fallback() {
+        let engine = NoVision::refusing_metadata();
+        assert_eq!(
+            health_body(&engine, &Front::new(&engine, Default::default()))
+                .unwrap_err()
+                .to_string(),
+            "bounded metadata health refusal",
+            "actual health body must propagate refusal, not successful metadata",
+        );
+        assert_eq!(
+            models_body(
+                "bounded",
+                &engine,
+                &crate::app::decisions::Decisions::Refused(String::new())
+            )
+            .unwrap_err()
+            .to_string(),
+            "bounded metadata warning refusal",
+            "actual model card must propagate warning refusal, not an empty list",
+        );
+        assert_eq!(engine.metadata_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn actual_model_card_reads_current_warnings_on_each_request() {
+        let engine = NoVision::dynamic_metadata();
+        engine.warning_epoch.store(1, Ordering::Relaxed);
+        let first = models_body(
+            "bounded",
+            &engine,
+            &crate::app::decisions::Decisions::Refused(String::new()),
+        )
+        .unwrap();
+        engine.warning_epoch.store(2, Ordering::Relaxed);
+        let second = models_body(
+            "bounded",
+            &engine,
+            &crate::app::decisions::Decisions::Refused(String::new()),
+        )
+        .unwrap();
+        let warnings =
+            |body: &serde_json::Value| body["data"][0]["load_warnings"].as_array().unwrap().clone();
+        assert_eq!(warnings(&first).len(), 1);
+        assert_eq!(warnings(&second).len(), 1);
+        assert_eq!(warnings(&first)[0]["kind"], "emulated_type");
+        assert_eq!(
+            warnings(&first)[0]["message"],
+            "bounded dynamic warning epoch 1"
+        );
+        assert_eq!(
+            warnings(&second)[0]["message"],
+            "bounded dynamic warning epoch 2",
+            "actual model card must read current warnings, not a cold snapshot"
+        );
+        assert_eq!(engine.metadata_calls.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+#[path = "serve_loaded_tests.rs"]
+mod loaded_owner_tests;
+
+#[cfg(test)]
+mod checked_trailer_tests {
+    use super::{write_stream_trailer, ChunkedWriter};
+    use crate::app::served::{tests::NoVision, Served};
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Mem(Arc<Mutex<Vec<u8>>>);
+    impl Write for Mem {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The actual post-decode trailer helper, with an in-memory writer, not a
+    // socket/HTTP dispatch or Loaded-owner admission control. Headers are
+    // already sent: refusal returns Err, not a retroactive HTTP 500.
+    #[test]
+    fn checked_vision_refusal_after_headers_emits_no_success_trailer() {
+        let engine = NoVision::refusing_metadata();
+        let mem = Mem::default();
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        mem.0.lock().extend_from_slice(headers);
+        let mut writer = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        writer.raw("data: prior-fragment\n\n").unwrap();
+        let before = mem.0.lock().clone();
+        let mut last = serde_json::json!({"choices":[{"finish_reason":"stop"}]});
+        let error = write_stream_trailer(writer, &mut last, |body| {
+            let report = engine.vision_report_checked()?;
+            body["vision"] = report;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "bounded metadata vision refusal");
+        assert_eq!(
+            *mem.0.lock(),
+            before,
+            "refused metadata wrote a success event or [DONE]"
+        );
+        assert!(
+            last.get("vision").is_none(),
+            "refusal fabricated vision metadata"
+        );
+    }
+
+    #[test]
+    fn successful_checked_trailer_preserves_event_done_and_chunk_termination() {
+        let mem = Mem::default();
+        let writer = ChunkedWriter {
+            w: Box::new(mem.clone()),
+        };
+        let mut last = serde_json::json!({"ok":true});
+        write_stream_trailer(writer, &mut last, |_| Ok(())).unwrap();
+        let bytes = mem.0.lock().clone();
+        let text = String::from_utf8(bytes).unwrap();
+        let event = text
+            .find("data: {\"ok\":true}\n\n")
+            .expect("success lost final event");
+        let done = text.find("data: [DONE]\n\n").expect("success lost [DONE]");
+        assert!(event < done, "trailer event reordered after [DONE]");
+        assert!(
+            text.ends_with("0\r\n\r\n"),
+            "success lost chunk termination"
+        );
     }
 }

@@ -11452,17 +11452,20 @@ fn run_inverse_cdf(logits: &[f32], vocab: usize, inv_t: f32, u: &[f32]) -> Vec<u
     let z = new_buffer(&device, logits);
     let ub = new_buffer(&device, u);
     let out = new_buffer(&device, &vec![u32::MAX; rows]);
-    crate::kernels::kernels::call_sample_inverse_cdf(
-        &device,
-        &encoder,
-        &kernels,
-        (&z, 0),
-        rows,
-        vocab,
-        inv_t,
-        (&ub, 0),
-        &out,
-    )
+    // SAFETY: the three buffers outlive the wait below and no ICB captures them.
+    unsafe {
+        crate::kernels::kernels::call_sample_inverse_cdf(
+            &device,
+            &encoder,
+            &kernels,
+            (&z, 0),
+            rows,
+            vocab,
+            inv_t,
+            (&ub, 0),
+            &out,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();

@@ -8,6 +8,9 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
+/// `native_key` before a commit names its native command buffer.
+const NO_KEY: usize = 0;
+
 const EMPTY: u8 = 0;
 const WRITING: u8 = 1;
 const PUBLISHED: u8 = 2;
@@ -20,11 +23,16 @@ pub(crate) struct OrderedMetadata<P> {
     ordered_ready: AtomicBool,
     callbacks_finished: AtomicBool,
     wrapper_handles: AtomicUsize,
+    /// The native object this generation's commit handed to the queue (its
+    /// address), so a queue-wide completion handler can find the record.
+    native_key: AtomicUsize,
     command_lifecycle: crate::command_lifecycle::CommandLifecycle,
 }
 // SAFETY: publication owns WRITING, extraction owns TAKEN after winning the
-// PUBLISHED CAS. No shared reference to P is exposed. Reset requires exclusive
-// generation custody from the containing registry, not just a native ticket.
+// PUBLISHED CAS. A shared reference to P is exposed only by `peek_successor`,
+// whose caller excludes extraction (see there) and which requires P: Sync.
+// Reset requires exclusive generation custody from the containing registry,
+// not just a native ticket.
 unsafe impl<P: Send> Send for OrderedMetadata<P> {}
 unsafe impl<P: Send> Sync for OrderedMetadata<P> {}
 impl<P> OrderedMetadata<P> {
@@ -36,6 +44,7 @@ impl<P> OrderedMetadata<P> {
             ordered_ready: AtomicBool::new(false),
             callbacks_finished: AtomicBool::new(false),
             wrapper_handles: AtomicUsize::new(0),
+            native_key: AtomicUsize::new(NO_KEY),
             command_lifecycle: crate::command_lifecycle::CommandLifecycle::new(),
         }
     }
@@ -66,6 +75,7 @@ impl<P> OrderedMetadata<P> {
         unsafe {
             self.command_lifecycle.reset_generation();
         }
+        self.native_key.store(NO_KEY, Ordering::Relaxed);
         self.native_ready.store(false, Ordering::Relaxed);
         self.ordered_ready.store(false, Ordering::Relaxed);
         self.callbacks_finished.store(false, Ordering::Relaxed);
@@ -87,6 +97,31 @@ impl<P> OrderedMetadata<P> {
         }
         self.successor_phase.store(PUBLISHED, Ordering::Release);
         Ok(())
+    }
+    /// The published successor, left in place.
+    ///
+    /// # Safety
+    /// The caller holds, for as long as it uses the reference, the one lock
+    /// under which every [`Self::take_successor`] of this chain runs, so the
+    /// value cannot be taken from under it; publication is complete once
+    /// PUBLISHED is observed, and a published value is never rewritten.
+    pub(crate) unsafe fn peek_successor(&self) -> Option<&P>
+    where
+        P: Sync,
+    {
+        if self.successor_phase.load(Ordering::Acquire) != PUBLISHED {
+            return None;
+        }
+        // SAFETY: PUBLISHED, and extraction is excluded by the caller.
+        unsafe { (*self.successor.get()).as_ref() }
+    }
+    /// Name the native object this generation's commit hands to the queue.
+    pub(crate) fn set_native_key(&self, key: usize) {
+        debug_assert_ne!(key, NO_KEY);
+        self.native_key.store(key, Ordering::Release);
+    }
+    pub(crate) fn native_key(&self) -> usize {
+        self.native_key.load(Ordering::Acquire)
     }
     pub(crate) fn take_successor(&self) -> Option<P> {
         self.successor_phase

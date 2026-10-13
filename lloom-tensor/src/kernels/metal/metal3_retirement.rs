@@ -42,6 +42,8 @@ pub(super) struct Completions {
     // Native error is terminal evidence, not adapter poison. Drain still runs
     // every genuinely ready callback to release known-completed owners.
     native_error: OnceLock<String>,
+    // Run by the drain for every flagged record, in prefix (commit) order.
+    hook: OnceLock<Arc<super::completion_hook::CompletionHook>>,
 }
 struct Drain {
     cursor: Marker,
@@ -69,7 +71,11 @@ impl Completions {
         wake: Arc<Wake>,
     ) -> Result<Arc<Self>, crate::kernels::MetalKernelError> {
         let sentinel = registry
-            .prepare(Captures(Vec::new()), NativeOwners::vacant(), |_| Ok(()))
+            .prepare(
+                Captures::new(Vec::new()),
+                NativeOwners::vacant(),
+                |_| Ok(()),
+            )
             .map_err(|_| unavailable("M3 sentinel registration refused"))?;
         let pins = (|| {
             let tail = sentinel
@@ -97,7 +103,17 @@ impl Completions {
             failure,
             wake,
             native_error: OnceLock::new(),
+            hook: OnceLock::new(),
         }))
+    }
+    /// Once, before the first commit flags a record for it.
+    pub(super) fn install_hook(
+        &self,
+        hook: Arc<super::completion_hook::CompletionHook>,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.hook
+            .set(hook)
+            .map_err(|_| unavailable("completion hook already installed"))
     }
     pub(super) fn identity(&self) -> usize {
         self as *const Self as usize
@@ -186,6 +202,68 @@ impl Completions {
         **tail = new_tail;
         Ok(())
     }
+    /// One queue-wide handler for every committed buffer: find the committed
+    /// record whose buffer this is, then publish as [`Self::native_feedback`].
+    /// The record is found by its buffer's address in the committed prefix,
+    /// never by position: Metal does not order its handlers. Every committed
+    /// record is still in the prefix when its own feedback arrives (the drain
+    /// passes a record only after that feedback), and its key was published
+    /// before the buffer was committed. A miss is a broken invariant: the
+    /// queue fails rather than lose the feedback.
+    fn native_feedback_for(&self, key: usize, read: impl FnOnce() -> Feedback) {
+        let record = {
+            let drain = self.drain.lock();
+            // SAFETY: `take_successor` runs only under this lock (`drain_ready`),
+            // held for as long as the walk's references live.
+            let mut at = drain
+                .next
+                .as_ref()
+                .or_else(|| unsafe { drain.cursor.peek_successor() });
+            loop {
+                match at {
+                    Some(m) if m.native_key() == key => break Some(m.record().clone()),
+                    // SAFETY: as above.
+                    Some(m) => at = unsafe { m.peek_successor() },
+                    None => break None,
+                }
+            }
+        };
+        match record {
+            Some(record) => self.native_feedback(record, read),
+            None => self
+                .failure
+                .publish(Failure::AdapterFailed, || self.wake.notify()),
+        }
+    }
+    /// The queue's completion handler: one block, built once, which Metal
+    /// copies (a retain, not an allocation) into each committed buffer. It
+    /// holds the queue's metadata core, so the core outlives every handler
+    /// Metal still holds; the core does not hold it back.
+    pub(super) fn native_handler(self: &Arc<Self>) -> Arc<NativeHandler> {
+        let core = self.clone();
+        Arc::new(NativeHandler(block2::RcBlock::new(
+            move |cb: std::ptr::NonNull<
+                objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+            >| {
+                core.native_feedback_for(cb.as_ptr() as *const () as usize, || {
+                    // SAFETY: Metal supplies the completed buffer for this native
+                    // callback. Only terminal status/error/timestamps are read.
+                    let cb = unsafe { cb.as_ref() };
+                    Feedback {
+                        error: (cb.status() == objc2_metal::MTLCommandBufferStatus::Error).then(
+                            || {
+                                cb.error()
+                                    .map(|e| e.localizedDescription().to_string())
+                                    .unwrap_or_else(|| "unknown Metal command buffer error".into())
+                            },
+                        ),
+                        start: cb.GPUStartTime(),
+                        end: cb.GPUEndTime(),
+                    }
+                });
+            },
+        )))
+    }
     pub(super) fn native_feedback(&self, record: Record, read: impl FnOnce() -> Feedback) {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Ready cannot detach before this feedback runs its callbacks.
@@ -245,7 +323,9 @@ impl Completions {
                 drain.next.as_ref().expect("ready successor").try_clone()?
             };
             next.record().run_callbacks(
-                |captures, _, feedback| captures.run(self.identity(), feedback),
+                |captures, _, feedback| {
+                    captures.run(self.identity(), feedback, self.hook.get().map(|h| &**h))
+                },
                 || self.wake.notify(),
             )?;
             next.publish_callbacks_finished();
@@ -295,6 +375,20 @@ enum CommitPhase {
     Returned,
 }
 
+/// [`Completions::native_handler`]'s block. Shared across threads: Metal
+/// copies and releases it from any thread, and it captures only the core.
+pub(super) struct NativeHandler(
+    block2::RcBlock<
+        dyn Fn(
+            std::ptr::NonNull<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
+        ),
+    >,
+);
+// SAFETY: block copy/release are atomic reference counts, and the closure
+// captures one `Arc<Completions>`, which is Send + Sync.
+unsafe impl Send for NativeHandler {}
+unsafe impl Sync for NativeHandler {}
+
 /// Only associated engine wrappers construct this transaction. Standalone raw
 /// CommandBuffer::new retains its explicit native-only compatibility contract.
 /// The actual wrapper constructor/routing remains an integration prerequisite.
@@ -305,11 +399,7 @@ pub(super) struct PreparedCommit<'a> {
     order: MutexGuard<'a, Marker>,
     link: Option<Marker>,
     new_tail: Option<Marker>,
-    handler: block2::RcBlock<
-        dyn Fn(
-            std::ptr::NonNull<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
-        ),
-    >,
+    handler: &'a NativeHandler,
     phase: CommitPhase,
 }
 impl Completions {
@@ -319,6 +409,7 @@ impl Completions {
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
         >,
         marker: &'a Marker,
+        handler: &'a NativeHandler,
         nonblocking: bool,
     ) -> Result<PreparedCommit<'a>, crate::kernels::MetalKernelError> {
         let order = self.prepare_order_mode(nonblocking)?;
@@ -335,32 +426,6 @@ impl Completions {
         let new_tail = marker
             .try_clone()
             .map_err(|_| unavailable("M3 tail pin refused"))?;
-        let record = marker.record().clone();
-        let completion = self.clone();
-        // This allocation happens before append/native handoff. Unused/drop
-        // cannot leave a sequence hole or a native-installed handler.
-        let handler = block2::RcBlock::new(
-            move |cb: std::ptr::NonNull<
-                objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
-            >| {
-                completion.native_feedback(record.clone(), || {
-                    // SAFETY: Metal supplies the completed buffer for this native
-                    // callback. Only terminal status/error/timestamps are read.
-                    let cb = unsafe { cb.as_ref() };
-                    Feedback {
-                        error: (cb.status() == objc2_metal::MTLCommandBufferStatus::Error).then(
-                            || {
-                                cb.error()
-                                    .map(|e| e.localizedDescription().to_string())
-                                    .unwrap_or_else(|| "unknown Metal command buffer error".into())
-                            },
-                        ),
-                        start: cb.GPUStartTime(),
-                        end: cb.GPUEndTime(),
-                    }
-                });
-            },
-        );
         Ok(PreparedCommit {
             core: self,
             raw,
@@ -374,16 +439,41 @@ impl Completions {
     }
 }
 impl PreparedCommit<'_> {
+    /// Flag this record for the queue's completion hook. No allocation, no
+    /// lock: a phase-exclusive edit of the prepared record.
+    pub(super) fn run_hook(&self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.core.check()?;
+        if self.core.hook.get().is_none() {
+            return Err(unavailable("M3 completion hook not installed"));
+        }
+        match self
+            .marker
+            .record()
+            .edit_prepared((), |captures, _, _| captures.hooked = true)
+        {
+            Ok(_) => Ok(()),
+            Err(crate::retirement_mailbox::PreparedEditError::Rejected(_)) => {
+                Err(unavailable("M3 completion hook phase refused"))
+            }
+            Err(crate::retirement_mailbox::PreparedEditError::Panicked { .. }) => {
+                Err(unavailable("M3 completion hook edit panicked"))
+            }
+        }
+    }
     pub(super) fn commit(mut self) -> Result<(), crate::kernels::MetalKernelError> {
         self.core.check()?;
         // Record phase before entering Objective-C. Handler installation cannot
         // execute GPU work; cancellation can still use host-only destruction.
         self.phase = CommitPhase::HandlerAttached;
-        // SAFETY: Metal copies this preallocated metadata-only block. No block
-        // disposal owns the last callback/physical payload reference.
+        // The queue-wide handler finds this record by its buffer: publish the
+        // key before the handler can exist on the buffer.
+        self.marker
+            .set_native_key(objc2::rc::Retained::as_ptr(self.raw) as *const () as usize);
+        // SAFETY: Metal copies (retains) the queue's heap block. It owns no
+        // callback or physical payload, only the metadata core.
         unsafe {
             self.raw
-                .addCompletedHandler(block2::RcBlock::as_ptr(&self.handler));
+                .addCompletedHandler(block2::RcBlock::as_ptr(&self.handler.0));
         }
         self.core.check()?;
         let link = self.link.take().expect("prepared successor pin");
@@ -444,6 +534,7 @@ pub(super) struct AssociatedBuffer {
     raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
     marker: Marker,
     core: Arc<Completions>,
+    handler: Arc<NativeHandler>,
     anchor: Metal3Anchor,
 }
 pub(super) struct CallbackRejected {
@@ -472,6 +563,7 @@ impl AssociatedBuffer {
     pub(super) fn new(
         raw: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>,
         core: Arc<Completions>,
+        handler: Arc<NativeHandler>,
         physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
     ) -> Result<Self, crate::kernels::MetalKernelError> {
         let anchor = core
@@ -520,7 +612,10 @@ impl AssociatedBuffer {
                 .into())
             }
         };
-        let marker = match core.reserve(Captures(Vec::new()), NativeOwners::metal3(native_anchor)) {
+        let marker = match core.reserve(
+            Captures::new(Vec::new()),
+            NativeOwners::metal3(native_anchor),
+        ) {
             Ok(marker) => marker,
             Err(rejected) => {
                 return Err(crate::kernels::err::CompletionRegistrationError::new(
@@ -557,6 +652,7 @@ impl AssociatedBuffer {
             raw,
             marker,
             core,
+            handler,
             anchor,
         })
     }
@@ -632,7 +728,7 @@ impl AssociatedBuffer {
         nonblocking: bool,
     ) -> Result<PreparedCommit<'_>, crate::kernels::MetalKernelError> {
         self.core
-            .prepare_commit(&self.raw, &self.marker, nonblocking)
+            .prepare_commit(&self.raw, &self.marker, &self.handler, nonblocking)
     }
     pub(super) fn try_commit(&self) -> Result<(), crate::kernels::MetalKernelError> {
         self.prepare_commit()?.commit()
@@ -655,13 +751,13 @@ impl AssociatedBuffer {
             .edit_prepared(callback, |captures, _, input| {
                 // Fallible/allocation work precedes transfer. After take, push into
                 // reserved capacity cannot allocate or invoke arbitrary user code.
-                if captures.0.try_reserve(1).is_err() {
+                if captures.callbacks.try_reserve(1).is_err() {
                     return Err(());
                 }
                 let Some(callback) = input.take() else {
                     return Err(());
                 };
-                captures.0.push(callback);
+                captures.callbacks.push(callback);
                 Ok(())
             }) {
             Ok((Ok(()), None)) => Ok(()),
@@ -725,6 +821,7 @@ impl Clone for AssociatedBuffer {
             .try_clone()
             .expect("M3 metadata pin count exhausted");
         let core = self.core.clone();
+        let handler = self.handler.clone();
         marker
             .add_wrapper_handle()
             .expect("M3 wrapper count exhausted");
@@ -732,6 +829,7 @@ impl Clone for AssociatedBuffer {
             raw,
             marker,
             core,
+            handler,
             anchor,
         }
     }
@@ -769,7 +867,7 @@ mod tests {
         (service, core)
     }
     fn reserve(core: &Completions, callback: super::super::retirement::Callback) -> Marker {
-        core.reserve(Captures(vec![callback]), NativeOwners::vacant())
+        core.reserve(Captures::new(vec![callback]), NativeOwners::vacant())
             .unwrap_or_else(|_| panic!("fake owner reserve"))
     }
     fn handoff(core: &Completions, marker: &Marker) {
@@ -921,6 +1019,77 @@ mod tests {
         assert!(fourth.callbacks_finished());
         cleanup(&service);
         assert!(fourth.callbacks_finished());
+    }
+
+    /// The queue-wide handler finds each record by its buffer's key, whatever
+    /// order the feedback arrives in, and callbacks still run in commit order;
+    /// a key that names no committed record fails the queue instead of being
+    /// dropped. Absolute references: the call order and the failure reason.
+    #[test]
+    fn the_queue_handler_finds_each_record_by_its_buffer_in_any_order() {
+        let (service, core) = core();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let markers: Vec<Marker> = (0..3)
+            .map(|i| {
+                let c = calls.clone();
+                reserve(&core, Box::new(move |_| c.lock().push(i)))
+            })
+            .collect();
+        for (i, m) in markers.iter().enumerate() {
+            m.set_native_key(0x1000 + i);
+            handoff(&core, m);
+        }
+        core.native_feedback_for(0x1002, || feedback(None));
+        assert!(markers[2].native_ready());
+        assert!(
+            calls.lock().is_empty(),
+            "a later buffer's callbacks ran first"
+        );
+        core.native_feedback_for(0x1000, || feedback(None));
+        assert_eq!(*calls.lock(), vec![0]);
+        core.native_feedback_for(0x1001, || feedback(None));
+        assert_eq!(*calls.lock(), vec![0, 1, 2]);
+        assert!(markers.iter().all(Marker::callbacks_finished));
+        assert_eq!(core.failure.get(), None);
+        core.native_feedback_for(0xdead, || feedback(None));
+        assert_eq!(
+            core.failure.get(),
+            Some(Failure::AdapterFailed),
+            "feedback for a buffer the queue never committed was dropped silently"
+        );
+        cleanup(&service);
+    }
+
+    /// Feedback that arrives while the drainer runs an earlier record's
+    /// callbacks is found through the record being run (`Drain::next`), and
+    /// runs after it.
+    #[test]
+    fn the_queue_handler_finds_a_record_behind_the_one_being_drained() {
+        let (service, core) = core();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::downgrade(&core);
+        let c0 = calls.clone();
+        let first = reserve(
+            &core,
+            Box::new(move |_| {
+                c0.lock().push(0);
+                inner
+                    .upgrade()
+                    .unwrap()
+                    .native_feedback_for(0x2001, || feedback(None));
+            }),
+        );
+        let c1 = calls.clone();
+        let second = reserve(&core, Box::new(move |_| c1.lock().push(1)));
+        for (key, m) in [(0x2000, &first), (0x2001, &second)] {
+            m.set_native_key(key);
+            handoff(&core, m);
+        }
+        core.native_feedback_for(0x2000, || feedback(None));
+        assert_eq!(*calls.lock(), vec![0, 1]);
+        assert!(second.callbacks_finished());
+        assert_eq!(core.failure.get(), None);
+        cleanup(&service);
     }
 
     #[test]

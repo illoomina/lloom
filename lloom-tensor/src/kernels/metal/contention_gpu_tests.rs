@@ -116,10 +116,10 @@ fn a_bind_blocked_by_a_map_writer_is_one_host_read_wait() {
 }
 
 /// A command buffer completes while the host holds the fence map and the
-/// fence book: the completion thread takes neither. The GPU clock's handler,
-/// registered after the session's, advances under them -- it could not if the
-/// session's handler were waiting on a lock the test holds -- and the session's
-/// entry leaves the map at the host's next encoder close.
+/// fence book: the completion thread takes neither. The queue's completion
+/// hook advances the GPU clock under them -- it could not if it were waiting
+/// on a lock the test holds -- which completes the session's fence, and the
+/// session's entry leaves the map at the host's next encoder close.
 #[test]
 fn a_completion_never_waits_on_the_hosts_fence_locks() {
     let Some(device) = Device::system_default() else {

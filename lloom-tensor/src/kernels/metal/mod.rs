@@ -40,6 +40,11 @@ pub mod completion;
 /// needs no GPU.
 #[cfg(test)]
 mod completion_gpu_tests;
+mod completion_hook;
+/// The completion hook on a real queue: commit-order epochs, fence completion,
+/// subscribers without their lock.
+#[cfg(test)]
+mod completion_hook_gpu_tests;
 /// Component digests: one fingerprint per mechanism per variant (#105).
 #[cfg(test)]
 mod component_digest_tests;

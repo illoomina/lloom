@@ -34,10 +34,6 @@ use crate::tuning::DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER;
 
 pub use crate::command_policy::CutPolicy;
 
-/// Callbacks run after each command buffer completes. See
-/// [`Commands::on_command_buffer_complete`].
-type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
-
 /// Whether the queue hands out command buffers that do NOT retain the
 /// resources encoded into them (`commandBufferWithUnretainedReferences`).
 ///
@@ -94,9 +90,7 @@ fn create_command_buffer(
         CommandBufferKind::Unretained => command_queue.commandBufferWithUnretainedReferences(),
         CommandBufferKind::Retaining => command_queue.commandBuffer(),
     };
-    raw.ok_or(MetalKernelError::FailedToCreateResource(
-        "CommandBuffer".to_string(),
-    ))
+    raw.ok_or_else(|| MetalKernelError::FailedToCreateResource("CommandBuffer".to_string()))
 }
 
 /// RAII guard for compute command encoder operations.
@@ -346,6 +340,8 @@ struct CommandsCore {
     command_queue: CommandQueue,
     modern_queue: Option<Arc<super::metal4::Queue>>,
     legacy_completions: Option<Arc<super::metal3_retirement::Completions>>,
+    /// The Metal 3 queue's one completion block, copied into every buffer.
+    legacy_handler: Option<Arc<super::metal3_retirement::NativeHandler>>,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: AtomicUsize,
@@ -393,13 +389,11 @@ struct CommandsCore {
     /// This queue's own dispatch trace (`trace::DeviceTrace`), handed to
     /// every compute encoder this creates while the trace switch is on.
     trace: Arc<crate::kernels::metal::trace::DeviceTrace>,
-    /// Run after each command buffer completes, once per command buffer.
-    ///
-    /// The buffer pools subscribe here to sweep in what that command buffer was
-    /// holding up. Kept as a callback rather than a direct reference to the
-    /// pools so that `Commands` does not need to know they exist -- it owns the
-    /// clock, not the things that read it.
-    on_complete: CompletionSubscribers,
+    /// What every command buffer committed here runs on completion: the
+    /// failure latch, the clock, the subscribers. Built once and installed in
+    /// the completion adapter, so a commit allocates and locks nothing for it
+    /// (`completion_hook.rs`).
+    hook: Arc<super::completion_hook::CompletionHook>,
     /// How dispatches reach the GPU (`DESIGN.md` §11.1). Handed to every
     /// compute encoder this creates.
     ///
@@ -481,7 +475,7 @@ struct CommandsCore {
 /// stays raised: the failed buffer's writes never happened, so nothing
 /// computed after it can be trusted, whichever wait the host next makes.
 #[derive(Default)]
-struct CommandBufferFailure {
+pub(super) struct CommandBufferFailure {
     failed: AtomicBool,
     message: std::sync::OnceLock<CommandFailureMessage>,
 }
@@ -491,17 +485,17 @@ enum CommandFailureMessage {
 }
 
 impl CommandBufferFailure {
-    fn record(&self, message: String) {
+    pub(super) fn record(&self, message: String) {
         let _ = self.message.set(CommandFailureMessage::Native(message));
         self.failed.store(true, Ordering::Release);
     }
 
-    fn record_static(&self, message: &'static str) {
+    pub(super) fn record_static(&self, message: &'static str) {
         let _ = self.message.set(CommandFailureMessage::Host(message));
         self.failed.store(true, Ordering::Release);
     }
 
-    fn check(&self) -> Result<(), MetalKernelError> {
+    pub(super) fn check(&self) -> Result<(), MetalKernelError> {
         if !self.failed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -519,9 +513,9 @@ impl CommandBufferFailure {
 
 /// The host's fence bookkeeping beside `prev_ce_outputs`.
 ///
-/// A command buffer's completion handler only marks the fences of the sessions
-/// it carried completed ([`Fence::mark_completed`]); the host removes their map
-/// entries at its next encoder close or queue-wide wait ([`FenceBook::reap`]),
+/// A session's fence completes when the queue's clock marks the epoch of the
+/// command buffer that carried it ([`Fence::is_completed`]); the host removes
+/// their map entries at its next encoder close or queue-wide wait ([`FenceBook::reap`]),
 /// under the locks those take anyway. Nothing removes an entry whose session
 /// may still be running: with several threads on one queue, a wait covers only
 /// what was committed when it began. So no Metal completion thread ever takes the map's lock
@@ -731,6 +725,9 @@ impl Commands {
         } else {
             None
         };
+        let legacy_handler = legacy_completions
+            .as_ref()
+            .map(|core| core.native_handler());
         let cb = if let Some(queue) = &modern_queue {
             eprintln!("[metal] command_api=metal4 reusable_native_buffers=true");
             CommandBuffer::from_metal4(queue.acquire()?)
@@ -741,6 +738,10 @@ impl Commands {
                     .as_ref()
                     .expect("M3 core constructed")
                     .clone(),
+                legacy_handler
+                    .as_ref()
+                    .expect("M3 handler constructed")
+                    .clone(),
                 None,
             )?)
         };
@@ -750,7 +751,16 @@ impl Commands {
         let clock = Arc::new(GpuClock::new());
         let hold = (kind == CommandBufferKind::Unretained)
             .then(|| Arc::new(InFlightHold::new(Arc::clone(&clock))));
-        let failure = Arc::default();
+        let failure: Arc<CommandBufferFailure> = Arc::default();
+        let hook = Arc::new(super::completion_hook::CompletionHook::new(
+            Arc::clone(&clock),
+            Arc::clone(&failure),
+        ));
+        match (&modern_queue, &legacy_completions) {
+            (Some(queue), _) => queue.install_hook(Arc::clone(&hook))?,
+            (None, Some(core)) => core.install_hook(Arc::clone(&hook))?,
+            (None, None) => unreachable!("one completion adapter per queue"),
+        }
         let encoder_finalizer = Arc::new(EncoderFinalizer {
             prev_ce_outputs: Arc::new(Censused::new(parking_lot::RwLock::new(HashMap::new()))),
             live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
@@ -769,6 +779,7 @@ impl Commands {
             command_queue,
             modern_queue,
             legacy_completions,
+            legacy_handler,
             compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
             pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
             cut_policy,
@@ -780,7 +791,7 @@ impl Commands {
             clock,
             census: Arc::default(),
             trace: Arc::default(),
-            on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            hook,
             executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
             completion_wait,
             completion_event,
@@ -936,6 +947,13 @@ impl Commands {
         f()
     }
 
+    /// Hold the completion subscribers' lock on the calling thread while `f`
+    /// runs, so a test can show a commit and a completion never take it.
+    #[cfg(test)]
+    pub(crate) fn while_subscribers_locked<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.core.hook.while_subscribers_locked(f)
+    }
+
     /// Install the executor that subsequent compute encoders will submit
     /// through (`DESIGN.md` §11.1).
     ///
@@ -997,12 +1015,14 @@ impl Commands {
         &self.core.trace
     }
 
-    /// Registers `f` to run after every command buffer completes.
+    /// Registers `f` to run after every command buffer that completes from now
+    /// on, after the clock has marked that buffer's epoch.
     ///
-    /// Must be called during device setup, before any work is encoded:
-    /// subscribers added later would miss the command buffers already in
-    /// flight, and a buffer parked against one of those epochs would never be
-    /// swept in.
+    /// Call during device setup, before any work is encoded: a subscriber
+    /// added later misses the buffers that completed before it, and a buffer
+    /// parked against one of those epochs is swept in only at a later one.
+    /// Registration publishes a new snapshot; a completion reads the current
+    /// one without a lock (`completion_hook.rs`).
     ///
     /// Runs on Metal's completion thread. Per CONTRIBUTING §3.3a, a callback
     /// must not acquire a lock the encoding thread takes or submit work that
@@ -1011,7 +1031,7 @@ impl Commands {
     /// slot. Keep callbacks bounded; advance a flag and drain host-owned work
     /// on the host, as the buffer pools do.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.core.on_complete.lock().push(Arc::new(f));
+        self.core.hook.subscribe(Arc::new(f));
     }
 
     /// The cut policy in force (`DESIGN.md` §13.5m).
@@ -1163,7 +1183,11 @@ impl Commands {
                         .to_string(),
                 ));
             }
-            let fence = Arc::new(Fence::held_by(&self.core.device, self.core.hold.clone()));
+            let fence = Arc::new(Fence::held_by(
+                &self.core.device,
+                Some(Arc::clone(&self.core.clock)),
+                self.core.hold.clone(),
+            ));
             // No blanket wait here. HazardTrackingModeUntracked means Metal does
             // not flush GPU caches at encoder boundaries, so ordering is ours to
             // enforce -- but the encoder already records every buffer it binds,
@@ -1292,7 +1316,11 @@ impl Commands {
         // End compute encoder before starting blit.
         self.core.close_compute(&mut state_guard)?;
 
-        let fence = Arc::new(Fence::held_by(&self.core.device, self.core.hold.clone()));
+        let fence = Arc::new(Fence::held_by(
+            &self.core.device,
+            Some(Arc::clone(&self.core.clock)),
+            self.core.hold.clone(),
+        ));
         let encoder = state_guard
             .current
             .recording()
@@ -1642,6 +1670,11 @@ impl Commands {
                         .as_ref()
                         .expect("M3 core constructed")
                         .clone(),
+                    self.core
+                        .legacy_handler
+                        .as_ref()
+                        .expect("M3 handler constructed")
+                        .clone(),
                     physical,
                 )
                 .map(CommandBuffer::from_metal3_associated)
@@ -1980,8 +2013,7 @@ impl CommandsCore {
                 let (_, removed) = self.residency_set.commit_pending_extracted();
                 *destination = Some(removed);
                 let t_residency = timed.map(|t| t.elapsed());
-                let subs = self.on_complete.lock().clone();
-                self.submit_prepared(prepared, subs, timed, t_end_enc, t_residency)
+                self.submit_prepared(prepared, timed, t_end_enc, t_residency)
             })
             .copied()
     }
@@ -2000,11 +2032,17 @@ impl CommandsCore {
 
     /// Common native handoff for ordinary cuts and final no-replacement submit.
     /// Residency was published by the caller before this point. All selectable
-    /// completion signals, epoch callbacks and GPU profiling use this one body.
+    /// completion signals, the completion hook and GPU profiling use this one
+    /// body.
+    ///
+    /// The epoch is taken after every fallible registration and before the
+    /// native commit, both under the commit's exclusion: a refused
+    /// registration consumes no epoch, so the hook's n-th run is epoch n
+    /// (`completion_hook.rs`). A commit refused after the epoch fails the
+    /// queue, and no later record runs the hook.
     fn submit_prepared(
         &self,
         prepared: super::command_buffer::PreparedCommandCommit<'_>,
-        subs: Vec<Arc<dyn Fn() + Send + Sync>>,
         timed: Option<std::time::Instant>,
         t_end_enc: Option<std::time::Duration>,
         t_residency: Option<std::time::Duration>,
@@ -2016,19 +2054,9 @@ impl CommandsCore {
             self.completion_signals.fetch_add(1, Ordering::Relaxed);
         }
         crate::kernels::metal::trace::note_command_buffer();
-        let epoch = self.clock.commit_epoch();
-        let clock = Arc::clone(&self.clock);
-        let failure = Arc::clone(&self.failure);
-        prepared.on_completion_of(move |error| {
-            if let Some(error) = error {
-                failure.record(error);
-            }
-            clock.mark_completed(epoch);
-            for f in &subs {
-                f();
-            }
-        })?;
+        prepared.run_completion_hook()?;
         prepared.record_gpu_time_on_completion()?;
+        let epoch = self.clock.commit_epoch();
         prepared.commit()?;
         if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, timed.map(|t| t.elapsed())) {
             crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
@@ -2163,7 +2191,10 @@ impl EncoderFinalizer {
                 drop(prev_ce_outputs);
                 encoder.raw.updateFence(encoder.fence.raw());
 
-                let registration = if retires {
+                // A clocked fence completes with its buffer's epoch; only a
+                // fence with no clock needs a handler of its own.
+                let clocked = encoder.fence.close_on_clock();
+                let registration = if retires && !clocked {
                     let completed = encoder.fence.completion_flag();
                     closing
                         .on_completion(move || {
@@ -2334,13 +2365,6 @@ impl lifecycle::FinalCore for CommandsCore {
             }
             // Do NOT take/drop the canonical encoder under EntryState.
         }
-        let subscribers = self
-            .on_complete
-            .try_lock()
-            .ok_or(MetalKernelError::QueueUnavailable(
-                "final completion subscribers still borrowed",
-            ))?
-            .clone();
         let submitted = state
             .current
             .submit_marked(&self.replacement_pending, |cb| {
@@ -2364,7 +2388,7 @@ impl lifecycle::FinalCore for CommandsCore {
                 // Empty C was staged before entering this method. Even an unwind
                 // after this transfer leaves the opaque raw+charge payload rooted.
                 captures.removals = Some(removals);
-                self.submit_prepared(prepared, subscribers, None, None, None)
+                self.submit_prepared(prepared, None, None, None)
             });
         match submitted {
             Ok(_) => Ok(true),
@@ -2421,9 +2445,9 @@ impl lifecycle::FinalCore for CommandsCore {
             .ok_or(MetalKernelError::QueueUnavailable(
                 "final executor still borrowed",
             ))?;
-        let mut subscribers =
-            self.on_complete
-                .try_lock()
+        let subscribers =
+            self.hook
+                .try_take_subscribers()
                 .ok_or(MetalKernelError::QueueUnavailable(
                     "final completion subscribers still borrowed",
                 ))?;
@@ -2448,7 +2472,7 @@ impl lifecycle::FinalCore for CommandsCore {
                 && captures.encoder_executor.is_none()
         );
         captures.executor = Some(std::mem::replace(&mut *executor, empty_executor.clone()));
-        captures.subscribers = std::mem::take(&mut *subscribers);
+        captures.subscribers = subscribers.take();
         // Inert native wrappers stay in Core. Custom executor captures instead
         // leave through C while Core remains independently rooted.
         if let Some(encoder) = state.current_encoder.as_mut() {

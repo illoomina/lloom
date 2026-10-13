@@ -89,6 +89,10 @@ path = "tests/metal_pool_alloc_free.rs"
 name = "metal_cb_failure_tests"
 path = "tests/metal_cb_failure_tests.rs"
 
+[[test]]
+name = "metal_commit_alloc_free"
+path = "tests/metal_commit_alloc_free.rs"
+
 [dev-dependencies]
 parking_lot_core = "0.9.12"
 anyhow = { workspace = true }

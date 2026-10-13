@@ -154,6 +154,18 @@ impl Queue {
         );
     }
 
+    /// The completion hook every flagged submission of this queue runs; once,
+    /// before the first commit.
+    pub(super) fn install_hook(
+        &self,
+        hook: Arc<super::completion_hook::CompletionHook>,
+    ) -> Result<(), MetalKernelError> {
+        self.completions
+            .get()
+            .expect("queue initialized")
+            .install_hook(hook)
+    }
+
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
         // Obtain the real default pin before removing any reusable/native slot.
         // Counted-clone refusal leaves queue state/capacity unchanged. Initial
@@ -202,7 +214,7 @@ impl Queue {
         // The explicit retained quota permit is an integration prerequisite;
         // this source draft still has the earlier uncharged growth hook.
         let retirement = match self.retirement.prepare(
-            super::retirement::Captures(Vec::new()),
+            super::retirement::Captures::new(Vec::new()),
             super::retirement::NativeOwners::vacant(),
             |_| Ok(()),
         ) {
@@ -226,6 +238,7 @@ impl Queue {
             state: Mutex::new(State {
                 slot: Some(slot),
                 callbacks: Vec::new(),
+                hooked: false,
                 events: Vec::new(),
                 physical,
             }),
@@ -400,6 +413,8 @@ pub(super) struct EventBoundary {
 struct State {
     slot: Option<Slot>,
     callbacks: Vec<Callback>,
+    /// The queue's completion hook runs for this submission (`run_hook`).
+    hooked: bool,
     events: Vec<EventBoundary>,
     // Prepared once before exposure. Commit/abandonment move this actual pin;
     // final Submission Drop never needs a fallible owner acquisition.
@@ -1015,6 +1030,29 @@ pub(super) struct PreparedCommit<'a> {
     phase: CommitPhase,
 }
 impl PreparedCommit<'_> {
+    /// Flag this submission for the queue's completion hook: one field of the
+    /// recording state this preparation already holds. No allocation, no lock.
+    pub(super) fn run_hook(&self) -> Result<(), MetalKernelError> {
+        self.submission.queue.check_failure()?;
+        if !self
+            .submission
+            .queue
+            .completions
+            .get()
+            .expect("queue initialized")
+            .has_hook()
+        {
+            return Err(MetalKernelError::QueueUnavailable(
+                "Metal 4 completion hook not installed",
+            ));
+        }
+        self.state
+            .borrow_mut()
+            .as_mut()
+            .expect("prepared recording")
+            .hooked = true;
+        Ok(())
+    }
     pub(super) fn on_completion(
         &self,
         f: impl Fn(&Feedback) + Send + Sync + 'static,
@@ -1056,6 +1094,7 @@ impl PreparedCommit<'_> {
         let physical = state.physical.take();
         let residency = slot.residency.clone();
         let callbacks = std::mem::take(&mut state.callbacks);
+        let hooked = state.hooked;
         let events = std::mem::take(&mut state.events);
         assert!(
             submission.committed_events.set(events).is_ok(),
@@ -1071,7 +1110,7 @@ impl PreparedCommit<'_> {
         let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
         match submission
             .retirement
-            .replace_prepared(super::retirement::Captures(callbacks), owners)
+            .replace_prepared(super::retirement::Captures { callbacks, hooked }, owners)
         {
             Ok(displaced) => drop(displaced), // Empty pre-reserved record only.
             Err(rejected) => {
@@ -1200,7 +1239,7 @@ impl Drop for Submission {
             );
             match self
                 .retirement
-                .replace_prepared(super::retirement::Captures(callbacks), owners)
+                .replace_prepared(super::retirement::Captures::new(callbacks), owners)
             {
                 Ok(displaced) => drop(displaced),
                 Err(rejected) => {

@@ -11452,8 +11452,7 @@ fn run_inverse_cdf(logits: &[f32], vocab: usize, inv_t: f32, u: &[f32]) -> Vec<u
     let z = new_buffer(&device, logits);
     let ub = new_buffer(&device, u);
     let out = new_buffer(&device, &vec![u32::MAX; rows]);
-    // SAFETY: the test owns every buffer bound here and reads `out` only
-    // after waiting for the command buffer that writes it.
+    // SAFETY: the three buffers outlive the wait below and no ICB captures them.
     unsafe {
         crate::kernels::kernels::call_sample_inverse_cdf(
             &device,

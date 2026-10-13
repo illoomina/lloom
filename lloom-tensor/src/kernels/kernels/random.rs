@@ -120,10 +120,7 @@ pub unsafe fn call_sample_inverse_cdf(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "sample_inverse_cdf rows={rows} vocab={vocab}");
-    // SAFETY: this function's contract (# Safety above).
-    unsafe {
-        set_params!(encoder, (logits, vocab as u32, inv_t, u, Output::new(out)));
-    }
+    set_params!(encoder, (logits, vocab as u32, inv_t, u, Output::new(out)));
     let max = pipeline.max_total_threads_per_threadgroup().min(1024);
     // The scan and the tree assume a power of two.
     let width = if max.is_power_of_two() {

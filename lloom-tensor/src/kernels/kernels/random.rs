@@ -98,8 +98,13 @@ pub unsafe fn call_random_normal(
 /// `u`, the drawn index per row into `out` (`sample_inverse_cdf_f32`). One
 /// threadgroup per row; the width is the kernel's shared arrays' (1024) or
 /// the pipeline's maximum, a power of two either way.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_sample_inverse_cdf(
+pub unsafe fn call_sample_inverse_cdf(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,

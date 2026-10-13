@@ -10,6 +10,7 @@ use crate::{
     completion_wake::Wake,
     memory_admission::PhysicalCharge,
     retirement_owners::{Failure, FailureSignal},
+    schedule_hook::schedule_point,
 };
 use parking_lot::Mutex;
 use std::{
@@ -84,6 +85,10 @@ pub(crate) unsafe trait CleanupInbox: Send + Sync {
     fn take_final_metadata_charge(&self) -> Option<PhysicalCharge> {
         None
     }
+    /// Trusted deferred engine notification, outside active/registry guards.
+    /// Concurrent worker/shutdown consumers are permitted; each caller retains
+    /// this counted inbox until its notification obligation completes.
+    fn service_notify(&self) {}
     fn fail(&self, reason: Failure);
 }
 
@@ -127,7 +132,9 @@ impl Inbox {
     fn progress(&self) -> bool {
         match self {
             Self::Cleanup(entry) => {
-                if !entry.begin_retire() {
+                let ready = entry.begin_retire();
+                entry.service_notify();
+                if !ready {
                     return false;
                 }
                 entry.drop_captures();
@@ -191,7 +198,10 @@ impl Inbox {
     }
     fn fail(&self, reason: Failure) {
         match self {
-            Self::Cleanup(entry) => entry.fail(reason),
+            Self::Cleanup(entry) => {
+                entry.fail(reason);
+                entry.service_notify();
+            }
             Self::Lifecycle(entry) => entry.fail(reason),
         }
     }
@@ -200,6 +210,7 @@ impl Inbox {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServiceError {
     StartFailed,
+    AllocationFailed,
     Failed(Failure),
 }
 
@@ -216,10 +227,167 @@ impl Drop for InboxSnapshot {
     }
 }
 
+/// Existing legacy registry remains explicit. Priced header roots use one
+/// exact Box node instead of unpriced Vec capacity growth. Both routes share
+/// this SAME registry guard, service worker, census and notification policy.
+#[derive(Default)]
+struct InboxRegistry {
+    legacy: Vec<Inbox>,
+    priced: Option<Box<RegistrationNode>>,
+    priced_len: usize,
+    polling_len: usize,
+}
+struct RegistrationNode {
+    entry: Option<Inbox>,
+    next: Option<Box<RegistrationNode>>,
+    previous: Option<std::ptr::NonNull<RegistrationNode>>,
+    polling: bool,
+}
+// SAFETY: previous is an address-only link into this registry's stable Boxes.
+// Only the existing registry mutex permits link access/mutation; no link or
+// pointee reference escapes except the exclusive host-pass cursor below.
+unsafe impl Send for RegistrationNode {}
+struct RemovedRegistration {
+    _block: Option<Box<RegistrationNode>>,
+    _entry: Inbox,
+}
+#[derive(Clone, Copy)]
+enum RegistryCursor {
+    Legacy(usize),
+    Priced(std::ptr::NonNull<RegistrationNode>),
+}
+struct PassLease<'a>(&'a AtomicBool);
+impl Drop for PassLease<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+impl InboxRegistry {
+    fn len(&self) -> usize {
+        self.legacy.len() + self.priced_len
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn iter(&self) -> impl Iterator<Item = &Inbox> {
+        self.legacy.iter().chain(
+            std::iter::successors(self.priced.as_deref(), |node| node.next.as_deref())
+                .map(|node| node.entry.as_ref().expect("queued root")),
+        )
+    }
+    fn push(&mut self, entry: Inbox) {
+        self.polling_len += usize::from(entry.requires_polling());
+        self.legacy.push(entry);
+    }
+    fn push_priced(&mut self, mut node: Box<RegistrationNode>) {
+        let address = std::ptr::NonNull::from(&mut *node);
+        node.next = self.priced.take();
+        if let Some(next) = node.next.as_mut() {
+            next.previous = Some(address);
+        }
+        self.polling_len += usize::from(node.polling);
+        self.priced = Some(node);
+        self.priced_len += 1;
+    }
+    fn priced_head(&self) -> Option<RegistryCursor> {
+        self.priced
+            .as_deref()
+            .map(|node| RegistryCursor::Priced(std::ptr::NonNull::from(node)))
+    }
+    /// # Safety
+    /// Priced cursor belongs to this registry's elected PassLease. Only that
+    /// pass removes nodes; cold registration only prepends stable Boxes. Caller
+    /// holds the registry mutex for this borrow and never borrows across unlock.
+    unsafe fn entry(&self, cursor: RegistryCursor) -> Option<&Inbox> {
+        match cursor {
+            RegistryCursor::Legacy(index) => self.legacy.get(index),
+            RegistryCursor::Priced(address) => {
+                // SAFETY: elected pass cursor remains reachable and stable.
+                unsafe { address.as_ref() }.entry.as_ref()
+            }
+        }
+    }
+    /// Same elected-pass/mutex contract as entry; next is captured before
+    /// offguard progress and is not freed by cold prepend or other consumers.
+    unsafe fn next_priced(&self, cursor: RegistryCursor) -> Option<RegistryCursor> {
+        match cursor {
+            RegistryCursor::Legacy(_) => None,
+            RegistryCursor::Priced(address) => {
+                // SAFETY: only this pass can remove the current/next nodes.
+                unsafe { address.as_ref() }
+                    .next
+                    .as_deref()
+                    .map(|node| RegistryCursor::Priced(std::ptr::NonNull::from(node)))
+            }
+        }
+    }
+    fn snapshot(&self) -> Vec<Inbox> {
+        self.iter().cloned().collect()
+    }
+    /// # Safety
+    /// Same registry-owned cursor and exclusive PassLease as entry. Pointer
+    /// links are dereferenced only while the existing registry guard is held.
+    unsafe fn remove(&mut self, cursor: RegistryCursor) -> RemovedRegistration {
+        match cursor {
+            RegistryCursor::Legacy(index) => {
+                let polling = self.legacy[index].requires_polling();
+                let entry = self.legacy.swap_remove(index);
+                self.polling_len -= usize::from(polling);
+                RemovedRegistration {
+                    _block: None,
+                    _entry: entry,
+                }
+            }
+            RegistryCursor::Priced(address) => {
+                // SAFETY: address names the current live node under this guard.
+                let previous = unsafe { address.as_ref() }.previous;
+                let link = match previous {
+                    None => &mut self.priced,
+                    Some(mut previous) => {
+                        // SAFETY: predecessor is live/reachable; cold prepend
+                        // updates this link under the same guard before removal.
+                        &mut unsafe { previous.as_mut() }.next
+                    }
+                };
+                assert_eq!(
+                    link.as_deref().map(std::ptr::NonNull::from),
+                    Some(address),
+                    "current cursor remains linked"
+                );
+                let mut block = link.take().expect("current live node");
+                *link = block.next.take();
+                if let Some(next) = link.as_mut() {
+                    next.previous = previous;
+                }
+                block.previous = None;
+                let entry = block.entry.take().expect("queued root");
+                self.priced_len -= 1;
+                self.polling_len -= usize::from(block.polling);
+                RemovedRegistration {
+                    _block: Some(block),
+                    _entry: entry,
+                }
+            }
+        }
+    }
+}
+impl Drop for InboxRegistry {
+    fn drop(&mut self) {
+        while let Some(mut node) = self.priced.take() {
+            self.priced = node.next.take();
+            let entry = node.entry.take();
+            drop(node);
+            drop(entry);
+        }
+    }
+}
+
 pub(crate) struct HostRetirementService {
     // Only host registration and this host worker access the registry lock.
     // Native feedback publishes into its rooted inbox and calls wake.notify.
-    registry: Mutex<Vec<Inbox>>,
+    registry: Mutex<InboxRegistry>,
+    // Service-only cursor election; no producer path acquires this lease.
+    passing: AtomicBool,
     wake: Arc<Wake>,
     failure: FailureSignal,
     // Cold registry edits publish this summary under the existing registry
@@ -228,8 +396,11 @@ pub(crate) struct HostRetirementService {
     // unmeasured latency/idle-cost tradeoff, not an optimum or deadline promise.
     polling: AtomicBool,
     polling_interval: Duration,
-    #[cfg(test)]
-    test_stop: AtomicBool,
+    // The worker returns at its next loop top once this is set, and marks
+    // `exited` as it leaves (`stop_worker`).
+    stop: AtomicBool,
+    exited: Mutex<bool>,
+    exit_signal: parking_lot::Condvar,
     #[cfg(test)]
     test_idle_parks: std::sync::atomic::AtomicUsize,
     // An arbitrary destructor panic can itself carry owned values. Keep those
@@ -240,22 +411,56 @@ pub(crate) struct HostRetirementService {
     active_metadata_charge: Mutex<Option<PhysicalCharge>>,
 }
 
+static SHARED_SERVICE: OnceLock<Result<Arc<HostRetirementService>, ServiceError>> = OnceLock::new();
+
+/// Stops the shared worker, if it was ever started, and waits until
+/// `deadline` for it to leave its loop. `None` when no worker was started;
+/// otherwise whether it stopped in time. For process exit only: records
+/// published after this are never serviced (their custody stays rooted).
+#[cfg(feature = "metal")]
+pub(crate) fn stop_shared_worker(deadline: Instant) -> Option<bool> {
+    match SHARED_SERVICE.get() {
+        Some(Ok(service)) => Some(service.stop_worker(deadline)),
+        _ => None,
+    }
+}
+
 impl HostRetirementService {
+    /// Asks the worker to leave its loop at its next check, and waits until
+    /// `deadline` for it to have left. A pass in progress finishes first;
+    /// no pass starts after the worker has seen the request.
+    #[cfg(feature = "metal")]
+    pub(crate) fn stop_worker(&self, deadline: Instant) -> bool {
+        self.stop.store(true, Ordering::Release);
+        self.wake.notify();
+        let mut exited = self.exited.lock();
+        while !*exited {
+            if self
+                .exit_signal
+                .wait_until(&mut exited, deadline)
+                .timed_out()
+            {
+                return *exited;
+            }
+        }
+        true
+    }
+
     /// Setup-only. Start failure is returned before any inbox/owner can be
     /// registered. The immutable static retains successful service custody even
     /// if its worker exits unexpectedly. No mandatory worker until first use.
     pub(crate) fn shared() -> Result<&'static Arc<Self>, ServiceError> {
-        static SERVICE: OnceLock<Result<Arc<HostRetirementService>, ServiceError>> =
-            OnceLock::new();
-        match SERVICE.get_or_init(|| {
+        match SHARED_SERVICE.get_or_init(|| {
             let service = Arc::new(Self {
-                registry: Mutex::new(Vec::new()),
+                registry: Mutex::new(InboxRegistry::default()),
+                passing: AtomicBool::new(false),
                 wake: Arc::new(Wake::default()),
                 failure: FailureSignal::default(),
                 polling: AtomicBool::new(false),
                 polling_interval: Duration::from_millis(10),
-                #[cfg(test)]
-                test_stop: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+                exited: Mutex::new(false),
+                exit_signal: parking_lot::Condvar::new(),
                 #[cfg(test)]
                 test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
                 panic_payloads: Mutex::new(Vec::new()),
@@ -276,13 +481,15 @@ impl HostRetirementService {
     #[cfg(test)]
     pub(crate) fn manual() -> Arc<Self> {
         Arc::new(Self {
-            registry: Mutex::new(Vec::new()),
+            registry: Mutex::new(InboxRegistry::default()),
+            passing: AtomicBool::new(false),
             wake: Arc::new(Wake::default()),
             failure: FailureSignal::default(),
             polling: AtomicBool::new(false),
             polling_interval: Duration::from_millis(10),
-            #[cfg(test)]
-            test_stop: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            exited: Mutex::new(false),
+            exit_signal: parking_lot::Condvar::new(),
             #[cfg(test)]
             test_idle_parks: std::sync::atomic::AtomicUsize::new(0),
             panic_payloads: Mutex::new(Vec::new()),
@@ -298,7 +505,7 @@ impl HostRetirementService {
     #[cfg(test)]
     pub(crate) fn manual_with_snapshot(&self, run: impl FnOnce()) {
         let _snapshot = InboxSnapshot {
-            entries: self.registry.lock().clone(),
+            entries: self.registry.lock().snapshot(),
             wake: self.wake.clone(),
         };
         run();
@@ -314,6 +521,61 @@ impl HostRetirementService {
         self.register_inbox(Inbox::Cleanup(inbox.clone()))
     }
 
+    /// Requested Box storage for one priced registration. Root's same ticket
+    /// holds this term through offguard node free and final root Arc destruction.
+    pub(crate) fn requested_registration_bytes() -> usize {
+        std::alloc::Layout::new::<RegistrationNode>().size()
+    }
+    /// Cold only; caller's live root already owns an admitted registration term
+    /// BEFORE this Box allocation. Root remains privately held through refusal.
+    /// New nodes share the original registry/census, not a second inbox/worker.
+    pub(crate) fn register_owned(&self, inbox: &Arc<dyn CleanupInbox>) -> Result<(), ServiceError> {
+        let node = crate::cold_box::try_new(RegistrationNode {
+            entry: Some(Inbox::Cleanup(inbox.clone())),
+            next: None,
+            previous: None,
+            polling: inbox.requires_polling(),
+        })
+        .map_err(|unallocated| {
+            // No registry guard is held; caller still owns the root. No Box
+            // exists, so release the input Arc before caller refunds its term.
+            drop(unallocated);
+            ServiceError::AllocationFailed
+        })?;
+        let mut candidate = Some(node);
+        let mut registry = self.registry.lock();
+        if let Some(reason) = self.failure.get() {
+            drop(registry);
+            drop(candidate); // caller still owns the root, now storage is free
+            return Err(ServiceError::Failed(reason));
+        }
+        if !registry.iter().any(|entry| {
+            entry.same(
+                candidate
+                    .as_ref()
+                    .expect("candidate")
+                    .entry
+                    .as_ref()
+                    .expect("candidate root"),
+            )
+        }) {
+            if registry.priced_len == usize::MAX - registry.legacy.len() {
+                drop(registry);
+                drop(candidate);
+                return Err(ServiceError::StartFailed);
+            }
+            let polling = inbox.requires_polling();
+            registry.push_priced(candidate.take().expect("candidate"));
+            if polling {
+                self.polling.store(true, Ordering::Release);
+            }
+        }
+        drop(registry);
+        drop(candidate); // duplicate cold node free is offguard, before caller root
+        self.wake.notify();
+        Ok(())
+    }
+
     pub(crate) fn register_lifecycle(
         &self,
         inbox: &Arc<dyn LifecycleInbox>,
@@ -327,6 +589,10 @@ impl HostRetirementService {
             return Err(ServiceError::Failed(reason));
         }
         if !registry.iter().any(|entry| entry.same(&inbox)) {
+            if registry.len() == usize::MAX {
+                drop(registry);
+                return Err(ServiceError::StartFailed);
+            }
             let requires_polling = inbox.requires_polling();
             registry.push(inbox);
             if requires_polling {
@@ -353,7 +619,7 @@ impl HostRetirementService {
         // concurrent worker removal cannot skip an entry by shifting indices.
         // Admission was closed before this call, so no new entry can be missed.
         let snapshot = InboxSnapshot {
-            entries: self.registry.lock().clone(),
+            entries: self.registry.lock().snapshot(),
             wake: self.wake.clone(),
         };
         for entry in &snapshot.entries {
@@ -366,19 +632,40 @@ impl HostRetirementService {
     }
 
     fn pass(&self) -> bool {
-        // Production has one worker and exits on unwind. A manual/erroneous
-        // later pass must not clear a charge retained across prior failed Drop.
+        if self
+            .passing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        let _pass = PassLease(&self.passing);
+        // A later pass cannot clear a charge retained across prior failed Drop.
         if self.active_metadata_charge.lock().is_some() {
             self.failure
                 .publish(Failure::WorkerFailed, || self.wake.notify());
             return false;
         }
-        let mut index = 0;
+        let mut cursor = Some(RegistryCursor::Legacy(0));
         let mut progressed = false;
         loop {
-            let entry = self.registry.lock().get(index).cloned();
-            let Some(entry) = entry else {
+            let Some(current_cursor) = cursor else {
                 return progressed;
+            };
+            let (entry, next_priced) = {
+                let registry = self.registry.lock();
+                // SAFETY: this pass owns the sole removal lease and retains no
+                // borrowed node reference across registry unlock.
+                let entry = unsafe { registry.entry(current_cursor) }.cloned();
+                if entry.is_none() {
+                    cursor = registry.priced_head();
+                    continue;
+                }
+                // SAFETY: next node remains registered until this same pass
+                // reaches it; cold registration cannot remove/move it.
+                (entry.expect("located entry"), unsafe {
+                    registry.next_priced(current_cursor)
+                })
             };
             // Crucially outside the registry lock. Detaching one credit before
             // Drop permits that destructor to register/submit another record.
@@ -388,19 +675,17 @@ impl HostRetirementService {
                 // Snapshot cloning and final metadata census share this lock.
                 // Count the actual inner Cleanup Arc, not an enum wrapper.
                 // Lifecycle inboxes retain their independent phase contract.
-                if registry
-                    .get(index)
+                // SAFETY: exclusive pass + registry guard retain current node.
+                if unsafe { registry.entry(current_cursor) }
                     .is_some_and(|current| current.same(&entry) && current.metadata_removable())
                 {
-                    // Query surviving roots BEFORE removal: no removed root
-                    // is exposed to an erroneous immutable predicate unwind.
-                    // Lifecycle/default-false inboxes never opt into polling.
-                    let polling = registry
-                        .iter()
-                        .enumerate()
-                        .any(|(candidate, inbox)| candidate != index && inbox.requires_polling());
-                    let removed = registry.swap_remove(index);
-                    self.polling.store(polling, Ordering::Release);
+                    // Immutable cold policy is counted, not rescanned per
+                    // removal; legacy's query completes before root unlink.
+                    // SAFETY: same elected cursor; node storage is returned
+                    // intact and deallocated only after this guard is released.
+                    let removed = unsafe { registry.remove(current_cursor) };
+                    self.polling
+                        .store(registry.polling_len != 0, Ordering::Release);
                     Some(removed)
                 } else {
                     None
@@ -408,11 +693,12 @@ impl HostRetirementService {
             } else {
                 None
             };
-            if removed.is_none() {
-                // Empty payload does not imply foreign metadata quiescence.
-                // Move on rather than spin while can_unregister stays true.
-                index += 1;
-            }
+            cursor = match current_cursor {
+                RegistryCursor::Legacy(index) => Some(RegistryCursor::Legacy(
+                    index + usize::from(removed.is_none()),
+                )),
+                RegistryCursor::Priced(_) => next_priced,
+            };
             if let Some(removed) = removed {
                 // Only an opted-in metadata inbox participates. Non-opt-in
                 // lifecycle root removal still has its original semantics.
@@ -454,15 +740,15 @@ impl HostRetirementService {
             // Snapshot before examining inboxes, including RETURNED and final
             // reader notifications; the shared Wake closes check -> park.
             let seen = self.wake.snapshot();
-            // Test stop uses the same snapshot -> check -> park handshake.
-            #[cfg(test)]
-            if self.test_stop.load(Ordering::Acquire) {
+            // A stop uses the same snapshot -> check -> park handshake.
+            if self.stop.load(Ordering::Acquire) {
                 return;
             }
             #[cfg(feature = "metal")]
             let progressed = objc2::rc::autoreleasepool(|_| self.pass());
             #[cfg(not(feature = "metal"))]
             let progressed = self.pass();
+            schedule_point!(RetirePassed);
             if !progressed && self.polling.load(Ordering::Acquire) {
                 // Existing notifications remain responsive: unlike sleep,
                 // timed park returns on a legacy Wake as well as timeout.
@@ -496,8 +782,11 @@ impl HostRetirementService {
             // registry roots remain, all admissions/waiters observe failure.
             self.failure
                 .publish(Failure::WorkerFailed, || self.wake.notify());
+            schedule_point!(RetireFailed);
             self.fail_inboxes(Failure::WorkerFailed);
         }
+        *self.exited.lock() = true;
+        self.exit_signal.notify_all();
     }
 }
 
@@ -1120,7 +1409,7 @@ mod polling_tests {
     }
     impl Drop for RunningWorker {
         fn drop(&mut self) {
-            self.service.test_stop.store(true, Ordering::Release);
+            self.service.stop.store(true, Ordering::Release);
             self.service.wake.notify();
             self.thread.take().unwrap().join().unwrap();
         }
@@ -1300,5 +1589,143 @@ mod polling_tests {
         assert!(!service.polling.load(Ordering::Acquire));
         assert_eq!(service.failure.get(), None);
         drop(running); // Stop+notify+join even after removal restores indefinite wait.
+    }
+}
+
+#[cfg(test)]
+mod priced_cursor_controls {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    struct CursorInbox {
+        id: usize,
+        polled: bool,
+        removable: AtomicBool,
+        visits: Arc<Mutex<Vec<usize>>>,
+        action: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+    }
+    // SAFETY: manual scalar fake has no payload/native handoff or delayed
+    // publisher. Local removable=true means no resource exists to detach.
+    // Actions exercise offguard cold registration; nested pass is refused by
+    // the real production election, never recursive payload destruction.
+    unsafe impl CleanupInbox for CursorInbox {
+        fn begin_retire(&self) -> bool {
+            self.visits.lock().push(self.id);
+            let action = self.action.lock().take();
+            if let Some(action) = action {
+                action();
+            }
+            false
+        }
+        fn drop_captures(&self) {
+            panic!("fake has no captures")
+        }
+        fn finish_retire(&self) {
+            panic!("fake has no anchors")
+        }
+        fn can_unregister(&self) -> bool {
+            self.removable.load(Ordering::Acquire)
+        }
+        fn requires_polling(&self) -> bool {
+            self.polled
+        }
+        fn fail(&self, _: Failure) {}
+    }
+    fn inbox(id: usize, polled: bool, visits: &Arc<Mutex<Vec<usize>>>) -> Arc<CursorInbox> {
+        Arc::new(CursorInbox {
+            id,
+            polled,
+            removable: AtomicBool::new(false),
+            visits: visits.clone(),
+            action: Mutex::new(None),
+        })
+    }
+    fn enroll(service: &HostRetirementService, inbox: &Arc<CursorInbox>) {
+        // Structural fixture only: no claim to price the fake's own Arc/control.
+        let root: Arc<dyn CleanupInbox> = inbox.clone();
+        service.register_owned(&root).unwrap();
+    }
+    fn assert_registry(
+        service: &HostRetirementService,
+        expected: &[&Arc<CursorInbox>],
+        polling: usize,
+    ) {
+        let registry = service.registry.lock();
+        assert_eq!(registry.len(), expected.len());
+        assert_eq!(registry.polling_len, polling);
+        for (actual, expected) in registry.iter().zip(expected) {
+            let reference: Arc<dyn CleanupInbox> = (*expected).clone();
+            assert!(actual.same(&Inbox::Cleanup(reference)));
+        }
+        assert_eq!(service.polling.load(Ordering::Acquire), polling != 0);
+    }
+    #[test]
+    fn priced_cursor_prepend_offguard_and_reentrant_pass_preserve_original_walk() {
+        let service = HostRetirementService::manual();
+        let visits = Arc::new(Mutex::new(Vec::new()));
+        let tail = inbox(1, false, &visits);
+        let head = inbox(2, true, &visits);
+        let added = inbox(3, true, &visits);
+        let nested_calls = Arc::new(AtomicUsize::new(0));
+        enroll(&service, &tail);
+        enroll(&service, &head);
+        let weak_service = Arc::downgrade(&service);
+        let added_for_action = added.clone();
+        let nested_for_action = nested_calls.clone();
+        *head.action.lock() = Some(Box::new(move || {
+            let service = weak_service.upgrade().unwrap();
+            assert!(
+                service.registry.try_lock().is_some(),
+                "progress ran under registry guard"
+            );
+            enroll(&service, &added_for_action);
+            assert!(
+                !service.manual_pass(),
+                "nested pass acquired existing cursor"
+            );
+            nested_for_action.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(!service.manual_pass());
+        assert_eq!(
+            *visits.lock(),
+            [2, 1],
+            "cold prepend changed in-flight walk"
+        );
+        assert_eq!(nested_calls.load(Ordering::SeqCst), 1);
+        assert_registry(&service, &[&added, &head, &tail], 2);
+        visits.lock().clear();
+        assert!(!service.manual_pass());
+        assert_eq!(
+            *visits.lock(),
+            [3, 2, 1],
+            "new head was not visited next pass"
+        );
+        for root in [&tail, &head, &added] {
+            root.removable.store(true, Ordering::Release);
+        }
+        assert!(!service.manual_pass());
+        assert_registry(&service, &[], 0);
+        assert!(!service.passing.load(Ordering::Acquire));
+    }
+    #[test]
+    fn priced_cursor_middle_head_tail_unlink_preserves_polling_summary() {
+        let service = HostRetirementService::manual();
+        let visits = Arc::new(Mutex::new(Vec::new()));
+        let tail = inbox(1, false, &visits);
+        let middle = inbox(2, true, &visits);
+        let head = inbox(3, true, &visits);
+        for root in [&tail, &middle, &head] {
+            enroll(&service, root);
+        }
+        assert_registry(&service, &[&head, &middle, &tail], 2);
+        middle.removable.store(true, Ordering::Release);
+        service.manual_pass();
+        assert_registry(&service, &[&head, &tail], 1);
+        head.removable.store(true, Ordering::Release);
+        service.manual_pass();
+        assert_registry(&service, &[&tail], 0);
+        tail.removable.store(true, Ordering::Release);
+        service.manual_pass();
+        assert_registry(&service, &[], 0);
+        assert!(!service.passing.load(Ordering::Acquire));
     }
 }

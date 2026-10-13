@@ -915,6 +915,7 @@ impl Registry {
             reserved: AtomicU64::new(bytes),
             domain_bound: AtomicBool::new(false),
             gate: Gate::new(cfg),
+            last_refusal: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1031,6 +1032,7 @@ pub struct Holding {
     // domain the right to count the same high-water as its own coverage.
     domain_bound: AtomicBool,
     gate: Gate,
+    last_refusal: parking_lot::Mutex<Option<Verdict>>,
 }
 
 /// An exclusive internal domain binding, retained through promises/charges.
@@ -1081,16 +1083,41 @@ impl Holding {
         self.grow_with(target, || {})
     }
 
+    /// [`Self::grow_to`] with the refusal typed: the verdict the room could
+    /// not hold, apart from a registry or host that could not be read.
+    pub fn try_grow_to(&self, target: u64) -> Result<Option<Verdict>, GrowRefusal> {
+        self.try_grow_with(target, || {})
+    }
+
+    /// The verdict of the last growth this holding refused, for a caller
+    /// reporting the arithmetic after a typed refusal.
+    pub fn last_refusal(&self) -> Option<Verdict> {
+        self.last_refusal.lock().clone()
+    }
+
     // The callback lets the concurrency test pause after the fast-path
     // snapshot, without relying on scheduling or sleeps. Production calls
     // monomorphize the empty callback away.
     fn grow_with(&self, target: u64, before_lock: impl FnOnce()) -> crate::Result<Option<Verdict>> {
+        self.try_grow_with(target, before_lock)
+            .map_err(|e| match e {
+                GrowRefusal::Room(v) => crate::Error::Msg(v.describe()).bt(),
+                GrowRefusal::Unavailable(e) => e,
+            })
+    }
+
+    fn try_grow_with(
+        &self,
+        target: u64,
+        before_lock: impl FnOnce(),
+    ) -> Result<Option<Verdict>, GrowRefusal> {
         let current = self.reserved();
         if target <= current {
             return Ok(None);
         }
         before_lock();
-        let guard = self.registry.guard().map_err(crate::Error::wrap)?;
+        let unavailable = |e: io::Error| GrowRefusal::Unavailable(crate::Error::wrap(e));
+        let guard = self.registry.guard().map_err(unavailable)?;
         // Another grower may have widened this holding while we waited.
         // Both the delta and the no-growth decision belong under the lock
         // that serializes the registry update, not to the fast-path read.
@@ -1099,26 +1126,39 @@ impl Holding {
             return Ok(None);
         }
         let need = target - current;
-        let entries = self.registry.scan(&guard).map_err(crate::Error::wrap)?;
-        let v = self.gate.decide(
-            need,
-            None,
-            &entries,
-            Some(self.registry.dir().to_path_buf()),
-        )?;
+        let entries = self.registry.scan(&guard).map_err(unavailable)?;
+        let v = self
+            .gate
+            .decide(
+                need,
+                None,
+                &entries,
+                Some(self.registry.dir().to_path_buf()),
+            )
+            .map_err(GrowRefusal::Unavailable)?;
         if !v.fits && !v.forced {
-            crate::bail!("{}", v.describe());
+            *self.last_refusal.lock() = Some(v.clone());
+            return Err(GrowRefusal::Room(v));
         }
         let mut entry = self.entry.lock();
         let mut next = entry.clone();
         next.reserved = target;
         let mut f = self.file.lock();
-        replace_entry(&mut f, &entry, &next, write_entry).map_err(crate::Error::wrap)?;
+        replace_entry(&mut f, &entry, &next, write_entry).map_err(unavailable)?;
         *entry = next;
         self.reserved.store(target, Ordering::Release);
         drop(guard);
         Ok(Some(v))
     }
+}
+
+/// Why [`Holding::try_grow_to`] could not widen the reservation.
+#[derive(Debug)]
+pub enum GrowRefusal {
+    /// The room could not hold the growth; the verdict carries the arithmetic.
+    Room(Verdict),
+    /// The registry or the host could not be read, or the arithmetic overflowed.
+    Unavailable(crate::Error),
 }
 
 impl Drop for Holding {

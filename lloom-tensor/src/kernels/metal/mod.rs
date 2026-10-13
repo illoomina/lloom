@@ -13,6 +13,10 @@ mod arena_gpu_tests;
 pub mod arms;
 pub mod backing;
 pub mod buffer;
+mod physical_roles;
+pub(crate) use physical_roles::{
+    ColdUnpooled, PreparedPoolSlot, PreparedStagingSlot, StagingError,
+};
 pub mod buffer_pool;
 /// A stateful model-based fuzzer over the pool's public surface (#494).
 #[cfg(any(test, feature = "fuzzing"))]
@@ -100,6 +104,7 @@ pub mod io_queue;
 pub mod ledger;
 mod metal3_retirement;
 mod metal4;
+mod native_generation_bindings;
 mod raw_encoder;
 mod retirement;
 /// The paged KV pool: allocation, free list, refcounts and the page table

@@ -122,6 +122,7 @@ use objc2_metal::{MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 use super::cache_pad::CachePadded;
 use super::{CommandBuffer, Device};
 use crate::kernels::MetalKernelError;
+use crate::schedule_hook::schedule_point;
 
 /// How the host waits for a committed command buffer.
 ///
@@ -565,6 +566,7 @@ impl CompletionWait {
                 ..WaitOutcome::default()
             });
         }
+        schedule_point!(CompletionWaiting);
         match self.wait_route(event.is_some(), signalled.is_some()) {
             // The incumbent, and the fallback whenever a signal was not
             // encoded. Falling back to a blocking wait can only ever be
@@ -623,6 +625,7 @@ impl CompletionWait {
                             )? == 0
                                 && ev.signaled_value() < target
                             {
+                                schedule_point!(CompletionFallback);
                                 cb.try_wait_data_ready()?;
                             }
                             break;
@@ -657,6 +660,7 @@ impl CompletionWait {
                     // this falls back to the blocking wait -- the same
                     // fail-safe direction as a missing event, and for the same
                     // reason: blocking can only ever be early.
+                    schedule_point!(CompletionFallback);
                     cb.try_wait_data_ready()?;
                 }
                 cb.try_wait_data_ready()?;
@@ -686,6 +690,7 @@ impl CompletionWait {
                     // reported rather than hidden, because a listener silently
                     // falling back to the incumbent is §7.1a-i's wrong-arm
                     // shape: a run that says one thing and does another.
+                    schedule_point!(CompletionFallback);
                     cb.try_wait_data_ready()?;
                 }
                 cb.try_wait_data_ready()?;
@@ -1137,6 +1142,7 @@ impl SharedEvent {
                     st.seen = st.seen.max(seen);
                     st.fired += 1;
                 }
+                schedule_point!(ListenerFired);
                 // Woken under no lock: the waiter re-checks the predicate, so a
                 // wake that races the unlock is harmless.
                 cv.notify_all();
@@ -1157,6 +1163,7 @@ impl SharedEvent {
             self.raw
                 .notifyListener_atValue_block(listener, value, &*block as *const _ as *mut _);
         }
+        schedule_point!(ListenerRegistered);
 
         let (lock, cv) = &**self.shared;
         let deadline = std::time::Duration::from_millis(timeout_ms);

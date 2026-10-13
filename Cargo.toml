@@ -250,3 +250,7 @@ lto = false
 # uses to get one object; it buys nothing for a correctness arm and it is one
 # more difference between this build and the one whose behaviour is under test.
 codegen-units = 16
+
+# Owned pinned transport repair; public mirror retains this relative locus.
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }

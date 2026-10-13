@@ -167,6 +167,48 @@ impl Queue {
     }
 
     pub fn acquire(self: &Arc<Self>) -> Result<Arc<Submission>, MetalKernelError> {
+        self.acquire_impl(None)
+    }
+
+    /// Cold/preflight constructor. Actual Queue failure/Wake identities are
+    /// preheld in the rooted relay. No generation is silently inferred from
+    /// a raw Buffer or a namespace; caller carries the genuine submission clock.
+    /// This additive route is not yet enabled by default/scoped factories.
+    pub(super) unsafe fn cold_binding_inventory(
+        &self,
+        context: &crate::memory_admission::AllocationContext,
+        clock: Arc<super::buffer_pool::GpuClock>,
+    ) -> Result<super::native_generation_bindings::BindingInventory, MetalKernelError> {
+        let relay = Arc::new(crate::deferred_failure_relay::DeferredFailureRelay::cold(
+            self.failure.clone(),
+            self.ready.clone(),
+        ));
+        unsafe {
+            super::native_generation_bindings::BindingInventory::cold_in(
+                context,
+                clock,
+                relay,
+                self.failure.clone(),
+            )
+        }
+    }
+
+    pub(super) fn acquire_bound(
+        self: &Arc<Self>,
+        prepared: super::native_generation_bindings::PreparedGeneration,
+    ) -> Result<Arc<Submission>, MetalKernelError> {
+        if !prepared.matches_queue(&self.failure) {
+            return Err(MetalKernelError::QueueUnavailable(
+                "binding inventory belongs to another native queue",
+            ));
+        }
+        self.acquire_impl(Some(prepared))
+    }
+
+    fn acquire_impl(
+        self: &Arc<Self>,
+        prepared: Option<super::native_generation_bindings::PreparedGeneration>,
+    ) -> Result<Arc<Submission>, MetalKernelError> {
         // Obtain the real default pin before removing any reusable/native slot.
         // Counted-clone refusal leaves queue state/capacity unchanged. Initial
         // cold acquire has None; pristine attachment fills that State below.
@@ -226,6 +268,15 @@ impl Queue {
                 ));
             }
         };
+        // Cold/native failures above leave preparation unconsumed; its Drop
+        // cancels the genuine never-attached witness. After this move no fallible
+        // operation occurs before BOTH immutable Submission and native Slot own
+        // their exact heads. Escaped encoders keep Submission, never Queue.current.
+        let bindings = prepared.map(|prepared| {
+            let (submission, native) = prepared.take();
+            slot.bindings = Some(native);
+            submission
+        });
         Ok(Arc::new(Submission {
             front_event,
             generation,
@@ -245,6 +296,7 @@ impl Queue {
             feedback: OnceLock::new(),
             callbacks_finished: AtomicBool::new(false),
             done: self.ready.clone(),
+            bindings,
         }))
     }
 }
@@ -282,6 +334,10 @@ pub(super) struct Slot {
     offset: usize,
     // LAST: release native resources/allocator/table before root publication.
     namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
+    // LAST: exact old generation remains through native cached-reference reset
+    // and through final Slot native/resource destruction. Header release atoms
+    // cannot run arbitrary native/charge Drop on this producer.
+    bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 unsafe impl Send for Slot {}
 
@@ -327,6 +383,7 @@ impl Slot {
             page: 0,
             offset: 0,
             namespaces: Vec::new(),
+            bindings: None,
         })
     }
 
@@ -354,6 +411,10 @@ impl Slot {
         // Native cached references of the prior generation were cleared/reset.
         // Persistent scratch pages retain their own native reservation owners.
         self.namespaces.clear();
+        // Only actual dual-sided completion returns Slot to the available pool.
+        // Clear old native caches BEFORE dropping old head. Any escaped old
+        // Submission/Encoder keeps its own old head and cannot borrow a successor.
+        self.bindings.take();
     }
 
     fn command_buffer(&self, index: usize) -> &ProtocolObject<dyn MTL4CommandBuffer> {
@@ -434,11 +495,47 @@ pub(crate) struct Submission {
     feedback: OnceLock<Feedback>,
     callbacks_finished: AtomicBool,
     done: Arc<Wake>,
+    // LAST: escaped logical wrappers retain this immutable exact generation.
+    bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 unsafe impl Send for Submission {}
 unsafe impl Sync for Submission {}
 
 impl Submission {
+    pub(super) fn bindings(
+        &self,
+    ) -> Result<&super::native_generation_bindings::GenerationBindings, MetalKernelError> {
+        self.bindings
+            .as_ref()
+            .ok_or(MetalKernelError::QueueUnavailable(
+                "submission is explicit legacy/untracked route",
+            ))
+    }
+    pub(super) fn stage_binding_epoch(
+        &self,
+        epoch: crate::retire::Epoch,
+    ) -> Result<(), MetalKernelError> {
+        if let Some(bindings) = &self.bindings {
+            bindings.stage_epoch(epoch)?;
+        }
+        Ok(())
+    }
+    fn binding_failure(&self, reason: crate::retirement_owners::Failure) {
+        if let Some(bindings) = &self.bindings {
+            bindings.quarantine(reason); // counted root; atoms only
+        } else {
+            self.queue.poison(reason); // unchanged explicit compatibility path
+        }
+    }
+    fn binding_cancelled(&self) {
+        if let Some(bindings) = &self.bindings {
+            // SAFETY: caller has actual no-native-handoff cancellation proof.
+            // Cached native objects and escaped wrappers retain SAME head.
+            if unsafe { bindings.terminal_cancelled() }.is_err() {
+                bindings.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            }
+        }
+    }
     pub(super) fn attach_physical_owner(
         &self,
         owner: crate::metal_backend::device_retirement::NamespaceOwner,
@@ -501,9 +598,14 @@ impl Submission {
         self.queue.check_failure()
     }
     pub(super) fn fail_lifecycle(&self) {
-        self.queue
-            .poison(crate::retirement_owners::Failure::AdapterFailed);
-        self.notify_lifecycle();
+        self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+        if self.bindings.is_none() {
+            self.notify_lifecycle(); // unchanged legacy service + waiter wakes
+        }
+        // Enrolled failure publishes through the genuine HeaderStrong only.
+        // Its immutable polling root/pending relay remains registered through
+        // the next service pass; no producer parking-queue lock is needed.
+        // Normal lifecycle release notifications remain separate and unchanged.
     }
 
     pub fn enqueue(&self) -> Result<(), MetalKernelError> {
@@ -905,22 +1007,36 @@ impl Submission {
             // Invariant failure before handoff: preserve rather than release an
             // owner on an exceptional producer stack. Queue refuses new work.
             std::mem::forget(slot);
-            self.queue
-                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             panic!("native slot installed twice");
         }
     }
     pub(super) fn publish_native_reuse(&self, side: crate::native_reuse::ReuseSide) {
-        let result = self
-            .native_reuse
-            .publish(side)
-            .and_then(|ready| match ready {
-                Some(ready) => ready.release(|slot| self.queue.return_retirement_slot(slot)),
-                None => Ok(()),
-            });
-        if result.is_err() {
-            self.queue
-                .poison(crate::retirement_owners::Failure::AdapterFailed);
+        let ready = match self.native_reuse.publish(side) {
+            Ok(Some(ready)) => ready,
+            Ok(None) => return,
+            Err(_) => {
+                self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+                return;
+            }
+        };
+        // Unique winner acquired actual returned native handoff AND ordered
+        // callback completion. Feedback alone may precede native call return.
+        if let Some(bindings) = &self.bindings {
+            // SAFETY: the two immutable adapter facts prove this generation's
+            // terminal prefix. SAME Slot head and escaped-head holders preserve
+            // cached-reference/future-emission custody until they really close.
+            if unsafe { bindings.terminal_submitted() }.is_err() {
+                drop(ready); // restores exact Slot, not native/charge destruction
+                bindings.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+                return;
+            }
+        }
+        if ready
+            .release(|slot| self.queue.return_retirement_slot(slot))
+            .is_err()
+        {
+            self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
         }
     }
     /// Called only by native-owner host cleanup. If no side published, cleanup
@@ -1053,6 +1169,19 @@ impl PreparedCommit<'_> {
             .hooked = true;
         Ok(())
     }
+    /// After the epoch is taken (`Commands::submit_prepared`): a refusal fails
+    /// the queue, since the hook counts every epoch taken (`completion_hook.rs`).
+    pub(super) fn stage_binding_epoch(
+        &self,
+        epoch: crate::retire::Epoch,
+    ) -> Result<(), MetalKernelError> {
+        self.submission
+            .stage_binding_epoch(epoch)
+            .inspect_err(|_| {
+                self.submission
+                    .binding_failure(crate::retirement_owners::Failure::AdapterFailed)
+            })
+    }
     pub(super) fn on_completion(
         &self,
         f: impl Fn(&Feedback) + Send + Sync + 'static,
@@ -1089,6 +1218,12 @@ impl PreparedCommit<'_> {
     pub(super) fn commit(mut self) -> Result<(), MetalKernelError> {
         let submission = self.submission;
         submission.queue.check_failure()?;
+        if let Some(bindings) = &submission.bindings {
+            // Direct public commit also supplies a precise staged epoch. The
+            // ordinary Commands path already staged its exact commit_epoch.
+            // A commit taking its own epoch runs the queue's completion hook.
+            bindings.ensure_staged(|| self.run_hook())?;
+        }
         let mut state = self.state.get_mut().take().expect("prepared recording");
         let slot = state.slot.take().expect("prepared recording slot");
         let physical = state.physical.take();
@@ -1110,16 +1245,21 @@ impl PreparedCommit<'_> {
         let owners = super::retirement::NativeOwners::metal4(slot, submission.clone(), physical);
         match submission
             .retirement
-            .replace_prepared(super::retirement::Captures { callbacks, hooked }, owners)
+            .replace_prepared(
+                super::retirement::Captures {
+                    callbacks,
+                    hooked,
+                    bindings: None,
+                },
+                owners,
+            )
         {
             Ok(displaced) => drop(displaced), // Empty pre-reserved record only.
             Err(rejected) => {
                 // An invariant failure must not drop the only physical owner.
                 // Queue closure prevents repeated attempts; retain this payload.
                 std::mem::forget(rejected.value);
-                submission
-                    .queue
-                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+                submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
                 return Err(MetalKernelError::QueueUnavailable(
                     "prepared owner installation failed",
                 ));
@@ -1131,15 +1271,19 @@ impl PreparedCommit<'_> {
         residency.commit();
         self.extra.last().unwrap_or(&self.first).endCommandBuffer();
         submission.retirement.begin_handoff().map_err(|_| {
-            submission
-                .queue
-                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             MetalKernelError::QueueUnavailable("native handoff refused")
         })?;
         *self.order = self
             .order
             .checked_add(1)
             .expect("checked during preparation");
+        if let Some(bindings) = &submission.bindings {
+            bindings.entered().map_err(|error| {
+                submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+                error
+            })?;
+        }
         self.phase = CommitPhase::EnteredNative;
         submission
             .status
@@ -1188,13 +1332,17 @@ impl PreparedCommit<'_> {
                 }
             },
         );
-        // Reuse publication is independent of cleanup readiness. It happens
-        // only after all native entry calls return; callbacks may precede it.
+        // Publish RETURNED before this side can elect the terminal winner.
+        // All native queue entries returned; callbacks may already be complete.
+        if let Some(bindings) = &submission.bindings {
+            bindings.returned().map_err(|error| {
+                submission.binding_failure(crate::retirement_owners::Failure::UnknownHandoff);
+                error
+            })?;
+        }
         submission.publish_native_reuse(crate::native_reuse::ReuseSide::HandoffReturned);
         submission.retirement.handoff_returned().map_err(|_| {
-            submission
-                .queue
-                .poison(crate::retirement_owners::Failure::AdapterFailed);
+            submission.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             MetalKernelError::QueueUnavailable("handoff return publication failed")
         })?;
         self.phase = CommitPhase::Returned;
@@ -1204,21 +1352,32 @@ impl PreparedCommit<'_> {
 impl Drop for PreparedCommit<'_> {
     fn drop(&mut self) {
         match self.phase {
+            // Unused preserves actual PREPARED cancellation/retry contract.
+            // A merely staged epoch is unobserved, not terminal-cancelled work.
             CommitPhase::Unused | CommitPhase::Returned => {}
             CommitPhase::Installed => {
-                let _ = self.submission.retirement.cancel_before_handoff();
+                if self.submission.retirement.cancel_before_handoff().is_ok() {
+                    self.submission.binding_cancelled();
+                } else {
+                    self.submission
+                        .binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+                }
                 self.submission
-                    .queue
-                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+                    .binding_failure(crate::retirement_owners::Failure::AdapterFailed);
             }
             CommitPhase::EnteredNative => {
-                let _ = self
-                    .submission
-                    .retirement
-                    .handoff_unknown(|| self.submission.queue.ready.notify());
+                // Enrolled path does not notify under order/state guards. Root
+                // relay's immutable polling pass wakes SAME Queue waiters later.
+                if self.submission.bindings.is_some() {
+                    let _ = self.submission.retirement.handoff_unknown(|| {});
+                } else {
+                    let _ = self
+                        .submission
+                        .retirement
+                        .handoff_unknown(|| self.submission.queue.ready.notify());
+                }
                 self.submission
-                    .queue
-                    .poison(crate::retirement_owners::Failure::UnknownHandoff);
+                    .binding_failure(crate::retirement_owners::Failure::UnknownHandoff);
             }
         }
     }
@@ -1244,14 +1403,16 @@ impl Drop for Submission {
                 Ok(displaced) => drop(displaced),
                 Err(rejected) => {
                     std::mem::forget(rejected.value);
-                    self.queue
-                        .poison(crate::retirement_owners::Failure::AdapterFailed);
+                    self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
                     return;
                 }
             }
             if self.retirement.cancel_before_handoff().is_err() {
-                self.queue
-                    .poison(crate::retirement_owners::Failure::AdapterFailed);
+                self.binding_failure(crate::retirement_owners::Failure::AdapterFailed);
+            } else {
+                // Last Submission/escaped encoder Arc is gone; no native entry
+                // occurred. NativeOwners still holds Slot through actual destroy.
+                self.binding_cancelled();
             }
         } else {
             // Legacy public commit still owns its old callback payload. Retire

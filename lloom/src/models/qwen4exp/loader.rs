@@ -1126,7 +1126,41 @@ pub(crate) fn open_shards(paths: &[PathBuf]) -> Result<(Vec<Content>, Vec<File>)
     Ok((contents, files))
 }
 
+/// Enter the existing domain before headers, eager maps or worker services.
+/// Preserve every family option except the already-satisfied machine gate.
+fn in_admitted_load<T>(
+    device: &Device,
+    load: crate::nn::memory::LoadContext,
+    opts: &LoadOptions,
+    build: impl FnOnce(&Device, &LoadOptions) -> Result<T>,
+) -> Result<crate::nn::memory::Loaded<T>> {
+    crate::nn::memory::Loaded::new(device, load, |resolved, _context| {
+        let mut scoped = opts.clone();
+        scoped.machine = None;
+        build(resolved, &scoped)
+    })
+}
+
 impl<P: Profile> Qwen4Exp<P, Resident> {
+    /// Resident loading in one caller-supplied admitted model domain.
+    /// Headers and the incumbent complete assembly run inside the scope; the
+    /// caller's load peak includes their host metadata and transfer temporaries.
+    /// No second machine Holding is created. Legacy constructors are unchanged.
+    ///
+    /// Source integration only, pending complete allocator/native/worker producer
+    /// enrollment. Requests must enter the returned owner's pass scope, including
+    /// fresh cache, PLE and lazy service creation; context alone is not a namespace.
+    pub fn from_gguf_shards_admitted(
+        paths: &[PathBuf],
+        device: &Device,
+        opts: &LoadOptions,
+        load: crate::nn::memory::LoadContext,
+    ) -> Result<crate::nn::memory::Loaded<Self>> {
+        in_admitted_load(device, load, opts, |resolved, scoped| {
+            Self::from_gguf_shards(paths, resolved, scoped)
+        })
+    }
+
     /// Load the model from an open GGUF shard, without the N-gram PLE (see
     /// [`Self::from_gguf_with`]).
     pub fn from_gguf<R: Read + Seek>(
@@ -1296,6 +1330,28 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
 }
 
 impl<P: Profile> Qwen4Exp<P, Streamed> {
+    /// Streamed loading in the same caller-supplied domain as its resident
+    /// weights, slot pools, staging ring, prefetcher and optional MTP head.
+    /// Reuses the complete existing loader and its slot/working-set checks;
+    /// skips only a duplicate legacy machine reservation.
+    ///
+    /// Source integration only. Before activation, IO/native custody and every
+    /// worker request must retain that namespace and a live pass context. The
+    /// lexical load scope does not automatically propagate into service threads.
+    /// Caller load/pass predictions include all asynchronous retention and host
+    /// metadata, not only physical expert payloads.
+    pub fn from_gguf_streamed_admitted(
+        paths: &[PathBuf],
+        device: &Device,
+        opts: &LoadOptions,
+        stream: &StreamOptions,
+        load: crate::nn::memory::LoadContext,
+    ) -> Result<crate::nn::memory::Loaded<Self>> {
+        in_admitted_load(device, load, opts, |resolved, scoped| {
+            Self::from_gguf_streamed(paths, resolved, scoped, stream)
+        })
+    }
+
     /// Load from a sharded checkpoint with the routed experts streamed from the
     /// shards into a per-layer slot pool (`stream.slots` experts per
     /// projection); everything else resident as on the `Resident` path.

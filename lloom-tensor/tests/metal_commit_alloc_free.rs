@@ -409,6 +409,10 @@ fn commit_loop(kind: CommandBufferKind, subscriber: bool, commits: u64) -> (u64,
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(&device));
     let cmds = Commands::new_with(queue, residency_set, CompletionWait::Synchronize, kind).unwrap();
+    run_commits(&device, &cmds, subscriber, commits)
+}
+
+fn run_commits(device: &Device, cmds: &Commands, subscriber: bool, commits: u64) -> (u64, u64) {
     // Production registers no subscriber (the pools drain on the host); the
     // other arm registers one, to price the subscriber path itself.
     let fired = Arc::new(AtomicU64::new(0));
@@ -425,18 +429,22 @@ fn commit_loop(kind: CommandBufferKind, subscriber: bool, commits: u64) -> (u64,
     let dst: Buffer = device.new_buffer(len, SHARED).unwrap();
     let step = || {
         let encoder = cmds.command_encoder().unwrap();
-        call_affine(
-            &device,
-            &encoder,
-            &kernels,
-            "affine_f32",
-            std::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&src),
-            &dst,
-            2.0,
-            1.0,
-        )
+        // SAFETY: the loop owns `src` and `dst`, binds them to every command
+        // buffer it commits, and drains every buffer before it returns.
+        unsafe {
+            call_affine(
+                device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                std::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&src),
+                &dst,
+                2.0,
+                1.0,
+            )
+        }
         .unwrap();
     };
     for i in 0..128 {

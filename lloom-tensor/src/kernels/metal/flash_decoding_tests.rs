@@ -52,7 +52,9 @@ fn commands(device: &Device) -> Commands {
 }
 
 fn read_f32(buf: &crate::kernels::Buffer, n: usize) -> Vec<f32> {
-    let p = buf.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let p = unsafe { buf.contents() } as *const f32;
     assert!(!p.is_null(), "buffer has no CPU mapping");
     // SAFETY: shared storage holding at least `n` f32, and the caller has
     // waited for the command buffer.
@@ -63,7 +65,9 @@ fn new_f32(device: &Device, values: &[f32]) -> crate::kernels::Buffer {
     let buf = device
         .new_buffer(std::mem::size_of_val(values).max(4), SHARED)
         .unwrap();
-    let dst = buf.contents() as *mut f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let dst = unsafe { buf.contents() } as *mut f32;
     // SAFETY: freshly allocated shared storage of exactly this length.
     unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len()) };
     buf
@@ -73,7 +77,9 @@ fn new_u32(device: &Device, values: &[u32]) -> crate::kernels::Buffer {
     let buf = device
         .new_buffer(std::mem::size_of_val(values).max(4), SHARED)
         .unwrap();
-    let dst = buf.contents() as *mut u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let dst = unsafe { buf.contents() } as *mut u32;
     // SAFETY: as `new_f32`.
     unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), dst, values.len()) };
     buf
@@ -81,7 +87,9 @@ fn new_u32(device: &Device, values: &[u32]) -> crate::kernels::Buffer {
 
 fn write_struct<T>(device: &Device, value: T) -> crate::kernels::Buffer {
     let buf = device.new_buffer(std::mem::size_of::<T>(), SHARED).unwrap();
-    let dst = buf.contents() as *mut T;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let dst = unsafe { buf.contents() } as *mut T;
     // SAFETY: freshly allocated shared storage sized for exactly one `T`.
     unsafe { dst.write(value) };
     buf
@@ -435,31 +443,35 @@ fn run_flash_guarded(
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_decoding(
-            device,
-            &guard,
-            kernels,
-            0,
-            &q_buf,
-            0,
-            &k_buf,
-            0,
-            &v_buf,
-            &out,
-            &partials,
-            &sums,
-            &maxs,
-            &table_buf,
-            &pp,
-            &cp,
-            &walk,
-            &keys_buf,
-            n_q_heads,
-            head_dim,
-            n_chunks,
-            dtype,
-            partial_width,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_decoding(
+                device,
+                &guard,
+                kernels,
+                0,
+                &q_buf,
+                0,
+                &k_buf,
+                0,
+                &v_buf,
+                &out,
+                &partials,
+                &sums,
+                &maxs,
+                &table_buf,
+                &pp,
+                &cp,
+                &walk,
+                &keys_buf,
+                n_q_heads,
+                head_dim,
+                n_chunks,
+                dtype,
+                partial_width,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -2124,35 +2136,41 @@ fn run_flash_with(
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_decoding(
-            device,
-            &guard,
-            kernels,
-            0,
-            &q_buf,
-            0,
-            &k_buf,
-            0,
-            &v_buf,
-            &out,
-            &partials,
-            &sums,
-            &maxs,
-            &table_buf,
-            &pp,
-            &cp,
-            &walk,
-            &keys_buf,
-            n_q_heads,
-            g.head_dim,
-            n_chunks,
-            FlashDType::F32,
-            PARTIAL_WIDTH,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_decoding(
+                device,
+                &guard,
+                kernels,
+                0,
+                &q_buf,
+                0,
+                &k_buf,
+                0,
+                &v_buf,
+                &out,
+                &partials,
+                &sums,
+                &maxs,
+                &table_buf,
+                &pp,
+                &cp,
+                &walk,
+                &keys_buf,
+                n_q_heads,
+                g.head_dim,
+                n_chunks,
+                FlashDType::F32,
+                PARTIAL_WIDTH,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
-    let walk_p = walk.contents() as *const u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let walk_p = unsafe { walk.contents() } as *const u32;
     // SAFETY: shared storage sized for `n_q_heads * n_chunks` u32, waited.
     let walk = unsafe { std::slice::from_raw_parts(walk_p, n_q_heads * n_chunks) }.to_vec();
     FlashRun {
@@ -2182,22 +2200,26 @@ fn run_scatter(
     let pp = write_struct(device, params);
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_kv_scatter(
-            device,
-            &guard,
-            kernels,
-            0,
-            &src_buf,
-            0,
-            &dst_buf,
-            &slots_buf,
-            0,
-            &pp,
-            params.n_rows as usize,
-            n_kv_heads,
-            head_dim,
-            FlashDType::F32,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_kv_scatter(
+                device,
+                &guard,
+                kernels,
+                0,
+                &src_buf,
+                0,
+                &dst_buf,
+                &slots_buf,
+                0,
+                &pp,
+                params.n_rows as usize,
+                n_kv_heads,
+                head_dim,
+                FlashDType::F32,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -2261,31 +2283,35 @@ fn run_partials(
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_decoding(
-            device,
-            &guard,
-            kernels,
-            0,
-            &q_buf,
-            0,
-            &k_buf,
-            0,
-            &v_buf,
-            &out,
-            &partials,
-            &sums,
-            &maxs,
-            &table_buf,
-            &pp,
-            &cp,
-            &walk,
-            &keys_buf,
-            n_q_heads,
-            head_dim,
-            n_chunks,
-            FlashDType::F32,
-            PARTIAL_WIDTH,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_decoding(
+                device,
+                &guard,
+                kernels,
+                0,
+                &q_buf,
+                0,
+                &k_buf,
+                0,
+                &v_buf,
+                &out,
+                &partials,
+                &sums,
+                &maxs,
+                &table_buf,
+                &pp,
+                &cp,
+                &walk,
+                &keys_buf,
+                n_q_heads,
+                head_dim,
+                n_chunks,
+                FlashDType::F32,
+                PARTIAL_WIDTH,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -2457,31 +2483,35 @@ fn token_stride_is_read_from_the_parameter() {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_decoding(
-            &device,
-            &guard,
-            &kernels,
-            0,
-            &q_buf,
-            0,
-            &k_buf,
-            0,
-            &v_buf,
-            &out,
-            &partials,
-            &sums,
-            &maxs,
-            &table_buf,
-            &pp,
-            &cp,
-            &walk,
-            &keys_buf,
-            n_q_heads,
-            head_dim,
-            n_chunks,
-            FlashDType::F32,
-            PARTIAL_WIDTH,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_decoding(
+                &device,
+                &guard,
+                &kernels,
+                0,
+                &q_buf,
+                0,
+                &k_buf,
+                0,
+                &v_buf,
+                &out,
+                &partials,
+                &sums,
+                &maxs,
+                &table_buf,
+                &pp,
+                &cp,
+                &walk,
+                &keys_buf,
+                n_q_heads,
+                head_dim,
+                n_chunks,
+                FlashDType::F32,
+                PARTIAL_WIDTH,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
@@ -2620,36 +2650,42 @@ fn walk_order_of(
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_flash_decoding(
-            device,
-            &guard,
-            kernels,
-            0,
-            &q_buf,
-            0,
-            &k_buf,
-            0,
-            &v_buf,
-            &out,
-            &partials,
-            &sums,
-            &maxs,
-            &table_buf,
-            &pp,
-            &cp,
-            &walk,
-            &keys_buf,
-            n_q_heads,
-            head_dim,
-            n_chunks,
-            FlashDType::F32,
-            PARTIAL_WIDTH,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_flash_decoding(
+                device,
+                &guard,
+                kernels,
+                0,
+                &q_buf,
+                0,
+                &k_buf,
+                0,
+                &v_buf,
+                &out,
+                &partials,
+                &sums,
+                &maxs,
+                &table_buf,
+                &pp,
+                &cp,
+                &walk,
+                &keys_buf,
+                n_q_heads,
+                head_dim,
+                n_chunks,
+                FlashDType::F32,
+                PARTIAL_WIDTH,
+            )
+        }
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
 
-    let p = walk.contents() as *const u32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let p = unsafe { walk.contents() } as *const u32;
     // SAFETY: shared storage sized for `n_q_heads * n_chunks` u32, waited.
     let got = unsafe { std::slice::from_raw_parts(p, n_q_heads * n_chunks) }.to_vec();
     assert!(

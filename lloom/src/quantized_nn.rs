@@ -124,3 +124,12 @@ impl Module for RmsNorm {
         crate::nn::ops::rms_norm(x, &self.weight, self.eps as f32)
     }
 }
+
+impl crate::nn::linear::Projection for Linear {
+    fn dimensions(&self) -> Result<(usize, usize)> {
+        self.weight.dimensions()
+    }
+    fn projection_bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+}

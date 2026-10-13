@@ -45,18 +45,22 @@ fn affine_then_wait(device: &Device, cmds: &Commands) -> Result<Vec<f32>, MetalK
     let dst = device.new_buffer(len, SHARED).unwrap();
     {
         let encoder = cmds.command_encoder()?;
-        call_affine(
-            device,
-            &encoder,
-            &kernels,
-            "affine_f32",
-            std::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&src),
-            &dst,
-            2.0,
-            1.0,
-        )?;
+        // SAFETY: the test owns `src` and `dst` and reads `dst` only after the
+        // wait below.
+        unsafe {
+            call_affine(
+                device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                std::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&src),
+                &dst,
+                2.0,
+                1.0,
+            )
+        }?;
     }
     cmds.flush_and_wait_current()?;
     // SAFETY: shared, `n` f32, waited above.
@@ -64,10 +68,9 @@ fn affine_then_wait(device: &Device, cmds: &Commands) -> Result<Vec<f32>, MetalK
 }
 
 /// Encode a blit copy whose source the host releases before the command
-/// buffer is committed, and commit it. Returns the marker for that buffer —
-/// or the error its commit returned, when Metal reported the failed copy
-/// before the queue registered its next buffer: a queue with a native error
-/// takes no new work, so the failure can surface at its own commit.
+/// buffer is committed, and commit it. Returns the marker for that buffer, or
+/// the latched failure when Metal failed the buffer before the commit had
+/// registered its replacement.
 fn commit_a_copy_of_a_released_buffer(
     device: &Device,
     cmds: &Commands,
@@ -77,7 +80,10 @@ fn commit_a_copy_of_a_released_buffer(
     let dst = filled(device, len, 0);
     {
         let mut blit = cmds.blit_command_encoder().unwrap();
-        blit.copy_from_buffer(&src, 0, &dst, 0, len);
+        // SAFETY: deliberately broken for the injected failure: `src` is
+        // released before the commit, which an unretained command buffer
+        // reports as an invalid resource. Nothing reads `dst` afterwards.
+        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, len) };
     }
     drop(src);
     cmds.flush_marker()
@@ -96,47 +102,50 @@ fn latched(cmds: &Commands) -> bool {
     true
 }
 
+/// The latch, after the injected buffer failed: the failure is Metal's, and
+/// the queue reports it at every later commit and wait.
+fn assert_latched(device: &Device, cmds: &Commands, failure: &MetalKernelError, attempt: usize) {
+    let msg = failure.to_string();
+    assert!(msg.contains("Invalid Resource"), "attempt {attempt}: {msg}");
+    assert!(latched(cmds), "attempt {attempt}: the failure never latched");
+    assert!(affine_then_wait(device, cmds).is_err());
+    assert!(cmds.flush_and_wait().is_err());
+}
+
 /// **The injected failure.** Under the unretained kind, a command buffer whose
 /// copy reads a buffer the host released before the commit is one Metal fails
 /// with an invalid-resource error. The wait that follows names a LATER,
 /// healthy buffer, which completes cleanly; it must fail exactly when the
 /// earlier one did, and every wait and commit after it must fail too.
 ///
+/// The failure can also surface one step earlier, at the commit of the
+/// failing buffer itself: the commit registers the buffer that replaces it,
+/// and that registration reads the queue's latch, so when Metal has failed the
+/// copy before it, `flush_marker` returns the failure instead of a marker.
+/// That is the latch reporting at a later commit, and it is held to the same
+/// assertions (`docs/tuning.md` §13.5x). The queue's latch is set when the
+/// failed buffer's completion runs, which can trail the error the commit
+/// returned, so the test waits for it rather than read it once.
+///
 /// Metal does not fail the released read every time: alone in a process it
 /// failed 4 of 4 copies, beside other GPU tests most completed. So the
 /// assertion is per attempt — the wait's verdict equals the earlier buffer's
 /// own status — over attempts until one failed, and a run in which Metal
 /// never failed one is reported, not passed.
-///
-/// When Metal reports the failure before the queue has registered its next
-/// buffer, the commit of the failed buffer returns it (`docs/tuning.md`
-/// §13.5x): the run fails at the earliest point a host can see the failure.
-/// That attempt must carry the injected error, and the latch must then fail
-/// every later commit and wait, as on the wait's path.
 #[test]
 fn a_failed_command_buffer_fails_the_next_wait_whichever_buffer_it_names() {
     let device = Device::system_default().expect("no Metal device");
     let len = 64 << 20;
-    let mut injected = 0;
+    let (mut at_wait, mut at_commit, mut attempts) = (0, 0, 0);
     for attempt in 0..16 {
+        attempts += 1;
         let cmds = commands(&device, CommandBufferKind::Unretained);
         let first = match commit_a_copy_of_a_released_buffer(&device, &cmds, len) {
-            Ok(first) => first,
-            Err(error) => {
-                let msg = error.to_string();
-                assert!(
-                    msg.contains("Invalid Resource"),
-                    "attempt {attempt}: the commit failed, and not with the injected error: {msg}"
-                );
-                assert!(
-                    latched(&cmds),
-                    "attempt {attempt}: the failure never latched"
-                );
-                assert!(affine_then_wait(&device, &cmds).is_err());
-                assert!(cmds.flush_and_wait().is_err());
-                println!("INJECTED attempt={attempt} surfaced=commit");
-                injected += 1;
-                if injected == 2 {
+            Ok(marker) => marker,
+            Err(failure) => {
+                assert_latched(&device, &cmds, &failure, attempt);
+                at_commit += 1;
+                if at_wait + at_commit == 2 {
                     break;
                 }
                 continue;
@@ -152,21 +161,18 @@ fn a_failed_command_buffer_fails_the_next_wait_whichever_buffer_it_names() {
             if first_failed { "had" } else { "had not" }
         );
         if first_failed {
-            let msg = waited.unwrap_err().to_string();
-            assert!(msg.contains("Invalid Resource"), "{msg}");
-            // Latched: the queue reports it at every later commit and wait.
-            assert!(cmds.check_failed().is_err());
-            assert!(affine_then_wait(&device, &cmds).is_err());
-            assert!(cmds.flush_and_wait().is_err());
-            println!("INJECTED attempt={attempt} surfaced=wait");
-            injected += 1;
-            if injected == 2 {
+            // On this path the latch is set before the wait returns.
+            assert!(cmds.check_failed().is_err(), "attempt {attempt}");
+            assert_latched(&device, &cmds, &waited.unwrap_err(), attempt);
+            at_wait += 1;
+            if at_wait + at_commit == 2 {
                 break;
             }
         }
     }
+    eprintln!("INJECTED attempts={attempts} at_wait={at_wait} at_commit={at_commit}");
     assert!(
-        injected > 0,
+        at_wait + at_commit > 0,
         "Metal failed none of the 16 injected command buffers: the test injected nothing"
     );
 

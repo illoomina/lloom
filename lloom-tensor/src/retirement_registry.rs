@@ -7,7 +7,7 @@
 use crate::{
     completion_wake::Wake,
     memory_admission::{
-        AdmissionError, AllocationOrigin, AllocationTicket, DomainKey, PhysicalCharge,
+        AllocationError, AllocationOrigin, AllocationTicket, DomainKey, PhysicalCharge,
     },
     retirement_mailbox::{CleanupPolicy, Detached, MailboxError, OwnerMailbox, Ticket},
     retirement_owners::{Failure, FailureSignal},
@@ -30,7 +30,7 @@ pub(crate) enum RegistryError {
     Service(ServiceError),
     MetadataAllocation,
     GrowthRefused,
-    Admission(AdmissionError),
+    Admission(AllocationError),
 }
 pub(crate) struct Rejected<C, A> {
     pub error: RegistryError,
@@ -452,7 +452,7 @@ impl<C, A, F> Slab<C, A, F> {
                     .and_then(|ordered| cells.checked_add(ordered))
             })
             .and_then(|vectors| std::mem::size_of::<Self>().checked_add(vectors));
-        bytes.ok_or(RegistryError::Admission(AdmissionError::Overflow))
+        bytes.ok_or(RegistryError::Admission(AllocationError::Overflow))
     }
 
     fn new(
@@ -1351,7 +1351,7 @@ mod metadata_admission_tests {
             .expect("foreign ticket accepted");
         assert!(matches!(
             rejected.error,
-            RegistryError::Admission(AdmissionError::ReuseDomainMismatch { .. })
+            RegistryError::Admission(AllocationError::ReuseDomainMismatch { .. })
         ));
         assert_eq!((rejected.captures, rejected.anchors), (11, 13));
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
@@ -1414,7 +1414,10 @@ mod metadata_admission_tests {
             .expect("under-bound ticket accepted");
         assert!(matches!(
             rejected.error,
-            RegistryError::Admission(AdmissionError::PromiseTooSmall { .. })
+            RegistryError::Admission(AllocationError::Refused {
+                domain: crate::memory_admission::RefusalDomain::Promise,
+                ..
+            })
         ));
         assert_eq!((rejected.captures, rejected.anchors), (31, 37));
         assert_eq!(domain.snapshot(), AccountSnapshot::default());

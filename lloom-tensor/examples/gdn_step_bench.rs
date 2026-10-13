@@ -95,22 +95,26 @@ fn main() -> Result<()> {
             } else {
                 (&s0, &outs[k], &os[k])
             };
-            call_gdn_step(
-                &dev,
-                &enc,
-                &kernels,
-                d,
-                h,
-                off(&heads),
-                off(&alpha),
-                off(&beta),
-                off(&dt_bias),
-                off(&ssm_a),
-                off(src),
-                o,
-                off(dst),
-                reg,
-            )?;
+            // SAFETY: the bench owns every buffer bound here and reads them only after
+            // waiting for the command buffer that writes them.
+            unsafe {
+                call_gdn_step(
+                    &dev,
+                    &enc,
+                    &kernels,
+                    d,
+                    h,
+                    off(&heads),
+                    off(&alpha),
+                    off(&beta),
+                    off(&dt_bias),
+                    off(&ssm_a),
+                    off(src),
+                    o,
+                    off(dst),
+                    reg,
+                )
+            }?;
         }
         enc.end_encoding()?;
         cb.commit()?;
@@ -123,22 +127,26 @@ fn main() -> Result<()> {
     let one = |reg: bool, out: &Buffer, o: &Buffer| -> Result<(Vec<u8>, Vec<u8>)> {
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
         let enc = cb.compute_command_encoder_no_fence()?;
-        call_gdn_step(
-            &dev,
-            &enc,
-            &kernels,
-            d,
-            h,
-            off(&heads),
-            off(&alpha),
-            off(&beta),
-            off(&dt_bias),
-            off(&ssm_a),
-            off(&s0),
-            o,
-            off(out),
-            reg,
-        )?;
+        // SAFETY: the bench owns every buffer bound here and reads them only after
+        // waiting for the command buffer that writes them.
+        unsafe {
+            call_gdn_step(
+                &dev,
+                &enc,
+                &kernels,
+                d,
+                h,
+                off(&heads),
+                off(&alpha),
+                off(&beta),
+                off(&dt_bias),
+                off(&ssm_a),
+                off(&s0),
+                o,
+                off(out),
+                reg,
+            )
+        }?;
         enc.end_encoding()?;
         cb.commit()?;
         cb.wait_until_completed()?;

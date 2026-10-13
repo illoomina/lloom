@@ -1,9 +1,9 @@
-//! The short causal convolution block: a channel-wise `k`-tap causal conv over
-//! each channel's newest inputs, carried across steps as a window of state.
+//! The short convolution block: channel-wise temporal folds, either causal
+//! windows carried across steps or a centered three-tap full-sequence fold.
 //! LFM2's conv layers and Gated DeltaNet's prologue are both this block
 //! (`docs/fusion.md` §12.2 row 1, `docs/sequence-state.md` §10.2).
 //!
-//! The block is one type over a [`Layout`] — where the window lives:
+//! The block is one type over a [`Layout`] — its temporal access pattern:
 //!
 //! - [`Shift`]: a `[channels, k]` window, the next one written out of place
 //!   each step (taps `1..k` of the old window, then the input). LFM2's
@@ -14,7 +14,11 @@
 //!   (§10.2a). Folded in slot order against a per-phase permuted weight table,
 //!   a reduction order of its own (§10.2g).
 //!
-//! The Metal half is `metal_src/conv/short_conv.metal`, composed into
+//! - [`Centered`]: left/current/right positions of a complete sequence, zero
+//!   outside its ends. A caller-supplied right gate can isolate a media prefix.
+//!   This layout carries no recurrent state.
+//!
+//! The Metal half of the causal layouts is `metal_src/conv/short_conv.metal`, composed into
 //! `conv.metal`'s `shortconv_step` / `shortconv_ring` and `gdn.metal`'s
 //! prologues. A kernel keeps its epilogue (LFM2's `*C` gate; GDN's SiLU and
 //! head norms): the fold is the block's.
@@ -26,9 +30,10 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Shift {}
     impl Sealed for super::Ring {}
+    impl Sealed for super::Centered {}
 }
 
-/// Where a [`ShortConv`] keeps its window, and the weights its fold reads.
+/// A [`ShortConv`] temporal access pattern and any layout-specific weight tables.
 pub trait Layout: sealed::Sealed {
     /// The weights in the form this layout's fold reads.
     type Weights: std::fmt::Debug + Clone;
@@ -43,9 +48,18 @@ pub struct Shift;
 #[derive(Debug, Clone, Copy)]
 pub struct Ring;
 
+/// A complete sequence with zero-padded left/current/right taps, no state.
+#[derive(Debug, Clone, Copy)]
+pub struct Centered;
+
 impl Layout for Shift {
     type Weights = ();
     const NAME: &'static str = "shift";
+}
+
+impl Layout for Centered {
+    type Weights = ();
+    const NAME: &'static str = "centered";
 }
 
 impl Layout for Ring {
@@ -65,8 +79,8 @@ pub struct RingWeights {
     table: Tensor,
 }
 
-/// One layer's short causal conv: its `[channels, k]` taps (oldest first) and
-/// what its layout's fold reads besides.
+/// One layer's short conv: `[channels, k]` taps and layout-specific tables.
+/// Causal taps are oldest first; centered taps are left/current/right.
 #[derive(Debug, Clone)]
 pub struct ShortConv<L: Layout> {
     weight: Tensor,
@@ -77,7 +91,8 @@ pub struct ShortConv<L: Layout> {
 }
 
 impl<L: Layout> ShortConv<L> {
-    /// The taps, `[channels, k]`, oldest first.
+    /// `[channels, k]` taps: oldest first for causal layouts, left/current/right
+    /// for the centered layout.
     pub fn weight(&self) -> &Tensor {
         &self.weight
     }
@@ -88,6 +103,83 @@ impl<L: Layout> ShortConv<L> {
 
     pub fn k(&self) -> usize {
         self.k
+    }
+}
+
+impl ShortConv<Centered> {
+    /// Centered three-tap weights `[channels, 3]`, with no recurrent state.
+    pub fn new(weight: Tensor) -> Result<Self> {
+        let (channels, k) = weight.dims2()?;
+        if channels == 0 || k != 3 {
+            lloom_tensor::bail!("centered short conv requires nonempty [channels,3] weights")
+        }
+        if !matches!(
+            weight.dtype(),
+            lloom_tensor::DType::F16
+                | lloom_tensor::DType::BF16
+                | lloom_tensor::DType::F32
+                | lloom_tensor::DType::F64
+        ) {
+            lloom_tensor::bail!("centered short conv requires floating-point weights")
+        }
+        Ok(Self {
+            weight,
+            channels,
+            k,
+            layout: (),
+            _layout: PhantomData,
+        })
+    }
+
+    /// `b*x` folded left/current/right, then gated by `c`, returning `[B,L,C]`.
+    /// Inputs are `[B,C,L]`; `keep_right` is a numeric mask `[B,1,L]` of the
+    /// same dtype/device. Zero suppresses a right neighbor; one preserves it.
+    /// Other values scale it. Values are not checked by host readback.
+    /// Input padding before projection belongs to the caller. The fold orders
+    /// additions left, current, right and applies the right mask before its tap.
+    pub fn gated_sequence(
+        &self,
+        b: &Tensor,
+        x: &Tensor,
+        c: &Tensor,
+        keep_right: &Tensor,
+    ) -> Result<Tensor> {
+        let (batch, channels, length) = b.dims3()?;
+        if batch == 0
+            || channels != self.channels
+            || length == 0
+            || x.dims() != b.dims()
+            || c.dims() != b.dims()
+            || keep_right.dims() != [batch, 1, length]
+        {
+            lloom_tensor::bail!("centered short conv requires positive matching [B,C,L] inputs and [B,1,L] right mask")
+        }
+        for tensor in [b, x, c, keep_right] {
+            if tensor.dtype() != self.weight.dtype()
+                || !tensor.device().same_device(self.weight.device())
+            {
+                lloom_tensor::bail!("centered short conv inputs must match weight dtype and device")
+            }
+        }
+        let padded = length
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(channels))
+            .and_then(|n| n.checked_mul(batch))
+            .and_then(|n| n.checked_mul(self.weight.dtype().size_in_bytes()));
+        if padded.is_none() {
+            lloom_tensor::bail!("centered short conv padded shape byte count overflow")
+        }
+        let bx = (b * x)?;
+        let zero = Tensor::zeros((batch, channels, 1), bx.dtype(), bx.device())?;
+        let padded = Tensor::cat(&[&zero, &bx, &zero], 2)?;
+        let tap = |i| self.weight.narrow(1, i, 1)?.unsqueeze(0);
+        let left = padded.narrow(2, 0, length)?.broadcast_mul(&tap(0)?)?;
+        let center = padded.narrow(2, 1, length)?.broadcast_mul(&tap(1)?)?;
+        let right = padded
+            .narrow(2, 2, length)?
+            .broadcast_mul(keep_right)?
+            .broadcast_mul(&tap(2)?)?;
+        (((left + center)? + right)? * c)?.transpose(1, 2)
     }
 }
 
@@ -404,5 +496,140 @@ mod tests {
             cur.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         );
         assert_eq!(wa, wb);
+    }
+
+    #[test]
+    fn centered_fold_matches_asymmetric_scalar_at_short_lengths_and_strided_layouts() -> Result<()>
+    {
+        let (batch, channels) = (2, 3);
+        let weights: Vec<f32> = (0..channels)
+            .flat_map(|c| [0.5 + c as f32 * 0.25, -1. - c as f32 * 0.5, 2. + c as f32])
+            .collect();
+        let conv = ShortConv::<Centered>::new(Tensor::from_vec(
+            weights.clone(),
+            (channels, 3),
+            &Device::Cpu,
+        )?)?;
+        for length in [1, 2, 5] {
+            let n = batch * channels * length;
+            let b: Vec<f32> = (0..n).map(|i| (i % 7 + 1) as f32 * 0.25).collect();
+            let x: Vec<f32> = (0..n).map(|i| ((i * 3 % 11) as f32 - 5.) * 0.5).collect();
+            let c: Vec<f32> = (0..n)
+                .map(|i| if i % 2 == 0 { 0.5 } else { -1.5 })
+                .collect();
+            let mut mask = vec![1f32; batch * length];
+            mask[0] = 0.;
+            mask[length + length.saturating_sub(2)] = 0.;
+            let right = Tensor::from_vec(mask.clone(), (batch, 1, length), &Device::Cpu)?;
+            let make = |values: &[f32], strided: bool| -> Result<Tensor> {
+                let tensor = Tensor::from_slice(values, (batch, channels, length), &Device::Cpu)?;
+                if strided {
+                    tensor.transpose(1, 2)?.contiguous()?.transpose(1, 2)
+                } else {
+                    Ok(tensor)
+                }
+            };
+            let mut expected = vec![0f32; n];
+            for row in 0..batch {
+                for ch in 0..channels {
+                    for t in 0..length {
+                        let at = |position| (row * channels + ch) * length + position;
+                        let left = if t > 0 {
+                            b[at(t - 1)] * x[at(t - 1)]
+                        } else {
+                            0.
+                        };
+                        let center = b[at(t)] * x[at(t)];
+                        let neighbor = if t + 1 < length {
+                            b[at(t + 1)] * x[at(t + 1)]
+                        } else {
+                            0.
+                        };
+                        let folded = (left * weights[ch * 3] + center * weights[ch * 3 + 1])
+                            + (neighbor * mask[row * length + t]) * weights[ch * 3 + 2];
+                        expected[(row * length + t) * channels + ch] = folded * c[at(t)];
+                    }
+                }
+            }
+            for strided in [false, true] {
+                let (bt, xt, ct) = (make(&b, strided)?, make(&x, strided)?, make(&c, strided)?);
+                if strided && length > 1 {
+                    assert!(!bt.is_contiguous());
+                }
+                for _ in 0..3 {
+                    let actual = conv
+                        .gated_sequence(&bt, &xt, &ct, &right)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    assert_eq!(actual, expected, "length={length} strided={strided}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn centered_right_gate_preserves_prefix_independence_and_is_numeric() -> Result<()> {
+        let conv = ShortConv::<Centered>::new(Tensor::new(&[[1f32, 2., 4.]], &Device::Cpu)?)?;
+        let ones = Tensor::ones((1, 1, 2), lloom_tensor::DType::F32, &Device::Cpu)?;
+        let x = Tensor::new(&[[[3f32, 5.]]], &Device::Cpu)?;
+        let mask = Tensor::new(&[[[0f32, 1.]]], &Device::Cpu)?;
+        assert_eq!(
+            conv.gated_sequence(&ones, &x, &ones, &mask)?
+                .to_vec3::<f32>()?,
+            [[[6.], [13.]]]
+        );
+        let altered = Tensor::new(&[[[3f32, 99.]]], &Device::Cpu)?;
+        assert_eq!(
+            conv.gated_sequence(&ones, &altered, &ones, &mask)?
+                .to_vec3::<f32>()?[0][0][0],
+            6.
+        );
+        let half = Tensor::new(&[[[0.5f32, 1.]]], &Device::Cpu)?;
+        assert_eq!(
+            conv.gated_sequence(&ones, &x, &ones, &half)?
+                .to_vec3::<f32>()?,
+            [[[16.], [13.]]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn centered_rejects_bad_geometry_dtype_and_mask_before_folding() -> Result<()> {
+        use lloom_tensor::DType;
+        for shape in [(0, 3), (2, 2), (2, 4)] {
+            assert!(
+                ShortConv::<Centered>::new(Tensor::zeros(shape, DType::F32, &Device::Cpu)?)
+                    .is_err()
+            );
+        }
+        assert!(
+            ShortConv::<Centered>::new(Tensor::zeros((2, 3), DType::U32, &Device::Cpu)?).is_err()
+        );
+        let conv = ShortConv::<Centered>::new(Tensor::ones((2, 3), DType::F32, &Device::Cpu)?)?;
+        let valid = Tensor::ones((2, 2, 3), DType::F32, &Device::Cpu)?;
+        let mask = Tensor::ones((2, 1, 3), DType::F32, &Device::Cpu)?;
+        for bad in [
+            valid.to_dtype(DType::F64)?,
+            valid.narrow(1, 0, 1)?,
+            valid.narrow(2, 0, 2)?,
+            valid.reshape((4, 3))?,
+        ] {
+            assert!(conv.gated_sequence(&valid, &bad, &valid, &mask).is_err());
+            assert!(conv.gated_sequence(&valid, &valid, &bad, &mask).is_err());
+        }
+        for bad in [
+            mask.to_dtype(DType::U32)?,
+            mask.narrow(0, 0, 1)?,
+            mask.narrow(2, 0, 2)?,
+            valid.clone(),
+        ] {
+            assert!(conv.gated_sequence(&valid, &valid, &valid, &bad).is_err());
+        }
+        for shape in [(0, 2, 3), (2, 2, 0), (2, 1, 3)] {
+            let bad = Tensor::zeros(shape, DType::F32, &Device::Cpu)?;
+            assert!(conv.gated_sequence(&bad, &bad, &bad, &mask).is_err());
+        }
+        Ok(())
     }
 }

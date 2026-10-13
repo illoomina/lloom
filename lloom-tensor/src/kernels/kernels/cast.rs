@@ -15,8 +15,12 @@ use crate::kernels::{get_tile_size, linear_split};
 const CAST_PARAMS_ALIGN: usize = core::mem::align_of::<CastParams>();
 const CAST_STRIDED_PARAMS_ALIGN: usize = core::mem::align_of::<CastStridedParams>();
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_cast_contiguous(
+pub unsafe fn call_cast_contiguous(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -26,17 +30,20 @@ pub fn call_cast_contiguous(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_cast_contiguous_with(
-        device,
-        ep,
-        kernels,
-        kernel_name,
-        dtype_size,
-        length,
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_cast_contiguous_with(
+            device,
+            ep,
+            kernels,
+            kernel_name,
+            dtype_size,
+            length,
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_cast_contiguous`], choosing how the scalars are bound.
@@ -45,8 +52,13 @@ pub fn call_cast_contiguous(
 /// so there is one body rather than two and the styles cannot drift in what
 /// they bind -- which is the property that makes the bit-identical test
 /// meaningful.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_cast_contiguous_with(
+pub unsafe fn call_cast_contiguous_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -66,7 +78,10 @@ pub fn call_cast_contiguous_with(
     debug_group!(encoder, "cast {kernel_name} elems={length}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(encoder, (length, &input, Output::new(output)));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (length, &input, Output::new(output)));
+    }
     let _staged = finish_packed_params(device, encoder, style, CAST_PARAMS_ALIGN)?;
 
     let tile_size = get_tile_size(dtype_size);
@@ -76,8 +91,12 @@ pub fn call_cast_contiguous_with(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_cast_strided(
+pub unsafe fn call_cast_strided(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -87,21 +106,28 @@ pub fn call_cast_strided(
     input_strides: &[usize],
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_cast_strided_with(
-        device,
-        ep,
-        kernels,
-        kernel_name,
-        shape,
-        input,
-        input_strides,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_cast_strided_with(
+            device,
+            ep,
+            kernels,
+            kernel_name,
+            shape,
+            input,
+            input_strides,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_cast_strided_with(
+pub unsafe fn call_cast_strided_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -123,17 +149,20 @@ pub fn call_cast_strided_with(
     debug_group!(encoder, "cast_strided {kernel_name} elems={length}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            length,
-            shape.len(),
-            shape,
-            input_strides,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                length,
+                shape.len(),
+                shape,
+                input_strides,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CAST_STRIDED_PARAMS_ALIGN)?;
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);

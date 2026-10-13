@@ -17,11 +17,12 @@
 # ~200 dependencies -- a global `-Zsanitizer=address` does not link on
 # aarch64-apple-darwin (`ld: initializer pointer has no target` in LibAFL's
 # `ctor` dependency). rustc links the ASan runtime when the final crate is
-# sanitized, which every `fuzz_*` binary is.
+# sanitized, which every `fuzz_*` binary is. `--cfg lloom_fuzz_asan` compiles
+# the arm's own positive controls (`record::sanitizer_controls`).
 rustc="$1"; shift
 extra=""
 if [ "${LLOOM_FUZZ_ASAN:-0}" = "1" ]; then
-  extra="-Zsanitizer=address"
+  extra="-Zsanitizer=address --cfg lloom_fuzz_asan"
 fi
 case " $* " in
   *" --crate-name lloom "*|*" --crate-name lloom_tensor "*|*" --crate-name lloom_fuzz "*|*" --crate-name fuzz_"*)

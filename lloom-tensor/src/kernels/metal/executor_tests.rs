@@ -67,21 +67,27 @@ fn run_cos(executor: Option<Arc<ExecutorSlot>>, input: &[f32]) -> Vec<f32> {
 
     {
         let guard = cmds.command_encoder().unwrap();
-        call_unary_contiguous(
-            &device,
-            &guard,
-            &kernels,
-            unary::contiguous::cos::FLOAT,
-            std::mem::size_of::<f32>(),
-            input.len(),
-            BufferOffset::zero_offset(&src),
-            &dst,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_contiguous(
+                &device,
+                &guard,
+                &kernels,
+                unary::contiguous::cos::FLOAT,
+                std::mem::size_of::<f32>(),
+                input.len(),
+                BufferOffset::zero_offset(&src),
+                &dst,
+            )
+        }
         .unwrap();
     }
     cmds.flush_and_wait().unwrap();
 
-    let ptr = dst.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { dst.contents() } as *const f32;
     // SAFETY: the command buffer has completed and `dst` holds `input.len()`
     // f32 in shared storage.
     unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()

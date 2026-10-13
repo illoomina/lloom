@@ -93,6 +93,10 @@ path = "tests/metal_cb_failure_tests.rs"
 name = "metal_commit_alloc_free"
 path = "tests/metal_commit_alloc_free.rs"
 
+[[test]]
+name = "allocation_refusal_alloc_free"
+path = "tests/allocation_refusal_alloc_free.rs"
+
 [dev-dependencies]
 parking_lot_core = "0.9.12"
 anyhow = { workspace = true }
@@ -117,6 +121,11 @@ fuzzing = []
 # workspace and from test dev-dependencies; with it off the macros expand to
 # the bare check.
 shape-probe = []
+# Schedule points (`schedule_hook`, `docs/invariants.md` §15.1l): the host
+# completion/retirement protocols call an installed scheduler hook at each named
+# transition. Off by default, and enabled only from `lloom-fuzz` and test
+# builds that ask for it; with it off the points expand to nothing.
+schedule-hooks = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]

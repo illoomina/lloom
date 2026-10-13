@@ -1,5 +1,16 @@
 //! Implementation of Backend traits for Metal
 //!
+//! **Binding authority.** The kernel entry points are `unsafe`: a buffer they
+//! bind must stay unreused and unwritten by the host until the GPU is done with
+//! it. Every `unsafe` kernel or blit call in this module binds only buffers this
+//! device owns for the purpose: a storage (the receiver's, an operand's, or an
+//! output or upload allocated for the op), a constant-cache block, or a
+//! staging buffer the call holds until its wait. A dropped storage or upload
+//! is recycled only by its pool, once the GPU clock passes the command buffer
+//! that bound it (§6.3a), or not at all; an arena slot is reused only past its
+//! planned last bind (§6.7); a constant block never changes. This is the
+//! pool's and the plan's authority, not a tracked lease.
+//!
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
@@ -22,6 +33,10 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod allocation_namespace;
+mod operation_payload;
+mod planned_output_catalog;
+pub(crate) use device::PreparedAffineInput;
+pub(crate) use planned_output_catalog::{CatalogPlanLease, DirectOutputPosition};
 mod allocation_scope;
 pub use allocation_scope::{
     AllocationRequest, AllocationWorker, ExecutionScope, MetalAllocationDomain,
@@ -370,7 +385,7 @@ fn stage_readback_with(
     // dispatch: outside any pass plan (§9.2aa).
     let buffer = match dst {
         Some(d) => {
-            if d.length() < size || d.contents().is_null() {
+            if d.length() < size || unsafe { d.contents() }.is_null() {
                 crate::bail!(
                     "stage_readback_into: a {}-byte destination for {size} bytes, or not host-visible",
                     d.length()
@@ -406,25 +421,29 @@ fn stage_readback_with(
             dtype => crate::bail!("stage_readback: Metal copy2d {dtype:?} not implemented"),
         };
         let encoder = m.device.command_encoder()?;
-        crate::kernels::call_copy2d(
-            &m.device.device,
-            &encoder,
-            &m.device.kernels,
-            kernel_name,
-            &m.buffer,
-            &buffer,
-            1,
-            count,
-            count,
-            count,
-            layout.start_offset() * elem,
-            0,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_copy2d(
+                &m.device.device,
+                &encoder,
+                &m.device.kernels,
+                kernel_name,
+                &m.buffer,
+                &buffer,
+                1,
+                count,
+                count,
+                count,
+                layout.start_offset() * elem,
+                0,
+            )
+        }
         .map_err(MetalError::from)?;
     } else {
         let mut blit = m.device.blit_command_encoder()?;
         blit.set_label("staged_readback");
-        blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size);
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe { blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size) };
     }
     let marker = if commit {
         Some(m.device.flush_marker()?)
@@ -651,18 +670,21 @@ impl BackendStorage for MetalStorage {
                 DType::I64 => "affine_i64",
                 dtype => crate::bail!("Metal contiguous affine {dtype:?} not implemented"),
             };
-            crate::kernels::call_affine(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                self.dtype.size_in_bytes(),
-                el,
-                src,
-                &buffer,
-                mul as f32,
-                add as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_affine(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    self.dtype.size_in_bytes(),
+                    el,
+                    src,
+                    &buffer,
+                    mul as f32,
+                    add as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             let name = match self.dtype {
@@ -674,18 +696,21 @@ impl BackendStorage for MetalStorage {
                 DType::I64 => "affine_i64_strided",
                 dtype => crate::bail!("Metal strided affine {dtype:?} not implemented"),
             };
-            crate::kernels::call_affine_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                &buffer,
-                mul as f32,
-                add as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_affine_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    &buffer,
+                    mul as f32,
+                    add as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
@@ -712,17 +737,20 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "powf_bf16",
                 dtype => crate::bail!("Metal contiguous powf {dtype:?} not implemented"),
             };
-            crate::kernels::call_powf(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                self.dtype.size_in_bytes(),
-                el,
-                src,
-                &buffer,
-                pow as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_powf(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    self.dtype.size_in_bytes(),
+                    el,
+                    src,
+                    &buffer,
+                    pow as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             let name = match self.dtype {
@@ -731,17 +759,20 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "powf_bf16_strided",
                 dtype => crate::bail!("Metal strided powf {dtype:?} not implemented"),
             };
-            crate::kernels::call_powf_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                &buffer,
-                pow as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_powf_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    &buffer,
+                    pow as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
@@ -768,17 +799,20 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "elu_bf16",
                 dtype => crate::bail!("Metal contiguous elu {dtype:?} not implemented"),
             };
-            crate::kernels::call_elu(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                self.dtype.size_in_bytes(),
-                el,
-                src,
-                &buffer,
-                alpha as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_elu(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    self.dtype.size_in_bytes(),
+                    el,
+                    src,
+                    &buffer,
+                    alpha as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             let name = match self.dtype {
@@ -787,17 +821,20 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => "elu_bf16_strided",
                 dtype => crate::bail!("Metal strided elu {dtype:?} not implemented"),
             };
-            crate::kernels::call_elu_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                &buffer,
-                alpha as f32,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_elu_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    &buffer,
+                    alpha as f32,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(Self::new_allocated(buffer, device.clone(), el, dtype)?)
@@ -874,16 +911,19 @@ impl BackendStorage for MetalStorage {
                 .build()?;
             let encoder = self.device.command_encoder()?;
             let src = buffer_o(&self.buffer, layout, self.dtype);
-            crate::kernels::call_reduce_contiguous(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                name,
-                src_dims,
-                dst_el,
-                src,
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_reduce_contiguous(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    name,
+                    src_dims,
+                    dst_el,
+                    src,
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
 
             return Ok(Self::new_allocated(buffer, device, dst_el, dtype)?);
@@ -933,17 +973,20 @@ impl BackendStorage for MetalStorage {
             .build()?;
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        crate::kernels::call_reduce_strided(
-            &device.device,
-            &encoder,
-            &device.kernels,
-            name,
-            &dims,
-            &stride,
-            dst_el,
-            src,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_reduce_strided(
+                &device.device,
+                &encoder,
+                &device.kernels,
+                name,
+                &dims,
+                &stride,
+                dst_el,
+                src,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
 
         Ok(Self::new_allocated(buffer, device, dst_el, dtype)?)
@@ -995,16 +1038,19 @@ impl BackendStorage for MetalStorage {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
                     }
                 };
-                crate::kernels::call_const_set_contiguous(
-                    &device.device,
-                    &encoder,
-                    &device.kernels,
-                    kernel_name,
-                    dtype.size_in_bytes(),
-                    el_count,
-                    s,
-                    dst,
-                )
+                // SAFETY: storage-owned buffers (binding authority, module head).
+                unsafe {
+                    crate::kernels::call_const_set_contiguous(
+                        &device.device,
+                        &encoder,
+                        &device.kernels,
+                        kernel_name,
+                        dtype.size_in_bytes(),
+                        el_count,
+                        s,
+                        dst,
+                    )
+                }
                 .map_err(MetalError::from)?;
             } else {
                 use crate::kernels::unary::strided;
@@ -1026,16 +1072,19 @@ impl BackendStorage for MetalStorage {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
                     }
                 };
-                crate::kernels::call_const_set_strided(
-                    &device.device,
-                    &encoder,
-                    &device.kernels,
-                    kernel_name,
-                    l.dims(),
-                    s,
-                    l.stride(),
-                    dst,
-                )
+                // SAFETY: storage-owned buffers (binding authority, module head).
+                unsafe {
+                    crate::kernels::call_const_set_strided(
+                        &device.device,
+                        &encoder,
+                        &device.kernels,
+                        kernel_name,
+                        l.dims(),
+                        s,
+                        l.stride(),
+                        dst,
+                    )
+                }
                 .map_err(MetalError::from)?;
             }
             Ok(())
@@ -1105,16 +1154,19 @@ impl BackendStorage for MetalStorage {
                     crate::bail!("Metal contiguous to_dtype {left:?} {right:?} not implemented")
                 }
             };
-            crate::kernels::call_cast_contiguous(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel_name,
-                self.dtype.size_in_bytes(),
-                el_count,
-                src,
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_cast_contiguous(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel_name,
+                    self.dtype.size_in_bytes(),
+                    el_count,
+                    src,
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             let kernel_name = match (self.dtype, dtype) {
@@ -1158,16 +1210,19 @@ impl BackendStorage for MetalStorage {
                     crate::bail!("Metal strided to_dtype {left:?} {right:?} not implemented")
                 }
             };
-            crate::kernels::call_cast_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel_name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_cast_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel_name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(Self::new_allocated(
@@ -1268,16 +1323,19 @@ impl BackendStorage for MetalStorage {
                 }
             };
 
-            crate::kernels::call_unary_contiguous(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel_name,
-                dtype.size_in_bytes(),
-                el_count,
-                src,
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_unary_contiguous(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel_name,
+                    dtype.size_in_bytes(),
+                    el_count,
+                    src,
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             use crate::kernels::unary::strided;
@@ -1348,16 +1406,19 @@ impl BackendStorage for MetalStorage {
                 }
             };
             let dst = BufferOffset::zero_offset(&buffer);
-            crate::kernels::call_unary_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel_name,
-                layout.dims(),
-                src,
-                layout.stride(),
-                dst,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_unary_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel_name,
+                    layout.dims(),
+                    src,
+                    layout.stride(),
+                    dst,
+                )
+            }
             .map_err(MetalError::from)?;
         }
 
@@ -1418,24 +1479,27 @@ impl BackendStorage for MetalStorage {
         let src = buffer_o(&self.buffer, layout, self.dtype);
         let t = buffer_o(&t.buffer, t_l, t.dtype);
         let f = buffer_o(&f.buffer, f_l, f.dtype);
-        crate::kernels::call_where_cond(
-            &device.device,
-            &encoder,
-            &device.kernels,
-            name,
-            dtype.size_in_bytes(),
-            dims,
-            src,
-            layout.stride(),
-            layout.is_contiguous(),
-            t,
-            t_l.stride(),
-            t_l.is_contiguous(),
-            f,
-            f_l.stride(),
-            f_l.is_contiguous(),
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_where_cond(
+                &device.device,
+                &encoder,
+                &device.kernels,
+                name,
+                dtype.size_in_bytes(),
+                dims,
+                src,
+                layout.stride(),
+                layout.is_contiguous(),
+                t,
+                t_l.stride(),
+                t_l.is_contiguous(),
+                f,
+                f_l.stride(),
+                f_l.is_contiguous(),
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(buffer, device, el, dtype)?)
     }
@@ -1467,17 +1531,20 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         let name = conv_kernel_name(ConvKernel::IM2COL1D, self.dtype, "conv1d")?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        crate::kernels::call_im2col1d_strided(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            layout.shape().dims(),
-            strides,
-            (k_size, stride, padding, dilation),
-            src,
-            &dst,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_im2col1d_strided(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                layout.shape().dims(),
+                strides,
+                (k_size, stride, padding, dilation),
+                src,
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
         drop(encoder);
         let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
@@ -1572,35 +1639,41 @@ impl BackendStorage for MetalStorage {
 
         let encoder = self.device.command_encoder()?;
         match specialized {
-            Some(name) => crate::kernels::call_conv1d_depthwise_k(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                name,
-                dims,
-                (params.k_size, params.padding),
-                buffer_o(&self.buffer, layout, self.dtype),
-                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-                &dst,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            Some(name) => unsafe {
+                crate::kernels::call_conv1d_depthwise_k(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    name,
+                    dims,
+                    (params.k_size, params.padding),
+                    buffer_o(&self.buffer, layout, self.dtype),
+                    buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                    &dst,
+                )
+            }
             .map_err(MetalError::from)?,
-            None => crate::kernels::call_conv1d_depthwise(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                name,
-                dims,
-                layout.stride(),
-                (
-                    params.k_size,
-                    params.stride,
-                    params.padding,
-                    params.dilation,
-                ),
-                buffer_o(&self.buffer, layout, self.dtype),
-                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-                &dst,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            None => unsafe {
+                crate::kernels::call_conv1d_depthwise(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    name,
+                    dims,
+                    layout.stride(),
+                    (
+                        params.k_size,
+                        params.stride,
+                        params.padding,
+                        params.dilation,
+                    ),
+                    buffer_o(&self.buffer, layout, self.dtype),
+                    buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                    &dst,
+                )
+            }
             .map_err(MetalError::from)?,
         }
 
@@ -1666,17 +1739,20 @@ impl BackendStorage for MetalStorage {
             // _status < MTLCommandBufferStatusCommitted >
             // -[IOGPUMetalCommandBuffer setCurrentCommandEncoder:]
             let encoder = self.device.command_encoder()?;
-            crate::kernels::call_col2im1d(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                name,
-                &[b_size, l_in, c_out, k_size],
-                params.k_size,
-                params.stride,
-                BufferOffset::zero_offset(&col.buffer),
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_col2im1d(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    name,
+                    &[b_size, l_in, c_out, k_size],
+                    params.k_size,
+                    params.stride,
+                    BufferOffset::zero_offset(&col.buffer),
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
             buffer
         } else {
@@ -1690,28 +1766,31 @@ impl BackendStorage for MetalStorage {
             let encoder = self.device.command_encoder()?;
             let name =
                 conv_kernel_name(ConvKernel::CONV_TRANSPOSE1D, self.dtype, "conv_transpose1d")?;
-            crate::kernels::call_conv_transpose1d(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                name,
-                params.dilation,
-                params.stride,
-                params.padding,
-                params.output_padding,
-                params.c_out,
-                l_out,
-                params.b_size,
-                layout.dims(),
-                layout.stride(),
-                k_layout.dims(),
-                k_layout.stride(),
-                &self.buffer,
-                layout.start_offset() * self.dtype.size_in_bytes(),
-                &k.buffer,
-                k_layout.start_offset() * k.dtype.size_in_bytes(),
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_conv_transpose1d(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    name,
+                    params.dilation,
+                    params.stride,
+                    params.padding,
+                    params.output_padding,
+                    params.c_out,
+                    l_out,
+                    params.b_size,
+                    layout.dims(),
+                    layout.stride(),
+                    k_layout.dims(),
+                    k_layout.stride(),
+                    &self.buffer,
+                    layout.start_offset() * self.dtype.size_in_bytes(),
+                    &k.buffer,
+                    k_layout.start_offset() * k.dtype.size_in_bytes(),
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
             buffer
         };
@@ -1754,17 +1833,20 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         let name = conv_kernel_name(ConvKernel::IM2COL, self.dtype, "conv2d")?;
         let src = buffer_o(&self.buffer, layout, self.dtype);
-        crate::kernels::call_im2col_strided(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            layout.shape().dims(),
-            layout.stride(),
-            (h_k, w_k, stride, padding, dilation),
-            src,
-            &dst,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_im2col_strided(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                layout.shape().dims(),
+                layout.stride(),
+                (h_k, w_k, stride, padding, dilation),
+                src,
+                &dst,
+            )
+        }
         .map_err(MetalError::from)?;
         drop(encoder);
         let col = Self::new_allocated(dst, device, dst_el, self.dtype)?;
@@ -1831,31 +1913,34 @@ impl BackendStorage for MetalStorage {
 
         let name = conv_kernel_name(ConvKernel::CONV_TRANSPOSE2D, self.dtype, "conv_transpose2d")?;
 
-        crate::kernels::call_conv_transpose2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            CallConvTranspose2dCfg {
-                dilation: params.dilation,
-                stride: params.stride,
-                padding: params.padding,
-                output_padding: params.output_padding,
-                c_out: params.c_out,
-                out_h,
-                out_w,
-                b_size: params.b_size,
-                input_dims: l.dims(),
-                input_stride: l.stride(),
-                kernel_dims: kernel_l.dims(),
-                kernel_stride: kernel_l.stride(),
-                input_offset: l.start_offset() * self.dtype.size_in_bytes(),
-                kernel_offset: kernel_l.start_offset() * kernel.dtype.size_in_bytes(),
-            },
-            &self.buffer,
-            &kernel.buffer,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_conv_transpose2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                CallConvTranspose2dCfg {
+                    dilation: params.dilation,
+                    stride: params.stride,
+                    padding: params.padding,
+                    output_padding: params.output_padding,
+                    c_out: params.c_out,
+                    out_h,
+                    out_w,
+                    b_size: params.b_size,
+                    input_dims: l.dims(),
+                    input_stride: l.stride(),
+                    kernel_dims: kernel_l.dims(),
+                    kernel_stride: kernel_l.stride(),
+                    input_offset: l.start_offset() * self.dtype.size_in_bytes(),
+                    kernel_offset: kernel_l.start_offset() * kernel.dtype.size_in_bytes(),
+                },
+                &self.buffer,
+                &kernel.buffer,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(
             buffer,
@@ -1885,22 +1970,25 @@ impl BackendStorage for MetalStorage {
             .with_label("avg_pool2d")
             .build()?;
         let encoder = self.device.command_encoder()?;
-        crate::kernels::call_pool2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            inp_l.dims(),
-            strides,
-            out_w,
-            out_h,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            &self.buffer,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_pool2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                inp_l.dims(),
+                strides,
+                out_w,
+                out_h,
+                w_k,
+                h_k,
+                w_stride,
+                h_stride,
+                &self.buffer,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(
             buffer,
@@ -1930,22 +2018,25 @@ impl BackendStorage for MetalStorage {
             .with_label("max_pool2d")
             .build()?;
         let encoder = self.device.command_encoder()?;
-        crate::kernels::call_pool2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            inp_l.dims(),
-            strides,
-            out_w,
-            out_h,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            &self.buffer,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_pool2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                inp_l.dims(),
+                strides,
+                out_w,
+                out_h,
+                w_k,
+                h_k,
+                w_stride,
+                h_stride,
+                &self.buffer,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(
             buffer,
@@ -1982,18 +2073,21 @@ impl BackendStorage for MetalStorage {
             .build()?;
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, inp_l, self.dtype);
-        crate::kernels::call_upsample_nearest_2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            dims,
-            strides,
-            out_w,
-            out_h,
-            src,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_upsample_nearest_2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                dims,
+                strides,
+                out_w,
+                out_h,
+                src,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(
             buffer,
@@ -2037,21 +2131,24 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
 
         let src = buffer_o(&self.buffer, inp_l, self.dtype);
-        crate::kernels::call_upsample_bilinear_2d(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            dims,
-            strides,
-            out_w,
-            out_h,
-            align_corners,
-            scale_h,
-            scale_w,
-            src,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_upsample_bilinear_2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                dims,
+                strides,
+                out_w,
+                out_h,
+                align_corners,
+                scale_h,
+                scale_w,
+                src,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
 
         Ok(Self::new_allocated(
@@ -2105,18 +2202,21 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        crate::kernels::call_gather(
-            &device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            ids_el,
-            dim,
-            src,
-            ids,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_gather(
+                &device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                ids_el,
+                dim,
+                src,
+                ids,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
@@ -2149,18 +2249,21 @@ impl BackendStorage for MetalStorage {
         let dst = buffer_o(&self.buffer, l, self.dtype);
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        crate::kernels::call_scatter(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            l.dims(),
-            dim,
-            src,
-            ids,
-            dst,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_scatter(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                l.dims(),
+                dim,
+                src,
+                ids,
+                dst,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(())
     }
@@ -2189,18 +2292,21 @@ impl BackendStorage for MetalStorage {
         let dst = buffer_o(&self.buffer, l, self.dtype);
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        crate::kernels::call_scatter(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            l.dims(),
-            dim,
-            src,
-            ids,
-            dst,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_scatter(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                l.dims(),
+                dim,
+                src,
+                ids,
+                dst,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(())
     }
@@ -2234,21 +2340,24 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&self.buffer, src_l, dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        crate::kernels::call_index_select(
-            &device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            ids_el,
-            dim,
-            src_l.is_contiguous(),
-            src_l.dims(),
-            src_l.stride(),
-            src,
-            ids,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_index_select(
+                &device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                ids_el,
+                dim,
+                src_l.is_contiguous(),
+                src_l.dims(),
+                src_l.stride(),
+                src,
+                ids,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(buffer, device.clone(), dst_el, dtype)?)
     }
@@ -2278,19 +2387,22 @@ impl BackendStorage for MetalStorage {
         let encoder = self.device.command_encoder()?;
         let src = buffer_o(&src.buffer, src_l, src.dtype);
         let ids = buffer_o(&ids.buffer, ids_l, ids.dtype);
-        crate::kernels::call_index_add(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            src_l.dims(),
-            l.dims(),
-            ids_l.dims(),
-            dim,
-            src,
-            ids,
-            &acc.buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_index_add(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                src_l.dims(),
+                l.dims(),
+                ids_l.dims(),
+                dim,
+                src,
+                ids,
+                &acc.buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(acc)
     }
@@ -2346,20 +2458,23 @@ impl BackendStorage for MetalStorage {
                 )
             }
         };
-        crate::kernels::call_mlx_gemm(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            dtype,
-            (b, m, n, k),
-            lhs_l.stride(),
-            lhs_l.start_offset() * self.dtype.size_in_bytes(),
-            &self.buffer,
-            rhs_l.stride(),
-            rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
-            &rhs.buffer,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_mlx_gemm(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                dtype,
+                (b, m, n, k),
+                lhs_l.stride(),
+                lhs_l.start_offset() * self.dtype.size_in_bytes(),
+                &self.buffer,
+                rhs_l.stride(),
+                rhs_l.start_offset() * rhs.dtype.size_in_bytes(),
+                &rhs.buffer,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
 
         Ok(Self::new_allocated(
@@ -2395,7 +2510,10 @@ impl BackendStorage for MetalStorage {
             let src_offset = src_o * self.dtype.size_in_bytes();
             let length = d1 * d2 * self.dtype.size_in_bytes();
             let dst_offset = dst_o * dst.dtype().size_in_bytes();
-            blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length)
+            };
         } else {
             let el_count = d1 * d2;
             if el_count == 0 {
@@ -2413,20 +2531,23 @@ impl BackendStorage for MetalStorage {
                 dtype => crate::bail!("Metal copy2d {dtype:?} not implemented"),
             };
             let encoder = self.device.command_encoder()?;
-            crate::kernels::call_copy2d(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                kernel_name,
-                &self.buffer,
-                &dst.buffer,
-                d1,
-                d2,
-                src_s,
-                dst_s,
-                src_o * self.dtype.size_in_bytes(),
-                dst_o * self.dtype.size_in_bytes(),
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_copy2d(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    kernel_name,
+                    &self.buffer,
+                    &dst.buffer,
+                    d1,
+                    d2,
+                    src_s,
+                    dst_s,
+                    src_o * self.dtype.size_in_bytes(),
+                    dst_o * self.dtype.size_in_bytes(),
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(())
@@ -2464,17 +2585,20 @@ impl BackendStorage for MetalStorage {
         let src = buffer_o(&self.buffer, src_l, self.dtype);
         let out = buffer_o(&dst.buffer, dst_l, dst.dtype);
         let encoder = self.device.command_encoder()?;
-        crate::kernels::call_copy_nd(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            kernel_name,
-            src_l.dims(),
-            src,
-            src_l.stride(),
-            out,
-            dst_l.stride(),
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_copy_nd(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                kernel_name,
+                src_l.dims(),
+                src,
+                src_l.stride(),
+                out,
+                dst_l.stride(),
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(true)
     }
@@ -2501,7 +2625,10 @@ impl BackendStorage for MetalStorage {
             let src_offset = src_l.start_offset() * self.dtype.size_in_bytes();
             let length = src_l.shape().elem_count() * self.dtype.size_in_bytes();
             let dst_offset = dst_offset * dst.dtype().size_in_bytes();
-            blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length)
+            };
         } else {
             let src_shape = src_l.shape();
             let el_count = src_shape.elem_count();
@@ -2547,16 +2674,19 @@ impl BackendStorage for MetalStorage {
                 offset_in_bytes: dst_offset * dst.dtype.size_in_bytes(),
             };
             let encoder = self.device.command_encoder()?;
-            crate::kernels::call_unary_strided(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                kernel_name,
-                src_l.dims(),
-                src,
-                src_l.stride(),
-                dst,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_unary_strided(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    kernel_name,
+                    src_l.dims(),
+                    src,
+                    src_l.stride(),
+                    dst,
+                )
+            }
             .map_err(MetalError::from)?;
         }
         Ok(())
@@ -2564,6 +2694,27 @@ impl BackendStorage for MetalStorage {
 }
 
 impl MetalStorage {
+    /// Opt-in storage birth from actual initialized rich input and exact cold plan.
+    /// The ordinary BackendStorage::affine/default selector remains unchanged.
+    /// # Safety
+    /// Same full pricing/closed-use and SAME-device/context contract as the
+    /// private rich input and plan factories. This is not legacy coercion or
+    /// authorization to read returned Shared contents before its own GPU marker.
+    pub(crate) unsafe fn affine_prepared_f32(
+        device: &MetalDevice,
+        input: &PreparedAffineInput,
+        position: &DirectOutputPosition,
+        context: &crate::memory_admission::AllocationContext,
+        mul: f32,
+        add: f32,
+    ) -> Result<Self> {
+        let output = unsafe {
+            crate::kernels::kernels::affine::call_affine_catalog_f32(
+                device, input, position, context, mul, add,
+            )
+        }?;
+        Self::new_allocated(output, device.clone(), input.elements(), DType::F32)
+    }
     pub fn new(buffer: BufferHandle, device: MetalDevice, count: usize, dtype: DType) -> Self {
         Self {
             buffer,
@@ -2612,18 +2763,21 @@ impl MetalStorage {
             .with_label("eos_index")
             .build()?;
         let encoder = device.command_encoder()?;
-        crate::kernels::call_eos_index(
-            &device.device,
-            &encoder,
-            &device.kernels,
-            self.buffer(),
-            tokens_offset,
-            n,
-            eos_ids.buffer(),
-            eos_offset,
-            n_eos,
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_eos_index(
+                &device.device,
+                &encoder,
+                &device.kernels,
+                self.buffer(),
+                tokens_offset,
+                n,
+                eos_ids.buffer(),
+                eos_offset,
+                n_eos,
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new_allocated(buffer, device.clone(), 1, DType::U32)?)
     }
@@ -2657,17 +2811,20 @@ impl MetalStorage {
             .with_label("sample_inverse_cdf")
             .build()?;
         let encoder = device.command_encoder()?;
-        crate::kernels::call_sample_inverse_cdf(
-            &device.device,
-            &encoder,
-            &device.kernels,
-            (self.buffer(), offset),
-            rows,
-            vocab,
-            inv_t,
-            (u.buffer(), u_offset),
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_sample_inverse_cdf(
+                &device.device,
+                &encoder,
+                &device.kernels,
+                (self.buffer(), offset),
+                rows,
+                vocab,
+                inv_t,
+                (u.buffer(), u_offset),
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(Self::new(buffer, device.clone(), rows, DType::U32))
     }
@@ -2728,17 +2885,20 @@ impl MetalStorage {
                 .with_size_for(el_count, dtype)
                 .with_label(op)
                 .build()?;
-            crate::kernels::call_binary_contiguous(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel,
-                self.dtype.size_in_bytes(),
-                el_count,
-                lhs,
-                rhs,
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_binary_contiguous(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel,
+                    self.dtype.size_in_bytes(),
+                    el_count,
+                    lhs,
+                    rhs,
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
             buffer
         } else {
@@ -2747,19 +2907,22 @@ impl MetalStorage {
                 .with_size_for(el_count, dtype)
                 .with_label(op)
                 .build()?;
-            crate::kernels::call_binary_strided(
-                &device.device,
-                &encoder,
-                &device.kernels,
-                kernel,
-                self.dtype.size_in_bytes(),
-                lhs_l.dims(),
-                lhs,
-                lhs_l.stride(),
-                rhs,
-                rhs_l.stride(),
-                &buffer,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_binary_strided(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    kernel,
+                    self.dtype.size_in_bytes(),
+                    lhs_l.dims(),
+                    lhs,
+                    lhs_l.stride(),
+                    rhs,
+                    rhs_l.stride(),
+                    &buffer,
+                )
+            }
             .map_err(MetalError::from)?;
             buffer
         };
@@ -2797,7 +2960,10 @@ impl MetalStorage {
         if count != 0 {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("staged_read");
-            blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem);
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem)
+            };
         }
         let marker = self.device.flush_marker()?;
         Ok(StagedMetalRead {
@@ -2882,7 +3048,7 @@ impl MetalStorage {
         // there rather than here, so the gate's needles cannot match this
         // comment -- which the gate's own first run demonstrated by tripping on
         // the sentence that used to be here.
-        let src = std::hint::black_box(self.buffer.contents());
+        let src = std::hint::black_box(unsafe { self.buffer.contents() });
         if src.is_null() {
             PEEK_UNMAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
@@ -2931,7 +3097,7 @@ impl MetalStorage {
         if index >= self.count {
             return None;
         }
-        let src = std::hint::black_box(self.buffer.contents());
+        let src = std::hint::black_box(unsafe { self.buffer.contents() });
         if src.is_null() {
             PEEK_UNMAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
@@ -3095,7 +3261,7 @@ impl MetalStorage {
             // `black_box` makes the pointer opaque, so the test survives
             // whatever the optimiser can prove about the ObjC getter. It costs
             // one unfoldable move on a path that has just waited for the GPU.
-            let src = std::hint::black_box(self.buffer.contents());
+            let src = std::hint::black_box(unsafe { self.buffer.contents() });
             if !src.is_null() {
                 TO_CPU_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 note_readback("to_cpu fast");
@@ -3140,25 +3306,29 @@ impl MetalStorage {
                 dtype => crate::bail!("to_cpu: Metal copy2d {dtype:?} not implemented"),
             };
             let encoder = self.device.command_encoder()?;
-            crate::kernels::call_copy2d(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                kernel_name,
-                &self.buffer,
-                &buffer,
-                1,
-                self.count,
-                self.count,
-                self.count,
-                0,
-                0,
-            )
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe {
+                crate::kernels::call_copy2d(
+                    &self.device.device,
+                    &encoder,
+                    &self.device.kernels,
+                    kernel_name,
+                    &self.buffer,
+                    &buffer,
+                    1,
+                    self.count,
+                    self.count,
+                    self.count,
+                    0,
+                    0,
+                )
+            }
             .map_err(MetalError::from)?;
         } else {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
+            // SAFETY: storage-owned buffers (binding authority, module head).
+            unsafe { blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size) };
         }
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec(&buffer, self.count))
@@ -3190,39 +3360,39 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
-        // Cold metadata-only process payer. This does not change the native
-        // Legacy origin, acquire a machine owner, or latch first model load.
+        // Cold metadata-only process payer, separate from native allocation custody.
+        // Neither payer acquires a machine owner or latches first model load.
         // The process policy remains safely configurable before that load.
         // Outer header and managed first slab Layouts are quoted; constructor Arc,
         // registry/service and generation storage still need explicit pricing.
-        let metadata_domain = crate::memory_admission::process_account()
-            .metadata_domain()
-            .map_err(crate::Error::wrap)?;
-        let metadata_bytes =
-            DeviceTeardown::requested_metadata_bytes().map_err(MetalError::from)?;
-        let metadata_pass = metadata_domain
-            .reserve(metadata_bytes)
-            .map_err(crate::Error::wrap)?;
+        let metadata_domain = crate::memory_admission::process_account().metadata_domain()?;
+        let metadata_bytes = DeviceTeardown::requested_metadata_bytes()
+            .map_err(MetalError::from)?
+            .checked_add(Commands::requested_binding_metadata_bytes().map_err(MetalError::from)?)
+            .ok_or_else(|| crate::Error::Msg("shared base metadata quote overflow".into()))?;
+        let metadata_pass = metadata_domain.reserve(metadata_bytes)?;
         let metadata = metadata_pass.context();
+        // Actual native bootstrap payer on the SAME process account. Existing
+        // pending/committed charges survive later pre-model cap adoption.
+        let native_domain = crate::memory_admission::process_account().unadmitted_domain(None)?;
         let device = Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue().map_err(MetalError::from)?;
         #[cfg(feature = "metal-debug-labels")]
         command_queue.setLabel(Some(&NSString::from_str("candle-metal")));
         let kernels = Arc::new(Kernels::new());
         let residency_set = Arc::new(ResidencySet::new(&device));
-        let seed_buf = device
-            .new_buffer_with_data(
-                [299792458u64].as_ptr() as *const c_void,
-                std::mem::size_of::<u64>(),
-                RESOURCE_OPTIONS,
+        residency_set.register_device_set();
+        // SAFETY: cold shared-base metadata domain/context quoted once above;
+        // no model supplied promise pays this queue/control storage again.
+        let commands = unsafe {
+            Commands::new_with_binding_metadata(
+                command_queue,
+                Arc::clone(&residency_set),
+                &metadata_domain,
+                &metadata,
             )
-            .map_err(MetalError::from)?;
-        #[cfg(feature = "metal-debug-labels")]
-        seed_buf.set_label("rng_seed");
-        residency_set.insert(&seed_buf);
-        let seed = Arc::new(parking_lot::Mutex::new(seed_buf));
-        let commands =
-            Commands::new(command_queue, Arc::clone(&residency_set)).map_err(MetalError::from)?;
+        }
+        .map_err(MetalError::from)?;
 
         let ledger = crate::kernels::metal::ledger::Ledger::new();
         commands.attach_command_ledger(Arc::clone(&ledger));
@@ -3232,22 +3402,26 @@ impl BackendDevice for MetalDevice {
             &residency_set,
             &ledger,
             None,
+            native_domain,
             None,
         );
+        // Namespace/backing first: seed receives the same admitted native
+        // owner and allocation-local Membership exactly once, before escape.
+        let seed_buf = allocation_namespace
+            .backings
+            .resident_shared
+            .alloc_data(&[299792458u64], None)?
+            .buffer;
+        #[cfg(feature = "metal-debug-labels")]
+        seed_buf.set_label("rng_seed");
+        let seed = Arc::new(parking_lot::Mutex::new(seed_buf));
         let emulated = Arc::new(
             crate::kernels::metal::arms::EmulatedArms::for_device(&device)
                 .map_err(MetalError::from)?,
         );
         let commands = Arc::new(commands);
         // Cold enrollment before any MetalDevice/recording capability escapes.
-        // Seed uses the same allocation-local membership protocol as backings.
-        let seed_membership = allocation_namespace
-            .membership
-            .for_buffer(&seed.lock())
-            .map_err(crate::Error::wrap)?;
-        let enriched_seed = seed.lock().clone().with_membership(seed_membership);
-        let old_seed = std::mem::replace(&mut *seed.lock(), enriched_seed);
-        drop(old_seed);
+        // Seed already carries the namespace backing membership; do not mint twice.
         let teardown = DeviceTeardown::new(
             allocation_namespace.clone(),
             seed.clone(),
@@ -3547,17 +3721,20 @@ impl BackendDevice for MetalDevice {
             .with_label("rand_uniform")
             .build()?;
         let encoder = self.command_encoder()?;
-        crate::kernels::call_random_uniform(
-            &self.device,
-            &encoder,
-            &self.kernels,
-            name,
-            min as f32,
-            max as f32,
-            shape.elem_count(),
-            &self.seed.lock(),
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_random_uniform(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                name,
+                min as f32,
+                max as f32,
+                shape.elem_count(),
+                &self.seed.lock(),
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
 
         Ok(Self::Storage::new_allocated(
@@ -3587,17 +3764,20 @@ impl BackendDevice for MetalDevice {
             .with_label("rand_normal")
             .build()?;
         let encoder = self.command_encoder()?;
-        crate::kernels::call_random_normal(
-            &self.device,
-            &encoder,
-            &self.kernels,
-            name,
-            mean as f32,
-            stddev as f32,
-            shape.elem_count(),
-            &self.seed.lock(),
-            &buffer,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_random_normal(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                name,
+                mean as f32,
+                stddev as f32,
+                shape.elem_count(),
+                &self.seed.lock(),
+                &buffer,
+            )
+        }
         .map_err(MetalError::from)?;
 
         Ok(Self::Storage::new_allocated(
@@ -3615,7 +3795,7 @@ impl BackendDevice for MetalDevice {
             .seed
             .try_lock()
             .ok_or(MetalError::LockError(LockError::WouldBlock))?;
-        let contents = seed_buffer.data();
+        let contents = unsafe { seed_buffer.data() };
 
         // **The two words are written in the order the KERNEL reads them, which
         // is not native `u64` order** (lloom #277).
@@ -3716,7 +3896,7 @@ impl BackendDevice for MetalDevice {
 /// records for the pre-#366 `assert!`. The `black_box` below is what keeps the
 /// test, and it is the same repair the fast path in `to_cpu` now carries.
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
-    let ptr = std::hint::black_box(buffer.contents()) as *const T;
+    let ptr = std::hint::black_box(unsafe { buffer.contents() }) as *const T;
     if ptr.is_null() {
         panic!(
             "read_to_vec: buffer has no CPU mapping (len={}, n={n})",
@@ -3793,7 +3973,9 @@ mod issue_336_split {
             {
                 let mut blit = ms.device.blit_command_encoder().unwrap();
                 blit.set_label("blit_to_cpu");
-                blit.copy_from_buffer(&ms.buffer, 0, &dst, 0, size);
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe { blit.copy_from_buffer(&ms.buffer, 0, &dst, 0, size) };
             }
             let e = s2.elapsed().as_secs_f64() * 1e3;
 
@@ -3855,7 +4037,9 @@ mod issue_336_to_cpu {
         {
             let mut blit = ms.device.blit_command_encoder().unwrap();
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size);
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { blit.copy_from_buffer(&ms.buffer, 0, &buffer, 0, size) };
         }
         ms.device.flush_and_wait_current().unwrap();
         super::read_to_vec(&buffer, ms.count)
@@ -3979,8 +4163,8 @@ mod issue_336_to_cpu {
         // without the probe it would have been read as the behaviour change it
         // is written to detect. Same elision as the two production sites in
         // `to_cpu` and `read_to_vec`, landing on the check for it.
-        let mapped_ptr = std::hint::black_box(mapped.contents());
-        let unmapped_ptr = std::hint::black_box(unmapped.contents());
+        let mapped_ptr = std::hint::black_box(unsafe { mapped.contents() });
+        let unmapped_ptr = std::hint::black_box(unsafe { unmapped.contents() });
 
         if !crate::tuning::tuning().metal.private_cpu_mapping {
             assert!(
@@ -3993,7 +4177,7 @@ mod issue_336_to_cpu {
             );
             let shared = m.allocate_buffer(1 << 20).unwrap();
             assert!(
-                !std::hint::black_box(shared.contents()).is_null(),
+                !std::hint::black_box(unsafe { shared.contents() }).is_null(),
                 "Shared control must remain mapped"
             );
             return;
@@ -4014,7 +4198,9 @@ mod issue_336_to_cpu {
         // statement about Private rather than about size alone.
         let big_shared = m.allocate_buffer(1 << 20).unwrap();
         assert!(
-            !std::hint::black_box(big_shared.contents()).is_null(),
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            !std::hint::black_box(unsafe { big_shared.contents() }).is_null(),
             "shared must be mapped"
         );
 
@@ -4034,8 +4220,8 @@ mod issue_336_to_cpu {
         );
         let first = heaps.alloc(128).unwrap();
         let placed = heaps.alloc(128).unwrap();
-        let offset = placed.as_ref().heapOffset();
-        let raw_ptr = std::hint::black_box(placed.as_ref().contents().as_ptr());
+        let offset = unsafe { placed.raw_unchecked() }.heapOffset();
+        let raw_ptr = std::hint::black_box(unsafe { placed.raw_unchecked() }.contents().as_ptr());
         assert!(offset > 0, "the second placement is at offset 0");
         assert_eq!(
             raw_ptr as usize, offset,
@@ -4043,7 +4229,9 @@ mod issue_336_to_cpu {
              heap offset; re-measure what the override in `Buffer::new` guards"
         );
         assert!(
-            std::hint::black_box(placed.contents()).is_null(),
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            std::hint::black_box(unsafe { placed.contents() }).is_null(),
             "a 128 B Private heap sub-buffer at offset {offset} was reported \
              CPU-mapped; its contents() is {raw_ptr:?}, which is not a mapping"
         );
@@ -4071,16 +4259,16 @@ mod issue_336_to_cpu {
         let placed = heaps.alloc(128).unwrap();
         use objc2_metal::MTLResource as _;
         assert!(
-            placed.as_ref().heapOffset() > 0,
+            unsafe { placed.raw_unchecked() }.heapOffset() > 0,
             "nonzero placement control"
         );
         for buffer in [&first, &placed] {
             assert!(!buffer.may_be_cpu_mapped());
-            assert!(std::hint::black_box(buffer.contents()).is_null());
+            assert!(std::hint::black_box(unsafe { buffer.contents() }).is_null());
         }
         let shared = m.allocate_buffer(128).unwrap();
         assert!(shared.may_be_cpu_mapped());
-        assert!(!std::hint::black_box(shared.contents()).is_null());
+        assert!(!std::hint::black_box(unsafe { shared.contents() }).is_null());
         heaps.release(&placed);
         heaps.release(&first);
     }
@@ -4175,7 +4363,9 @@ mod issue_336_to_cpu {
             let mut blit = m.blit_command_encoder().unwrap();
             blit.set_label("heap probe fill");
             for b in &subs {
-                blit.fill_buffer(b, (0, b.length()), 0xA5);
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe { blit.fill_buffer(b, (0, b.length()), 0xA5) };
             }
         }
         m.wait_until_completed().unwrap();
@@ -4197,7 +4387,7 @@ mod issue_336_to_cpu {
         unsafe { std::ptr::write_bytes(shared.contents(), 0x5A, bytes) };
         line("host-touched every page", None);
         let half = bytes / 2;
-        let ptr = shared.contents() as *mut libc::c_void;
+        let ptr = unsafe { shared.contents() } as *mut libc::c_void;
         let rc = unsafe { libc::munlock(ptr, half) };
         assert_eq!(rc, 0, "munlock: {}", std::io::Error::last_os_error());
         let rc = unsafe { libc::madvise(ptr, half, libc::MADV_FREE_REUSABLE) };
@@ -4280,10 +4470,11 @@ mod issue_336_to_cpu {
         #[derive(Debug)]
         struct Refusing;
         impl Backing for Refusing {
-            fn alloc(&self, bytes: usize) -> Result<Allocation, crate::kernels::MetalKernelError> {
-                Err(crate::kernels::MetalKernelError::FailedToCreateResource(
-                    format!("refused {bytes}"),
-                ))
+            fn alloc(
+                &self,
+                bytes: usize,
+            ) -> Result<Allocation, crate::memory_admission::AllocationError> {
+                Err(crate::memory_admission::AllocationError::DeviceOom { requested: bytes })
             }
             fn reclaim(&self, _: &Buffer) -> bool {
                 false
@@ -4373,7 +4564,7 @@ mod issue_336_storage_probe {
             unreachable!()
         };
 
-        let ptr = ms.buffer().contents();
+        let ptr = unsafe { ms.buffer().contents() };
         println!(
             "ISSUE336 argmax_out dtype={:?} count={}",
             am.dtype(),
@@ -4449,7 +4640,7 @@ mod issue_481_arena_mapping {
         let base = arena.base();
         let len = base.length();
         // See the module note: without `black_box` this test measures nothing.
-        let ptr = std::hint::black_box(base.contents());
+        let ptr = std::hint::black_box(unsafe { base.contents() });
         let is_null = ptr.is_null();
         println!("ISSUE481 arena_bytes={len} contents={ptr:?} null={is_null}");
         dev.clear_arena();
@@ -4499,7 +4690,9 @@ mod issue_481_arena_mapping {
             );
             let shared = m.allocate_buffer(small_len).unwrap();
             assert!(
-                !std::hint::black_box(shared.contents()).is_null(),
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                !std::hint::black_box(unsafe { shared.contents() }).is_null(),
                 "Shared control must be mapped"
             );
             return;
@@ -4557,7 +4750,9 @@ mod issue_481_arena_mapping {
             for (_, len, _) in &rows {
                 let shared = m.allocate_buffer(*len).unwrap();
                 assert!(
-                    !std::hint::black_box(shared.contents()).is_null(),
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    !std::hint::black_box(unsafe { shared.contents() }).is_null(),
                     "Shared control at {len} bytes must be mapped"
                 );
             }
@@ -4837,22 +5032,25 @@ impl MetalStorage {
         );
         let params_buf = self.device.constant_of(&params)?;
         let encoder = self.device.command_encoder()?;
-        crate::kernels::call_flash_kv_scatter(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            g.src_offset * self.dtype.size_in_bytes(),
-            &self.buffer,
-            g.dst_offset * dst.dtype.size_in_bytes(),
-            &dst.buffer,
-            &slots.buffer,
-            g.slots_offset * DType::U32.size_in_bytes(),
-            &params_buf,
-            n_rows,
-            g.n_kv_heads,
-            g.head_dim,
-            itype,
-        )
+        // SAFETY: storage-owned buffers (binding authority, module head).
+        unsafe {
+            crate::kernels::call_flash_kv_scatter(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                g.src_offset * self.dtype.size_in_bytes(),
+                &self.buffer,
+                g.dst_offset * dst.dtype.size_in_bytes(),
+                &dst.buffer,
+                &slots.buffer,
+                g.slots_offset * DType::U32.size_in_bytes(),
+                &params_buf,
+                n_rows,
+                g.n_kv_heads,
+                g.head_dim,
+                itype,
+            )
+        }
         .map_err(MetalError::from)?;
         Ok(())
     }

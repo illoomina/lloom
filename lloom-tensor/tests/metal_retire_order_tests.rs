@@ -35,19 +35,23 @@ fn command_buffers_retire_in_commit_order_when_the_gpu_finishes_them_out_of_orde
     let buf = || dev.new_buffer(4096, RESOURCE_OPTIONS).unwrap();
     let (ping, pong, small_in, small_out) = (buf(), buf(), buf(), buf());
     let cos = |enc: &ComputeCommandEncoder, input: &Buffer, output: &Buffer| {
-        call_unary_contiguous(
-            &dev,
-            enc,
-            &kernels,
-            unary::contiguous::cos::FLOAT,
-            4,
-            256,
-            BufferOffset {
-                buffer: input,
-                offset_in_bytes: 0,
-            },
-            output,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_contiguous(
+                &dev,
+                enc,
+                &kernels,
+                unary::contiguous::cos::FLOAT,
+                4,
+                256,
+                BufferOffset {
+                    buffer: input,
+                    offset_in_bytes: 0,
+                },
+                output,
+            )
+        }
         .unwrap();
     };
 

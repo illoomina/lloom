@@ -1,0 +1,168 @@
+{
+  "source": "https://huggingface.co/LiquidAI/d1-omni-600M/resolve/02b55d7076f15129e59ab3f94783f32c4b088674/model.safetensors",
+  "revision": "02b55d7076f15129e59ab3f94783f32c4b088674",
+  "header_sha256": "f458399741ff996722a31d8293e2231f6e7426caae77c61380c44a28649c0250",
+  "scope": "Actual header subset: embeddings, first vision layer, post-layernorm, projector. Shapes are metadata only; tests use smaller synthetic geometry.",
+  "tensors": {
+    "vision.projector.linear_1.bias": {
+      "dtype": "F32",
+      "shape": [
+        2048
+      ]
+    },
+    "vision.projector.linear_1.weight": {
+      "dtype": "F32",
+      "shape": [
+        2048,
+        3072
+      ]
+    },
+    "vision.projector.linear_2.bias": {
+      "dtype": "F32",
+      "shape": [
+        1024
+      ]
+    },
+    "vision.projector.linear_2.weight": {
+      "dtype": "F32",
+      "shape": [
+        1024,
+        2048
+      ]
+    },
+    "vision.tower.vision_model.embeddings.patch_embedding.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.embeddings.patch_embedding.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "vision.tower.vision_model.embeddings.position_embedding.weight": {
+      "dtype": "F32",
+      "shape": [
+        256,
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.layer_norm1.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.layer_norm1.weight": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.layer_norm2.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.layer_norm2.weight": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.mlp.fc1.bias": {
+      "dtype": "F32",
+      "shape": [
+        3072
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.mlp.fc1.weight": {
+      "dtype": "F32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.mlp.fc2.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.mlp.fc2.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.k_proj.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.k_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.out_proj.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.out_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.q_proj.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.q_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.v_proj.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.encoder.layers.0.self_attn.v_proj.weight": {
+      "dtype": "F32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "vision.tower.vision_model.post_layernorm.bias": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    },
+    "vision.tower.vision_model.post_layernorm.weight": {
+      "dtype": "F32",
+      "shape": [
+        768
+      ]
+    }
+  }
+}

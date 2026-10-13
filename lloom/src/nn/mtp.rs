@@ -197,6 +197,24 @@ impl<'a, L: Layer> NextnDrafter<'a, L> {
         NextnLanes(std::mem::take(&mut self.lanes))
     }
 
+    /// Invalidate incomplete request reuse on the existing lane objects.
+    /// The layer's reset may release cache backing; the next append owns regrowth.
+    /// A callback/error may interrupt before the target's token bookkeeping is
+    /// committed; preserved lanes must not advertise that partial prefix.
+    pub fn reset_lanes(lanes: &mut NextnLanes<L::State>) {
+        for lane in &mut lanes.0 {
+            L::reset_state(&mut lane.state);
+            lane.prompt.clear();
+            lane.keyed.clear();
+            lane.seeded = false;
+            lane.seed_rows = 0;
+            lane.draft = None;
+            lane.carry = None;
+            lane.rows_seen = 0;
+            // Keep the historical reset counter; this is not another begin_at.
+        }
+    }
+
     pub fn k(&self) -> usize {
         self.k
     }

@@ -232,6 +232,8 @@ pub struct Engine<P: QwenShape, R: ExpertResidency + HasStreamStats> {
     mtp: bool,
     /// Tokens the MTP drafter proposes per round.
     mtp_k: usize,
+    /// Resolved private-cache ring geometry, including the DFlash window.
+    private_k: usize,
     /// The DFlash drafter, when it is the speculative body: one sequence's,
     /// kept across requests so its context follows the target's prefix
     /// reuse (`Speculator::begin_at`).
@@ -250,6 +252,94 @@ pub struct Engine<P: QwenShape, R: ExpertResidency + HasStreamStats> {
     /// `--batch N`: the scheduler and its thread.
     sched: Option<BatchHandle<Qwen4Exp<P, R>, ()>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// Request-level residency choice; the resident/streamed hot loops remain
+/// separately monomorphized and share one supplied-domain loaded owner.
+pub enum Engines<P: QwenShape> {
+    Resident(Engine<P, Resident>),
+    Streamed(Engine<P, Streamed>),
+}
+
+impl<P: QwenShape> Engines<P> {
+    fn into_served(self) -> Box<dyn Served> {
+        match self {
+            Self::Resident(engine) => Box::new(engine),
+            Self::Streamed(engine) => Box::new(engine),
+        }
+    }
+
+    /// Existing chat body inside the same owner used by decision requests.
+    /// Whole-pass predictions include outstanding stream/IO work and staging;
+    /// worker namespace/pass propagation is a prerequisite, not TLS inheritance.
+    pub fn complete_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            let out = match engine {
+                Self::Resident(engine) => {
+                    engine.complete_until(prompt_ids, params, &mut on_fragment)
+                }
+                Self::Streamed(engine) => {
+                    engine.complete_until(prompt_ids, params, &mut on_fragment)
+                }
+            };
+            out.map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        })?)
+    }
+
+    /// Prepared retained-trunk decisions on the chat model's weights. Native
+    /// streaming custody, allocator/host producers and tokenizer boundaries must
+    /// be enrolled/validated before default endpoint activation.
+    pub fn decide_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        request: &crate::decision::CausalRequest,
+    ) -> Result<crate::decision::SystemOneResponse> {
+        Ok(
+            loaded.with_pass(predicted_extra, |engine, _context| match engine {
+                Self::Resident(engine) => engine.decide_prepared(request),
+                Self::Streamed(engine) => engine.decide_prepared(request),
+            })?,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LoadAdmission {
+    Legacy,
+    CallerScoped,
+}
+
+/// Additive complete-engine factory with one caller-supplied load domain. The
+/// scope starts before drafter/header/slot planning and remains through expert
+/// loading, hotlist warming, cache/rings, tokenizer and warmup. No model-only
+/// wrapper or second legacy admission. Source activation is still conditional
+/// on complete native/worker/host producer enrollment; existing routes remain.
+pub fn load_admitted_as<P: QwenShape>(
+    opts: LoadOptions,
+    device: &Device,
+    load: lloom::nn::memory::LoadContext,
+) -> Result<lloom::nn::memory::Loaded<Engines<P>>> {
+    lloom_tensor::memory_admission::begin_model_load();
+    if opts.cpu != device.is_cpu() {
+        anyhow::bail!("supplied Qwen4Exp device disagrees with load options");
+    }
+    if opts.batch != 1 {
+        anyhow::bail!("admitted Qwen4Exp batch scheduler pass propagation is pending");
+    }
+    Ok(lloom::nn::memory::Loaded::new(
+        device,
+        load,
+        |resolved, _context| {
+            load_on::<P>(opts, Some(resolved.clone()), LoadAdmission::CallerScoped)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        },
+    )?)
 }
 
 /// Why a ring arm on this engine cannot take the PLE's host fill
@@ -420,6 +510,7 @@ fn load_dflash<P: Profile, R: ExpertResidency>(
 /// the regime from the contract — one `match` over the eight
 /// (`lloom::profile::dispatch!`), bounded by what the family ships.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::profile::{NoRewind, One, Paged, Rewind as _, Ring, Rows as _};
     let key = ProfileKey::at_contract(
         if opts.mtp.is_some() || opts.dflash.is_some() {
@@ -464,7 +555,16 @@ fn admitted_checkpoints(device: &Device, frame_bytes: usize, want: usize) -> usi
     want
 }
 
-fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
+fn load_as<P: QwenShape>(opts: LoadOptions) -> Result<Box<dyn Served>> {
+    load_on::<P>(opts, None, LoadAdmission::Legacy).map(Engines::into_served)
+}
+
+fn load_on<P: QwenShape>(
+    mut opts: LoadOptions,
+    resolved: Option<Device>,
+    admission: LoadAdmission,
+) -> Result<Engines<P>> {
+    lloom_tensor::memory_admission::begin_model_load();
     {
         // The DFlash drafter's directory and config first: the slot plan
         // claims what it will hold beside the experts.
@@ -482,10 +582,10 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
             drafter_bytes = dflash_device_bytes(&dcfg, dflash_max_pos(opts.kv_capacity, &dcfg));
             opts.dflash = Some(dir);
         }
-        let device = if opts.cpu {
-            Device::Cpu
-        } else {
-            open_device()?
+        let device = match resolved {
+            Some(device) => device,
+            None if opts.cpu => Device::Cpu,
+            None => open_device()?,
         };
         let mut shards = discover_shards(&opts.first_shard);
         if let Some(p) = &opts.mtp {
@@ -531,13 +631,16 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
             kv_precision: opts.kv_precision,
-            machine: Some(lloom::nn::memory::MachineLoad {
-                gate: opts.memory.machine_gate(),
-                label: super::common::machine_label("qwen4exp", &opts.first_shard),
-                rows: opts.batch.max(1),
-                kv_tokens: opts.kv_reserve_tokens.unwrap_or(opts.kv_capacity).max(1),
-                prefill_tile: opts.prefill_tile,
-            }),
+            machine: match admission {
+                LoadAdmission::Legacy => Some(lloom::nn::memory::MachineLoad {
+                    gate: opts.memory.machine_gate(),
+                    label: super::common::machine_label("qwen4exp", &opts.first_shard),
+                    rows: opts.batch.max(1),
+                    kv_tokens: opts.kv_reserve_tokens.unwrap_or(opts.kv_capacity).max(1),
+                    prefill_tile: opts.prefill_tile,
+                }),
+                LoadAdmission::CallerScoped => None,
+            },
         };
         // The ledger's quota, set before the load so the load's own
         // allocations are admitted against it (§9.5c).
@@ -570,6 +673,7 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                 model.set_memory_fraction(opts.memory_fraction);
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
                 Engine::<P, Resident>::finish(model, device, opts, tier, installed)
+                    .map(Engines::Resident)
             }
             "stream" => {
                 let slots = match opts.slots.as_str() {
@@ -632,6 +736,7 @@ fn load_as<P: QwenShape>(mut opts: LoadOptions) -> Result<Box<dyn Served>> {
                     "warm": warmed,
                 });
                 Engine::<P, Streamed>::finish(model, device, opts, tier, installed)
+                    .map(Engines::Streamed)
             }
             other => anyhow::bail!("--experts {other}: resident | stream"),
         }
@@ -645,7 +750,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         opts: LoadOptions,
         mut tier: Value,
         installed: super::report::Installed,
-    ) -> Result<Box<dyn Served>> {
+    ) -> Result<Self> {
         let tokenizer_path = match &opts.tokenizer {
             Some(p) => p.clone(),
             None => newest_snapshot("models--Qwen--Qwen3.8-Flash-Next")
@@ -773,6 +878,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             mem_sample: opts.mem_sample,
             mtp,
             mtp_k: opts.mtp_k.max(1),
+            private_k: k,
             dflash: dflash.map(|(spec, _)| Mutex::new(spec)),
             hotlist: opts.hotlist.clone(),
             tier,
@@ -842,7 +948,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             );
         }
         engine.text.prime();
-        Ok(Box::new(engine))
+        Ok(engine)
     }
 
     /// Run `f` over a session on the held sequence, and put the sequence
@@ -867,6 +973,23 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         out
     }
 
+    fn decide_prepared(
+        &self,
+        request: &crate::decision::CausalRequest,
+    ) -> lloom_tensor::Result<crate::decision::SystemOneResponse> {
+        self.check_fits(request.max_prompt_tokens(), 0)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        let single = lock(&self.single);
+        let options = single.decode.options(0, ReadbackArm::Blocking, 0);
+        let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.device)?;
+        request.execute_with_cache_factory(
+            &self.core.model,
+            &mut readback,
+            &options,
+            |model, device| P::single(model, device, self.private_k),
+        )
+    }
+
     fn detok(&self) -> impl FnMut(&[u32]) -> lloom_tensor::Result<String> + '_ {
         |ids: &[u32]| -> lloom_tensor::Result<String> {
             self.text
@@ -877,15 +1000,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     }
 
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
-        let need = prompt + gen;
-        if need > self.kv_capacity {
-            anyhow::bail!(
-                "prompt {prompt} + generation {gen} = {need} positions exceeds the KV capacity \
-                 {} (start with --kv-capacity >= {need})",
-                self.kv_capacity
-            );
-        }
-        Ok(())
+        super::common::check_context_capacity(self.kv_capacity, prompt, gen, 0)
     }
 
     /// The MTP drafter for one run: the head, the shared embedding and
@@ -1376,7 +1491,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
         batch: usize,
     ) -> Result<DecodeTiming> {
         self.check_batch(batch)?;
-        self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        super::common::check_context_capacity(self.kv_capacity, prompt_tokens, decode_tokens, 1)?;
         if batch > 1 || self.sched.is_some() {
             return self.decode_throughput_rows(prompt_tokens, decode_tokens, batch.max(1));
         }

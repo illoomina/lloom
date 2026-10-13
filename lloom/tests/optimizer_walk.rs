@@ -56,7 +56,7 @@ fn off_metal_the_walk_reads_the_route_the_model_took() {
 /// forward — and fails here, naming the first edge, until the listing is
 /// rewritten (`LLOOM_BLESS_LISTINGS=1`) and the rewrite reviewed.
 fn listing_gate(name: &str, g: &Graph) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/walk_listings")
         .join(format!("{name}.txt"));
     let now = lloom::optimizer::listing(g);
@@ -99,4 +99,15 @@ fn the_lfm2_walk_matches_its_committed_listing() {
     let dev = Device::new_metal(0).expect("metal");
     let model = ghost::lfm2::<CrownExact>(&traced(), DType::F16, &dev).expect("ghost build");
     listing_gate("lfm2-2.6b-traced", &walk(&model));
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

@@ -169,14 +169,16 @@ impl Tensor {
         let (c_out, c_in_k, k_size) = kernel.dims3()?;
         let (b_size, c_in, l_in) = self.dims3()?;
         if c_in != c_in_k * groups {
-            Err(Error::Conv1dInvalidArgs {
-                inp_shape: self.shape().clone(),
-                k_shape: kernel.shape().clone(),
-                padding,
-                stride,
-                msg: "the number of in-channels on the input doesn't match the kernel size",
-            }
-            .bt())?
+            Err(
+                Error::Conv1dInvalidArgs(Box::new(crate::error::Conv1dInvalidArgs {
+                    inp_shape: self.shape().clone(),
+                    k_shape: kernel.shape().clone(),
+                    padding,
+                    stride,
+                    msg: "the number of in-channels on the input doesn't match the kernel size",
+                }))
+                .bt(),
+            )?
         }
 
         let params = ParamsConv1D {

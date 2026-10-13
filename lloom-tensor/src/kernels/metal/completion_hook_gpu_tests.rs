@@ -71,7 +71,9 @@ fn the_clock_marks_completed_buffers_in_commit_order_and_no_further() {
     let held = clock.current_epoch().0;
     let writer = {
         let g = cmds.command_encoder().unwrap();
-        g.as_ref().set_output_buffer(0, Some(&x), 0);
+        // SAFETY: the test owns `x`, binds it only for its fence (no
+        // dispatch reads or writes it), and drops it after every wait.
+        unsafe { g.as_ref().set_output_buffer(0, Some(&x), 0) };
         Arc::clone(&g.as_ref().fence)
     };
     let held_marker = cmds.flush_marker().unwrap();

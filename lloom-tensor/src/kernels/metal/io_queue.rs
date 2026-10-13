@@ -73,13 +73,12 @@ fn checked_load_range(
 /// including ranges assigned to later lanes. No descriptor copy is needed:
 /// IoLoad and Buffer extents remain immutable throughout the borrowed batch.
 fn validate_loads(loads: &[IoLoad<'_>]) -> Result<(), MetalKernelError> {
-    use objc2_metal::MTLBuffer as _;
     let mut total = 0u64;
     for load in loads {
         checked_load_range(
             load.dst.base_offset(),
             load.dst.length(),
-            load.dst.as_ref().length(),
+            load.dst.native_allocation_length(),
             load.dst_offset,
             load.src_offset,
             load.len,
@@ -195,7 +194,7 @@ impl IoQueue {
             // SAFETY: as in `issue`.
             unsafe {
                 cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
-                    l.dst.as_ref(),
+                    l.dst.raw_unchecked(),
                     l.dst.base_offset() + l.dst_offset,
                     l.len,
                     &l.file.handle,
@@ -320,7 +319,7 @@ impl IoQueue {
             // memory unsafety.
             unsafe {
                 cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
-                    l.dst.as_ref(),
+                    l.dst.raw_unchecked(),
                     l.dst.base_offset() + l.dst_offset,
                     l.len,
                     &l.file.handle,

@@ -134,6 +134,11 @@ impl<L> ResidencyOwners<L> {
     pub(crate) fn contains(&self, key: usize) -> bool {
         self.active.contains_key(&key)
     }
+    /// Whether the native set still names this allocation: an active member,
+    /// or one retired from the record but not removed from Metal.
+    pub(crate) fn lists(&self, key: usize) -> bool {
+        self.active.contains_key(&key) || self.retired.contains_key(&key)
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,73 @@
 //! Rotary Embeddings
 //!
-use lloom_tensor::{CpuStorage, Layout, Result, Shape, Tensor, D};
+use lloom_tensor::{CpuStorage, DType, Device, Layout, Result, Shape, Tensor, D};
 use rayon::prelude::*;
+
+/// Default (unscaled) RoPE tables `[length, head_dim / 2]`, returned as
+/// `(cos, sin)`. Extracted from LFM2's table preparation so model families share
+/// its arithmetic: F32 inverse frequencies, U32 positions cast to F32, an outer
+/// product, then cosine/sine cast to the requested floating dtype. This is not
+/// an F64 frequency calculation, even when the output dtype is F64.
+///
+/// Geometry/byte checks precede allocation. They establish representability,
+/// not a memory budget: the caller owns admission and the device/domain. Tables
+/// should be retained by that owner, rather than regenerated per layer/token.
+pub fn default_rope_tables(
+    head_dim: usize,
+    theta: f32,
+    length: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let end = validate_default_rope_tables(head_dim, theta, length, dtype)?;
+
+    let inv_freq: Vec<f32> = (0..head_dim)
+        .step_by(2)
+        .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
+        .collect();
+    let inv_freq = Tensor::new(inv_freq, device)?;
+    let angles = Tensor::arange(0, end, device)?
+        .to_dtype(DType::F32)?
+        .reshape((length, 1))?
+        .matmul(&inv_freq.reshape((1, inv_freq.elem_count()))?)?;
+    let cos = angles.cos()?.to_dtype(dtype)?;
+    let sin = angles.sin()?.to_dtype(dtype)?;
+    Ok((cos, sin))
+}
+
+/// Allocation-free geometry preflight shared with model load planners.
+pub(crate) fn validate_default_rope_tables(
+    head_dim: usize,
+    theta: f32,
+    length: usize,
+    dtype: DType,
+) -> Result<u32> {
+    if head_dim == 0 || head_dim % 2 != 0 || length == 0 {
+        lloom_tensor::bail!("default RoPE needs a positive even head dimension and positive length")
+    }
+    if !theta.is_finite() || theta <= 0. {
+        lloom_tensor::bail!("default RoPE theta must be finite and positive")
+    }
+    if !matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
+        lloom_tensor::bail!("default RoPE needs a floating output dtype")
+    }
+    let end = u32::try_from(length).map_err(|_| {
+        lloom_tensor::Error::Msg("default RoPE length exceeds U32 positions".into())
+    })?;
+    let half = head_dim / 2;
+    let checked_bytes = |dims: &[usize]| -> Result<usize> {
+        dims.iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(|| lloom_tensor::Error::Msg("default RoPE shape/byte overflow".into()))
+    };
+    checked_bytes(&[half, std::mem::size_of::<f32>()])?;
+    checked_bytes(&[length, std::mem::size_of::<u32>()])?;
+    checked_bytes(&[length, half, std::mem::size_of::<f32>()])?;
+    checked_bytes(&[2, length, half, dtype.size_in_bytes()])?;
+
+    Ok(end)
+}
 
 /// Interleaved variant of rotary embeddings.
 /// The x0 and x1 value are interleaved on the n_embd (= head_dim) dimension.
@@ -224,22 +290,26 @@ impl lloom_tensor::CustomOp3 for RotaryEmbI {
             .with_size_for(el, src.dtype())
             .with_label("rope_i")
             .build()?;
-        lloom_tensor::kernels::call_rope_i(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b * h,
-            t * d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope_i(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b * h,
+                t * d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
@@ -530,23 +600,27 @@ impl lloom_tensor::CustomOp3 for RotaryEmb {
             .with_size_for(el, src.dtype())
             .with_label("rope")
             .build()?;
-        lloom_tensor::kernels::call_rope(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b * h,
-            t * d,
-            d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b * h,
+                t * d,
+                d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
@@ -805,24 +879,28 @@ impl lloom_tensor::CustomOp3 for RotaryEmbThd {
             .with_size_for(el, src.dtype())
             .with_label("rope_thd")
             .build()?;
-        lloom_tensor::kernels::call_rope_thd(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b,
-            t,
-            h,
-            d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope_thd(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b,
+                t,
+                h,
+                d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
@@ -856,4 +934,91 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         lloom_tensor::bail!("sin has to be contiguous in rope")
     }
     xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
+}
+
+#[cfg(test)]
+mod default_tables_tests {
+    use super::*;
+
+    // Pre-extraction LFM2 expression, intentionally kept local to this test.
+    fn legacy(dim: usize, theta: f32, length: usize, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let freq: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / theta.powf(i as f32 / dim as f32))
+            .collect();
+        let freq = Tensor::new(freq, &Device::Cpu)?;
+        let angles = Tensor::arange(0, length as u32, &Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .reshape((length, 1))?
+            .matmul(&freq.reshape((1, freq.elem_count()))?)?;
+        Ok((
+            angles.cos()?.to_dtype(dtype)?,
+            angles.sin()?.to_dtype(dtype)?,
+        ))
+    }
+    fn bits(t: &Tensor) -> Result<Vec<u32>> {
+        Ok(t.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect())
+    }
+
+    #[test]
+    fn preserves_legacy_expression_bits_in_all_three_model_dtypes() -> Result<()> {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (dim, theta, length) in [(8, 10000f32, 5), (2, 1f32, 1), (6, 1e6f32, 7)] {
+                let (expected_cos, expected_sin) = legacy(dim, theta, length, dtype)?;
+                for _ in 0..3 {
+                    let (cos, sin) = default_rope_tables(dim, theta, length, dtype, &Device::Cpu)?;
+                    assert_eq!(cos.dims(), [length, dim / 2]);
+                    assert_eq!(sin.dims(), cos.dims());
+                    assert_eq!(cos.dtype(), dtype);
+                    assert_eq!(sin.dtype(), dtype);
+                    assert_eq!(bits(&cos)?, bits(&expected_cos)?, "cos {dtype:?}");
+                    assert_eq!(bits(&sin)?, bits(&expected_sin)?, "sin {dtype:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agrees_with_absolute_scalar_frequencies_and_positions() -> Result<()> {
+        // Independent f64 scalar formula; bounds account for the production
+        // F32 exponent/frequency calculation rather than sharing its Tensor path.
+        let (cos, sin) = default_rope_tables(8, 10000., 5, DType::F32, &Device::Cpu)?;
+        let cos = cos.to_vec2::<f32>()?;
+        let sin = sin.to_vec2::<f32>()?;
+        for position in 0..5 {
+            for frequency in 0..4 {
+                let angle = position as f64 / 10000f64.powf(frequency as f64 / 4.);
+                assert!((cos[position][frequency] as f64 - angle.cos()).abs() < 2e-7);
+                assert!((sin[position][frequency] as f64 - angle.sin()).abs() < 2e-7);
+            }
+        }
+        assert!(sin[1][0] > 0.8 && sin[1][1] < 0.11);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_geometry_before_allocating_tables() {
+        for (dim, theta, length, dtype) in [
+            (0, 10000., 1, DType::F32),
+            (3, 10000., 1, DType::F32),
+            (8, 10000., 0, DType::F32),
+            (8, 0., 1, DType::F32),
+            (8, -1., 1, DType::F32),
+            (8, f32::NAN, 1, DType::F32),
+            (8, f32::INFINITY, 1, DType::F32),
+            (8, 10000., 1, DType::U32),
+            (usize::MAX - 1, 10000., 2, DType::F32),
+        ] {
+            assert!(default_rope_tables(dim, theta, length, dtype, &Device::Cpu).is_err());
+        }
+        if let Some(too_long) = (u32::MAX as usize).checked_add(1) {
+            assert!(default_rope_tables(2, 10000., too_long, DType::F32, &Device::Cpu).is_err());
+        }
+    }
 }

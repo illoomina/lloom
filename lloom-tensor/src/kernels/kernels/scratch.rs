@@ -155,8 +155,13 @@ const LANES: usize = 32;
 /// `scratch_partials_write_disjoint_regions` rather than argued: §3.5 says
 /// disjointness is *our* assertion, not the driver's, and under
 /// `HazardTrackingModeUntracked` a wrong one is silent corruption.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_scratch_partials(
+pub unsafe fn call_scratch_partials(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -172,7 +177,10 @@ pub fn call_scratch_partials(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "{name} heads={n_heads} chunks={live_chunks}");
-    set_params!(encoder, (Output::new(out), params));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (Output::new(out), params));
+    }
     let grid = MTLSize {
         width: n_heads.max(1) as usize,
         height: live_chunks.max(1) as usize,
@@ -200,8 +208,13 @@ pub fn call_scratch_partials(
 /// barrier, per §9.4. `Output::new(out)` against the partials' `Output` gives it
 /// through candle's `auto_barrier`, the same mechanism `call_arena_reset` uses
 /// for its ordering binding (#70).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_scratch_combine(
+pub unsafe fn call_scratch_combine(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -218,10 +231,13 @@ pub fn call_scratch_combine(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "{name} heads={n_heads}");
-    set_params!(
-        encoder,
-        (partials, Output::new(out), params, Output::new(order))
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (partials, Output::new(out), params, Output::new(order))
+        );
+    }
     let grid = MTLSize {
         width: n_heads.max(1) as usize,
         height: 1,
@@ -242,7 +258,12 @@ pub fn call_scratch_combine(
 /// stats count, `sizeof(ScratchParams)`, the padded interleaved record stride,
 /// and the unpadded record size -- the last two being the pair whose difference
 /// is what `align_up` does on a shape LFM2 can actually produce.
-pub fn call_scratch_report(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_scratch_report(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -254,7 +275,10 @@ pub fn call_scratch_report(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "scratch_report");
-    set_params!(encoder, (Output::new(out), params));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (Output::new(out), params));
+    }
     let one = MTLSize {
         width: 1,
         height: 1,

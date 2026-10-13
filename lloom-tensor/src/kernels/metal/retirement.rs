@@ -23,12 +23,23 @@ pub(super) struct Captures {
     pub callbacks: Vec<Callback>,
     /// The queue's completion hook runs for this record, after its callbacks.
     pub hooked: bool,
+    /// A bound Metal 3 buffer's generation: told after the hook that every
+    /// earlier record and this one's callbacks are done.
+    pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 impl Captures {
     pub fn new(callbacks: Vec<Callback>) -> Self {
         Self {
             callbacks,
             hooked: false,
+            bindings: None,
+        }
+    }
+    pub fn with_binding(head: super::native_generation_bindings::GenerationBindings) -> Self {
+        Self {
+            callbacks: Vec::new(),
+            hooked: false,
+            bindings: Some(head),
         }
     }
     pub fn run(
@@ -49,6 +60,14 @@ impl Captures {
                 hook.expect("hooked record on a queue without a completion hook")
                     .complete(feedback);
             }
+            if let Some(head) = &self.bindings {
+                // SAFETY: only AssociatedBuffer's original record installs this
+                // head. M3 elected prefix drain calls run after own native ready
+                // and preceding records; every arbitrary callback and the hook
+                // just returned. C/record custody spans this genuine HeaderStrong
+                // borrow.
+                unsafe { head.ordered_callbacks_finished() };
+            }
         });
     }
 }
@@ -62,8 +81,10 @@ pub(super) type Metal3Anchor = crate::host_anchor::HostAnchorPermit<(), Metal3Ra
 pub(super) struct Metal3RawOwners {
     pub raw: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     pub physical: Option<crate::metal_backend::device_retirement::NamespaceOwner>,
-    // LAST: original raw retain releases before metadata capability publication.
+    // Original raw retain releases before namespace metadata capabilities.
     pub namespaces: Vec<crate::metal_backend::device_retirement::NamespaceOwner>,
+    // LAST: actual raw/native/namespace drops precede counted generation release.
+    pub bindings: Option<super::native_generation_bindings::GenerationBindings>,
 }
 // SAFETY: same cross-thread retain/release contract as CommandBuffer.
 unsafe impl Send for Metal3RawOwners {}

@@ -15,7 +15,9 @@ fn commands(device: &Device) -> Commands {
 }
 
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
-    let ptr = buffer.contents() as *const T;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { buffer.contents() } as *const T;
     assert!(!ptr.is_null());
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
@@ -73,16 +75,20 @@ fn run<T: Clone>(v: &[T], name: unary::contiguous::Kernel) -> Vec<T> {
         offset_in_bytes: 0,
     };
     let output = new_buffer(&device, v);
-    call_unary_contiguous(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        size_of::<T>(),
-        v.len(),
-        input,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_unary_contiguous(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            size_of::<T>(),
+            v.len(),
+            input,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -100,17 +106,21 @@ fn run_binary<T: Clone, S: ToString>(x: &[T], y: &[T], name: S) -> Vec<T> {
     let output = device
         .new_buffer(std::mem::size_of_val(x), options)
         .unwrap();
-    call_binary_contiguous(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        size_of::<T>(),
-        x.len(),
-        BufferOffset::zero_offset(&left),
-        BufferOffset::zero_offset(&right),
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_binary_contiguous(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            size_of::<T>(),
+            x.len(),
+            BufferOffset::zero_offset(&left),
+            BufferOffset::zero_offset(&right),
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -138,9 +148,13 @@ fn run_strided<T: Clone>(
         offset_in_bytes: 0,
     };
     let kernels = Kernels::new();
-    call_unary_strided(
-        &device, &encoder, &kernels, kernel, shape, input, strides, output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_unary_strided(
+            &device, &encoder, &kernels, kernel, shape, input, strides, output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -339,16 +353,20 @@ fn run_cast<T: Clone, U: Clone>(v: &[T], name: &'static str) -> Vec<U> {
     let size = v.len() * std::mem::size_of::<U>();
     let output = device.new_buffer(size, options).unwrap();
 
-    call_cast_contiguous(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        size_of::<T>(),
-        v.len(),
-        BufferOffset::zero_offset(&input),
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_cast_contiguous(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            size_of::<T>(),
+            v.len(),
+            BufferOffset::zero_offset(&input),
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -552,18 +570,22 @@ fn run_affine<T: Clone>(v: &[T], mul: f64, add: f64) -> Vec<T> {
 
     let size = v.len();
 
-    call_affine(
-        &device,
-        &encoder,
-        &kernels,
-        "affine_f32",
-        size_of::<T>(),
-        size,
-        BufferOffset::zero_offset(&input),
-        &output,
-        mul as f32,
-        add as f32,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_affine(
+            &device,
+            &encoder,
+            &kernels,
+            "affine_f32",
+            size_of::<T>(),
+            size,
+            BufferOffset::zero_offset(&input),
+            &output,
+            mul as f32,
+            add as f32,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -586,18 +608,22 @@ fn run_affine_strided<T: Clone>(
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, v);
 
-    call_affine_strided(
-        &device,
-        &encoder,
-        &kernels,
-        "affine_f32_strided",
-        shape,
-        BufferOffset::zero_offset(&input),
-        strides,
-        &output,
-        mul as f32,
-        add as f32,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_affine_strided(
+            &device,
+            &encoder,
+            &kernels,
+            "affine_f32_strided",
+            shape,
+            BufferOffset::zero_offset(&input),
+            strides,
+            &output,
+            mul as f32,
+            add as f32,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -644,16 +670,20 @@ fn run_mlx_sort<T: Clone>(v: &[T], ncols: usize) -> Vec<u32> {
     let indexes = vec![0u32; v.len()];
     let output = new_buffer(&device, &indexes);
 
-    call_mlx_arg_sort(
-        &device,
-        &encoder,
-        &kernels,
-        DType::F32,
-        nrows,
-        ncols,
-        BufferOffset::zero_offset(&input),
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_arg_sort(
+            &device,
+            &encoder,
+            &kernels,
+            DType::F32,
+            nrows,
+            ncols,
+            BufferOffset::zero_offset(&input),
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -842,21 +872,25 @@ fn run_index_select<T: Clone, I: Clone + std::fmt::Debug>(
     let dst_buffer = new_buffer(&device, &vec![0.0f32; dst_el]);
 
     let kernels = Kernels::new();
-    call_index_select(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        shape,
-        ids.len(),
-        dim,
-        true,
-        shape,
-        stride,
-        BufferOffset::zero_offset(&embeddings_buffer),
-        BufferOffset::zero_offset(&ids_buffer),
-        &dst_buffer,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_index_select(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            shape,
+            ids.len(),
+            dim,
+            true,
+            shape,
+            stride,
+            BufferOffset::zero_offset(&embeddings_buffer),
+            BufferOffset::zero_offset(&ids_buffer),
+            &dst_buffer,
+        )
+    }
     .unwrap();
 
     drop(encoder);
@@ -886,21 +920,25 @@ fn run_index_select_strided<T: Clone, I: Clone + std::fmt::Debug>(
     let dst_buffer = new_buffer(&device, &vec![0.0f32; dst_el]);
 
     let kernels = Kernels::new();
-    call_index_select(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        shape,
-        ids.len(),
-        dim,
-        false,
-        shape,
-        stride,
-        BufferOffset::zero_offset(&embeddings_buffer),
-        BufferOffset::zero_offset(&ids_buffer),
-        &dst_buffer,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_index_select(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            shape,
+            ids.len(),
+            dim,
+            false,
+            shape,
+            stride,
+            BufferOffset::zero_offset(&embeddings_buffer),
+            BufferOffset::zero_offset(&ids_buffer),
+            &dst_buffer,
+        )
+    }
     .unwrap();
 
     drop(encoder);
@@ -938,16 +976,20 @@ fn run_reduce<T, U: Clone>(
         .new_buffer(out_length * core::mem::size_of::<U>(), options)
         .unwrap();
     let shape = vec![in_length];
-    match call_reduce_contiguous(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        &shape,
-        out_length,
-        BufferOffset::zero_offset(&input),
-        &output,
-    ) {
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    match unsafe {
+        call_reduce_contiguous(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            &shape,
+            out_length,
+            BufferOffset::zero_offset(&input),
+            &output,
+        )
+    } {
         Ok(_) => {}
         Err(e) => {
             println!("{e}");
@@ -967,17 +1009,21 @@ fn run_softmax<T: Clone + std::fmt::Debug>(v: &[T], last_dim: usize, name: &'sta
     let encoder = commands.command_encoder().unwrap();
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, v);
-    call_last_softmax(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        v.len(),
-        last_dim,
-        &input,
-        0,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_last_softmax(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            v.len(),
+            last_dim,
+            &input,
+            0,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -1289,24 +1335,28 @@ fn run_where_cond<I: Clone, T: Clone>(
         buffer: &right,
         offset_in_bytes: cond_offset,
     };
-    call_where_cond(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        size_of::<T>(),
-        shape,
-        cond,
-        &cond_stride,
-        true,
-        left,
-        &left_stride,
-        true,
-        right,
-        &cond_stride,
-        true,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_where_cond(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            size_of::<T>(),
+            shape,
+            cond,
+            &cond_stride,
+            true,
+            left,
+            &left_stride,
+            true,
+            right,
+            &cond_stride,
+            true,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -1392,20 +1442,24 @@ fn run_mlx_gemm<T: Clone>(
     let output = device
         .new_buffer(length * core::mem::size_of::<T>(), options)
         .unwrap();
-    call_mlx_gemm(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        lhs_offset,
-        &lhs,
-        rhs_stride,
-        rhs_offset,
-        &rhs,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemm(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            lhs_offset,
+            &lhs,
+            rhs_stride,
+            rhs_offset,
+            &rhs,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -1537,14 +1591,22 @@ fn run_random<T: Clone>(name: &'static str, seed: u64, length: usize, a: f32, b:
         .unwrap();
 
     if name.starts_with("rand_uniform") {
-        call_random_uniform(
-            &device, &encoder, &kernels, name, a, b, length, &seed, &output,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_random_uniform(
+                &device, &encoder, &kernels, name, a, b, length, &seed, &output,
+            )
+        }
         .unwrap();
     } else {
-        call_random_normal(
-            &device, &encoder, &kernels, name, a, b, length, &seed, &output,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_random_normal(
+                &device, &encoder, &kernels, name, a, b, length, &seed, &output,
+            )
+        }
         .unwrap();
     }
     drop(encoder);
@@ -1643,18 +1705,22 @@ fn run_scatter_add<T: Clone, I: Clone + std::fmt::Debug>(
     let output = device
         .new_buffer(std::mem::size_of_val(input), options)
         .unwrap();
-    call_scatter(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        shape,
-        shape,
-        dim,
-        BufferOffset::zero_offset(&input_buffer),
-        BufferOffset::zero_offset(&ids_buffer),
-        BufferOffset::zero_offset(&output),
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_scatter(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            shape,
+            shape,
+            dim,
+            BufferOffset::zero_offset(&input_buffer),
+            BufferOffset::zero_offset(&ids_buffer),
+            BufferOffset::zero_offset(&output),
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -1745,19 +1811,23 @@ fn run_index_add<T: Clone, I: Clone + std::fmt::Debug>(
     let input_buffer = new_buffer(&device, right);
     let output = new_buffer(&device, left);
     let indices_buffer = new_buffer(&device, indices);
-    call_index_add(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        shape,
-        shape,
-        shape,
-        dim,
-        BufferOffset::zero_offset(&input_buffer),
-        BufferOffset::zero_offset(&indices_buffer),
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_index_add(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            shape,
+            shape,
+            shape,
+            dim,
+            BufferOffset::zero_offset(&input_buffer),
+            BufferOffset::zero_offset(&indices_buffer),
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -1861,10 +1931,14 @@ fn run_pool2d<T: Clone>(
     let input = new_buffer(&device, v);
     let output = new_buffer(&device, &vec![0.0f32; dst_el]);
     let kernels = Kernels::new();
-    call_pool2d(
-        &device, &encoder, &kernels, name, shape, strides, out_w, out_h, w_k, h_k, w_stride,
-        h_stride, &input, &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_pool2d(
+            &device, &encoder, &kernels, name, shape, strides, out_w, out_h, w_k, h_k, w_stride,
+            h_stride, &input, &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -2211,28 +2285,32 @@ fn run_conv_transpose1d<T: Clone>(
     let output = new_buffer(&device, &vec![0.0f32; dst_el]);
     let kernels = Kernels::new();
 
-    call_conv_transpose1d(
-        &device,
-        &encoder,
-        &kernels,
-        name,
-        dilation,
-        stride,
-        padding,
-        out_padding,
-        c_out,
-        l_out,
-        b_size,
-        input_shape,
-        input_stride,
-        kernel_shape,
-        kernel_stride,
-        &input,
-        0,
-        &kernel,
-        0,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_conv_transpose1d(
+            &device,
+            &encoder,
+            &kernels,
+            name,
+            dilation,
+            stride,
+            padding,
+            out_padding,
+            c_out,
+            l_out,
+            b_size,
+            input_shape,
+            input_stride,
+            kernel_shape,
+            kernel_stride,
+            &input,
+            0,
+            &kernel,
+            0,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -2408,7 +2486,9 @@ fn const_fill() {
         let buffer = dev
             .new_buffer(len * std::mem::size_of::<T>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_const_fill(&dev, &encoder, &kernels, name, len, &buffer, value).unwrap();
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { call_const_fill(&dev, &encoder, &kernels, name, len, &buffer, value) }.unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
         read_to_vec::<T>(&buffer, len)
@@ -2474,7 +2554,7 @@ fn residency_set_batch_insert_remove() {
 
     let device = device();
     let set = ResidencySet::new(&device);
-    let Some(raw) = set.raw() else {
+    let Some(raw) = (unsafe { set.raw() }) else {
         // Residency sets are unsupported on this device/OS; the set no-ops.
         return;
     };
@@ -2511,7 +2591,7 @@ fn residency_set_refuses_a_double_remove() {
 
     let device = device();
     let set = ResidencySet::new(&device);
-    let Some(raw) = set.raw() else {
+    let Some(raw) = (unsafe { set.raw() }) else {
         return;
     };
 
@@ -2556,7 +2636,7 @@ fn residency_set_insert_is_idempotent() {
 
     let device = device();
     let set = ResidencySet::new(&device);
-    let Some(raw) = set.raw() else {
+    let Some(raw) = (unsafe { set.raw() }) else {
         return;
     };
 
@@ -2600,7 +2680,7 @@ fn residency_set_keys_views_to_their_parent() {
 
     let device = device();
     let set = ResidencySet::new(&device);
-    let Some(raw) = set.raw() else {
+    let Some(raw) = (unsafe { set.raw() }) else {
         return;
     };
 
@@ -2647,7 +2727,7 @@ fn residency_set_remove_all_empties_and_stays_empty() {
 
     let device = device();
     let set = ResidencySet::new(&device);
-    let Some(raw) = set.raw() else {
+    let Some(raw) = (unsafe { set.raw() }) else {
         return;
     };
 
@@ -3259,17 +3339,21 @@ fn reduce_both_ways<T, U: Clone>(
         let output = device
             .new_buffer(out_length * core::mem::size_of::<U>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_reduce_contiguous_with(
-            &device,
-            &encoder,
-            &kernels,
-            name,
-            &shape,
-            out_length,
-            BufferOffset::zero_offset(&input),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_reduce_contiguous_with(
+                &device,
+                &encoder,
+                &kernels,
+                name,
+                &shape,
+                out_length,
+                BufferOffset::zero_offset(&input),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -3380,18 +3464,22 @@ fn packed_matches_split_for_softmax_f32() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_last_softmax_with(
-            &device,
-            &encoder,
-            &kernels,
-            "softmax_f32",
-            v.len(),
-            128,
-            &input,
-            0,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_last_softmax_with(
+                &device,
+                &encoder,
+                &kernels,
+                "softmax_f32",
+                v.len(),
+                128,
+                &input,
+                0,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -3421,21 +3509,25 @@ fn packed_matches_split_for_rmsnorm_f16() {
         let input = new_buffer(&device, &v);
         let alpha_buf = new_buffer(&device, &alpha);
         let output = new_buffer(&device, &v);
-        call_rms_norm_with(
-            &device,
-            &encoder,
-            &kernels,
-            "rmsnorm_f16",
-            v.len(),
-            256,
-            1e-5,
-            &input,
-            0,
-            &alpha_buf,
-            0,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_rms_norm_with(
+                &device,
+                &encoder,
+                &kernels,
+                "rmsnorm_f16",
+                v.len(),
+                256,
+                1e-5,
+                &input,
+                0,
+                &alpha_buf,
+                0,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -3469,10 +3561,14 @@ fn packed_matches_split_for_rope_f16() {
         let cos = new_buffer(&device, &cs);
         let sin = new_buffer(&device, &cs);
         let output = new_buffer(&device, &v);
-        call_rope_with(
-            &device, &encoder, &kernels, "rope_f16", bh, td, d, 0, &input, 0, &cos, 0, &sin, 0,
-            &output, style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_rope_with(
+                &device, &encoder, &kernels, "rope_f16", bh, td, d, 0, &input, 0, &cos, 0, &sin, 0,
+                &output, style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -3506,18 +3602,22 @@ fn packed_matches_split_for_sum_f32_strided() {
         let output = device
             .new_buffer(32 * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_reduce_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            "fast_sum_f32_strided",
-            &shape,
-            &strides,
-            32,
-            BufferOffset::zero_offset(&input),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_reduce_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                "fast_sum_f32_strided",
+                &shape,
+                &strides,
+                32,
+                BufferOffset::zero_offset(&input),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -3556,7 +3656,9 @@ fn layout_disagreements(
         .unwrap();
     let enc: &ComputeCommandEncoder = encoder.as_ref();
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_output_buffer(0, Some(&out), 0);
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe { enc.set_output_buffer(0, Some(&out), 0) };
     enc.dispatch_thread_groups(
         MTLSize {
             width: 1,
@@ -3631,21 +3733,25 @@ fn run_mlx_gemv_style<T: Clone>(
         .new_buffer(length * core::mem::size_of::<T>(), options)
         .unwrap();
 
-    call_mlx_gemv_with(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        style,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_with(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            style,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -3831,24 +3937,28 @@ fn packed_matches_split_for_the_fused_epilogues_f16() {
                     e => e.needs_operand().then_some((&res_b, 0usize)),
                 };
                 // `x [1, k] @ w.t()` with `w [n_out, k]`: the Linear layout.
-                call_mlx_gemv_epilogue(
-                    &device,
-                    &encoder,
-                    &kernels,
-                    GemmDType::F16,
-                    (1, 1, n_out, k),
-                    &[k, k, 1],
-                    0,
-                    &vec_b,
-                    &[n_out * k, 1, k],
-                    0,
-                    &mat_b,
-                    &output,
-                    style,
-                    None,
-                    epilogue,
-                    operand,
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_epilogue(
+                        &device,
+                        &encoder,
+                        &kernels,
+                        GemmDType::F16,
+                        (1, 1, n_out, k),
+                        &[k, k, 1],
+                        0,
+                        &vec_b,
+                        &[n_out * k, 1, k],
+                        0,
+                        &mat_b,
+                        &output,
+                        style,
+                        None,
+                        epilogue,
+                        operand,
+                    )
+                }
                 .unwrap();
                 drop(encoder);
                 commands.wait_until_completed().unwrap();
@@ -4180,17 +4290,21 @@ fn packed_matches_split_for_unary_silu_f16() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_unary_contiguous_with(
-            &device,
-            &encoder,
-            &kernels,
-            unary::contiguous::silu::HALF,
-            core::mem::size_of::<f16>(),
-            v.len(),
-            BufferOffset::zero_offset(&input),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_contiguous_with(
+                &device,
+                &encoder,
+                &kernels,
+                unary::contiguous::silu::HALF,
+                core::mem::size_of::<f16>(),
+                v.len(),
+                BufferOffset::zero_offset(&input),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4219,17 +4333,21 @@ fn packed_matches_split_for_unary_strided_f32() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_unary_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            unary::strided::cos::FLOAT,
-            &shape,
-            BufferOffset::zero_offset(&input),
-            &strides,
-            BufferOffset::zero_offset(&output),
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_unary_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                unary::strided::cos::FLOAT,
+                &shape,
+                BufferOffset::zero_offset(&input),
+                &strides,
+                BufferOffset::zero_offset(&output),
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4257,21 +4375,25 @@ fn packed_matches_split_for_copy2d_f16() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &src);
         let output = new_buffer(&device, &dst_init);
-        call_copy2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            unary::copy2d::HALF,
-            &input,
-            &output,
-            d1,
-            d2,
-            src_s,
-            dst_s,
-            0,
-            0,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_copy2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                unary::copy2d::HALF,
+                &input,
+                &output,
+                d1,
+                d2,
+                src_s,
+                dst_s,
+                0,
+                0,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4303,18 +4425,22 @@ fn packed_matches_split_for_binary_bmul_f16() {
         let left = new_buffer(&device, &l);
         let right = new_buffer(&device, &r);
         let output = new_buffer(&device, &l);
-        call_binary_contiguous_with(
-            &device,
-            &encoder,
-            &kernels,
-            "bmul_f16",
-            core::mem::size_of::<f16>(),
-            n,
-            BufferOffset::zero_offset(&left),
-            BufferOffset::zero_offset(&right),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_binary_contiguous_with(
+                &device,
+                &encoder,
+                &kernels,
+                "bmul_f16",
+                core::mem::size_of::<f16>(),
+                n,
+                BufferOffset::zero_offset(&left),
+                BufferOffset::zero_offset(&right),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4348,20 +4474,24 @@ fn packed_matches_split_for_binary_badd_f16_strided() {
         let left = new_buffer(&device, &l);
         let right = new_buffer(&device, &r);
         let output = new_buffer(&device, &l);
-        call_binary_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            "badd_f16_strided",
-            core::mem::size_of::<f16>(),
-            &shape,
-            BufferOffset::zero_offset(&left),
-            &ls,
-            BufferOffset::zero_offset(&right),
-            &rs,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_binary_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                "badd_f16_strided",
+                core::mem::size_of::<f16>(),
+                &shape,
+                BufferOffset::zero_offset(&left),
+                &ls,
+                BufferOffset::zero_offset(&right),
+                &rs,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4387,17 +4517,21 @@ fn packed_matches_split_for_cast_f16_f32() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &zero);
-        call_cast_contiguous_with(
-            &device,
-            &encoder,
-            &kernels,
-            "cast_f16_f32",
-            core::mem::size_of::<f16>(),
-            n,
-            BufferOffset::zero_offset(&input),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_cast_contiguous_with(
+                &device,
+                &encoder,
+                &kernels,
+                "cast_f16_f32",
+                core::mem::size_of::<f16>(),
+                n,
+                BufferOffset::zero_offset(&input),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4427,21 +4561,25 @@ fn packed_matches_split_for_affine_f32() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_affine_with(
-            &device,
-            &encoder,
-            &kernels,
-            "affine_f32",
-            core::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&input),
-            &output,
-            // Deliberately distinct and non-commutative under a swap, so a
-            // mul/add transposition cannot pass by coincidence.
-            2.5,
-            -0.75,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_affine_with(
+                &device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                core::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&input),
+                &output,
+                // Deliberately distinct and non-commutative under a swap, so a
+                // mul/add transposition cannot pass by coincidence.
+                2.5,
+                -0.75,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4468,18 +4606,22 @@ fn packed_matches_split_for_powf_f32() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_powf_with(
-            &device,
-            &encoder,
-            &kernels,
-            "powf_f32",
-            core::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&input),
-            &output,
-            1.75,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_powf_with(
+                &device,
+                &encoder,
+                &kernels,
+                "powf_f32",
+                core::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&input),
+                &output,
+                1.75,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4508,19 +4650,23 @@ fn packed_matches_split_for_affine_f32_strided() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &v);
         let output = new_buffer(&device, &v);
-        call_affine_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            "affine_f32_strided",
-            &shape,
-            BufferOffset::zero_offset(&input),
-            &strides,
-            &output,
-            2.5,
-            -0.75,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_affine_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                "affine_f32_strided",
+                &shape,
+                BufferOffset::zero_offset(&input),
+                &strides,
+                &output,
+                2.5,
+                -0.75,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4780,18 +4926,22 @@ fn conv_packed_matches_split_for_conv1d_depthwise_k() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_conv1d_depthwise_k_with(
-            &device,
-            &encoder,
-            &kernels,
-            "conv1d_depthwise_f16_k3",
-            &shape,
-            (k_size, padding),
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&w_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_conv1d_depthwise_k_with(
+                &device,
+                &encoder,
+                &kernels,
+                "conv1d_depthwise_f16_k3",
+                &shape,
+                (k_size, padding),
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&w_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4833,19 +4983,23 @@ fn conv_packed_matches_split_for_conv1d_depthwise() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_conv1d_depthwise_with(
-            &device,
-            &encoder,
-            &kernels,
-            "conv1d_depthwise_f32",
-            &shape,
-            &strides,
-            (k_size, stride, padding, dilation),
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&w_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_conv1d_depthwise_with(
+                &device,
+                &encoder,
+                &kernels,
+                "conv1d_depthwise_f32",
+                &shape,
+                &strides,
+                (k_size, stride, padding, dilation),
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&w_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4889,18 +5043,22 @@ fn conv_packed_matches_split_for_im2col() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_im2col_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            "im2col_f32",
-            &shape,
-            &strides,
-            (h_k, w_k, stride, padding, dilation),
-            BufferOffset::zero_offset(&src_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_im2col_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                "im2col_f32",
+                &shape,
+                &strides,
+                (h_k, w_k, stride, padding, dilation),
+                BufferOffset::zero_offset(&src_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4933,18 +5091,22 @@ fn conv_packed_matches_split_for_im2col1d() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_im2col1d_strided_with(
-            &device,
-            &encoder,
-            &kernels,
-            "im2col1d_f16",
-            &shape,
-            &strides,
-            (k_size, stride, padding, dilation),
-            BufferOffset::zero_offset(&src_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_im2col1d_strided_with(
+                &device,
+                &encoder,
+                &kernels,
+                "im2col1d_f16",
+                &shape,
+                &strides,
+                (k_size, stride, padding, dilation),
+                BufferOffset::zero_offset(&src_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -4977,18 +5139,22 @@ fn conv_packed_matches_split_for_col2im1d() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_col2im1d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "col2im1d_f32",
-            &shape,
-            k_size,
-            stride,
-            BufferOffset::zero_offset(&src_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_col2im1d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "col2im1d_f32",
+                &shape,
+                k_size,
+                stride,
+                BufferOffset::zero_offset(&src_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5030,22 +5196,26 @@ fn conv_packed_matches_split_for_upsample_bilinear2d() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_upsample_bilinear_2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "upsample_bilinear2d_f32",
-            &shape,
-            &strides,
-            out_w,
-            out_h,
-            false,
-            Some(1.25),
-            None,
-            BufferOffset::zero_offset(&src_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_upsample_bilinear_2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "upsample_bilinear2d_f32",
+                &shape,
+                &strides,
+                out_w,
+                out_h,
+                false,
+                Some(1.25),
+                None,
+                BufferOffset::zero_offset(&src_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5081,19 +5251,23 @@ fn conv_packed_matches_split_for_upsample_nearest2d() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_upsample_nearest_2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "upsample_nearest2d_f16",
-            &shape,
-            &strides,
-            out_w,
-            out_h,
-            BufferOffset::zero_offset(&src_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_upsample_nearest_2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "upsample_nearest2d_f16",
+                &shape,
+                &strides,
+                out_w,
+                out_h,
+                BufferOffset::zero_offset(&src_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5141,23 +5315,27 @@ fn conv_packed_matches_split_for_avg_pool2d_u8() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<u8>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_pool2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "avg_pool2d_u8",
-            &shape,
-            &strides,
-            out_w,
-            out_h,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            &src_buf,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_pool2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "avg_pool2d_u8",
+                &shape,
+                &strides,
+                out_w,
+                out_h,
+                w_k,
+                h_k,
+                w_stride,
+                h_stride,
+                &src_buf,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5197,23 +5375,27 @@ fn conv_packed_matches_split_for_max_pool2d() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_pool2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "max_pool2d_f32",
-            &shape,
-            &strides,
-            out_w,
-            out_h,
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            &src_buf,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_pool2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "max_pool2d_f32",
+                &shape,
+                &strides,
+                out_w,
+                out_h,
+                w_k,
+                h_k,
+                w_stride,
+                h_stride,
+                &src_buf,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5258,29 +5440,33 @@ fn conv_packed_matches_split_for_conv_transpose1d_u32() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<u32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_conv_transpose1d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "conv_transpose1d_u32",
-            dilation,
-            stride,
-            padding,
-            out_padding,
-            c_out,
-            l_out,
-            b,
-            &src_shape,
-            &src_strides,
-            &k_shape,
-            &k_strides,
-            &src_buf,
-            0,
-            &k_buf,
-            0,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_conv_transpose1d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "conv_transpose1d_u32",
+                dilation,
+                stride,
+                padding,
+                out_padding,
+                c_out,
+                l_out,
+                b,
+                &src_shape,
+                &src_strides,
+                &k_shape,
+                &k_strides,
+                &src_buf,
+                0,
+                &k_buf,
+                0,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5340,17 +5526,21 @@ fn conv_packed_matches_split_for_conv_transpose2d() {
             input_offset: 0,
             kernel_offset: 0,
         };
-        call_conv_transpose2d_with(
-            &device,
-            &encoder,
-            &kernels,
-            "conv_transpose2d_f32",
-            cfg,
-            &src_buf,
-            &k_buf,
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_conv_transpose2d_with(
+                &device,
+                &encoder,
+                &kernels,
+                "conv_transpose2d_f32",
+                cfg,
+                &src_buf,
+                &k_buf,
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5846,22 +6036,26 @@ fn indexing_packed_matches_split_for_index_select() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_index_select_with(
-            &device,
-            &encoder,
-            &kernels,
-            "is_u32_f16",
-            &shape,
-            ids.len(),
-            0,
-            true,
-            &shape,
-            &strides,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_index_select_with(
+                &device,
+                &encoder,
+                &kernels,
+                "is_u32_f16",
+                &shape,
+                ids.len(),
+                0,
+                true,
+                &shape,
+                &strides,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5912,22 +6106,26 @@ fn indexing_packed_matches_split_for_index_select_strided() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_index_select_with(
-            &device,
-            &encoder,
-            &kernels,
-            "is_u32_f32",
-            &dims,
-            ids.len(),
-            dim,
-            false,
-            &dims,
-            &strides,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_index_select_with(
+                &device,
+                &encoder,
+                &kernels,
+                "is_u32_f32",
+                &dims,
+                ids.len(),
+                dim,
+                false,
+                &dims,
+                &strides,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -5960,19 +6158,23 @@ fn indexing_packed_matches_split_for_gather() {
         let output = device
             .new_buffer(dst_el * core::mem::size_of::<f32>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_gather_with(
-            &device,
-            &encoder,
-            &kernels,
-            "gather_u32_f32",
-            &shape,
-            cols,
-            1,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_gather_with(
+                &device,
+                &encoder,
+                &kernels,
+                "gather_u32_f32",
+                &shape,
+                cols,
+                1,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -6014,19 +6216,23 @@ fn indexing_packed_matches_split_for_scatter() {
         // on both arms and prove nothing about them.
         let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * -0.25 - 1.0).collect();
         let output = new_buffer(&device, &seed);
-        call_scatter_with(
-            &device,
-            &encoder,
-            &kernels,
-            "s_u32_f32",
-            &src_shape,
-            &dst_shape,
-            1,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            BufferOffset::zero_offset(&output),
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scatter_with(
+                &device,
+                &encoder,
+                &kernels,
+                "s_u32_f32",
+                &src_shape,
+                &dst_shape,
+                1,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                BufferOffset::zero_offset(&output),
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -6065,19 +6271,23 @@ fn indexing_packed_matches_split_for_scatter_add() {
         let ids_buf = new_buffer(&device, &ids);
         let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * 0.5 + 2.0).collect();
         let output = new_buffer(&device, &seed);
-        call_scatter_with(
-            &device,
-            &encoder,
-            &kernels,
-            "sa_u32_f32",
-            &src_shape,
-            &dst_shape,
-            1,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            BufferOffset::zero_offset(&output),
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_scatter_with(
+                &device,
+                &encoder,
+                &kernels,
+                "sa_u32_f32",
+                &src_shape,
+                &dst_shape,
+                1,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                BufferOffset::zero_offset(&output),
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -6115,20 +6325,24 @@ fn indexing_packed_matches_split_for_index_add() {
         let ids_buf = new_buffer(&device, &ids);
         let seed: Vec<f32> = (0..dst_el).map(|i| (i as f32) * 0.75 - 3.0).collect();
         let output = new_buffer(&device, &seed);
-        call_index_add_with(
-            &device,
-            &encoder,
-            &kernels,
-            "ia_u32_f32",
-            &src_shape,
-            &dst_shape,
-            &ids_shape,
-            1,
-            BufferOffset::zero_offset(&src_buf),
-            BufferOffset::zero_offset(&ids_buf),
-            &output,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_index_add_with(
+                &device,
+                &encoder,
+                &kernels,
+                "ia_u32_f32",
+                &src_shape,
+                &dst_shape,
+                &ids_shape,
+                1,
+                BufferOffset::zero_offset(&src_buf),
+                BufferOffset::zero_offset(&ids_buf),
+                &output,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -6433,33 +6647,37 @@ fn sdpa_vector_paged_writes_every_head_dimension() {
                     for rep in 0..3 {
                         let out = upload(&vec![-999.; rows * nh * hd]);
                         let enc = commands.command_encoder().unwrap();
-                        call_sdpa_vector_paged(
-                            &device,
-                            &enc,
-                            &kernels,
-                            rows,
-                            nh,
-                            nh / nkv,
-                            hd,
-                            0,
-                            &q,
-                            0,
-                            &k,
-                            tokens * hd,
-                            0,
-                            &v,
-                            tokens * hd,
-                            &tb,
-                            0,
-                            stride,
-                            &ns,
-                            0,
-                            page_size,
-                            &out,
-                            1.,
-                            dtype,
-                            two_pass.then_some((&partials, &sums, &maxs)),
-                        )
+                        // SAFETY: the test owns every buffer bound or mapped here and reads its
+                        // results only after waiting for the command buffer that writes them.
+                        unsafe {
+                            call_sdpa_vector_paged(
+                                &device,
+                                &enc,
+                                &kernels,
+                                rows,
+                                nh,
+                                nh / nkv,
+                                hd,
+                                0,
+                                &q,
+                                0,
+                                &k,
+                                tokens * hd,
+                                0,
+                                &v,
+                                tokens * hd,
+                                &tb,
+                                0,
+                                stride,
+                                &ns,
+                                0,
+                                page_size,
+                                &out,
+                                1.,
+                                dtype,
+                                two_pass.then_some((&partials, &sums, &maxs)),
+                            )
+                        }
                         .unwrap();
                         drop(enc);
                         commands.wait_until_completed().unwrap();
@@ -6613,32 +6831,36 @@ fn sdpa_vector_declares_variants_the_name_table_cannot_reach() {
     // The other half of the claim: Rust cannot ask for them. Asserted against
     // the error rather than by reading the match, so a fix that widens the
     // table turns this red.
-    let err = call_sdpa_vector(
-        &device,
-        &commands(&device).command_encoder().unwrap(),
-        &kernels,
-        0,
-        &[1, 1, 1, 72],
-        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
-        0,
-        &[1, 1, 1, 72],
-        &[72, 72, 72, 1],
-        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
-        0,
-        &[72, 72, 72, 1],
-        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
-        &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
-        1.0,
-        1.0,
-        SdpaDType::F16,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let err = unsafe {
+        call_sdpa_vector(
+            &device,
+            &commands(&device).command_encoder().unwrap(),
+            &kernels,
+            0,
+            &[1, 1, 1, 72],
+            &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+            0,
+            &[1, 1, 1, 72],
+            &[72, 72, 72, 1],
+            &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+            0,
+            &[72, 72, 72, 1],
+            &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+            &device.new_buffer(72 * 2, RESOURCE_OPTIONS).unwrap(),
+            1.0,
+            1.0,
+            SdpaDType::F16,
+        )
+    }
     .expect_err(
         "head_dim 72 is instantiated in the metallib; if call_sdpa_vector now \
          accepts it, the name table was widened and this test has done its job \
          -- update it rather than relaxing it",
     );
     assert!(
-        matches!(err, MetalKernelError::SdpaHeadSizeMismatch { got: 72, .. }),
+        matches!(&err, MetalKernelError::SdpaHeadSizeMismatch(m) if m.got == 72),
         "expected the head-size mismatch that records the gap, got {err:?}"
     );
 }
@@ -6722,26 +6944,30 @@ fn sdpa_packed_matches_split_for_sdpa_vector() {
         let output = device
             .new_buffer(out_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
             .unwrap();
-        call_sdpa_vector_with(
-            &device,
-            &encoder,
-            &kernels,
-            0,
-            &q_shape,
-            &q_buf,
-            0,
-            &kv_shape,
-            &k_strides,
-            &k_buf,
-            0,
-            &v_strides,
-            &v_buf,
-            &output,
-            scale,
-            1.0,
-            SdpaDType::F16,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_sdpa_vector_with(
+                &device,
+                &encoder,
+                &kernels,
+                0,
+                &q_shape,
+                &q_buf,
+                0,
+                &kv_shape,
+                &k_strides,
+                &k_buf,
+                0,
+                &v_strides,
+                &v_buf,
+                &output,
+                scale,
+                1.0,
+                SdpaDType::F16,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -6901,18 +7127,22 @@ fn run_gemv_fused_rmsnorm(
     // The input vector is `lhs` when `n == 1` and `rhs` when `m == 1`; the
     // fused arm is only instantiated for the non-transposed kernel, which is
     // the `n == 1` shape here.
-    call_rms_norm_scale(
-        &device,
-        &encoder,
-        &kernels,
-        scale_kernel,
-        b * k,
-        k,
-        eps,
-        &rhs_buf,
-        0,
-        &scale_buf,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm_scale(
+            &device,
+            &encoder,
+            &kernels,
+            scale_kernel,
+            b * k,
+            k,
+            eps,
+            &rhs_buf,
+            0,
+            &scale_buf,
+        )
+    }
     .unwrap();
 
     let length = b * m * n;
@@ -6920,28 +7150,32 @@ fn run_gemv_fused_rmsnorm(
         .new_buffer(length * core::mem::size_of::<f32>(), options)
         .unwrap();
 
-    call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        ParamStyle::Split,
-        Some(GemvRmsNorm {
-            weight: &w_buf,
-            weight_offset: 0,
-            scale: &scale_buf,
-            scale_offset: 0,
-        }),
-        GemvEpilogue::None,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            ParamStyle::Split,
+            Some(GemvRmsNorm {
+                weight: &w_buf,
+                weight_offset: 0,
+                scale: &scale_buf,
+                scale_offset: 0,
+            }),
+            GemvEpilogue::None,
+        )
+    }
     .unwrap();
 
     drop(encoder);
@@ -7128,39 +7362,47 @@ fn gemv_fused_rmsnorm_agrees_with_the_unfused_path() {
     let normed = device
         .new_buffer(k * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_rms_norm(
-        &device,
-        &encoder,
-        &kernels,
-        "rmsnorm_f32",
-        k,
-        k,
-        eps,
-        &vec_buf,
-        0,
-        &w_buf,
-        0,
-        &normed,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm(
+            &device,
+            &encoder,
+            &kernels,
+            "rmsnorm_f32",
+            k,
+            k,
+            eps,
+            &vec_buf,
+            0,
+            &w_buf,
+            0,
+            &normed,
+        )
+    }
     .unwrap();
     let out = device
         .new_buffer(n_out * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_mlx_gemv_with(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (b, m, n, k),
-        &[m * k, k, 1],
-        0,
-        &mat_buf,
-        &[k, 1, 1],
-        0,
-        &normed,
-        &out,
-        ParamStyle::Split,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_with(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (b, m, n, k),
+            &[m * k, k, 1],
+            0,
+            &mat_buf,
+            &[k, 1, 1],
+            0,
+            &normed,
+            &out,
+            ParamStyle::Split,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -7213,46 +7455,54 @@ fn gemv_fused_rmsnorm_is_refused_where_it_is_not_instantiated() {
 
     // `m == 1` routes to the TRANSPOSED kernel, which carries no `_rmsnorm`
     // instantiation. It must be an error rather than a silent unfused run.
-    let transposed = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 1, 512, k),
-        &[k, k, 1],
-        0,
-        &buf,
-        &[512 * k, 512, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Split,
-        Some(norm),
-        GemvEpilogue::None,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let transposed = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 1, 512, k),
+            &[k, k, 1],
+            0,
+            &buf,
+            &[512 * k, 512, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Split,
+            Some(norm),
+            GemvEpilogue::None,
+        )
+    };
     assert!(
         transposed.is_err(),
         "the transposed kernel has no fused instantiation and must be refused"
     );
 
     // The admitted bound: the non-transposed decode tile IS instantiated.
-    let ok = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 512, 1, k),
-        &[512 * k, k, 1],
-        0,
-        &buf,
-        &[k, 1, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Split,
-        Some(norm),
-        GemvEpilogue::None,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ok = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 512, 1, k),
+            &[512 * k, k, 1],
+            0,
+            &buf,
+            &[k, 1, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Split,
+            Some(norm),
+            GemvEpilogue::None,
+        )
+    };
     assert!(
         ok.is_ok(),
         "the non-transposed decode tile must be admitted: {ok:?}"
@@ -7340,33 +7590,41 @@ fn rmsnorm_scale_matches_the_shipping_reduction() {
     let normed = device.new_buffer(k * 4, options).unwrap();
     let scale = device.new_buffer(4, options).unwrap();
 
-    call_rms_norm(
-        &device,
-        &encoder,
-        &kernels,
-        "rmsnorm_f32",
-        k,
-        k,
-        eps,
-        &src,
-        0,
-        &w,
-        0,
-        &normed,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm(
+            &device,
+            &encoder,
+            &kernels,
+            "rmsnorm_f32",
+            k,
+            k,
+            eps,
+            &src,
+            0,
+            &w,
+            0,
+            &normed,
+        )
+    }
     .unwrap();
-    call_rms_norm_scale(
-        &device,
-        &encoder,
-        &kernels,
-        "rmsnorm_scale_f32",
-        k,
-        k,
-        eps,
-        &src,
-        0,
-        &scale,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm_scale(
+            &device,
+            &encoder,
+            &kernels,
+            "rmsnorm_scale_f32",
+            k,
+            k,
+            eps,
+            &src,
+            0,
+            &scale,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -7408,16 +7666,20 @@ fn run_mlx_sort_dtype<T: Clone>(v: &[T], ncols: usize, dtype: DType) -> Vec<u32>
     let indexes = vec![0u32; v.len()];
     let output = new_buffer(&device, &indexes);
 
-    call_mlx_arg_sort(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        nrows,
-        ncols,
-        BufferOffset::zero_offset(&input),
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_arg_sort(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            nrows,
+            ncols,
+            BufferOffset::zero_offset(&input),
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -7630,23 +7892,27 @@ fn run_gemv_fused_silu(
         .new_buffer(length * core::mem::size_of::<f32>(), options)
         .unwrap();
 
-    call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Silu,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Silu,
+        )
+    }
     .unwrap();
 
     drop(encoder);
@@ -7807,38 +8073,46 @@ fn gemv_fused_silu_agrees_with_the_unfused_path() {
     let gate = device
         .new_buffer(n_out * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_mlx_gemv_with(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (b, m, n, k),
-        &[m * k, k, 1],
-        0,
-        &mat_buf,
-        &[k, 1, 1],
-        0,
-        &vec_buf,
-        &gate,
-        ParamStyle::Split,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_with(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (b, m, n, k),
+            &[m * k, k, 1],
+            0,
+            &mat_buf,
+            &[k, 1, 1],
+            0,
+            &vec_buf,
+            &gate,
+            ParamStyle::Split,
+        )
+    }
     .unwrap();
     let out = device
         .new_buffer(n_out * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_unary_contiguous(
-        &device,
-        &encoder,
-        &kernels,
-        unary::contiguous::silu::FLOAT,
-        core::mem::size_of::<f32>(),
-        n_out,
-        BufferOffset {
-            buffer: &gate,
-            offset_in_bytes: 0,
-        },
-        &out,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_unary_contiguous(
+            &device,
+            &encoder,
+            &kernels,
+            unary::contiguous::silu::FLOAT,
+            core::mem::size_of::<f32>(),
+            n_out,
+            BufferOffset {
+                buffer: &gate,
+                offset_in_bytes: 0,
+            },
+            &out,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -7889,23 +8163,27 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
 
     // `m == 1` routes to the TRANSPOSED kernel, which carries no `_silu`
     // instantiation.
-    let transposed = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 1, 512, k),
-        &[k, k, 1],
-        0,
-        &buf,
-        &[512 * k, 512, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Silu,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let transposed = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 1, 512, k),
+            &[k, k, 1],
+            0,
+            &buf,
+            &[512 * k, 512, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Silu,
+        )
+    };
     assert!(
         transposed.is_err(),
         "the transposed kernel has no fused epilogue and must be refused"
@@ -7915,23 +8193,27 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
     // could not otherwise cover the fused arms, §3.7c), so this is the
     // positive control of the refusals above: the same tile that is refused
     // transposed is admitted packed.
-    let packed = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 512, 1, k),
-        &[512 * k, k, 1],
-        0,
-        &buf,
-        &[k, 1, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Packed,
-        None,
-        GemvEpilogue::Silu,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let packed = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 512, 1, k),
+            &[512 * k, k, 1],
+            0,
+            &buf,
+            &[k, 1, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Packed,
+            None,
+            GemvEpilogue::Silu,
+        )
+    };
     assert!(
         packed.is_ok(),
         "the packed style has a fused epilogue sibling and must be admitted: {packed:?}"
@@ -7944,23 +8226,27 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
         scale: &scale,
         scale_offset: 0,
     };
-    let both = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 512, 1, k),
-        &[512 * k, k, 1],
-        0,
-        &buf,
-        &[k, 1, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Split,
-        Some(norm),
-        GemvEpilogue::Silu,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let both = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 512, 1, k),
+            &[512 * k, k, 1],
+            0,
+            &buf,
+            &[k, 1, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Split,
+            Some(norm),
+            GemvEpilogue::Silu,
+        )
+    };
     assert!(
         both.is_err(),
         "no `_rmsnorm_silu` variant is instantiated and the combination must \
@@ -7968,23 +8254,27 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
     );
 
     // The admitted bound: the non-transposed decode tile IS instantiated.
-    let ok = call_mlx_gemv_full(
-        &device,
-        &encoder,
-        &kernels,
-        GemmDType::F32,
-        (1, 512, 1, k),
-        &[512 * k, k, 1],
-        0,
-        &buf,
-        &[k, 1, 1],
-        0,
-        &buf,
-        &out,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Silu,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ok = unsafe {
+        call_mlx_gemv_full(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, 512, 1, k),
+            &[512 * k, k, 1],
+            0,
+            &buf,
+            &[k, 1, 1],
+            0,
+            &buf,
+            &out,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Silu,
+        )
+    };
     assert!(
         ok.is_ok(),
         "the non-transposed decode tile must be admitted: {ok:?}"
@@ -8097,24 +8387,28 @@ fn run_gemv_fused_residual(
         .new_buffer(length * core::mem::size_of::<f32>(), options)
         .unwrap();
 
-    call_mlx_gemv_epilogue(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Residual,
-        Some((&res_buf, 0)),
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_epilogue(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Residual,
+            Some((&res_buf, 0)),
+        )
+    }
     .unwrap();
 
     drop(encoder);
@@ -8157,24 +8451,28 @@ fn run_gemv_fused_mul(
     let output = device
         .new_buffer(length * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_mlx_gemv_epilogue(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Mul,
-        Some((&gate_buf, 0)),
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_epilogue(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Mul,
+            Some((&gate_buf, 0)),
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -8304,24 +8602,28 @@ fn run_gemv_fused_swiglu(
     let output = device
         .new_buffer(length * core::mem::size_of::<f32>(), options)
         .unwrap();
-    call_mlx_gemv_epilogue(
-        &device,
-        &encoder,
-        &kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        0,
-        &lhs_buf,
-        rhs_stride,
-        0,
-        &rhs_buf,
-        &output,
-        ParamStyle::Split,
-        None,
-        GemvEpilogue::Swiglu,
-        Some((&gate_buf, 0)),
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_mlx_gemv_epilogue(
+            &device,
+            &encoder,
+            &kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            0,
+            &lhs_buf,
+            rhs_stride,
+            0,
+            &rhs_buf,
+            &output,
+            ParamStyle::Split,
+            None,
+            GemvEpilogue::Swiglu,
+            Some((&gate_buf, 0)),
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -8582,24 +8884,28 @@ fn gemv_epilogue_operand_arity_is_enforced() {
         .unwrap();
 
     let call = |ep: GemvEpilogue, operand: Option<(&Buffer, usize)>| {
-        call_mlx_gemv_epilogue(
-            &device,
-            &encoder,
-            &kernels,
-            GemmDType::F32,
-            (1, n_out, 1, k),
-            &[n_out * k, k, 1],
-            0,
-            &mat_b,
-            &[k, 1, 1],
-            0,
-            &vec_b,
-            &out,
-            ParamStyle::Split,
-            None,
-            ep,
-            operand,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_mlx_gemv_epilogue(
+                &device,
+                &encoder,
+                &kernels,
+                GemmDType::F32,
+                (1, n_out, 1, k),
+                &[n_out * k, k, 1],
+                0,
+                &mat_b,
+                &[k, 1, 1],
+                0,
+                &vec_b,
+                &out,
+                ParamStyle::Split,
+                None,
+                ep,
+                operand,
+            )
+        }
     };
 
     // Residual with no operand: refused.
@@ -8797,22 +9103,26 @@ fn run_quantize_kv(
         SdpaQuantWriteParams::for_append(seq_len * head_dim, capacity, head_dim, dst_offset, bits);
     let params = new_buffer(device, &[p]);
 
-    call_quantize_kv(
-        device,
-        &encoder,
-        kernels,
-        0,
-        &src_buf,
-        &codes,
-        &scales,
-        &biases,
-        &params,
-        n_heads,
-        seq_len,
-        head_dim,
-        bits,
-        SdpaDType::F16,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_quantize_kv(
+            device,
+            &encoder,
+            kernels,
+            0,
+            &src_buf,
+            &codes,
+            &scales,
+            &biases,
+            &params,
+            n_heads,
+            seq_len,
+            head_dim,
+            bits,
+            SdpaDType::F16,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -9096,24 +9406,28 @@ fn sdpa_vector_quant_matches_the_scalar_reference_at_both_widths() {
         );
         let params = new_buffer(&device, &[p]);
 
-        call_sdpa_vector_quant(
-            &device,
-            &encoder,
-            &kernels,
-            0,
-            &[1, n_q_heads, 1, head_dim],
-            &q_buf,
-            &kc,
-            &ks,
-            &kb,
-            &vc,
-            &vs,
-            &vb,
-            &output,
-            &params,
-            bits,
-            SdpaDType::F16,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_sdpa_vector_quant(
+                &device,
+                &encoder,
+                &kernels,
+                0,
+                &[1, n_q_heads, 1, head_dim],
+                &q_buf,
+                &kc,
+                &ks,
+                &kb,
+                &vc,
+                &vs,
+                &vb,
+                &output,
+                &params,
+                bits,
+                SdpaDType::F16,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -9245,25 +9559,29 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
             head_dim,
             1,
         ];
-        call_sdpa_vector(
-            &device,
-            &encoder,
-            &kernels,
-            0,
-            &[1, n_q_heads, 1, head_dim],
-            &q_buf,
-            0,
-            &[1, n_kv_heads, kv_len, head_dim],
-            &strides,
-            &k_buf,
-            0,
-            &strides,
-            &v_buf,
-            &output,
-            scale,
-            1.0,
-            SdpaDType::F16,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_sdpa_vector(
+                &device,
+                &encoder,
+                &kernels,
+                0,
+                &[1, n_q_heads, 1, head_dim],
+                &q_buf,
+                0,
+                &[1, n_kv_heads, kv_len, head_dim],
+                &strides,
+                &k_buf,
+                0,
+                &strides,
+                &v_buf,
+                &output,
+                scale,
+                1.0,
+                SdpaDType::F16,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -9303,24 +9621,28 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
             bits,
         );
         let params = new_buffer(&device, &[p]);
-        call_sdpa_vector_quant(
-            &device,
-            &encoder,
-            &kernels,
-            0,
-            &[1, n_q_heads, 1, head_dim],
-            &q_buf,
-            &kc,
-            &ks,
-            &kb,
-            &vc,
-            &vs,
-            &vb,
-            &output,
-            &params,
-            bits,
-            SdpaDType::F16,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_sdpa_vector_quant(
+                &device,
+                &encoder,
+                &kernels,
+                0,
+                &[1, n_q_heads, 1, head_dim],
+                &q_buf,
+                &kc,
+                &ks,
+                &kb,
+                &vc,
+                &vs,
+                &vb,
+                &output,
+                &params,
+                bits,
+                SdpaDType::F16,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -9393,22 +9715,26 @@ fn run_quantize_kv_f32(
     let p =
         SdpaQuantWriteParams::for_append(seq_len * head_dim, capacity, head_dim, dst_offset, bits);
     let params = new_buffer(device, &[p]);
-    call_quantize_kv(
-        device,
-        &encoder,
-        kernels,
-        0,
-        &src_buf,
-        &codes,
-        &scales,
-        &biases,
-        &params,
-        n_heads,
-        seq_len,
-        head_dim,
-        bits,
-        SdpaDType::F32,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_quantize_kv(
+            device,
+            &encoder,
+            kernels,
+            0,
+            &src_buf,
+            &codes,
+            &scales,
+            &biases,
+            &params,
+            n_heads,
+            seq_len,
+            head_dim,
+            bits,
+            SdpaDType::F32,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -9592,31 +9918,10 @@ fn qwen_quant_attention_case(
         new_buffer(device, &vbi),
     );
     match sel {
-        None => call_sdpa_vector_quant(
-            device,
-            &encoder,
-            kernels,
-            0,
-            &[1, n_q, 1, hd],
-            &qb,
-            &kcb,
-            &ksb,
-            &kbb,
-            &vcb,
-            &vsb,
-            &vbb,
-            &output,
-            &params,
-            bits,
-            SdpaDType::F32,
-        )
-        .unwrap(),
-        Some(cells) => {
-            // A leading pad word, so the binding's byte offset is exercised.
-            let mut padded = vec![u32::MAX];
-            padded.extend_from_slice(cells);
-            let sb = new_buffer(device, &padded);
-            call_sdpa_vector_quant_sel(
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        None => unsafe {
+            call_sdpa_vector_quant(
                 device,
                 &encoder,
                 kernels,
@@ -9631,10 +9936,39 @@ fn qwen_quant_attention_case(
                 &vbb,
                 &output,
                 &params,
-                (&sb, 4),
                 bits,
                 SdpaDType::F32,
             )
+        }
+        .unwrap(),
+        Some(cells) => {
+            // A leading pad word, so the binding's byte offset is exercised.
+            let mut padded = vec![u32::MAX];
+            padded.extend_from_slice(cells);
+            let sb = new_buffer(device, &padded);
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_sdpa_vector_quant_sel(
+                    device,
+                    &encoder,
+                    kernels,
+                    0,
+                    &[1, n_q, 1, hd],
+                    &qb,
+                    &kcb,
+                    &ksb,
+                    &kbb,
+                    &vcb,
+                    &vsb,
+                    &vbb,
+                    &output,
+                    &params,
+                    (&sb, 4),
+                    bits,
+                    SdpaDType::F32,
+                )
+            }
             .unwrap()
         }
     }
@@ -10041,18 +10375,22 @@ fn run_eos_index(tokens: &[u32], eos_ids: &[u32]) -> u32 {
     let tokens_buf = new_buffer(&device, tokens);
     let eos_buf = new_buffer(&device, eos_ids);
     let out = new_buffer(&device, &[u32::MAX]); // 1 word, pre-set to a value the kernel must overwrite
-    crate::kernels::kernels::call_eos_index(
-        &device,
-        &encoder,
-        &kernels,
-        &tokens_buf,
-        0,
-        tokens.len(),
-        &eos_buf,
-        0,
-        eos_ids.len(),
-        &out,
-    )
+                                                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                                                // results only after waiting for the command buffer that writes them.
+    unsafe {
+        crate::kernels::kernels::call_eos_index(
+            &device,
+            &encoder,
+            &kernels,
+            &tokens_buf,
+            0,
+            tokens.len(),
+            &eos_buf,
+            0,
+            eos_ids.len(),
+            &out,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10114,18 +10452,22 @@ fn run_eos_index_at(buffer: &[u32], offset: usize, n: usize, eos_ids: &[u32]) ->
     let tokens_buf = new_buffer(&device, buffer);
     let eos_buf = new_buffer(&device, eos_ids);
     let out = new_buffer(&device, &[u32::MAX]);
-    crate::kernels::kernels::call_eos_index(
-        &device,
-        &encoder,
-        &kernels,
-        &tokens_buf,
-        offset * std::mem::size_of::<u32>(), // BYTE offset, as Metal's setBuffer:offset:
-        n,
-        &eos_buf,
-        0,
-        eos_ids.len(),
-        &out,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        crate::kernels::kernels::call_eos_index(
+            &device,
+            &encoder,
+            &kernels,
+            &tokens_buf,
+            offset * std::mem::size_of::<u32>(), // BYTE offset, as Metal's setBuffer:offset:
+            n,
+            &eos_buf,
+            0,
+            eos_ids.len(),
+            &out,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10376,20 +10718,24 @@ fn rmsnorm_contiguous<T: Copy>(
     let input = new_buffer(device, src);
     let alpha_buf = new_buffer(device, alpha);
     let output = new_buffer(device, src);
-    call_rms_norm(
-        device,
-        &encoder,
-        kernels,
-        name,
-        src.len(),
-        d,
-        1e-5,
-        &input,
-        0,
-        &alpha_buf,
-        0,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm(
+            device,
+            &encoder,
+            kernels,
+            name,
+            src.len(),
+            d,
+            1e-5,
+            &input,
+            0,
+            &alpha_buf,
+            0,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10413,25 +10759,29 @@ fn rmsnorm_strided<T: Copy>(
     let input = new_buffer(device, bthd);
     let alpha_buf = new_buffer(device, alpha);
     let output = new_buffer(device, bthd);
-    call_rms_norm_strided_with(
-        device,
-        &encoder,
-        kernels,
-        name,
-        shape,
-        strides,
-        1e-5,
-        BufferOffset {
-            buffer: &input,
-            offset_in_bytes: 0,
-        },
-        BufferOffset {
-            buffer: &alpha_buf,
-            offset_in_bytes: 0,
-        },
-        &output,
-        style,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm_strided_with(
+            device,
+            &encoder,
+            kernels,
+            name,
+            shape,
+            strides,
+            1e-5,
+            BufferOffset {
+                buffer: &input,
+                offset_in_bytes: 0,
+            },
+            BufferOffset {
+                buffer: &alpha_buf,
+                offset_in_bytes: 0,
+            },
+            &output,
+            style,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10566,23 +10916,27 @@ fn rmsnorm_then_rope<T: Copy>(
     let cos_buf = new_buffer(device, cos);
     let sin_buf = new_buffer(device, sin);
     let output = new_buffer(device, &normed);
-    call_rope(
-        device,
-        &encoder,
-        kernels,
-        rope,
-        g.b * g.h,
-        g.t * g.d,
-        g.d,
-        0,
-        &input,
-        0,
-        &cos_buf,
-        0,
-        &sin_buf,
-        0,
-        &output,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rope(
+            device,
+            &encoder,
+            kernels,
+            rope,
+            g.b * g.h,
+            g.t * g.d,
+            g.d,
+            0,
+            &input,
+            0,
+            &cos_buf,
+            0,
+            &sin_buf,
+            0,
+            &output,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10610,22 +10964,26 @@ fn rmsnorm_rope<T: Copy>(
     let cos_buf = new_buffer(device, cos);
     let sin_buf = new_buffer(device, sin);
     let output = new_buffer(device, src);
-    call_rms_norm_rope_with(
-        device,
-        &encoder,
-        kernels,
-        name,
-        shape,
-        strides,
-        t_len,
-        1e-5,
-        bo(&input),
-        bo(&alpha_buf),
-        bo(&cos_buf),
-        bo(&sin_buf),
-        &output,
-        style,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        call_rms_norm_rope_with(
+            device,
+            &encoder,
+            kernels,
+            name,
+            shape,
+            strides,
+            t_len,
+            1e-5,
+            bo(&input),
+            bo(&alpha_buf),
+            bo(&cos_buf),
+            bo(&sin_buf),
+            &output,
+            style,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -10758,21 +11116,25 @@ fn rmsnorm_rope_refuses_a_row_its_threadgroup_cannot_pair() {
     let cos_buf = new_buffer(&device, &table);
     let sin_buf = new_buffer(&device, &table);
     let output = new_buffer(&device, &src);
-    let r = call_rms_norm_rope(
-        &device,
-        &encoder,
-        &kernels,
-        "rmsnorm_rope_f16",
-        &[1, 2, 1, 96],
-        None,
-        1,
-        1e-5,
-        bo(&input),
-        bo(&alpha_buf),
-        bo(&cos_buf),
-        bo(&sin_buf),
-        &output,
-    );
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let r = unsafe {
+        call_rms_norm_rope(
+            &device,
+            &encoder,
+            &kernels,
+            "rmsnorm_rope_f16",
+            &[1, 2, 1, 96],
+            None,
+            1,
+            1e-5,
+            bo(&input),
+            bo(&alpha_buf),
+            bo(&cos_buf),
+            bo(&sin_buf),
+            &output,
+        )
+    };
     assert!(r.is_err(), "a 96-wide row must be refused");
 }
 
@@ -10870,24 +11232,28 @@ fn copy_nd_writes_a_transposed_view_into_a_strided_window() {
         let encoder = commands.command_encoder().unwrap();
         let input = new_buffer(&device, &src);
         let output = new_buffer(&device, &fill);
-        call_copy_nd_with(
-            &device,
-            &encoder,
-            &kernels,
-            copy_nd::HALF,
-            &shape,
-            BufferOffset {
-                buffer: &input,
-                offset_in_bytes: 0,
-            },
-            &src_strides,
-            BufferOffset {
-                buffer: &output,
-                offset_in_bytes: off * g.d * 2,
-            },
-            &dst_strides,
-            style,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            call_copy_nd_with(
+                &device,
+                &encoder,
+                &kernels,
+                copy_nd::HALF,
+                &shape,
+                BufferOffset {
+                    buffer: &input,
+                    offset_in_bytes: 0,
+                },
+                &src_strides,
+                BufferOffset {
+                    buffer: &output,
+                    offset_in_bytes: off * g.d * 2,
+                },
+                &dst_strides,
+                style,
+            )
+        }
         .unwrap();
         drop(encoder);
         commands.wait_until_completed().unwrap();
@@ -11043,7 +11409,9 @@ fn a_blit_copy_extends_the_recorded_interval_of_both_buffers() {
     let commands = commands(&device);
     {
         let mut blit = commands.blit_command_encoder().unwrap();
-        blit.copy_from_buffer(&src, 0, &dst, 0, 256);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, 256) };
     }
     set_bind_observer(None);
     commands.wait_until_completed().unwrap();
@@ -11084,17 +11452,21 @@ fn run_inverse_cdf(logits: &[f32], vocab: usize, inv_t: f32, u: &[f32]) -> Vec<u
     let z = new_buffer(&device, logits);
     let ub = new_buffer(&device, u);
     let out = new_buffer(&device, &vec![u32::MAX; rows]);
-    crate::kernels::kernels::call_sample_inverse_cdf(
-        &device,
-        &encoder,
-        &kernels,
-        (&z, 0),
-        rows,
-        vocab,
-        inv_t,
-        (&ub, 0),
-        &out,
-    )
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    unsafe {
+        crate::kernels::kernels::call_sample_inverse_cdf(
+            &device,
+            &encoder,
+            &kernels,
+            (&z, 0),
+            rows,
+            vocab,
+            inv_t,
+            (&ub, 0),
+            &out,
+        )
+    }
     .unwrap();
     drop(encoder);
     commands.wait_until_completed().unwrap();
@@ -11290,23 +11662,27 @@ fn strided_copy_accepts_element_aligned_offsets() {
                     let sentinel = values[0];
                     let output = new_buffer(&dev, &[sentinel; 8]);
                     let encoder = commands.command_encoder().unwrap();
-                    call_unary_strided_with(
-                        &dev,
-                        &encoder,
-                        &kernels,
-                        unary::strided::Kernel(name),
-                        &[2, 3],
-                        BufferOffset {
-                            buffer: &input,
-                            offset_in_bytes: offset * size_of::<T>(),
-                        },
-                        &[1, 2],
-                        BufferOffset {
-                            buffer: &output,
-                            offset_in_bytes: size_of::<T>(),
-                        },
-                        style,
-                    )
+                    // SAFETY: the test owns every buffer bound or mapped here and reads its
+                    // results only after waiting for the command buffer that writes them.
+                    unsafe {
+                        call_unary_strided_with(
+                            &dev,
+                            &encoder,
+                            &kernels,
+                            unary::strided::Kernel(name),
+                            &[2, 3],
+                            BufferOffset {
+                                buffer: &input,
+                                offset_in_bytes: offset * size_of::<T>(),
+                            },
+                            &[1, 2],
+                            BufferOffset {
+                                buffer: &output,
+                                offset_in_bytes: size_of::<T>(),
+                            },
+                            style,
+                        )
+                    }
                     .unwrap();
                     drop(encoder);
                     commands.wait_until_completed().unwrap();

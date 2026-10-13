@@ -1022,7 +1022,9 @@ impl WeightGroups {
         let lloom_tensor::Storage::Metal(m) = &*storage else {
             return None;
         };
-        let base = m.buffer().contents();
+        // SAFETY: the loader writes only slots the cache handed out as
+        // victims past their last reader's epoch (`victim_settled`).
+        let base = unsafe { m.buffer().contents() };
         if base.is_null() {
             return None;
         }

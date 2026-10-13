@@ -65,8 +65,13 @@ fn one_thread() -> (MTLSize, MTLSize) {
 /// that would run past it is declined rather than wrapped -- wrapping would
 /// hand out an offset addressing another slot's bytes, which is silent
 /// corruption under `HazardTrackingModeUntracked` (§3.5).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_arena_bump(
+pub unsafe fn call_arena_bump(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -84,16 +89,19 @@ pub fn call_arena_bump(
     // The cursor is bound as an Output: it is read-modify-written, and binding
     // it as an input would let a write-after-read against the previous step's
     // readers go unordered. See `call_arena_reset`.
-    set_params!(
-        encoder,
-        (
-            Output::new(cursor),
-            sizes,
-            Output::new(out_offs),
-            n,
-            capacity
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                Output::new(cursor),
+                sizes,
+                Output::new(out_offs),
+                n,
+                capacity
+            )
+        );
+    }
     let (grid, group) = one_thread();
     encoder.dispatch_thread_groups(grid, group);
     Ok(())
@@ -106,8 +114,13 @@ pub fn call_arena_bump(
 /// from ordinal to offset -- so the sequential form is chosen on evidence
 /// rather than on caution. §2.3.2: a nondeterministic layout is
 /// indistinguishable from a missing fence, so this must not reach a model.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_arena_bump_concurrent(
+pub unsafe fn call_arena_bump_concurrent(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -122,16 +135,19 @@ pub fn call_arena_bump_concurrent(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "arena_bump_concurrent n={n}");
-    set_params!(
-        encoder,
-        (
-            Output::new(cursor),
-            sizes,
-            Output::new(out_offs),
-            n,
-            capacity
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                Output::new(cursor),
+                sizes,
+                Output::new(out_offs),
+                n,
+                capacity
+            )
+        );
+    }
     let group = MTLSize {
         width: (n as usize).clamp(1, 64),
         height: 1,
@@ -186,7 +202,12 @@ pub fn call_arena_bump_concurrent(
 /// a kernel that still resets the cursor correctly in isolation and races the
 /// previous step in an encoder -- the silent case §9.3 says has no safety net,
 /// and `reset_orders_against_the_previous_steps_arena_reads` is what pins it.
-pub fn call_arena_reset(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_arena_reset(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -198,11 +219,17 @@ pub fn call_arena_reset(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "arena_reset_cursor");
-    set_params!(encoder, (Output::new(cursor)));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (Output::new(cursor)));
+    }
     // Bound for ordering, not for data -- see the doc comment. The index is
     // past the kernel's declared arguments, which Metal permits, and the kernel
     // never reads it.
-    encoder.set_output_buffer(1, Some(arena), 0);
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        encoder.set_output_buffer(1, Some(arena), 0);
+    }
     let (grid, group) = one_thread();
     encoder.dispatch_thread_groups(grid, group);
     Ok(())
@@ -213,7 +240,12 @@ pub fn call_arena_reset(
 /// The cross-boundary check §11.3d argues for: a `static_assert` in MSL proves
 /// only that MSL agrees with itself, and the failure being guarded against is
 /// the two sides disagreeing.
-pub fn call_arena_alloc_report(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_arena_alloc_report(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -224,7 +256,10 @@ pub fn call_arena_alloc_report(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "arena_alloc_report");
-    set_params!(encoder, (Output::new(out)));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (Output::new(out)));
+    }
     let (grid, group) = one_thread();
     encoder.dispatch_thread_groups(grid, group);
     Ok(())

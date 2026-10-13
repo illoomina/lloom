@@ -39,8 +39,12 @@ const SHORTCONV_RING_PARAMS_ALIGN: usize = core::mem::align_of::<ShortconvRingPa
 // only non-`usize` binds, and `conv.metal` declares them `bool` and `float` to
 // match. The parity tests are what would have caught it either way.
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_im2col1d_strided(
+pub unsafe fn call_im2col1d_strided(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -51,18 +55,21 @@ pub fn call_im2col1d_strided(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_im2col1d_strided_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        (k_size, stride, padding, dilation),
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_im2col1d_strided_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            (k_size, stride, padding, dilation),
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_im2col1d_strided`], choosing how the scalars are bound.
@@ -71,8 +78,13 @@ pub fn call_im2col1d_strided(
 /// so there is one body rather than two and the styles cannot drift in what
 /// they bind -- which is the property that makes the bit-identical test
 /// meaningful.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_im2col1d_strided_with(
+pub unsafe fn call_im2col1d_strided_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -94,21 +106,24 @@ pub fn call_im2col1d_strided_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "im2col1d {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            l_out,
-            k_size,
-            stride,
-            padding,
-            dilation,
-            shape,
-            strides,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                l_out,
+                k_size,
+                stride,
+                padding,
+                dilation,
+                shape,
+                strides,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, IM2COL1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -121,8 +136,13 @@ pub fn call_im2col1d_strided_with(
 /// transposes the result, and candle splits grouped convolutions into one
 /// convolution per group — so a depthwise layer over N channels costs roughly
 /// 3N dispatches there against one here.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise(
+pub unsafe fn call_conv1d_depthwise(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -134,24 +154,32 @@ pub fn call_conv1d_depthwise(
     weight: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_conv1d_depthwise_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        (k_size, stride, padding, dilation),
-        input,
-        weight,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_conv1d_depthwise_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            (k_size, stride, padding, dilation),
+            input,
+            weight,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_conv1d_depthwise`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise_with(
+pub unsafe fn call_conv1d_depthwise_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -175,22 +203,25 @@ pub fn call_conv1d_depthwise_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_depthwise {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            l_out,
-            k_size,
-            stride,
-            padding,
-            dilation,
-            shape,
-            strides,
-            &input,
-            &weight,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                l_out,
+                k_size,
+                stride,
+                padding,
+                dilation,
+                shape,
+                strides,
+                &input,
+                &weight,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -209,8 +240,13 @@ pub fn call_conv1d_depthwise_with(
 /// The preconditions are the caller's to enforce; this function cannot check
 /// them, because the layout is not passed in. `MetalStorage::conv1d_depthwise`
 /// is the single caller and checks all three.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise_k(
+pub unsafe fn call_conv1d_depthwise_k(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -221,23 +257,31 @@ pub fn call_conv1d_depthwise_k(
     weight: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_conv1d_depthwise_k_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        (k_size, padding),
-        input,
-        weight,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_conv1d_depthwise_k_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            (k_size, padding),
+            input,
+            weight,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_conv1d_depthwise_k`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise_k_with(
+pub unsafe fn call_conv1d_depthwise_k_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -261,18 +305,21 @@ pub fn call_conv1d_depthwise_k_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_depthwise_k {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            l_out,
-            padding,
-            shape,
-            &input,
-            &weight,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                l_out,
+                padding,
+                shape,
+                &input,
+                &weight,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_K_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -284,8 +331,13 @@ pub fn call_conv1d_depthwise_k_with(
 /// `tid`; the caller passes the `C` tensor. Same preconditions as
 /// [`call_conv1d_depthwise_k`] (stride 1, dilation 1, contiguous source), plus
 /// `scale` contiguous in destination layout — the single caller enforces both.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise_k_scaled(
+pub unsafe fn call_conv1d_depthwise_k_scaled(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -297,24 +349,32 @@ pub fn call_conv1d_depthwise_k_scaled(
     scale: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_conv1d_depthwise_k_scaled_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        (k_size, padding),
-        input,
-        weight,
-        scale,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_conv1d_depthwise_k_scaled_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            (k_size, padding),
+            input,
+            weight,
+            scale,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_conv1d_depthwise_k_scaled`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv1d_depthwise_k_scaled_with(
+pub unsafe fn call_conv1d_depthwise_k_scaled_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -337,19 +397,22 @@ pub fn call_conv1d_depthwise_k_scaled_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_depthwise_k_scaled {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            l_out,
-            padding,
-            shape,
-            &input,
-            &weight,
-            &scale,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                l_out,
+                padding,
+                shape,
+                &input,
+                &weight,
+                &scale,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_K_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -363,8 +426,13 @@ pub fn call_conv1d_depthwise_k_scaled_with(
 /// contiguous `state_in`/`state_out` in `[b, hidden, k]`, contiguous `weight` in
 /// `[hidden, k]`, decode shape (`l_out == 1`), and a `k` with an instantiated
 /// variant. The single caller enforces them.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_shortconv_step(
+pub unsafe fn call_shortconv_step(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -378,26 +446,34 @@ pub fn call_shortconv_step(
     state_out: &Buffer,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_shortconv_step_with(
-        device,
-        ep,
-        kernels,
-        name,
-        (dst_numel, hidden, proj_stride_b, proj_stride_c),
-        b_in,
-        x_in,
-        c_in,
-        state_in,
-        weight,
-        state_out,
-        dst,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_shortconv_step_with(
+            device,
+            ep,
+            kernels,
+            name,
+            (dst_numel, hidden, proj_stride_b, proj_stride_c),
+            b_in,
+            x_in,
+            c_in,
+            state_in,
+            weight,
+            state_out,
+            dst,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_shortconv_step`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_shortconv_step_with(
+pub unsafe fn call_shortconv_step_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -420,22 +496,25 @@ pub fn call_shortconv_step_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "shortconv_step {name} dst_numel={dst_numel}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_numel,
-            hidden,
-            proj_stride_b,
-            proj_stride_c,
-            &b_in,
-            &x_in,
-            &c_in,
-            &state_in,
-            &weight,
-            Output::new(state_out),
-            Output::new(dst)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_numel,
+                hidden,
+                proj_stride_b,
+                proj_stride_c,
+                &b_in,
+                &x_in,
+                &c_in,
+                &state_in,
+                &weight,
+                Output::new(state_out),
+                Output::new(dst)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, SHORTCONV_STEP_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -450,8 +529,13 @@ pub fn call_shortconv_step_with(
 /// `weights` in `[width, hidden, width]` (the per-phase permuted table),
 /// `1 <= seq_len <= width`; `dst` is written contiguous `[b, seq_len, hidden]`.
 /// The single caller enforces them.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_shortconv_ring(
+pub unsafe fn call_shortconv_ring(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -471,27 +555,35 @@ pub fn call_shortconv_ring(
     row_slots: &Buffer,
     row_phases: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_shortconv_ring_with(
-        device,
-        ep,
-        kernels,
-        name,
-        params,
-        b_in,
-        x_in,
-        c_in,
-        state,
-        weights,
-        dst,
-        row_slots,
-        row_phases,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_shortconv_ring_with(
+            device,
+            ep,
+            kernels,
+            name,
+            params,
+            b_in,
+            x_in,
+            c_in,
+            state,
+            weights,
+            dst,
+            row_slots,
+            row_phases,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_shortconv_ring`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_shortconv_ring_with(
+pub unsafe fn call_shortconv_ring_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -520,38 +612,45 @@ pub fn call_shortconv_ring_with(
         params.seq_len
     );
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            params.dst_numel as usize,
-            params.hidden as usize,
-            params.seq_len as usize,
-            params.width as usize,
-            params.phase_last as usize,
-            params.proj_stride_b as usize,
-            params.proj_stride_c as usize,
-            params.proj_stride_l as usize,
-            params.per_row as usize,
-            &b_in,
-            &x_in,
-            &c_in,
-            // `Output`, not a plain bind: the state is written, and the
-            // encoder's hazard tracker must see the write to order the next
-            // pass's read of the same range against it (§9.2e).
-            Output::from_buffer_offset(&state),
-            &weights,
-            Output::new(dst),
-            row_slots,
-            row_phases
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                params.dst_numel as usize,
+                params.hidden as usize,
+                params.seq_len as usize,
+                params.width as usize,
+                params.phase_last as usize,
+                params.proj_stride_b as usize,
+                params.proj_stride_c as usize,
+                params.proj_stride_l as usize,
+                params.per_row as usize,
+                &b_in,
+                &x_in,
+                &c_in,
+                // `Output`, not a plain bind: the state is written, and the
+                // encoder's hazard tracker must see the write to order the next
+                // pass's read of the same range against it (§9.2e).
+                Output::from_buffer_offset(&state),
+                &weights,
+                Output::new(dst),
+                row_slots,
+                row_phases
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, SHORTCONV_RING_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_col2im1d(
+pub unsafe fn call_col2im1d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -562,23 +661,31 @@ pub fn call_col2im1d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_col2im1d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        k_size,
-        stride,
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_col2im1d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            k_size,
+            stride,
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_col2im1d`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_col2im1d_with(
+pub unsafe fn call_col2im1d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -602,26 +709,33 @@ pub fn call_col2im1d_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "col2im1d {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            l_out,
-            l_in,
-            c_out,
-            k_size,
-            stride,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                l_out,
+                l_in,
+                c_out,
+                k_size,
+                stride,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, COL2IM1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_im2col_strided(
+pub unsafe fn call_im2col_strided(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -632,23 +746,31 @@ pub fn call_im2col_strided(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_im2col_strided_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        (h_k, w_k, stride, padding, dilation),
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_im2col_strided_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            (h_k, w_k, stride, padding, dilation),
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_im2col_strided`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_im2col_strided_with(
+pub unsafe fn call_im2col_strided_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -675,30 +797,37 @@ pub fn call_im2col_strided_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "im2col {name} dst_el={dst_el}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            h_out,
-            w_out,
-            h_k,
-            w_k,
-            stride,
-            padding,
-            dilation,
-            shape,
-            strides,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                h_out,
+                w_out,
+                h_k,
+                w_k,
+                stride,
+                padding,
+                dilation,
+                shape,
+                strides,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, IM2COL_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_upsample_nearest_2d(
+pub unsafe fn call_upsample_nearest_2d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -710,24 +839,32 @@ pub fn call_upsample_nearest_2d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_upsample_nearest_2d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        out_w,
-        out_h,
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_upsample_nearest_2d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            out_w,
+            out_h,
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_upsample_nearest_2d`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_upsample_nearest_2d_with(
+pub unsafe fn call_upsample_nearest_2d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -750,26 +887,33 @@ pub fn call_upsample_nearest_2d_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "upsample_nearest2d {name} {out_w}x{out_h}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            out_w,
-            out_h,
-            scale_w,
-            scale_h,
-            shape,
-            strides,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                out_w,
+                out_h,
+                scale_w,
+                scale_h,
+                shape,
+                strides,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, UPSAMPLE_NEAREST2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_upsample_bilinear_2d(
+pub unsafe fn call_upsample_bilinear_2d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -784,22 +928,25 @@ pub fn call_upsample_bilinear_2d(
     input: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_upsample_bilinear_2d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        out_w,
-        out_h,
-        align_corners,
-        scale_h,
-        scale_w,
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_upsample_bilinear_2d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            out_w,
+            out_h,
+            align_corners,
+            scale_h,
+            scale_w,
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_upsample_bilinear_2d`], choosing how the scalars are bound.
@@ -811,8 +958,13 @@ pub fn call_upsample_bilinear_2d(
 /// point has pinned `[[buffer(N)]]` indices, which the packed one deliberately
 /// does *not* carry forward -- seven scalars leave the argument list, so the
 /// remaining bindings renumber down to 0..4. See `conv.metal`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_upsample_bilinear_2d_with(
+pub unsafe fn call_upsample_bilinear_2d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -838,30 +990,37 @@ pub fn call_upsample_bilinear_2d_with(
     debug_group!(encoder, "upsample_bilinear2d {name} {out_w}x{out_h}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            out_w,
-            out_h,
-            align_corners,
-            scale_h.is_some(),
-            scale_h.unwrap_or(0.0) as f32,
-            scale_w.is_some(),
-            scale_w.unwrap_or(0.0) as f32,
-            shape,
-            strides,
-            &input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                out_w,
+                out_h,
+                align_corners,
+                scale_h.is_some(),
+                scale_h.unwrap_or(0.0) as f32,
+                scale_w.is_some(),
+                scale_w.unwrap_or(0.0) as f32,
+                shape,
+                strides,
+                &input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, UPSAMPLE_BILINEAR2D_PARAMS_ALIGN)?;
 
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_pool2d(
+pub unsafe fn call_pool2d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -877,23 +1036,26 @@ pub fn call_pool2d(
     input: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_pool2d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        strides,
-        out_w,
-        out_h,
-        w_k,
-        h_k,
-        w_stride,
-        h_stride,
-        input,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_pool2d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            strides,
+            out_w,
+            out_h,
+            w_k,
+            h_k,
+            w_stride,
+            h_stride,
+            input,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_pool2d`], choosing how the scalars are bound.
@@ -903,8 +1065,13 @@ pub fn call_pool2d(
 /// side, so it is not part of the binding and is untouched here. The integer
 /// `avg_pool2d` instantiations accumulate in their own type rather than
 /// widening (`DESIGN.md` §8.1c), and that is preserved by construction.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_pool2d_with(
+pub unsafe fn call_pool2d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -929,26 +1096,33 @@ pub fn call_pool2d_with(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "pool2d {name} {out_w}x{out_h} k={w_k}x{h_k}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            w_k,
-            h_k,
-            w_stride,
-            h_stride,
-            shape,
-            strides,
-            input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                w_k,
+                h_k,
+                w_stride,
+                h_stride,
+                shape,
+                strides,
+                input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, POOL2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv_transpose1d(
+pub unsafe fn call_conv_transpose1d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -970,34 +1144,42 @@ pub fn call_conv_transpose1d(
     kernel_offset: usize,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_conv_transpose1d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        dilation,
-        stride,
-        padding,
-        out_padding,
-        c_out,
-        l_out,
-        b_size,
-        src_shape,
-        src_strides,
-        kernel_shape,
-        kernel_strides,
-        input,
-        input_offset,
-        kernel,
-        kernel_offset,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_conv_transpose1d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            dilation,
+            stride,
+            padding,
+            out_padding,
+            c_out,
+            l_out,
+            b_size,
+            src_shape,
+            src_strides,
+            kernel_shape,
+            kernel_strides,
+            input,
+            input_offset,
+            kernel,
+            kernel_offset,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_conv_transpose1d`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv_transpose1d_with(
+pub unsafe fn call_conv_transpose1d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1031,23 +1213,26 @@ pub fn call_conv_transpose1d_with(
         "conv_transpose1d {name} c_out={c_out} l_out={l_out} b={b_size}"
     );
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            l_out,
-            stride,
-            padding,
-            out_padding,
-            dilation,
-            src_shape,
-            src_strides,
-            kernel_shape,
-            kernel_strides,
-            (input, input_offset),
-            (kernel, kernel_offset),
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                l_out,
+                stride,
+                padding,
+                out_padding,
+                dilation,
+                src_shape,
+                src_strides,
+                kernel_shape,
+                kernel_strides,
+                (input, input_offset),
+                (kernel, kernel_offset),
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CONV_TRANSPOSE1D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
@@ -1070,8 +1255,12 @@ pub struct CallConvTranspose2dCfg<'a> {
     pub kernel_offset: usize,
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv_transpose2d(
+pub unsafe fn call_conv_transpose2d(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1081,22 +1270,30 @@ pub fn call_conv_transpose2d(
     kernel: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_conv_transpose2d_with(
-        device,
-        ep,
-        kernels,
-        name,
-        cfg,
-        input,
-        kernel,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_conv_transpose2d_with(
+            device,
+            ep,
+            kernels,
+            name,
+            cfg,
+            input,
+            kernel,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_conv_transpose2d`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_conv_transpose2d_with(
+pub unsafe fn call_conv_transpose2d_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1122,24 +1319,27 @@ pub fn call_conv_transpose2d_with(
         cfg.b_size
     );
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            cfg.out_w,
-            cfg.out_h,
-            cfg.stride,
-            cfg.padding,
-            cfg.output_padding,
-            cfg.dilation,
-            cfg.input_dims,
-            cfg.input_stride,
-            cfg.kernel_dims,
-            cfg.kernel_stride,
-            (input, cfg.input_offset),
-            (kernel, cfg.kernel_offset),
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                cfg.out_w,
+                cfg.out_h,
+                cfg.stride,
+                cfg.padding,
+                cfg.output_padding,
+                cfg.dilation,
+                cfg.input_dims,
+                cfg.input_stride,
+                cfg.kernel_dims,
+                cfg.kernel_stride,
+                (input, cfg.input_offset),
+                (kernel, cfg.kernel_offset),
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, CONV_TRANSPOSE2D_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())

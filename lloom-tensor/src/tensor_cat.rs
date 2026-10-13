@@ -48,13 +48,15 @@ impl Tensor {
                 .enumerate()
             {
                 if dim_idx != dim && v1 != v2 {
-                    Err(Error::ShapeMismatchCat {
-                        dim: dim_idx,
-                        first_shape: arg0.shape().clone(),
-                        n: arg_idx + 1,
-                        nth_shape: arg.shape().clone(),
-                    }
-                    .bt())?
+                    Err(
+                        Error::ShapeMismatchCat(Box::new(crate::error::ShapeMismatchCat {
+                            dim: dim_idx,
+                            first_shape: arg0.shape().clone(),
+                            n: arg_idx + 1,
+                            nth_shape: arg.shape().clone(),
+                        }))
+                        .bt(),
+                    )?
                 }
             }
         }
@@ -102,11 +104,13 @@ impl Tensor {
                 .bt())?
             }
             if arg.device().location() != device.location() {
-                Err(Error::DeviceMismatchBinaryOp {
-                    lhs: device.location(),
-                    rhs: arg.device().location(),
-                    op: "cat",
-                }
+                Err(Error::DeviceMismatchBinaryOp(Box::new(
+                    crate::error::DeviceMismatchBinaryOp {
+                        lhs: device.location(),
+                        rhs: arg.device().location(),
+                        op: "cat",
+                    },
+                ))
                 .bt())?
             }
             if rank != arg.rank() {
@@ -128,13 +132,15 @@ impl Tensor {
                     cat_dims[0] += v2;
                 }
                 if dim_idx != 0 && v1 != v2 {
-                    Err(Error::ShapeMismatchCat {
-                        dim: dim_idx,
-                        first_shape: arg0.shape().clone(),
-                        n: arg_idx + 1,
-                        nth_shape: arg.shape().clone(),
-                    }
-                    .bt())?
+                    Err(
+                        Error::ShapeMismatchCat(Box::new(crate::error::ShapeMismatchCat {
+                            dim: dim_idx,
+                            first_shape: arg0.shape().clone(),
+                            n: arg_idx + 1,
+                            nth_shape: arg.shape().clone(),
+                        }))
+                        .bt(),
+                    )?
                 }
             }
             let next_offset = offsets.last().context("empty offsets")? + arg.elem_count();
@@ -176,11 +182,13 @@ impl Tensor {
                 .bt())?
             }
             if arg.device().location() != device.location() {
-                Err(Error::DeviceMismatchBinaryOp {
-                    lhs: device.location(),
-                    rhs: arg.device().location(),
-                    op: "cat",
-                }
+                Err(Error::DeviceMismatchBinaryOp(Box::new(
+                    crate::error::DeviceMismatchBinaryOp {
+                        lhs: device.location(),
+                        rhs: arg.device().location(),
+                        op: "cat",
+                    },
+                ))
                 .bt())?
             }
             if rank != arg.rank() {
@@ -202,13 +210,15 @@ impl Tensor {
                     cat_dims[dim] += v2;
                 }
                 if dim_idx != dim && v1 != v2 {
-                    Err(Error::ShapeMismatchCat {
-                        dim: dim_idx,
-                        first_shape: arg0.shape().clone(),
-                        n: arg_idx + 1,
-                        nth_shape: arg.shape().clone(),
-                    }
-                    .bt())?
+                    Err(
+                        Error::ShapeMismatchCat(Box::new(crate::error::ShapeMismatchCat {
+                            dim: dim_idx,
+                            first_shape: arg0.shape().clone(),
+                            n: arg_idx + 1,
+                            nth_shape: arg.shape().clone(),
+                        }))
+                        .bt(),
+                    )?
                 }
             }
         }
@@ -298,12 +308,14 @@ impl Tensor {
             .bt())?
         }
         if self.device().location() != src.device().location() {
-            Err(Error::DeviceMismatchBinaryOp {
-                lhs: self.device().location(),
-                rhs: src.device().location(),
-                op: "slice-set",
-            }
-            .bt())?
+            Err(
+                Error::DeviceMismatchBinaryOp(Box::new(crate::error::DeviceMismatchBinaryOp {
+                    lhs: self.device().location(),
+                    rhs: src.device().location(),
+                    op: "slice-set",
+                }))
+                .bt(),
+            )?
         }
         if self.rank() != src.rank() {
             Err(Error::UnexpectedNumberOfDims {

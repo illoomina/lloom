@@ -1183,6 +1183,7 @@ impl SamplingConfig {
             prefill_tile,
             thinking: None,
             turn_tail: 0,
+            logprobs: None,
         }
     }
 }
@@ -1683,6 +1684,41 @@ pub struct ReasoningConfig {
     pub effort: Option<String>,
 }
 
+fn parse_missing_reasoning(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["as-sent", "log"]).map(str::to_string)
+}
+
+fn parse_keep_logprobs(v: &str) -> Result<String, String> {
+    lloom_tensor::options::parse_arm(v, &["none", "sampled", "full"]).map(str::to_string)
+}
+
+/// The conversation's history as the front end keeps it: the sampled ids of
+/// each reply, and what is kept beside them.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[options(v0 = false)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Keep past replies' reasoning in the history the next turn renders (the chat template's `preserve_thinking`); unset = the template's own default.
+    #[opt(bool, flag = "persist-thinking", path = "session.persist_thinking", status = "stable", cli = "persist-thinking", switches = ["strip-thinking=false"])]
+    pub persist_thinking: Option<bool>,
+    /// A past reply of ours sent back without the reasoning the model wrote: `as-sent` renders the message as the client sent it; `log` restores the reasoning from the session log.
+    #[opt(flag = "missing-reasoning", parser = "parse_missing_reasoning", variants = ["as-sent", "log"], path = "session.missing_reasoning", status = "advanced")]
+    pub missing_reasoning: String,
+    /// What the session log keeps beside each reply's sampled ids: `none`; `sampled`, the sampled token's log-probability; `full`, every position's log-probabilities over the vocabulary (for a trainer that embeds the engine).
+    #[opt(flag = "keep-logprobs", parser = "parse_keep_logprobs", variants = ["none", "sampled", "full"], path = "session.keep_logprobs", status = "advanced")]
+    pub keep_logprobs: String,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        SessionConfig {
+            persist_thinking: None,
+            missing_reasoning: "as-sent".into(),
+            keep_logprobs: "none".into(),
+        }
+    }
+}
+
 /// How a prompt is encoded.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(v0 = false)]
@@ -1912,6 +1948,9 @@ pub struct EngineOptions {
     /// Prompt encoding (`chat`).
     #[opt(nested, no_args)]
     pub prompt: PromptConfig,
+    /// The conversation's history (`chat`, `serve`).
+    #[opt(nested, no_args)]
+    pub session: SessionConfig,
     /// What a front-end reports.
     #[opt(nested, no_args)]
     pub report: ReportConfig,

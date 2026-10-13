@@ -1056,6 +1056,7 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
             },
             stats: done.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 
@@ -1282,6 +1283,9 @@ impl<P: QwenShape, R: ExpertResidency + HasStreamStats + Send + Sync + 'static> 
     }
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
+    }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {

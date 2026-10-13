@@ -19,7 +19,7 @@
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::readback::RING_HISTORY_SLOTS;
 use lloom::generation::{
-    Blocking, EosRead, LogitsProcessor, Processors, ReadbackStrategy, Ring, Sampling,
+    Blocking, EosRead, LogitsProcessor, Logprobs, Processors, ReadbackStrategy, Ring, Sampling,
     ThinkingBudget, ThinkingReport,
 };
 use lloom::nn::{
@@ -263,6 +263,20 @@ pub struct DecodeParams {
     /// the next request, whose render keeps everything before it, is a
     /// restore there rather than a fresh prefill. 0: no hint.
     pub turn_tail: usize,
+    /// Keep each returned id's log-probability (`Decoded::logprobs`). A host
+    /// read of every step's logits: the run takes the blocking arm, as the
+    /// logits digest does, and the speculative body and the batch scheduler
+    /// refuse it. `None` costs nothing.
+    pub logprobs: Option<LogprobRequest>,
+}
+
+/// What a run keeps of each step's distribution: the drawn id's
+/// log-probability always, the `top` most likely, and with `rows` the whole
+/// row (a trainer's use, never the inference path's).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogprobRequest {
+    pub top: usize,
+    pub rows: bool,
 }
 
 impl DecodeParams {
@@ -315,6 +329,15 @@ impl DecodeParams {
         Ok(())
     }
 
+    /// Refuse the logprobs on a path that reads no logits on the host —
+    /// `path` names it and `why` says what it reads instead.
+    pub fn refuse_logprobs(&self, path: &str, why: &str) -> Result<()> {
+        if self.logprobs.is_some() {
+            lloom_tensor::bail!("{path} does not keep per-token logprobs: {why}");
+        }
+        Ok(())
+    }
+
     /// Refuse the thinking budget on a path that cannot feed its forced
     /// tokens — `path` names it and `why` says what it feeds instead.
     pub fn refuse_thinking_budget(&self, path: &str, why: &str) -> Result<()> {
@@ -345,6 +368,7 @@ impl Default for DecodeParams {
             prefill_tile: 0,
             thinking: None,
             turn_tail: 0,
+            logprobs: None,
         }
     }
 }
@@ -375,6 +399,9 @@ pub struct Decoded {
     pub stats: DecodeStats,
     /// What the run did inside the thinking block, when a budget was armed.
     pub thinking: Option<ThinkingReport>,
+    /// Per returned id, its log-probability (and what else
+    /// `DecodeParams::logprobs` asked for).
+    pub logprobs: Option<Logprobs>,
 }
 
 /// A decode session: a borrowed target and the sequence it drives — the cache,
@@ -696,7 +723,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 
         let mut sampler = params.sampler();
         sampler.observe_prompt(prompt_ids);
-        let arm = if params.logits_digest {
+        let arm = if params.logits_digest || params.logprobs.is_some() {
             ReadbackArm::Blocking
         } else {
             params
@@ -729,9 +756,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Ok(true)
         };
 
+        let mut logprobs: Option<Logprobs> = None;
         let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+                if let Some(r) = params.logprobs {
+                    readback = readback.with_logprobs(r.top, r.rows);
+                }
                 readback.set_thinking_budget(params.thinking.as_ref())?;
                 let opts = self.config.options(
                     params.max_tokens,
@@ -746,6 +777,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     &opts,
                     &mut on_tokens,
                 )?;
+                logprobs = readback.take_logprobs();
                 (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
@@ -931,6 +963,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             logits_sha256: sampler.logits_digest(),
             stats: out.stats,
             thinking,
+            logprobs,
         })
     }
 }
@@ -988,6 +1021,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             "the speculative body (--dspark, --mtp)",
             "its verify accepts the target's argmax over a drafted block, so a forced token \
              cannot be fed in place of a draw",
+        )?;
+        params.refuse_logprobs(
+            "the speculative body (--dspark, --mtp)",
+            "its verify reads the drawn ids back, never a row of logits",
         )?;
         if params.logits_digest {
             lloom_tensor::bail!(
@@ -1085,6 +1122,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             logits_sha256: None,
             stats: out.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 }

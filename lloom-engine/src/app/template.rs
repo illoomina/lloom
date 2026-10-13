@@ -37,7 +37,7 @@ pub const REQUEST_FIELDS: [&str; 3] = [REASONING_EFFORT, ENABLE_THINKING, TOOLS]
 /// A value no template recognises: rendering with it in place of a
 /// variable's value shows whether the template's output depends on that
 /// value at all.
-const PROBE_VALUE: &str = "lloom-probe: not a value";
+pub(super) const PROBE_VALUE: &str = "lloom-probe: not a value";
 
 /// The template refused to render the request (`raise_exception`): the
 /// message is the template's own.

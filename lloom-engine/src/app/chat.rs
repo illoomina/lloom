@@ -18,6 +18,7 @@
 
 use super::budgets::{self, PromptMode};
 use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
+use super::front::{self, Front};
 use super::report;
 use super::served::Served;
 use super::template::{Rejected, Unrenderable, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
@@ -55,6 +56,9 @@ pub struct ChatArgs {
     pub prompt_options: crate::options::PromptConfigArgs,
 
     #[command(flatten)]
+    pub session: crate::options::SessionConfigArgs,
+
+    #[command(flatten)]
     pub report: crate::options::ReportConfigArgs,
 
     /// A system message for the conversation.
@@ -86,6 +90,7 @@ impl ChatArgs {
         self.prefix.apply(&mut o.prefix)?;
         self.reasoning.apply(&mut o.reasoning)?;
         self.prompt_options.apply(&mut o.prompt)?;
+        self.session.apply(&mut o.session)?;
         self.report.apply(&mut o.report)
     }
 }
@@ -281,6 +286,20 @@ pub fn run(args: ChatArgs) -> Result<()> {
         kwargs.insert(REASONING_EFFORT.into(), json!(effort));
     }
     check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
+    let front = Front::new(engine.as_ref(), front::SessionOptions::of(&options.session));
+    eprintln!("[session: {}]", front.line());
+    if let Some(why) = front.persist_unsupported() {
+        anyhow::bail!(
+            "--persist-thinking: {}: {why}",
+            engine.capabilities().family
+        );
+    }
+    if let (Some(why), true) = (
+        front::logprobs_refused(engine.as_ref()),
+        front.options().keep != front::KeepLogprobs::None,
+    ) {
+        anyhow::bail!("--keep-logprobs: {why}");
+    }
     if !args.raw {
         check_thinking(engine.as_ref(), args.system.as_deref(), &kwargs, want)?;
     }
@@ -370,29 +389,44 @@ pub fn run(args: ChatArgs) -> Result<()> {
             messages.push(json!({ "role": "user", "content": parts }));
             images.append(&mut pending);
         }
-        let rendered = if args.raw {
-            user.clone()
-        } else {
-            engine.render_chat(&json!(messages), &kwargs)?
-        };
-        let rendered = if images.is_empty() {
-            rendered
+        // One render and one tokenization: the replies of ours the history
+        // carries take the ids the model sampled (`front.rs`).
+        let built = if args.raw {
+            None
         } else {
             let expansions = images
                 .iter()
                 .map(|img| engine.image_placeholder(img))
                 .collect::<Result<Vec<_>>>()?;
-            expand_image_tokens(&rendered, &expansions)?
+            let expand = |r: &str| expand_image_tokens(r, &expansions);
+            let expand_ref: front::Expand<'_> = &expand;
+            let conv = json!(messages);
+            Some(
+                front
+                    .prompt(
+                        engine.as_ref(),
+                        front::Request {
+                            messages: &conv,
+                            kwargs: kwargs.clone(),
+                            want,
+                            add_bos,
+                            expand: (!images.is_empty()).then_some(expand_ref),
+                        },
+                    )
+                    .map_err(|e| {
+                        if let Some(r) = e.downcast_ref::<front::Refused>() {
+                            return anyhow::anyhow!("--think: {r}");
+                        }
+                        e
+                    })?,
+            )
         };
-        let mut ids = engine.encode(&rendered, add_bos)?;
+        let mut ids = match &built {
+            Some(p) => p.ids.clone(),
+            None => engine.encode(&user, add_bos)?,
+        };
         let tags = engine.think_tags();
-        let think: Option<Thinking> = if args.raw {
-            None
-        } else {
-            let t = thinking::apply(want, tags.as_ref(), &mut ids)
-                .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
-            Some(t)
-        };
+        let think: Option<Thinking> = built.as_ref().and_then(|p| p.thinking);
         // The prompt budget, before the prompt reaches the engine: truncated,
         // the conversation itself loses its oldest turns, so the next turn
         // extends the cache this one leaves.
@@ -405,37 +439,47 @@ pub fn run(args: ChatArgs) -> Result<()> {
                     "--prompt-budget-mode truncate drops the oldest turns instead"
                 ));
             }
-            if args.raw {
-                (ids, dropped) = budgets::truncate_raw(&ids, k, engine.bos_id());
-            } else {
-                if !images.is_empty() {
-                    anyhow::bail!(
-                        "--prompt-budget {k}: the conversation holds an image, and truncating it \
-                         would drop turns without their images"
-                    );
+            match &built {
+                None => (ids, dropped) = budgets::truncate_raw(&ids, k, engine.bos_id()),
+                Some(p) => {
+                    if !images.is_empty() {
+                        anyhow::bail!(
+                            "--prompt-budget {k}: the conversation holds an image, and truncating it \
+                             would drop turns without their images"
+                        );
+                    }
+                    let fitted = match front.fit(p, &messages, k) {
+                        Some(f) => f,
+                        None => budgets::fit_messages(&messages, k, ids.len(), |ms| {
+                            let mut ids = engine
+                                .encode(&engine.render_chat(&json!(ms), &p.kwargs)?, add_bos)?;
+                            thinking::apply(want, tags.as_ref(), &mut ids)
+                                .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
+                            Ok(ids)
+                        })?
+                        .map(|f| front::Fitted {
+                            messages: f.messages,
+                            ids: f.ids,
+                            dropped: f.dropped,
+                        }),
+                    };
+                    let Some(fitted) = fitted else {
+                        anyhow::bail!(budgets::over_budget(
+                            ids.len(),
+                            k,
+                            "the last turn alone does not fit"
+                        ));
+                    };
+                    (messages, ids, dropped) = (fitted.messages, fitted.ids, fitted.dropped);
                 }
-                let fitted = budgets::fit_messages(&messages, k, ids.len(), |ms| {
-                    let mut ids =
-                        engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, add_bos)?;
-                    thinking::apply(want, tags.as_ref(), &mut ids)
-                        .map_err(|why| anyhow::anyhow!("--think: {why}"))?;
-                    Ok(ids)
-                })?;
-                let Some(fitted) = fitted else {
-                    anyhow::bail!(budgets::over_budget(
-                        ids.len(),
-                        k,
-                        "the last turn alone does not fit"
-                    ));
-                };
-                (messages, ids, dropped) = (fitted.messages, fitted.ids, fitted.dropped);
             }
         }
         let mut params =
             sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         params.logits_digest = options.decode.logits_digest;
-        if !args.raw {
-            params.turn_tail = thinking::checkpoint_tail(&*engine, &kwargs, want, &ids);
+        params.logprobs = front.options().keep.capture();
+        if let Some(p) = &built {
+            params.turn_tail = p.turn_tail;
         }
         if let Some(n) = sampling.thinking_budget {
             let refused = engine.thinking_budget_refused();
@@ -485,12 +529,15 @@ pub fn run(args: ChatArgs) -> Result<()> {
         out.finish();
         let decoded = decoded.context("decoding the turn")?;
         println!();
+        if let Some(p) = &built {
+            front.record(engine.as_ref(), p.thinking, &decoded);
+        }
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} logits_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} publish_parks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} think={} think_by={} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={} gen_prompt={} renders={} history={}/{} spliced={}/{}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -529,6 +576,10 @@ pub fn run(args: ChatArgs) -> Result<()> {
             dropped.tokens,
             params.turn_tail,
             engine.template_renders() - renders_before,
+            built.as_ref().map_or(0, |p| p.spliced.matched),
+            built.as_ref().map_or(0, |p| p.spliced.replies),
+            built.as_ref().map_or(0, |p| p.spliced.spliced_tokens),
+            built.as_ref().map_or(0, |p| p.spliced.reply_tokens),
         );
         if st.readback.poll_fallbacks > 0 {
             eprintln!(

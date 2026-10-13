@@ -1738,6 +1738,7 @@ impl<P: Lfm2Shape> Engine<P> {
             },
             stats: done.stats,
             thinking: None,
+            logprobs: None,
         })
     }
 
@@ -2829,6 +2830,9 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
     }
     fn template_renders(&self) -> u64 {
         self.text.template.as_ref().map_or(0, |t| t.renders())
+    }
+    fn text(&self) -> Option<&super::common::Text> {
+        Some(&self.text)
     }
     fn thinking_budget_refused(&self) -> Option<&'static str> {
         if self.sched.is_some() {

@@ -526,6 +526,10 @@ where
             "its rows draw through the batched driver, which feeds no forced token (serve it at \
              --batch 1)",
         )?;
+        req.params.refuse_logprobs(
+            "the batch scheduler",
+            "its rows draw on the device and read the ids back (serve it at --batch 1)",
+        )?;
         let (routed, seq) = self
             .pool
             .acquire(&req.prompt_ids)

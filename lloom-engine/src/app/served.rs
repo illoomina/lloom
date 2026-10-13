@@ -92,6 +92,13 @@ pub trait Served: Send + Sync {
     fn template_renders(&self) -> u64 {
         0
     }
+    /// The family's text side: the tokenizer and the template the request
+    /// front end (`front.rs`) reads its load-time constants from and encodes
+    /// with. `None` where the family keeps none; the front end then renders
+    /// and encodes through the methods above, with no reply splicing.
+    fn text(&self) -> Option<&super::common::Text> {
+        None
+    }
     /// Why this process's decode path cannot feed a thinking budget's
     /// forced tokens (`budgets::BATCHED`, `budgets::SPECULATIVE`); `None`
     /// on the K=1 body, which carries it on every readback arm.

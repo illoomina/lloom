@@ -229,9 +229,11 @@ fn three_turns(
 }
 
 /// The reuse of three turns against their `--no-reuse` run, on `model`
-/// with `arms`: turns 2 and 3 reuse what the template keeps — `Rewound`
-/// to the previous turn's checkpoint when its render drops a tail, else
-/// `Extend` — and every turn's tokens are the fresh run's.
+/// with `arms`: turns 2 and 3 reuse what the template keeps — `Extend` when
+/// the previous turn's prompt and reply are all in the next prompt (the
+/// reply's sampled ids), else `Rewound` to no earlier than the previous
+/// turn's checkpoint, which stands where the next render diverges — and
+/// every turn's tokens are the fresh run's.
 fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
     for arm in arms {
         let (reused, stderr) = three_turns(model, tok, &arm);
@@ -249,17 +251,17 @@ fn assert_three_turns_reuse(model: &Path, tok: &str, arms: Vec<Vec<&str>>) {
             let reply: usize = reused[t - 1]["completion_tokens"].parse().unwrap();
             let kept: usize = reused[t]["reused"].parse().unwrap();
             let prefilled: usize = reused[t]["prefilled"].parse().unwrap();
-            // The previous prompt up to its generation prompt (the
-            // load-time constant the checkpoint is placed at,
-            // `thinking::checkpoint_tail`), the reply dropped with the
-            // generation prompt's tokens; a template that drops nothing
-            // extends the log.
-            let ok = if kept > prev {
-                reused[t]["reuse"] == "Extend" && kept >= prev + reply
+            // The session log is the previous prompt and its reply. All of
+            // it in the next prompt extends; else the cache goes back to
+            // where they part, never before the previous turn's checkpoint
+            // (`gen_prompt` ids before its prompt's end, the load-time
+            // constant: where the next render diverges).
+            let log = prev + reply;
+            let gen: usize = reused[t - 1]["gen_prompt"].parse().unwrap();
+            let ok = if kept >= log {
+                reused[t]["reuse"] == "Extend"
             } else {
-                let tail = prev - kept;
-                let gen: usize = reused[t - 1]["gen_prompt"].parse().unwrap();
-                reused[t]["reuse"] == format!("Rewound({})", reply + tail) && tail == gen && gen > 0
+                reused[t]["reuse"] == format!("Rewound({})", log - kept) && kept + gen >= prev
             };
             assert!(
                 ok,
@@ -1879,6 +1881,175 @@ fn serve_answers_a_template_failure_on_client_data_with_a_400() {
     let server = Server::start(&model, &args);
     let (status, err) = server.call("POST", "/v1/chat/completions", &bad);
     assert_eq!(status, 400, "{err}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The process's front-end counters (`/health`): template renders and
+/// tokenization passes so far.
+fn passes(server: &Server) -> (u64, u64) {
+    let (status, h) = server.call("GET", "/health", &json!({}));
+    assert_eq!(status, 200, "{h}");
+    (
+        h["template_renders"].as_u64().unwrap(),
+        h["tokenizations"].as_u64().unwrap(),
+    )
+}
+
+/// The request front end through `lloom serve`, on the tiny Qwen4-exp with
+/// thinking off (its template keeps the generation prompt in the history):
+/// each chat request renders the template once and tokenizes the result
+/// once, whatever its history; the second turn carries the first reply's
+/// sampled ids, so the session extends — it reuses the first prompt and the
+/// whole reply.
+#[test]
+fn serve_renders_once_and_the_next_turn_extends_the_sampled_reply() {
+    let (dir, model, base) = qwen_tiny("front-once");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--prefix-reuse", "true"]);
+    let server = Server::start(&model, &args);
+    // `a` every step: a reply the template renders back verbatim.
+    let common = json!({ "enable_thinking": false, "temperature": 0, "max_tokens": 6,
+                         "logit_bias": { "97": 100 } });
+    let with = |messages: Value| {
+        let mut r = common.clone();
+        r["messages"] = messages;
+        r
+    };
+    let before = passes(&server);
+    let (status, one) = server.chat(with(json!([{ "role": "user", "content": PROMPT }])));
+    assert_eq!(status, 200, "{one}");
+    let after = passes(&server);
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "turn 1: {one}"
+    );
+    let reply = one["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(reply, "aaaaaa", "the bias holds");
+    let p1 = one["usage"]["prompt_tokens"].as_u64().unwrap();
+    let r1 = one["usage"]["completion_tokens"].as_u64().unwrap();
+
+    let before = passes(&server);
+    let (status, two) = server.chat(with(json!([
+        { "role": "user", "content": PROMPT },
+        { "role": "assistant", "content": reply },
+        { "role": "user", "content": "And Italy?" },
+    ])));
+    assert_eq!(status, 200, "{two}");
+    let after = passes(&server);
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (1, 1),
+        "turn 2: {two}"
+    );
+    let t = &two["timings"];
+    assert_eq!(t["renders"], 1, "{t}");
+    assert_eq!(t["history_matched"], 1, "{t}");
+    assert_eq!(t["history_spliced_tokens"], r1, "{t}");
+    assert_eq!(t["reuse"], "Extend", "{t}");
+    assert_eq!(
+        t["reused"],
+        p1 + r1,
+        "the first prompt and the whole reply: {t}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The token-level API: ids in (`prompt_token_ids`, on both routes) are the
+/// ids the engine ran, and the ids out (`return_token_ids`) are the run's,
+/// with their log-probabilities (`logprobs`); greedy, each is its row's
+/// maximum. With `session.keep_logprobs = sampled`, the next turn's prompt
+/// carries the first reply's ids and the logprobs they were sampled at.
+#[test]
+fn the_token_api_runs_the_ids_sent_and_returns_the_ids_and_logprobs_run() {
+    let (dir, model, base) = qwen_tiny("token-api");
+    let mut args: Vec<&str> = base.iter().map(String::as_str).collect();
+    args.extend(["--keep-logprobs", "sampled"]);
+    let server = Server::start(&model, &args);
+    let tok = Qwen4ExpTiny::tokenizer();
+    let ids = encode(&tok, &qwen_not_thinking());
+    let (status, c) = server.call(
+        "POST",
+        "/v1/completions",
+        &json!({ "prompt_token_ids": ids, "max_tokens": 5, "temperature": 0,
+                 "logprobs": 2, "return_token_ids": true, "ignore_eos": true }),
+    );
+    assert_eq!(status, 200, "{c}");
+    assert_eq!(c["timings"]["prompt_ids_sha256"], sha(&ids), "{c}");
+    assert_eq!(c["prompt_token_ids"], json!(ids));
+    let out = &c["choices"][0];
+    assert_eq!(out["token_ids"], c["timings"]["tokens"]);
+    let n = out["token_ids"].as_array().unwrap().len();
+    assert_eq!(n, 5);
+    let lp = &out["logprobs"];
+    let sampled = lp["token_logprobs"].as_array().unwrap();
+    assert_eq!(sampled.len(), n);
+    for (i, top) in lp["top_ids"].as_array().unwrap().iter().enumerate() {
+        let top = top.as_array().unwrap();
+        assert_eq!(top.len(), 2, "{lp}");
+        let (first, second) = (top[0][1].as_f64().unwrap(), top[1][1].as_f64().unwrap());
+        assert!(first >= second, "most likely first: {lp}");
+        let s = sampled[i].as_f64().unwrap();
+        assert!(s <= 0.0, "{lp}");
+        assert_eq!(
+            top[0][0], out["token_ids"][i],
+            "greedy draws the row's maximum: {lp}"
+        );
+        assert!(
+            (s - first).abs() < 1e-6,
+            "position {i}: {s} vs {first}: {lp}"
+        );
+    }
+
+    let (status, chat) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "prompt_token_ids": ids, "max_tokens": 3, "temperature": 0, "ignore_eos": true }),
+    );
+    assert_eq!(status, 200, "{chat}");
+    assert_eq!(chat["timings"]["prompt_ids_sha256"], sha(&ids));
+
+    let first = json!([{ "role": "user", "content": PROMPT }]);
+    let req = |messages: Value| {
+        json!({ "messages": messages, "enable_thinking": false, "temperature": 0,
+                "max_tokens": 4, "logit_bias": { "98": 100 }, "return_token_ids": true })
+    };
+    let (status, one) = server.call("POST", "/v1/chat/completions", &req(first));
+    assert_eq!(status, 200, "{one}");
+    let reply = one["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reply_ids = one["choices"][0]["token_ids"].as_array().unwrap().clone();
+    let reply_lp = one["choices"][0]["token_logprobs"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        reply_lp.len(),
+        reply_ids.len(),
+        "the session's capture: {one}"
+    );
+    let p1 = one["prompt_token_ids"].as_array().unwrap().len();
+    let (status, two) = server.call(
+        "POST",
+        "/v1/chat/completions",
+        &req(json!([
+            { "role": "user", "content": PROMPT },
+            { "role": "assistant", "content": reply },
+            { "role": "user", "content": "And Italy?" },
+        ])),
+    );
+    assert_eq!(status, 200, "{two}");
+    let ids2 = two["prompt_token_ids"].as_array().unwrap();
+    let lp2 = two["prompt_sampled_logprobs"].as_array().unwrap();
+    assert_eq!(lp2.len(), ids2.len());
+    let span = p1..p1 + reply_ids.len();
+    assert_eq!(&ids2[span.clone()], &reply_ids[..], "{two}");
+    assert_eq!(&lp2[span.clone()], &reply_lp[..], "{two}");
+    assert!(lp2[..p1].iter().all(Value::is_null));
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }

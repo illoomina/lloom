@@ -382,6 +382,108 @@ pub struct Blocking {
     forcing: Option<HostForcing>,
     /// The budget's state before the last draw ([`ReadbackStrategy::retract_draw`]).
     forcing_before: Option<crate::generation::budget::ForcingMark>,
+    /// The drawn ids' log-probabilities, kept per draw ([`Self::with_logprobs`]).
+    capture: Option<LogprobCapture>,
+}
+
+/// The log-probabilities of a run's drawn ids, over the raw logits (before
+/// the processors and the temperature): the drawn id's, the `top` most
+/// likely per position, and with `rows` each position's whole row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Logprobs {
+    pub sampled: Vec<f32>,
+    /// Per position, `(id, logprob)` most likely first; empty rows when no
+    /// `top` was asked for.
+    pub top: Vec<Vec<(u32, f32)>>,
+    pub rows: Option<Vec<Vec<f32>>>,
+}
+
+/// What a run keeps of each draw's distribution (`Blocking::with_logprobs`).
+#[derive(Debug, Clone)]
+pub struct LogprobCapture {
+    top: usize,
+    out: Logprobs,
+}
+
+impl LogprobCapture {
+    pub fn new(top: usize, rows: bool) -> Self {
+        Self {
+            top,
+            out: Logprobs {
+                rows: rows.then(Vec::new),
+                ..Logprobs::default()
+            },
+        }
+    }
+
+    /// Keep `id`'s log-probability under `logits` (one position's row).
+    pub fn push(&mut self, logits: &Tensor, id: u32) -> Result<()> {
+        let v = logits
+            .flatten_all()?
+            .to_dtype(lloom_tensor::DType::F32)?
+            .to_vec1::<f32>()?;
+        let lp = log_softmax_row(&v);
+        let Some(&drawn) = lp.get(id as usize) else {
+            lloom_tensor::bail!(
+                "LogprobCapture: drawn id {id} is outside the {}-wide row",
+                lp.len()
+            );
+        };
+        self.out.sampled.push(drawn);
+        let top = if self.top > 0 {
+            top_k(&lp, self.top)
+        } else {
+            Vec::new()
+        };
+        self.out.top.push(top);
+        if let Some(rows) = &mut self.out.rows {
+            rows.push(lp);
+        }
+        Ok(())
+    }
+
+    /// Take the last position back (a retracted draw, an EOS the run drops).
+    pub fn pop(&mut self) {
+        self.out.sampled.pop();
+        self.out.top.pop();
+        if let Some(rows) = &mut self.out.rows {
+            rows.pop();
+        }
+    }
+
+    pub fn into_logprobs(self) -> Logprobs {
+        self.out
+    }
+}
+
+/// `x - logsumexp(x)`, in f64 for the sum.
+pub fn log_softmax_row(x: &[f32]) -> Vec<f32> {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return x.iter().map(|_| f32::NAN).collect();
+    }
+    let sum: f64 = x.iter().map(|&v| ((v - max) as f64).exp()).sum();
+    let lse = max + sum.ln() as f32;
+    x.iter().map(|&v| v - lse).collect()
+}
+
+/// The `k` largest of `lp` as `(index, value)`, largest first, ties to the
+/// lower index.
+fn top_k(lp: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<u32> = (0..lp.len() as u32).collect();
+    let k = k.min(idx.len());
+    let cmp = |a: &u32, b: &u32| {
+        lp[*b as usize]
+            .partial_cmp(&lp[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(b))
+    };
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k, cmp);
+        idx.truncate(k);
+    }
+    idx.sort_by(cmp);
+    idx.into_iter().map(|i| (i, lp[i as usize])).collect()
 }
 
 impl Blocking {
@@ -396,7 +498,20 @@ impl Blocking {
             last: None,
             forcing: None,
             forcing_before: None,
+            capture: None,
         })
+    }
+
+    /// Keep each draw's log-probability (and the `top` most likely, and the
+    /// whole row with `rows`). Every draw then reads its logits back.
+    pub fn with_logprobs(mut self, top: usize, rows: bool) -> Self {
+        self.capture = Some(LogprobCapture::new(top, rows));
+        self
+    }
+
+    /// What the run kept, one entry per returned id.
+    pub fn take_logprobs(&mut self) -> Option<Logprobs> {
+        self.capture.take().map(LogprobCapture::into_logprobs)
     }
 }
 
@@ -438,7 +553,11 @@ impl ReadbackStrategy for Blocking {
         // so they read the id and upload it as they always did.
         self.forcing_before = self.forcing.as_ref().map(HostForcing::mark);
         // A digesting sampler reads the logits back anyway: the host draw.
-        if self.forcing.is_none() && *sampler.sampling() == Sampling::ArgMax && !sampler.digests() {
+        if self.forcing.is_none()
+            && self.capture.is_none()
+            && *sampler.sampling() == Sampling::ArgMax
+            && !sampler.digests()
+        {
             if let Some((draw, id)) = sampler.draw_and_read(logits)? {
                 self.ids.push(id);
                 self.last = Some(id);
@@ -449,6 +568,9 @@ impl ReadbackStrategy for Blocking {
             Some(f) => sampler.sample_fed(logits, |d| f.feed(d))?,
             None => sampler.sample(logits)?,
         };
+        if let Some(c) = &mut self.capture {
+            c.push(logits, id)?;
+        }
         self.ids.push(id);
         self.last = Some(id);
         Tensor::new(&[id], &self.device)?.unsqueeze(0)
@@ -472,6 +594,9 @@ impl ReadbackStrategy for Blocking {
             lloom_tensor::bail!("Blocking::retract_draw: no draw to take back");
         }
         self.ids.pop();
+        if let Some(c) = &mut self.capture {
+            c.pop();
+        }
         if let (Some(f), Some(m)) = (self.forcing.as_mut(), self.forcing_before.take()) {
             f.rewind(m);
         }
@@ -484,6 +609,9 @@ impl ReadbackStrategy for Blocking {
         };
         if self.eos_ids.contains(&id) {
             self.ids.pop();
+            if let Some(c) = &mut self.capture {
+                c.pop();
+            }
             return Ok(true);
         }
         Ok(false)
@@ -2701,6 +2829,46 @@ impl std::str::FromStr for CommitBudget {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// The kept logprobs line up with the ids the run returns: one per
+    /// draw, taken back with a retracted draw and with the EOS the run drops;
+    /// each is the drawn id's `logit - logsumexp`, the top two are the row's
+    /// largest, and the full row sums to one.
+    #[test]
+    fn kept_logprobs_follow_the_returned_ids() {
+        let dev = Device::Cpu;
+        let row = [0f32, 5.0, 1.0, 0.0, 3.0];
+        let to_eos = [0f32, 0.0, 0.0, 9.0, 0.0];
+        let logits = Tensor::new(&row, &dev).unwrap();
+        let eos = Tensor::new(&to_eos, &dev).unwrap();
+        let mut rb = Blocking::new(&[3], &dev).unwrap().with_logprobs(2, true);
+        let mut s = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        rb.sample_and_feed(&mut s, &logits).unwrap();
+        assert!(!rb.eos_of_last().unwrap());
+        rb.sample_and_feed(&mut s, &logits).unwrap();
+        rb.retract_draw().unwrap();
+        rb.sample_and_feed(&mut s, &logits).unwrap();
+        assert!(!rb.eos_of_last().unwrap());
+        rb.sample_and_feed(&mut s, &eos).unwrap();
+        assert!(rb.eos_of_last().unwrap());
+        let ids = rb.take_ids().unwrap();
+        let lp = rb.take_logprobs().unwrap();
+        assert_eq!(ids, vec![1, 1]);
+        assert_eq!(lp.sampled.len(), ids.len());
+        let lse = row.iter().map(|&x| (x as f64).exp()).sum::<f64>().ln();
+        for &l in &lp.sampled {
+            assert!((l as f64 - (5.0 - lse)).abs() < 1e-6, "{l}");
+        }
+        assert_eq!(
+            lp.top[0].iter().map(|t| t.0).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        let rows = lp.rows.unwrap();
+        assert_eq!(rows.len(), 2);
+        let total: f64 = rows[0].iter().map(|&l| (l as f64).exp()).sum();
+        assert!((total - 1.0).abs() < 1e-6, "{total}");
+        assert!(Blocking::new(&[3], &dev).unwrap().take_logprobs().is_none());
+    }
 
     /// A draw taken back leaves the blocking arm as it was before it: the
     /// ids, and a thinking budget's position — a draw retracted inside the

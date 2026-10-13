@@ -938,6 +938,7 @@ mod witness_tests {
             return;
         };
         let set = ResidencySet::new(&device);
+        // SAFETY: only asks whether a native set exists; nothing is borrowed.
         if unsafe { set.raw() }.is_none() {
             return;
         }

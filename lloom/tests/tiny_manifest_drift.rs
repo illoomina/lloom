@@ -82,7 +82,7 @@ fn replay<F: TinyFamily, P: Profile>(
 }
 
 fn check<F: TinyFamily, P: Profile>(gpu: &Device, contract: &str) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/tiny_manifests")
         .join(if contract == "fast" {
             format!("{}.json", F::NAME)
@@ -145,7 +145,7 @@ fn replay_manifests<P: Profile>(contract: &str) {
     let _ = lloom::tuning::install(t);
     // And with the step form its manifest records: the census names the
     // step's kernel, so the replay runs the form the campaign ran.
-    let qwen = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let qwen = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/tiny_manifests")
         .join(if contract == "fast" {
             "qwen4exp.json"
@@ -179,4 +179,15 @@ fn every_manifest_entry_still_reaches_its_points() {
 #[test]
 fn deterministic_manifest_entries_still_reach_their_points() {
     replay_manifests::<CrownExact>("deterministic");
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

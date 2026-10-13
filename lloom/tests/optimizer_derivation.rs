@@ -66,7 +66,7 @@ fn census_of(cfg: &Config) -> (u64, Vec<(String, u64)>) {
 /// `== kernels per decode token (step 1) ==` block in the IR's families
 /// (`optimizer::kernel_family`), and its `dispatches per decode token`.
 fn traced_census() -> (u64, Vec<(String, u64)>) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/fixtures/lfm2-trace-arena-shuffle-branch.txt");
     let text = std::fs::read_to_string(&path).expect("the committed trace");
     let mut lines = text.lines();
@@ -582,4 +582,15 @@ fn the_norm_prologue_is_derived_on_the_real_step_at_the_reorder_budget() {
         "{:?}",
         d.refused
     );
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

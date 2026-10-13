@@ -293,7 +293,7 @@ fn the_recurrences_are_marked() {
 /// read from), every `TRACE … kernel=<label> n=<count>` line in the IR's
 /// families.
 fn traced(step: usize) -> Census {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/fixtures/qwen4exp-trace-dev-bfc70b8f4.txt");
     let text = std::fs::read_to_string(&path).expect("the committed trace");
     let prefix = format!("TRACE run=1 step={step} kernel=");
@@ -346,7 +346,7 @@ fn the_block_completing_walk_is_the_traced_step_10() {
 #[test]
 fn the_past_dense_walk_is_the_needle_step() {
     use lloom::models::qwen4exp::testing::ghost_model_host_planned;
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = std::path::PathBuf::from(lloom_manifest_dir())
         .join("tests/fixtures/qwen4exp-trace-needle-dev-a5c815f13.txt");
     let text = std::fs::read_to_string(&path).expect("the committed needle trace");
     let prefix = "TRACE run=1 step=9 kernel=";
@@ -380,4 +380,15 @@ fn the_past_dense_walk_is_the_needle_step() {
     );
     let d = derive(&walk_at(&m, pos), &m.switches_policy()).expect("derive");
     assert_eq!(with_driver(d.graph).census(), needle);
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

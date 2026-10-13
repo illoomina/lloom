@@ -134,7 +134,7 @@ fn every_axis_has_a_default_that_is_one_of_its_variants() {
 #[test]
 fn axes_manifest_is_in_sync() {
     let manifest = lloom::axes::manifest();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/axes-manifest.txt");
+    let path = PathBuf::from(lloom_manifest_dir()).join("tests/fixtures/axes-manifest.txt");
 
     if std::env::var_os("LLOOM_WRITE_AXES_MANIFEST").is_some() {
         std::fs::write(&path, &manifest)
@@ -170,4 +170,15 @@ fn axes_manifest_is_in_sync() {
             );
         }
     }
+}
+
+/// The crate's manifest directory **at run time** — what cargo and nextest
+/// export to the test process — falling back to the build-time path. A test
+/// binary archived on one host and run on another (`cargo nextest archive` /
+/// `--workspace-remap`) reads its fixtures where the archive was unpacked;
+/// `env!("CARGO_MANIFEST_DIR")` would bake the building host's path in
+/// (measured 2026-10-13: `every_test_file_is_a_module` panicked with NotFound
+/// on silverberry from a Mac-built archive).
+fn lloom_manifest_dir() -> String {
+    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
 }

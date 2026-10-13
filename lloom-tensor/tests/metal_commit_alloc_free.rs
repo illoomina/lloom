@@ -464,7 +464,7 @@ fn commit_loop(kind: CommandBufferKind, subscriber: bool, commits: u64) -> (u64,
     // Encoding one dispatch, for scale: the same counter around a step.
     let mut encode = 0;
     for _ in 0..64 {
-        let ((), e) = counted(&step);
+        let ((), e) = counted(step);
         encode += e;
         cmds.flush_and_wait().unwrap();
     }

@@ -335,6 +335,70 @@ impl Image {
 
 static IMAGE: std::sync::OnceLock<Image> = std::sync::OnceLock::new();
 
+/// Where the last signal capture's frame buffer lived, for the delivery
+/// controls to classify: thread stack, alternate stack, or ASan's fake stack.
+/// The fake-stack query only recognises a live frame, so it is made inside the
+/// capture, through entry points resolved before any delivery.
+#[cfg(test)]
+mod handler_frame {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type Current = unsafe extern "C" fn() -> *mut libc::c_void;
+    type IsIn = unsafe extern "C" fn(
+        *mut libc::c_void,
+        *mut libc::c_void,
+        *mut *mut libc::c_void,
+        *mut *mut libc::c_void,
+    ) -> *mut libc::c_void;
+
+    pub(super) static ADDR: AtomicUsize = AtomicUsize::new(0);
+    /// 0: no ASan runtime, 1: not in a fake frame, 2: in a live fake frame.
+    pub(super) static IN_FAKE: AtomicUsize = AtomicUsize::new(0);
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static IS_IN: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn resolve() {
+        // SAFETY: dlsym of exported ASan interface functions; null if absent.
+        unsafe {
+            let current = libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"__asan_get_current_fake_stack".as_ptr(),
+            );
+            let is_in = libc::dlsym(libc::RTLD_DEFAULT, c"__asan_addr_is_in_fake_stack".as_ptr());
+            CURRENT.store(current as usize, Ordering::Relaxed);
+            IS_IN.store(is_in as usize, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn note(addr: usize) {
+        ADDR.store(addr, Ordering::Relaxed);
+        let (current, is_in) = (
+            CURRENT.load(Ordering::Relaxed),
+            IS_IN.load(Ordering::Relaxed),
+        );
+        if current == 0 || is_in == 0 {
+            IN_FAKE.store(0, Ordering::Relaxed);
+            return;
+        }
+        // SAFETY: both were resolved from the ASan runtime's exported interface
+        // with these C signatures; the query reads the thread's fake stack only.
+        let hit = unsafe {
+            let current: Current = std::mem::transmute(current);
+            let is_in: IsIn = std::mem::transmute(is_in);
+            let fake = current();
+            !fake.is_null()
+                && !is_in(
+                    fake,
+                    addr as *mut libc::c_void,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+                .is_null()
+        };
+        IN_FAKE.store(if hit { 2 } else { 1 }, Ordering::Relaxed);
+    }
+}
+
 extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     let interrupted_errno = signals::PreservedErrno::new();
     if let Some(r) = RING.get() {
@@ -379,6 +443,8 @@ fn capture_signal(r: &Ring, sig: libc::c_int, info: *mut libc::siginfo_t) {
         unsafe { (*info).si_addr as usize }
     };
     let mut frames = [std::ptr::null_mut::<libc::c_void>(); 96];
+    #[cfg(test)]
+    handler_frame::note(frames.as_ptr() as usize);
     // SAFETY: a fixed-size frame buffer; the count written is bounded by it.
     let n = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int) };
     let frames = &frames[..(n.max(0) as usize).min(frames.len())];
@@ -1022,6 +1088,69 @@ mod signal_capture_controls {
         }
     }
 
+    /// The ASan runtime's `detect_stack_use_after_return` as this process
+    /// reads it; `None` without the runtime.
+    fn use_after_return_option() -> Option<libc::c_int> {
+        // SAFETY: dlsym of an exported data symbol; null if absent.
+        let option = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"__asan_option_detect_stack_use_after_return".as_ptr(),
+            )
+        };
+        // SAFETY: the runtime's option is a C int it initialised before main.
+        (!option.is_null())
+            .then(|| unsafe { std::ptr::read_volatile(option as *const libc::c_int) })
+    }
+
+    /// Where the last capture's frame buffer lived.
+    fn handler_frame_location() -> &'static str {
+        let addr = handler_frame::ADDR.load(Ordering::Relaxed);
+        assert_ne!(addr, 0, "no capture frame was noted");
+        if handler_frame::IN_FAKE.load(Ordering::Relaxed) == 2 {
+            return "fake";
+        }
+        // SAFETY: queries of this thread's stack and alternate stack only.
+        unsafe {
+            let me = libc::pthread_self();
+            let top = libc::pthread_get_stackaddr_np(me) as usize;
+            let size = libc::pthread_get_stacksize_np(me);
+            if addr < top && addr >= top - size {
+                return "thread";
+            }
+            let mut alt: libc::stack_t = std::mem::zeroed();
+            assert_eq!(libc::sigaltstack(std::ptr::null(), &mut alt), 0);
+            let base = alt.ss_sp as usize;
+            if base != 0 && addr >= base && addr < base + alt.ss_size {
+                return "altstack";
+            }
+        }
+        "other"
+    }
+
+    /// A fresh alternate signal stack for this thread, outside the heap.
+    fn install_altstack() {
+        const SIZE: usize = 256 * 1024;
+        // SAFETY: an anonymous private mapping, kept for the child's life.
+        unsafe {
+            let base = libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            assert_ne!(base, libc::MAP_FAILED);
+            let stack = libc::stack_t {
+                ss_sp: base,
+                ss_size: SIZE,
+                ss_flags: 0,
+            };
+            assert_eq!(libc::sigaltstack(&stack, std::ptr::null_mut()), 0);
+        }
+    }
+
     /// Resolve libmalloc's `malloc_logger` variable once, before anything is
     /// measured: dlsym itself takes dyld's lock and may allocate.
     fn resolve_logger() {
@@ -1080,10 +1209,14 @@ mod signal_capture_controls {
         for input in [b"first".as_slice(), b"", b"dying input"] {
             record.push(input).unwrap();
         }
+        let onstack = mode == "capture-onstack";
+        if onstack {
+            install_altstack();
+        }
         // SAFETY: the action is fully initialized before registration.
         let mut prior: libc::sigaction = unsafe { std::mem::zeroed() };
         prior.sa_sigaction = predecessor as *const () as usize;
-        prior.sa_flags = libc::SA_SIGINFO;
+        prior.sa_flags = libc::SA_SIGINFO | if onstack { libc::SA_ONSTACK } else { 0 };
         assert_eq!(
             unsafe {
                 libc::sigemptyset(&mut prior.sa_mask);
@@ -1092,6 +1225,7 @@ mod signal_capture_controls {
             0
         );
         Record::install_crash_dump().unwrap();
+        handler_frame::resolve();
         resolve_logger();
         logger(true);
         EVENTS.store(0, Ordering::Relaxed);
@@ -1118,11 +1252,28 @@ mod signal_capture_controls {
         };
         let pid = std::process::id();
         match mode {
-            "capture" => {
+            "capture" | "capture-onstack" => {
                 let during = deliver();
                 println!("CAPTURE_ALLOCATOR_EVENTS={during}");
                 assert_eq!(CALLS.load(Ordering::Relaxed), 1);
                 allocation_free(during);
+                let option = use_after_return_option();
+                let location = handler_frame_location();
+                println!(
+                    "HANDLER_FRAME={location} UAR_OPTION={option:?} IN_FAKE_QUERY={}",
+                    handler_frame::IN_FAKE.load(Ordering::Relaxed)
+                );
+                let fake = option.unwrap_or(0) != 0;
+                let own = if onstack { "altstack" } else { "thread" };
+                if fake && onstack {
+                    // Reported, not pinned: where ASan places a fake frame
+                    // taken on an alternate signal stack is what this measures.
+                    assert!(matches!(location, "fake" | "altstack"), "{location}");
+                } else if fake {
+                    assert_eq!(location, "fake", "use-after-return on, frame not fake");
+                } else {
+                    assert_eq!(location, own, "capture frame outside its stack");
+                }
                 let archive = dir.join(format!("record-{pid}-0"));
                 let mut replayed = Vec::new();
                 let n = replay_with_identity(&archive, Some(IDENTITY), false, |bytes| {
@@ -1231,6 +1382,12 @@ mod signal_capture_controls {
     fn delivered_signal_writes_a_replayable_record_without_allocating() {
         run("capture", "SIGNAL_CAPTURE_REPLAYED inputs=3");
     }
+    /// The campaign's own predecessors set `SA_ONSTACK`, so its handler runs on
+    /// an alternate stack; the record must hold there as on the thread stack.
+    #[test]
+    fn delivered_signal_on_an_alternate_stack_writes_a_replayable_record() {
+        run("capture-onstack", "SIGNAL_CAPTURE_REPLAYED inputs=3");
+    }
     #[test]
     fn delivered_signal_refuses_a_held_snapshot_without_blocking() {
         run("busy", "BUSY_REFUSED_THEN_CAPTURED");
@@ -1267,15 +1424,44 @@ mod sanitizer_controls {
                     read_at(stack.as_ptr(), std::hint::black_box(32))
                 );
             }
+            "return" => {
+                let gone = dangling();
+                println!("UNREPORTED={}", read_at(gone, 0));
+            }
             other => panic!("unknown control {other}"),
         }
     }
 
-    fn reported(kind: &str, report: &str) {
-        if let Some(mode) = std::env::var_os(CHILD) {
-            planted(mode.to_str().unwrap());
-            return;
-        }
+    /// A pointer into a frame that has returned. The address leaves through a
+    /// call, not `black_box`: `black_box` is inline asm, and ASan gives a
+    /// function holding inline asm no fake frame, so nothing is poisoned at
+    /// its return and the read below would be invisible to the arm.
+    #[inline(never)]
+    fn dangling() -> *const u8 {
+        let local = [7u8; 32];
+        escape(&local)
+    }
+
+    #[inline(never)]
+    fn escape(local: &[u8; 32]) -> *const u8 {
+        local.as_ptr()
+    }
+
+    /// The runtime's `detect_stack_use_after_return`, as this process reads it.
+    fn use_after_return_option() -> libc::c_int {
+        // SAFETY: dlsym of an exported data symbol; null if absent.
+        let option = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"__asan_option_detect_stack_use_after_return".as_ptr(),
+            )
+        };
+        assert!(!option.is_null(), "ASan runtime without the option symbol");
+        // SAFETY: the runtime's option is a C int it initialised before main.
+        unsafe { std::ptr::read_volatile(option as *const libc::c_int) }
+    }
+
+    fn child_output(kind: &str) -> std::process::Output {
         // SAFETY: dlsym of an exported function name; null if absent.
         let runtime =
             !unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__asan_init".as_ptr()) }.is_null();
@@ -1286,9 +1472,23 @@ mod sanitizer_controls {
             .env(CHILD, kind)
             .output()
             .unwrap();
+        eprintln!(
+            "[{kind}] status {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn reported(kind: &str, report: &str) {
+        if let Some(mode) = std::env::var_os(CHILD) {
+            planted(mode.to_str().unwrap());
+            return;
+        }
+        let output = child_output(kind);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("[{kind}] status {:?}\n{stdout}\n{stderr}", output.status);
         assert!(
             !output.status.success(),
             "planted {kind} overflow ran clean"
@@ -1311,5 +1511,42 @@ mod sanitizer_controls {
     #[test]
     fn asan_reports_a_planted_stack_overflow() {
         reported("stack", "stack-buffer-overflow");
+    }
+    /// A read through a returned frame is reported exactly when the runtime
+    /// detects use-after-return, and runs clean when it does not. An arm states
+    /// the level it set in `LLOOM_EXPECT_UAR`, so one that believes it set the
+    /// option and did not fails here rather than passing the other branch.
+    #[test]
+    fn asan_reports_a_planted_use_after_return_iff_detection_is_on() {
+        if let Some(mode) = std::env::var_os(CHILD) {
+            planted(mode.to_str().unwrap());
+            return;
+        }
+        let option = use_after_return_option();
+        println!("UAR_OPTION={option}");
+        if let Some(expected) = std::env::var_os("LLOOM_EXPECT_UAR") {
+            assert_eq!(
+                option.to_string(),
+                expected.to_str().unwrap(),
+                "the arm's detect_stack_use_after_return did not take"
+            );
+        }
+        if option != 0 {
+            reported("return", "stack-use-after-return");
+            return;
+        }
+        let output = child_output("return");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "detection off, child failed");
+        assert!(
+            stdout.contains("UNREPORTED="),
+            "detection off, read did not return"
+        );
+        assert!(
+            !stderr.contains("ERROR: AddressSanitizer"),
+            "detection off, yet reported"
+        );
+        println!("ASAN_USE_AFTER_RETURN_OFF_PINNED");
     }
 }

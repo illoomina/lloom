@@ -151,10 +151,7 @@ pub(super) fn with_operation_context<R>(
         context.check_open()?;
         run(&scope.view, &context)
     } else {
-        let context = device
-            .allocation_namespace
-            .default_operation_context()
-            .map_err(crate::Error::wrap)?;
+        let context = device.allocation_namespace.default_operation_context()?;
         run(device, &context)
     }
 }

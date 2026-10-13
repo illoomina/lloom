@@ -3383,7 +3383,8 @@ impl<P: Profile, R: ExpertResidency> Qwen4Exp<P, R> {
                 // Outlives every pass: no plan serves it.
                 let _declared = lloom_tensor::EscapeGuard::new();
                 let buf = m.new_persistent_shared(n * std::mem::size_of::<f32>())?;
-                if buf.contents().is_null() {
+                // SAFETY: the pointer is only compared with null.
+                if unsafe { buf.contents() }.is_null() {
                     return Ok(None);
                 }
                 let storage =

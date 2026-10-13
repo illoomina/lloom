@@ -45,18 +45,22 @@ fn affine_then_wait(device: &Device, cmds: &Commands) -> Result<Vec<f32>, MetalK
     let dst = device.new_buffer(len, SHARED).unwrap();
     {
         let encoder = cmds.command_encoder()?;
-        call_affine(
-            device,
-            &encoder,
-            &kernels,
-            "affine_f32",
-            std::mem::size_of::<f32>(),
-            n,
-            BufferOffset::zero_offset(&src),
-            &dst,
-            2.0,
-            1.0,
-        )?;
+        // SAFETY: the test owns `src` and `dst` and reads `dst` only after the
+        // wait below.
+        unsafe {
+            call_affine(
+                device,
+                &encoder,
+                &kernels,
+                "affine_f32",
+                std::mem::size_of::<f32>(),
+                n,
+                BufferOffset::zero_offset(&src),
+                &dst,
+                2.0,
+                1.0,
+            )
+        }?;
     }
     cmds.flush_and_wait_current()?;
     // SAFETY: shared, `n` f32, waited above.
@@ -74,7 +78,10 @@ fn commit_a_copy_of_a_released_buffer(
     let dst = filled(device, len, 0);
     {
         let mut blit = cmds.blit_command_encoder().unwrap();
-        blit.copy_from_buffer(&src, 0, &dst, 0, len);
+        // SAFETY: deliberately broken for the injected failure: `src` is
+        // released before the commit, which an unretained command buffer
+        // reports as an invalid resource. Nothing reads `dst` afterwards.
+        unsafe { blit.copy_from_buffer(&src, 0, &dst, 0, len) };
     }
     drop(src);
     cmds.flush_marker().unwrap()

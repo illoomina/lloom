@@ -25,6 +25,27 @@ struct PayloadCell<T> {
     initialized: AtomicBool,
 }
 
+/// Private exclusive vacant-cell authority; NOT a root/ticket acquisition path.
+/// Construct only while the correct root owns sole PREPARING reservation.
+/// The token has no Drop and cannot publish/recycle metadata on its own.
+pub(crate) struct VacantPayload<'a, T> {
+    cell: &'a PayloadCell<T>,
+}
+impl<T> VacantPayload<'_, T> {
+    /// # Safety
+    /// The exact-root PREPARING reservation used to validate this cell remains
+    /// owned through this call; no accessor/other token can touch the payload.
+    /// No fallible/arbitrary operation occurs between write and publication.
+    pub(crate) unsafe fn initialize(self, value: T) {
+        // SAFETY: token was validated before value construction while that same
+        // exclusive reservation was held, and the caller retains it through us.
+        unsafe {
+            (*self.cell.value.get()).write(value);
+        }
+        self.cell.initialized.store(true, Ordering::Release);
+    }
+}
+
 /// Owns exactly one checked Layout allocation. Arc/control/wrapper storage and
 /// allocator rounding remain separate accounting obligations. Construction is
 /// cold: the eventual adapter must admit requested_layout before allocating.
@@ -119,6 +140,24 @@ impl<T, const N: usize> HeaderStorage<T, N> {
                 .add(index)
         })
     }
+    /// Validate BEFORE constructing captured/anchor owners. Refusal returns no
+    /// native/charge-bearing T to destroy on the producer. Existing initialize
+    /// remains available for callers that deliberately own returned rejection.
+    /// # Safety
+    /// Caller holds the sole genuine PREPARING reservation in THIS storage root
+    /// and keeps it exclusive while using the returned token. No existing T or
+    /// accessor is allowed in that cell. Root/storage outlive the token borrow.
+    pub(crate) unsafe fn vacant(
+        &self,
+        index: usize,
+    ) -> Result<VacantPayload<'_, T>, HeaderStorageError> {
+        let cell = self.cell(index)?;
+        if cell.initialized.load(Ordering::Acquire) {
+            return Err(HeaderStorageError::Initialized);
+        }
+        Ok(VacantPayload { cell })
+    }
+
     /// # Safety
     /// Caller owns the exclusive genuine PREPARING reservation in THIS root,
     /// no payload accessor can exist, and the root stays alive through this call.
@@ -162,11 +201,16 @@ impl<T, const N: usize> HeaderStorage<T, N> {
         Ok(unsafe { (&*cell.value.get()).assume_init_ref() })
     }
     /// # Safety
-    /// Caller owns exclusive genuine PREPARING rollback OR the service-claimed
-    /// DETACHING authority in THIS root. All strong accesses ended (Release
-    /// decrements/Acquire fence), upgrade cannot resurrect zero, and no payload
-    /// reference remains. Move returned T into root-owned active custody before
-    /// arbitrary Drop; retain anchors/charge on unwind. Root spans every access.
+    /// Caller owns (a) exclusive genuine PREPARING rollback, (b) service-claimed
+    /// DETACHING authority in THIS root, OR (c) final exclusive ownership of this
+    /// entire storage allocation with no surviving accessor, producer, service
+    /// snapshot or native use. Case (c) is distinct from a consumed/quarantined
+    /// reservation: it grants no header credit/recovery/terminality inference.
+    /// In (a)/(b), all strong accesses ended (Release decrements/Acquire fence),
+    /// upgrade cannot resurrect zero, and no payload reference remains. Every
+    /// case moves returned T into owned cleanup custody BEFORE arbitrary Drop,
+    /// retains needed anchors/charge on unwind, and spans access with the actual
+    /// storage owner. Final exclusivity alone does not waive native/Drop duties.
     pub(crate) unsafe fn take(&self, index: usize) -> Result<T, HeaderStorageError> {
         let cell = self.cell(index)?;
         if !cell.initialized.swap(false, Ordering::AcqRel) {

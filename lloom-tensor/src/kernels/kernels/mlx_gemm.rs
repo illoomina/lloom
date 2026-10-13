@@ -548,8 +548,13 @@ impl GemvEpilogue {
 
 /// M=1 -> gemv_t (vec[K] x mat[K,N] -> vec[N])
 /// N=1 -> gemv   (mat[M,K] x vec[K] -> vec[M])
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv(
+pub unsafe fn call_mlx_gemv(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -563,21 +568,24 @@ pub fn call_mlx_gemv(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_mlx_gemv_with(
-        device,
-        ep,
-        kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_mlx_gemv_with(
+            device,
+            ep,
+            kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_mlx_gemv`], choosing how the scalars are bound.
@@ -586,8 +594,13 @@ pub fn call_mlx_gemv(
 /// so there is one body rather than two and the styles cannot drift in what
 /// they bind — which is the property that makes the bit-identical test
 /// meaningful. Same shape as `call_reduce_contiguous_with` (issue #38).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_with(
+pub unsafe fn call_mlx_gemv_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -602,23 +615,26 @@ pub fn call_mlx_gemv_with(
     output: &Buffer,
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
-    call_mlx_gemv_full(
-        device,
-        ep,
-        kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-        style,
-        None,
-        GemvEpilogue::None,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_mlx_gemv_full(
+            device,
+            ep,
+            kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            style,
+            None,
+            GemvEpilogue::None,
+        )
+    }
 }
 
 /// As [`call_mlx_gemv_with`], optionally fusing an RMSNorm prologue onto the
@@ -639,8 +655,13 @@ pub fn call_mlx_gemv_with(
 /// tile outside the two the decode path selects. A fused request that quietly
 /// ran unfused would produce an un-normalized result, which §3.5 says nothing
 /// reports.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_full(
+pub unsafe fn call_mlx_gemv_full(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -657,24 +678,27 @@ pub fn call_mlx_gemv_full(
     fused_norm: Option<GemvRmsNorm<'_>>,
     epilogue: GemvEpilogue,
 ) -> Result<(), MetalKernelError> {
-    call_mlx_gemv_epilogue(
-        device,
-        ep,
-        kernels,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-        style,
-        fused_norm,
-        epilogue,
-        None,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_mlx_gemv_epilogue(
+            device,
+            ep,
+            kernels,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            style,
+            fused_norm,
+            epilogue,
+            None,
+        )
+    }
 }
 
 /// As [`call_mlx_gemv_full`], supplying the second operand an epilogue that
@@ -702,8 +726,13 @@ pub fn call_mlx_gemv_full(
 /// never refused *here* anyway: it surfaced two frames down as a
 /// `newFunctionWithName:` failure naming a mangled kernel, which is the
 /// illegibility #516 removes rather than relabels.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_epilogue(
+pub unsafe fn call_mlx_gemv_epilogue(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -725,24 +754,27 @@ pub fn call_mlx_gemv_epilogue(
         Some(norm) => GemvPrologue::RmsNorm(norm),
         None => GemvPrologue::None,
     };
-    gemv_dispatch(
-        device,
-        ep,
-        kernels,
-        dtype,
-        mnk,
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-        style,
-        prologue,
-        epilogue,
-        epilogue_operand,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_dispatch(
+            device,
+            ep,
+            kernels,
+            dtype,
+            mnk,
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            style,
+            prologue,
+            epilogue,
+            epilogue_operand,
+        )
+    }
 }
 
 /// A GEMV with its RMSNorm computed inside it ([`GemvNormInline`]): `out =
@@ -752,8 +784,13 @@ pub fn call_mlx_gemv_epilogue(
 /// `epilogue_operand` the GATE weight, both sweeps normalized,
 /// `gemv_norm_swiglu`), at the non-transposed `bm4`/`bm8` decode tiles,
 /// `ParamStyle::Split`; anything else is refused.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_norm(
+pub unsafe fn call_mlx_gemv_norm(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -770,28 +807,35 @@ pub fn call_mlx_gemv_norm(
     epilogue: GemvEpilogue,
     epilogue_operand: Option<(&Buffer, usize)>,
 ) -> Result<(), MetalKernelError> {
-    gemv_dispatch(
-        device,
-        ep,
-        kernels,
-        dtype,
-        mnk,
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-        ParamStyle::Split,
-        GemvPrologue::NormInline(norm),
-        epilogue,
-        epilogue_operand,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_dispatch(
+            device,
+            ep,
+            kernels,
+            dtype,
+            mnk,
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+            ParamStyle::Split,
+            GemvPrologue::NormInline(norm),
+            epilogue,
+            epilogue_operand,
+        )
+    }
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-fn gemv_dispatch(
+unsafe fn gemv_dispatch(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1090,26 +1134,29 @@ fn gemv_dispatch(
     // call would be two declarations of one thing, which is the hand-sync
     // `DESIGN.md` §8.1b exists to remove.
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            Input::with_offset(mat_buffer, mat_offset),
-            Input::with_offset(vec_buffer, vec_offset),
-            (), // bias
-            Output::new(output),
-            in_vec_size as i32,
-            out_vec_size as i32,
-            mat_ld as i32,
-            1.0f32, // alpha
-            0.0f32, // beta
-            1i32,   // batch_ndim
-            &batch_shape[..],
-            &vec_batch_strides[..],
-            &mat_batch_strides[..],
-            &bias_batch_strides[..],
-            1i32 // bias_stride
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                Input::with_offset(mat_buffer, mat_offset),
+                Input::with_offset(vec_buffer, vec_offset),
+                (), // bias
+                Output::new(output),
+                in_vec_size as i32,
+                out_vec_size as i32,
+                mat_ld as i32,
+                1.0f32, // alpha
+                0.0f32, // beta
+                1i32,   // batch_ndim
+                &batch_shape[..],
+                &vec_batch_strides[..],
+                &mat_batch_strides[..],
+                &bias_batch_strides[..],
+                1i32 // bias_stride
+            )
+        );
+    }
     // Held until after the dispatch is encoded: the params block and any array
     // promoted out of `setBytes` must outlive it.
     let _staged = finish_packed_params(device, encoder, style, GEMV_PARAMS_ALIGN)?;
@@ -1130,16 +1177,17 @@ fn gemv_dispatch(
     // written by the reduction dispatch immediately before this one, so the
     // RAW edge between them is exactly what must not be dropped -- and under
     // `HazardTrackingModeUntracked` a missed one is silent corruption (§3.5).
+    // SAFETY: this function's contract (# Safety above).
     match &prologue {
-        GemvPrologue::RmsNorm(norm) => {
+        GemvPrologue::RmsNorm(norm) => unsafe {
             encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
             encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
-        }
+        },
         // After the epilogue's operand when it reads one (`gemv_norm_swiglu`:
         // the gate weight at 15, the norm at 16 and 17), else at 15 and 16.
         GemvPrologue::NormInline(norm) => {
             let at = if epilogue.needs_operand() { 16 } else { 15 };
-            encoder.set_input_buffer(at, Some(norm.weight), norm.weight_offset);
+            unsafe { encoder.set_input_buffer(at, Some(norm.weight), norm.weight_offset) };
             encoder.set_bytes(at + 1, &norm.eps);
         }
         GemvPrologue::None => {}
@@ -1156,7 +1204,8 @@ fn gemv_dispatch(
     // previous op, and dropping that edge is silent corruption under
     // `HazardTrackingModeUntracked` (§3.5).
     if let Some((buf, offset)) = epilogue_operand {
-        encoder.set_input_buffer(15, Some(buf), offset);
+        // SAFETY: this function's contract (# Safety above).
+        unsafe { encoder.set_input_buffer(15, Some(buf), offset) };
     }
 
     let n_out_per_tgp = if transpose_mat {
@@ -1210,8 +1259,13 @@ impl MixedEpilogue {
 ///
 /// `vec` is `b` contiguous rows of `k` (`vec_batch_stride` elements apart);
 /// `mat` is shared across the batch.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_mixed(
+pub unsafe fn call_mlx_gemv_mixed(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1225,21 +1279,24 @@ pub fn call_mlx_gemv_mixed(
     epilogue: MixedEpilogue,
     scale: f32,
 ) -> Result<(), MetalKernelError> {
-    gemv_mixed_dispatch(
-        device,
-        ep,
-        kernels,
-        bnk,
-        mat_buffer,
-        mat_offset,
-        vec_buffer,
-        vec_offset,
-        vec_batch_stride,
-        output,
-        epilogue,
-        scale,
-        None,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_mixed_dispatch(
+            device,
+            ep,
+            kernels,
+            bnk,
+            mat_buffer,
+            mat_offset,
+            vec_buffer,
+            vec_offset,
+            vec_batch_stride,
+            output,
+            epilogue,
+            scale,
+            None,
+        )
+    }
 }
 
 /// The grouped RMSNorm a [`call_mlx_gemv_mixed_gnorm`] computes inside the
@@ -1261,8 +1318,13 @@ pub struct GemvGroupNorm<'a> {
 /// where the composed route is the norm's launch and the GEMV. Refused where
 /// [`gemv_mixed_gnorm_serves`] is false, and for the sigmoid epilogue (not
 /// instantiated).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemv_mixed_gnorm(
+pub unsafe fn call_mlx_gemv_mixed_gnorm(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1277,25 +1339,32 @@ pub fn call_mlx_gemv_mixed_gnorm(
     scale: f32,
     norm: GemvGroupNorm<'_>,
 ) -> Result<(), MetalKernelError> {
-    gemv_mixed_dispatch(
-        device,
-        ep,
-        kernels,
-        bnk,
-        mat_buffer,
-        mat_offset,
-        vec_buffer,
-        vec_offset,
-        vec_batch_stride,
-        output,
-        epilogue,
-        scale,
-        Some(norm),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        gemv_mixed_dispatch(
+            device,
+            ep,
+            kernels,
+            bnk,
+            mat_buffer,
+            mat_offset,
+            vec_buffer,
+            vec_offset,
+            vec_batch_stride,
+            output,
+            epilogue,
+            scale,
+            Some(norm),
+        )
+    }
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-fn gemv_mixed_dispatch(
+unsafe fn gemv_mixed_dispatch(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1344,39 +1413,44 @@ fn gemv_mixed_dispatch(
     let vec_batch_strides = [vec_batch_stride as i64];
     let mat_batch_strides = [0i64];
     let bias_batch_strides = [0i64];
-    set_params!(
-        encoder,
-        (
-            Input::with_offset(mat_buffer, mat_offset),
-            Input::with_offset(vec_buffer, vec_offset),
-            (), // bias
-            Output::new(output),
-            k as i32,
-            n_out as i32,
-            k as i32, // matrix_ld: row-major [n_out, k]
-            scale,    // alpha: the epilogue's pre-scale
-            0.0f32,   // beta
-            1i32,     // batch_ndim
-            &batch_shape[..],
-            &vec_batch_strides[..],
-            &mat_batch_strides[..],
-            &bias_batch_strides[..],
-            1i32 // bias_stride
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                Input::with_offset(mat_buffer, mat_offset),
+                Input::with_offset(vec_buffer, vec_offset),
+                (), // bias
+                Output::new(output),
+                k as i32,
+                n_out as i32,
+                k as i32, // matrix_ld: row-major [n_out, k]
+                scale,    // alpha: the epilogue's pre-scale
+                0.0f32,   // beta
+                1i32,     // batch_ndim
+                &batch_shape[..],
+                &vec_batch_strides[..],
+                &mat_batch_strides[..],
+                &bias_batch_strides[..],
+                1i32 // bias_stride
+            )
+        );
+    }
     // The grouped norm's bindings, after every slot the classical layout
     // declares (`gemv_mixed_gnorm_wrapper`). Reads through `set_input_buffer`
     // (the hazard edge to the input's producer), the scales through
     // `set_output_buffer` (a later consumer's edge to this dispatch); with no
     // scales asked for, the output is bound at 19 and never written there.
     if let Some(g) = &norm {
-        encoder.set_input_buffer(15, Some(g.weight), g.weight_offset);
+        // SAFETY: this function's contract (# Safety above).
+        unsafe { encoder.set_input_buffer(15, Some(g.weight), g.weight_offset) };
         encoder.set_bytes(16, &g.eps);
         encoder.set_bytes(17, &(g.group as i32));
         encoder.set_bytes(18, &(g.groups as i32));
+        // SAFETY: this function's contract (# Safety above).
         match g.scales {
-            Some((buf, off)) => encoder.set_output_buffer(19, Some(buf), off),
-            None => encoder.set_output_buffer(19, Some(output), 0),
+            Some((buf, off)) => unsafe { encoder.set_output_buffer(19, Some(buf), off) },
+            None => unsafe { encoder.set_output_buffer(19, Some(output), 0) },
         }
         encoder.set_bytes(20, &(g.scales.is_some() as i32));
     }
@@ -1397,8 +1471,12 @@ fn gemv_mixed_dispatch(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemm(
+pub unsafe fn call_mlx_gemm(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1412,21 +1490,24 @@ pub fn call_mlx_gemm(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_mlx_gemm_out(
-        device,
-        ep,
-        kernels,
-        dtype,
-        dtype,
-        (b, m, n, k),
-        lhs_stride,
-        lhs_offset,
-        lhs_buffer,
-        rhs_stride,
-        rhs_offset,
-        rhs_buffer,
-        output,
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_mlx_gemm_out(
+            device,
+            ep,
+            kernels,
+            dtype,
+            dtype,
+            (b, m, n, k),
+            lhs_stride,
+            lhs_offset,
+            lhs_buffer,
+            rhs_stride,
+            rhs_offset,
+            rhs_buffer,
+            output,
+        )
+    }
 }
 
 /// [`call_mlx_gemm`] with the output in `out_dtype`: the operands `dtype`,
@@ -1434,8 +1515,13 @@ pub fn call_mlx_gemm(
 /// kernel's `OutT`). Instantiated for `(F16, F32)` — half operands, a float
 /// result, the dequantise-once stems' route (issue #749 P26) — beside the
 /// same-type arms. A mixed pair never takes the gemv route.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_mlx_gemm_out(
+pub unsafe fn call_mlx_gemm_out(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -1674,7 +1760,7 @@ pub fn call_mlx_gemm_out(
     debug_group!(encoder, "mlx_gemm {name} B={b} M={m} N={n} K={k}");
 
     impl EncoderParam for GemmParams {
-        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+        unsafe fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
             encoder.set_bytes(position, &data);
         }
     }
@@ -1682,19 +1768,22 @@ pub fn call_mlx_gemm_out(
     // Batch strides for buffer 7 (same as main branch)
     let batch_strides = [batch_stride_a, batch_stride_b];
 
-    set_params!(
-        encoder,
-        (
-            (lhs_buffer, lhs_offset),
-            (rhs_buffer, rhs_offset),
-            (),
-            Output::new(output),
-            gemm_params,
-            (),
-            b as i32,
-            &batch_strides[..]
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                (lhs_buffer, lhs_offset),
+                (rhs_buffer, rhs_offset),
+                (),
+                Output::new(output),
+                gemm_params,
+                (),
+                b as i32,
+                &batch_strides[..]
+            )
+        );
+    }
 
     let grid_size = MTLSize {
         width: tn,

@@ -53,8 +53,12 @@ const INDEX_ADD_PARAMS_ALIGN: usize = core::mem::align_of::<IndexAddParams>();
 // is still computed, still used, and still on the host, one line above the call
 // that no longer passes it.
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_index_select(
+pub unsafe fn call_index_select(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -69,22 +73,25 @@ pub fn call_index_select(
     ids: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_index_select_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        ids_size,
-        dim,
-        contiguous,
-        src_dims,
-        src_strides,
-        input,
-        ids,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_index_select_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            ids_size,
+            dim,
+            contiguous,
+            src_dims,
+            src_strides,
+            input,
+            ids,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_index_select`], choosing how the scalars are bound.
@@ -115,8 +122,13 @@ pub fn call_index_select(
 /// boundary turns out not to be a special case for *this* axis at all. It was
 /// a special case for the registry, because a test can only resolve names
 /// against the metallib from inside this crate.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_index_select_with(
+pub unsafe fn call_index_select_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -158,22 +170,25 @@ pub fn call_index_select_with(
     debug_group!(encoder, "index_select {name} dim={dim} dst_el={dst_el}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            src_dim_size,
-            right_size,
-            ids_size,
-            contiguous,
-            src_num_dims,
-            src_dims,
-            src_strides,
-            &input,
-            &ids,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                src_dim_size,
+                right_size,
+                ids_size,
+                contiguous,
+                src_num_dims,
+                src_dims,
+                src_strides,
+                &input,
+                &ids,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, INDEX_PARAMS_ALIGN)?;
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
@@ -182,8 +197,12 @@ pub fn call_index_select_with(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gather(
+pub unsafe fn call_gather(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -195,24 +214,32 @@ pub fn call_gather(
     ids: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_gather_with(
-        device,
-        ep,
-        kernels,
-        name,
-        shape,
-        ids_size,
-        dim,
-        input,
-        ids,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_gather_with(
+            device,
+            ep,
+            kernels,
+            name,
+            shape,
+            ids_size,
+            dim,
+            input,
+            ids,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_gather`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gather_with(
+pub unsafe fn call_gather_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -239,18 +266,21 @@ pub fn call_gather_with(
     debug_group!(encoder, "gather {name} dim={dim} dst_el={dst_el}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            src_dim_size,
-            right_size,
-            ids_size,
-            &input,
-            &ids,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                src_dim_size,
+                right_size,
+                ids_size,
+                &input,
+                &ids,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, GATHER_PARAMS_ALIGN)?;
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
@@ -259,8 +289,12 @@ pub fn call_gather_with(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_scatter(
+pub unsafe fn call_scatter(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -272,19 +306,22 @@ pub fn call_scatter(
     ids: BufferOffset,
     output: BufferOffset,
 ) -> Result<(), MetalKernelError> {
-    call_scatter_with(
-        device,
-        ep,
-        kernels,
-        name,
-        src_shape,
-        dst_shape,
-        dim,
-        input,
-        ids,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_scatter_with(
+            device,
+            ep,
+            kernels,
+            name,
+            src_shape,
+            dst_shape,
+            dim,
+            input,
+            ids,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_scatter`], choosing how the scalars are bound.
@@ -292,8 +329,13 @@ pub fn call_scatter(
 /// Serves `scatter` and `scatter_add` alike -- `candle-core` picks between them
 /// by name, and the two bind the same five scalars, which is why they share
 /// [`ScatterParams`].
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_scatter_with(
+pub unsafe fn call_scatter_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -321,18 +363,21 @@ pub fn call_scatter_with(
     debug_group!(encoder, "scatter {name} dim={dim} dst_el={dst_el}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            src_dim_size,
-            right_size,
-            dst_dim_size,
-            &input,
-            &ids,
-            Output::from_buffer_offset(&output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                src_dim_size,
+                right_size,
+                dst_dim_size,
+                &input,
+                &ids,
+                Output::from_buffer_offset(&output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, SCATTER_PARAMS_ALIGN)?;
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
@@ -341,8 +386,12 @@ pub fn call_scatter_with(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_index_add(
+pub unsafe fn call_index_add(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -355,25 +404,33 @@ pub fn call_index_add(
     ids: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_index_add_with(
-        device,
-        ep,
-        kernels,
-        name,
-        src_shape,
-        dst_shape,
-        ids_shape,
-        dim,
-        input,
-        ids,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_index_add_with(
+            device,
+            ep,
+            kernels,
+            name,
+            src_shape,
+            dst_shape,
+            ids_shape,
+            dim,
+            input,
+            ids,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_index_add`], choosing how the scalars are bound.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_index_add_with(
+pub unsafe fn call_index_add_with(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -402,19 +459,22 @@ pub fn call_index_add_with(
     debug_group!(encoder, "index_add {name} dim={dim} dst_el={dst_el}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            src_dim_size,
-            right_size,
-            dst_dim_size,
-            ids_dim_size,
-            &input,
-            &ids,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                dst_el,
+                src_dim_size,
+                right_size,
+                dst_dim_size,
+                ids_dim_size,
+                &input,
+                &ids,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, INDEX_ADD_PARAMS_ALIGN)?;
 
     let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);

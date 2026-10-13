@@ -28,7 +28,12 @@ fn gated_kernel(base: &str, silu_gate: bool) -> &'static str {
 /// `(I + A)⁻¹` for `batch` strictly-lower `[n, n]` f32 matrices at `a`, into
 /// `out` (`batch · n · n` f32, contiguous). One threadgroup of `min(n, max)`
 /// threads per matrix.
-pub fn call_unit_lower_inverse(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_unit_lower_inverse(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -42,7 +47,10 @@ pub fn call_unit_lower_inverse(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "unit_lower_inverse batch={batch} n={n}");
-    set_params!(encoder, (&a, Output::new(out), n as u32));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (&a, Output::new(out), n as u32));
+    }
     let width = n.max(1).min(pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(
         MTLSize {
@@ -61,8 +69,13 @@ pub fn call_unit_lower_inverse(
 
 /// `gdn_prologue_f32`: `qkv [conv_ch]` + the conv window (in place) →
 /// `heads [3, h_v, d]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_prologue(
+pub unsafe fn call_gdn_prologue(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -83,22 +96,25 @@ pub fn call_gdn_prologue(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_prologue d={d} h_k={h_k} h_v={h_v}");
-    set_params!(
-        encoder,
-        (
-            &qkv,
-            &conv_w,
-            &win,
-            Output::new(heads),
-            d as u32,
-            h_k as u32,
-            h_v as u32,
-            kk as u32,
-            eps,
-            q_scale,
-            Output::from_buffer_offset(&win_out)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qkv,
+                &conv_w,
+                &win,
+                Output::new(heads),
+                d as u32,
+                h_k as u32,
+                h_v as u32,
+                kk as u32,
+                eps,
+                q_scale,
+                Output::from_buffer_offset(&win_out)
+            )
+        );
+    }
     let width = d
         .max(32)
         .next_power_of_two()
@@ -112,8 +128,13 @@ pub fn call_gdn_prologue(
 /// `S` in registers (the slab read once) where an instantiated array bound
 /// covers `ceil(d / split)`; otherwise, and when `register` is false, the loop
 /// form.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_step(
+pub unsafe fn call_gdn_step(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -134,21 +155,24 @@ pub fn call_gdn_step(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_step d={d} h_v={h_v}");
-    set_params!(
-        encoder,
-        (
-            &heads,
-            &alpha,
-            &beta,
-            &dt_bias,
-            &ssm_a,
-            &s,
-            Output::new(o),
-            d as u32,
-            h_v as u32,
-            Output::from_buffer_offset(&s_out)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &heads,
+                &alpha,
+                &beta,
+                &dt_bias,
+                &ssm_a,
+                &s,
+                Output::new(o),
+                d as u32,
+                h_v as u32,
+                Output::from_buffer_offset(&s_out)
+            )
+        );
+    }
     dispatch_groups(encoder, d, h_v * split);
     Ok(())
 }
@@ -210,8 +234,13 @@ fn gdn_step_pipeline(
 }
 
 /// `gdn_gated_norm_f32`: per-head RMS norm of `o [h_v, d]` × γ × sigmoid(z).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_gated_norm(
+pub unsafe fn call_gdn_gated_norm(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -233,7 +262,10 @@ pub fn call_gdn_gated_norm(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_gated_norm d={d} h_v={h_v}");
-    set_params!(encoder, (&o, &gamma, &z, Output::new(out), d as u32, eps));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (&o, &gamma, &z, Output::new(out), d as u32, eps));
+    }
     let width = d
         .max(32)
         .next_power_of_two()
@@ -243,8 +275,13 @@ pub fn call_gdn_gated_norm(
 }
 
 /// `gdn_gate_f32`: `alpha`, `beta_raw` `[seq, h_v]` → `[2, h_v, nc, cs]` (g, β).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_gate(
+pub unsafe fn call_gdn_gate(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -263,20 +300,23 @@ pub fn call_gdn_gate(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_gate seq={seq} h_v={h_v} nc={nc}");
-    set_params!(
-        encoder,
-        (
-            &alpha,
-            &beta_raw,
-            &dt_bias,
-            &ssm_a,
-            Output::new(out),
-            seq as u32,
-            h_v as u32,
-            nc as u32,
-            cs as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &alpha,
+                &beta_raw,
+                &dt_bias,
+                &ssm_a,
+                Output::new(out),
+                seq as u32,
+                h_v as u32,
+                nc as u32,
+                cs as u32
+            )
+        );
+    }
     let n = h_v * nc * cs;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, n.div_ceil(width), width);
@@ -285,8 +325,13 @@ pub fn call_gdn_gate(
 
 /// `gdn_prefill_prologue_f32`: `qkv [seq, C]`, the window, the taps →
 /// `[3, h_v, nc, cs, d]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_prefill_prologue(
+pub unsafe fn call_gdn_prefill_prologue(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -312,31 +357,39 @@ pub fn call_gdn_prefill_prologue(
         encoder,
         "gdn_prefill_prologue seq={seq} d={d} h_k={h_k} h_v={h_v}"
     );
-    set_params!(
-        encoder,
-        (
-            &qkv,
-            &win,
-            &conv_w,
-            Output::new(out),
-            seq as u32,
-            d as u32,
-            h_k as u32,
-            h_v as u32,
-            kk as u32,
-            cs as u32,
-            nc as u32,
-            eps,
-            q_scale
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qkv,
+                &win,
+                &conv_w,
+                Output::new(out),
+                seq as u32,
+                d as u32,
+                h_k as u32,
+                h_v as u32,
+                kk as u32,
+                cs as u32,
+                nc as u32,
+                eps,
+                q_scale
+            )
+        );
+    }
     dispatch_groups_2d(encoder, 2 * h_k + h_v, nc * cs, head_width(d, &pipeline));
     Ok(())
 }
 
 /// `gdn_conv_window_f32`: the window after the chunk → a new `[C, kk]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_conv_window(
+pub unsafe fn call_gdn_conv_window(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -352,17 +405,20 @@ pub fn call_gdn_conv_window(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_conv_window seq={seq} C={channels} kk={kk}");
-    set_params!(
-        encoder,
-        (
-            &win,
-            &qkv,
-            Output::new(out),
-            seq as u32,
-            channels as u32,
-            kk as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &win,
+                &qkv,
+                Output::new(out),
+                seq as u32,
+                channels as u32,
+                kk as u32
+            )
+        );
+    }
     let n = channels * kk;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, n.div_ceil(width), width);
@@ -370,8 +426,13 @@ pub fn call_gdn_conv_window(
 }
 
 /// `gdn_chunk_decay_f32`: `g [h_v, nc, cs]` → the flat decay pack (see the kernel).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_chunk_decay(
+pub unsafe fn call_gdn_chunk_decay(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -391,18 +452,26 @@ pub fn call_gdn_chunk_decay(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_chunk_decay h_v={h_v} nc={nc} cs={cs}");
-    set_params!(
-        encoder,
-        (&g, Output::new(out), h_v as u32, nc as u32, cs as u32)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&g, Output::new(out), h_v as u32, nc as u32, cs as u32)
+        );
+    }
     dispatch_groups(encoder, h_v * nc, head_width(cs, &pipeline));
     Ok(())
 }
 
 /// `gdn_chunk_scale_f32`: the chunked q/k/v `[3, n, d]`, the gate pack, the
 /// decay pack → the five scaled operands, flat `[5, n, d]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_chunk_scale(
+pub unsafe fn call_gdn_chunk_scale(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -418,10 +487,13 @@ pub fn call_gdn_chunk_scale(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_chunk_scale n={n} d={d}");
-    set_params!(
-        encoder,
-        (&qkv, &gb, &small, Output::new(out), n as u32, d as u32)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&qkv, &gb, &small, Output::new(out), n as u32, d as u32)
+        );
+    }
     let total = n * d;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, total.div_ceil(width), width);
@@ -432,8 +504,13 @@ pub fn call_gdn_chunk_scale(
 /// as one launch, a threadgroup per head (`w`, `u`, `qg`, `kg` `[h_v, nc,
 /// cs, d]`; `kq [h_v, nc, cs, cs]`; `gl [h_v, nc]`; `s_in [h_v, d, d]`) →
 /// `o [h_v, nc·cs, d]` and `s_out [h_v, d, d]`; `vn [h_v, cs, d]` scratch.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_chunk_scan_at(
+pub unsafe fn call_gdn_chunk_scan_at(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -464,33 +541,41 @@ pub fn call_gdn_chunk_scan_at(
         encoder,
         "gdn_chunk_scan h={h_v} nc={nc} cs={cs} d={d} splits={splits}"
     );
-    set_params!(
-        encoder,
-        (
-            &w,
-            &u,
-            &qg,
-            &kq,
-            &kg,
-            &gl,
-            &s_in,
-            Output::new(o),
-            Output::with_offset(s_out.buffer, s_out.offset_in_bytes),
-            Output::new(vn),
-            nc as u32,
-            cs as u32,
-            d as u32,
-            splits as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &w,
+                &u,
+                &qg,
+                &kq,
+                &kg,
+                &gl,
+                &s_in,
+                Output::new(o),
+                Output::with_offset(s_out.buffer, s_out.offset_in_bytes),
+                Output::new(vn),
+                nc as u32,
+                cs as u32,
+                d as u32,
+                splits as u32
+            )
+        );
+    }
     dispatch_groups(encoder, h_v * splits, 128);
     Ok(())
 }
 
 /// `gdn_chunk_epilogue_f32`: `o [h_v, padded, d]`, γ, `z [seq, h_v·d]` →
 /// `[seq, h_v·d]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_chunk_epilogue(
+pub unsafe fn call_gdn_chunk_epilogue(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -514,19 +599,22 @@ pub fn call_gdn_chunk_epilogue(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_chunk_epilogue seq={seq} d={d} h_v={h_v}");
-    set_params!(
-        encoder,
-        (
-            &o,
-            &gamma,
-            &z,
-            Output::new(out),
-            padded as u32,
-            d as u32,
-            h_v as u32,
-            eps
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &o,
+                &gamma,
+                &z,
+                Output::new(out),
+                padded as u32,
+                d as u32,
+                h_v as u32,
+                eps
+            )
+        );
+    }
     dispatch_groups_2d(encoder, h_v, seq, head_width(d, &pipeline));
     Ok(())
 }
@@ -534,8 +622,13 @@ pub fn call_gdn_chunk_epilogue(
 /// `gdn_prologue_rows_f32`: `B` rows of `qkv [B, C]` against the window
 /// pool (`slots` / `phases` per row) → `heads [B, 3, h_v, d]`, each row's
 /// window after the step written to its next phase.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_prologue_rows(
+pub unsafe fn call_gdn_prologue_rows(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -563,26 +656,29 @@ pub fn call_gdn_prologue_rows(
         encoder,
         "gdn_prologue_rows rows={rows} d={d} h_k={h_k} h_v={h_v}"
     );
-    set_params!(
-        encoder,
-        (
-            &qkv,
-            &conv_w,
-            &win_pool,
-            &slots,
-            &phases,
-            Output::new(heads),
-            d as u32,
-            h_k as u32,
-            h_v as u32,
-            kk as u32,
-            eps,
-            q_scale,
-            n_slots as u32,
-            n_phases as u32,
-            Output::from_buffer_offset(&win_pool)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qkv,
+                &conv_w,
+                &win_pool,
+                &slots,
+                &phases,
+                Output::new(heads),
+                d as u32,
+                h_k as u32,
+                h_v as u32,
+                kk as u32,
+                eps,
+                q_scale,
+                n_slots as u32,
+                n_phases as u32,
+                Output::from_buffer_offset(&win_pool)
+            )
+        );
+    }
     dispatch_groups_2d(encoder, 2 * h_k + h_v, rows, head_width(d, &pipeline));
     Ok(())
 }
@@ -590,8 +686,13 @@ pub fn call_gdn_prologue_rows(
 /// `gdn_prologue_seq_f32`: `T` positions of one row (`slot` at `phase`) →
 /// `heads [T, 3, h_v, d]`, the window after each position at phase
 /// `phase + 1 + t`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_prologue_seq(
+pub unsafe fn call_gdn_prologue_seq(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -619,26 +720,29 @@ pub fn call_gdn_prologue_seq(
         encoder,
         "gdn_prologue_seq steps={steps} d={d} h_k={h_k} h_v={h_v}"
     );
-    set_params!(
-        encoder,
-        (
-            &qkv,
-            &conv_w,
-            &win_pool,
-            Output::new(heads),
-            d as u32,
-            h_k as u32,
-            h_v as u32,
-            kk as u32,
-            eps,
-            q_scale,
-            n_slots as u32,
-            n_phases as u32,
-            slot as u32,
-            phase as u32,
-            Output::from_buffer_offset(&win_pool)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qkv,
+                &conv_w,
+                &win_pool,
+                Output::new(heads),
+                d as u32,
+                h_k as u32,
+                h_v as u32,
+                kk as u32,
+                eps,
+                q_scale,
+                n_slots as u32,
+                n_phases as u32,
+                slot as u32,
+                phase as u32,
+                Output::from_buffer_offset(&win_pool)
+            )
+        );
+    }
     dispatch_groups_2d(encoder, 2 * h_k + h_v, steps, head_width(d, &pipeline));
     Ok(())
 }
@@ -657,8 +761,13 @@ fn gdn_split_cap() -> usize {
 
 /// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool, in the
 /// form `register` names (as [`call_gdn_step`]).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_step_rows(
+pub unsafe fn call_gdn_step_rows(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -683,25 +792,28 @@ pub fn call_gdn_step_rows(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_step_rows rows={rows} d={d} h_v={h_v}");
-    set_params!(
-        encoder,
-        (
-            &heads,
-            &alpha,
-            &beta,
-            &dt_bias,
-            &ssm_a,
-            &s_pool,
-            &slots,
-            &phases,
-            Output::new(o),
-            d as u32,
-            h_v as u32,
-            n_slots as u32,
-            n_phases as u32,
-            Output::from_buffer_offset(&s_pool)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &heads,
+                &alpha,
+                &beta,
+                &dt_bias,
+                &ssm_a,
+                &s_pool,
+                &slots,
+                &phases,
+                Output::new(o),
+                d as u32,
+                h_v as u32,
+                n_slots as u32,
+                n_phases as u32,
+                Output::from_buffer_offset(&s_pool)
+            )
+        );
+    }
     dispatch_groups_2d(encoder, d, rows, h_v * split);
     Ok(())
 }
@@ -709,8 +821,13 @@ pub fn call_gdn_step_rows(
 /// `gdn_step_seq_f32`: `T` positions of one row's recurrence in one launch,
 /// every intermediate `S` kept at phases `phase + 1 ..= phase + T`, in the
 /// form `register` names (as [`call_gdn_step`]).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_step_seq(
+pub unsafe fn call_gdn_step_seq(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -735,33 +852,41 @@ pub fn call_gdn_step_seq(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_step_seq steps={steps} d={d} h_v={h_v}");
-    set_params!(
-        encoder,
-        (
-            &heads,
-            &alpha,
-            &beta,
-            &dt_bias,
-            &ssm_a,
-            &s_pool,
-            Output::new(o),
-            d as u32,
-            h_v as u32,
-            n_slots as u32,
-            n_phases as u32,
-            slot as u32,
-            phase as u32,
-            steps as u32,
-            Output::from_buffer_offset(&s_pool)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &heads,
+                &alpha,
+                &beta,
+                &dt_bias,
+                &ssm_a,
+                &s_pool,
+                Output::new(o),
+                d as u32,
+                h_v as u32,
+                n_slots as u32,
+                n_phases as u32,
+                slot as u32,
+                phase as u32,
+                steps as u32,
+                Output::from_buffer_offset(&s_pool)
+            )
+        );
+    }
     dispatch_groups(encoder, d, h_v * split);
     Ok(())
 }
 
 /// `gdn_gated_norm_rows_f32`: `B` rows of the gated norm.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_gdn_gated_norm_rows(
+pub unsafe fn call_gdn_gated_norm_rows(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -784,10 +909,13 @@ pub fn call_gdn_gated_norm_rows(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "gdn_gated_norm_rows rows={rows} d={d} h_v={h_v}");
-    set_params!(
-        encoder,
-        (&o, &gamma, &z, Output::new(out), d as u32, h_v as u32, eps)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&o, &gamma, &z, Output::new(out), d as u32, h_v as u32, eps)
+        );
+    }
     dispatch_groups_2d(encoder, h_v, rows, head_width(d, &pipeline));
     Ok(())
 }

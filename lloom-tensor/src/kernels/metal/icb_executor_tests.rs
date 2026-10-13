@@ -138,19 +138,23 @@ fn run_cos_steps(steps: usize, executor: Option<&Arc<IcbExecutor>>, input: &[f32
     for _ in 0..steps {
         {
             let guard = cmds.command_encoder().unwrap();
-            call_unary_contiguous(
-                &device,
-                &guard,
-                &kernels,
-                unary::contiguous::cos::FLOAT,
-                std::mem::size_of::<f32>(),
-                input.len(),
-                BufferOffset {
-                    buffer: &src,
-                    offset_in_bytes: SRC_SKIP * std::mem::size_of::<f32>(),
-                },
-                &dst,
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_unary_contiguous(
+                    &device,
+                    &guard,
+                    &kernels,
+                    unary::contiguous::cos::FLOAT,
+                    std::mem::size_of::<f32>(),
+                    input.len(),
+                    BufferOffset {
+                        buffer: &src,
+                        offset_in_bytes: SRC_SKIP * std::mem::size_of::<f32>(),
+                    },
+                    &dst,
+                )
+            }
             .unwrap();
         }
         cmds.flush_and_wait().unwrap();
@@ -159,7 +163,9 @@ fn run_cos_steps(steps: usize, executor: Option<&Arc<IcbExecutor>>, input: &[f32
         }
     }
 
-    let ptr = dst.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { dst.contents() } as *const f32;
     // SAFETY: the command buffer has completed and `dst` holds `input.len()`
     // f32 in shared storage.
     unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
@@ -380,19 +386,23 @@ fn run_cos_chain(
                     _ if link % 2 == 1 => (&a, &b),
                     _ => (&b, &a),
                 };
-                call_unary_contiguous(
-                    &device,
-                    &guard,
-                    &kernels,
-                    unary::contiguous::cos::FLOAT,
-                    std::mem::size_of::<f32>(),
-                    input.len(),
-                    BufferOffset {
-                        buffer: from,
-                        offset_in_bytes: 0,
-                    },
-                    to,
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_unary_contiguous(
+                        &device,
+                        &guard,
+                        &kernels,
+                        unary::contiguous::cos::FLOAT,
+                        std::mem::size_of::<f32>(),
+                        input.len(),
+                        BufferOffset {
+                            buffer: from,
+                            offset_in_bytes: 0,
+                        },
+                        to,
+                    )
+                }
                 .unwrap();
             }
         }
@@ -403,7 +413,9 @@ fn run_cos_chain(
     }
 
     let last = if links % 2 == 1 { &a } else { &b };
-    let ptr = last.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { last.contents() } as *const f32;
     // SAFETY: the command buffer has completed and the buffer holds
     // `input.len()` f32 in shared storage.
     unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
@@ -649,19 +661,23 @@ fn run_two_runs(
                         ParamStyle::Packed
                     });
                 }
-                call_unary_contiguous(
-                    &device,
-                    &guard,
-                    &kernels,
-                    unary::contiguous::cos::FLOAT,
-                    std::mem::size_of::<f32>(),
-                    input.len(),
-                    BufferOffset {
-                        buffer: from,
-                        offset_in_bytes: 0,
-                    },
-                    to,
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_unary_contiguous(
+                        &device,
+                        &guard,
+                        &kernels,
+                        unary::contiguous::cos::FLOAT,
+                        std::mem::size_of::<f32>(),
+                        input.len(),
+                        BufferOffset {
+                            buffer: from,
+                            offset_in_bytes: 0,
+                        },
+                        to,
+                    )
+                }
                 .unwrap();
             }
         }
@@ -671,7 +687,9 @@ fn run_two_runs(
         }
     }
 
-    let ptr = a.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { a.contents() } as *const f32;
     // SAFETY: the command buffer has completed and `a` holds `input.len()` f32
     // in shared storage -- the fifth link wrote it.
     let out = unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec();
@@ -823,19 +841,23 @@ fn run_chain_shaped(
                 } else {
                     &b
                 };
-                call_unary_contiguous(
-                    &device,
-                    &guard,
-                    &kernels,
-                    unary::contiguous::cos::FLOAT,
-                    std::mem::size_of::<f32>(),
-                    input.len(),
-                    BufferOffset {
-                        buffer: from,
-                        offset_in_bytes: 0,
-                    },
-                    to,
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_unary_contiguous(
+                        &device,
+                        &guard,
+                        &kernels,
+                        unary::contiguous::cos::FLOAT,
+                        std::mem::size_of::<f32>(),
+                        input.len(),
+                        BufferOffset {
+                            buffer: from,
+                            offset_in_bytes: 0,
+                        },
+                        to,
+                    )
+                }
                 .unwrap();
                 from = to;
                 last = to;
@@ -849,7 +871,9 @@ fn run_chain_shaped(
         }
         cmds.flush_and_wait().unwrap();
     }
-    let ptr = last.contents() as *const f32;
+    // SAFETY: the test owns every buffer bound or mapped here and reads its
+    // results only after waiting for the command buffer that writes them.
+    let ptr = unsafe { last.contents() } as *const f32;
     // SAFETY: the command buffer has completed and the buffer holds
     // `input.len()` f32 in shared storage.
     unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
@@ -1042,43 +1066,51 @@ fn run_gemv_epilogue_steps(
         {
             let guard = cmds.command_encoder().unwrap();
             match orient {
-                Orient::Weight => call_mlx_gemv_epilogue(
-                    &device,
-                    &guard,
-                    &kernels,
-                    dtype,
-                    (1, n_out, 1, k),
-                    &[n_out * k, k, 1],
-                    0,
-                    &up_buf,
-                    &[k, 1, 1],
-                    0,
-                    &vec_buf,
-                    &out,
-                    style,
-                    None,
-                    epilogue,
-                    Some((&op_buf, 0)),
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                Orient::Weight => unsafe {
+                    call_mlx_gemv_epilogue(
+                        &device,
+                        &guard,
+                        &kernels,
+                        dtype,
+                        (1, n_out, 1, k),
+                        &[n_out * k, k, 1],
+                        0,
+                        &up_buf,
+                        &[k, 1, 1],
+                        0,
+                        &vec_buf,
+                        &out,
+                        style,
+                        None,
+                        epilogue,
+                        Some((&op_buf, 0)),
+                    )
+                }
                 .unwrap(),
-                Orient::Model => call_mlx_gemv_epilogue(
-                    &device,
-                    &guard,
-                    &kernels,
-                    dtype,
-                    (1, 1, n_out, k),
-                    &[k, k, 1],
-                    0,
-                    &vec_buf,
-                    &[1, k],
-                    0,
-                    &up_buf,
-                    &out,
-                    style,
-                    None,
-                    epilogue,
-                    Some((&op_buf, 0)),
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                Orient::Model => unsafe {
+                    call_mlx_gemv_epilogue(
+                        &device,
+                        &guard,
+                        &kernels,
+                        dtype,
+                        (1, 1, n_out, k),
+                        &[k, k, 1],
+                        0,
+                        &vec_buf,
+                        &[1, k],
+                        0,
+                        &up_buf,
+                        &out,
+                        style,
+                        None,
+                        epilogue,
+                        Some((&op_buf, 0)),
+                    )
+                }
                 .unwrap(),
             }
         }
@@ -1252,7 +1284,9 @@ fn run_mlp_steps(
     let arena = device.new_buffer(1 << 20, private).unwrap();
     {
         let mut blit = cmds.blit_command_encoder().unwrap();
-        blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20) };
     }
     cmds.flush_and_wait().unwrap();
     let x = arena.view(512000, 256000);
@@ -1272,21 +1306,25 @@ fn run_mlp_steps(
     let copy =
         |src: &crate::kernels::metal::Buffer, dst: &crate::kernels::metal::Buffer, dst_off| {
             let guard = cmds.command_encoder().unwrap();
-            call_copy2d_with(
-                &device,
-                &guard,
-                &kernels,
-                copy2d::HALF,
-                src,
-                dst,
-                1,
-                k,
-                k,
-                k,
-                0,
-                dst_off,
-                ParamStyle::Split,
-            )
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe {
+                call_copy2d_with(
+                    &device,
+                    &guard,
+                    &kernels,
+                    copy2d::HALF,
+                    src,
+                    dst,
+                    1,
+                    k,
+                    k,
+                    k,
+                    0,
+                    dst_off,
+                    ParamStyle::Split,
+                )
+            }
             .unwrap();
         };
     // Make the cap arm deterministic rather than relying on GPU/host speed.
@@ -1318,46 +1356,54 @@ fn run_mlp_steps(
         for _ in 0..reps {
             {
                 let guard = cmds.command_encoder().unwrap();
-                call_mlx_gemv_epilogue(
-                    &device,
-                    &guard,
-                    &kernels,
-                    GemmDType::F16,
-                    (1, 1, n_out, k),
-                    &[k, k, 1],
-                    0,
-                    &x,
-                    &[1, k],
-                    0,
-                    &up_buf,
-                    &h,
-                    producer_style,
-                    None,
-                    GemvEpilogue::Swiglu,
-                    Some((&gate_buf, 0)),
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_epilogue(
+                        &device,
+                        &guard,
+                        &kernels,
+                        GemmDType::F16,
+                        (1, 1, n_out, k),
+                        &[k, k, 1],
+                        0,
+                        &x,
+                        &[1, k],
+                        0,
+                        &up_buf,
+                        &h,
+                        producer_style,
+                        None,
+                        GemvEpilogue::Swiglu,
+                        Some((&gate_buf, 0)),
+                    )
+                }
                 .unwrap();
             }
             {
                 let guard = cmds.command_encoder().unwrap();
-                call_mlx_gemv_epilogue(
-                    &device,
-                    &guard,
-                    &kernels,
-                    GemmDType::F16,
-                    (1, 1, k, n_out),
-                    &[n_out, n_out, 1],
-                    0,
-                    &h,
-                    &[1, n_out],
-                    0,
-                    &w2_buf,
-                    &o,
-                    consumer_style,
-                    None,
-                    GemvEpilogue::Residual,
-                    Some((residual, 0)),
-                )
+                // SAFETY: the test owns every buffer bound or mapped here and reads its
+                // results only after waiting for the command buffer that writes them.
+                unsafe {
+                    call_mlx_gemv_epilogue(
+                        &device,
+                        &guard,
+                        &kernels,
+                        GemmDType::F16,
+                        (1, 1, k, n_out),
+                        &[n_out, n_out, 1],
+                        0,
+                        &h,
+                        &[1, n_out],
+                        0,
+                        &w2_buf,
+                        &o,
+                        consumer_style,
+                        None,
+                        GemvEpilogue::Residual,
+                        Some((residual, 0)),
+                    )
+                }
                 .unwrap();
             }
         }

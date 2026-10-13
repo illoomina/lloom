@@ -37,6 +37,8 @@ pub enum Feature {
     Avx2,
     /// x86 F16C: f16 <-> f32 conversion.
     F16c,
+    /// x86 FMA3: the fused multiply-add.
+    Fma,
     /// x86 AVX-VNNI: 256-bit int8 dot product.
     AvxVnni,
     /// x86 AVX512-VNNI.
@@ -47,7 +49,7 @@ pub enum Feature {
 
 impl Feature {
     /// Every feature the registry knows, in declaration order.
-    pub const ALL: [Feature; 10] = [
+    pub const ALL: [Feature; 11] = [
         Feature::DotProd,
         Feature::Fp16,
         Feature::Fhm,
@@ -55,6 +57,7 @@ impl Feature {
         Feature::Bf16,
         Feature::Avx2,
         Feature::F16c,
+        Feature::Fma,
         Feature::AvxVnni,
         Feature::Avx512Vnni,
         Feature::Avx512Bf16,
@@ -70,6 +73,7 @@ impl Feature {
             Feature::Bf16 => "bf16",
             Feature::Avx2 => "avx2",
             Feature::F16c => "f16c",
+            Feature::Fma => "fma",
             Feature::AvxVnni => "avxvnni",
             Feature::Avx512Vnni => "avx512vnni",
             Feature::Avx512Bf16 => "avx512bf16",
@@ -92,6 +96,7 @@ impl Feature {
             Feature::Bf16 => cfg!(target_feature = "bf16"),
             Feature::Avx2 => cfg!(target_feature = "avx2"),
             Feature::F16c => cfg!(target_feature = "f16c"),
+            Feature::Fma => cfg!(target_feature = "fma"),
             Feature::AvxVnni => cfg!(target_feature = "avxvnni"),
             Feature::Avx512Vnni => cfg!(target_feature = "avx512vnni"),
             Feature::Avx512Bf16 => cfg!(target_feature = "avx512bf16"),
@@ -116,6 +121,8 @@ impl Feature {
             Feature::Avx2 => std::arch::is_x86_feature_detected!("avx2"),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Feature::F16c => std::arch::is_x86_feature_detected!("f16c"),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Feature::Fma => std::arch::is_x86_feature_detected!("fma"),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Feature::AvxVnni => std::arch::is_x86_feature_detected!("avxvnni"),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

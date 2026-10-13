@@ -108,15 +108,19 @@ fn dequant_rows_f16_matches(
             _ => unreachable!("a Metal tensor"),
         };
         let enc = md.command_encoder()?;
-        lloom_tensor::kernels::call_quantized_dequant_rows_f16(
-            md.device(),
-            &enc,
-            md.kernels(),
-            dtype.into(),
-            (rows, k),
-            q.metal_buffer()?,
-            dst,
-        )
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe {
+            lloom_tensor::kernels::call_quantized_dequant_rows_f16(
+                md.device(),
+                &enc,
+                md.kernels(),
+                dtype.into(),
+                (rows, k),
+                q.metal_buffer()?,
+                dst,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
     }
     let got = out.to_device(&Device::Cpu)?.to_vec1::<f16>()?;

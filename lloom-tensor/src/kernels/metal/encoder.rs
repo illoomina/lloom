@@ -754,7 +754,566 @@ impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
     }
 }
 
+/// Already-evaluated inline constant borrow. This is a byte representation,
+/// not an arbitrary EncoderParam callback; preparation invokes no native effect.
+/// Packed/ICB uses a separate genuine staged-block binding, not this inline mode.
+pub(crate) struct InlineArgument<'a> {
+    pub(crate) index: usize,
+    pub(crate) bytes: &'a [u8],
+}
+
+// Cold-owned immutable shader access is separate from the unique operation
+// writer. A Plan moves whole into original-generation slots before any effect.
+enum InlinePipelineOwner<'a> {
+    Borrowed(&'a ComputePipeline),
+    Plan(crate::metal_backend::CatalogPlanLease),
+}
+enum InstalledInlinePipeline<'a> {
+    Borrowed(&'a ComputePipeline),
+    Plan(super::native_generation_bindings::InstalledPlan),
+}
+impl InstalledInlinePipeline<'_> {
+    fn pipeline(&self) -> &ComputePipeline {
+        match self {
+            Self::Borrowed(pipeline) => pipeline,
+            Self::Plan(plan) => plan.affine_shader().native_pipeline(),
+        }
+    }
+}
+/// Original encoder Ticket, not current Commands lookup. Existing state mutex
+/// is held only to borrow the Ticket; executor/native lowering runs offguard.
+struct BindingEdit<'a> {
+    buffer: &'a super::CommandBuffer,
+    ticket: Option<crate::command_lifecycle::Ticket>,
+    entered_effects: bool,
+}
+impl BindingEdit<'_> {
+    fn finish(mut self) -> Result<(), crate::kernels::MetalKernelError> {
+        self.buffer
+            .finish_binding_edit(self.ticket.as_mut().expect("binding edit"))?;
+        self.ticket = None;
+        Ok(())
+    }
+}
+impl Drop for BindingEdit<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.as_mut() else {
+            return;
+        };
+        let result = if self.entered_effects || std::thread::panicking() {
+            self.buffer.abandon_binding_edit(ticket)
+        } else {
+            self.buffer.finish_binding_edit(ticket)
+        };
+        if result.is_err() || self.entered_effects || std::thread::panicking() {
+            if let Ok(generation) = self.buffer.binding_generation() {
+                // Quarantine is not terminality/Drop. Root polling later wakes
+                // SAME queue waiters outside registry and ready/active locks.
+                generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            }
+        }
+    }
+}
 impl ComputeCommandEncoder {
+    fn binding_edit(&self) -> Result<BindingEdit<'_>, crate::kernels::MetalKernelError> {
+        let state = self.state.lock(); // existing mutex only
+        if state.ended {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "encoder already ended",
+            ));
+        }
+        let owner =
+            state
+                .recording
+                .as_ref()
+                .ok_or(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "raw encoder requires unsafe interoperability",
+                ))?;
+        if !owner.same_buffer(&self.command_buffer) {
+            return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                "foreign encoder admission",
+            ));
+        }
+        let ticket = owner.begin_binding_edit()?;
+        drop(state);
+        Ok(BindingEdit {
+            buffer: &self.command_buffer,
+            ticket: Some(ticket),
+            entered_effects: false,
+        })
+    }
+    /// All tuple arguments and counted mints are preflighted before this private
+    /// lowering entry. Installed capability roots exact generation+NativeUse;
+    /// untracked legacy/foreign/replaced generations never take this safe route.
+    pub(crate) fn set_buffer_tracked(
+        &self,
+        index: usize,
+        binding: &super::native_generation_bindings::PreparedBuffer,
+        offset: usize,
+        write: bool,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        self.set_buffer_batch_tracked(&[(index, binding, offset, write)])
+    }
+
+    /// Buffer-only batch primitive, preserving one exact operation permit.
+    /// Caller evaluates argument expressions ONCE and premints EVERY lease
+    /// before this call. Full heterogeneous scalar/packed/ICB lowering remains a
+    /// caller migration obligation; this does not claim all set_params coverage.
+    pub(crate) fn set_buffer_batch_tracked<const N: usize>(
+        &self,
+        bindings: &[(
+            usize,
+            &super::native_generation_bindings::PreparedBuffer,
+            usize,
+            bool,
+        ); N],
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        let mut edit = self.binding_edit()?;
+        let generation = self.command_buffer.binding_generation()?;
+        let mut prepared: [Option<super::native_generation_bindings::PreparedBuffer>; N] =
+            std::array::from_fn(|_| None);
+        for (slot, &(_, binding, _, _)) in prepared.iter_mut().zip(bindings) {
+            *slot = Some(binding.try_clone()?);
+        }
+        // Keep the actual packed cursor under its EXISTING mutex across whole
+        // preflight/once-only commit, but release before any custom/native lower.
+        let mut capture = self
+            .capturing
+            .load(Ordering::Relaxed)
+            .then(|| self.param_capture.lock());
+        let mut next_buffer = capture.as_ref().map(|capture| capture.next_buffer);
+        let mut preview_effects = false;
+        let plan = crate::native_binding_preflight::preflight_buffer_indices(
+            next_buffer.as_mut(),
+            bindings,
+            |entry| entry.0,
+            |_, &(_, binding, offset, _)| {
+                if !binding.matches(generation) {
+                    return Err(crate::kernels::MetalKernelError::QueueUnavailable(
+                        "stale native binding generation",
+                    ));
+                }
+                let buffer = binding.lease().buffer_for_binding().map_err(|_| {
+                    crate::kernels::MetalKernelError::QueueUnavailable(
+                        "native binding is not counted External custody",
+                    )
+                })?;
+                crate::native_binding_preflight::checked_bind_offset(
+                    buffer.base_offset(),
+                    buffer.length(),
+                    offset,
+                )
+                .ok_or(crate::kernels::MetalKernelError::QueueUnavailable(
+                    "native binding view offset refused",
+                ))?;
+                Ok(())
+            },
+            crate::kernels::MetalKernelError::QueueUnavailable,
+            &mut preview_effects,
+        )?;
+        // All ordinary checks/clones complete. Existing exact EDIT is the
+        // sole slot-writer permit; capacity refusal commits nothing above/below.
+        let installed = unsafe {
+            generation
+                .install_prepared(prepared.map(|binding| binding.expect("prepared tuple member")))
+        }?;
+        edit.entered_effects |= preview_effects;
+        if let (Some(capture), Some(next)) = (capture.as_mut(), next_buffer) {
+            capture.next_buffer = next;
+        }
+        drop(capture);
+        for (position, &(index, _, offset, write)) in bindings.iter().enumerate() {
+            let binding = &installed[position];
+            let index = plan.resolve(position, index);
+            let lease = binding.lease();
+            // Already checked immutable External role; borrow spans same head.
+            let buffer = lease.buffer_for_binding().map_err(|_| {
+                crate::kernels::MetalKernelError::QueueUnavailable(
+                    "installed native binding changed role",
+                )
+            })?;
+            // SAFETY: installed counted lease and exact generation head survive
+            // native terminality and cached references; raw does not escape.
+            let raw = unsafe { lease.raw_unchecked() };
+            if write {
+                self.set_output_buffer_native_resolved(index, Some(buffer), offset, Some(raw));
+            } else {
+                self.set_input_buffer_native_resolved(index, Some(buffer), offset, Some(raw));
+            }
+        }
+        edit.finish()
+    }
+
+    /// Genuine mint-only output custody, before pipeline/scalar/dispatch effects.
+    /// Capacity is caller-preadmitted/refilled; no legacy lease coercion occurs.
+    pub(crate) fn prepare_fill_output(
+        &self,
+        buffer: &Buffer,
+    ) -> Result<super::native_generation_bindings::PreparedBuffer, crate::kernels::MetalKernelError>
+    {
+        self.command_buffer
+            .binding_generation()?
+            .prepare_buffer(buffer)
+    }
+
+    /// Preserved prior captured-fill intermediate; not selected by inline adapter. Exact original encoder Ticket
+    /// spans preflight, packed bytes, pipeline, output, scalars AND dispatch.
+    /// # Safety
+    /// Caller binds the exact fill shader to this primitive's width/alignment,
+    /// validates output extent and dispatch geometry, and owns every captured
+    /// array/packed block through terminal native use AND escaped emission.
+    /// A packed block may be CPU-rewritten only under its genuine exclusive
+    /// physical occupancy; clock identity or a cursor reset is not that proof.
+    /// All arguments are evaluated once before any encoder effects.
+    pub(crate) unsafe fn dispatch_fill_captured_intermediate(
+        &self,
+        pipeline: &ComputePipeline,
+        output: &Buffer,
+        value: &[u8],
+        value_align: usize,
+        length: usize,
+        groups: MTLSize,
+        threads: MTLSize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        let mut edit = self.binding_edit()?;
+        let generation = self.command_buffer.binding_generation()?;
+        let buffer = output;
+        if value.is_empty() || value.len() > 8 || !value_align.is_power_of_two() || value_align > 8
+        {
+            return Err(Error::QueueUnavailable("invalid sealed fill scalar layout"));
+        }
+        let extent = length
+            .checked_mul(value.len())
+            .ok_or(Error::QueueUnavailable("fill byte extent overflow"))?;
+        if extent > buffer.length() {
+            return Err(Error::QueueUnavailable("fill exceeds output view"));
+        }
+        let length_bytes = length.to_ne_bytes();
+        let mut capture = self
+            .capturing
+            .load(Ordering::Relaxed)
+            .then(|| self.param_capture.lock());
+        // Exact existing packed order: Output(0), scalar(1), usize length(2).
+        // Preflight all byte geometry/capacity BEFORE effect latch/cursor commit.
+        let scalar_layout = if let Some(cap) = capture.as_ref() {
+            let value_start = cap
+                .bytes
+                .len()
+                .checked_add(value_align - 1)
+                .map(|end| end & !(value_align - 1))
+                .ok_or(Error::QueueUnavailable(
+                    "fill packed scalar offset overflow",
+                ))?;
+            let value_end = value_start
+                .checked_add(value.len())
+                .ok_or(Error::QueueUnavailable("fill packed scalar end overflow"))?;
+            let align = core::mem::align_of::<usize>();
+            let length_start = value_end
+                .checked_add(align - 1)
+                .map(|end| end & !(align - 1))
+                .ok_or(Error::QueueUnavailable(
+                    "fill packed length offset overflow",
+                ))?;
+            let end = length_start
+                .checked_add(length_bytes.len())
+                .ok_or(Error::QueueUnavailable("fill packed length end overflow"))?;
+            if end > cap.bytes.capacity() {
+                return Err(Error::QueueUnavailable(
+                    "fill packed storage needs cold refill",
+                ));
+            }
+            Some((value_start, value_end, length_start, end))
+        } else {
+            None
+        };
+        // Preview against local cursor/effects only. No shared capture mutation,
+        // pin reservation or native effect until every ordinary preflight succeeds.
+        let mut next_buffer = capture.as_ref().map(|cap| cap.next_buffer);
+        let mut preview_effects = false;
+        let entries = [0usize];
+        let plan = crate::native_binding_preflight::preflight_buffer_indices(
+            next_buffer.as_mut(),
+            &entries,
+            |entry| *entry,
+            |_, _| {
+                crate::native_binding_preflight::checked_bind_offset(
+                    buffer.base_offset(),
+                    buffer.length(),
+                    0,
+                )
+                .map(|_| ())
+                .ok_or(Error::QueueUnavailable(
+                    "fill output absolute offset overflow",
+                ))
+            },
+            Error::QueueUnavailable,
+            &mut preview_effects,
+        )?;
+        // Exact original EDIT admission excludes native close/submit. Counted
+        // mint/refusal runs before consuming slot, through shared actual helper.
+        let prepared = generation.prepare_buffer(output)?;
+        // SAFETY: original EDIT is held; complete scalar/geometry/capture
+        // preflight above. No ordinary failure can consume a partial tuple.
+        let [installed] = unsafe { generation.install_prepared([prepared]) }?;
+        let buffer = installed.lease().buffer_for_binding().map_err(|_| {
+            generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            Error::QueueUnavailable("installed fill lease violated External role")
+        })?;
+        edit.entered_effects |= preview_effects;
+        if let (Some(cap), Some(next)) = (capture.as_mut(), next_buffer) {
+            cap.next_buffer = next;
+        }
+        if let (Some(cap), Some((value_start, value_end, length_start, end))) =
+            (capture.as_mut(), scalar_layout)
+        {
+            // All bounds/capacity checked. u8 resize fits retained allocation;
+            // no fallible clone/allocation/user callback between arm and commit.
+            cap.bytes.resize(end, 0);
+            cap.bytes[value_start..value_end].copy_from_slice(value);
+            cap.bytes[length_start..end].copy_from_slice(&length_bytes);
+        }
+        drop(capture);
+        self.set_compute_pipeline_state(pipeline);
+        // SAFETY: genuine output's same-generation head remains throughout this
+        // call and independently through raw terminality/cached-reference closure.
+        let raw = unsafe { installed.lease().raw_unchecked() };
+        self.set_output_buffer_native_resolved(plan.resolve(0, 0), Some(buffer), 0, Some(raw));
+        if scalar_layout.is_none() {
+            self.set_bytes_directly(1, value.len(), value.as_ptr().cast());
+            self.set_bytes(2, &length);
+        }
+        self.dispatch_thread_groups(groups, threads);
+        edit.finish()
+    }
+
+    /// Shared complete inline operation: one original EDIT covers every buffer
+    /// mint, whole credit plan/install, scalar, pipeline and dispatch. This is
+    /// an intermediate caller seam, not legacy or Packed/ICB activation.
+    /// # Safety
+    /// Caller validates this pipeline's exact shader schema, scalar widths and
+    /// accessed buffer extents/grid. All arguments are evaluated once before
+    /// this call. Inline mode has no active old parameter capture; Packed/ICB
+    /// callers must supply genuine plan-owned staging/rewrite custody separately.
+    pub(crate) unsafe fn dispatch_inline_arguments_tracked<const N: usize>(
+        &self,
+        pipeline: &ComputePipeline,
+        buffers: &[(usize, &Buffer, usize, bool)],
+        scalars: &[InlineArgument<'_>],
+        groups: MTLSize,
+        threads: MTLSize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        // SAFETY: unchanged exact schema/geometry caller contract above.
+        unsafe {
+            self.dispatch_inline_arguments_impl::<N>(
+                InlinePipelineOwner::Borrowed(pipeline),
+                buffers,
+                scalars,
+                groups,
+                threads,
+            )
+        }
+    }
+
+    /// Complete actual affine tuple with terminal-owned SAME-node writer/root.
+    /// No method-return unlock, pipeline retain or operation Arc allocation.
+    /// # Safety
+    /// Sealed payload preparation validates shader/native integer geometry and
+    /// originating input/output/staging extents. ALL parameter writes ended
+    /// before into_plan. All buffer arguments were evaluated once. Escaped
+    /// native/executor/ICB emissions retain this SAME generation's page head.
+    pub(crate) unsafe fn dispatch_affine_arguments_tracked<const N: usize>(
+        &self,
+        plan: crate::metal_backend::CatalogPlanLease,
+        buffers: &[(usize, &Buffer, usize, bool)],
+        scalars: &[InlineArgument<'_>],
+        groups: MTLSize,
+        threads: MTLSize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        // SAFETY: no mutable plan projection survives consumption above; the
+        // common actual EDIT/mint/preflight body publishes N+1 before effects.
+        unsafe {
+            self.dispatch_inline_arguments_impl::<N>(
+                InlinePipelineOwner::Plan(plan),
+                buffers,
+                scalars,
+                groups,
+                threads,
+            )
+        }
+    }
+
+    unsafe fn dispatch_inline_arguments_impl<const N: usize>(
+        &self,
+        pipeline: InlinePipelineOwner<'_>,
+        buffers: &[(usize, &Buffer, usize, bool)],
+        scalars: &[InlineArgument<'_>],
+        groups: MTLSize,
+        threads: MTLSize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        let mut edit = self.binding_edit()?;
+        let generation = self.command_buffer.binding_generation()?;
+        if buffers.len() != N {
+            return Err(Error::QueueUnavailable(
+                "inline operation tuple arity mismatch",
+            ));
+        }
+        // Existing Packed/ICB route remains callable; this new inline route is
+        // not used to erase it or claim its independent staging ownership closed.
+        if self.capturing.load(Ordering::Acquire) {
+            return Err(Error::QueueUnavailable(
+                "inline operation requires prepared noncapture mode",
+            ));
+        }
+        // A complete shader argument tuple has one binding per native index.
+        // Reject scalar/buffer and same-kind collisions before any mint, credit
+        // reservation or effect; otherwise setBytes could replace a live buffer.
+        let mut occupied = 0u32;
+        for &(index, _, _, _) in buffers {
+            if index >= 31 {
+                return Err(Error::QueueUnavailable(
+                    "inline buffer native index refused",
+                ));
+            }
+            let bit = 1u32 << index;
+            if occupied & bit != 0 {
+                return Err(Error::QueueUnavailable("inline argument index collision"));
+            }
+            occupied |= bit;
+        }
+        for scalar in scalars {
+            // Apple setBytes contract: data smaller than 4KiB. The prepared
+            // caller stages larger arrays as ordinary counted buffer members.
+            if scalar.bytes.len() >= 4096 {
+                return Err(Error::QueueUnavailable(
+                    "inline argument needs genuine staged buffer",
+                ));
+            }
+            if scalar.index >= 31 {
+                return Err(Error::QueueUnavailable(
+                    "inline scalar native index refused",
+                ));
+            }
+            let bit = 1u32 << scalar.index;
+            if occupied & bit != 0 {
+                return Err(Error::QueueUnavailable("inline argument index collision"));
+            }
+            occupied |= bit;
+        }
+        let mut prepared: [Option<super::native_generation_bindings::PreparedBuffer>; N] =
+            std::array::from_fn(|_| None);
+        for (slot, &(_, buffer, _, _)) in prepared.iter_mut().zip(buffers) {
+            *slot = Some(generation.prepare_buffer(buffer)?);
+        }
+        let mut preview_effects = false;
+        let plan = crate::native_binding_preflight::preflight_buffer_indices(
+            None,
+            buffers,
+            |entry| entry.0,
+            |_, &(_, buffer, offset, _)| {
+                crate::native_binding_preflight::checked_bind_offset(
+                    buffer.base_offset(),
+                    buffer.length(),
+                    offset,
+                )
+                .map(|_| ())
+                .ok_or(Error::QueueUnavailable("inline buffer view offset refused"))
+            },
+            Error::QueueUnavailable,
+            &mut preview_effects,
+        )?;
+        // SAFETY: SAME original EDIT spans this entire call and is the sole
+        // slot writer. Every ordinary schema/geometry/mint check precedes this.
+        let prepared = prepared.map(|binding| binding.expect("prepared inline member"));
+        let (installed, pipeline) = match pipeline {
+            InlinePipelineOwner::Borrowed(pipeline) => (
+                unsafe { generation.install_prepared(prepared) }?,
+                InstalledInlinePipeline::Borrowed(pipeline),
+            ),
+            InlinePipelineOwner::Plan(plan) => {
+                let (buffers, plan) =
+                    unsafe { generation.install_prepared_with_plan(prepared, plan) }?;
+                (buffers, InstalledInlinePipeline::Plan(plan))
+            }
+        };
+        // No effect precedes every counted pin and optional plan LIVE. Any
+        // unwind/refused finish quarantines original generation; writer/root,
+        // native leases and initialized slots remain in SAME terminal custody.
+        edit.entered_effects = true;
+        self.set_compute_pipeline_state(pipeline.pipeline());
+        for (position, &(index, _, offset, write)) in buffers.iter().enumerate() {
+            let lease = installed[position].lease();
+            let buffer = lease.buffer_for_binding().map_err(|_| {
+                generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+                Error::QueueUnavailable("installed inline lease violated External role")
+            })?;
+            let raw = unsafe { lease.raw_unchecked() };
+            let index = plan.resolve(position, index);
+            if write {
+                self.set_output_buffer_native_resolved(index, Some(buffer), offset, Some(raw));
+            } else {
+                self.set_input_buffer_native_resolved(index, Some(buffer), offset, Some(raw));
+            }
+        }
+        for scalar in scalars {
+            self.set_bytes_directly(
+                scalar.index,
+                scalar.bytes.len(),
+                scalar.bytes.as_ptr().cast(),
+            );
+        }
+        self.dispatch_thread_groups(groups, threads);
+        edit.finish()
+    }
+
+    /// Sealed primitive fill is the first actual common-bundle caller. Dynamic
+    /// shader/type pairs never enter through this method's sealed outer adapter.
+    pub(crate) fn dispatch_fill_tracked(
+        &self,
+        pipeline: &ComputePipeline,
+        output: &Buffer,
+        value: &[u8],
+        value_align: usize,
+        length: usize,
+        groups: MTLSize,
+        threads: MTLSize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        if value.is_empty() || value.len() > 8 || !value_align.is_power_of_two() || value_align > 8
+        {
+            return Err(Error::QueueUnavailable("invalid sealed fill scalar layout"));
+        }
+        let extent = length
+            .checked_mul(value.len())
+            .ok_or(Error::QueueUnavailable("fill byte extent overflow"))?;
+        if extent > output.length() {
+            return Err(Error::QueueUnavailable("fill exceeds output view"));
+        }
+        let length_bytes = length.to_ne_bytes();
+        // SAFETY: sole caller is the sealed TrackedFillValue adapter: matching
+        // fill shader/primitive width, output extent checked above; native
+        // groups/threads come from its checked nonzero pipeline width.
+        unsafe {
+            self.dispatch_inline_arguments_tracked::<1>(
+                pipeline,
+                &[(0, output, 0, true)],
+                &[
+                    InlineArgument {
+                        index: 1,
+                        bytes: value,
+                    },
+                    InlineArgument {
+                        index: 2,
+                        bytes: &length_bytes,
+                    },
+                ],
+                groups,
+                threads,
+            )
+        }
+    }
+
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -1321,8 +1880,41 @@ impl ComputeCommandEncoder {
         }
     }
 
-    pub fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+    /// # Safety
+    /// Explicit legacy/raw interoperability: caller retains genuine originating
+    /// reuse authority and native/accounting owners through actual terminal work,
+    /// cached native references and every escaped future emission. Bare derived
+    /// Buffer/native pointer retention is NOT reuse authority. No tracked pin is
+    /// installed by this method; use the admitted typed operation instead.
+    pub unsafe fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        // Existing legacy spelling remains until coordinated raw API/caller
+        // migration. It is not enrolled by this additive tracked route.
+        self.set_input_buffer_native(
+            index,
+            buffer,
+            offset,
+            buffer.map(|buffer| unsafe { buffer.raw_unchecked() }),
+        );
+    }
+    fn set_input_buffer_native(
+        &self,
+        index: usize,
+        buffer: Option<&Buffer>,
+        offset: usize,
+        native: Option<&ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) {
         let index = self.capture_buffer_index(index);
+        self.set_input_buffer_native_resolved(index, buffer, offset, native);
+    }
+    // The tracked batch has already reserved its actual packed indices. Legacy
+    // single bindings preserve their original capture behavior through wrapper.
+    fn set_input_buffer_native_resolved(
+        &self,
+        index: usize,
+        buffer: Option<&Buffer>,
+        offset: usize,
+        native: Option<&ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) {
         // An arena slot is a region of a shared allocation, so the byte the
         // kernel must start at is the slot's base plus the layout offset the
         // caller computed. `base_offset` is 0 for every ordinary allocation,
@@ -1367,14 +1959,42 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, false);
             }
         }
-        unsafe {
-            self.raw
-                .setBuffer_offset_atIndex(buffer.map(|b| b.as_ref()), offset, index)
-        }
+        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
     }
 
-    pub fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+    /// # Safety
+    /// Explicit legacy/raw interoperability: caller retains genuine originating
+    /// reuse authority and native/accounting owners through actual terminal work,
+    /// cached native references and every escaped future emission. Bare derived
+    /// Buffer/native pointer retention is NOT reuse authority. No tracked pin is
+    /// installed by this method; use the admitted typed operation instead.
+    pub unsafe fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.set_output_buffer_native(
+            index,
+            buffer,
+            offset,
+            buffer.map(|buffer| unsafe { buffer.raw_unchecked() }),
+        );
+    }
+    fn set_output_buffer_native(
+        &self,
+        index: usize,
+        buffer: Option<&Buffer>,
+        offset: usize,
+        native: Option<&ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) {
         let index = self.capture_buffer_index(index);
+        self.set_output_buffer_native_resolved(index, buffer, offset, native);
+    }
+    // The tracked batch has already reserved its actual packed indices. Legacy
+    // single bindings preserve their original capture behavior through wrapper.
+    fn set_output_buffer_native_resolved(
+        &self,
+        index: usize,
+        buffer: Option<&Buffer>,
+        offset: usize,
+        native: Option<&ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+    ) {
         // See `set_input_buffer`: the arena's `base + offset`, added once at the
         // choke point every binding passes through.
         let offset = offset + buffer.map_or(0, Buffer::base_offset);
@@ -1411,10 +2031,7 @@ impl ComputeCommandEncoder {
                 self.executor.will_bind_buffer(index, buf, offset, true);
             }
         }
-        unsafe {
-            self.raw
-                .setBuffer_offset_atIndex(buffer.map(|b| b.as_ref()), offset, index)
-        }
+        unsafe { self.raw.setBuffer_offset_atIndex(native, offset, index) }
     }
 
     pub fn set_bytes_directly(&self, index: usize, length: usize, bytes: *const c_void) {
@@ -1470,7 +2087,11 @@ impl ComputeCommandEncoder {
     /// for why that is acceptable here and what a plan-owned buffer would look
     /// like instead.
     #[inline]
-    pub(crate) fn capture_array(&self, len_bytes: usize, bytes: *const c_void) -> bool {
+    /// # Safety
+    /// Original packed staging interoperability. Caller closes actual staging
+    /// native references, reuse/accounting and future emission; this method is
+    /// not a counted generation/ICB ownership proof.
+    pub(crate) unsafe fn capture_array(&self, len_bytes: usize, bytes: *const c_void) -> bool {
         if !self.capturing.load(Ordering::Relaxed) {
             return false;
         }
@@ -1499,7 +2120,7 @@ impl ComputeCommandEncoder {
         }
         unsafe {
             self.raw
-                .setBuffer_offset_atIndex(Some(buffer.as_ref()), 0, index)
+                .setBuffer_offset_atIndex(Some(unsafe { buffer.raw_unchecked() }), 0, index)
         }
         // The staging buffer must stay alive until the dispatch it feeds has
         // completed, not merely until it is encoded. It is parked here and
@@ -1658,6 +2279,179 @@ impl ComputeCommandEncoder {
     pub fn debug_group(&self, label: &str) -> DebugGroupGuard<'_> {
         self.raw.pushDebugGroup(&NSString::from_str(label));
         DebugGroupGuard { encoder: self }
+    }
+}
+
+/// One exact copy2d_u8 rectangle, using already admitted tuple positions.
+/// Positions identify installed owners, not native buffer indices. The fixed
+/// shader schema supplies those; no Packed cursor or argument callback runs.
+pub(crate) struct ByteCopyStep {
+    pub(crate) source: usize,
+    pub(crate) destination: usize,
+    pub(crate) source_offset: usize,
+    pub(crate) destination_offset: usize,
+    pub(crate) rows: usize,
+    pub(crate) columns: usize,
+    pub(crate) packed: Option<usize>,
+}
+impl ComputeCommandEncoder {
+    /// Lower all rectangles and optional overlap scratch phases under ONE
+    /// original EDIT. Every native user is minted/installed before ANY effect.
+    /// # Safety
+    /// Pipeline is exact nongated copy2d_u8[_packed] (constant777=false). Split
+    /// scalars below match four int64 fields; every Packed owner contains that
+    /// step's initialized four-field block. Originating owners are genuine rich
+    /// handles; all source bytes are initialized. Overlap must use independent
+    /// placement scratch, write its complete range before reading it, and honor
+    /// actual executor barrier semantics. Escaped ICB/emission/IO custody is an
+    /// independent terminal owner obligation, not established by these bounds.
+    pub(crate) unsafe fn dispatch_byte_copy_steps<const N: usize>(
+        &self,
+        pipeline: &ComputePipeline,
+        owners: &[&super::BufferHandle; N],
+        steps: &[ByteCopyStep],
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        let invalid = Error::QueueUnavailable;
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let max_threads = pipeline.max_total_threads_per_threadgroup();
+        if max_threads == 0 {
+            return Err(invalid("byte copy pipeline has zero thread width"));
+        }
+        // Check the ENTIRE operation before original EDIT/mint/credit/effect.
+        // Grid IDs are exact uint2, address/stride arithmetic exact signed64.
+        for step in steps {
+            if step.rows == 0
+                || step.columns == 0
+                || step.rows > u32::MAX as usize
+                || step.columns > u32::MAX as usize
+            {
+                return Err(invalid("copy rectangle uint grid refused"));
+            }
+            let bytes = step
+                .rows
+                .checked_mul(step.columns)
+                .filter(|bytes| *bytes <= i64::MAX as usize)
+                .ok_or(invalid("copy rectangle signed address extent refused"))?;
+            let source = owners
+                .get(step.source)
+                .ok_or(invalid("copy source tuple position refused"))?;
+            let destination = owners
+                .get(step.destination)
+                .ok_or(invalid("copy destination tuple position refused"))?;
+            crate::native_binding_preflight::checked_byte_range(
+                source.base_offset(),
+                source.length(),
+                step.source_offset,
+                bytes,
+            )
+            .ok_or(invalid("copy source originating range refused"))?;
+            crate::native_binding_preflight::checked_byte_range(
+                destination.base_offset(),
+                destination.length(),
+                step.destination_offset,
+                bytes,
+            )
+            .ok_or(invalid("copy destination originating range refused"))?;
+            if let Some(position) = step.packed {
+                let packed = owners
+                    .get(position)
+                    .ok_or(invalid("copy Packed tuple position refused"))?;
+                crate::native_binding_preflight::checked_byte_range(
+                    packed.base_offset(),
+                    packed.length(),
+                    0,
+                    32,
+                )
+                .ok_or(invalid("copy Packed block range refused"))?;
+            }
+        }
+        let mut edit = self.binding_edit()?;
+        if self.capturing.load(Ordering::Acquire) {
+            return Err(invalid(
+                "byte copy requires explicit prepared Packed ownership",
+            ));
+        }
+        let generation = self.command_buffer.binding_generation()?;
+        let mut prepared: [Option<super::native_generation_bindings::PreparedBuffer>; N] =
+            std::array::from_fn(|_| None);
+        for (slot, owner) in prepared.iter_mut().zip(owners) {
+            *slot = Some(generation.prepare_buffer(owner.as_ref())?);
+        }
+        // SAFETY: exact original EDIT spans ALL native-user publication and
+        // both phases; no other writer can consume this generation's cursor.
+        let installed = unsafe {
+            generation.install_prepared(prepared.map(|p| p.expect("preminted copy owner")))
+        }?;
+        edit.entered_effects = true;
+        self.set_compute_pipeline_state(pipeline);
+        for step in steps {
+            let (input_index, output_index) = if let Some(position) = step.packed {
+                let lease = installed[position].lease();
+                let buffer = lease
+                    .buffer_for_binding()
+                    .map_err(|_| invalid("installed copy Packed role refused"))?;
+                self.set_input_buffer_native_resolved(
+                    0,
+                    Some(buffer),
+                    0,
+                    Some(unsafe { lease.raw_unchecked() }),
+                );
+                (1, 2)
+            } else {
+                let values = [
+                    step.rows as i64,
+                    step.columns as i64,
+                    step.columns as i64,
+                    step.columns as i64,
+                ];
+                for (index, value) in values.iter().enumerate() {
+                    self.set_bytes_directly(
+                        index,
+                        std::mem::size_of::<i64>(),
+                        std::ptr::from_ref(value).cast(),
+                    );
+                }
+                (4, 5)
+            };
+            let source = installed[step.source].lease();
+            let destination = installed[step.destination].lease();
+            let source_buffer = source
+                .buffer_for_binding()
+                .map_err(|_| invalid("installed copy source role refused"))?;
+            let destination_buffer = destination
+                .buffer_for_binding()
+                .map_err(|_| invalid("installed copy destination role refused"))?;
+            self.set_input_buffer_native_resolved(
+                input_index,
+                Some(source_buffer),
+                step.source_offset,
+                Some(unsafe { source.raw_unchecked() }),
+            );
+            self.set_output_buffer_native_resolved(
+                output_index,
+                Some(destination_buffer),
+                step.destination_offset,
+                Some(unsafe { destination.raw_unchecked() }),
+            );
+            // EXACT grid, no rounded uint IDs. The existing dispatch path keeps
+            // hazard/trace/executor behavior and real write->read barriers.
+            self.dispatch_threads(
+                MTLSize {
+                    width: step.rows,
+                    height: step.columns,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: max_threads.min(step.rows),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        edit.finish()
     }
 }
 
@@ -1835,6 +2629,171 @@ impl BlitCommandEncoder {
         }
     }
 
+    /// Only the already-selected legal aligned blit arm. A complete transfer
+    /// caller selects its tracked compute/staged arm BEFORE acquiring this
+    /// encoder for U8 misalignment/overlap; this method is not that dispatcher.
+    /// Ordinary geometry/count/page refusal occurs before native effects.
+    pub(crate) fn copy_from_handles_aligned(
+        &mut self,
+        source: &super::BufferHandle,
+        source_offset: usize,
+        destination: &super::BufferHandle,
+        destination_offset: usize,
+        size: usize,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        use crate::native_binding_preflight::{byte_copy_route, ByteCopyRoute};
+        let (source_offset, destination_offset) = match byte_copy_route(
+            source.base_offset(),
+            source.length(),
+            source_offset,
+            destination.base_offset(),
+            destination.length(),
+            destination_offset,
+            size,
+            source.raw_ptr() == destination.raw_ptr(),
+        )
+        .ok_or(Error::QueueUnavailable(
+            "blit copy exceeds originating view",
+        ))? {
+            ByteCopyRoute::Empty => return Ok(()),
+            ByteCopyRoute::AlignedBlit {
+                source,
+                destination,
+            } => (source, destination),
+            ByteCopyRoute::Compute { .. } => {
+                return Err(Error::QueueUnavailable(
+                    "byte transfer requires its prepared compute/staged arm",
+                ))
+            }
+        };
+        let owner = self.recording.as_ref().ok_or(Error::QueueUnavailable(
+            "raw blit encoder requires unsafe interoperability",
+        ))?;
+        if self.ended {
+            return Err(Error::QueueUnavailable("blit encoder already ended"));
+        }
+        let buffer = owner.command_buffer();
+        let ticket = owner.begin_binding_edit()?;
+        let mut edit = BindingEdit {
+            buffer,
+            ticket: Some(ticket),
+            entered_effects: false,
+        };
+        let generation = buffer.binding_generation()?;
+        // Authentic rich handles span both counted mints. Legacy refusal occurs
+        // before native retain/member clone; no bare-pointer lifetime inference.
+        let source_prepared = generation.prepare_buffer(source)?;
+        let destination_prepared = generation.prepare_buffer(destination)?;
+        // SAFETY: SAME original encoder EDIT and complete immutable geometry;
+        // shared whole-batch planner either installs BOTH pins or consumes none.
+        let installed =
+            unsafe { generation.install_prepared([source_prepared, destination_prepared]) }?;
+        let source_lease = installed[0].lease();
+        let destination_lease = installed[1].lease();
+        let source = source_lease.buffer_for_binding().map_err(|_| {
+            generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            Error::QueueUnavailable("installed blit source lost External custody")
+        })?;
+        let destination = destination_lease.buffer_for_binding().map_err(|_| {
+            generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            Error::QueueUnavailable("installed blit destination lost External custody")
+        })?;
+        // Keep every existing diagnostic and writer dependency. No new lock is
+        // added; existing map/diagnostic/Vec warm costs are NOT discharged here.
+        edit.entered_effects = true;
+        let source_ptr = source.raw_ptr() as usize;
+        let destination_ptr = destination.raw_ptr() as usize;
+        arena::note_bind(source_ptr);
+        arena::note_bind(destination_ptr);
+        late_bind::on_bind(source_ptr, false, "blit copy");
+        late_bind::on_bind(destination_ptr, true, "blit copy");
+        self.wait_for_last_writers(&[source_ptr, destination_ptr]);
+        self.tracked_outputs.push(destination_ptr);
+        // SAFETY: checked absolute ranges and macOS alignment; both installed
+        // External pins survive exact native terminal + escaped emission/refs.
+        unsafe {
+            self.raw
+                .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    source_lease.raw_unchecked(),
+                    source_offset,
+                    destination_lease.raw_unchecked(),
+                    destination_offset,
+                    size,
+                );
+        }
+        edit.finish()
+    }
+
+    /// Selected legal aligned fill arm; unaligned ranges select their sealed
+    /// u8 compute fill before obtaining this blit encoder. No adjacent-view
+    /// rounding or old raw setter is used by this ownership-tracked entry.
+    pub(crate) fn fill_handle_aligned(
+        &mut self,
+        destination: &super::BufferHandle,
+        range: (usize, usize),
+        value: u8,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        use crate::kernels::MetalKernelError as Error;
+        let absolute = crate::native_binding_preflight::checked_byte_range(
+            destination.base_offset(),
+            destination.length(),
+            range.0,
+            range.1,
+        )
+        .ok_or(Error::QueueUnavailable(
+            "blit fill exceeds originating view",
+        ))?;
+        if range.1 == 0 {
+            return Ok(());
+        }
+        if absolute % 4 != 0 || range.1 % 4 != 0 {
+            return Err(Error::QueueUnavailable(
+                "byte fill requires its prepared compute arm",
+            ));
+        }
+        let owner = self.recording.as_ref().ok_or(Error::QueueUnavailable(
+            "raw blit encoder requires unsafe interoperability",
+        ))?;
+        if self.ended {
+            return Err(Error::QueueUnavailable("blit encoder already ended"));
+        }
+        let buffer = owner.command_buffer();
+        let ticket = owner.begin_binding_edit()?;
+        let mut edit = BindingEdit {
+            buffer,
+            ticket: Some(ticket),
+            entered_effects: false,
+        };
+        let generation = buffer.binding_generation()?;
+        let prepared = generation.prepare_buffer(destination)?;
+        // SAFETY: SAME exact EDIT; whole checked range and counted mint precede
+        // this single-member install. Full consumes no credit/native effects.
+        let [installed] = unsafe { generation.install_prepared([prepared]) }?;
+        let lease = installed.lease();
+        let destination = lease.buffer_for_binding().map_err(|_| {
+            generation.quarantine(crate::retirement_owners::Failure::AdapterFailed);
+            Error::QueueUnavailable("installed fill destination lost External custody")
+        })?;
+        edit.entered_effects = true;
+        let ptr = destination.raw_ptr() as usize;
+        arena::note_bind(ptr);
+        late_bind::on_bind(ptr, true, "blit fill");
+        self.wait_for_last_writers(&[ptr]);
+        self.tracked_outputs.push(ptr);
+        // SAFETY: exact initialized view geometry, legal macOS range and SAME
+        // installed External lease through terminal + emission/ref closure.
+        self.raw.fillBuffer_range_value(
+            unsafe { lease.raw_unchecked() },
+            NSRange {
+                location: absolute,
+                length: range.1,
+            },
+            value,
+        );
+        edit.finish()
+    }
+
     /// Copy bytes from src to dst, ordered after the last writer of *either*.
     ///
     /// The source wait is the obvious one: the copy reads it. The destination
@@ -1853,7 +2812,13 @@ impl BlitCommandEncoder {
     /// fence can observe -- at the aliasing instant no encoder has bound the
     /// buffer, and by the time one does it looks freshly allocated
     /// (`DESIGN.md` §2.3.8b). Measured at 11/30 unstable with and without.
-    pub fn copy_from_buffer(
+    /// # Safety
+    /// Explicit legacy/raw interoperability: caller retains genuine originating
+    /// reuse authority and native/accounting owners through actual terminal work,
+    /// cached native references and every escaped future emission. Bare derived
+    /// Buffer/native pointer retention is NOT reuse authority. No tracked pin is
+    /// installed by this method; use the admitted typed operation instead.
+    pub unsafe fn copy_from_buffer(
         &mut self,
         src_buffer: &Buffer,
         src_offset: usize,
@@ -1883,16 +2848,22 @@ impl BlitCommandEncoder {
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    src_buffer.as_ref(),
+                    unsafe { src_buffer.raw_unchecked() },
                     src_offset,
-                    dst_buffer.as_ref(),
+                    unsafe { dst_buffer.raw_unchecked() },
                     dst_offset,
                     size,
                 )
         }
     }
 
-    pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
+    /// # Safety
+    /// Explicit legacy/raw interoperability: caller retains genuine originating
+    /// reuse authority and native/accounting owners through actual terminal work,
+    /// cached native references and every escaped future emission. Bare derived
+    /// Buffer/native pointer retention is NOT reuse authority. No tracked pin is
+    /// installed by this method; use the admitted typed operation instead.
+    pub unsafe fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
         let ptr = buffer.raw_ptr() as usize;
         arena::note_bind(ptr);
         late_bind::on_bind(ptr, true, "blit fill");
@@ -1900,7 +2871,7 @@ impl BlitCommandEncoder {
         self.tracked_outputs.push(ptr);
 
         self.raw.fillBuffer_range_value(
-            buffer.as_ref(),
+            unsafe { buffer.raw_unchecked() },
             NSRange {
                 location: range.0,
                 length: range.1,

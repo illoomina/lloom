@@ -290,22 +290,26 @@ impl lloom_tensor::CustomOp3 for RotaryEmbI {
             .with_size_for(el, src.dtype())
             .with_label("rope_i")
             .build()?;
-        lloom_tensor::kernels::call_rope_i(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b * h,
-            t * d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope_i(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b * h,
+                t * d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
@@ -596,23 +600,27 @@ impl lloom_tensor::CustomOp3 for RotaryEmb {
             .with_size_for(el, src.dtype())
             .with_label("rope")
             .build()?;
-        lloom_tensor::kernels::call_rope(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b * h,
-            t * d,
-            d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b * h,
+                t * d,
+                d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;
@@ -871,24 +879,28 @@ impl lloom_tensor::CustomOp3 for RotaryEmbThd {
             .with_size_for(el, src.dtype())
             .with_label("rope_thd")
             .build()?;
-        lloom_tensor::kernels::call_rope_thd(
-            device.metal_device(),
-            &encoder,
-            kernels,
-            name,
-            b,
-            t,
-            h,
-            d,
-            stride_b,
-            src.buffer(),
-            l_src.start_offset() * src.dtype().size_in_bytes(),
-            cos.buffer(),
-            l_cos.start_offset() * cos.dtype().size_in_bytes(),
-            sin.buffer(),
-            l_sin.start_offset() * sin.dtype().size_in_bytes(),
-            &output,
-        )
+        // SAFETY: the op binds storages, constant-cache blocks and uploads made
+        // for it (binding authority, `lloom_tensor::metal_backend` module docs).
+        unsafe {
+            lloom_tensor::kernels::call_rope_thd(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                b,
+                t,
+                h,
+                d,
+                stride_b,
+                src.buffer(),
+                l_src.start_offset() * src.dtype().size_in_bytes(),
+                cos.buffer(),
+                l_cos.start_offset() * cos.dtype().size_in_bytes(),
+                sin.buffer(),
+                l_sin.start_offset() * sin.dtype().size_in_bytes(),
+                &output,
+            )
+        }
         .map_err(lloom_tensor::Error::wrap)?;
         let out =
             lloom_tensor::MetalStorage::new_allocated(output, device.clone(), el, src.dtype())?;

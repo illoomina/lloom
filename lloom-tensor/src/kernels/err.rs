@@ -4,6 +4,9 @@ pub use crate::command_lifecycle::LifecycleError as CommandLifecycleError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum MetalKernelError {
+    /// An allocation refused inside a kernel-layer path; widened unchanged.
+    #[error(transparent)]
+    Allocation(#[from] crate::memory_admission::AllocationError),
     #[error("command buffer recording admission refused: {0}")]
     RecordingAdmission(#[from] CommandLifecycleError),
     #[error("completion registration refused: {0}")]

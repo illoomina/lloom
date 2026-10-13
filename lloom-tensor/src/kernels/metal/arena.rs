@@ -411,6 +411,73 @@ pub struct Slot {
     pub size: usize,
 }
 
+/// Sealed operation metadata attached to the ORIGINAL allocation ordinal.
+/// This is schema/geometry only, never a physical/root capability. The actual
+/// backend cold publisher must pair it with the exact newly constructed Node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperationSchema {
+    Affine {
+        dtype: crate::kernels::kernels::affine::AffineDType,
+        operation: crate::kernels::kernels::affine::AffineOperation,
+        style: crate::kernels::kernels::params::ParamStyle,
+        elements: usize,
+        strided_rank: Option<usize>,
+    },
+}
+impl std::fmt::Debug for OperationSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Affine {
+                dtype,
+                operation,
+                style,
+                elements,
+                strided_rank,
+            } => f
+                .debug_struct("Affine")
+                .field("dtype_tag", &(*dtype as u8))
+                .field("operation_tag", &(*operation as u8))
+                .field("style", style)
+                .field("elements", elements)
+                .field("strided_rank", strided_rank)
+                .finish(),
+        }
+    }
+}
+
+/// Exact attribution returned by the ORIGINAL recorder allocation event.
+/// Copying this metadata conveys no buffer/native authority. A cold publisher
+/// must price/prepare its schema table before observing events and pair entries
+/// with its genuine same-plan Node positions; no extra Vec is added to legacy
+/// ArenaRecorder or StepPlan snapshots by this seam.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordedAllocation {
+    ordinal: usize,
+    dispatch: usize,
+    bytes: usize,
+}
+impl RecordedAllocation {
+    pub(crate) fn ordinal(self) -> usize {
+        self.ordinal
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OperationPlanEntry {
+    allocation: RecordedAllocation,
+    schema: OperationSchema,
+}
+impl OperationPlanEntry {
+    pub(crate) fn from_recorded(allocation: RecordedAllocation, schema: OperationSchema) -> Self {
+        Self { allocation, schema }
+    }
+    pub(crate) fn ordinal(&self) -> usize {
+        self.allocation.ordinal
+    }
+    pub(crate) fn schema(&self) -> OperationSchema {
+        self.schema
+    }
+}
+
 /// What a decode step's allocations map to.
 ///
 /// Index is the **allocation ordinal within the step**: the Nth activation
@@ -859,6 +926,114 @@ pub struct ArenaOffer {
     pub decline: Option<ArenaDecline>,
 }
 
+/// Linear result of the existing arena allocation claim. ONE ordinal, no
+/// legacy Handle clone before choosing the route. Non-Clone and local-only;
+/// retain it across cold refill, never claim another ordinal for that operation.
+/// The actual exclusive pass actor must span final validation through effects;
+/// public Arena clones do NOT enforce that actor. Step/dispatch checks detect
+/// stale metadata but are not an execution lease or native-use authority.
+#[must_use = "retain the original claim across cold recovery"]
+pub(crate) struct ArenaAllocationClaim<'a> {
+    arena: &'a Arena,
+    ordinal: Option<usize>,
+    slot: Option<usize>,
+    decline: Option<ArenaDecline>,
+    step_generation: u64,
+    entry_typed_valid: bool,
+    dispatch: usize,
+    requested: usize,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperationClaimError {
+    Declined(ArenaDecline),
+    SchemaMismatch,
+    StaleStep,
+    NeedsColdStep,
+}
+impl ArenaAllocationClaim<'_> {
+    pub(crate) fn ordinal(&self) -> Option<usize> {
+        self.ordinal
+    }
+
+    pub(crate) fn check_operation(
+        &self,
+        entry: &OperationPlanEntry,
+        schema: OperationSchema,
+    ) -> Result<usize, OperationClaimError> {
+        if let Some(decline) = self.decline {
+            return Err(OperationClaimError::Declined(decline));
+        }
+        if !self.entry_typed_valid || !self.arena.inner.typed_step_valid.load(Ordering::Relaxed) {
+            return Err(OperationClaimError::NeedsColdStep);
+        }
+        if !self.arena.is_active()
+            || self
+                .arena
+                .inner
+                .typed_step_generation
+                .load(Ordering::Relaxed)
+                != self.step_generation
+            || STEP_DISPATCH.load(Ordering::Relaxed) != self.dispatch
+        {
+            return Err(OperationClaimError::StaleStep);
+        }
+        let ordinal = self.ordinal.expect("accepted original claim has ordinal");
+        let plan = &self.arena.inner.plan_state.plan;
+        if entry.allocation.ordinal != ordinal
+            || entry.allocation.bytes != self.requested
+            || entry.allocation.dispatch != self.dispatch
+            || entry.schema != schema
+            || plan.alloc_position(ordinal) != Some(entry.allocation.dispatch)
+        {
+            return Err(OperationClaimError::SchemaMismatch);
+        }
+        Ok(ordinal)
+    }
+    pub(crate) fn finish_operation(
+        self,
+        entry: &OperationPlanEntry,
+        schema: OperationSchema,
+    ) -> Result<usize, OperationClaimError> {
+        let ordinal = match self.check_operation(entry, schema) {
+            Ok(ordinal) => ordinal,
+            Err(error) => {
+                if error == OperationClaimError::SchemaMismatch {
+                    self.arena
+                        .inner
+                        .counters
+                        .declined_drift
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.arena.inner.drifted.store(true, Ordering::Relaxed);
+                    self.arena.inner.active.store(0, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        };
+        self.arena
+            .inner
+            .counters
+            .hits
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(ordinal)
+    }
+    fn serve_legacy(self) -> ArenaOffer {
+        let served = self.slot.map(|slot| {
+            self.arena
+                .inner
+                .counters
+                .hits
+                .fetch_add(1, Ordering::Relaxed);
+            BufferHandle::clone(&self.arena.inner.plan_state.slot_handles[slot])
+        });
+        ArenaOffer {
+            served,
+            ordinal: self.ordinal,
+            decline: self.decline,
+        }
+    }
+}
+
 /// The activation arena.
 ///
 /// Cheap to clone; every clone refers to the same arena.
@@ -949,6 +1124,10 @@ struct ArenaInner {
     /// side is nearly all one thread), and where `Commands`'s already-padded
     /// pair becomes live rather than structural (§11.3o).
     ordinal: AtomicUsize,
+    // Not resettable engagement counters. Overflow requires cold typed-frame
+    // replacement; never wrap claim identity or disable legacy arena serving.
+    typed_step_generation: AtomicU64,
+    typed_step_valid: std::sync::atomic::AtomicBool,
     /// Whether a step is currently open. Outside a step the arena declines
     /// everything, so prefill and setup allocate from the pool as before.
     active: AtomicU64,
@@ -1029,6 +1208,8 @@ impl Arena {
                 counters: LiveCounters::default(),
                 drifted: std::sync::atomic::AtomicBool::new(false),
                 ordinal: AtomicUsize::new(0),
+                typed_step_generation: AtomicU64::new(0),
+                typed_step_valid: std::sync::atomic::AtomicBool::new(false),
                 active: AtomicU64::new(0),
             }),
         })
@@ -1130,15 +1311,27 @@ impl Arena {
     /// the boundary because only the caller knows where a step begins -- the same
     /// signal the dispatch-trace harness already takes for its per-step regions.
     pub fn begin_step(&self) {
+        self.inner.typed_step_valid.store(false, Ordering::Relaxed);
+        let advanced = self
+            .inner
+            .typed_step_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .is_ok();
         self.inner.ordinal.store(0, Ordering::Relaxed);
         STEP_DISPATCH.store(0, Ordering::Relaxed);
         DISPATCH_COUNTING.store(true, Ordering::Relaxed);
         self.inner.active.store(1, Ordering::Relaxed);
+        self.inner
+            .typed_step_valid
+            .store(advanced, Ordering::Relaxed);
         self.inner.counters.steps.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Close the current step. Allocations outside a step go to the pool.
     pub fn end_step(&self) {
+        self.inner.typed_step_valid.store(false, Ordering::Relaxed);
         self.inner.active.store(0, Ordering::Relaxed);
         DISPATCH_COUNTING.store(false, Ordering::Relaxed);
     }
@@ -1261,12 +1454,29 @@ impl Arena {
     /// is untouched — §3.6's *add a variant behind a seam, never rip out the
     /// block*.
     pub fn acquire_attributed(&self, size: usize) -> ArenaOffer {
+        self.claim_attributed(size).serve_legacy()
+    }
+
+    pub(crate) fn claim_attributed(&self, size: usize) -> ArenaAllocationClaim<'_> {
+        // Entry snapshots precede the ORIGINAL ordinal fetch_add. Sampling at
+        // return could relabel an old-step ordinal after concurrent rebegin.
+        // Final checks remain necessary; they do not replace the real actor.
+        let step_generation = self.inner.typed_step_generation.load(Ordering::Relaxed);
+        let entry_typed_valid = self.inner.typed_step_valid.load(Ordering::Relaxed);
+        let dispatch = STEP_DISPATCH.load(Ordering::Relaxed);
+        let make_claim = |ordinal, slot, decline| ArenaAllocationClaim {
+            arena: self,
+            ordinal,
+            slot,
+            decline,
+            step_generation,
+            entry_typed_valid,
+            dispatch,
+            requested: size,
+            _local: std::marker::PhantomData,
+        };
         if !self.is_active() {
-            return ArenaOffer {
-                served: None,
-                ordinal: None,
-                decline: Some(ArenaDecline::Inactive),
-            };
+            return make_claim(None, None, Some(ArenaDecline::Inactive));
         }
         let ordinal = self.inner.ordinal.fetch_add(1, Ordering::Relaxed);
         let counters = &self.inner.counters;
@@ -1276,44 +1486,28 @@ impl Arena {
         // it is) and the value is never a slot's, whatever the plan planned.
         if escaping() {
             counters.declined_escaped.fetch_add(1, Ordering::Relaxed);
-            return ArenaOffer {
-                served: None,
-                ordinal: Some(ordinal),
-                decline: Some(ArenaDecline::Escaped),
-            };
+            return make_claim(Some(ordinal), None, Some(ArenaDecline::Escaped));
         }
 
         let entry = match plan_state.plan.by_ordinal.get(ordinal) {
             Some(e) => *e,
             None => {
                 counters.declined_exhausted.fetch_add(1, Ordering::Relaxed);
-                return ArenaOffer {
-                    served: None,
-                    ordinal: Some(ordinal),
-                    decline: Some(ArenaDecline::PastPlan),
-                };
+                return make_claim(Some(ordinal), None, Some(ArenaDecline::PastPlan));
             }
         };
         // Not the arena's: session state, excluded when the plan was built
         // because its size moved between the two recorded steps (§9.1).
         let Some((slot, want)) = entry else {
             counters.declined_session.fetch_add(1, Ordering::Relaxed);
-            return ArenaOffer {
-                served: None,
-                ordinal: Some(ordinal),
-                decline: Some(ArenaDecline::Session),
-            };
+            return make_claim(Some(ordinal), None, Some(ArenaDecline::Session));
         };
         // Size must match what was planned for this ordinal. A larger request
         // would run past the slot; a smaller one means the sequence has drifted
         // from the plan and the ordinal no longer names what it did.
         if size != want {
             counters.declined_size.fetch_add(1, Ordering::Relaxed);
-            return ArenaOffer {
-                served: None,
-                ordinal: Some(ordinal),
-                decline: Some(ArenaDecline::SizeMismatch),
-            };
+            return make_claim(Some(ordinal), None, Some(ArenaDecline::SizeMismatch));
         }
         // The position must match too. A size coincides across a shifted
         // sequence -- the hidden size is most of a step's allocations -- and a
@@ -1329,19 +1523,10 @@ impl Arena {
                 counters.declined_drift.fetch_add(1, Ordering::Relaxed);
                 self.inner.drifted.store(true, Ordering::Relaxed);
                 self.inner.active.store(0, Ordering::Relaxed);
-                return ArenaOffer {
-                    served: None,
-                    ordinal: Some(ordinal),
-                    decline: Some(ArenaDecline::Drift),
-                };
+                return make_claim(Some(ordinal), None, Some(ArenaDecline::Drift));
             }
         }
-        counters.hits.fetch_add(1, Ordering::Relaxed);
-        ArenaOffer {
-            served: Some(BufferHandle::clone(&plan_state.slot_handles[slot])),
-            ordinal: Some(ordinal),
-            decline: None,
-        }
+        make_claim(Some(ordinal), Some(slot), None)
     }
 
     /// A snapshot of the counters.
@@ -1765,6 +1950,17 @@ impl ArenaRecorder {
     /// allocation reusing the same address opens a new value and takes the
     /// address over from the old one, which is what stops the two from merging.
     pub fn record_alloc(&mut self, addr: usize, size: usize) {
+        let _ = self.record_alloc_attributed(addr, size);
+    }
+
+    /// Same original event, returning its exact ordinal/dispatch/bytes. The
+    /// device's admitted cold operation recorder pairs this with sealed schema;
+    /// no automatic extra stream or post-allocation pricing is hidden here.
+    pub(crate) fn record_alloc_attributed(
+        &mut self,
+        addr: usize,
+        size: usize,
+    ) -> RecordedAllocation {
         let ordinal = self.ordinal;
         self.ordinal += 1;
         self.sizes.push(size);
@@ -1790,6 +1986,11 @@ impl ArenaRecorder {
         // is the same phantom by another path; `note_new_buffer` covers it.
         self.previous_by_addr.remove(&addr);
         self.by_addr.insert(addr, ordinal);
+        RecordedAllocation {
+            ordinal,
+            dispatch: self.dispatch,
+            bytes: size,
+        }
     }
 
     /// Record that a dispatch bound the buffer at `addr`.
@@ -2573,13 +2774,17 @@ mod tests {
         let base = dev
             .new_buffer(4096, crate::kernels::RESOURCE_OPTIONS)
             .expect("allocation");
-        let parent_ptr = base.contents() as usize;
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        let parent_ptr = unsafe { base.contents() } as usize;
 
         let view = base.view(128, 256);
         assert_eq!(view.length(), 256, "view reported the parent's length");
         assert_eq!(view.base_offset(), 128);
         assert_eq!(
-            view.contents() as usize,
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { view.contents() } as usize,
             parent_ptr + 128,
             "view's CPU pointer did not start at its slot"
         );
@@ -2588,7 +2793,9 @@ mod tests {
         let inner = view.view(64, 64);
         assert_eq!(inner.base_offset(), 192);
         assert_eq!(inner.length(), 64);
-        assert_eq!(inner.contents() as usize, parent_ptr + 192);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        assert_eq!(unsafe { inner.contents() } as usize, parent_ptr + 192);
 
         // An ordinary buffer is unaffected: offset 0, full length.
         assert_eq!(base.base_offset(), 0);

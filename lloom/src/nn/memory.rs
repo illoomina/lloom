@@ -333,10 +333,8 @@ pub struct LoadContext {
 
 impl LoadContext {
     fn from_admitted(admitted: Admitted, bytes: usize, quota: Option<usize>) -> Result<Self> {
-        let domain = process_account()
-            .domain(quota, admitted)
-            .map_err(lloom_tensor::Error::wrap)?;
-        let pass = domain.reserve(bytes).map_err(lloom_tensor::Error::wrap)?;
+        let domain = process_account().domain(quota, admitted)?;
+        let pass = domain.reserve(bytes)?;
         Ok(Self { pass, domain })
     }
 
@@ -592,7 +590,7 @@ pub fn pool_bound_bytes(device: &Device) -> usize {
 mod load_context_tests {
     use super::*;
     use lloom_tensor::machine::GateConfig;
-    use lloom_tensor::memory_admission::{AccountSnapshot, AdmissionError, MachineStatus};
+    use lloom_tensor::memory_admission::{AccountSnapshot, AllocationError, MachineStatus};
 
     fn off() -> MachineLoad {
         MachineLoad {
@@ -656,6 +654,27 @@ mod load_context_tests {
             .is_err());
     }
 
+    /// A load whose promise its quota cannot hold is refused as the typed
+    /// allocation error, not as text (`memory_admission::AllocationError`).
+    #[test]
+    fn a_load_past_its_quota_is_refused_typed() {
+        let refused = off()
+            .admit_context(&Device::Cpu, Peak::new().with("weights", 64), Some(16))
+            .err()
+            .expect("a 64-byte load in a 16-byte quota is refused");
+        assert!(
+            matches!(
+                refused,
+                lloom_tensor::Error::Allocation(AllocationError::Refused {
+                    requested: 64,
+                    available: 16,
+                    domain: lloom_tensor::memory_admission::RefusalDomain::Model,
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn numeric_pool_inclusive_promise_finish_and_issued_ticket() {
         // The actual helper used by both public routes; injected pool=5 keeps
@@ -676,7 +695,7 @@ mod load_context_tests {
         let context = load.allocations();
         let ticket = context.take(8).unwrap();
         let domain = load.finish();
-        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
         assert_eq!(
             domain.snapshot(),
             AccountSnapshot {
@@ -700,7 +719,7 @@ mod load_context_tests {
         let context = load.allocations();
         let domain = load.domain().clone();
         drop(load);
-        assert!(matches!(context.take(1), Err(AdmissionError::Cancelled)));
+        assert!(matches!(context.take(1), Err(AllocationError::Cancelled)));
         assert_eq!(domain.snapshot(), AccountSnapshot::default());
     }
 

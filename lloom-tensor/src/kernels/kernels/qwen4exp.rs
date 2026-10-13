@@ -12,8 +12,13 @@ use crate::kernels::{
 
 /// `hc_norm_f32`: the grouped RMS norm of `rows` carries of `n` streams of
 /// `d`, γ over `n·d`. One threadgroup per (row, stream).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_norm(
+pub unsafe fn call_hc_norm(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -30,10 +35,13 @@ pub fn call_hc_norm(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_norm rows={rows} n={n} d={d}");
-    set_params!(
-        encoder,
-        (&x, &gamma, Output::new(out), n as u32, d as u32, eps)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&x, &gamma, Output::new(out), n as u32, d as u32, eps)
+        );
+    }
     let width = 256usize
         .min(pipeline.max_total_threads_per_threadgroup())
         .min(d.max(32).next_power_of_two());
@@ -48,8 +56,13 @@ pub fn call_hc_norm(
 /// block is then zeros; `w_inject` is unread). Threadgroups `(⌈(lr+n)/8⌉, rows)`
 /// of 256 threads, a simdgroup per output row. `n` ≤ 8 (the threadgroup
 /// stream scales).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_mix_a(
+pub unsafe fn call_hc_mix_a(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -76,23 +89,26 @@ pub fn call_hc_mix_a(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_mix_a rows={rows} n={n} d={d} lr={lr}");
-    set_params!(
-        encoder,
-        (
-            &h,
-            &gamma,
-            &w_down,
-            &w_inject,
-            Output::new(out),
-            n as u32,
-            d as u32,
-            lr as u32,
-            n_inj as u32,
-            rows as u32,
-            eps,
-            scale
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &h,
+                &gamma,
+                &w_down,
+                &w_inject,
+                Output::new(out),
+                n as u32,
+                d as u32,
+                lr as u32,
+                n_inj as u32,
+                rows as u32,
+                eps,
+                scale
+            )
+        );
+    }
     let gx = (lr + n).div_ceil(HC_MIX_SG * HC_MIX_OUT);
     dispatch_groups_2d(encoder, gx, rows, HC_MIX_SG * 32);
     Ok(())
@@ -102,8 +118,13 @@ pub fn call_hc_mix_a(
 /// (sigmoid) and the gated collapse over the streams, `out [rows, d]`, from
 /// `hc_mix_a`'s buffer. Threadgroups `(⌈d/8⌉, rows)`, a simdgroup per column.
 /// `lr` ≤ 1 024 (the threadgroup staging of `lo`).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_mix_b(
+pub unsafe fn call_hc_mix_b(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -126,19 +147,22 @@ pub fn call_hc_mix_b(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_mix_b rows={rows} n={n} d={d} lr={lr}");
-    set_params!(
-        encoder,
-        (
-            &packed,
-            &w_up,
-            Output::new(out),
-            n as u32,
-            d as u32,
-            lr as u32,
-            rows as u32,
-            inv_n
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &packed,
+                &w_up,
+                Output::new(out),
+                n as u32,
+                d as u32,
+                lr as u32,
+                rows as u32,
+                inv_n
+            )
+        );
+    }
     let gx = d.div_ceil(HC_MIX_SG);
     dispatch_groups_2d(encoder, gx, rows, HC_MIX_SG * 32);
     Ok(())
@@ -155,8 +179,13 @@ const HC_MIX_MAX_LR: usize = 1024;
 const HC_MIX_MAX_N: usize = 8;
 
 /// `hc_collapse_f32`: `out [rows, d] = mean_s(xn · gate)` over the `n` streams.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_collapse(
+pub unsafe fn call_hc_collapse(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -172,17 +201,20 @@ pub fn call_hc_collapse(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_collapse rows={rows} n={n} d={d}");
-    set_params!(
-        encoder,
-        (
-            &xn,
-            &gate,
-            Output::new(out),
-            n as u32,
-            d as u32,
-            rows as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &xn,
+                &gate,
+                Output::new(out),
+                n as u32,
+                d as u32,
+                rows as u32
+            )
+        );
+    }
     let total = rows * d;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, total.div_ceil(width), width);
@@ -192,8 +224,13 @@ pub fn call_hc_collapse(
 /// `hc_collapse_scaled_f32`: [`call_hc_collapse`] with `xn` recomputed from
 /// the carry `h`, γ and the per-row stream `scales` (`rows · n` f32) a
 /// grouped-norm GEMV wrote — `(h · scale) · γ`, `hc_norm_f32`'s form.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_collapse_scaled(
+pub unsafe fn call_hc_collapse_scaled(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -211,19 +248,22 @@ pub fn call_hc_collapse_scaled(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_collapse_scaled rows={rows} n={n} d={d}");
-    set_params!(
-        encoder,
-        (
-            &h,
-            &gamma,
-            &scales,
-            &gate,
-            Output::new(out),
-            n as u32,
-            d as u32,
-            rows as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &h,
+                &gamma,
+                &scales,
+                &gate,
+                Output::new(out),
+                n as u32,
+                d as u32,
+                rows as u32
+            )
+        );
+    }
     let total = rows * d;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, total.div_ceil(width), width);
@@ -231,8 +271,13 @@ pub fn call_hc_collapse_scaled(
 }
 
 /// `hc_combine_f32`: `out [rows, n·d] = h + bo ⊗ 2·sigmoid(inject / n)`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_hc_combine(
+pub unsafe fn call_hc_combine(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -249,18 +294,21 @@ pub fn call_hc_combine(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "hc_combine rows={rows} n={n} d={d}");
-    set_params!(
-        encoder,
-        (
-            &h,
-            &bo,
-            &inject,
-            Output::new(out),
-            n as u32,
-            d as u32,
-            rows as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &h,
+                &bo,
+                &inject,
+                Output::new(out),
+                n as u32,
+                d as u32,
+                rows as u32
+            )
+        );
+    }
     let total = rows * n * d;
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, total.div_ceil(width), width);
@@ -269,8 +317,13 @@ pub fn call_hc_combine(
 
 /// `moe_topk_f32`: per row of `n_experts` logits, the top-`k` ids (u32) and
 /// their renormalised softmax weights. `n_experts` ≤ 1024.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_moe_topk(
+pub unsafe fn call_moe_topk(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -291,16 +344,19 @@ pub fn call_moe_topk(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "moe_topk rows={rows} e={n_experts} k={k}");
-    set_params!(
-        encoder,
-        (
-            &logits,
-            Output::new(ids),
-            Output::new(w),
-            n_experts as u32,
-            k as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &logits,
+                Output::new(ids),
+                Output::new(w),
+                n_experts as u32,
+                k as u32
+            )
+        );
+    }
     let width = 256usize
         .min(pipeline.max_total_threads_per_threadgroup())
         .max(k.next_power_of_two().max(32));
@@ -328,8 +384,13 @@ fn float_kernel(
 
 /// `silu_mul_<dtype>`: `out = silu(g) · u` over `n` elements, all three of
 /// `dtype` (f32 or f16).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_silu_mul(
+pub unsafe fn call_silu_mul(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -345,7 +406,10 @@ pub fn call_silu_mul(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "silu_mul n={n}");
-    set_params!(encoder, (&g, &u, Output::new(out), n as u32));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (&g, &u, Output::new(out), n as u32));
+    }
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())
@@ -358,8 +422,13 @@ pub const MOE_MASK_FUNCTION_CONSTANT: usize = 778;
 
 /// `moe_combine_<y_dtype>`: `out [rows, d] = Σ_k w · y + shared ·
 /// sigmoid(gate)`, f32 except `y`, which is `y_dtype` (f32 or f16).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_moe_combine(
+pub unsafe fn call_moe_combine(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -387,19 +456,22 @@ pub fn call_moe_combine(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "moe_combine rows={rows} k={k} d={d}");
-    set_params!(
-        encoder,
-        (
-            &y,
-            &w,
-            &shared,
-            &gate,
-            Output::new(out),
-            k as u32,
-            d as u32,
-            rows as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &y,
+                &w,
+                &shared,
+                &gate,
+                Output::new(out),
+                k as u32,
+                d as u32,
+                rows as u32
+            )
+        );
+    }
     if let Some(f) = &flags {
         crate::kernels::utils::set_param(encoder, 8, f);
     }
@@ -411,8 +483,13 @@ pub fn call_moe_combine(
 
 /// `qsa_prep_f32`: the q/gate split, the per-head norms and the partial rope
 /// at `pos` → `out [2·nh + nkv, hd]`.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_qsa_prep(
+pub unsafe fn call_qsa_prep(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -439,23 +516,26 @@ pub fn call_qsa_prep(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "qsa_prep hd={hd} nh={nh} nkv={nkv} pos={pos}");
-    set_params!(
-        encoder,
-        (
-            &qg,
-            &k,
-            &q_gamma,
-            &k_gamma,
-            Output::new(out),
-            hd as u32,
-            n_rot as u32,
-            nh as u32,
-            nkv as u32,
-            pos as u32,
-            theta,
-            eps
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qg,
+                &k,
+                &q_gamma,
+                &k_gamma,
+                Output::new(out),
+                hd as u32,
+                n_rot as u32,
+                nh as u32,
+                nkv as u32,
+                pos as u32,
+                theta,
+                eps
+            )
+        );
+    }
     let width = hd
         .max(32)
         .next_power_of_two()
@@ -468,8 +548,13 @@ pub fn call_qsa_prep(
 /// `qg [rows, nh, 2·hd]`, `k [rows, nkv, hd]`, `pos [rows]` (u32) → `out`
 /// as three row-major regions `q [rows, nh, hd] | gate [rows, nh, hd] | k
 /// [rows, nkv, hd]`, row for row the single kernel's result.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_qsa_prep_batch(
+pub unsafe fn call_qsa_prep_batch(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -500,30 +585,38 @@ pub fn call_qsa_prep_batch(
         encoder,
         "qsa_prep_batch rows={rows} hd={hd} nh={nh} nkv={nkv}"
     );
-    set_params!(
-        encoder,
-        (
-            &qg,
-            &k,
-            &pos,
-            &q_gamma,
-            &k_gamma,
-            Output::new(out),
-            hd as u32,
-            n_rot as u32,
-            nh as u32,
-            nkv as u32,
-            theta,
-            eps,
-            rows as u32
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qg,
+                &k,
+                &pos,
+                &q_gamma,
+                &k_gamma,
+                Output::new(out),
+                hd as u32,
+                n_rot as u32,
+                nh as u32,
+                nkv as u32,
+                theta,
+                eps,
+                rows as u32
+            )
+        );
+    }
     dispatch_groups_2d(encoder, nh + nkv, rows, head_width(hd, &pipeline));
     Ok(())
 }
 
 /// `sigmoid_mul_f32`: `out = sigmoid(a) · b` over `n` elements.
-pub fn call_sigmoid_mul(
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
+pub unsafe fn call_sigmoid_mul(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -537,15 +630,23 @@ pub fn call_sigmoid_mul(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "sigmoid_mul n={n}");
-    set_params!(encoder, (&a, &b, Output::new(out), n as u32));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (&a, &b, Output::new(out), n as u32));
+    }
     let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())
 }
 
 /// `qsa_prep_rows_f32`: over a chunk from `pos0` → the flat pack (see the kernel).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_qsa_prep_rows(
+pub unsafe fn call_qsa_prep_rows(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -577,33 +678,41 @@ pub fn call_qsa_prep_rows(
         encoder,
         "qsa_prep_rows hd={hd} nh={nh} nkv={nkv} seq={seq} pos0={pos0}"
     );
-    set_params!(
-        encoder,
-        (
-            &qg,
-            &k,
-            &v,
-            &q_gamma,
-            &k_gamma,
-            Output::new(out),
-            hd as u32,
-            n_rot as u32,
-            nh as u32,
-            nkv as u32,
-            seq as u32,
-            pos0 as u32,
-            theta,
-            eps
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                &qg,
+                &k,
+                &v,
+                &q_gamma,
+                &k_gamma,
+                Output::new(out),
+                hd as u32,
+                n_rot as u32,
+                nh as u32,
+                nkv as u32,
+                seq as u32,
+                pos0 as u32,
+                theta,
+                eps
+            )
+        );
+    }
     dispatch_groups_2d(encoder, nh + nkv, seq, head_width(hd, &pipeline));
     Ok(())
 }
 
 /// `moe_slot_map_u32`: expert ids through the residency table → the flat
 /// `[3·n]` plan (slot ids | ids | miss flags).
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_moe_slot_map(
+pub unsafe fn call_moe_slot_map(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -618,10 +727,13 @@ pub fn call_moe_slot_map(
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "moe_slot_map n={n}");
-    set_params!(
-        encoder,
-        (&ids, &table, Output::new(out), n as u32, n_experts as u32)
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (&ids, &table, Output::new(out), n as u32, n_experts as u32)
+        );
+    }
     let width = 64usize.min(pipeline.max_total_threads_per_threadgroup());
     dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())

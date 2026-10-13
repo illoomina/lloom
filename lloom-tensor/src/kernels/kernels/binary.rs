@@ -18,8 +18,12 @@ const BINARY_STRIDED_PARAMS_ALIGN: usize = core::mem::align_of::<BinaryStridedPa
 
 ops!(badd, bsub, bmul, bdiv, bminimum, bmaximum, eq, ne, le, lt, ge, gt);
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_contiguous<S: ToString>(
+pub unsafe fn call_binary_contiguous<S: ToString>(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -30,18 +34,21 @@ pub fn call_binary_contiguous<S: ToString>(
     right: BufferOffset,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_binary_contiguous_with(
-        device,
-        ep,
-        kernels,
-        kernel_name,
-        dtype_size,
-        length,
-        left,
-        right,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_binary_contiguous_with(
+            device,
+            ep,
+            kernels,
+            kernel_name,
+            dtype_size,
+            length,
+            left,
+            right,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_binary_contiguous`], choosing how the scalars are bound.
@@ -50,8 +57,13 @@ pub fn call_binary_contiguous<S: ToString>(
 /// so there is one body rather than two and the styles cannot drift in what
 /// they bind -- which is the property that makes the bit-identical test
 /// meaningful.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_contiguous_with<S: ToString>(
+pub unsafe fn call_binary_contiguous_with<S: ToString>(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -73,7 +85,10 @@ pub fn call_binary_contiguous_with<S: ToString>(
     debug_group!(encoder, "binary {kernel_name} elems={length}");
 
     let _capture = begin_packed_params(encoder, style);
-    set_params!(encoder, (length, &left, &right, Output::new(output)));
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(encoder, (length, &left, &right, Output::new(output)));
+    }
     let _staged = finish_packed_params(device, encoder, style, BINARY_PARAMS_ALIGN)?;
 
     let tile_size = get_tile_size(dtype_size);
@@ -84,8 +99,12 @@ pub fn call_binary_contiguous_with<S: ToString>(
     Ok(())
 }
 
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_strided<S: ToString>(
+pub unsafe fn call_binary_strided<S: ToString>(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -98,20 +117,23 @@ pub fn call_binary_strided<S: ToString>(
     right_strides: &[usize],
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    call_binary_strided_with(
-        device,
-        ep,
-        kernels,
-        kernel_name,
-        dtype_size,
-        shape,
-        left_input,
-        left_strides,
-        right_input,
-        right_strides,
-        output,
-        ParamStyle::default(),
-    )
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        call_binary_strided_with(
+            device,
+            ep,
+            kernels,
+            kernel_name,
+            dtype_size,
+            shape,
+            left_input,
+            left_strides,
+            right_input,
+            right_strides,
+            output,
+            ParamStyle::default(),
+        )
+    }
 }
 
 /// As [`call_binary_strided`], choosing how the scalars are bound.
@@ -120,8 +142,13 @@ pub fn call_binary_strided<S: ToString>(
 /// so there is one body rather than two and the styles cannot drift in what
 /// they bind -- which is the property that makes the bit-identical test
 /// meaningful.
+///
+/// # Safety
+/// Every buffer bound here stays unreused and unwritten by the host until
+/// the command buffer it is encoded into completes, and while an ICB that
+/// captured it can replay ([`crate::kernels::utils::EncoderParam`]).
 #[allow(clippy::too_many_arguments)]
-pub fn call_binary_strided_with<S: ToString>(
+pub unsafe fn call_binary_strided_with<S: ToString>(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
@@ -150,19 +177,22 @@ pub fn call_binary_strided_with<S: ToString>(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "binary_strided {kernel_name} elems={length}");
     let _capture = begin_packed_params(encoder, style);
-    set_params!(
-        encoder,
-        (
-            length,
-            num_dims,
-            shape,
-            left_strides,
-            right_strides,
-            &left_input,
-            &right_input,
-            Output::new(output)
-        )
-    );
+    // SAFETY: this function's contract (# Safety above).
+    unsafe {
+        set_params!(
+            encoder,
+            (
+                length,
+                num_dims,
+                shape,
+                left_strides,
+                right_strides,
+                &left_input,
+                &right_input,
+                Output::new(output)
+            )
+        );
+    }
     let _staged = finish_packed_params(device, encoder, style, BINARY_STRIDED_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())

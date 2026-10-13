@@ -1548,7 +1548,7 @@ fn encode_plan(
                 .iter()
                 .map(|b| {
                     let r: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLResource> =
-                        objc2::runtime::ProtocolObject::from_ref(b.as_ref());
+                        objc2::runtime::ProtocolObject::from_ref(unsafe { b.raw_unchecked() });
                     core::ptr::NonNull::from(r)
                 })
                 .collect();
@@ -1652,7 +1652,7 @@ fn encode_command(
         // SAFETY: the buffer outlives the ICB -- it is retained in the run's
         // residency set and the plan owns both -- and the index is under
         // `maxKernelBufferBindCount`, the maximum over exactly these bindings.
-        unsafe { cmd.setKernelBuffer_offset_atIndex(buf.as_ref(), b.offset, b.index) };
+        unsafe { cmd.setKernelBuffer_offset_atIndex(buf.raw_unchecked(), b.offset, b.index) };
     }
     let tg = MTLSize {
         width: d.threads_per_threadgroup.width,

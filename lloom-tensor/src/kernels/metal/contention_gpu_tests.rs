@@ -61,8 +61,12 @@ fn uncontended_submission_records_nothing() {
     for _ in 0..8 {
         {
             let g = cmds.command_encoder().unwrap();
-            g.as_ref().set_input_buffer(0, Some(&x), 0);
-            g.as_ref().set_output_buffer(1, Some(&y), 0);
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { g.as_ref().set_input_buffer(0, Some(&x), 0) };
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { g.as_ref().set_output_buffer(1, Some(&y), 0) };
             probes += g.as_ref().fence_stats().0;
         }
         // Ends the compute session: its outputs are written into the map.
@@ -103,7 +107,9 @@ fn a_bind_blocked_by_a_map_writer_is_one_host_read_wait() {
         });
         is_held.recv().unwrap();
         let t = Instant::now();
-        enc.set_input_buffer(0, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { enc.set_input_buffer(0, Some(&x), 0) };
         let waited = t.elapsed();
         holder.join().unwrap();
         assert!(waited >= HOLD / 4, "the bind returned after {waited:?}");
@@ -133,7 +139,9 @@ fn a_completion_never_waits_on_the_hosts_fence_locks() {
 
     let map = {
         let g = cmds.command_encoder().unwrap();
-        g.as_ref().set_output_buffer(0, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { g.as_ref().set_output_buffer(0, Some(&x), 0) };
         Arc::clone(&g.as_ref().prev_ce_outputs)
     };
     // Closes the session (x enters the map; its handler is attached) and
@@ -170,7 +178,9 @@ fn a_completion_never_waits_on_the_hosts_fence_locks() {
     // hit, no wait -- what it found once the handler had removed the entry.
     {
         let g = cmds.command_encoder().unwrap();
-        g.as_ref().set_input_buffer(0, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { g.as_ref().set_input_buffer(0, Some(&x), 0) };
         assert_eq!(
             g.as_ref().fence_stats(),
             (1, 0, 0),
@@ -203,7 +213,9 @@ fn an_incomplete_writer_is_never_reaped() {
 
     let (map, writer) = {
         let g = cmds.command_encoder().unwrap();
-        g.as_ref().set_output_buffer(0, Some(&x), 0);
+        // SAFETY: the test owns every buffer bound or mapped here and reads its
+        // results only after waiting for the command buffer that writes them.
+        unsafe { g.as_ref().set_output_buffer(0, Some(&x), 0) };
         (
             Arc::clone(&g.as_ref().prev_ce_outputs),
             Arc::clone(&g.as_ref().fence),
@@ -217,7 +229,9 @@ fn an_incomplete_writer_is_never_reaped() {
     for _ in 0..2 {
         {
             let g = cmds.command_encoder().unwrap();
-            g.as_ref().set_input_buffer(0, Some(&x), 0);
+            // SAFETY: the test owns every buffer bound or mapped here and reads its
+            // results only after waiting for the command buffer that writes them.
+            unsafe { g.as_ref().set_input_buffer(0, Some(&x), 0) };
             assert_eq!(
                 g.as_ref().fence_stats(),
                 (1, 1, 1),

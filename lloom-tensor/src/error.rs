@@ -174,6 +174,11 @@ pub enum Error {
     #[error("Metal error {0}")]
     Metal(#[from] MetalError),
 
+    /// An allocation entry point refused, on any backend. `Copy` and built
+    /// without allocating, so a warm refusal stays allocation-free.
+    #[error(transparent)]
+    Allocation(#[from] crate::memory_admission::AllocationError),
+
     #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios"), feature = "ug"))]
     #[error(transparent)]
     Ug(#[from] candle_ug::Error),

@@ -45,6 +45,26 @@ impl<N> AliasPins<N> {
             std::process::abort();
         }
     }
+    /// Checked counted-physical acquisition. Caller already owns a genuine
+    /// counted source or primary issuer throughout this operation. Failure is
+    /// count-only and changes no state; existing legacy clone_external policy
+    /// remains unchanged. No quota/native allocation occurs here.
+    pub(crate) fn try_clone_external(&self) -> bool {
+        self.external
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                old.checked_add(1)
+                    .filter(|next| *next <= isize::MAX as usize)
+            })
+            .is_ok()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_external_count(&self, count: usize) {
+        self.external.store(count, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn test_current_external_count(&self) -> usize {
+        self.external.load(Ordering::Acquire)
+    }
     /// Convert first adopter's external pin into the unique internal baseline.
     /// Secondary adoption keeps its pin and does not create another owner.
     pub(crate) fn claim_primary(&self) -> bool {

@@ -286,6 +286,76 @@ pub unsafe fn call_sdpa_full_with(
     itype: SdpaDType,
     paged: Option<SdpaPageTable<'_>>,
 ) -> Result<(), MetalKernelError> {
+    // SAFETY: this function's contract (# Safety above), passed on unchanged.
+    unsafe {
+        call_sdpa_full_with_mask_offset(
+            device,
+            ep,
+            kernels,
+            q_offset,
+            q_shape,
+            q_strides,
+            q_buffer,
+            k_offset,
+            k_shape,
+            k_strides,
+            k_buffer,
+            v_offset,
+            v_buffer,
+            v_strides,
+            mask_type,
+            mask_buffer,
+            0,
+            m_strides,
+            output,
+            o_strides,
+            scale,
+            do_causal,
+            itype,
+            paged,
+        )
+    }
+}
+
+/// [`call_sdpa_full_with`] with an explicit additive-mask byte offset.
+///
+/// The offset belongs to the mask's tensor view, separately from its backing
+/// buffer and outer strides. The compatibility entry point above retains its
+/// original zero-offset contract; callers holding a layout use this entry.
+/// Four mask strides preserve the key axis, including broadcast stride zero;
+/// a legacy three-stride slice retains its implied unit key stride.
+///
+/// # Safety
+/// As [`call_sdpa_full_with`]: every buffer bound here stays unreused and
+/// unwritten by the host until the command buffer it is encoded into
+/// completes, and while an ICB that captured it can replay.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn call_sdpa_full_with_mask_offset(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_strides: &[usize],
+    q_buffer: &Buffer,
+    k_offset: usize,
+    k_shape: &[usize],
+    k_strides: &[usize],
+    k_buffer: &Buffer,
+    v_offset: usize,
+    v_buffer: &Buffer,
+    v_strides: &[usize],
+    mask_type: Option<SdpaDType>,
+    mask_buffer: Option<&Buffer>,
+    mask_offset: usize,
+    m_strides: Option<&[usize]>,
+    output: &Buffer,
+    o_strides: &[usize],
+    scale: f32,
+    do_causal: bool,
+    itype: SdpaDType,
+    paged: Option<SdpaPageTable<'_>>,
+) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]
     struct AttnParams {
@@ -313,7 +383,7 @@ pub unsafe fn call_sdpa_full_with(
     #[derive(Debug)]
     #[repr(C)]
     struct AttnMaskParams {
-        m_strides: [i64; 3],
+        m_strides: [i64; 4],
     }
 
     /// Mirrors `AttnPagedParams` in `scaled_dot_product_attention.metal`.
@@ -356,6 +426,10 @@ pub unsafe fn call_sdpa_full_with(
     // the same loads they would under `align_K`.
     let align_k = kl.is_multiple_of(bk) && paged.is_none_or(|p| p.n_keys_stride == 0);
     let has_mask = mask_buffer.is_some();
+    // Legacy direct callers may supply the three outer strides only. Their
+    // original contract implied a contiguous key axis; tensor layouts carry
+    // all four, including nonunit and broadcast-zero key strides.
+    let mask_k_stride = m_strides.and_then(|s| s.get(3)).copied().unwrap_or(1);
 
     // When an explicit additive mask is supplied it already encodes causality.
     // Also enabling the in-kernel `do_causal` path double-applies causality and,
@@ -383,6 +457,7 @@ pub unsafe fn call_sdpa_full_with(
         (300, Value::Bool(/* has_mask */ has_mask)),
         (301, Value::Bool(/* do_causal */ do_causal)),
         (302, Value::Bool(/* is_paged */ paged.is_some())),
+        (303, Value::Bool(/* mask_k_contiguous */ mask_k_stride == 1)),
     ]));
 
     #[cfg(feature = "debug-labels")]
@@ -465,6 +540,7 @@ pub unsafe fn call_sdpa_full_with(
                 mask_strides[0] as i64,
                 mask_strides[1] as i64,
                 mask_strides[2] as i64,
+                mask_k_stride as i64,
             ],
         };
 
@@ -479,7 +555,7 @@ pub unsafe fn call_sdpa_full_with(
                     Output::new(output),
                     params,
                     mask_params,
-                    mask
+                    (mask, mask_offset)
                 )
             );
         }

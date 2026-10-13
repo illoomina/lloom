@@ -88,6 +88,99 @@ pub struct RecurrentState {
     pooled: Option<Pooled>,
 }
 
+/// An independently stored current state, outside the finite phase rings.
+/// Private fields prevent callers from substituting aliasing tensor handles.
+#[derive(Debug)]
+pub struct RecurrentRetained {
+    slab: Vec<Option<Tensor>>,
+    phases: Option<Vec<usize>>,
+}
+
+impl crate::nn::branch::RetainState for RecurrentState {
+    type Retained = RecurrentRetained;
+
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        if self.window_open || self.held_open {
+            lloom_tensor::bail!("recurrent retention requires settled windows")
+        }
+        // Validate every backing before allocating the first copy.
+        for tensor in self.slab.iter().flatten() {
+            let bytes = tensor
+                .dims()
+                .iter()
+                .try_fold(tensor.dtype().size_in_bytes(), |n, d| n.checked_mul(*d))
+                .filter(|n| *n <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    lloom_tensor::Error::Msg("retained recurrent bytes overflow".into())
+                })?;
+            let _ = bytes;
+        }
+        let mut slab = crate::nn::branch::retained_vec(self.slab.len())?;
+        let phases = if let Some(p) = &self.pooled {
+            let mut phases = crate::nn::branch::retained_vec(p.phase.len())?;
+            phases.extend_from_slice(&p.phase);
+            Some(phases)
+        } else {
+            None
+        };
+        let _persistent = lloom_tensor::EscapeGuard::new();
+        for t in &self.slab {
+            slab.push(t.as_ref().map(own_copy).transpose()?);
+        }
+        Ok(RecurrentRetained { slab, phases })
+    }
+
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.window_open || self.held_open {
+            lloom_tensor::bail!("recurrent retention requires settled windows")
+        }
+        if saved.slab.len() != self.slab.len() || saved.phases.is_some() != self.pooled.is_some() {
+            lloom_tensor::bail!("retained recurrent state has incompatible geometry")
+        }
+        if let (Some(phases), Some(p)) = (&saved.phases, &self.pooled) {
+            if phases.len() != self.slab.len() || phases.iter().any(|v| *v >= p.pool.phases()) {
+                lloom_tensor::bail!("retained recurrent state has invalid phases")
+            }
+        }
+        for (old, saved) in self.slab.iter().zip(&saved.slab) {
+            if let (Some(old), Some(saved)) = (old, saved) {
+                if old.dims() != saved.dims()
+                    || old.dtype() != saved.dtype()
+                    || !old.device().same_device(saved.device())
+                {
+                    lloom_tensor::bail!("retained recurrent state changed shape, dtype or device")
+                }
+            }
+        }
+        for (l, saved_tensor) in saved.slab.iter().enumerate() {
+            if let Some(p) = &mut self.pooled {
+                let phase = saved.phases.as_ref().expect("validated pooled metadata")[l];
+                if let Some(t) = saved_tensor {
+                    let dst = Self::pool_view(p, l, phase)?;
+                    if dst.dims() != t.dims()
+                        || dst.dtype() != t.dtype()
+                        || !dst.device().same_device(t.device())
+                    {
+                        lloom_tensor::bail!("retained recurrent state differs from pool geometry")
+                    }
+                    let _persistent = lloom_tensor::EscapeGuard::new();
+                    dst.slice_set(t, 0, 0)?;
+                    self.slab[l] = Some(dst);
+                } else {
+                    self.slab[l] = None;
+                }
+                p.phase[l] = phase;
+                p.written[l] = saved_tensor.is_some();
+            } else if let Some(t) = saved_tensor {
+                self.write(l, t.clone())?;
+            } else {
+                self.slab[l] = None;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Whether every state write replaces the slab with a fresh copy instead of
 /// writing it in place (`QWEN4EXP_STATE_WRITE=copy`, read once). A debugging
 /// instrument behind a gate (§3.3a): an allocation per layer per token,

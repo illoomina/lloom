@@ -3282,6 +3282,8 @@ pub struct State<P: Profile> {
     profile: PhantomData<P>,
     masks: HashMap<(usize, usize), Tensor>,
     pub use_kv_cache: bool,
+    /// Private retained-request continuation; never changes ordinary chat defaults.
+    branch_continuation: bool,
     /// The KV, one representation per shape (`profiles-and-memory-design.md`
     /// §7.1): the other arm is not a field.
     kv: KvOf<P>,
@@ -3467,6 +3469,146 @@ pub struct State<P: Profile> {
     /// (`VerifyWords`); `None` until the first verify, or off Metal. A cloned
     /// cache starts without them (two caches must not share one stamp).
     verify_words: VerifyWordsSlot,
+}
+
+/// Full current convolution state, not a normalized prefill checkpoint.
+pub struct RetainedState {
+    conv: Vec<Option<Tensor>>,
+    cat: Option<Vec<Option<(Tensor, Tensor)>>>,
+    kv_len: usize,
+    phase: usize,
+    phase_prev: usize,
+    history: usize,
+    compact: bool,
+}
+
+impl<P: Profile> crate::nn::branch::RetainState for State<P> {
+    type Retained = RetainedState;
+    fn prepare_branching(&mut self) -> Result<()> {
+        if self.speculative || !self.use_kv_cache || self.kv_len() != 0 {
+            lloom_tensor::bail!("lfm2 branching requires a fresh non-speculative KV cache")
+        }
+        self.branch_continuation = true;
+        Ok(())
+    }
+    fn retain_state(&mut self) -> Result<Self::Retained> {
+        if self.speculative || !self.use_kv_cache {
+            lloom_tensor::bail!("lfm2 retention requires a settled KV-cached sequence")
+        }
+        let mut conv = crate::nn::branch::retained_vec(self.conv_states.len())?;
+        let cat = match self.kv.arm() {
+            Arm::One(OwnKv::Cat(kv)) => {
+                let mut saved = crate::nn::branch::retained_vec(kv.len())?;
+                // Cat replaces the old prefix, never mutates its backing.
+                saved.extend(kv.iter().cloned());
+                Some(saved)
+            }
+            _ => None,
+        };
+        let _persistent = lloom_tensor::EscapeGuard::new();
+        for t in &self.conv_states {
+            conv.push(t.as_ref().map(crate::nn::recurrent::own_copy).transpose()?);
+        }
+        Ok(RetainedState {
+            conv,
+            cat,
+            kv_len: self.kv_len(),
+            phase: self.conv_phase,
+            phase_prev: self.conv_phase_prev,
+            history: self.conv_history,
+            compact: self.conv_compact,
+        })
+    }
+    fn restore_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.speculative
+            || !self.use_kv_cache
+            || saved.kv_len > self.kv_len()
+            || saved.conv.len() != self.conv_states.len()
+        {
+            lloom_tensor::bail!("lfm2 retention: invalid window, KV prefix or layer count")
+        }
+        match (self.kv.arm_mut(), &saved.cat) {
+            (ArmMut::One(OwnKv::Cat(kv)), Some(cat)) => {
+                if kv.len() != cat.len() {
+                    lloom_tensor::bail!("lfm2 retained Cat prefix has different layer count")
+                }
+                kv.clone_from_slice(cat);
+            }
+            (ArmMut::One(OwnKv::Cat(_)), None) | (_, Some(_)) => {
+                lloom_tensor::bail!("lfm2 retained KV representation changed")
+            }
+            (_, None) => self.rewind_kv(self.kv_len() - saved.kv_len)?,
+        }
+        self.restore_retained_conv(saved)
+    }
+}
+
+/// A fresh cache adopts a trunk on the Cat arm only: Cat replaces a layer's
+/// KV on every append and never writes into the retained tensors, so rows
+/// continuing one trunk share its prefix. An in-place slab is one buffer a
+/// row would write its own tokens into.
+impl<P: Profile> crate::nn::branch::AdoptRetained for State<P> {
+    fn adopt_retained(&mut self, saved: &Self::Retained) -> Result<()> {
+        if self.speculative
+            || !self.use_kv_cache
+            || self.kv_len() != 0
+            || saved.conv.len() != self.conv_states.len()
+        {
+            lloom_tensor::bail!("lfm2 adoption: the cache is not a fresh one of this model")
+        }
+        match (self.kv.arm_mut(), &saved.cat) {
+            (ArmMut::One(OwnKv::Cat(kv)), Some(cat)) if kv.len() == cat.len() => {
+                kv.clone_from_slice(cat);
+            }
+            _ => lloom_tensor::bail!(
+                "lfm2 adoption: rows share a retained trunk on the Cat KV arm only \
+                 (kv_append = cat on both the trunk and the row)"
+            ),
+        }
+        self.restore_retained_conv(saved)
+    }
+}
+
+impl<P: Profile> State<P> {
+    /// The conv rings, their phase and the per-pass marks [`RetainedState`]
+    /// carries, put back after the KV was.
+    fn restore_retained_conv(&mut self, saved: &RetainedState) -> Result<()> {
+        for (l, t) in saved.conv.iter().enumerate() {
+            match t {
+                Some(t) => {
+                    let dst = match &self.conv_states[l] {
+                        Some(dst)
+                            if dst.dims() == t.dims()
+                                && dst.dtype() == t.dtype()
+                                && dst.device().same_device(t.device()) =>
+                        {
+                            dst.clone()
+                        }
+                        _ => crate::nn::recurrent::own_copy(t)?,
+                    };
+                    let _persistent = lloom_tensor::EscapeGuard::new();
+                    dst.slice_set(t, 0, 0)?;
+                    self.set_conv_state(l, dst)?;
+                }
+                None => self.conv_states[l] = None,
+            }
+        }
+        self.conv_phase = saved.phase;
+        self.conv_phase_prev = saved.phase_prev;
+        self.conv_history = saved.history;
+        self.conv_compact = saved.compact;
+        self.paged_pass_pending = false;
+        self.turn_ckpt_cur = None;
+        for t in &mut self.taps {
+            *t = None;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(b) = self.shared_mut() {
+            b.pass = None;
+        }
+        self.forget_checkpoints_past(saved.kv_len);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -3690,14 +3832,6 @@ impl VerifyWords {
         }
         Ok(&self.host)
     }
-}
-
-fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
-    let head_dim = cfg.head_dim();
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
-        .collect()
 }
 
 impl<P: Profile> crate::nn::model::CacheShare for State<P> {
@@ -4052,15 +4186,13 @@ impl<P: Profile> State<P> {
             }
         }
 
-        let theta = calculate_default_inv_freq(config);
-        let theta = Tensor::new(theta, device)?;
-
-        let idx_theta = Tensor::arange(0, config.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
+        let (cos, sin) = crate::nn::rotary_emb::default_rope_tables(
+            config.head_dim(),
+            config.rope_theta,
+            config.max_position_embeddings,
+            dtype,
+            device,
+        )?;
 
         let num_layers = config.num_hidden_layers;
         let kv = kv(slab, num_layers)?;
@@ -4088,6 +4220,7 @@ impl<P: Profile> State<P> {
             profile: PhantomData,
             masks: HashMap::new(),
             use_kv_cache,
+            branch_continuation: false,
             kv,
             paged_pass_pending: false,
             kv_append: config.kv_append,
@@ -5144,6 +5277,8 @@ impl<P: Profile> State<P> {
         self.conv_phase_prev = 0;
         self.conv_history = 0;
         self.conv_compact = false;
+        self.speculative = false;
+        self.taps.iter_mut().for_each(|tap| *tap = None);
         // The checkpoints describe the sequence that was just discarded; the
         // slots' buffers stay as scratch for the next one.
         self.turn_checkpoints
@@ -5523,9 +5658,9 @@ impl<P: Profile> State<P> {
     /// cover both halves of the state: the KV length and the conv phase are
     /// both read here, before either is moved.
     ///
-    /// Between this call and its [`Cache::resolve`], reads see all `len + k`
-    /// positions, and **no second `advance` is permitted** — enforced by
-    /// `SpecToken` not being `Copy`, so the caller cannot hold two.
+    /// The move-only receipt prevents consuming the same value twice, but does
+    /// not borrow this cache or prevent overlapping windows. Callers keep window
+    /// order; reset discards the sequence without certifying old receipts.
     pub fn advance(&mut self, k: usize) -> Result<SpecToken> {
         if k == 0 {
             lloom_tensor::bail!(
@@ -5767,11 +5902,9 @@ impl<P: Profile<Rows = crate::profile::Paged>> State<P> {
 
 /// The receipt for an open speculative window — `DESIGN.md` §10.2a.
 ///
-/// **`#[must_use]` and not `Copy`, and both are load-bearing.** A caller who
-/// advances and forgets to resolve gets a compile warning; one who resolves
-/// twice gets a move error. `Cache` is the only place that can mint one, which
-/// is what makes "no second `advance` before a `resolve`" a property of the
-/// type rather than of anyone's discipline.
+/// `#[must_use]` warns about an ignored receipt, and a move prevents consuming
+/// the same value twice. Neither prevents overlapping advances nor binds the
+/// receipt to a cache/reset generation; that identity contract is not enforced.
 ///
 /// It carries the pre-advance state rather than only the width, so `resolve`
 /// checks that the window ran the passes it was opened for instead of trusting
@@ -8547,8 +8680,14 @@ impl<P: Profile> ShortConv<P> {
             // padding, or its first `l_cache - 1` outputs convolve over zeros
             // where the previous turn's tokens belong. Behind `ConvPrefillCtx`;
             // off, this is the zero-padded pass every recorded digest belongs to.
+            // A private branching cache enables continuation before its first
+            // trunk tile without changing the loaded model/chat flag.
             let ctx = match &cache.conv_states[block_idx] {
-                Some(prev) if self.prefill_ctx && cache.use_kv_cache && self.l_cache > 1 => {
+                Some(prev)
+                    if (self.prefill_ctx || cache.branch_continuation)
+                        && cache.use_kv_cache
+                        && self.l_cache > 1 =>
+                {
                     Some(self.window_tail(prev, cache.conv_phase_prev)?)
                 }
                 _ => None,
@@ -9588,6 +9727,7 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl<P: Profile> Model<P> {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        lloom_tensor::memory_admission::begin_model_load();
         crate::profile::hold::<P::Regime>("lfm2")?;
         cfg.check_shape::<P>()?;
         // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING
@@ -11773,6 +11913,10 @@ pub mod kv_slot_fuzz {
         v
     }
 }
+
+#[cfg(test)]
+#[path = "lfm2/reset_recovery_tests.rs"]
+mod reset_recovery_tests;
 
 #[cfg(test)]
 mod tests {

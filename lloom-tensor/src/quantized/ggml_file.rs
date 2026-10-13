@@ -141,6 +141,7 @@ pub fn qtensor_from_ggml(
     dims: Vec<usize>,
     device: &Device,
 ) -> Result<super::QTensor> {
+    ggml_dtype.validate_file_weight()?;
     let tensor_elems = dims.iter().product::<usize>();
     let block_size = ggml_dtype.block_size();
     if tensor_elems % block_size != 0 {

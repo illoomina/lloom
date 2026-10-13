@@ -7,14 +7,20 @@
 //! binary name for the pipette runner and is `lloom serve` verbatim.
 
 pub mod budgets;
+pub mod causal_loaded;
 pub mod chat;
 pub mod common;
+pub mod decision_endpoint;
+mod decisions;
 pub mod family;
 pub mod lfm2;
+pub mod lfm2_gguf;
 pub mod modes;
+pub mod omni;
 pub mod qwen3_5;
 pub mod qwen4exp;
 pub mod report;
+mod request_slot;
 pub mod serve;
 pub mod served;
 pub mod template;
@@ -52,6 +58,8 @@ pub struct Shape {
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
+    /// `scheduler.decision_ragged`; taken only under the `fast` contract.
+    pub decision_ragged: bool,
 }
 
 impl Shape {
@@ -71,6 +79,7 @@ impl Shape {
             mem_sample: o.report.memory_sample,
             rows: o.scheduler.rows.clone(),
             share_prefix: o.prefix.share,
+            decision_ragged: o.scheduler.decision_ragged,
         }
     }
 }
@@ -84,6 +93,8 @@ pub enum Family {
     Qwen4Exp(PathBuf),
     /// A GGUF's first shard (`qwen35` / `qwen35moe`).
     Qwen3_5(PathBuf),
+    /// An LFM2 GGUF (`general.architecture = lfm2`, d1-3B's official files).
+    Lfm2Gguf(PathBuf),
 }
 
 /// The family from the path: a `.gguf` file, or a directory holding GGUF
@@ -99,6 +110,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
     Ok(match f.name() {
         "lfm2" => Family::Lfm2(checkpoint),
         "qwen3_5" => Family::Qwen3_5(checkpoint),
+        "lfm2-gguf" => Family::Lfm2Gguf(checkpoint),
         _ => Family::Qwen4Exp(checkpoint),
     })
 }
@@ -108,6 +120,7 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 /// an EOS gate the executor arms cannot run, are named here with their
 /// reasons, beside the arm the loaded line renders.
 pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    lloom_tensor::memory_admission::begin_model_load();
     use lloom::load_warning::{LoadWarning, LoadWarningKind};
     let mut notes = Vec::new();
     if let Some(note) = shape.decode.readback.adaptive_clamp() {
@@ -119,7 +132,7 @@ pub fn load_engine(load: &LoadConfig, mut shape: Shape) -> Result<(Box<dyn Serve
         notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
     let (mut engine, path) = family::load(load, shape)?;
-    engine.note_load_warnings(notes);
+    engine.note_load_warnings_checked(notes)?;
     Ok((engine, path))
 }
 
@@ -621,8 +634,10 @@ pub enum Command {
 /// process leaves it to the OS.
 const DEVICE_RETIREMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The `lloom` binary's entry. A dropped device retires on the host
-/// retirement service, so the process joins that retirement before it exits.
+/// The `lloom` binary's entry. The HTTP retirement service owns whatever a
+/// dropped server left running, so the process joins it before it exits; a
+/// dropped device retires on the host retirement service, so the process
+/// joins that retirement too, after the HTTP one.
 pub fn main(argv: Vec<String>) -> Result<()> {
     let cli = Cli::parse_from(argv);
     let result = match cli.command {
@@ -632,6 +647,7 @@ pub fn main(argv: Vec<String>) -> Result<()> {
         Command::Config(args) => print_config(&args),
         Command::Options(args) => print_options(&args),
     };
+    serve::join_http_retirement();
     let joined = join_device_retirement();
     result.and(joined)
 }
@@ -888,6 +904,7 @@ mod option_layer_tests {
                 mem_sample: false,
                 rows: "auto".into(),
                 share_prefix: false,
+                decision_ragged: true,
             }
         };
         let mut s = shape(&["--replay"]);
@@ -950,6 +967,26 @@ mod model_group_tests {
         let mut full = vec!["t"];
         full.extend_from_slice(argv);
         T::parse_from(full).common
+    }
+
+    #[test]
+    fn explicit_mmproj_uses_existing_option_layers_and_roundtrips() {
+        assert!(crate::LoadConfig::default().mmproj.is_none());
+        for args in [
+            vec!["--mmproj", "/one/mmproj.gguf"],
+            vec!["--set", "model.mmproj=/one/mmproj.gguf"],
+            vec!["--model-config", r#"{"mmproj":"/one/mmproj.gguf"}"#],
+        ] {
+            let options = resolve_options_uninstalled(&common(&args), &no_front).unwrap();
+            assert_eq!(
+                options.load.mmproj.as_deref(),
+                Some(std::path::Path::new("/one/mmproj.gguf"))
+            );
+            let dump = serde_json::to_value(&options).unwrap();
+            let mut restored = crate::EngineOptions::default();
+            restored.merge_json(&dump).unwrap();
+            assert_eq!(restored, options);
+        }
     }
 
     #[test]

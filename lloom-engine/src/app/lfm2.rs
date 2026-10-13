@@ -23,6 +23,7 @@ use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, profile_reset, profile_take,
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
+use super::request_slot::{AbortState, Lease as RequestLease, State as RequestState};
 use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
@@ -58,19 +59,20 @@ pub struct Core<P: Profile> {
     pub device: Device,
 }
 
-/// The `--batch 1` state: the one sequence every request drives, taken out
-/// for the request's session and put back after it, the token rings kept
-/// across requests (`RingPool`, built at load, #702), and the drafter.
-struct Single<P: Profile> {
-    seq: Option<Sequence<State<P>>>,
-    rings: Option<RingPool>,
+/// Side state travels with the held sequence under one request checkout.
+struct SingleExtra {
     spec: Option<DSparkSpeculator>,
-    /// The loop's options, handed to every request's session.
     decode: crate::DecodeConfig,
-    /// The images whose rows the held sequence's image positions carry, in
-    /// order. A cached prefix is reused only across the same images: the
-    /// `<image>` ids of two different images are identical.
+    /// Pixel keys for the rows in the held prefix, not merely image token ids.
     image_keys: Vec<[u8; 32]>,
+}
+impl AbortState for SingleExtra {
+    fn abort(&mut self) {
+        self.image_keys.clear();
+        if let Some(spec) = &mut self.spec {
+            spec.reset_contexts();
+        }
+    }
 }
 
 /// The vision half of an LFM2-VL checkpoint: its config and preprocessing
@@ -236,9 +238,38 @@ impl<P: Profile> crate::MakeDriver<Model<P>> for Speculators {
 
 pub type Extra = Speculators;
 
+/// The private-sequence policy shared by initial chat and decision caches.
+/// Pooled batch rows retain their separate shared-pool constructor.
+#[derive(Clone, Copy)]
+struct PrivateCachePolicy {
+    capacity: usize,
+    bucket: usize,
+    grow_fraction: Option<f64>,
+}
+
+impl PrivateCachePolicy {
+    fn create<P: Lfm2Shape>(
+        self,
+        config: &Config,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<State<P>> {
+        let mut cache = P::state(config, dtype, device, self.capacity, None)
+            .context("allocating the KV cache")?
+            .with_kv_bucket(self.bucket)
+            .context("memory.kv_bucket")?;
+        if let Some(fraction) = self.grow_fraction {
+            cache = cache
+                .with_kv_grow_fraction(fraction)
+                .context("memory.kv_grow_fraction")?;
+        }
+        Ok(cache)
+    }
+}
+
 pub struct Engine<P: Profile> {
     pub core: Arc<Core<P>>,
-    pub text: Text,
+    pub text: Arc<Text>,
     pub model_name: String,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
@@ -293,7 +324,14 @@ pub struct Engine<P: Profile> {
     load_warnings: Vec<LoadWarning>,
     /// What the load reserved on the machine, released with the engine.
     pub machine: Option<Arc<lloom_tensor::machine::Holding>>,
-    single: Mutex<Single<P>>,
+    private_cache: PrivateCachePolicy,
+    /// `/v1/systemone`'s executor binding: a native d1 checkpoint's own, or
+    /// the template `decision.template` selected; `None` refuses by name.
+    decisions: Option<ServedDecisions>,
+    /// `scheduler.decision_ragged`, and the state the last ragged read kept.
+    decision_ragged: bool,
+    trunks: crate::decision::TrunkCache<lloom::models::lfm2::RetainedState>,
+    single: parking_lot::Mutex<Option<RequestState<State<P>, SingleExtra>>>,
     sched: Option<BatchHandle<Model<P>, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -340,6 +378,15 @@ pub struct LoadOptions {
     /// `--flash-k`: pages per FlashDecoding chunk (the model's
     /// `flash_pages_per_chunk`), under `--attn flash` only.
     pub flash_k: Option<usize>,
+    /// `decision.template`: the systemone template the decision executor
+    /// renders, when the checkpoint is not a native decision model or a
+    /// different template is wanted (`decision::binding::Selection`).
+    pub decision_template: Option<String>,
+    /// `scheduler.decision_ragged`: read a request's questions as one ragged
+    /// batch over its state (`CausalRequest::execute_ragged`), under `fast`.
+    pub decision_ragged: bool,
+    /// `model.text_only`: build no vision tower on a VL checkpoint.
+    pub text_only: bool,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -392,29 +439,6 @@ impl RowsArm {
 
     pub fn pooled(self) -> bool {
         matches!(self, Self::Pool | Self::PoolPerRow)
-    }
-}
-
-impl<P: Profile> Single<P> {
-    /// Run `f` over a session on the held sequence, and put the sequence back
-    /// whatever `f` returned.
-    fn with_session<T>(
-        &mut self,
-        core: &Core<P>,
-        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
-    ) -> Result<T> {
-        let seq = self
-            .seq
-            .take()
-            .context("the sequence is checked out — a previous request panicked mid-decode")?;
-        let rings = self.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&core.model, seq, core.device.clone(), rings)
-            .with_config(self.decode.clone());
-        let out = f(&mut session, &mut self.spec);
-        let (seq, rings) = session.into_parts();
-        self.seq = Some(seq);
-        self.rings = Some(rings);
-        out
     }
 }
 
@@ -530,22 +554,286 @@ fn shape_key(opts: &LoadOptions) -> Result<ProfileKey> {
 /// profile the resolved config names, one `match` over the eight
 /// (`lloom::profile::dispatch!`), bounded by what the family ships.
 pub fn load(opts: LoadOptions) -> Result<Box<dyn super::served::Served>> {
+    lloom_tensor::memory_admission::begin_model_load();
     let key = shape_key(&opts)?;
     lloom::profile::dispatch!(key, lloom::profile::LFM2, P => {
         Engine::<P>::load_as(opts).map(|e| Box::new(e) as Box<dyn super::served::Served>)
     })
 }
 
+/// The bounds a served `/v1/systemone` request's images decode under.
+pub(crate) const SERVED_DECISION_IMAGES: super::vision::ImageDecodeLimits =
+    super::vision::ImageDecodeLimits {
+        max_encoded_bytes: 64 << 20,
+        max_width: 16384,
+        max_height: 16384,
+        max_pixels: 64 << 20,
+        max_decoder_bytes: 3 * (64 << 20),
+    };
+
+/// A served LFM2's decision executor: the template bound at load, before
+/// any weight is read (`causal_loaded::BoundPolicy`).
+type ServedDecisions = super::causal_loaded::BoundPolicy;
+
+fn served_decisions(config: &Value, selection: Option<&str>) -> Result<Option<ServedDecisions>> {
+    let facts = crate::decision::binding::CheckpointDecision::from_config(config)?;
+    Ok(ServedDecisions::resolve(&facts, selection)?)
+}
+
+#[cfg(test)]
+mod served_decisions_tests {
+    use super::served_decisions;
+    use crate::decision::binding::DecisionType;
+    use serde_json::json;
+
+    fn d1() -> serde_json::Value {
+        json!({"model_type": "lfm2_vl", "auto_map": {"AutoModel": "modeling_d1.D1Model"}})
+    }
+
+    /// A native d1-3B config binds its shipped template with no selection; a
+    /// plain LFM2-VL binds nothing unless `decision.template` names one, and
+    /// then it is not native (so `/v1/models` does not advertise decisions).
+    #[test]
+    fn native_config_binds_itself_and_a_plain_one_only_when_selected() {
+        let native = served_decisions(&d1(), None).unwrap().unwrap();
+        assert_eq!(native.native, Some(DecisionType::Lfm2D1));
+        assert!(native
+            .origin
+            .starts_with("lfm2-d1 (engine-shipped, sha256 b47201d7"));
+        assert_eq!(native.policy.max_options, 255);
+        let plain = json!({"model_type": "lfm2_vl"});
+        assert!(served_decisions(&plain, None).unwrap().is_none());
+        assert!(served_decisions(&plain, Some("generic")).unwrap().is_none());
+        let selected = served_decisions(&plain, Some("lfm2-d1")).unwrap().unwrap();
+        assert_eq!(selected.native, None);
+        assert!(selected.policy.template.has_causal_certificate());
+    }
+
+    /// What this family cannot render is refused at load, by name: the omni
+    /// layout, and a template the shared-state renderer was not audited for.
+    #[test]
+    fn omni_and_uncertified_templates_are_refused_at_load() {
+        let omni = json!({"model_type": "d1_omni"});
+        let error = served_decisions(&omni, None).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("lfm2-d1-omni decision model"),
+            "{error:#}"
+        );
+        let dir = std::env::temp_dir().join(format!("lloom947-template-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.jinja");
+        std::fs::write(&path, "{{ state }}QUESTION:{{ instructions }}").unwrap();
+        let error = served_decisions(&d1(), path.to_str()).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("not byte-identical"),
+            "{error:#}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+}
+
+/// Internal choice only: CallerScoped is reached exclusively inside Loaded::new.
+#[derive(Clone, Copy)]
+enum LoadAdmission {
+    Legacy,
+    CallerScoped,
+}
+
+/// Checked cold witness for the incumbent shutdown's worker-stop semantics.
+/// It certifies neither native DATA nor callback/retirement quiescence.
+struct NoWorkerWitness(());
+impl NoWorkerWitness {
+    fn shutdown(&self) {} // No batch worker was constructed; no fresh budget gate.
+}
+
+pub mod admitted;
+
 impl<P: Lfm2Shape> Engine<P> {
     /// The engine at the shape `P` names; `load` picks `P` from the
     /// resolved config (`shape_key`) and dispatches here.
     pub fn load_as(opts: LoadOptions) -> Result<Self> {
-        let model_dir = opts.model_dir.clone();
+        lloom_tensor::memory_admission::begin_model_load();
         let device = if opts.cpu {
             Device::Cpu
         } else {
             open_device()?
         };
+        Self::load_on(opts, device, LoadAdmission::Legacy)
+    }
+
+    /// Additive embedding factory using one caller-supplied model domain.
+    /// The caller admits checkpoint/header metadata and the complete load peak
+    /// BEFORE this entry; no second `MachineLoad::admit` runs inside it.
+    ///
+    /// Source integration only: allocator/native/host producer enrollment must
+    /// be complete before enabling this in the default CLI/server factory. All
+    /// subsequent chat AND decision work must use the returned owner's pass
+    /// scope; extracting an unscoped engine is deliberately not offered.
+    ///
+    /// The current admitted variant is single-sequence: the batch scheduler's
+    /// cross-thread pass propagation is still pending. Incumbent batch/CPU/CUDA
+    /// routes remain available unchanged through `load_as`.
+    pub fn load_as_admitted(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+    ) -> Result<lloom::nn::memory::Loaded<Self>> {
+        Self::load_as_admitted_with(opts, device, load, |_, _| ()).map(|(loaded, ())| loaded)
+    }
+
+    // Private load-time capture only: no unscoped getter or owner extraction.
+    fn load_as_admitted_with<T>(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+        capture: impl FnOnce(&Self, NoWorkerWitness) -> T,
+    ) -> Result<(lloom::nn::memory::Loaded<Self>, T)> {
+        Self::load_as_admitted_with_preflight(opts, device, load, |_, _| Ok(()), capture)
+    }
+
+    fn load_as_admitted_with_preflight<T>(
+        opts: LoadOptions,
+        device: &Device,
+        load: lloom::nn::memory::LoadContext,
+        preflight: impl FnOnce(&Config, &Text) -> Result<()>,
+        capture: impl FnOnce(&Self, NoWorkerWitness) -> T,
+    ) -> Result<(lloom::nn::memory::Loaded<Self>, T)> {
+        lloom_tensor::memory_admission::begin_model_load();
+        if opts.cpu != device.is_cpu() {
+            anyhow::bail!("supplied LFM2 device disagrees with load options");
+        }
+        if opts.batch != 1 {
+            anyhow::bail!("admitted LFM2 batch scheduler pass propagation is pending");
+        }
+        let mut metadata = None;
+        let loaded = lloom::nn::memory::Loaded::new(device, load, |resolved, _context| {
+            let engine = Self::load_on_with_preflight(
+                opts,
+                resolved.clone(),
+                LoadAdmission::CallerScoped,
+                preflight,
+            )
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+            // The single-sequence branch returns before spawn_batch. Check the
+            // actual owner too, so a future constructor cannot invalidate the
+            // wrapper's narrowed shutdown without a refusal here.
+            if engine.sched.is_some() || lock(&engine.sched_thread).is_some() {
+                return Err(lloom_tensor::Error::msg(
+                    "admitted LFM2 worker shutdown custody is not installed",
+                ));
+            }
+            metadata = Some(capture(&engine, NoWorkerWitness(())));
+            Ok(engine)
+        })?;
+        Ok((
+            loaded,
+            metadata.expect("successful admitted load ran metadata capture"),
+        ))
+    }
+
+    /// Chat on the admitted loaded owner, using the incumbent decode loop and
+    /// held chat cache. `predicted_extra` covers the complete asynchronous pass;
+    /// borrowed prompt/callback allocations retain their own origin. This does
+    /// not enable the default server factory before producer enrollment.
+    pub fn complete_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            engine
+                .complete_until(prompt_ids, params, on_fragment)
+                .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+        })?)
+    }
+
+    /// Decisions on the SAME loaded model as `complete_admitted`, without
+    /// touching its held chat sequence or loading another checkpoint. The
+    /// already-prepared request's host storage keeps its origin; the pass must
+    /// cover a fresh configured cache, retained frames and all readout scratch.
+    /// A common request checkout excludes both callers from the model executor.
+    /// Media expansion, raw HTTP rendering and full producer enrollment remain
+    /// factory/frontend obligations, not implicit behavior of this token API.
+    pub fn decide_admitted(
+        loaded: &lloom::nn::memory::Loaded<Self>,
+        predicted_extra: usize,
+        request: &crate::decision::CausalRequest,
+    ) -> Result<crate::decision::SystemOneResponse> {
+        Ok(loaded.with_pass(predicted_extra, |engine, _context| {
+            engine.decide_in_scope(request)
+        })?)
+    }
+
+    // Both prepared and raw callers enter exactly one existing Loaded pass.
+    fn decide_in_scope(
+        &self,
+        request: &crate::decision::CausalRequest,
+    ) -> lloom_tensor::Result<crate::decision::SystemOneResponse> {
+        self.check_fits(request.max_prompt_tokens(), 0)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        let mut lease = self
+            .checkout_single()
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))?;
+        // Fresh decision caches still touch the same model scratch. Keep
+        // Held exclusion and mark recovery on Err/unwind before any work.
+        lease.start_external_work();
+        let options = lease.extra().decode.options(0, ReadbackArm::Blocking, 0);
+        let mut readback = lloom::generation::Blocking::new(&NEVER_EOS, &self.core.device)?;
+        let result = match self.ragged_config() {
+            Some(config) => request.execute_ragged(
+                &self.core.model,
+                &self.core.model,
+                &mut readback,
+                &options,
+                |_model, device| self.decision_cache(&config, device),
+                Some(&self.trunks),
+                true,
+            ),
+            None => request.execute_with_cache_factory(
+                &self.core.model,
+                &mut readback,
+                &options,
+                |_model, device| self.decision_cache(&self.config, device),
+            ),
+        };
+        if result.is_ok() {
+            lease.mark_complete();
+        }
+        result
+    }
+
+    /// The decision caches' config when the `decision-ragged` arm is taken
+    /// (`scheduler.decision_ragged` under `fast`): the served config with
+    /// Cat KV, the arm whose appends never write into the trunk the rows
+    /// share (`AdoptRetained`).
+    fn ragged_config(&self) -> Option<Config> {
+        (self.decision_ragged && lloom_tensor::tuning::contract().is_fast()).then(|| {
+            let mut config = self.config.clone();
+            config.kv_append = lloom::models::lfm2::KvAppend::Cat;
+            config
+        })
+    }
+
+    fn decision_cache(&self, config: &Config, device: &Device) -> lloom_tensor::Result<State<P>> {
+        self.private_cache
+            .create::<P>(config, self.dtype, device)
+            .map_err(|error| lloom_tensor::Error::Msg(format!("{error:#}")))
+    }
+
+    fn load_on(opts: LoadOptions, device: Device, admission: LoadAdmission) -> Result<Self> {
+        Self::load_on_with_preflight(opts, device, admission, |_, _| Ok(()))
+    }
+
+    fn load_on_with_preflight(
+        opts: LoadOptions,
+        device: Device,
+        admission: LoadAdmission,
+        preflight: impl FnOnce(&Config, &Text) -> Result<()>,
+    ) -> Result<Self> {
+        let model_dir = opts.model_dir.clone();
         let dtype = if device.is_cpu() {
             DType::F32
         } else {
@@ -560,6 +848,7 @@ impl<P: Lfm2Shape> Engine<P> {
         let config_bytes = std::fs::read(model_dir.join("config.json"))?;
         let root: Value = serde_json::from_slice(&config_bytes).context("parsing config.json")?;
         let vl = root.get("vision_config").is_some();
+        let decisions = served_decisions(&root, opts.decision_template.as_deref())?;
         let config: Lfm2Config = if vl {
             text_config_of(&root)?
         } else {
@@ -656,6 +945,49 @@ impl<P: Lfm2Shape> Engine<P> {
                 opts.reuse_prefix,
             );
         let axes_line = config.axes_line();
+        // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
+        // turn end).
+        let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
+        if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
+            if !eos_ids.contains(&id) {
+                eos_ids.push(id);
+            }
+        }
+        let bos_id = tokenizer.token_to_id("<|startoftext|>");
+        let bos_token = bos_id
+            .and_then(|id| tokenizer.id_to_token(id))
+            .unwrap_or_default();
+
+        let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
+            Ok(src) => Some(Template::compile(&src)?),
+            Err(_) => None,
+        };
+
+        let seed_tokens = tokenizer
+            .encode(opts.seed_text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
+            .get_ids()
+            .to_vec();
+        if seed_tokens.is_empty() {
+            anyhow::bail!("the prompt seed tokenized to nothing");
+        }
+
+        // Prepare the SAME Text once, before weight mapping/model/cache creation.
+        // Executor/device setup above and host metadata remain cold producers;
+        // this ordering is not a complete constructor/error-custody certificate.
+        let text = Arc::new(Text {
+            tokenizer,
+            template,
+            bos_token,
+            bos_id,
+            eos_ids,
+            seed_tokens,
+            think: Default::default(),
+            gen_prompts: Default::default(),
+        });
+        text.prime();
+        preflight(&config, &text)?;
+
         // Admission (§9.5d): predict the peak at the configured ceiling and
         // refuse at load rather than find the limit by dying. The activation
         // term is a function of the LONGEST forward this process will run
@@ -855,18 +1187,28 @@ impl<P: Lfm2Shape> Engine<P> {
             let drafter = std::fs::metadata(dir.join("model.safetensors")).map_or(0, |m| m.len());
             peak.push("drafter", drafter);
         }
-        let machine = lloom::nn::memory::MachineLoad {
-            gate: opts.memory.machine_gate(),
-            label: super::common::machine_label("lfm2", &model_dir),
-            rows: opts.batch.max(1),
-            kv_tokens: kv_floor,
-            prefill_tile: opts.prefill_tile,
-        }
-        .admit(&device, peak)?
-        .holding;
+        let machine = match admission {
+            LoadAdmission::Legacy => {
+                lloom::nn::memory::MachineLoad {
+                    gate: opts.memory.machine_gate(),
+                    label: super::common::machine_label("lfm2", &model_dir),
+                    rows: opts.batch.max(1),
+                    kv_tokens: kv_floor,
+                    prefill_tile: opts.prefill_tile,
+                }
+                .admit(&device, peak)?
+                .holding
+            }
+            // Loaded<Self> retains the caller's admitted domain. Attaching a
+            // second legacy Holding here would double-admit the same model.
+            LoadAdmission::CallerScoped => None,
+        };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         load_warnings.splice(0..0, model.load_warnings().iter().cloned());
-        let vision = if vl {
+        if vl && opts.text_only {
+            eprintln!("[lfm2: text only: the vision tower is not built]");
+        }
+        let vision = if vl && !opts.text_only {
             let vl_config: Lfm2VlConfig = serde_json::from_value(root.clone())
                 .context("parsing config.json's vision half")?;
             Some(Vision {
@@ -881,46 +1223,13 @@ impl<P: Lfm2Shape> Engine<P> {
         } else {
             None
         };
-        let make_cache = |device: &Device| {
-            let mut cache = P::state(&config, dtype, device, opts.kv_capacity, None)
-                .context("allocating the KV cache")?
-                .with_kv_bucket(opts.memory.kv_bucket)
-                .context("memory.kv_bucket")?;
-            if let Some(fraction) = opts.memory.kv_grow_fraction {
-                cache = cache
-                    .with_kv_grow_fraction(fraction)
-                    .context("memory.kv_grow_fraction")?;
-            }
-            Ok::<_, anyhow::Error>(cache)
+        let private_cache = PrivateCachePolicy {
+            capacity: opts.kv_capacity,
+            bucket: opts.memory.kv_bucket,
+            grow_fraction: opts.memory.kv_grow_fraction,
         };
+        let make_cache = |device: &Device| private_cache.create::<P>(&config, dtype, device);
         let cache = make_cache(&device)?;
-
-        // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
-        // turn end).
-        let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
-        if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
-            if !eos_ids.contains(&id) {
-                eos_ids.push(id);
-            }
-        }
-        let bos_id = tokenizer.token_to_id("<|startoftext|>");
-        let bos_token = bos_id
-            .and_then(|id| tokenizer.id_to_token(id))
-            .unwrap_or_default();
-
-        let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-            Ok(src) => Some(Template::compile(&src)?),
-            Err(_) => None,
-        };
-
-        let seed_tokens = tokenizer
-            .encode(opts.seed_text.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("tokenizing the prompt seed: {e}"))?
-            .get_ids()
-            .to_vec();
-        if seed_tokens.is_empty() {
-            anyhow::bail!("the prompt seed tokenized to nothing");
-        }
 
         let model_name = opts
             .model_name
@@ -929,16 +1238,7 @@ impl<P: Lfm2Shape> Engine<P> {
         let core = Arc::new(Core { model, device });
         let mut engine = Engine {
             core: Arc::clone(&core),
-            text: Text {
-                tokenizer,
-                template,
-                bos_token,
-                bos_id,
-                eos_ids,
-                seed_tokens,
-                think: Default::default(),
-                gen_prompts: Default::default(),
-            },
+            text,
             model_name,
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
@@ -978,17 +1278,23 @@ impl<P: Lfm2Shape> Engine<P> {
             warm_in_flight: None,
             load_warnings,
             machine,
-            single: Mutex::new(Single {
-                seq: Some(Sequence::new(cache)),
+            private_cache,
+            decisions,
+            decision_ragged: opts.decision_ragged,
+            trunks: Default::default(),
+            single: parking_lot::Mutex::new(Some(RequestState {
+                sequence: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
-                spec: None,
-                decode: opts.decode.clone(),
-                image_keys: Vec::new(),
-            }),
+                extra: SingleExtra {
+                    spec: None,
+                    decode: opts.decode.clone(),
+                    image_keys: Vec::new(),
+                },
+                needs_recovery: false,
+            })),
             sched: None,
             sched_thread: Mutex::new(None),
         };
-        engine.text.prime();
 
         if opts.warmup {
             let ((libs, pipes), measured) =
@@ -1100,7 +1406,8 @@ impl<P: Lfm2Shape> Engine<P> {
         if opts.batch == 1 {
             if dcfg.is_some() {
                 let spec = build_spec(1)?;
-                lock(&engine.single).spec = Some(spec);
+                let mut lease = RequestLease::<Model<P>, _>::checkout(&engine.single, true)?;
+                lease.extra_mut().spec = Some(spec);
             }
             return Ok(engine);
         }
@@ -1251,11 +1558,38 @@ impl<P: Lfm2Shape> Engine<P> {
         Ok(engine)
     }
 
+    fn fence_failed_request(&self) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(device) = &self.core.device {
+            let marker = device.flush_marker()?;
+            device.wait_marker_prefix_data(&marker)?;
+            return Ok(());
+        }
+        self.core.device.synchronize()?;
+        Ok(())
+    }
+
+    fn checkout_single(&self) -> Result<RequestLease<'_, Model<P>, SingleExtra>> {
+        let lease = RequestLease::<Model<P>, _>::checkout(&self.single, true)?;
+        // Retained target scratch also needs quiescence without speculation.
+        // Refusal restores Held custody and the marker before any reset.
+        lease.before_recovery(|| self.fence_failed_request())?;
+        Ok(lease)
+    }
+
     fn with_single<T>(
         &self,
-        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut Option<DSparkSpeculator>) -> Result<T>,
+        f: impl FnOnce(&mut DecodeSession<'_, Model<P>>, &mut SingleExtra) -> Result<T>,
     ) -> Result<T> {
-        lock(&self.single).with_session(&self.core, f)
+        let mut lease = self.checkout_single()?;
+        let decode = lease.extra().decode.clone();
+        lease.start_decode(&self.core.model, &self.core.device, decode);
+        let (session, extra) = lease.parts_mut();
+        let out = f(session, extra);
+        if out.is_ok() {
+            lease.mark_complete();
+        }
+        out
     }
 
     /// Run a closed job on the batch thread and wait for it.
@@ -1399,15 +1733,13 @@ impl<P: Lfm2Shape> Engine<P> {
         }
         let reuse = self.reuse_prefix;
         let detok = self.detok();
-        let mut single = lock(&self.single);
-        // A text prompt holds no image position, so neither does what it
-        // leaves in the cache.
-        single.image_keys.clear();
-        single.with_session(&self.core, |s, spec| {
+        self.with_single(|s, extra| {
+            // A text prompt leaves no image rows in the held cache.
+            extra.image_keys.clear();
             if !reuse {
                 s.reset();
             }
-            match spec {
+            match &mut extra.spec {
                 Some(spec) => s
                     .decode_speculative_until(
                         rewindable::<P>()?,
@@ -1515,21 +1847,18 @@ impl<P: Lfm2Shape> Engine<P> {
         }
         let keys: Vec<[u8; 32]> = images.iter().map(|im| im.key).collect();
         let device = self.core.device.clone();
+        let mut lease = self.checkout_single()?;
+        let decode = lease.extra().decode.clone();
+        // Install stage custody and recover abandoned target/drafter state before
+        // encoder work or comparing the kept token/pixel prefix.
+        lease.with_model(&self.core.model, &device, decode.clone(), |s, _| {
+            s.reconcile();
+            Ok::<_, anyhow::Error>(())
+        })?;
         let encoder = v.encoder(&device)?;
 
-        let mut single = lock(&self.single);
-        // The previous run's overrun (the flow's forwards past its EOS) is
-        // discarded first, as `Session::prepare` does, so the check below
-        // compares the cache's own position with the token log.
-        single.with_session(&self.core, |s, _| {
-            s.reconcile();
-            Ok(())
-        })?;
         let start = {
-            let seq = single
-                .seq
-                .as_ref()
-                .context("the sequence is checked out — a previous request panicked mid-decode")?;
+            let seq = lease.sequence();
             let cached = seq.tokens();
             let extends = self.reuse_prefix
                 && seq.pos() == cached.len()
@@ -1543,7 +1872,8 @@ impl<P: Lfm2Shape> Engine<P> {
                 rows += rows_of[k];
                 k += 1;
             }
-            let same_images = single.image_keys.len() >= k && single.image_keys[..k] == keys[..k];
+            let same_images =
+                lease.extra().image_keys.len() >= k && lease.extra().image_keys[..k] == keys[..k];
             if extends && same_images {
                 cached.len()
             } else {
@@ -1590,35 +1920,28 @@ impl<P: Lfm2Shape> Engine<P> {
         let mut rows_placed = 0;
         let run = match features {
             Some(features) => {
-                let lm = ImageRows::new(
+                let lm = ImageRows::try_new(
                     &self.core.model,
                     prompt_ids.to_vec(),
                     image_token,
                     features,
                     first_rank,
-                );
-                let seq = single.seq.take().context("the sequence is checked out")?;
-                let rings = single.rings.take().unwrap_or_default();
-                let mut s = DecodeSession::from_parts(&lm, seq, device.clone(), rings)
-                    .with_config(single.decode.clone());
-                if start == 0 {
-                    s.reset();
-                }
-                let run = (|| -> Result<_> {
+                )?;
+                let run = lease.with_model(&lm, &device, decode.clone(), |s, _| {
+                    if start == 0 {
+                        s.reset();
+                    }
                     let pre = s.prefill(&prompt_ids[start..], params)?;
                     let prefill_w = take_window(&device)?;
                     let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
                     let decode_w = take_window(&device)?;
-                    Ok((d, pre, prefill_w, decode_w))
-                })();
-                let (seq, rings) = s.into_parts();
-                single.seq = Some(seq);
-                single.rings = Some(rings);
+                    Ok::<_, anyhow::Error>((d, pre, prefill_w, decode_w))
+                });
                 rows_placed = lm.spliced();
                 run
             }
             // Every image row is in the kept prefix: the rest is text.
-            None => single.with_session(&self.core, |s, _| {
+            None => lease.with_model(&self.core.model, &device, decode, |s, _| {
                 let pre = s.prefill(&prompt_ids[start..], params)?;
                 let prefill_w = take_window(&device)?;
                 let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
@@ -1629,12 +1952,11 @@ impl<P: Lfm2Shape> Engine<P> {
         let (mut decoded, pre, prefill_w, decode_w) = match run {
             Ok(r) => r,
             Err(e) => {
-                single.image_keys.clear();
+                lease.extra_mut().image_keys.clear();
                 return Err(e);
             }
         };
-        single.image_keys = keys;
-        drop(single);
+        lease.extra_mut().image_keys = keys;
         if rows_placed != total - rows_kept {
             anyhow::bail!(
                 "image prefill placed {rows_placed} image rows; the uncached prompt holds {}",
@@ -1667,6 +1989,7 @@ impl<P: Lfm2Shape> Engine<P> {
         report["image_rows_placed"] = json!(rows_placed);
         report["census"] = census.map(|c| c.json()).unwrap_or(Value::Null);
         *lock(&self.last_vision) = report;
+        lease.mark_complete();
         Ok(decoded)
     }
 
@@ -1861,7 +2184,7 @@ impl<P: Lfm2Shape> Engine<P> {
         decode_tokens: usize,
         batch: usize,
     ) -> Result<DecodeTiming> {
-        self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        super::common::check_context_capacity(self.kv_capacity, prompt_tokens, decode_tokens, 1)?;
         if batch <= 1 && self.sched.is_none() {
             return self.decode_throughput_single(prompt_tokens, decode_tokens);
         }
@@ -2063,9 +2386,9 @@ impl<P: Lfm2Shape> Engine<P> {
         let prefill_tile = self.prefill_tile;
         let detok = self.detok();
         let gauge = MemGauge::start(&device, self.mem_sample);
-        let mut timing = self.with_single(|s, spec| {
+        let mut timing = self.with_single(|s, extra| {
             s.reset();
-            if let Some(spec) = spec {
+            if let Some(spec) = &mut extra.spec {
                 // One run of `D` tokens; the prompt's submit time subtracted
                 // (the prefill's GPU tail is inside the bracket).
                 let params = DecodeParams {
@@ -2230,10 +2553,11 @@ impl<P: Lfm2Shape> Engine<P> {
     /// is the reading).
     pub fn diagnostics(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let single = lock(&self.single);
-        let flag = single.decode.in_flight;
-        if let Some((measured, (host_ns, gpu_ns))) = self.warm_in_flight {
-            out.push(format!(
+        let slot = self.single.lock();
+        if let Some(single) = slot.as_ref() {
+            let flag = single.extra.decode.in_flight;
+            if let Some((measured, (host_ns, gpu_ns))) = self.warm_in_flight {
+                out.push(format!(
                 "[in-flight: depth {} (warmup measured {:.2} ms host encode / {:.2} ms gpu step -> \
                  {measured}){}]",
                 if flag > 0 { flag } else { lloom::nn::decode::IN_FLIGHT_FLOOR },
@@ -2245,22 +2569,22 @@ impl<P: Lfm2Shape> Engine<P> {
                     "; the pacer takes decode.in_flight, whose 0 is the floor, not the measured depth"
                 },
             ));
-        }
-        if let Some(seq) = single.seq.as_ref() {
-            let kv = seq.cache().kv_report();
-            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
-            #[cfg(feature = "metal")]
-            let device_line = match &self.core.device {
-                Device::Metal(m) => format!(
-                    " device_allocated={:.2} GB working_set={:.2} GB",
-                    m.device().current_allocated_size() as f64 / 1e9,
-                    m.device().recommended_max_working_set_size() as f64 / 1e9
-                ),
-                _ => String::new(),
-            };
-            #[cfg(not(feature = "metal"))]
-            let device_line = String::new();
-            out.push(format!(
+            }
+            if let Some(seq) = single.sequence.as_ref() {
+                let kv = seq.cache().kv_report();
+                let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+                #[cfg(feature = "metal")]
+                let device_line = match &self.core.device {
+                    Device::Metal(m) => format!(
+                        " device_allocated={:.2} GB working_set={:.2} GB",
+                        m.device().current_allocated_size() as f64 / 1e9,
+                        m.device().recommended_max_working_set_size() as f64 / 1e9
+                    ),
+                    _ => String::new(),
+                };
+                #[cfg(not(feature = "metal"))]
+                let device_line = String::new();
+                out.push(format!(
                 "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
                 kv.kv_len,
                 kv.slab,
@@ -2269,7 +2593,11 @@ impl<P: Lfm2Shape> Engine<P> {
                 kv.grows,
                 mib(kv.bytes)
             ));
+            }
+        } else {
+            out.push("[kv: request owner busy; cache report unavailable]".to_string());
         }
+        drop(slot);
         // §4.8: the weight-group tier's shape and counters, when the layers
         // stream (nothing at full quota — R1, the tier is not there).
         if let Some((slots, groups, slot_bytes, g)) = self.core.model.streamed_layers_stats() {
@@ -2311,6 +2639,18 @@ impl<P: Lfm2Shape> Engine<P> {
                 self.config.kv_append
             );
         }
+        let mut lease = self.checkout_single()?;
+        lease.start_external_work();
+        let out = self.run_mode_body(spec, pooled);
+        if out.is_ok() {
+            lease.mark_complete();
+        }
+        out
+    }
+
+    // Only reached while the same model's request lease is held. The modes
+    // retain all incumbent fresh/reference/batched/speculative cache paths.
+    fn run_mode_body(&self, spec: &super::modes::ModeSpec, pooled: bool) -> Result<()> {
         let pool = if pooled {
             let p = BatchPool::new(
                 &self.config,
@@ -2347,15 +2687,7 @@ impl<P: Lfm2Shape> Engine<P> {
     }
 
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
-        let need = prompt + gen;
-        if need > self.kv_capacity {
-            anyhow::bail!(
-                "prompt {prompt} + generation {gen} = {need} positions exceeds the KV capacity \
-                 {} (start lloom-serve with --kv-capacity >= {need})",
-                self.kv_capacity
-            );
-        }
-        Ok(())
+        super::common::check_context_capacity(self.kv_capacity, prompt, gen, 0)
     }
 
     /// A cell's `batch` must fit the pool the server was started with.
@@ -2761,6 +3093,7 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
             "rows": self.rows.name(),
             "share_prefix": self.share_prefix,
             "dspark_k": self.dspark_k,
+            "decision_ragged": self.decision_ragged.then(|| self.trunks.report()),
             "pool": self.pool.as_ref().map(|p| {
                 let r = p.report();
                 json!({
@@ -2797,7 +3130,44 @@ impl<P: Lfm2Shape> super::served::Served for Engine<P> {
         self.generation.clone()
     }
     fn capabilities(&self) -> super::family::Capabilities {
-        super::family::LFM2_CAPABILITIES
+        super::family::Capabilities {
+            decisions: self.decisions.is_some(),
+            vision: self.vision.is_some(),
+            vision_missing: "no vision tower is built: the checkpoint names no vision_config, \
+                or it was loaded text only (model.text_only, --text-only)",
+            ..super::family::LFM2_CAPABILITIES
+        }
+    }
+    fn systemone(
+        &self,
+        body: &crate::decision::OrderedJson,
+    ) -> std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>
+    {
+        let Some(decisions) = &self.decisions else {
+            return Err(crate::decision::SystemOneError::Unsupported(format!(
+                "{} has no decision template: it is not a native decision checkpoint and \
+                 decision.template selected none",
+                self.model_name
+            )));
+        };
+        self.systemone_images_in_scope(body, &decisions.policy, SERVED_DECISION_IMAGES)
+    }
+    fn systemone_batch(
+        &self,
+        bodies: &[&crate::decision::OrderedJson],
+    ) -> Vec<std::result::Result<crate::decision::SystemOneResponse, crate::decision::SystemOneError>>
+    {
+        match &self.decisions {
+            Some(decisions) => {
+                self.systemone_together(bodies, &decisions.policy, SERVED_DECISION_IMAGES)
+            }
+            None => bodies.iter().map(|body| self.systemone(body)).collect(),
+        }
+    }
+    fn decision_binding(&self) -> Option<(Option<crate::decision::binding::DecisionType>, String)> {
+        self.decisions
+            .as_ref()
+            .map(|decisions| (decisions.native, decisions.origin.clone()))
     }
     fn load_warnings(&self) -> Vec<LoadWarning> {
         let mut w = self.load_warnings.clone();
@@ -2984,3 +3354,5 @@ mod tests {
         }
     }
 }
+
+pub(crate) mod decision_media;

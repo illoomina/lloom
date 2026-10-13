@@ -127,6 +127,18 @@ pub struct QMatMul {
 }
 
 impl QMatMul {
+    pub(crate) fn dimensions(&self) -> Result<(usize, usize)> {
+        let shape = match &self.inner {
+            lloom_tensor::quantized::QMatMul::QTensor(w) => w.shape(),
+            lloom_tensor::quantized::QMatMul::Tensor(w)
+            | lloom_tensor::quantized::QMatMul::TensorF16(w) => w.shape(),
+        };
+        match shape.dims() {
+            &[rows, cols] => Ok((rows, cols)),
+            _ => lloom_tensor::bail!("projection weight must be rank2, got {shape:?}"),
+        }
+    }
+
     pub fn new(
         out_dim: usize,
         in_dim: usize,

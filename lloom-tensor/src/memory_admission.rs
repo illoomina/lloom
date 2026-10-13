@@ -937,4 +937,57 @@ mod tests {
             MachineStatus::Off
         ));
     }
+    #[test]
+    fn cap_adoption_metadata_facade_remains_configurable_without_reset() {
+        let cell = ProcessCell::default();
+        let account = cell.get();
+        let metadata = account.metadata_domain().unwrap();
+        let pass = metadata.reserve(4).unwrap();
+        let charge = pass.context().take(4).unwrap().commit(4).unwrap();
+        drop(pass);
+        assert_eq!(
+            account.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 4
+            }
+        );
+        assert!(matches!(
+            cell.configure(Some(3)),
+            Err(AllocationError::Refused {
+                requested: 4,
+                available: 3,
+                domain: RefusalDomain::Process,
+            })
+        ));
+        assert_eq!(account.cap(), None);
+        cell.configure(Some(4)).unwrap();
+        assert_eq!(account.cap(), Some(4));
+        assert_eq!(
+            account.snapshot(),
+            AccountSnapshot {
+                pending: 0,
+                committed: 4
+            }
+        );
+        account.core.begin_model_load(); // Same core method used by public hook.
+        assert_eq!(
+            cell.configure(Some(8)),
+            Err(AllocationError::ConfigurationConflict {
+                active: Some(4),
+                requested: Some(8)
+            })
+        );
+        assert!(matches!(
+            metadata.reserve(1),
+            Err(AllocationError::Refused {
+                requested: 1,
+                available: 0,
+                ..
+            })
+        ));
+        drop(charge);
+        assert_eq!(account.snapshot(), AccountSnapshot::default());
+        assert_eq!(account.cap(), Some(4));
+    }
 }

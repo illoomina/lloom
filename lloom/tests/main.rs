@@ -132,6 +132,7 @@ mod sampled_cells;
 mod scale_synthetic;
 mod sdpa;
 mod sdpa_full_variants;
+mod sdpa_masked_query;
 mod sdpa_vector_head_dims;
 mod sequence_reuse_tests;
 mod shape_probe_sites;

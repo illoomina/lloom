@@ -1,0 +1,138 @@
+{
+  "source_sha256": "43ad71029f82e20fd26b97574627773d47639d7a3742c8b04fe5bf55f41c4c28",
+  "revision": "02b55d7076f15129e59ab3f94783f32c4b088674",
+  "function": "vision.py::layout",
+  "constraint": "Siglip2VisionEmbeddings.resize_positional_embeddings requires real_grid<=max_length1024",
+  "cases": [
+    {
+      "height": 64,
+      "width": 64,
+      "rows": 1,
+      "cols": 1,
+      "resized": [
+        256,
+        256
+      ],
+      "tiled": false,
+      "position_grid_fits": true,
+      "prefix_tokens": 64
+    },
+    {
+      "height": 100,
+      "width": 300,
+      "rows": 1,
+      "cols": 1,
+      "resized": [
+        160,
+        448
+      ],
+      "tiled": false,
+      "position_grid_fits": true,
+      "prefix_tokens": 70
+    },
+    {
+      "height": 80,
+      "width": 112,
+      "rows": 1,
+      "cols": 1,
+      "resized": [
+        224,
+        320
+      ],
+      "tiled": false,
+      "position_grid_fits": true,
+      "prefix_tokens": 70
+    },
+    {
+      "height": 720,
+      "width": 720,
+      "rows": 1,
+      "cols": 1,
+      "resized": [
+        512,
+        512
+      ],
+      "tiled": false,
+      "position_grid_fits": true,
+      "prefix_tokens": 256
+    },
+    {
+      "height": 688,
+      "width": 752,
+      "rows": 2,
+      "cols": 2,
+      "resized": [
+        480,
+        512
+      ],
+      "tiled": true,
+      "position_grid_fits": true,
+      "prefix_tokens": 1264
+    },
+    {
+      "height": 768,
+      "width": 768,
+      "rows": 2,
+      "cols": 2,
+      "resized": [
+        512,
+        512
+      ],
+      "tiled": true,
+      "position_grid_fits": true,
+      "prefix_tokens": 1280
+    },
+    {
+      "height": 641,
+      "width": 853,
+      "rows": 2,
+      "cols": 3,
+      "resized": [
+        416,
+        576
+      ],
+      "tiled": true,
+      "position_grid_fits": true,
+      "prefix_tokens": 1770
+    },
+    {
+      "height": 1,
+      "width": 65535,
+      "rows": 1,
+      "cols": 10,
+      "resized": [
+        32,
+        131040
+      ],
+      "tiled": true,
+      "position_grid_fits": false,
+      "prefix_tokens": 6655
+    },
+    {
+      "height": 65535,
+      "width": 1,
+      "rows": 10,
+      "cols": 1,
+      "resized": [
+        131040,
+        32
+      ],
+      "tiled": true,
+      "position_grid_fits": false,
+      "prefix_tokens": 6655
+    },
+    {
+      "height": 1,
+      "width": 1,
+      "rows": 1,
+      "cols": 1,
+      "resized": [
+        256,
+        256
+      ],
+      "tiled": false,
+      "position_grid_fits": true,
+      "prefix_tokens": 64
+    }
+  ]
+}

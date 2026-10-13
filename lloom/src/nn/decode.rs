@@ -2904,6 +2904,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if prompt.is_empty() {
             return Ok(PrefillOut::default());
         }
+        // A failed forward may already mutate the cache. Previous logits no
+        // longer describe it; failure requires caller recovery/reset, not a
+        // stale prediction. This invalidates the result, not the transaction.
+        self.seq.last_logits = None;
         let device = readback.device().clone();
         // The prefill's own in-flight bound when one is set, as `decode` runs
         // its prefill block at (`prefill_pacer_depth`); else the decode depth.

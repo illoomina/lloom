@@ -85,29 +85,79 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    // Header inspection validates file geometry, not a host allocation.
+    // In particular a header-only reader may inspect >isize::MAX payloads.
+    fn size_in_bytes(&self) -> Result<u64> {
+        let tensor_elems = self.shape.dims().iter().try_fold(1u64, |n, &dim| {
+            n.checked_mul(dim as u64)
+                .context("gguf: tensor element count overflow")
+        })?;
+        let block_size = self.ggml_dtype.block_size() as u64;
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+            )
+        }
+        (tensor_elems / block_size)
+            .checked_mul(self.ggml_dtype.type_size() as u64)
+            .context("gguf: tensor byte size overflow")
+    }
+
+    // Actual conversion below uses usize element counts and a host Vec<u8>.
+    // These limits do not belong to header-only inspection. Neither check is
+    // admission: a representable allocation may still exceed available memory.
+    fn materialized_size_in_bytes(&self) -> Result<usize> {
+        self.shape.dims().iter().try_fold(1usize, |n, &dim| {
+            n.checked_mul(dim)
+                .context("gguf: host tensor element count overflow")
+        })?;
+        let bytes = usize::try_from(self.size_in_bytes()?)
+            .map_err(|_| crate::Error::Msg("gguf: tensor byte size exceeds host usize".into()))?;
+        if bytes > isize::MAX as usize {
+            crate::bail!("gguf: tensor byte size {bytes} exceeds host allocation limit")
+        }
+        Ok(bytes)
+    }
+
+    /// Check materialization geometry and file extent without reading payload
+    /// or allocating tensor storage. This is not a memory admission promise.
+    /// The reader position is left at EOF; callers must seek before reading.
+    pub fn validate_payload<R: std::io::Seek>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+    ) -> Result<(u64, usize)> {
+        self.ggml_dtype.validate_file_weight()?;
+        let size_in_bytes = self.materialized_size_in_bytes()?;
+        let tensor_start = tensor_data_offset
+            .checked_add(self.offset)
+            .context("gguf: tensor start offset overflow")?;
+        let file_size = reader.seek(std::io::SeekFrom::End(0))?;
+        let remaining = file_size.checked_sub(tensor_start).with_context(|| {
+            format!("gguf: tensor offset {tensor_start} exceeds file size {file_size}, no remaining bytes")
+        })?;
+        if size_in_bytes as u64 > remaining {
+            crate::bail!(
+                "tensor needs {size_in_bytes} bytes at offset {tensor_start}, only {remaining} remaining in file"
+            )
+        }
+        Ok((tensor_start, size_in_bytes))
+    }
+
     pub fn read<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
         tensor_data_offset: u64,
         device: &Device,
     ) -> Result<QTensor> {
-        let tensor_elems = self.shape.elem_count();
-        let block_size = self.ggml_dtype.block_size();
-        if !tensor_elems.is_multiple_of(block_size) {
-            crate::bail!(
-            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
-        )
-        }
-        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
-        let tensor_start = tensor_data_offset.saturating_add(self.offset);
-        let file_size = reader.seek(std::io::SeekFrom::End(0))?;
-        let remaining = file_size.saturating_sub(tensor_start);
-        if size_in_bytes as u64 > remaining {
-            crate::bail!(
-                "tensor needs {size_in_bytes} bytes at offset {tensor_start}, only {remaining} remaining in file"
-            )
-        }
-        let mut raw_data = vec![0u8; size_in_bytes];
+        let (tensor_start, size_in_bytes) = self.validate_payload(reader, tensor_data_offset)?;
+        let mut raw_data = Vec::new();
+        raw_data.try_reserve_exact(size_in_bytes).map_err(|e| {
+            crate::Error::Msg(format!(
+                "gguf: cannot reserve {size_in_bytes} tensor bytes: {e}"
+            ))
+        })?;
+        raw_data.resize(size_in_bytes, 0u8);
         reader.seek(std::io::SeekFrom::Start(tensor_start))?;
         reader.read_exact(&mut raw_data)?;
         super::ggml_file::qtensor_from_ggml(
@@ -272,6 +322,24 @@ impl Value {
             Self::Bool(v) => Ok(*v as u64),
             v => crate::bail!("not a u64 or upcastable to u64 {v:?}"),
         }
+    }
+
+    /// A count or a dimension: an integer of any width, as converters write
+    /// them (llama.cpp writes `head_count_kv` as `i32`), refused when negative;
+    /// a bool or a float is not a count.
+    pub fn to_count(&self) -> Result<u64> {
+        let signed = match self {
+            Self::U8(v) => return Ok(u64::from(*v)),
+            Self::U16(v) => return Ok(u64::from(*v)),
+            Self::U32(v) => return Ok(u64::from(*v)),
+            Self::U64(v) => return Ok(*v),
+            Self::I8(v) => i64::from(*v),
+            Self::I16(v) => i64::from(*v),
+            Self::I32(v) => i64::from(*v),
+            Self::I64(v) => *v,
+            v => crate::bail!("not a non-negative integer {v:?}"),
+        };
+        u64::try_from(signed).map_err(|_| crate::Error::Msg(format!("negative count {signed}")))
     }
 
     pub fn to_i64(&self) -> Result<i64> {
@@ -530,7 +598,16 @@ impl Content {
                 VersionedMagic::GgufV2 | VersionedMagic::GgufV3 => {
                     let mut dimensions = vec![0; n_dimensions as usize];
                     reader.read_u64_into::<LittleEndian>(&mut dimensions)?;
-                    dimensions.into_iter().map(|c| c as usize).collect()
+                    dimensions
+                        .into_iter()
+                        .map(|dim| {
+                            usize::try_from(dim).map_err(|_| {
+                                crate::Error::Msg(format!(
+                                    "gguf: tensor dimension {dim} exceeds host usize"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
                 }
             };
 
@@ -538,14 +615,13 @@ impl Content {
             let ggml_dtype = reader.read_u32::<LittleEndian>()?;
             let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
             let offset = reader.read_u64::<LittleEndian>()?;
-            tensor_infos.insert(
-                tensor_name,
-                TensorInfo {
-                    shape: crate::Shape::from(dimensions),
-                    offset,
-                    ggml_dtype,
-                },
-            );
+            let info = TensorInfo {
+                shape: crate::Shape::from(dimensions),
+                offset,
+                ggml_dtype,
+            };
+            info.size_in_bytes()?;
+            tensor_infos.insert(tensor_name, info);
         }
         let position = reader.stream_position()?;
         let alignment = match metadata.get("general.alignment") {
@@ -557,13 +633,39 @@ impl Content {
             Some(Value::I32(v)) if *v >= 0 => *v as u64,
             _ => DEFAULT_ALIGNMENT,
         };
-        let tensor_data_offset = position.div_ceil(alignment) * alignment;
+        if alignment == 0 {
+            crate::bail!("gguf: general.alignment must be nonzero")
+        }
+        // Preserve positive legacy alignments, including non-powers of two.
+        let padding = (alignment - position % alignment) % alignment;
+        let tensor_data_offset = position
+            .checked_add(padding)
+            .context("gguf: aligned tensor data offset overflow")?;
+        for info in tensor_infos.values() {
+            // Bounds against the actual file remain lazy in TensorInfo::read:
+            // callers deliberately inspect headers before placing payload data.
+            let bytes = info.size_in_bytes()?;
+            tensor_data_offset
+                .checked_add(info.offset)
+                .and_then(|start| start.checked_add(bytes))
+                .context("gguf: tensor byte range offset overflow")?;
+        }
         Ok(Self {
             magic,
             metadata,
             tensor_infos,
             tensor_data_offset,
         })
+    }
+
+    /// Validate every payload an eager loader will materialize, including
+    /// unrequested extra tensors. Header-only `read` deliberately stays lazy.
+    /// No tensor bytes are read or allocated. The reader is left at EOF.
+    pub fn validate_payloads<R: std::io::Seek>(&self, reader: &mut R) -> Result<()> {
+        for info in self.tensor_infos.values() {
+            info.validate_payload(reader, self.tensor_data_offset)?;
+        }
+        Ok(())
     }
 
     pub fn tensor<R: std::io::Seek + std::io::Read>(

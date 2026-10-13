@@ -52,6 +52,9 @@ sha2 = { version = "0.10", optional = true }
 # composes image rows and names no codec.
 image = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
+# Audio input on `/v1/systemone` (d1-omni's clip): WAV and FLAC, decoded to
+# the 16 kHz mono samples the model reads. The binary's only.
+symphonia = { version = "0.6", default-features = false, features = ["flac", "wav", "pcm"], optional = true }
 # `lloom chat --verbose`'s page-fault count over a turn (`getrusage`).
 libc = { workspace = true, optional = true }
 # The sampling group draws a fresh seed when none is given (the library too).
@@ -109,4 +112,5 @@ serve = [
     "dep:image",
     "dep:base64",
     "dep:libc",
+    "dep:symphonia",
 ]

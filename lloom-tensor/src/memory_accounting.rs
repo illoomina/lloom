@@ -976,3 +976,171 @@ mod machine_bridge_tests {
             Some(MachineAdmission::ForcedUnregistered { initial }) if initial.forced));
     }
 }
+
+#[cfg(test)]
+mod cap_adoption_tests {
+    use super::*;
+    #[test]
+    fn cap_adoption_includes_pending_and_committed_refuses_then_retries() {
+        let account = ProcessAccount::bootstrap();
+        let metadata = account.domain(None).unwrap();
+        let mut promise = metadata.try_reserve(10).unwrap();
+        let charge = promise.commit(6).unwrap();
+        let before = account.snapshot();
+        assert_eq!(
+            before,
+            Snapshot {
+                pending: 4,
+                committed: 6
+            }
+        );
+        assert_eq!(
+            account.configure_cap(Some(9)),
+            Err(Refusal::Limit {
+                scope: Scope::Process,
+                limit: 9,
+                requested: 10,
+                requested_total: 10,
+            })
+        );
+        assert!(matches!(
+            account.state.lock().policy,
+            CapPolicy::Unspecified
+        ));
+        assert_eq!(account.snapshot(), before);
+        assert_eq!(account.cap(), None);
+        account.configure_cap(Some(10)).unwrap();
+        assert_eq!(account.snapshot(), before);
+        assert!(matches!(
+            metadata.try_reserve(1),
+            Err(Refusal::Limit {
+                scope: Scope::Process,
+                limit: 10,
+                requested: 1,
+                requested_total: 11
+            })
+        ));
+        drop(promise);
+        assert_eq!(
+            account.snapshot(),
+            Snapshot {
+                pending: 0,
+                committed: 6
+            }
+        );
+        let later_model = account.domain(None).unwrap();
+        let remaining = later_model.try_reserve(4).unwrap();
+        assert_eq!(account.snapshot(), before);
+        drop(remaining);
+        drop(charge);
+        assert_eq!(account.snapshot(), Snapshot::default());
+        assert_eq!(account.cap(), Some(10));
+    }
+    #[test]
+    fn cap_adoption_explicit_none_idempotence_and_first_attempt_freeze() {
+        let unlimited = ProcessAccount::bootstrap();
+        unlimited.configure_cap(None).unwrap();
+        unlimited.configure_cap(None).unwrap();
+        assert_eq!(
+            unlimited.configure_cap(Some(8)),
+            Err(Refusal::ConfigurationConflict {
+                active: None,
+                requested: Some(8)
+            })
+        );
+        let configured = ProcessAccount::bootstrap();
+        configured.configure_cap(Some(8)).unwrap();
+        configured.configure_cap(Some(8)).unwrap();
+        configured.begin_model_load();
+        configured.begin_model_load();
+        configured.configure_cap(Some(8)).unwrap();
+        assert_eq!(
+            configured.configure_cap(Some(16)),
+            Err(Refusal::ConfigurationConflict {
+                active: Some(8),
+                requested: Some(16)
+            })
+        );
+        let unspecified = ProcessAccount::bootstrap();
+        unspecified.begin_model_load();
+        assert!(matches!(
+            unspecified.state.lock().policy,
+            CapPolicy::Frozen(None)
+        ));
+        assert_eq!(
+            unspecified.configure_cap(Some(8)),
+            Err(Refusal::ConfigurationConflict {
+                active: None,
+                requested: Some(8)
+            })
+        );
+        unspecified.configure_cap(None).unwrap();
+    }
+    #[test]
+    fn cap_adoption_usize_max_is_a_real_limit_not_a_sentinel() {
+        let account = ProcessAccount::bootstrap();
+        let domain = account.domain(None).unwrap();
+        // Numeric promise only: no usizeMAX physical allocation is attempted.
+        let mut promised = domain.try_reserve(usize::MAX).unwrap();
+        let charged = promised.commit(1).unwrap();
+        let before = account.snapshot();
+        account.configure_cap(Some(usize::MAX)).unwrap();
+        assert_eq!(account.cap(), Some(usize::MAX));
+        assert_eq!(account.snapshot(), before);
+        assert!(matches!(domain.try_reserve(1), Err(Refusal::Overflow)));
+        assert_eq!(account.snapshot(), before);
+        drop(promised);
+        drop(charged);
+        assert_eq!(account.snapshot(), Snapshot::default());
+        // Bounded corrupt-state seam verifies checked adoption fails BEFORE
+        // publication. No domains/physical charges correspond to these numbers.
+        let corrupt = ProcessAccount::bootstrap();
+        corrupt.state.lock().total = Snapshot {
+            pending: usize::MAX,
+            committed: 1,
+        };
+        assert_eq!(corrupt.configure_cap(None), Err(Refusal::Overflow));
+        assert!(matches!(
+            corrupt.state.lock().policy,
+            CapPolicy::Unspecified
+        ));
+        corrupt.state.lock().total = Snapshot::default();
+    }
+    #[test]
+    fn cap_adoption_both_serial_orders_enforce_same_guarded_policy() {
+        let reserve_first = ProcessAccount::bootstrap();
+        let domain = reserve_first.domain(None).unwrap();
+        let promise = domain.try_reserve(8).unwrap();
+        assert!(matches!(
+            reserve_first.configure_cap(Some(6)),
+            Err(Refusal::Limit {
+                requested_total: 8,
+                ..
+            })
+        ));
+        drop(promise);
+        reserve_first.configure_cap(Some(6)).unwrap();
+        assert!(matches!(
+            domain.try_reserve(7),
+            Err(Refusal::Limit {
+                limit: 6,
+                requested_total: 7,
+                ..
+            })
+        ));
+        let adopt_first = ProcessAccount::bootstrap();
+        adopt_first.configure_cap(Some(6)).unwrap();
+        let domain = adopt_first.domain(None).unwrap();
+        assert!(matches!(
+            domain.try_reserve(7),
+            Err(Refusal::Limit {
+                limit: 6,
+                requested_total: 7,
+                ..
+            })
+        ));
+        assert_eq!(reserve_first.snapshot(), Snapshot::default());
+        assert_eq!(adopt_first.snapshot(), Snapshot::default());
+        // Sequential order controls, NOT a threaded race/weak-memory test.
+    }
+}

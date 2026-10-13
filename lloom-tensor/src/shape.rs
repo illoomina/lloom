@@ -70,12 +70,14 @@ macro_rules! extract_dims {
     ($fn_name:ident, $cnt:tt, $dims:expr, $out_type:ty) => {
         pub fn $fn_name(dims: &[usize]) -> Result<$out_type> {
             if dims.len() != $cnt {
-                Err(Error::UnexpectedNumberOfDims {
-                    expected: $cnt,
-                    got: dims.len(),
-                    shape: Shape::from(dims),
-                }
-                .bt())
+                Err(
+                    Error::UnexpectedNumberOfDims(Box::new(crate::error::UnexpectedNumberOfDims {
+                        expected: $cnt,
+                        got: dims.len(),
+                        shape: Shape::from(dims),
+                    }))
+                    .bt(),
+                )
             } else {
                 Ok($dims(dims))
             }
@@ -479,10 +481,10 @@ impl<S: Into<Shape>> ShapeWithOneHole for S {
     fn into_shape(self, el_count: usize) -> Result<Shape> {
         let shape = self.into();
         if shape.elem_count() != el_count {
-            return Err(Error::ShapeMismatch {
+            return Err(Error::ShapeMismatch(Box::new(crate::error::ShapeMismatch {
                 buffer_size: el_count,
                 shape,
-            }
+            }))
             .bt());
         }
         Ok(shape)

@@ -1,8 +1,10 @@
-//! Every `Error` variant's `Display` text, pinned to the strings the enum
-//! printed before its cold payloads were boxed, so where a payload lives
-//! cannot change what a caller reads. `Debug` is `Display` (`error.rs`).
+//! Every `Error` variant's `Display` text, and through it every
+//! `AllocationError`, `MetalError` and `MetalKernelError` variant's, pinned to
+//! the strings the enums printed before their cold payloads were boxed and
+//! `AllocationError` was packed, so where a payload lives cannot change what a
+//! caller reads. `Debug` is `Display` (`error.rs`).
 
-use lloom_tensor::memory_admission::{AllocationError, RefusalDomain};
+use lloom_tensor::memory_admission::{AllocationError, RefusalDomain, ReuseDomains};
 use lloom_tensor::{DType, DeviceLocation, Error, Shape};
 
 fn s(dims: &[usize]) -> Shape {
@@ -19,18 +21,18 @@ fn variant(e: &Error) -> &'static str {
         Error::UnsupportedDTypeForOp(..) => "UnsupportedDTypeForOp",
         Error::DimOutOfRange(_) => "DimOutOfRange",
         Error::DuplicateDimIndex(_) => "DuplicateDimIndex",
-        Error::UnexpectedNumberOfDims { .. } => "UnexpectedNumberOfDims",
+        Error::UnexpectedNumberOfDims(_) => "UnexpectedNumberOfDims",
         Error::UnexpectedShape(_) => "UnexpectedShape",
-        Error::ShapeMismatch { .. } => "ShapeMismatch",
+        Error::ShapeMismatch(_) => "ShapeMismatch",
         Error::ShapeMismatchBinaryOp(_) => "ShapeMismatchBinaryOp",
         Error::ShapeMismatchCat(_) => "ShapeMismatchCat",
-        Error::ShapeMismatchSplit { .. } => "ShapeMismatchSplit",
-        Error::OnlySingleDimension { .. } => "OnlySingleDimension",
+        Error::ShapeMismatchSplit(_) => "ShapeMismatchSplit",
+        Error::OnlySingleDimension(_) => "OnlySingleDimension",
         Error::EmptyTensor { .. } => "EmptyTensor",
         Error::DeviceMismatchBinaryOp(_) => "DeviceMismatchBinaryOp",
         Error::NarrowInvalidArgs(_) => "NarrowInvalidArgs",
         Error::Conv1dInvalidArgs(_) => "Conv1dInvalidArgs",
-        Error::InvalidIndex { .. } => "InvalidIndex",
+        Error::InvalidIndex(_) => "InvalidIndex",
         Error::BroadcastIncompatibleShapes(_) => "BroadcastIncompatibleShapes",
         Error::CannotSetVar { .. } => "CannotSetVar",
         Error::MatMulUnexpectedStriding(_) => "MatMulUnexpectedStriding",
@@ -55,9 +57,9 @@ fn variant(e: &Error) -> &'static str {
         Error::SafeTensor(_) => "SafeTensor",
         Error::UnsupportedSafeTensorDtype(_) => "UnsupportedSafeTensorDtype",
         Error::Wrapped(_) => "Wrapped",
-        Error::WrappedContext { .. } => "WrappedContext",
+        Error::WrappedContext(_) => "WrappedContext",
         Error::Context { .. } => "Context",
-        Error::WithPath { .. } => "WithPath",
+        Error::WithPath(_) => "WithPath",
         Error::WithBacktrace { .. } => "WithBacktrace",
         Error::Msg(_) => "Msg",
         Error::UnwrapNone => "UnwrapNone",
@@ -107,11 +109,11 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "UnexpectedNumberOfDims",
-            Error::UnexpectedNumberOfDims {
+            Error::UnexpectedNumberOfDims(Box::new(lloom_tensor::error::UnexpectedNumberOfDims {
                 expected: 3,
                 got: 2,
                 shape: s(&[5, 6]),
-            },
+            })),
         ),
         (
             "UnexpectedShape",
@@ -123,10 +125,10 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "ShapeMismatch",
-            Error::ShapeMismatch {
+            Error::ShapeMismatch(Box::new(lloom_tensor::error::ShapeMismatch {
                 buffer_size: 7,
                 shape: s(&[8]),
-            },
+            })),
         ),
         (
             "ShapeMismatchBinaryOp",
@@ -147,18 +149,18 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "ShapeMismatchSplit",
-            Error::ShapeMismatchSplit {
+            Error::ShapeMismatchSplit(Box::new(lloom_tensor::error::ShapeMismatchSplit {
                 shape: s(&[9]),
                 dim: 0,
                 n_parts: 2,
-            },
+            })),
         ),
         (
             "OnlySingleDimension",
-            Error::OnlySingleDimension {
+            Error::OnlySingleDimension(Box::new(lloom_tensor::error::OnlySingleDimension {
                 op: "squeeze",
                 dims: vec![0, 2],
-            },
+            })),
         ),
         ("EmptyTensor", Error::EmptyTensor { op: "max" }),
         (
@@ -191,11 +193,11 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "InvalidIndex",
-            Error::InvalidIndex {
+            Error::InvalidIndex(Box::new(lloom_tensor::error::InvalidIndex {
                 op: "index-select",
                 index: 9,
                 size: 4,
-            },
+            })),
         ),
         (
             "BroadcastIncompatibleShapes",
@@ -274,16 +276,15 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         (
             "Allocation.ReuseDomainMismatch",
             Error::Allocation(AllocationError::ReuseDomainMismatch {
-                expected: "a",
-                actual: "b",
+                domains: &ReuseDomains {
+                    expected: "a",
+                    actual: "b",
+                },
             }),
         ),
         (
             "Allocation.ConfigurationConflict",
-            Error::Allocation(AllocationError::ConfigurationConflict {
-                active: Some(1),
-                requested: None,
-            }),
+            Error::Allocation(AllocationError::configuration_conflict(Some(1), None)),
         ),
         (
             "TryFromIntError",
@@ -294,7 +295,7 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ("ParseInt", Error::ParseInt("x".parse::<u32>().unwrap_err())),
         (
             "FromUtf8",
-            Error::FromUtf8(String::from_utf8(vec![0xff, 0x41]).unwrap_err()),
+            Error::from(String::from_utf8(vec![0xff, 0x41]).unwrap_err()),
         ),
         (
             "Io",
@@ -305,7 +306,7 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "SafeTensor",
-            Error::SafeTensor(safetensors::SafeTensorError::HeaderTooLarge),
+            Error::from(safetensors::SafeTensorError::HeaderTooLarge),
         ),
         (
             "UnsupportedSafeTensorDtype",
@@ -314,10 +315,10 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ("Wrapped", Error::Wrapped(Box::new("wrapped fixture"))),
         (
             "WrappedContext",
-            Error::WrappedContext {
+            Error::WrappedContext(Box::new(lloom_tensor::error::WrappedContext {
                 wrapped: Box::new(std::io::Error::other("inner io")),
                 context: "while loading".to_string(),
-            },
+            })),
         ),
         (
             "Context",
@@ -328,10 +329,7 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         ),
         (
             "WithPath",
-            Error::WithPath {
-                inner: Box::new(Error::Msg("inner msg".to_string())),
-                path: std::path::PathBuf::from("/tmp/x.safetensors"),
-            },
+            Error::Msg("inner msg".to_string()).with_path("/tmp/x.safetensors"),
         ),
         (
             "WithBacktrace",
@@ -382,7 +380,12 @@ fn every_variant() -> Vec<(&'static str, Error)> {
         all.push((
             "Metal.Kernel.UnsupportedDTypeForOp",
             Error::Metal(MetalError::KernelError(
-                MetalKernelError::UnsupportedDTypeForOp("f64", "gemv"),
+                MetalKernelError::UnsupportedDTypeForOp(Box::new(
+                    lloom_tensor::kernels::err::UnsupportedDTypeForOp {
+                        dtype: "f64",
+                        op: "gemv",
+                    },
+                )),
             )),
         ));
         all.push((
@@ -416,10 +419,260 @@ fn every_variant() -> Vec<(&'static str, Error)> {
             )),
         ));
     }
+    all.extend(nested_fixtures());
     all
 }
 
-/// What each fixture printed on the enum before the boxing (`42ae34386`).
+/// One value of every `AllocationError`, `MetalError` and `MetalKernelError`
+/// variant the fixtures above leave out, every `ConfigurationConflict` cap
+/// presence, and the three origin pairs `AllocationOrigin::validate_reuse`
+/// refuses, built through it.
+fn nested_fixtures() -> Vec<(&'static str, Error)> {
+    use lloom_tensor::memory_admission::{
+        process_account, AllocationOrigin, MachineFailure, PredictionBasis,
+    };
+    let a = Error::Allocation;
+    let domain =
+        || AllocationOrigin::Domain(process_account().unadmitted_domain(Some(8)).unwrap().key());
+    let (one, two, legacy) = (domain(), domain(), AllocationOrigin::Legacy);
+    let reuse = |container: &AllocationOrigin, payer: &AllocationOrigin| {
+        Error::Allocation(container.validate_reuse(payer).unwrap_err())
+    };
+    #[allow(unused_mut)]
+    let mut all = vec![
+        (
+            "Allocation.CountExhausted",
+            a(AllocationError::CountExhausted),
+        ),
+        ("Allocation.Cancelled", a(AllocationError::Cancelled)),
+        (
+            "Allocation.DeviceOom",
+            a(AllocationError::DeviceOom { requested: 4096 }),
+        ),
+        (
+            "Allocation.HostAllocation",
+            a(AllocationError::HostAllocation),
+        ),
+        ("Allocation.Overflow", a(AllocationError::Overflow)),
+        (
+            "Allocation.Geometry",
+            a(AllocationError::Geometry("geometry")),
+        ),
+        (
+            "Allocation.PredictionExceeded",
+            a(AllocationError::PredictionExceeded {
+                predicted: 1,
+                actual: 2,
+                basis: PredictionBasis::HeapDescriptorSizeEstimate,
+            }),
+        ),
+        (
+            "Allocation.Unsupported",
+            a(AllocationError::Unsupported("unsupported")),
+        ),
+        (
+            "Allocation.Retirement",
+            a(AllocationError::Retirement("retirement")),
+        ),
+        (
+            "Allocation.InvalidCustody",
+            a(AllocationError::InvalidCustody),
+        ),
+        (
+            "Allocation.UnsupportedLayout",
+            a(AllocationError::UnsupportedLayout),
+        ),
+        (
+            "Allocation.DifferentDomain",
+            a(AllocationError::DifferentDomain),
+        ),
+        (
+            "Allocation.DifferentAllocationDevice",
+            a(AllocationError::DifferentAllocationDevice),
+        ),
+        (
+            "Allocation.UnboundAllocationDevice",
+            a(AllocationError::UnboundAllocationDevice),
+        ),
+        (
+            "Allocation.Machine.Unavailable",
+            a(AllocationError::Machine(MachineFailure::Unavailable)),
+        ),
+        (
+            "Allocation.Machine.Binding",
+            a(AllocationError::Machine(MachineFailure::Binding)),
+        ),
+        (
+            "Allocation.ConfigurationConflict.none-none",
+            a(AllocationError::configuration_conflict(None, None)),
+        ),
+        (
+            "Allocation.ConfigurationConflict.none-some",
+            a(AllocationError::configuration_conflict(None, Some(8))),
+        ),
+        (
+            "Allocation.ConfigurationConflict.some-some",
+            a(AllocationError::configuration_conflict(
+                Some(4),
+                Some(usize::MAX),
+            )),
+        ),
+        (
+            "Allocation.ReuseDomainMismatch.domain-domain",
+            reuse(&one, &two),
+        ),
+        (
+            "Allocation.ReuseDomainMismatch.domain-legacy",
+            reuse(&one, &legacy),
+        ),
+        (
+            "Allocation.ReuseDomainMismatch.legacy-domain",
+            reuse(&legacy, &one),
+        ),
+    ];
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::kernels::SdpaDType;
+        use lloom_tensor::kernels::MetalKernelError as K;
+        use lloom_tensor::metal_backend::LockError;
+        use lloom_tensor::MetalError;
+        let k = |e: K| Error::Metal(MetalError::KernelError(e));
+        all.extend([
+            ("Metal.Kernel.CallbackWouldBlock", k(K::CallbackWouldBlock)),
+            (
+                "Metal.Kernel.LockError",
+                k(K::LockError("lock fixture".into())),
+            ),
+            (
+                "Metal.Kernel.LoadLibraryError",
+                k(K::LoadLibraryError("library fixture".into())),
+            ),
+            (
+                "Metal.Kernel.LoadFunctionError",
+                k(K::LoadFunctionError("function fixture".into())),
+            ),
+            (
+                "Metal.Kernel.ArmRefused",
+                k(K::ArmRefused("arm fixture".into())),
+            ),
+            (
+                "Metal.Kernel.EmulatedRefused",
+                k(K::EmulatedRefused("emulated fixture".into())),
+            ),
+            (
+                "Metal.Kernel.FailedToCreateComputeFunction",
+                k(K::FailedToCreateComputeFunction),
+            ),
+            (
+                "Metal.Kernel.InvalidInput",
+                k(K::InvalidInput("input fixture".into())),
+            ),
+            (
+                "Metal.Kernel.FailedToCreateResource",
+                k(K::FailedToCreateResource("resource fixture".into())),
+            ),
+            (
+                "Metal.Kernel.SdpaHeadDTypeMismatch",
+                k(K::SdpaHeadDTypeMismatch {
+                    variation: "full",
+                    got: SdpaDType::BF16,
+                }),
+            ),
+            (
+                "Metal.Kernel.WithBacktrace",
+                k(K::WithBacktrace {
+                    inner: Box::new(K::CallbackWouldBlock),
+                    backtrace: Box::new(std::backtrace::Backtrace::disabled()),
+                }),
+            ),
+            (
+                "Metal.LockError.Poisoned",
+                Error::Metal(MetalError::LockError(LockError::Poisoned(
+                    "poison fixture".into(),
+                ))),
+            ),
+            (
+                "Metal.LockError.WouldBlock",
+                Error::Metal(MetalError::LockError(LockError::WouldBlock)),
+            ),
+        ]);
+    }
+    all
+}
+
+/// The nested variant a fixture reaches, `None` for an `Error`-level one. No
+/// wildcard below the `Error` level: a variant added to `AllocationError`,
+/// `MetalError` or `MetalKernelError` fails to compile here until it is named,
+/// and then fails the test until it has a fixture.
+fn nested_variant(e: &Error) -> Option<&'static str> {
+    match e {
+        Error::Allocation(a) => Some(allocation_variant(a)),
+        #[cfg(feature = "metal")]
+        Error::Metal(m) => Some(metal_variant(m)),
+        _ => None,
+    }
+}
+
+fn allocation_variant(e: &AllocationError) -> &'static str {
+    match e {
+        AllocationError::Refused { .. } => "Allocation.Refused",
+        AllocationError::CountExhausted => "Allocation.CountExhausted",
+        AllocationError::Cancelled => "Allocation.Cancelled",
+        AllocationError::DeviceOom { .. } => "Allocation.DeviceOom",
+        AllocationError::HostAllocation => "Allocation.HostAllocation",
+        AllocationError::Overflow => "Allocation.Overflow",
+        AllocationError::Geometry(_) => "Allocation.Geometry",
+        AllocationError::PredictionExceeded { .. } => "Allocation.PredictionExceeded",
+        AllocationError::Unsupported(_) => "Allocation.Unsupported",
+        AllocationError::Retirement(_) => "Allocation.Retirement",
+        AllocationError::InvalidCustody => "Allocation.InvalidCustody",
+        AllocationError::UnsupportedLayout => "Allocation.UnsupportedLayout",
+        AllocationError::DifferentDomain => "Allocation.DifferentDomain",
+        AllocationError::DifferentAllocationDevice => "Allocation.DifferentAllocationDevice",
+        AllocationError::UnboundAllocationDevice => "Allocation.UnboundAllocationDevice",
+        AllocationError::ReuseDomainMismatch { .. } => "Allocation.ReuseDomainMismatch",
+        AllocationError::Machine(_) => "Allocation.Machine",
+        AllocationError::ConfigurationConflict { .. } => "Allocation.ConfigurationConflict",
+    }
+}
+
+#[cfg(feature = "metal")]
+fn metal_variant(e: &lloom_tensor::MetalError) -> &'static str {
+    use lloom_tensor::kernels::MetalKernelError as K;
+    use lloom_tensor::MetalError as M;
+    match e {
+        M::Message(_) => "Metal.Message",
+        M::LockError(_) => "Metal.LockError",
+        M::UnexpectedDType { .. } => "Metal.UnexpectedDType",
+        M::KernelError(k) => match k {
+            K::Allocation(a) => allocation_variant(a),
+            K::RecordingAdmission(_) => "Metal.Kernel.RecordingAdmission",
+            // `CompletionRegistrationError::new` is crate-private; its text is
+            // pinned by `kernels::err`'s `registration_error_tests`.
+            K::CompletionRegistration(_) => "Metal.Kernel.CompletionRegistration",
+            K::CallbackWouldBlock => "Metal.Kernel.CallbackWouldBlock",
+            K::QueueUnavailable(_) => "Metal.Kernel.QueueUnavailable",
+            K::CommandBufferError(_) => "Metal.Kernel.CommandBufferError",
+            K::LockError(_) => "Metal.Kernel.LockError",
+            K::LoadLibraryError(_) => "Metal.Kernel.LoadLibraryError",
+            K::LoadFunctionError(_) => "Metal.Kernel.LoadFunctionError",
+            K::ArmRefused(_) => "Metal.Kernel.ArmRefused",
+            K::EmulatedRefused(_) => "Metal.Kernel.EmulatedRefused",
+            K::UnsupportedDTypeForOp(_) => "Metal.Kernel.UnsupportedDTypeForOp",
+            K::FailedToCreateComputeFunction => "Metal.Kernel.FailedToCreateComputeFunction",
+            K::InvalidInput(_) => "Metal.Kernel.InvalidInput",
+            K::FailedToCreateResource(_) => "Metal.Kernel.FailedToCreateResource",
+            K::FailedToCreatePipeline(_) => "Metal.Kernel.FailedToCreatePipeline",
+            K::MatMulNonContiguous(_) => "Metal.Kernel.MatMulNonContiguous",
+            K::SdpaHeadSizeMismatch(_) => "Metal.Kernel.SdpaHeadSizeMismatch",
+            K::SdpaHeadDTypeMismatch { .. } => "Metal.Kernel.SdpaHeadDTypeMismatch",
+            K::WithBacktrace { .. } => "Metal.Kernel.WithBacktrace",
+        },
+    }
+}
+
+/// What each fixture printed before the boxing: the `Error`-level ones on
+/// `42ae34386`, the nested ones (`nested_fixtures`) on `d583361c8`.
 const EXPECTED: &[(&str, &str)] = &[
     ("UnexpectedDType", "m, expected: F16, got: BF16"),
     ("DTypeMismatchBinaryOp", "dtype mismatch in add, lhs: F32, rhs: U8"),
@@ -477,6 +730,41 @@ const EXPECTED: &[(&str, &str)] = &[
     ("Metal.Kernel.MatMulNonContiguous", "Metal error Invalid matmul arguments [3, 1] [1, 4] (2, 4, 3)"),
     ("Metal.Kernel.SdpaHeadSizeMismatch", "Metal error Sdpa vector head size was 80, expectd [64, 128]"),
     ("Metal.Kernel.FailedToCreatePipeline", "Metal error Failed to create pipeline"),
+    ("Allocation.CountExhausted", "allocation reference count exhausted"),
+    ("Allocation.Cancelled", "allocation context was cancelled"),
+    ("Allocation.DeviceOom", "the device refused a 4096-byte allocation"),
+    ("Allocation.HostAllocation", "cold host allocation returned null"),
+    ("Allocation.Overflow", "memory admission arithmetic exceeds usize"),
+    ("Allocation.Geometry", "allocation geometry: geometry"),
+    ("Allocation.PredictionExceeded", "allocation prediction exceeded: 2 actual bytes > 1 predicted (HeapDescriptorSizeEstimate); raw allocation released; transient peak was not prevented"),
+    ("Allocation.Unsupported", "admitted allocation unsupported: unsupported"),
+    ("Allocation.Retirement", "allocation retirement registration: retirement"),
+    ("Allocation.InvalidCustody", "allocation custody invariant violated"),
+    ("Allocation.UnsupportedLayout", "owned Arc quote requires an audited std toolchain/source; legacy allocation APIs remain available"),
+    ("Allocation.DifferentDomain", "cannot return a promise to a different model domain"),
+    ("Allocation.DifferentAllocationDevice", "reusable allocation container and operation target different native devices"),
+    ("Allocation.UnboundAllocationDevice", "clock-only allocation container has no native device binding"),
+    ("Allocation.Machine.Unavailable", "machine admission: the registry or the host's memory could not be read; admission cannot establish room"),
+    ("Allocation.Machine.Binding", "machine admission: the machine holding is absent without an explicit force/off override, or already belongs to another admission domain; reuse that domain or obtain a distinct holding with Gate::admit"),
+    ("Allocation.ConfigurationConflict.none-none", "process memory cap already initialized to None, requested None; configure before the first load"),
+    ("Allocation.ConfigurationConflict.none-some", "process memory cap already initialized to None, requested Some(8); configure before the first load"),
+    ("Allocation.ConfigurationConflict.some-some", "process memory cap already initialized to Some(4), requested Some(18446744073709551615); configure before the first load"),
+    ("Allocation.ReuseDomainMismatch.domain-domain", "reusable allocation domain mismatch: container=accounted domain, active payer=accounted domain; accounted domains require identical origin"),
+    ("Allocation.ReuseDomainMismatch.domain-legacy", "reusable allocation domain mismatch: container=accounted domain, active payer=legacy/unadmitted; accounted domains require identical origin"),
+    ("Allocation.ReuseDomainMismatch.legacy-domain", "reusable allocation domain mismatch: container=legacy/unadmitted, active payer=accounted domain; accounted domains require identical origin"),
+    ("Metal.Kernel.CallbackWouldBlock", "Metal error a completion callback cannot block on its own queue"),
+    ("Metal.Kernel.LockError", "Metal error Could not lock resource: lock fixture"),
+    ("Metal.Kernel.LoadLibraryError", "Metal error Error while loading library: library fixture"),
+    ("Metal.Kernel.LoadFunctionError", "Metal error Error while loading function: function fixture"),
+    ("Metal.Kernel.ArmRefused", "Metal error arm fixture"),
+    ("Metal.Kernel.EmulatedRefused", "Metal error emulated fixture"),
+    ("Metal.Kernel.FailedToCreateComputeFunction", "Metal error Failed to create compute function"),
+    ("Metal.Kernel.InvalidInput", "Metal error Invalid input: input fixture"),
+    ("Metal.Kernel.FailedToCreateResource", "Metal error Failed to create metal resource: resource fixture"),
+    ("Metal.Kernel.SdpaHeadDTypeMismatch", "Metal error Sdpa full got dtype BF16"),
+    ("Metal.Kernel.WithBacktrace", "Metal error a completion callback cannot block on its own queue\ndisabled backtrace"),
+    ("Metal.LockError.Poisoned", "Metal error Poisoned(\"poison fixture\")"),
+    ("Metal.LockError.WouldBlock", "Metal error WouldBlock"),
 ];
 
 #[test]
@@ -498,4 +786,36 @@ fn every_variant_displays_as_before() {
     assert_eq!(listed, EXPECTED.len(), "a pinned text has no fixture");
     assert!(listed > 40, "only {listed} fixtures");
     assert_eq!(named.len(), 45, "variants without a fixture: {named:?}");
+    let nested: std::collections::BTreeSet<_> =
+        all.iter().filter_map(|(_, e)| nested_variant(e)).collect();
+    let allocation = nested
+        .iter()
+        .filter(|n| n.starts_with("Allocation."))
+        .count();
+    assert_eq!(
+        allocation, 18,
+        "AllocationError variants with a fixture: {nested:?}"
+    );
+    #[cfg(feature = "metal")]
+    {
+        let kernel = nested
+            .iter()
+            .filter(|n| n.starts_with("Metal.Kernel."))
+            .count();
+        // Twenty variants: `Allocation` is counted above and
+        // `CompletionRegistration` is pinned in `kernels::err`.
+        assert_eq!(
+            kernel, 18,
+            "MetalKernelError variants with a fixture: {nested:?}"
+        );
+        let metal = nested
+            .iter()
+            .filter(|n| !n.starts_with("Allocation."))
+            .count()
+            - kernel;
+        assert_eq!(
+            metal, 3,
+            "MetalError variants beside KernelError with a fixture: {nested:?}"
+        );
+    }
 }

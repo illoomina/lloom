@@ -4,6 +4,7 @@
 //! scalar references they are tested against. The Gated DeltaNet block's are
 //! in `gdn.rs`.
 
+use crate::kernels::err::UnsupportedDTypeForOp;
 use crate::kernels::utils::{dispatch_groups, dispatch_groups_2d, head_width, EncoderProvider};
 use crate::kernels::{
     debug_group, set_params, Buffer, BufferOffset, ComputeCommandEncoder, DType, Device, Kernels,
@@ -379,7 +380,12 @@ fn float_kernel(
         DType::U32 => "u32",
         DType::U8 => "u8",
     };
-    Err(MetalKernelError::UnsupportedDTypeForOp(other, f32_name))
+    Err(MetalKernelError::UnsupportedDTypeForOp(Box::new(
+        UnsupportedDTypeForOp {
+            dtype: other,
+            op: f32_name,
+        },
+    )))
 }
 
 /// `silu_mul_<dtype>`: `out = silu(g) · u` over `n` elements, all three of

@@ -26,12 +26,13 @@ out=$(cd "$out" && pwd)
 
 cd "$candle"
 files=$(grep -lE 'Fixture::(<|new)' lloom/tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | sort)
-tests=()
-for f in $files; do tests+=(--test "$f"); done
 
-echo "== build (${#tests[@]} args) -> $out/build.json"
+# Every file is a module of the one integration binary, `tests/main.rs`
+# (CONTRIBUTING §3.1d): build it once and select each file's tests by its
+# module path.
+echo "== build (tests/main.rs) -> $out/build.json"
 $arb share --wait-timeout 86400 -- \
-    cargo test --release --features metal -p lloom "${tests[@]}" --no-run \
+    cargo test --release --features metal -p lloom --test main --no-run \
     --message-format=json >|"$out/build.json" 2>"$out/build.err"
 rc=$?
 if [ $rc -ne 0 ]; then
@@ -47,8 +48,7 @@ mode=measure
 
 fail=0
 printf '%-40s %-8s %-6s %-8s %s\n' binary verdict tests wall_s max_rss_gb >|"$out/summary.txt"
-for f in $files; do
-    bin=$(python3 - "$out/build.json" "$f" <<'EOF'
+bin=$(python3 - "$out/build.json" main <<'EOF'
 import json, sys
 for line in open(sys.argv[1]):
     try:
@@ -61,15 +61,15 @@ for line in open(sys.argv[1]):
         print(m["executable"])
 EOF
 )
+if [ -z "$bin" ]; then
+    echo "no test binary built" | tee -a "$out/summary.txt"
+    exit 1
+fi
+for f in $files; do
     log="$out/$f.txt"
-    if [ -z "$bin" ]; then
-        echo "$f: no test binary built" | tee -a "$out/summary.txt"
-        fail=1
-        continue
-    fi
     echo "== $f"
     $arb $mode --wait-timeout 86400 -- \
-        /usr/bin/time -l env LLOOM_FIXTURE="$backend" "$bin" --test-threads 1 --nocapture \
+        /usr/bin/time -l env LLOOM_FIXTURE="$backend" "$bin" "$f::" --test-threads 1 --nocapture \
         >|"$log" 2>&1
     rc=$?
     ran=$(grep -Eo '^running [0-9]+ tests?' "$log" | awk '{s+=$2} END {print s+0}')
